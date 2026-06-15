@@ -1,4 +1,5 @@
 #include "graph/execute.h"
+#include "kernels/matmul.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -61,6 +62,12 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             output->shape[1] = params.i32.size() >= 4 ? (int64_t)params.i32[1] : 1;
             output->shape[2] = params.i32.size() >= 4 ? (int64_t)params.i32[2] : 1;
             output->shape[3] = params.i32.size() >= 4 ? (int64_t)params.i32[3] : 1;
+        }
+        break;
+
+    case OpType::MATMUL:
+        if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
+            kernel_matmul_fp32(*inputs[0], *inputs[1], *output);
         }
         break;
 
