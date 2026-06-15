@@ -1,5 +1,6 @@
 #include "graph/execute.h"
 #include "kernels/matmul.h"
+#include "kernels/norm.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -68,6 +69,13 @@ static void dispatch_kernel(OpType op, const OpParams& params,
     case OpType::MATMUL:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             kernel_matmul_fp32(*inputs[0], *inputs[1], *output);
+        }
+        break;
+
+    case OpType::RMS_NORM:
+        if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
+            float eps = graph_params::get_f32(params, 0, 1e-6f);
+            kernel_rms_norm(*inputs[0], *inputs[1], eps, *output);
         }
         break;
 
