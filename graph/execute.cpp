@@ -75,11 +75,13 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         break;
 
     case OpType::SDPA:
-    case OpType::SDPA_MLA:
-        if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2]) {
-            kernel_sdpa(params, inputs, outputs);
-        }
+    case OpType::SDPA_MLA: {
+        // SDPA needs multi-output — create a local output vector from graph tensors
+        // This is a simplified dispatch; the real engine will handle this properly
+        std::vector<Tensor*> sdpa_outs = { output };
+        kernel_sdpa(params, inputs, sdpa_outs);
         break;
+    }
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
             int rope_dim = graph_params::get_i32(params, 0, 64);
             bool interleave = graph_params::get_i32(params, 1, 1) != 0;
