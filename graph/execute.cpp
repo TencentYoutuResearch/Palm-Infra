@@ -2,6 +2,7 @@
 #include "kernels/matmul.h"
 #include "kernels/norm.h"
 #include "kernels/rope.h"
+#include "kernels/attention.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -73,7 +74,12 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         }
         break;
 
-    case OpType::ROTARY_EMBED:
+    case OpType::SDPA:
+    case OpType::SDPA_MLA:
+        if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2]) {
+            kernel_sdpa(params, inputs, outputs);
+        }
+        break;
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
             int rope_dim = graph_params::get_i32(params, 0, 64);
             bool interleave = graph_params::get_i32(params, 1, 1) != 0;
