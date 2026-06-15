@@ -1,6 +1,7 @@
 #include "graph/execute.h"
 #include "kernels/matmul.h"
 #include "kernels/norm.h"
+#include "kernels/rope.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -69,6 +70,14 @@ static void dispatch_kernel(OpType op, const OpParams& params,
     case OpType::MATMUL:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             kernel_matmul_fp32(*inputs[0], *inputs[1], *output);
+        }
+        break;
+
+    case OpType::ROTARY_EMBED:
+        if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
+            int rope_dim = graph_params::get_i32(params, 0, 64);
+            bool interleave = graph_params::get_i32(params, 1, 1) != 0;
+            kernel_rope(*inputs[0], *inputs[1], *inputs[2], rope_dim, interleave, *output);
         }
         break;
 
