@@ -29,6 +29,7 @@ set(SOURCES
     kernels/attention.cpp
     # engine
     engine/engine.cpp
+    engine/tokenizer.cpp
 )
 
 set(HEADERS
@@ -45,7 +46,10 @@ set(HEADERS
 )
 
 add_library(mlllm_lib STATIC ${SOURCES})
-target_include_directories(mlllm_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(mlllm_lib PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann
+)
 target_link_libraries(mlllm_lib PUBLIC)
 
 # ---------------------------------------------------------------------------
@@ -105,6 +109,7 @@ if(MLLLM_BUILD_TESTS)
     add_mlllm_test(test_rope          tests/test_rope.cpp)
     add_mlllm_test(test_attention     tests/test_attention.cpp)
     add_mlllm_test(test_engine        tests/test_engine.cpp)
+    add_mlllm_test(test_tokenizer     tests/test_tokenizer.cpp)
 endif()
 
 # ---------------------------------------------------------------------------
