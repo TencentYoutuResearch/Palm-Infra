@@ -82,6 +82,7 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         kernel_sdpa(params, inputs, sdpa_outs);
         break;
     }
+    case OpType::ROTARY_EMBED:
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
             int rope_dim = graph_params::get_i32(params, 0, 64);
             bool interleave = graph_params::get_i32(params, 1, 1) != 0;
@@ -93,6 +94,35 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             float eps = graph_params::get_f32(params, 0, 1e-6f);
             kernel_rms_norm(*inputs[0], *inputs[1], eps, *output);
+        }
+        break;
+
+    case OpType::CONCAT:
+        // zero-copy: concat produces a view? No — concat copies data.
+        // Placeholder: skip for now (the model uses concat, needs kernel)
+        break;
+
+    case OpType::SLICE:
+        // zero-copy: slice produces a view of the parent
+        if (!inputs.empty() && inputs[0] && output) {
+            int dim   = graph_params::get_i32(params, 0, 0);
+            int offset= graph_params::get_i32(params, 1, 0);
+            // For dim=0: view at byte offset
+            if (dim == 0 && offset >= 0) {
+                *output = *inputs[0];
+                size_t byte_off = (size_t)offset * inputs[0]->stride[0];
+                output->data = static_cast<char*>(inputs[0]->data) + byte_off;
+                output->mem_type = inputs[0]->mem_type;
+            } else {
+                *output = *inputs[0];
+            }
+        }
+        break;
+
+    case OpType::TILE:
+        // Tile: replicate data. Placeholder.
+        if (!inputs.empty() && inputs[0] && output) {
+            *output = *inputs[0];
         }
         break;
 

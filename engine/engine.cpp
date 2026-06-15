@@ -21,6 +21,34 @@ bool LLMEngine::load(const EngineConfig& cfg) {
         return false;
     }
 
+    // ---- load weight files referenced by CONSTANT nodes ----
+    std::string graph_dir = cfg.graph_path;
+    size_t slash = graph_dir.find_last_of("/\\");
+    if (slash != std::string::npos) graph_dir = graph_dir.substr(0, slash + 1);
+    else graph_dir = "./";
+
+    for (auto& node : graph_.nodes) {
+        if (node.op_type == OpType::CONSTANT && !node.params.str.empty()) {
+            std::string wpath = graph_dir + node.params.str[0];
+            MappedFile mf;
+            if (mf.open(wpath.c_str())) {
+                // set tensor data from mmap'd weight
+                auto& t = graph_.runtime.tensors[node.id];
+                t.prec = node.out_prec;
+                t.shape[0] = node.out_shape[0];
+                t.shape[1] = node.out_shape[1];
+                t.shape[2] = node.out_shape[2];
+                t.shape[3] = node.out_shape[3];
+                t.compute_strides();
+                t.data = const_cast<void*>(mf.data());
+                t.mem_type = MemoryType::EXTERNAL;
+                graph_.runtime.weights.push_back(std::move(mf));
+            } else {
+                fprintf(stderr, "Engine: failed to load weight %s\n", wpath.c_str());
+            }
+        }
+    }
+
     // set up execution context
     exec_ctx_.graph = &graph_;
     exec_ctx_.pool  = &graph_.runtime.pool;

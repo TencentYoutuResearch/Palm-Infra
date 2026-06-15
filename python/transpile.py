@@ -211,12 +211,20 @@ class GraphBuilder:
         sx = self._nodes[x].out_shape
         n_elems = 1
         for d in sx: n_elems *= d
+        # handle -1 (infer) dimension
+        resolved = list(shape)
+        if -1 in resolved:
+            known = 1
+            for d in resolved:
+                if d != -1: known *= d
+            idx = resolved.index(-1)
+            resolved[idx] = n_elems // known
         s_elems = 1
-        for d in shape: s_elems *= d
+        for d in resolved: s_elems *= d
         assert n_elems == s_elems, f"reshape element mismatch: {sx} vs {shape}"
-        return self._add(OpType.RESHAPE, [x], shape,
+        return self._add(OpType.RESHAPE, [x], tuple(resolved),
                          prec=self._nodes[x].out_prec,
-                         i32=list(self._normalize_shape(shape)))
+                         i32=list(self._normalize_shape(tuple(resolved))))
 
     def permute(self, x: int, order: tuple) -> int:
         sx = self._nodes[x].out_shape
@@ -249,10 +257,11 @@ class GraphBuilder:
 
     def tile(self, x: int, repeats: tuple) -> int:
         sx = self._nodes[x].out_shape
-        out = tuple(sx[i] * repeats[i] for i in range(4))
+        r = list(repeats) + [1] * (4 - len(repeats))
+        out = tuple(sx[i] * r[i] for i in range(4))
         return self._add(OpType.TILE, [x], out,
                          prec=self._nodes[x].out_prec,
-                         i32=list(repeats))
+                         i32=r)
 
     # ---- element-wise ----
 
@@ -357,6 +366,8 @@ def _numpy_to_precision(dt: np.dtype) -> Precision:
         return Precision.FP16
     elif dt == np.int8:
         return Precision.INT8
+    elif dt == np.uint16:
+        return Precision.FP16  # BF16 stored as uint16, treat as FP16 for now
     raise ValueError(f"unsupported dtype: {dt}")
 
 
