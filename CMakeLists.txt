@@ -27,6 +27,8 @@ set(SOURCES
     kernels/norm.cpp
     kernels/rope.cpp
     kernels/attention.cpp
+    # engine
+    engine/engine.cpp
 )
 
 set(HEADERS
@@ -102,6 +104,7 @@ if(MLLLM_BUILD_TESTS)
     add_mlllm_test(test_norm          tests/test_norm.cpp)
     add_mlllm_test(test_rope          tests/test_rope.cpp)
     add_mlllm_test(test_attention     tests/test_attention.cpp)
+    add_mlllm_test(test_engine        tests/test_engine.cpp)
 endif()
 
 # ---------------------------------------------------------------------------
