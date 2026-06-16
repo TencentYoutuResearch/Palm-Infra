@@ -136,20 +136,21 @@ class GraphBuilder:
     def matmul(self, a: int, b: int, trans_b: bool = False) -> int:
         sa = self._nodes[a].out_shape
         sb = self._nodes[b].out_shape
-        # A: [K, M], B: [K, N] (row-major)
+        # A: [K, M], B: weight matrix (either [K, N] or [N, K])
         # out: [N, M]
         K = sa[0]
         M = sa[1]
         if trans_b:
-            N = sb[1]  # B is [N, K] → transpose → [K, N]
+            N = sb[1]  # B is [N, K] -> transpose -> [K, N]
             assert sb[0] == K, f"matmul K mismatch: {sa} vs {sb}"
         else:
-            N = sb[0]  # B is [N, K], K=sa[0]
-            assert sb[1] == K or sb[0] == K, f"matmul K mismatch: {sa} vs {sb}"
-            if sb[1] == K:
-                N = sb[0]
+            # Detect N by comparing sb dimensions with K
+            if sb[0] == K:
+                N = sb[1]  # sb[0]=K (inner), sb[1]=N (output)
+            elif sb[1] == K:
+                N = sb[0]  # sb[1]=K (inner), sb[0]=N (output)
             else:
-                N = sb[1]
+                raise AssertionError(f"matmul K mismatch: {sa} vs {sb}")
         return self._add(OpType.MATMUL, [a, b], (N, M), prec=self._nodes[a].out_prec)
 
     # ---- normalisation ----

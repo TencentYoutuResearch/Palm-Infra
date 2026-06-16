@@ -168,35 +168,47 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
 }
 
 int LLMEngine::run_lmhead(const Tensor& hidden) {
-    fprintf(stderr, "run_lmhead: hidden.shape=%lld,%lld,%lld,%lld data=%p\n",
-            hidden.shape[0], hidden.shape[1], hidden.shape[2], hidden.shape[3], hidden.data);
-    if (!hidden.data) { fprintf(stderr, "run_lmhead: hidden.data is null!\n"); return 0; }
-
     if (embed_weight_ && embed_weight_->data) {
         int vocab_size = (int)embed_weight_->shape[0];
         int hidden_dim = (int)hidden.shape[0];
         int seq_len = (int)hidden.shape[1];
 
         const float* last_row = hidden.ptr<float>() + (seq_len - 1) * hidden_dim;
-        fprintf(stderr, "  last_row[0..3] = %f %f %f %f\n", last_row[0], last_row[1], last_row[2], last_row[3]);
 
         const float* w = embed_weight_->ptr<float>();
-        fprintf(stderr, "  embed_w[0..3] = %f %f %f %f\n", w[0], w[1], w[2], w[3]);
 
-        int best = 0;
-        float best_score = -1e38f;
-        for (int v = 0; v < std::min(vocab_size, 100); v++) {
+        // Find top 5
+        struct Candidate { int id; float score; };
+        Candidate top5[5] = {{0,-1e38f},{0,-1e38f},{0,-1e38f},{0,-1e38f},{0,-1e38f}};
+
+        for (int v = 0; v < vocab_size; v++) {
             float score = 0;
             for (int d = 0; d < hidden_dim; d++) {
                 score += last_row[d] * w[v * hidden_dim + d];
             }
-            if (v < 5) fprintf(stderr, "  token %d score=%f\n", v, score);
-            if (score > best_score) { best_score = score; best = v; }
+            // Insert into top 5
+            for (int i = 0; i < 5; i++) {
+                if (score > top5[i].score) {
+                    for (int j = 4; j > i; j--) top5[j] = top5[j-1];
+                    top5[i] = {v, score};
+                    break;
+                }
+            }
         }
-        fprintf(stderr, "  best=%d score=%f\n", best, best_score);
-        return best;
+
+        fprintf(stderr, "  C++ logits top 5:\n");
+        for (int i = 0; i < 5; i++) {
+            fprintf(stderr, "    token %d: %.4f\n", top5[i].id, top5[i].score);
+        }
+        fprintf(stderr, "  HF  logits top 5:\n");
+        fprintf(stderr, "    token 605: 22.4264\n");
+        fprintf(stderr, "    token 371: 22.0673\n");
+        fprintf(stderr, "    token 7171: 21.2848\n");
+        fprintf(stderr, "    token 4753: 20.9726\n");
+        fprintf(stderr, "    token 323: 20.9146\n");
+
+        return top5[0].id;
     }
-    fprintf(stderr, "run_lmhead: embed_weight not available\n");
     return 0;
 }
 

@@ -128,7 +128,15 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C) {
     // shapes: A[M,K] * B[K,N] → C[M,N]
     int M = (int)A.shape[1];  // rows of A
     int K = (int)A.shape[0];  // inner dim
-    int N = (int)B.shape[1];  // output cols (shape[1] = output_features)
+    // Detect N from B: the dimension that is NOT K
+    int N;
+    if ((int)B.shape[0] == K) {
+        N = (int)B.shape[1];  // B.shape[0] is K, B.shape[1] is N
+    } else if ((int)B.shape[1] == K) {
+        N = (int)B.shape[0];  // B.shape[1] is K, B.shape[0] is N
+    } else {
+        N = (int)B.shape[0];  // fallback
+    }
 
     static int call_count = 0;
     if (call_count < 3) {
@@ -158,8 +166,9 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C) {
     int ldc = (int)(C.stride[1] / sizeof(float));
 
     static int dbg = 0;
-    if (dbg < 6) {
-        fprintf(stderr, "  matmul_fp32[%d]: M=%d N=%d K=%d lda=%d ldb=%d ldc=%d\n", dbg, M, N, K, lda, ldb, ldc);
+    if (dbg < 8) {
+        fprintf(stderr, "  matmul_fp32[%d]: M=%d N=%d K=%d lda=%d ldb=%d ldc=%d C.shape=[%lld,%lld] nbytes=%zu\n",
+                dbg, M, N, K, lda, ldb, ldc, C.shape[0], C.shape[1], C.nbytes());
         dbg++;
     }
 
