@@ -83,6 +83,9 @@ def convert_mla(model_dir: str, output_prefix: str, num_layers: int = 32):
         _write_weight_file(str(wpath), data)
 
     for wname, wdata in weights.items():
+        # Skip norm weights — they'll be saved by _get_weight with FP32 conversion
+        if 'layernorm' in wname.lower() or 'norm' in wname.lower():
+            continue
         save_weight(wname.replace('.', '_'), wdata)
 
     # ---- graph inputs ----
@@ -210,9 +213,11 @@ def _get_weight(g: GraphBuilder, weights: dict, key: str,
                 save_name: str, is_norm: bool = False) -> int:
     """Load weight from safetensors dict, save as .weights file, return node id."""
     data = weights[key]
+    # Convert BF16/FP16 to FP32 for norm weights
+    if is_norm and data.dtype != np.float32:
+        data = data.astype(np.float32)
     prec = Precision.FP32 if is_norm else Precision.FP16
-    shape = tuple(data.shape)  # (out_features, in_features)
-    # Save
+    shape = tuple(data.shape)
     weight_prefix = Path(save_name).name
     weights_dir = Path('.')
     wpath = weights_dir / f"{weight_prefix}.weights"

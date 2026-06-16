@@ -34,6 +34,7 @@ bool LLMEngine::load(const EngineConfig& cfg) {
             if (mf.open(wpath.c_str())) {
                 // set tensor data from mmap'd weight
                 auto& t = graph_.runtime.tensors[node.id];
+                // Always trust the graph node's precision, not the file header
                 t.prec = node.out_prec;
                 t.shape[0] = node.out_shape[0];
                 t.shape[1] = node.out_shape[1];

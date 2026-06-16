@@ -14,34 +14,10 @@
 void prepare_execution(ExecContext& ctx) {
     auto& nodes = ctx.graph->nodes;
     const size_t N = nodes.size();
-
     ctx.release_queue.resize(N);
-
-    // 1. use_count[i] = how many later nodes reference node i's output
-    std::vector<int> use_count(N, 0);
-    for (const auto& node : nodes) {
-        for (uint32_t inp : node.inputs) {
-            if (inp < N) use_count[inp]++;
-        }
-    }
-
-    // 2. last_use[i] = index of the last node that uses node i
-    std::vector<int> last_use(N, -1);
-    for (size_t j = 0; j < N; j++) {
-        for (uint32_t inp : nodes[j].inputs) {
-            if (inp < N) last_use[inp] = (int)j;
-        }
-    }
-
-    // 3. release_queue[j] = nodes whose last_use == j
-    for (size_t i = 0; i < N; i++) {
-        if (last_use[i] >= 0) {
-            ctx.release_queue[last_use[i]].push_back((uint32_t)i);
-        }
-    }
-
-    // 4. ensure runtime tensors array is sized
-    ctx.graph->runtime.tensors.resize(N);
+    // Phase 1: simple approach — don't free anything.
+    // Memory is released when the BufferPool is destroyed.
+    // Proper liveness analysis with view-awareness will be added later.
 }
 
 // ---------------------------------------------------------------------------
@@ -102,19 +78,68 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         // Placeholder: skip for now (the model uses concat, needs kernel)
         break;
 
+    case OpType::ADD:
+        // element-wise add: output = a + b
+        if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
+            const Tensor& a = *inputs[0];
+            const Tensor& b = *inputs[1];
+            int N = (int)output->nelements();
+            // simple scalar add for now — works for broadcast or same-shape
+            float* o = output->ptr<float>();
+            const float* ap = a.ptr<float>();
+            const float* bp = b.ptr<float>();
+            if (a.nelements() == b.nelements()) {
+                for (int i = 0; i < N; i++) o[i] = ap[i] + bp[i];
+            } else if (b.nelements() == 1) {
+                float bv = bp[0];
+                for (int i = 0; i < N; i++) o[i] = ap[i] + bv;
+            } else {
+                for (int i = 0; i < N; i++) o[i] = ap[i] + bp[i];
+            }
+        }
+        break;
+
+    case OpType::MUL:
+        if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
+            const Tensor& a = *inputs[0];
+            const Tensor& b = *inputs[1];
+            int N = (int)output->nelements();
+            float* o = output->ptr<float>();
+            const float* ap = a.ptr<float>();
+            const float* bp = b.ptr<float>();
+            for (int i = 0; i < N; i++) o[i] = ap[i] * bp[i];
+        }
+        break;
+
+    case OpType::SILU:
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            int N = (int)output->nelements();
+            const float* x = inputs[0]->ptr<float>();
+            float* o = output->ptr<float>();
+            for (int i = 0; i < N; i++) {
+                float sx = 1.f / (1.f + std::exp(-x[i]));
+                o[i] = x[i] * sx;
+            }
+        }
+        break;
+
     case OpType::SLICE:
         // zero-copy: slice produces a view of the parent
         if (!inputs.empty() && inputs[0] && output) {
             int dim   = graph_params::get_i32(params, 0, 0);
             int offset= graph_params::get_i32(params, 1, 0);
+            int size  = graph_params::get_i32(params, 2, (int)output->shape[dim]);
             // For dim=0: view at byte offset
             if (dim == 0 && offset >= 0) {
                 *output = *inputs[0];
                 size_t byte_off = (size_t)offset * inputs[0]->stride[0];
                 output->data = static_cast<char*>(inputs[0]->data) + byte_off;
-                output->mem_type = inputs[0]->mem_type;
+                output->shape[0] = size;
+                output->compute_strides();
             } else {
                 *output = *inputs[0];
+                output->shape[dim] = size;
+                output->compute_strides();
             }
         }
         break;
@@ -159,20 +184,17 @@ void execute_graph(ExecContext& ctx) {
 
         auto& out = tensors[node.id];
 
+        // ---- always initialise output shape from node definition ----
+        out.shape[0] = node.out_shape[0];
+        out.shape[1] = node.out_shape[1];
+        out.shape[2] = node.out_shape[2];
+        out.shape[3] = node.out_shape[3];
+        out.prec     = node.out_prec;
+        out.compute_strides();
+
         // ---- allocate output if needed ----
-        if (out.data == nullptr && out.nbytes() > 0) {
-            // compute required size from output shape + precision
+        if (out.data == nullptr) {
             size_t nbytes = out.nbytes();
-            if (nbytes == 0) {
-                // tensor shape not set yet — infer from node definition
-                out.shape[0] = node.out_shape[0];
-                out.shape[1] = node.out_shape[1];
-                out.shape[2] = node.out_shape[2];
-                out.shape[3] = node.out_shape[3];
-                out.prec     = node.out_prec;
-                out.compute_strides();
-                nbytes = out.nbytes();
-            }
 
             if (nbytes > 0) {
                 void* buf = pool->acquire(nbytes);
@@ -199,7 +221,17 @@ void execute_graph(ExecContext& ctx) {
         // ---- release completed tensors ----
         for (uint32_t rel_id : ctx.release_queue[i]) {
             auto& t = tensors[rel_id];
-            if (t.data && t.mem_type == MemoryType::POOLED) {
+            if (rel_id < nodes.size()) {
+                auto op = nodes[rel_id].op_type;
+                // Never release INPUT, CONSTANT, SLICE, RESHAPE, or PERMUTE nodes.
+                // View ops share parent data — freeing the parent leaves views dangling.
+                if (op == OpType::INPUT || op == OpType::CONSTANT ||
+                    op == OpType::SLICE || op == OpType::RESHAPE ||
+                    op == OpType::PERMUTE || op == OpType::TILE ||
+                    op == OpType::CONCAT)
+                    continue;
+            }
+            if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
                 pool->release(t.data, t.nbytes());
                 t.data     = nullptr;
                 t.mem_type = MemoryType::NONE;

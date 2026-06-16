@@ -102,6 +102,13 @@ void kernel_rms_norm(const Tensor& x, const Tensor& weight,
     int D = (int)x.shape[0];  // feature dimension
     int N = (int)x.shape[1];  // number of rows
 
+    // Safety check
+    if ((int)weight.shape[0] < D) {
+        fprintf(stderr, "RMSNorm: weight too small! weight.dim0=%lld, x.dim0=%d\n",
+                weight.shape[0], D);
+        return;
+    }
+
     int ldx = (int)(x.stride[1] / sizeof(float));
     int ldo = (int)(out.stride[1] / sizeof(float));
 

@@ -89,7 +89,8 @@ void BufferPool::release(void* ptr, size_t bytes) {
 void BufferPool::clear() {
     for (auto& [size, list] : free_) {
         for (void* ptr : list) {
-            aligned_free(ptr);
+            // Safety: check pointer is not null
+            if (ptr) aligned_free(ptr);
         }
     }
     free_.clear();
