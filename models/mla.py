@@ -158,10 +158,15 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     pfx = f'model.layers.{layer_idx}.self_attn'
     weight_prefix = Path(f'{pfx}').name  # simplified
 
+    # ---- Input RMSNorm (applied before Q and KV projections) ----
+    ln_key = f'model.layers.{layer_idx}.input_layernorm.weight'
+    w_ln = _get_weight(g, weights, ln_key, f'layer{layer_idx}_input_ln', is_norm=True)
+    x_normed = g.rms_norm(x, w_ln, eps=eps)
+
     # ---- Q path ----
     # q_a_proj: hidden → q_lora_rank
     w_q_a = _get_weight(g, weights, f'{pfx}.q_a_proj.weight', f'layer{layer_idx}_q_a')
-    q_comp = g.matmul(x, w_q_a)
+    q_comp = g.matmul(x_normed, w_q_a)
     # q_a_layernorm
     w_q_a_norm = _get_weight(g, weights, f'{pfx}.q_a_layernorm.weight', f'layer{layer_idx}_q_a_norm', is_norm=True)
     q_comp = g.rms_norm(q_comp, w_q_a_norm, eps=eps)
@@ -178,7 +183,7 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     # ---- KV path ----
     # kv_a_proj: hidden → kv_lora_rank + qk_rope_dim
     w_kv_a = _get_weight(g, weights, f'{pfx}.kv_a_proj_with_mqa.weight', f'layer{layer_idx}_kv_a')
-    kv = g.matmul(x, w_kv_a)
+    kv = g.matmul(x_normed, w_kv_a)
     kv_compressed, k_rope_raw = g.slice(kv, [kv_lora_rank, qk_rope_dim], dim=0)
 
     # kv_b_proj: kv_lora_rank → num_heads * (qk_nope_dim + v_head_dim)
@@ -217,9 +222,23 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     out = g.matmul(attn_out, w_o)
     x = g.add(x, out)
 
-    # ---- MLP (simplified: just gate + up + down) ----
-    # For full MLA, this would be the SwiGLU MLP
-    # Skipping MLP for now — focus on attention
+    # ---- MLP (SwiGLU) ----
+    # post_attention_layernorm -> gate_proj + up_proj -> SiLU(gate) * up -> down_proj
+    mlp_pfx = f'model.layers.{layer_idx}.mlp'
+    ln2_key = f'model.layers.{layer_idx}.post_attention_layernorm.weight'
+    w_ln2 = _get_weight(g, weights, ln2_key, f'layer{layer_idx}_post_ln', is_norm=True)
+    x_normed2 = g.rms_norm(x, w_ln2, eps=eps)
+
+    w_gate = _get_weight(g, weights, f'{mlp_pfx}.gate_proj.weight', f'layer{layer_idx}_gate')
+    w_up   = _get_weight(g, weights, f'{mlp_pfx}.up_proj.weight',   f'layer{layer_idx}_up')
+    w_down = _get_weight(g, weights, f'{mlp_pfx}.down_proj.weight', f'layer{layer_idx}_down')
+
+    gate = g.matmul(x_normed2, w_gate)
+    up   = g.matmul(x_normed2, w_up)
+    gate = g.silu(gate)
+    mlp_hidden = g.mul(gate, up)
+    mlp_out = g.matmul(mlp_hidden, w_down)
+    x = g.add(x, mlp_out)
 
     return x, ck_out, cv_out
 
@@ -228,10 +247,10 @@ def _get_weight(g: GraphBuilder, weights: dict, key: str,
                 save_name: str, is_norm: bool = False) -> int:
     """Load weight from safetensors dict, save as .weights file, return node id."""
     data = weights[key]
-    # Convert BF16/FP16 to FP32 for norm weights
-    if is_norm and data.dtype != np.float32:
+    # Convert BF16/FP16 to FP32 for ALL weights (engine always uses FP32)
+    if data.dtype != np.float32:
         data = data.astype(np.float32)
-    prec = Precision.FP32 if is_norm else Precision.FP16
+    prec = Precision.FP32
     shape = tuple(data.shape)
     weight_prefix = Path(save_name).name
     weights_dir = Path('.')

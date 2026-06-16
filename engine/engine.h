@@ -43,7 +43,8 @@ public:
 
     const EngineConfig& config() const { return cfg_; }
     int past_len() const { return past_len_; }
-    Tensor* embed_weight() { return embed_weight_; }  // for debugging
+    Tensor* embed_weight() { return embed_weight_; }
+    const Graph& graph() const { return graph_; }
 
     // exposed for testing
     Tensor build_causal_mask(int seq_len, int past_len);

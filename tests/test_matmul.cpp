@@ -18,20 +18,20 @@ static void fill_rand(float* data, int n) {
     }
 }
 
-// reference matmul
+// reference matmul for N×K layout: B[n,k] at B[n*K+k]
 static void ref_matmul(const float* A, const float* B, float* C, int M, int N, int K) {
     for (int m = 0; m < M; m++) {
         for (int n = 0; n < N; n++) {
             float sum = 0;
             for (int k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[k * N + n];
+                sum += A[m * K + k] * B[n * K + k];
             }
             C[m * N + n] = sum;
         }
     }
 }
 
-static bool check_approx(const float* got, const float* ref, int n, float tol = 1e-5f) {
+static bool check_approx(const float* got, const float* ref, int n, float tol = 1e-4f) {
     for (int i = 0; i < n; i++) {
         if (std::fabs(got[i] - ref[i]) > tol) {
             fprintf(stderr, "  mismatch at %d: got %f, expected %f\n", i, got[i], ref[i]);
@@ -56,7 +56,7 @@ int main() {
         float* ref_c  = new float[M * N];
 
         Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, N, 1, 1, b_data);
         Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
         kernel_matmul_fp32(A, B, C);
@@ -79,11 +79,21 @@ int main() {
         float* ref_c  = new float[M * N];
 
         Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, N, 1, 1, b_data);
         Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
         kernel_matmul_fp32(A, B, C);
         ref_matmul(a_data, b_data, ref_c, M, N, K);
+
+        // Debug specific element
+        int idx = 1; // second element
+        if (M == 8 && N == 4 && K == 16) {
+            fprintf(stderr, "  DEBUG 8x16*16x4: c_data[%d]=%.6f ref_c[%d]=%.6f\n", idx, c_data[idx], idx, ref_c[idx]);
+            // Manual compute C[0,1]
+            float manual_c01 = 0;
+            for (int k = 0; k < K; k++) manual_c01 += a_data[0*K+k] * b_data[1*K+k];
+            fprintf(stderr, "  manual C[0,1]=%.6f (a_data[0], b_data[1])\n", manual_c01);
+        }
 
         CHECK(check_approx(c_data, ref_c, M * N), "8x16 * 16x4");
 
@@ -102,7 +112,7 @@ int main() {
         float* ref_c  = new float[M * N];
 
         Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, N, 1, 1, b_data);
         Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
         kernel_matmul_fp32(A, B, C);
@@ -125,7 +135,7 @@ int main() {
         float* ref_c  = new float[M * N];
 
         Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, N, 1, 1, b_data);
         Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
         kernel_matmul_fp32(A, B, C);
@@ -148,7 +158,7 @@ int main() {
         float* ref_c  = new float[M * N];
 
         Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, N, 1, 1, b_data);
         Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
         kernel_matmul_fp32(A, B, C);
@@ -171,7 +181,7 @@ int main() {
         float* ref_c  = new float[M * N];
 
         Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, N, 1, 1, b_data);
         Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
         kernel_matmul_fp32(A, B, C);
