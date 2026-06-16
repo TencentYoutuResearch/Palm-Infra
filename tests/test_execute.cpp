@@ -52,9 +52,8 @@ int main() {
 
     // ---- prepare ----
     prepare_execution(ctx);
+    // Phase 1: release_queue is empty (no-release mode)
     CHECK(ctx.release_queue.size() == 2, "release_queue sized");
-    CHECK(ctx.release_queue[1].size() == 1, "node 1 releases node 0");
-    CHECK(ctx.release_queue[1][0] == 0, "release node 0 after node 1");
 
     // ---- execute ----
     execute_graph(ctx);

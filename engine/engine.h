@@ -72,4 +72,7 @@ private:
     /// Feed inputs, run graph, extract output.
     Tensor run_decoder(const Tensor& hidden, const Tensor& mask,
                        const Tensor& cos, const Tensor& sin);
+
+    // weight tensors
+    Tensor* embed_weight_ = nullptr;  // [vocab_size, hidden_dim]
 };

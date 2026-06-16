@@ -78,6 +78,16 @@ bool LLMEngine::load(const EngineConfig& cfg) {
         }
     }
 
+    // find embed_tokens weight
+    for (auto& node : graph_.nodes) {
+        if (node.op_type == OpType::CONSTANT && !node.params.str.empty()) {
+            const auto& path = node.params.str[0];
+            if (path.find("embed_tokens") != std::string::npos) {
+                embed_weight_ = &graph_.runtime.tensors[node.id];
+            }
+        }
+    }
+
     printf("Engine: %d layers, %zu cache pairs, %zu nodes\n",
            n_layers, caches_.size(), graph_.nodes.size());
 
@@ -118,21 +128,61 @@ void LLMEngine::reset() {
 // embed / lmhead (placeholder — real implementation depends on model format)
 // ---------------------------------------------------------------------------
 
-Tensor LLMEngine::embed(const std::vector<int>& /*token_ids*/) {
-    // Placeholder: create a dummy hidden state.
-    // Real implementation loads embed weights and does lookup.
-    // For now, return a zero tensor of shape [hidden_dim, seq_len].
+Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
     int hidden_dim = 2048;
-    int seq_len = (int)past_len_ + 1;  // will be set properly by caller
+    int seq_len = (int)token_ids.size();
+
+    if (embed_weight_ && embed_weight_->data) {
+        // embed_weight_: [vocab_size, hidden_dim] in FP32
+        int vocab_size = (int)embed_weight_->shape[0];
+        // Use OWNED memory — the pool may reuse this memory later
+        float* buf = new float[hidden_dim * seq_len];
+        Tensor t = Tensor::create(Precision::FP32, MemoryType::OWNED, hidden_dim, seq_len, 1, 1, buf);
+
+        const float* embed_data = embed_weight_->ptr<float>();
+        for (int s = 0; s < seq_len; s++) {
+            int tid = token_ids[s];
+            if (tid < 0 || tid >= vocab_size) tid = 0;
+            const float* row = embed_data + tid * hidden_dim;
+            std::memcpy(t.ptr<float>() + s * hidden_dim, row, hidden_dim * sizeof(float));
+        }
+        return t;
+    }
+
+    // fallback: zero tensor
     void* buf = graph_.runtime.pool.acquire(hidden_dim * seq_len * sizeof(float));
     Tensor t = Tensor::create(Precision::FP32, MemoryType::POOLED, hidden_dim, seq_len, 1, 1, buf);
     std::memset(t.data, 0, t.nbytes());
     return t;
 }
 
-int LLMEngine::run_lmhead(const Tensor& /*hidden*/) {
-    // Placeholder: return a dummy token.
-    // Real implementation runs lm_head projection + argmax.
+int LLMEngine::run_lmhead(const Tensor& hidden) {
+    if (embed_weight_ && embed_weight_->data) {
+        // lm_head shares embed_tokens weight: [vocab_size, hidden_dim]
+        // logits = hidden[last_row] * W^T
+        int vocab_size = (int)embed_weight_->shape[0];
+        int hidden_dim = (int)hidden.shape[0];
+        int seq_len = (int)hidden.shape[1];
+
+        // Get last row of hidden
+        const float* last_row = hidden.ptr<float>() + (seq_len - 1) * hidden_dim;
+
+        // Simple argmax over vocab
+        const float* w = embed_weight_->ptr<float>();
+        int best = 0;
+        float best_score = -1e38f;
+        for (int v = 0; v < vocab_size; v++) {
+            float score = 0;
+            for (int d = 0; d < hidden_dim; d++) {
+                score += last_row[d] * w[v * hidden_dim + d];
+            }
+            if (score > best_score) {
+                best_score = score;
+                best = v;
+            }
+        }
+        return best;
+    }
     return 0;
 }
 

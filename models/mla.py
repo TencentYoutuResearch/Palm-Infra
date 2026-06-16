@@ -86,7 +86,14 @@ def convert_mla(model_dir: str, output_prefix: str, num_layers: int = 32):
         # Skip norm weights — they'll be saved by _get_weight with FP32 conversion
         if 'layernorm' in wname.lower() or 'norm' in wname.lower():
             continue
+        # Skip embed_tokens — saved separately below
+        if 'embed_tokens' in wname:
+            continue
         save_weight(wname.replace('.', '_'), wdata)
+
+    # ---- save embed_tokens as FP32 for lookup ----
+    embed_w = weights['model.embed_tokens.weight'].astype(np.float32)
+    save_weight('embed_tokens', embed_w)
 
     # ---- graph inputs ----
     hidden = g.input('hidden', (hidden_size,))

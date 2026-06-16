@@ -83,8 +83,7 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             const Tensor& a = *inputs[0];
             const Tensor& b = *inputs[1];
-            int N = (int)output->nelements();
-            // simple scalar add for now — works for broadcast or same-shape
+            int N = (int)a.nelements();  // use input shape, not output
             float* o = output->ptr<float>();
             const float* ap = a.ptr<float>();
             const float* bp = b.ptr<float>();
@@ -102,18 +101,17 @@ static void dispatch_kernel(OpType op, const OpParams& params,
     case OpType::MUL:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             const Tensor& a = *inputs[0];
-            const Tensor& b = *inputs[1];
-            int N = (int)output->nelements();
+            int N = (int)a.nelements();  // use input shape
             float* o = output->ptr<float>();
             const float* ap = a.ptr<float>();
-            const float* bp = b.ptr<float>();
+            const float* bp = inputs[1]->ptr<float>();
             for (int i = 0; i < N; i++) o[i] = ap[i] * bp[i];
         }
         break;
 
     case OpType::SILU:
         if (inputs.size() >= 1 && inputs[0] && output) {
-            int N = (int)output->nelements();
+            int N = (int)inputs[0]->nelements();  // use input shape
             const float* x = inputs[0]->ptr<float>();
             float* o = output->ptr<float>();
             for (int i = 0; i < N; i++) {
@@ -184,12 +182,49 @@ void execute_graph(ExecContext& ctx) {
 
         auto& out = tensors[node.id];
 
-        // ---- always initialise output shape from node definition ----
+        // ---- initialise output shape from node definition ----
         out.shape[0] = node.out_shape[0];
         out.shape[1] = node.out_shape[1];
         out.shape[2] = node.out_shape[2];
         out.shape[3] = node.out_shape[3];
         out.prec     = node.out_prec;
+
+        // ---- infer dynamic shape from inputs ----
+        // The graph is built with static shapes (seq_len=1 for weight nodes).
+        // At runtime, inputs may have dynamic shapes (e.g. prefill seq_len=20).
+        // We use the input shapes to compute the actual output shape for
+        // allocation, then let the kernel use its own shape logic.
+        if (node.op_type == OpType::MATMUL && node.inputs.size() >= 2) {
+            // output is [N, M] where M = A.shape[1], N determined by B shape
+            auto& A = tensors[node.inputs[0]];
+            out.shape[1] = A.shape[1];  // dynamic M (seq_len)
+            // shape[0] stays as node.out_shape[0] (static N from weight)
+        } else if (node.op_type == OpType::RMS_NORM && !node.inputs.empty()) {
+            auto& x = tensors[node.inputs[0]];
+            out.shape[1] = x.shape[1];  // dynamic seq_len
+        } else if (node.op_type == OpType::ROTARY_EMBED && !node.inputs.empty()) {
+            auto& x = tensors[node.inputs[0]];
+            out.shape[1] = x.shape[1];
+        } else if (node.op_type == OpType::SDPA && !node.inputs.empty()) {
+            auto& Q = tensors[node.inputs[0]];
+            out.shape[1] = Q.shape[1];  // dynamic seq_len
+            out.shape[2] = Q.shape[2];  // dynamic num_heads (from Q)
+        }
+        // Propagate dynamic shapes through view ops
+        if ((node.op_type == OpType::RESHAPE || node.op_type == OpType::PERMUTE ||
+             node.op_type == OpType::SLICE || node.op_type == OpType::CONCAT ||
+             node.op_type == OpType::TILE || node.op_type == OpType::ADD ||
+             node.op_type == OpType::MUL || node.op_type == OpType::SILU) &&
+            !node.inputs.empty()) {
+            // View/elementwise ops: infer dynamic dimensions from the first input
+            // Keep node.out_shape for static dims, use input for dynamic
+            // For now, just propagate shape[1] (seq_len) and shape[2] (heads)
+            auto& x = tensors[node.inputs[0]];
+            // Always use the input's dynamic dimension, not the static node shape
+            out.shape[1] = x.shape[1];
+            out.shape[2] = x.shape[2];
+        }
+
         out.compute_strides();
 
         // ---- allocate output if needed ----
