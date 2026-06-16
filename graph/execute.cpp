@@ -237,7 +237,7 @@ void execute_graph(ExecContext& ctx) {
             }
             auto& Qsrc = tensors[q_id];
             out.shape[1] = Qsrc.shape[1];  // dynamic seq_len from source
-            out.shape[2] = Qsrc.shape[2];  // dynamic num_heads from source
+            // Don't overwrite shape[2] — it's num_heads from the graph definition
         }
         // Propagate dynamic shapes through view ops
         // RESHAPE changes layout — keep node.out_shape as-is, but

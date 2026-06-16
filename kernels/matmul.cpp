@@ -70,9 +70,6 @@ static void matmul_fp32_neon_4x4(const float* A, const float* B, float* C,
                 {
                     // Gather: B[n][k], B[n+1][k], B[n+2][k], B[n+3][k]
                     if (n + 4 <= N) {
-                        b_vec = vld1q_f32(B + n * ldb + k);
-                        // Need to load from 4 different rows: B[n*ldb+k], B[(n+1)*ldb+k], ...
-                        // vld1q loads contiguous, so we need to gather.
                         float b_tmp[4];
                         b_tmp[0] = B[(n+0) * ldb + k];
                         b_tmp[1] = B[(n+1) * ldb + k];

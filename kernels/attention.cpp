@@ -96,6 +96,15 @@ void kernel_sdpa(const OpParams& params,
 
     float* qk_row = new float[dst_seqlen];
 
+    static int sdpa_dbg = 0;
+    if (sdpa_dbg == 0) {
+        fprintf(stderr, "  SDPA: out.shape=[%lld,%lld,%lld] nbytes=%zu stride=[%zu,%zu,%zu] v_head_dim=%d num_heads=%d\n",
+                out.shape[0], out.shape[1], out.shape[2], out.nbytes(),
+                out.stride[0], out.stride[1], out.stride[2],
+                v_head_dim, num_heads);
+        sdpa_dbg++;
+    }
+
     for (int h = 0; h < num_heads; h++) {
         int kv_h = h / heads_per_group;
 
