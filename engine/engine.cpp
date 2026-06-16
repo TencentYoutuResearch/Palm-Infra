@@ -29,9 +29,15 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 
     for (auto& node : graph_.nodes) {
         if (node.op_type == OpType::CONSTANT && !node.params.str.empty()) {
-            std::string wpath = graph_dir + node.params.str[0];
+            std::string wpath = node.params.str[0];
+            if (wpath[0] != '/' && (wpath.size() < 2 || wpath[1] != ':')) {
+                wpath = graph_dir + wpath;
+            }
             MappedFile mf;
-            if (mf.open(wpath.c_str())) {
+            bool ok = mf.open(wpath.c_str());
+            fprintf(stderr, "  weight node[%u]: path=%s → %s\n",
+                    node.id, node.params.str[0].c_str(), ok ? "OK" : "FAIL");
+            if (ok) {
                 // set tensor data from mmap'd weight
                 auto& t = graph_.runtime.tensors[node.id];
                 // Always trust the graph node's precision, not the file header
@@ -82,8 +88,11 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     for (auto& node : graph_.nodes) {
         if (node.op_type == OpType::CONSTANT && !node.params.str.empty()) {
             const auto& path = node.params.str[0];
+            fprintf(stderr, "  CONSTANT node[%u]: path='%s' data=%p\n",
+                    node.id, path.c_str(), graph_.runtime.tensors[node.id].data);
             if (path.find("embed_tokens") != std::string::npos) {
                 embed_weight_ = &graph_.runtime.tensors[node.id];
+                fprintf(stderr, "  Found embed_tokens at node %u\n", node.id);
             }
         }
     }
@@ -146,6 +155,8 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
             const float* row = embed_data + tid * hidden_dim;
             std::memcpy(t.ptr<float>() + s * hidden_dim, row, hidden_dim * sizeof(float));
         }
+        fprintf(stderr, "  C++ EMBED[0..2]: %.4f %.4f %.4f (HF: -0.1226 -0.0610 0.1074)\n",
+                t.ptr<float>()[0], t.ptr<float>()[1], t.ptr<float>()[2]);
         return t;
     }
 
@@ -157,32 +168,35 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
 }
 
 int LLMEngine::run_lmhead(const Tensor& hidden) {
+    fprintf(stderr, "run_lmhead: hidden.shape=%lld,%lld,%lld,%lld data=%p\n",
+            hidden.shape[0], hidden.shape[1], hidden.shape[2], hidden.shape[3], hidden.data);
+    if (!hidden.data) { fprintf(stderr, "run_lmhead: hidden.data is null!\n"); return 0; }
+
     if (embed_weight_ && embed_weight_->data) {
-        // lm_head shares embed_tokens weight: [vocab_size, hidden_dim]
-        // logits = hidden[last_row] * W^T
         int vocab_size = (int)embed_weight_->shape[0];
         int hidden_dim = (int)hidden.shape[0];
         int seq_len = (int)hidden.shape[1];
 
-        // Get last row of hidden
         const float* last_row = hidden.ptr<float>() + (seq_len - 1) * hidden_dim;
+        fprintf(stderr, "  last_row[0..3] = %f %f %f %f\n", last_row[0], last_row[1], last_row[2], last_row[3]);
 
-        // Simple argmax over vocab
         const float* w = embed_weight_->ptr<float>();
+        fprintf(stderr, "  embed_w[0..3] = %f %f %f %f\n", w[0], w[1], w[2], w[3]);
+
         int best = 0;
         float best_score = -1e38f;
-        for (int v = 0; v < vocab_size; v++) {
+        for (int v = 0; v < std::min(vocab_size, 100); v++) {
             float score = 0;
             for (int d = 0; d < hidden_dim; d++) {
                 score += last_row[d] * w[v * hidden_dim + d];
             }
-            if (score > best_score) {
-                best_score = score;
-                best = v;
-            }
+            if (v < 5) fprintf(stderr, "  token %d score=%f\n", v, score);
+            if (score > best_score) { best_score = score; best = v; }
         }
+        fprintf(stderr, "  best=%d score=%f\n", best, best_score);
         return best;
     }
+    fprintf(stderr, "run_lmhead: embed_weight not available\n");
     return 0;
 }
 

@@ -206,9 +206,22 @@ void execute_graph(ExecContext& ctx) {
             auto& x = tensors[node.inputs[0]];
             out.shape[1] = x.shape[1];
         } else if (node.op_type == OpType::SDPA && !node.inputs.empty()) {
-            auto& Q = tensors[node.inputs[0]];
-            out.shape[1] = Q.shape[1];  // dynamic seq_len
-            out.shape[2] = Q.shape[2];  // dynamic num_heads (from Q)
+            // Q is the first input.  But Q might be a view op (concat) whose
+            // dynamic shape hasn't been propagated yet.  Trace back through
+            // view ops to find the original source shape.
+            uint32_t q_id = node.inputs[0];
+            while (q_id < nodes.size() &&
+                   (nodes[q_id].op_type == OpType::RESHAPE ||
+                    nodes[q_id].op_type == OpType::PERMUTE ||
+                    nodes[q_id].op_type == OpType::SLICE ||
+                    nodes[q_id].op_type == OpType::CONCAT ||
+                    nodes[q_id].op_type == OpType::TILE) &&
+                   !nodes[q_id].inputs.empty()) {
+                q_id = nodes[q_id].inputs[0];
+            }
+            auto& Qsrc = tensors[q_id];
+            out.shape[1] = Qsrc.shape[1];  // dynamic seq_len from source
+            out.shape[2] = Qsrc.shape[2];  // dynamic num_heads from source
         }
         // Propagate dynamic shapes through view ops
         if ((node.op_type == OpType::RESHAPE || node.op_type == OpType::PERMUTE ||

@@ -45,6 +45,11 @@ def load_safetensors(path: str) -> dict[str, np.ndarray]:
             arr = np.frombuffer(data, dtype=np_dtype).reshape(shape)
             if dtype_str == 'F16':
                 arr = arr.astype(np.float32)
+            elif dtype_str == 'BF16':
+                # BF16 is FP32 with lower 16 bits zeroed
+                # uint16 → uint32 shift left 16 → view as float32
+                as_u32 = arr.astype(np.uint32) << 16
+                arr = as_u32.view(np.float32)
             tensors[name] = arr
     return tensors
 
@@ -94,6 +99,9 @@ def convert_mla(model_dir: str, output_prefix: str, num_layers: int = 32):
     # ---- save embed_tokens as FP32 for lookup ----
     embed_w = weights['model.embed_tokens.weight'].astype(np.float32)
     save_weight('embed_tokens', embed_w)
+    # Also create a graph node so the engine can find it
+    embed_node = g.weight(str(weights_dir / f"{weight_prefix}_embed_tokens.weights"),
+                          embed_w.shape, Precision.FP32)
 
     # ---- graph inputs ----
     hidden = g.input('hidden', (hidden_size,))
