@@ -250,6 +250,9 @@ def _get_weight(g: GraphBuilder, weights: dict, key: str,
     # Convert BF16/FP16 to FP32 for ALL weights (engine always uses FP32)
     if data.dtype != np.float32:
         data = data.astype(np.float32)
+    # Transpose to [K, N] = [in_features, out_features] for matmul convention
+    # Safetensors stores [out_features, in_features], we need [in_features, out_features]
+    data = data.T.copy()
     prec = Precision.FP32
     shape = tuple(data.shape)
     weight_prefix = Path(save_name).name
