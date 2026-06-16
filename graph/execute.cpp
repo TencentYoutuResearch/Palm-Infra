@@ -34,13 +34,29 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         break;
 
     case OpType::RESHAPE:
-        // zero-copy: adjust shape + stride
+        // zero-copy: adjust shape, resolve -1 dim dynamically
         if (!inputs.empty() && inputs[0] && output) {
             *output = *inputs[0];
-            output->shape[0] = params.i32.size() >= 4 ? (int64_t)params.i32[0] : output->shape[0];
-            output->shape[1] = params.i32.size() >= 4 ? (int64_t)params.i32[1] : 1;
-            output->shape[2] = params.i32.size() >= 4 ? (int64_t)params.i32[2] : 1;
-            output->shape[3] = params.i32.size() >= 4 ? (int64_t)params.i32[3] : 1;
+            int64_t new_shape[4] = {1,1,1,1};
+            for (int i = 0; i < 4 && i < (int)params.i32.size(); i++) {
+                new_shape[i] = params.i32[i];
+            }
+            // Resolve -1 dimension from actual input element count
+            int64_t total = inputs[0]->nelements();
+            int neg_idx = -1;
+            int64_t known = 1;
+            for (int i = 0; i < 4; i++) {
+                if (new_shape[i] == -1) { neg_idx = i; }
+                else { known *= new_shape[i]; }
+            }
+            if (neg_idx >= 0 && known > 0) {
+                new_shape[neg_idx] = total / known;
+            }
+            output->shape[0] = new_shape[0];
+            output->shape[1] = new_shape[1];
+            output->shape[2] = new_shape[2];
+            output->shape[3] = new_shape[3];
+            output->compute_strides();
         }
         break;
 
@@ -224,18 +240,46 @@ void execute_graph(ExecContext& ctx) {
             out.shape[2] = Qsrc.shape[2];  // dynamic num_heads from source
         }
         // Propagate dynamic shapes through view ops
-        if ((node.op_type == OpType::RESHAPE || node.op_type == OpType::PERMUTE ||
-             node.op_type == OpType::SLICE || node.op_type == OpType::CONCAT ||
-             node.op_type == OpType::TILE || node.op_type == OpType::ADD ||
-             node.op_type == OpType::MUL || node.op_type == OpType::SILU) &&
-            !node.inputs.empty()) {
-            // View/elementwise ops: infer dynamic dimensions from the first input
-            // Keep node.out_shape for static dims, use input for dynamic
-            // For now, just propagate shape[1] (seq_len) and shape[2] (heads)
+        // RESHAPE changes layout — keep node.out_shape as-is, but
+        // preserve total element count from input for dynamic seq_len.
+        // PERMUTE/SLICE/CONCAT/TILE: copy shape from input (layout preserved).
+        // ADD/MUL/SILU: elementwise — same shape as input.
+        if (!node.inputs.empty()) {
             auto& x = tensors[node.inputs[0]];
-            // Always use the input's dynamic dimension, not the static node shape
-            out.shape[1] = x.shape[1];
-            out.shape[2] = x.shape[2];
+            if (node.op_type == OpType::RESHAPE) {
+                // RESHAPE: use node.out_shape (computed by converter).
+                // The converter already computed the correct static shape.
+                // For dynamic seq_len: if node.out_shape has a -1 inferred dim,
+                // we compute it from total elements.
+                int64_t node_elems = node.out_shape[0] * node.out_shape[1] *
+                                     node.out_shape[2] * node.out_shape[3];
+                int64_t input_elems = x.shape[0] * x.shape[1] *
+                                      x.shape[2] * x.shape[3];
+                // If node.out_shape was computed with seq_len=1 but runtime
+                // has seq_len=N, the total elements differ.  Resolve the -1 dim.
+                if (node_elems > 0 && input_elems > 0 && node_elems != input_elems) {
+                    // Find which dim differs and scale it
+                    if (node.out_shape[1] == 1 && x.shape[1] > 1) {
+                        out.shape[1] = x.shape[1];
+                    }
+                }
+                // Otherwise keep node.out_shape as-is (no dynamic dim)
+            } else if (node.op_type == OpType::PERMUTE ||
+                       node.op_type == OpType::SLICE ||
+                       node.op_type == OpType::CONCAT ||
+                       node.op_type == OpType::TILE) {
+                // These ops preserve or redistribute the input shape.
+                // Use node.out_shape for the static layout, but keep
+                // input shape for dynamic dimensions.
+                out.shape[1] = x.shape[1];
+                out.shape[2] = x.shape[2];
+            } else if (node.op_type == OpType::ADD ||
+                       node.op_type == OpType::MUL ||
+                       node.op_type == OpType::SILU) {
+                // Elementwise: same shape as input
+                out.shape[1] = x.shape[1];
+                out.shape[2] = x.shape[2];
+            }
         }
 
         out.compute_strides();
