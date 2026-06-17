@@ -1,4 +1,5 @@
 #include "engine/engine.h"
+#include "kernels/matmul.h"
 
 #include <algorithm>
 #include <cmath>
@@ -294,40 +295,48 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
 // ---------------------------------------------------------------------------
 
 int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
-    if (embed_weight_ && embed_weight_->data) {
-        // embed_weight_ shape: [vocab_size, hidden_dim] with special stride
-        int vocab_size = (int)embed_weight_->shape[0];
-        int hidden_dim = (int)embed_weight_->shape[1];
-        int weight_stride = (int)(embed_weight_->stride[1] / sizeof(float));  // = hidden_dim
-        int seq_len = (int)hidden.shape[1];
+    if (!embed_weight_ || !embed_weight_->data) return 0;
 
-        // Read the last real token, not necessarily the last position
-        // (which may be padded when graph seq_len > n_tokens).
-        int last_pos = (n_tokens > 0 && n_tokens <= seq_len) ? n_tokens - 1 : seq_len - 1;
+    int vocab_size = (int)embed_weight_->shape[0];
+    int hidden_dim = (int)embed_weight_->shape[1];
+    int seq_len = (int)hidden.shape[1];
 
-        const float* last_row = hidden.ptr<float>() + last_pos * hidden_dim;
-        const float* w = embed_weight_->ptr<float>();
+    // Read the last real token, not necessarily the last position
+    // (which may be padded when graph seq_len > n_tokens).
+    int last_pos = (n_tokens > 0 && n_tokens <= seq_len) ? n_tokens - 1 : seq_len - 1;
 
-        struct Candidate { int id; float score; };
-        Candidate top5[5] = {{0,-1e38f},{0,-1e38f},{0,-1e38f},{0,-1e38f},{0,-1e38f}};
+    // hidden is [hidden_dim, seq_len], we want [hidden_dim, 1] for matmul
+    // embed_weight is [vocab_size, hidden_dim] — we use it as weight B
+    // output will be [vocab_size, 1] — we take argmax
 
-        for (int v = 0; v < vocab_size; v++) {
-            float score = 0;
-            for (int d = 0; d < hidden_dim; d++) {
-                score += last_row[d] * w[d + v * weight_stride];
-            }
-            for (int i = 0; i < 5; i++) {
-                if (score > top5[i].score) {
-                    for (int j = 4; j > i; j--) top5[j] = top5[j-1];
-                    top5[i] = {v, score};
-                    break;
-                }
+    // Create a view of the last hidden row as A: [hidden_dim, 1]
+    Tensor A = hidden;
+    A.shape[1] = 1;
+    A.data = static_cast<char*>(hidden.data) + last_pos * hidden_dim * sizeof(float);
+    A.compute_strides();
+
+    // Output: [vocab_size, 1]
+    void* c_buf = graph_prefill_.runtime.pool.acquire(vocab_size * sizeof(float));
+    Tensor C = Tensor::create(Precision::FP32, MemoryType::POOLED, vocab_size, 1, 1, 1, c_buf);
+
+    kernel_matmul_fp32(A, *embed_weight_, C, exec_ctx_decode_.thread_pool);
+
+    const float* scores = C.ptr<float>();
+    struct Candidate { int id; float score; };
+    Candidate top5[5] = {{0,-1e38f},{0,-1e38f},{0,-1e38f},{0,-1e38f},{0,-1e38f}};
+
+    for (int v = 0; v < vocab_size; v++) {
+        float score = scores[v];
+        for (int i = 0; i < 5; i++) {
+            if (score > top5[i].score) {
+                for (int j = 4; j > i; j--) top5[j] = top5[j-1];
+                top5[i] = {v, score};
+                break;
             }
         }
-
-        return top5[0].id;
     }
-    return 0;
+
+    return top5[0].id;
 }
 
 // ---------------------------------------------------------------------------
