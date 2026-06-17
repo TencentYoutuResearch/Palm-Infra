@@ -5,37 +5,84 @@
 #include "kernels/tensor.h"
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// PROJECT_NAME — LLM inference engine
+// mlllm — LLM inference engine
 //
-// Three-phase: load → prefill(ids) → decode(id) × N
-// KV cache is managed as persistent preallocated tensors with view height.
+// Multi-graph: prefill graph (seq_len=N) + decode graph (seq_len=1).
+// KV cache with embedded metadata header.
+// Weights shared between graphs via path-dedup mapping.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// CacheMetadata — embedded in KV cache buffer header (64 bytes)
+//
+// Layout of a cache buffer:
+//   [0..63]       CacheMetadata
+//   [64..]        key/value data (FP32)
+// ---------------------------------------------------------------------------
+
+struct CacheMetadata {
+    uint64_t current_seq_len = 0;   // valid sequence length (past_len)
+    uint64_t max_seq_len     = 0;   // buffer capacity (n_ctx)
+    uint64_t num_kv_heads    = 0;
+    uint64_t head_dim        = 0;
+    uint64_t v_head_dim      = 0;
+    uint64_t reserved[3]     = {0, 0, 0};
+
+    static constexpr size_t SIZE = 64;
+};
+
+static_assert(sizeof(CacheMetadata) == CacheMetadata::SIZE, "CacheMetadata must be 64 bytes");
+
+// Helper: get metadata pointer from cache tensor data
+inline CacheMetadata* cache_meta(void* data) {
+    return static_cast<CacheMetadata*>(data);
+}
+
+inline const CacheMetadata* cache_meta(const void* data) {
+    return static_cast<const CacheMetadata*>(data);
+}
+
+// Helper: get key/value data pointer (after metadata header)
+inline void* cache_data(void* data) {
+    return static_cast<char*>(data) + CacheMetadata::SIZE;
+}
+
+inline const void* cache_data(const void* data) {
+    return static_cast<const char*>(data) + CacheMetadata::SIZE;
+}
+
+// ---------------------------------------------------------------------------
+// EngineConfig
 // ---------------------------------------------------------------------------
 
 struct EngineConfig {
-    std::string graph_path;      // .graph file
-    int n_ctx = 4096;            // max sequence length
+    std::string prefill_graph_path;   // .graph file for prefill
+    std::string decode_graph_path;    // .graph file for decode
+    int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;
     int num_threads = 4;
-    std::string decoder_out_blob = "out";  // name of output node in graph
 };
+
+// ---------------------------------------------------------------------------
+// LLMEngine
+// ---------------------------------------------------------------------------
 
 class LLMEngine {
 public:
     ~LLMEngine();
 
-    /// Load the graph from file and initialise runtime state.
+    /// Load prefill and decode graphs, initialise shared weights and KV caches.
     bool load(const EngineConfig& cfg);
 
     /// Process a full sequence of tokens (prefill).
-    /// Returns the next token ID.
     int prefill(const std::vector<int>& token_ids);
 
     /// Process a single token (decode step).
-    /// Returns the next token ID.
     int decode(int token_id);
 
     /// Reset KV cache and past length.
@@ -44,7 +91,6 @@ public:
     const EngineConfig& config() const { return cfg_; }
     int past_len() const { return past_len_; }
     Tensor* embed_weight() { return embed_weight_; }
-    const Graph& graph() const { return graph_; }
 
     // exposed for testing
     Tensor build_causal_mask(int seq_len, int past_len);
@@ -52,28 +98,44 @@ public:
                              Tensor& cos, Tensor& sin);
 
 private:
-private:
     EngineConfig cfg_;
-    Graph        graph_;
-    ExecContext  exec_ctx_;
-    int          past_len_ = 0;
+    Graph graph_prefill_;
+    Graph graph_decode_;
+    ExecContext exec_ctx_prefill_;
+    ExecContext exec_ctx_decode_;
+    int past_len_ = 0;
+
+    // Shared mmap'd weight files (path → MappedFile)
+    std::unordered_map<std::string, size_t> weight_map_;  // path → index into shared_weights_
+    std::vector<MappedFile> shared_weights_;
 
     // KV cache tensor pointers (per layer)
     struct CachePair {
         Tensor* k = nullptr;
         Tensor* v = nullptr;
+        int k_head_dim = 0;      // head_dim for K cache (constant)
+        int k_num_heads = 0;     // num_kv_heads for K cache (constant)
+        int v_head_dim = 0;      // head_dim for V cache (constant)
+        int v_num_heads = 0;     // num_kv_heads for V cache (constant)
     };
     std::vector<CachePair> caches_;
 
-    /// Embed tokens (placeholder — returns dummy data).
+    /// Embed tokens.
     Tensor embed(const std::vector<int>& token_ids);
 
-    /// Run lm_head on the last hidden state (placeholder).
-    int run_lmhead(const Tensor& hidden);
+    /// Run lm_head on the last hidden state.
+    int run_lmhead(const Tensor& hidden, int n_tokens = 1);
 
     /// Feed inputs, run graph, extract output.
-    Tensor run_decoder(const Tensor& hidden, const Tensor& mask,
-                       const Tensor& cos, const Tensor& sin);
+    Tensor run_graph(Graph& graph, ExecContext& exec_ctx,
+                     const Tensor& hidden, const Tensor& mask,
+                     const Tensor& cos, const Tensor& sin);
+
+    /// Load a single graph and set up its CONSTANT nodes from shared weights.
+    bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path);
+
+    /// Allocate KV cache buffers with metadata header.
+    void allocate_caches(Graph& g, int n_ctx);
 
     // weight tensors
     Tensor* embed_weight_ = nullptr;  // [vocab_size, hidden_dim]

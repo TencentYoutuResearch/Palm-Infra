@@ -1,5 +1,6 @@
 #include "kernels/attention.h"
 #include "kernels/matmul.h"
+#include "engine/engine.h"  // for CacheMetadata, cache_meta, cache_data
 
 #include <algorithm>
 #include <cmath>
@@ -66,44 +67,103 @@ void kernel_sdpa(const OpParams& params,
     int cur_seqlen = (int)K_cur.shape[1];
     int past_seqlen = 0;
     int key_capacity = 0, value_capacity = 0;
+    static int sdpa_dbg_prefill = 0;
+    bool dump_prefill_dbg = false;
 
     // ---- KV cache append ----
-    if (kv_cache == 2 && K_cache && K_cache->data && K_cache->shape[1] > 0) {
-        past_seqlen   = (int)K_cache->shape[1];  // view height = valid length
-        key_capacity  = (int)K_cache->shape[2];  // full capacity dim
-        value_capacity = V_cache ? (int)V_cache->shape[2] : 0;
+    // KV cache buffer layout: [CacheMetadata(64B)] [data]
+    // Read past_seqlen from cache metadata header
+    if (kv_cache == 2 && K_cache && K_cache->data) {
+        const CacheMetadata* meta = cache_meta(K_cache->data);
+        past_seqlen = (int)meta->current_seq_len;
 
         size_t es = Q.element_size();
+        int k_cur_seqlen = (int)K_cur.shape[1];
+
+        // Debug: print the first two prefill SDPA layers for HF comparison.
+        int dbg_layer = sdpa_dbg_prefill;
+        dump_prefill_dbg = (sdpa_dbg_prefill < 2 && past_seqlen == 0 && src_seqlen > 1 && cur_seqlen > 1);
+        if (dump_prefill_dbg) {
+            fprintf(stderr, "  SDPA DBG[PREFILL L%d]: kv_cache=%d causal=%d num_heads=%d num_kv_heads=%d head_dim=%d v_head_dim=%d scale=%.6f\n",
+                    dbg_layer, kv_cache, causal, num_heads, num_kv_heads, head_dim, v_head_dim, scale);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: src_seqlen=%d cur_seqlen=%d past_seqlen=%d\n",
+                    src_seqlen, k_cur_seqlen, past_seqlen);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: Q.shape=[%lld,%lld,%lld,%lld] K_cur.shape=[%lld,%lld,%lld,%lld] V_cur.shape=[%lld,%lld,%lld,%lld]\n",
+                    Q.shape[0], Q.shape[1], Q.shape[2], Q.shape[3],
+                    K_cur.shape[0], K_cur.shape[1], K_cur.shape[2], K_cur.shape[3],
+                    V_cur.shape[0], V_cur.shape[1], V_cur.shape[2], V_cur.shape[3]);
+
+            const float* q_h0_s0 = Q.channel<float>(0);
+            const float* k_h0_s0 = K_cur.channel<float>(0);
+            const float* v_h0_s0 = V_cur.channel<float>(0);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: Q[0..2,0,h0]=%.6f %.6f %.6f\n", q_h0_s0[0], q_h0_s0[1], q_h0_s0[2]);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: K[0..2,0,h0]=%.6f %.6f %.6f\n", k_h0_s0[0], k_h0_s0[1], k_h0_s0[2]);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: V[0..2,0,h0]=%.6f %.6f %.6f\n", v_h0_s0[0], v_h0_s0[1], v_h0_s0[2]);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: Q[125..130,0,h0]=%.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    q_h0_s0[125], q_h0_s0[126], q_h0_s0[127], q_h0_s0[128], q_h0_s0[129], q_h0_s0[130]);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: K[125..130,0,h0]=%.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    k_h0_s0[125], k_h0_s0[126], k_h0_s0[127], k_h0_s0[128], k_h0_s0[129], k_h0_s0[130]);
+
+            const float* q_h0_s1 = Q.channel<float>(0) + Q.stride[1] / sizeof(float);
+            const float* k_h0_s1 = K_cur.channel<float>(0) + K_cur.stride[1] / sizeof(float);
+            const float* v_h0_s1 = V_cur.channel<float>(0) + V_cur.stride[1] / sizeof(float);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: Q[0..2,1,h0]=%.6f %.6f %.6f\n", q_h0_s1[0], q_h0_s1[1], q_h0_s1[2]);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: K[0..2,1,h0]=%.6f %.6f %.6f\n", k_h0_s1[0], k_h0_s1[1], k_h0_s1[2]);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: V[0..2,1,h0]=%.6f %.6f %.6f\n", v_h0_s1[0], v_h0_s1[1], v_h0_s1[2]);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: Q[125..130,1,h0]=%.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    q_h0_s1[125], q_h0_s1[126], q_h0_s1[127], q_h0_s1[128], q_h0_s1[129], q_h0_s1[130]);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: K[125..130,1,h0]=%.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    k_h0_s1[125], k_h0_s1[126], k_h0_s1[127], k_h0_s1[128], k_h0_s1[129], k_h0_s1[130]);
+
+            if (Q.shape[2] > 1 && K_cur.shape[2] > 1 && V_cur.shape[2] > 1) {
+                const float* q_h1_s0 = Q.channel<float>(1);
+                const float* k_h1_s0 = K_cur.channel<float>(1);
+                const float* v_h1_s0 = V_cur.channel<float>(1);
+                fprintf(stderr, "  SDPA DBG[PREFILL]: Q[0..2,0,h1]=%.6f %.6f %.6f\n", q_h1_s0[0], q_h1_s0[1], q_h1_s0[2]);
+                fprintf(stderr, "  SDPA DBG[PREFILL]: K[0..2,0,h1]=%.6f %.6f %.6f\n", k_h1_s0[0], k_h1_s0[1], k_h1_s0[2]);
+                fprintf(stderr, "  SDPA DBG[PREFILL]: V[0..2,0,h1]=%.6f %.6f %.6f\n", v_h1_s0[0], v_h1_s0[1], v_h1_s0[2]);
+                fprintf(stderr, "  SDPA DBG[PREFILL]: Q[125..130,0,h1]=%.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        q_h1_s0[125], q_h1_s0[126], q_h1_s0[127], q_h1_s0[128], q_h1_s0[129], q_h1_s0[130]);
+                fprintf(stderr, "  SDPA DBG[PREFILL]: K[125..130,0,h1]=%.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        k_h1_s0[125], k_h1_s0[126], k_h1_s0[127], k_h1_s0[128], k_h1_s0[129], k_h1_s0[130]);
+            }
+        }
+
+        // K data starts after metadata header
+        const void* k_cache_data = cache_data(K_cache->data);
+        const void* v_cache_data = V_cache ? cache_data(V_cache->data) : nullptr;
+
         for (int g = 0; g < num_kv_heads; g++) {
-            // append K_cur
-            unsigned char* kd = (unsigned char*)K_cache->channel<float>(g);
-            memcpy(kd + (size_t)past_seqlen * head_dim * es,
-                   K_cur.channel<unsigned char>(g), head_dim * cur_seqlen * es);
-            // append V_cur
-            unsigned char* vd = (unsigned char*)V_cache->channel<float>(g);
-            memcpy(vd + (size_t)past_seqlen * v_head_dim * es,
-                   V_cur.channel<unsigned char>(g), v_head_dim * cur_seqlen * es);
+            // K_cur: shape=[head_dim, seq_len, num_kv_heads]
+            const unsigned char* ks = (const unsigned char*)K_cur.channel<unsigned char>(g);
+            size_t k_cur_row_stride = K_cur.stride[1];
+            // K_cache data: shape=[head_dim, n_ctx, num_kv_heads]
+            unsigned char* kd = (unsigned char*)k_cache_data + g * (head_dim * meta->max_seq_len * es);
+            for (int s = 0; s < k_cur_seqlen; s++) {
+                std::memcpy(kd + (past_seqlen + s) * head_dim * es,
+                            ks + s * k_cur_row_stride,
+                            head_dim * es);
+            }
+
+            // V_cur
+            const unsigned char* vs = (const unsigned char*)V_cur.channel<unsigned char>(g);
+            size_t v_cur_row_stride = V_cur.stride[1];
+            unsigned char* vd = (unsigned char*)v_cache_data + g * (v_head_dim * meta->max_seq_len * es);
+            for (int s = 0; s < k_cur_seqlen; s++) {
+                std::memcpy(vd + (past_seqlen + s) * v_head_dim * es,
+                            vs + s * v_cur_row_stride,
+                            v_head_dim * es);
+            }
         }
     } else if (kv_cache == 1 && K_cache && K_cache->data) {
-        past_seqlen = (int)K_cache->shape[1];
+        const CacheMetadata* meta = cache_meta(K_cache->data);
+        past_seqlen = (int)meta->current_seq_len;
     }
 
     int dst_seqlen = past_seqlen + cur_seqlen;
 
     // ---- allocate scratch for QK and K/V concatenated ----
-    // QK: [dst_seqlen, src_seqlen] per query head (thread)
-    // We process one query head at a time, single-threaded for now
-
     float* qk_row = new float[dst_seqlen];
-
-    static int sdpa_dbg = 0;
-    if (sdpa_dbg == 0) {
-        fprintf(stderr, "  SDPA: out.shape=[%lld,%lld,%lld] nbytes=%zu stride=[%zu,%zu,%zu] v_head_dim=%d num_heads=%d\n",
-                out.shape[0], out.shape[1], out.shape[2], out.nbytes(),
-                out.stride[0], out.stride[1], out.stride[2],
-                v_head_dim, num_heads);
-        sdpa_dbg++;
-    }
 
     for (int h = 0; h < num_heads; h++) {
         int kv_h = h / heads_per_group;
@@ -116,8 +176,10 @@ void kernel_sdpa(const OpParams& params,
                 float dot = 0.f;
 
                 if (j < past_seqlen && K_cache && K_cache->data) {
-                    // from cache
-                    const float* k_ptr = K_cache->channel<float>(kv_h) + j * K_cache->stride[1] / sizeof(float);
+                    // from cache (data starts after metadata header)
+                    const void* kd = cache_data(K_cache->data);
+                    const float* k_ptr = (const float*)((const char*)kd + kv_h * (head_dim * cache_meta(K_cache->data)->max_seq_len * sizeof(float)));
+                    k_ptr += j * head_dim;
                     for (int d = 0; d < head_dim; d++) dot += q_ptr[d] * k_ptr[d];
                 } else {
                     // from cur
@@ -152,7 +214,9 @@ void kernel_sdpa(const OpParams& params,
 
                 const float* v_ptr;
                 if (j < past_seqlen && V_cache && V_cache->data) {
-                    v_ptr = V_cache->channel<float>(kv_h) + j * V_cache->stride[1] / sizeof(float);
+                    const void* vd = cache_data(V_cache->data);
+                    v_ptr = (const float*)((const char*)vd + kv_h * (v_head_dim * cache_meta(V_cache->data)->max_seq_len * sizeof(float)));
+                    v_ptr += j * v_head_dim;
                 } else {
                     int cur_idx = j - past_seqlen;
                     if (cur_idx >= cur_seqlen) continue;
@@ -164,6 +228,18 @@ void kernel_sdpa(const OpParams& params,
                 }
             }
         }
+    }
+
+    if (dump_prefill_dbg) {
+        const float* o_h0_s0 = out.channel<float>(0);
+        const float* o_h0_s1 = out.channel<float>(0) + out.stride[1] / sizeof(float);
+        fprintf(stderr, "  SDPA DBG[PREFILL]: O[0..2,0,h0]=%.6f %.6f %.6f\n", o_h0_s0[0], o_h0_s0[1], o_h0_s0[2]);
+        fprintf(stderr, "  SDPA DBG[PREFILL]: O[0..2,1,h0]=%.6f %.6f %.6f\n", o_h0_s1[0], o_h0_s1[1], o_h0_s1[2]);
+        if (out.shape[2] > 1) {
+            const float* o_h1_s0 = out.channel<float>(1);
+            fprintf(stderr, "  SDPA DBG[PREFILL]: O[0..2,0,h1]=%.6f %.6f %.6f\n", o_h1_s0[0], o_h1_s0[1], o_h1_s0[2]);
+        }
+        sdpa_dbg_prefill++;
     }
 
     delete[] qk_row;

@@ -223,9 +223,16 @@ class GraphBuilder:
         s_elems = 1
         for d in resolved: s_elems *= d
         assert n_elems == s_elems, f"reshape element mismatch: {sx} vs {shape}"
-        return self._add(OpType.RESHAPE, [x], tuple(resolved),
+        # Mark the dynamic dimension: the one that was -1 (inferred) is the
+        # seq_len dimension that will change between prefill and decode.
+        # Store the dim index in params_i32[4] so the C++ executor can use it.
+        resolved_4d = list(self._normalize_shape(tuple(resolved)))
+        dynamic_dim = idx if -1 in list(shape) else -1
+        i32_params = list(resolved_4d)
+        i32_params.append(dynamic_dim)  # params_i32[4] = dynamic dim index
+        return self._add(OpType.RESHAPE, [x], tuple(resolved_4d),
                          prec=self._nodes[x].out_prec,
-                         i32=list(self._normalize_shape(tuple(resolved))))
+                         i32=i32_params)
 
     def permute(self, x: int, order: tuple) -> int:
         sx = self._nodes[x].out_shape

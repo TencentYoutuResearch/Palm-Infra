@@ -17,12 +17,12 @@
 
 static void rope_scalar(const float* x, const float* cos, const float* sin,
                         float* out, int D, int N, int rope_dim, bool interleave,
-                        int ldx, int ldc, int lds) {
+                        int ldx, int ldo, int ldc, int lds) {
     int half = rope_dim / 2;
 
     for (int n = 0; n < N; n++) {
         const float* x_row  = x + n * ldx;
-        float*       o_row  = out + n * ldx;
+        float*       o_row  = out + n * ldo;
         const float* c_row  = cos + n * ldc;
         const float* s_row  = sin + n * lds;
 
@@ -63,12 +63,12 @@ static void rope_scalar(const float* x, const float* cos, const float* sin,
 
 static void rope_neon_interleave(const float* x, const float* cos, const float* sin,
                                   float* out, int D, int N, int rope_dim,
-                                  int ldx, int ldc, int lds) {
+                                  int ldx, int ldo, int ldc, int lds) {
     int half = rope_dim / 2;
 
     for (int n = 0; n < N; n++) {
         const float* x_row  = x + n * ldx;
-        float*       o_row  = out + n * ldx;
+        float*       o_row  = out + n * ldo;
         const float* c_row  = cos + n * ldc;
         const float* s_row  = sin + n * lds;
 
@@ -116,12 +116,12 @@ static void rope_neon_interleave(const float* x, const float* cos, const float* 
 
 static void rope_neon_halves(const float* x, const float* cos, const float* sin,
                               float* out, int D, int N, int rope_dim,
-                              int ldx, int ldc, int lds) {
+                              int ldx, int ldo, int ldc, int lds) {
     int half = rope_dim / 2;
 
     for (int n = 0; n < N; n++) {
         const float* x_row  = x + n * ldx;
-        float*       o_row  = out + n * ldx;
+        float*       o_row  = out + n * ldo;
         const float* c_row  = cos + n * ldc;
         const float* s_row  = sin + n * lds;
 
@@ -162,32 +162,41 @@ static void rope_neon_halves(const float* x, const float* cos, const float* sin,
 void kernel_rope(const Tensor& x, const Tensor& cos, const Tensor& sin,
                  int rope_dim, bool interleave, Tensor& out) {
     int D = (int)x.shape[0];  // feature dimension
-    int N = (int)x.shape[1];  // number of rows
+    int N = (int)x.shape[1];  // sequence dimension
+    int C = (int)(x.shape[2] * x.shape[3]);  // channels/batch planes sharing cos/sin
 
     int ldx = (int)(x.stride[1] / sizeof(float));
+    int ldo = (int)(out.stride[1] / sizeof(float));
     int ldc = (int)(cos.stride[1] / sizeof(float));
     int lds = (int)(sin.stride[1] / sizeof(float));
 
-    const float* x_ptr = x.ptr<float>();
     const float* c_ptr = cos.ptr<float>();
     const float* s_ptr = sin.ptr<float>();
-    float*       o_ptr = out.ptr<float>();
 
-    // copy x → out first (rope modifies in-place conceptually, but we
-    // do separate output for safety)
-    if (o_ptr != x_ptr) {
-        for (int n = 0; n < N; n++) {
-            std::memcpy(o_ptr + n * ldx, x_ptr + n * ldx, D * sizeof(float));
+    for (int c = 0; c < C; c++) {
+        int c2 = c % (int)x.shape[2];
+        int c3 = c / (int)x.shape[2];
+        const float* x_ptr = reinterpret_cast<const float*>(
+            static_cast<const char*>(x.data) + c2 * x.stride[2] + c3 * x.stride[3]);
+        float* o_ptr = reinterpret_cast<float*>(
+            static_cast<char*>(out.data) + c2 * out.stride[2] + c3 * out.stride[3]);
+
+        // copy x → out first (rope modifies in-place conceptually, but we
+        // do separate output for safety)
+        if (o_ptr != x_ptr) {
+            for (int n = 0; n < N; n++) {
+                std::memcpy(o_ptr + n * ldo, x_ptr + n * ldx, D * sizeof(float));
+            }
         }
-    }
 
 #if HAS_NEON
-    if (interleave) {
-        rope_neon_interleave(x_ptr, c_ptr, s_ptr, o_ptr, D, N, rope_dim, ldx, ldc, lds);
-    } else {
-        rope_neon_halves(x_ptr, c_ptr, s_ptr, o_ptr, D, N, rope_dim, ldx, ldc, lds);
-    }
+        if (interleave) {
+            rope_neon_interleave(x_ptr, c_ptr, s_ptr, o_ptr, D, N, rope_dim, ldx, ldo, ldc, lds);
+        } else {
+            rope_neon_halves(x_ptr, c_ptr, s_ptr, o_ptr, D, N, rope_dim, ldx, ldo, ldc, lds);
+        }
 #else
-    rope_scalar(x_ptr, c_ptr, s_ptr, o_ptr, D, N, rope_dim, interleave, ldx, ldc, lds);
+        rope_scalar(x_ptr, c_ptr, s_ptr, o_ptr, D, N, rope_dim, interleave, ldx, ldo, ldc, lds);
 #endif
+    }
 }

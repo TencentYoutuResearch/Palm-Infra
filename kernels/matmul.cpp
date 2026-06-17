@@ -17,17 +17,20 @@
 // scalar matmul (fallback)
 // ---------------------------------------------------------------------------
 
+// After weight dim swap: B has shape [N, K] (N=output, K=input).
+// Weight file stores row-major [K, N]: data[k*N + n] = weight[n,k].
+// Tensor access: B.at<float>(n, k) = data[n + k*N] = data[k*N + n].
+// C[m,n] = sum_k A[k + m*lda] * B[n + k*ldb] = sum_k A[k,m] * W[n,k] = (A @ W^T)[m,n]
 static void matmul_fp32_scalar(const float* A, const float* B, float* C,
                                int M, int N, int K,
-                               int lda, int ldb, int ldc) {
+                               int lda, int K_weight, int ldc) {
     for (int m = 0; m < M; m++) {
-        const float* a_row = A + m * lda;
-        float*       c_row = C + m * ldc;
+        float* c_row = C + m * ldc;
         for (int n = 0; n < N; n++) {
             float sum = 0.f;
-            const float* b_col = B + n;
             for (int k = 0; k < K; k++) {
-                sum += a_row[k] * b_col[k * ldb];
+                // A[k,m] * W[n,k] = A[k + m*lda] * B[n*K_weight + k]
+                sum += A[k + m * lda] * B[n * K_weight + k];
             }
             c_row[n] = sum;
         }
@@ -49,7 +52,7 @@ static void matmul_fp32_scalar(const float* A, const float* B, float* C,
 
 static void matmul_fp32_neon_4x4(const float* A, const float* B, float* C,
                                  int M, int N, int K,
-                                 int lda, int ldb, int ldc) {
+                                 int lda, int K_weight, int ldc) {
     for (int m = 0; m < M; m += 4) {
         int m_end = std::min(m + 4, M);
 
@@ -64,43 +67,35 @@ static void matmul_fp32_neon_4x4(const float* A, const float* B, float* C,
 
             // ---- K loop ----
             for (int k = 0; k < K; k++) {
-                // Load 4 elements from B: B[n, k], B[n+1, k], B[n+2, k], B[n+3, k]
-                // B is N×K row-major: row n starts at B + n*ldb
+                // Weight is [N, K_weight] row-major: W[n,k] = data[n*K_weight + k]
+                // Load 4 elements for columns n..n+3, row k
                 float32x4_t b_vec;
                 {
-                    // Gather: B[n][k], B[n+1][k], B[n+2][k], B[n+3][k]
-                    if (n + 4 <= N) {
-                        float b_tmp[4];
-                        b_tmp[0] = B[(n+0) * ldb + k];
-                        b_tmp[1] = B[(n+1) * ldb + k];
-                        b_tmp[2] = B[(n+2) * ldb + k];
-                        b_tmp[3] = B[(n+3) * ldb + k];
-                        b_vec = vld1q_f32(b_tmp);
-                    } else {
-                        float tmp[4] = {0, 0, 0, 0};
-                        for (int j = 0; j < n_end - n; j++) tmp[j] = B[(n+j) * ldb + k];
-                        b_vec = vld1q_f32(tmp);
+                    float tmp[4];
+                    for (int j = 0; j < 4 && n + j < n_end; j++) {
+                        tmp[j] = B[(n + j) * K_weight + k];
                     }
+                    b_vec = vld1q_f32(tmp);
                 }
 
                 // Row 0
                 if (m + 0 < m_end) {
-                    float a0 = A[(m + 0) * lda + k];
+                    float a0 = A[k + (m + 0) * lda];
                     c0 = vfmaq_n_f32(c0, b_vec, a0);
                 }
                 // Row 1
                 if (m + 1 < m_end) {
-                    float a1 = A[(m + 1) * lda + k];
+                    float a1 = A[k + (m + 1) * lda];
                     c1 = vfmaq_n_f32(c1, b_vec, a1);
                 }
                 // Row 2
                 if (m + 2 < m_end) {
-                    float a2 = A[(m + 2) * lda + k];
+                    float a2 = A[k + (m + 2) * lda];
                     c2 = vfmaq_n_f32(c2, b_vec, a2);
                 }
                 // Row 3
                 if (m + 3 < m_end) {
-                    float a3 = A[(m + 3) * lda + k];
+                    float a3 = A[k + (m + 3) * lda];
                     c3 = vfmaq_n_f32(c3, b_vec, a3);
                 }
             }
@@ -122,52 +117,20 @@ static void matmul_fp32_neon_4x4(const float* A, const float* B, float* C,
 // ---------------------------------------------------------------------------
 
 void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C) {
-    // shapes: A[M,K] * B[K,N] → C[M,N]
-    int M = (int)A.shape[1];  // rows of A
-    int K = (int)A.shape[0];  // inner dim
-    // Detect N from B: the dimension that is NOT K
-    int N;
-    if ((int)B.shape[0] == K) {
-        N = (int)B.shape[1];  // B.shape[0] is K, B.shape[1] is N
-    } else if ((int)B.shape[1] == K) {
-        N = (int)B.shape[0];  // B.shape[1] is K, B.shape[0] is N
-    } else {
-        N = (int)B.shape[0];  // fallback
-    }
-
-    static int call_count = 0;
-    if (call_count < 3) {
-        // Compute dot product manually for first 3 output elements to verify
-        float manual[3] = {0,0,0};
-        const float* a = A.ptr<float>();
-        const float* b = B.ptr<float>();
-        int ldb_elems = (int)B.stride[1] / (int)sizeof(float);
-        fprintf(stderr, "  C++ MATMUL[%d] ldb_elems=%d (stride[1]=%zu)\n",
-                call_count, ldb_elems, B.stride[1]);
-        for (int k = 0; k < K; k++) {
-            manual[0] += a[k] * b[0 * ldb_elems + k];
-            manual[1] += a[k] * b[1 * ldb_elems + k];
-            manual[2] += a[k] * b[2 * ldb_elems + k];
-        }
-        fprintf(stderr, "  C++ MATMUL[%d] manual[0..2]: %.4f %.4f %.4f\n",
-                call_count, manual[0], manual[1], manual[2]);
-        fprintf(stderr, "  C++ MATMUL[%d]: M=%d K=%d N=%d A[0..2]=%.4f %.4f %.4f B[0..2]=%.4f %.4f %.4f\n",
-                call_count, M, K, N,
-                A.ptr<float>()[0], A.ptr<float>()[1], A.ptr<float>()[2],
-                B.ptr<float>()[0], B.ptr<float>()[1], B.ptr<float>()[2]);
-        call_count++;
-    }
-
+    // A: [K, M] — input activations (K=features, M=seq_len)
+    // B: [N, K] — weight matrix (N=output, K=input), stored row-major
+    // C: [N, M] — output
+    // Compute: C[m,n] = sum_k A[k,m] * W[n,k]
+    int M = (int)A.shape[1];  // seq_len
+    int K = (int)A.shape[0];  // features
+    // N = B.shape[0] (weight is [N, K])
+    int N = (int)B.shape[0];
+    
     int lda = (int)(A.stride[1] / sizeof(float));
-    int ldb = (int)(B.stride[1] / sizeof(float));
     int ldc = (int)(C.stride[1] / sizeof(float));
-
-    static int dbg = 0;
-    if (dbg < 8) {
-        fprintf(stderr, "  matmul_fp32[%d]: M=%d N=%d K=%d lda=%d ldb=%d ldc=%d C.shape=[%lld,%lld] nbytes=%zu\n",
-                dbg, M, N, K, lda, ldb, ldc, C.shape[0], C.shape[1], C.nbytes());
-        dbg++;
-    }
+    
+    // Weight stride: B is [N, K] row-major, so W[n,k] = data[n*K + k]
+    int K_weight = (int)B.shape[1];
 
     const float* a_ptr = A.ptr<float>();
     const float* b_ptr = B.ptr<float>();
@@ -179,15 +142,14 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C) {
     }
 
 #if HAS_NEON
-    matmul_fp32_neon_4x4(a_ptr, b_ptr, c_ptr, M, N, K, lda, ldb, ldc);
+    matmul_fp32_neon_4x4(a_ptr, b_ptr, c_ptr, M, N, K, lda, K_weight, ldc);
 #else
-    matmul_fp32_scalar(a_ptr, b_ptr, c_ptr, M, N, K, lda, ldb, ldc);
+    matmul_fp32_scalar(a_ptr, b_ptr, c_ptr, M, N, K, lda, K_weight, ldc);
 #endif
 
-    static int out_count = 0;
-    if (out_count < 3) {
-        fprintf(stderr, "  C++ MATMUL[%d] out[0..2]: %.4f %.4f %.4f\n",
-                out_count, c_ptr[0], c_ptr[1], c_ptr[2]);
-        out_count++;
-    }
+#if HAS_NEON
+    matmul_fp32_neon_4x4(a_ptr, b_ptr, c_ptr, M, N, K, lda, K_weight, ldc);
+#else
+    matmul_fp32_scalar(a_ptr, b_ptr, c_ptr, M, N, K, lda, K_weight, ldc);
+#endif
 }

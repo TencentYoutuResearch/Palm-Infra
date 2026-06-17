@@ -102,20 +102,13 @@ void kernel_rms_norm(const Tensor& x, const Tensor& weight,
     int D = (int)x.shape[0];  // feature dimension
     int N = (int)x.shape[1];  // number of rows
 
-    // Safety check
-    if ((int)weight.shape[0] < D) {
-        fprintf(stderr, "RMSNorm: weight too small! weight.dim0=%lld, x.dim0=%d\n",
-                weight.shape[0], D);
+    // Safety check: weight is 1D vector, dim may be in shape[0] or shape[1]
+    // after weight dim swap
+    int64_t w_dim = weight.shape[0] > weight.shape[1] ? weight.shape[0] : weight.shape[1];
+    if (w_dim < D) {
+        fprintf(stderr, "RMSNorm: weight too small! weight=[%lld,%lld], x.dim0=%d\n",
+                weight.shape[0], weight.shape[1], D);
         return;
-    }
-
-    static int call_count = 0;
-    if (call_count == 0) {
-        fprintf(stderr, "  C++ RMSNORM0[0..2]: %.4f %.4f %.4f (HF: -1.0713 -0.1608 0.9653)\n",
-                x.ptr<float>()[0], x.ptr<float>()[1], x.ptr<float>()[2]);
-        fprintf(stderr, "  C++ RMSNORM0 weight[0..2]: %.4f %.4f %.4f\n",
-                weight.ptr<float>()[0], weight.ptr<float>()[1], weight.ptr<float>()[2]);
-        call_count++;
     }
 
     int ldx = (int)(x.stride[1] / sizeof(float));
@@ -130,11 +123,4 @@ void kernel_rms_norm(const Tensor& x, const Tensor& weight,
 #else
     rms_norm_scalar(x_ptr, w_ptr, o_ptr, D, N, eps, ldx, ldo);
 #endif
-
-    static int out_count = 0;
-    if (out_count == 0) {
-        fprintf(stderr, "  C++ RMSNORM0 out[0..2]: %.4f %.4f %.4f (HF: -1.0713 -0.1608 0.9653)\n",
-                out.ptr<float>()[0], out.ptr<float>()[1], out.ptr<float>()[2]);
-        out_count++;
-    }
 }

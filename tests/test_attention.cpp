@@ -1,4 +1,5 @@
 #include "kernels/attention.h"
+#include "engine/engine.h"  // for CacheMetadata
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -79,22 +80,46 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur, int past,
     Tensor Q = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, src, H, 1, qd);
     Tensor K_cur = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, cur, KV, 1, kd);
     Tensor V_cur = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vd, cur, KV, 1, vdata);
-    Tensor K_cache; K_cache.prec=Precision::FP32; K_cache.mem_type=MemoryType::EXTERNAL;
-    K_cache.shape[0]=hd; K_cache.shape[1]=cap; K_cache.shape[2]=KV; K_cache.shape[3]=1;
-    K_cache.compute_strides(); K_cache.shape[1]=past; K_cache.data=kc;
-    Tensor V_cache; V_cache.prec=Precision::FP32; V_cache.mem_type=MemoryType::EXTERNAL;
-    V_cache.shape[0]=vd; V_cache.shape[1]=cap; V_cache.shape[2]=KV; V_cache.shape[3]=1;
-    V_cache.compute_strides(); V_cache.shape[1]=past; V_cache.data=vc;
+
+    // KV cache buffers with CacheMetadata header
+    size_t k_cache_total = CacheMetadata::SIZE + KV * cap * hd * sizeof(float);
+    size_t v_cache_total = CacheMetadata::SIZE + KV * cap * vd * sizeof(float);
+    void* kc_buf = calloc(1, k_cache_total);
+    void* vc_buf = calloc(1, v_cache_total);
+
+    // Init metadata
+    auto* k_meta = cache_meta(kc_buf);
+    k_meta->current_seq_len = (uint64_t)past;
+    k_meta->max_seq_len     = (uint64_t)cap;
+    k_meta->num_kv_heads    = (uint64_t)KV;
+    k_meta->head_dim        = (uint64_t)hd;
+    auto* v_meta = cache_meta(vc_buf);
+    v_meta->current_seq_len = (uint64_t)past;
+    v_meta->max_seq_len     = (uint64_t)cap;
+    v_meta->num_kv_heads    = (uint64_t)KV;
+    v_meta->v_head_dim      = (uint64_t)vd;
+
+    // Copy pre-filled cache data into data region (after metadata)
+    memcpy(cache_data(kc_buf), kc, KV * cap * hd * sizeof(float));
+    memcpy(cache_data(vc_buf), vc, KV * cap * vd * sizeof(float));
+
+    Tensor K_cache = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                     (int64_t)k_cache_total / 4, 1, 1, 1, kc_buf);
+    Tensor V_cache = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                     (int64_t)v_cache_total / 4, 1, 1, 1, vc_buf);
     Tensor out = Tensor::create(Precision::FP32, MemoryType::OWNED, vd, src, H, 1, od);
-    Tensor K_out = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, cap, KV, 1, kc);
-    Tensor V_out = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vd, cap, KV, 1, vc);
+    Tensor K_out = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                   (int64_t)k_cache_total / 4, 1, 1, 1, kc_buf);
+    Tensor V_out = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                   (int64_t)v_cache_total / 4, 1, 1, 1, vc_buf);
 
     OpParams p; p.i32={2, causal?1:0, H, KV, hd, vd}; p.f32={scale};
     std::vector<const Tensor*> ins = {&Q, &K_cur, &V_cur, nullptr, &K_cache, &V_cache};
     std::vector<Tensor*> outs = {&out, &K_out, &V_out};
     kernel_sdpa(p, ins, outs);
 
-    ref_sdpa(qd, kc, vc, kd, vdata, ref, H, KV, hd, vd, src, cur, past, cap, scale, causal);
+    ref_sdpa(qd, (float*)cache_data(kc_buf), (float*)cache_data(vc_buf),
+             kd, vdata, ref, H, KV, hd, vd, src, cur, past, cap, scale, causal);
 
     // Debug first mismatch
     bool ok = true;
@@ -106,20 +131,20 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur, int past,
         }
     }
     if (!ok) {
-        // dump first few elements
         fprintf(stderr,"  od[0..4]: %f %f %f %f %f\n", od[0],od[1],od[2],od[3],od[4]);
         fprintf(stderr,"  ref[0..4]: %f %f %f %f %f\n", ref[0],ref[1],ref[2],ref[3],ref[4]);
     }
 
-    // check cache append (only when past > 0 — kernel skips append when past==0)
+    // check cache append (only when past > 0)
     if (past > 0) {
+        float* kc_data = (float*)cache_data(kc_buf);
         for (int g = 0; g < KV; g++)
             for (int j = 0; j < cur; j++)
                 for (int d = 0; d < hd; d++)
-                    if (fabsf(kc[g*cap*hd + (past+j)*hd + d] - kd[g*cur*hd + j*hd + d]) > 1e-5f) ok = false;
+                    if (fabsf(kc_data[g*cap*hd + (past+j)*hd + d] - kd[g*cur*hd + j*hd + d]) > 1e-5f) ok = false;
     }
 
-    delete[] qd; delete[] kd; delete[] vdata; delete[] kc; delete[] vc;
+    free(kc_buf); free(vc_buf);
     delete[] od; delete[] ref;
     return ok;
 }

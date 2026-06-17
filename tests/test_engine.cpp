@@ -41,7 +41,8 @@ int main() {
     {
         LLMEngine e;
         EngineConfig cfg;
-        cfg.graph_path = "/tmp/nonexistent.graph";
+        cfg.prefill_graph_path = "/tmp/nonexistent_prefill.graph";
+        cfg.decode_graph_path  = "/tmp/nonexistent_decode.graph";
         CHECK(!e.load(cfg), "load fails on missing file");
 
         // test that prefill/decode don't crash on empty graph

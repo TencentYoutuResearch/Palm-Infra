@@ -114,8 +114,130 @@ int main() {
     CHECK(tp.stride[0] == 12 && tp.stride[1] == 4, "permute strides correct");
     CHECK(tp.at<float>(0, 1) == 2.0f, "permute data access via stride");
 
+    // ---- test: slice(dim=0) + concat(dim=0) preserve row layout ----
+    Graph g3;
+    GraphNode in2;
+    in2.id = 0;
+    in2.op_type = OpType::INPUT;
+    in2.out_shape[0] = 4;
+    in2.out_shape[1] = 2;
+    in2.out_prec = Precision::FP32;
+    g3.nodes.push_back(in2);
+
+    GraphNode slice0;
+    slice0.id = 1;
+    slice0.op_type = OpType::SLICE;
+    slice0.inputs = {0};
+    slice0.out_shape[0] = 2;
+    slice0.out_shape[1] = 2;
+    slice0.out_prec = Precision::FP32;
+    slice0.params.i32 = {0, 0, 2};
+    g3.nodes.push_back(slice0);
+
+    GraphNode slice1;
+    slice1.id = 2;
+    slice1.op_type = OpType::SLICE;
+    slice1.inputs = {0};
+    slice1.out_shape[0] = 2;
+    slice1.out_shape[1] = 2;
+    slice1.out_prec = Precision::FP32;
+    slice1.params.i32 = {0, 2, 2};
+    g3.nodes.push_back(slice1);
+
+    GraphNode concat;
+    concat.id = 3;
+    concat.op_type = OpType::CONCAT;
+    concat.inputs = {1, 2};
+    concat.out_shape[0] = 4;
+    concat.out_shape[1] = 2;
+    concat.out_prec = Precision::FP32;
+    concat.params.i32 = {0};
+    g3.nodes.push_back(concat);
+
+    g3.graph_inputs = {0};
+    g3.graph_outputs = {3};
+    g3.runtime.tensors.resize(4);
+
+    float* d3 = new float[8]{0, 1, 2, 3, 4, 5, 6, 7};
+    g3.runtime.tensors[0] = Tensor::create(Precision::FP32, MemoryType::OWNED, 4, 2, 1, 1, d3);
+
+    BufferPool pool3;
+    ExecContext ctx3;
+    ctx3.graph = &g3;
+    ctx3.pool = &pool3;
+
+    prepare_execution(ctx3);
+    execute_graph(ctx3);
+
+    auto& ts0 = g3.runtime.tensors[1];
+    auto& ts1 = g3.runtime.tensors[2];
+    auto& tc = g3.runtime.tensors[3];
+    CHECK(ts0.stride[1] == g3.runtime.tensors[0].stride[1], "slice keeps parent row stride");
+    CHECK(ts0.at<float>(0, 1) == 4.0f && ts0.at<float>(1, 1) == 5.0f, "slice row 1 reads original left half");
+    CHECK(ts1.at<float>(0, 1) == 6.0f && ts1.at<float>(1, 1) == 7.0f, "slice row 1 reads original right half");
+    CHECK(tc.at<float>(0, 0) == 0.0f && tc.at<float>(1, 0) == 1.0f &&
+          tc.at<float>(2, 0) == 2.0f && tc.at<float>(3, 0) == 3.0f,
+          "concat row 0 preserves dim0 ordering");
+    CHECK(tc.at<float>(0, 1) == 4.0f && tc.at<float>(1, 1) == 5.0f &&
+          tc.at<float>(2, 1) == 6.0f && tc.at<float>(3, 1) == 7.0f,
+          "concat row 1 preserves dim0 ordering");
+
+    // ---- test: reshape after permute materializes logical order ----
+    Graph g4;
+    GraphNode in3;
+    in3.id = 0;
+    in3.op_type = OpType::INPUT;
+    in3.out_shape[0] = 2;
+    in3.out_shape[1] = 3;
+    in3.out_prec = Precision::FP32;
+    g4.nodes.push_back(in3);
+
+    GraphNode perm2;
+    perm2.id = 1;
+    perm2.op_type = OpType::PERMUTE;
+    perm2.inputs = {0};
+    perm2.out_shape[0] = 3;
+    perm2.out_shape[1] = 2;
+    perm2.out_prec = Precision::FP32;
+    perm2.params.i32 = {1, 0, 2, 3};
+    g4.nodes.push_back(perm2);
+
+    GraphNode reshape2;
+    reshape2.id = 2;
+    reshape2.op_type = OpType::RESHAPE;
+    reshape2.inputs = {1};
+    reshape2.out_shape[0] = 2;
+    reshape2.out_shape[1] = 3;
+    reshape2.out_prec = Precision::FP32;
+    reshape2.params.i32 = {2, 3, 1, 1};
+    g4.nodes.push_back(reshape2);
+
+    g4.graph_inputs = {0};
+    g4.graph_outputs = {2};
+    g4.runtime.tensors.resize(3);
+
+    float* d4 = new float[6]{0, 1, 2, 3, 4, 5};
+    g4.runtime.tensors[0] = Tensor::create(Precision::FP32, MemoryType::OWNED, 2, 3, 1, 1, d4);
+
+    BufferPool pool4;
+    ExecContext ctx4;
+    ctx4.graph = &g4;
+    ctx4.pool = &pool4;
+
+    prepare_execution(ctx4);
+    execute_graph(ctx4);
+
+    auto& tr = g4.runtime.tensors[2];
+    CHECK(tr.data != g4.runtime.tensors[1].data, "reshape after permute materializes new buffer");
+    CHECK(tr.at<float>(0, 0) == 0.0f && tr.at<float>(1, 0) == 2.0f &&
+          tr.at<float>(0, 1) == 4.0f && tr.at<float>(1, 1) == 1.0f &&
+          tr.at<float>(0, 2) == 3.0f && tr.at<float>(1, 2) == 5.0f,
+          "reshape after permute preserves logical element order");
+
     delete[] input_data;
     delete[] d2;
+    delete[] d3;
+    delete[] d4;
 
     if (failures == 0) {
         printf("\nAll execute tests passed!\n");
