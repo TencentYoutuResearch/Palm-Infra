@@ -13,3 +13,5 @@ venv/
 *.egg-info/
 dist/
 compile_commands.json
+*.weights
+*.graph
