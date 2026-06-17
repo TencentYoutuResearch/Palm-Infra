@@ -27,6 +27,7 @@ set(SOURCES
     kernels/norm.cpp
     kernels/rope.cpp
     kernels/attention.cpp
+    kernels/threading.cpp
     # engine
     engine/engine.cpp
     engine/tokenizer.cpp
@@ -38,6 +39,7 @@ set(HEADERS
     kernels/norm.h
     kernels/rope.h
     kernels/attention.h
+    kernels/threading.h
     graph/buffer_pool.h
     graph/mmap_file.h
     graph/graph.h

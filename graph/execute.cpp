@@ -4,6 +4,7 @@
 #include "kernels/rope.h"
 #include "kernels/attention.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -11,10 +12,25 @@
 // prepare_execution
 // ---------------------------------------------------------------------------
 
+void reset_profile_stats(ExecContext& ctx) {
+    ctx.profile_stats.clear();
+    if (!ctx.graph) return;
+
+    const auto& nodes = ctx.graph->nodes;
+    ctx.profile_stats.resize(nodes.size());
+    for (size_t i = 0; i < nodes.size(); i++) {
+        ctx.profile_stats[i].node_id = nodes[i].id;
+        ctx.profile_stats[i].op_type = nodes[i].op_type;
+        ctx.profile_stats[i].calls = 0;
+        ctx.profile_stats[i].total_ns = 0;
+    }
+}
+
 void prepare_execution(ExecContext& ctx) {
     auto& nodes = ctx.graph->nodes;
     const size_t N = nodes.size();
     ctx.release_queue.resize(N);
+    reset_profile_stats(ctx);
     // Phase 1: simple approach — don't free anything.
     // Memory is released when the BufferPool is destroyed.
     // Proper liveness analysis with view-awareness will be added later.
@@ -26,7 +42,8 @@ void prepare_execution(ExecContext& ctx) {
 
 static void dispatch_kernel(OpType op, const OpParams& params,
                             const std::vector<const Tensor*>& inputs,
-                            Tensor* output) {
+                            Tensor* output,
+                            ThreadPool* thread_pool) {
     switch (op) {
     case OpType::INPUT:
     case OpType::CONSTANT:
@@ -85,7 +102,7 @@ static void dispatch_kernel(OpType op, const OpParams& params,
 
     case OpType::MATMUL:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
-            kernel_matmul_fp32(*inputs[0], *inputs[1], *output);
+            kernel_matmul_fp32(*inputs[0], *inputs[1], *output, thread_pool);
         }
         break;
 
@@ -275,6 +292,10 @@ void execute_graph(ExecContext& ctx) {
         }
 
         auto& out = tensors[node.id];
+        auto start_time = std::chrono::steady_clock::time_point();
+        if (ctx.profile_enabled && node.id < ctx.profile_stats.size()) {
+            start_time = std::chrono::steady_clock::now();
+        }
 
         // initialise output shape from node definition (static!)
         out.shape[0] = node.out_shape[0];
@@ -307,7 +328,7 @@ void execute_graph(ExecContext& ctx) {
         }
 
         // dispatch
-        dispatch_kernel(node.op_type, node.params, inputs, &out);
+        dispatch_kernel(node.op_type, node.params, inputs, &out, ctx.thread_pool);
 
         // release completed tensors
         for (uint32_t rel_id : ctx.release_queue[i]) {
@@ -325,6 +346,14 @@ void execute_graph(ExecContext& ctx) {
                 t.data     = nullptr;
                 t.mem_type = MemoryType::NONE;
             }
+        }
+
+        if (ctx.profile_enabled && node.id < ctx.profile_stats.size()) {
+            auto end_time = std::chrono::steady_clock::now();
+            auto elapsed_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+            auto& stat = ctx.profile_stats[node.id];
+            stat.calls += 1;
+            stat.total_ns += elapsed_ns;
         }
     }
 }

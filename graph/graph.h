@@ -65,6 +65,31 @@ enum class OpType : uint32_t {
     // CONV1D             = 140,
 };
 
+inline const char* op_type_name(OpType op) {
+    switch (op) {
+    case OpType::INPUT: return "INPUT";
+    case OpType::CONSTANT: return "CONSTANT";
+    case OpType::MATMUL: return "MATMUL";
+    case OpType::RMS_NORM: return "RMS_NORM";
+    case OpType::LAYER_NORM: return "LAYER_NORM";
+    case OpType::SILU: return "SILU";
+    case OpType::GELU: return "GELU";
+    case OpType::ROTARY_EMBED: return "ROTARY_EMBED";
+    case OpType::SDPA: return "SDPA";
+    case OpType::SDPA_MLA: return "SDPA_MLA";
+    case OpType::RESHAPE: return "RESHAPE";
+    case OpType::PERMUTE: return "PERMUTE";
+    case OpType::CONCAT: return "CONCAT";
+    case OpType::SLICE: return "SLICE";
+    case OpType::TILE: return "TILE";
+    case OpType::ADD: return "ADD";
+    case OpType::MUL: return "MUL";
+    case OpType::QUANTIZE_KV: return "QUANTIZE_KV";
+    case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";
+    }
+    return "UNKNOWN";
+}
+
 // ---- op parameters ----
 //
 // Stored as flat arrays so serialisation is trivial.  The Python transpiler

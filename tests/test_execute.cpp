@@ -182,6 +182,50 @@ int main() {
           tc.at<float>(2, 1) == 6.0f && tc.at<float>(3, 1) == 7.0f,
           "concat row 1 preserves dim0 ordering");
 
+    // ---- test: profiler counts executed ops ----
+    {
+        Graph gp;
+        GraphNode in;
+        in.id = 0;
+        in.op_type = OpType::INPUT;
+        in.out_shape[0] = 4;
+        in.out_prec = Precision::FP32;
+        gp.nodes.push_back(in);
+
+        GraphNode reshape_p;
+        reshape_p.id = 1;
+        reshape_p.op_type = OpType::RESHAPE;
+        reshape_p.inputs = {0};
+        reshape_p.out_shape[0] = 2;
+        reshape_p.out_shape[1] = 2;
+        reshape_p.out_prec = Precision::FP32;
+        reshape_p.params.i32 = {2, 2, 1, 1};
+        gp.nodes.push_back(reshape_p);
+
+        gp.graph_inputs = {0};
+        gp.graph_outputs = {1};
+        gp.runtime.tensors.resize(2);
+
+        float* dp = new float[4]{1, 2, 3, 4};
+        gp.runtime.tensors[0] = Tensor::create(Precision::FP32, MemoryType::OWNED, 4, 1, 1, 1, dp);
+
+        BufferPool poolp;
+        ExecContext ctxp;
+        ctxp.graph = &gp;
+        ctxp.pool = &poolp;
+        ctxp.profile_enabled = true;
+
+        prepare_execution(ctxp);
+        execute_graph(ctxp);
+
+        CHECK(ctxp.profile_stats.size() == 2, "profile stats sized to node count");
+        CHECK(ctxp.profile_stats[1].calls == 1, "profile counts reshape call");
+        CHECK(ctxp.profile_stats[1].total_ns > 0, "profile records non-zero time");
+        CHECK(ctxp.profile_stats[1].op_type == OpType::RESHAPE, "profile records op type");
+
+        delete[] dp;
+    }
+
     // ---- test: reshape after permute materializes logical order ----
     Graph g4;
     GraphNode in3;

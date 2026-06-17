@@ -84,8 +84,8 @@ int main(int argc, char** argv) {
                    : 1;
     }
 
-    std::printf("mlllm_chat ready. single-turn mode, prefill_seq_len=%d\n",
-                prefill_seq_len);
+    std::printf("mlllm_chat ready. single-turn mode, prefill_seq_len=%d threads=%d\n",
+                prefill_seq_len, engine.config().num_threads);
     std::printf("Type /quit to exit.\n");
 
     std::string line;

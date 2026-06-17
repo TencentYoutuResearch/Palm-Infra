@@ -81,6 +81,14 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 error = "invalid value for --rope-theta";
                 return false;
             }
+        } else if (arg == "--threads") {
+            if (!require_value(argc, argv, i, "--threads", value, error)) return false;
+            if (!parse_int(value, opts.num_threads) || opts.num_threads < 1) {
+                error = "invalid value for --threads";
+                return false;
+            }
+        } else if (arg == "--profile") {
+            opts.profile = true;
         } else if (arg == "--warmup") {
             if (!require_value(argc, argv, i, "--warmup", value, error)) return false;
             if (!parse_int(value, opts.warmup) || opts.warmup < 0) {
@@ -113,6 +121,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --n-ctx <int>             Default: 4096\n");
     std::printf("  --rope-dim <int>          Default: 64\n");
     std::printf("  --rope-theta <float>      Default: 1600000\n");
+    std::printf("  --threads <int>          Default: 4\n");
+    std::printf("  --profile                Print aggregated per-op profile in bench\n");
     std::printf("  --warmup <int>            Default: 1 (used by benchmark)\n");
     if (extra_usage && *extra_usage) {
         std::printf("%s", extra_usage);
@@ -127,6 +137,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.n_ctx = opts.n_ctx;
     cfg.rope_dim = opts.rope_dim;
     cfg.rope_theta = opts.rope_theta;
+    cfg.num_threads = opts.num_threads;
     return cfg;
 }
 

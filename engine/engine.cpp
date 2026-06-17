@@ -99,6 +99,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
 
     exec_ctx.graph = &g;
     exec_ctx.pool  = &g.runtime.pool;
+    exec_ctx.thread_pool = &thread_pool_;
     prepare_execution(exec_ctx);
 
     return true;
@@ -148,8 +149,22 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
 // load — load both graphs, set up shared weights and caches
 // ---------------------------------------------------------------------------
 
+void LLMEngine::set_profile_enabled(bool enabled) {
+    exec_ctx_prefill_.profile_enabled = enabled;
+    exec_ctx_decode_.profile_enabled = enabled;
+}
+
+void LLMEngine::reset_profiles() {
+    reset_profile_stats(exec_ctx_prefill_);
+    reset_profile_stats(exec_ctx_decode_);
+}
+
 bool LLMEngine::load(const EngineConfig& cfg) {
     cfg_ = cfg;
+    cfg_.num_threads = std::max(cfg_.num_threads, 1);
+    thread_pool_.resize(cfg_.num_threads);
+    exec_ctx_prefill_.thread_pool = &thread_pool_;
+    exec_ctx_decode_.thread_pool = &thread_pool_;
 
     // Load prefill graph first (establishes shared weights)
     if (!load_graph(graph_prefill_, exec_ctx_prefill_, cfg.prefill_graph_path.c_str())) {

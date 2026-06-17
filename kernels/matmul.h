@@ -2,6 +2,8 @@
 
 #include "kernels/tensor.h"
 
+class ThreadPool;
+
 // ---------------------------------------------------------------------------
 // PROJECT_NAME — Matmul kernels
 //
@@ -14,4 +16,5 @@
 // (NEON SIMD for ARM, scalar fallback otherwise).
 // ---------------------------------------------------------------------------
 
-void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C);
+void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
+                        ThreadPool* thread_pool = nullptr);

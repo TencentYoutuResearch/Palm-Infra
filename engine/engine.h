@@ -3,6 +3,7 @@
 #include "graph/graph.h"
 #include "graph/execute.h"
 #include "kernels/tensor.h"
+#include "kernels/threading.h"
 
 #include <string>
 #include <unordered_map>
@@ -91,6 +92,10 @@ public:
     const EngineConfig& config() const { return cfg_; }
     int past_len() const { return past_len_; }
     Tensor* embed_weight() { return embed_weight_; }
+    void set_profile_enabled(bool enabled);
+    void reset_profiles();
+    const ExecContext& prefill_exec_ctx() const { return exec_ctx_prefill_; }
+    const ExecContext& decode_exec_ctx() const { return exec_ctx_decode_; }
 
     // exposed for testing
     Tensor build_causal_mask(int seq_len, int past_len);
@@ -103,6 +108,7 @@ private:
     Graph graph_decode_;
     ExecContext exec_ctx_prefill_;
     ExecContext exec_ctx_decode_;
+    ThreadPool thread_pool_;
     int past_len_ = 0;
 
     // Shared mmap'd weight files (path → MappedFile)

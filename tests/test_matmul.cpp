@@ -1,5 +1,6 @@
 #include "kernels/tensor.h"
 #include "kernels/matmul.h"
+#include "kernels/threading.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -181,6 +182,35 @@ int main() {
         ref_matmul(a_data, b_data, ref_c, M, N, K);
 
         CHECK(check_approx(c_data, ref_c, M * N), "4x8 * 8x3 (odd N)");
+
+        delete[] a_data; delete[] b_data; delete[] c_data; delete[] ref_c;
+    }
+
+    // ---- multithreaded large case ----
+    {
+        int M = 32, K = 256, N = 128;
+        float* a_data = new float[M * K];
+        float* b_data = new float[N * K];
+        fill_rand(a_data, M * K);
+        fill_rand(b_data, N * K);
+
+        float* c_data = new float[M * N];
+        float* ref_c  = new float[M * N];
+
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
+        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
+
+        ref_matmul(a_data, b_data, ref_c, M, N, K);
+
+        for (int num_threads : {1, 2, 4}) {
+            ThreadPool pool(num_threads);
+            kernel_matmul_fp32(A, B, C, &pool);
+
+            char msg[64];
+            std::snprintf(msg, sizeof(msg), "32x256 * 256x128 threads=%d", num_threads);
+            CHECK(check_approx(c_data, ref_c, M * N), msg);
+        }
 
         delete[] a_data; delete[] b_data; delete[] c_data; delete[] ref_c;
     }

@@ -1,9 +1,65 @@
 #include "examples/cli_common.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
+
+namespace {
+
+struct AggregatedProfileRow {
+    OpType op_type = OpType::INPUT;
+    uint64_t calls = 0;
+    uint64_t total_ns = 0;
+};
+
+std::vector<AggregatedProfileRow> aggregate_profile(const ExecContext& ctx) {
+    std::vector<AggregatedProfileRow> rows;
+    for (const auto& stat : ctx.profile_stats) {
+        if (stat.calls == 0 || stat.op_type == OpType::INPUT || stat.op_type == OpType::CONSTANT) {
+            continue;
+        }
+
+        auto it = std::find_if(rows.begin(), rows.end(), [&](const AggregatedProfileRow& row) {
+            return row.op_type == stat.op_type;
+        });
+        if (it == rows.end()) {
+            rows.push_back({stat.op_type, stat.calls, stat.total_ns});
+        } else {
+            it->calls += stat.calls;
+            it->total_ns += stat.total_ns;
+        }
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const AggregatedProfileRow& a, const AggregatedProfileRow& b) {
+        return a.total_ns > b.total_ns;
+    });
+    return rows;
+}
+
+void print_profile_section(const char* title, const ExecContext& ctx) {
+    auto rows = aggregate_profile(ctx);
+    if (rows.empty()) return;
+
+    uint64_t total_ns = 0;
+    for (const auto& row : rows) total_ns += row.total_ns;
+
+    std::printf("[%s]\n", title);
+    for (const auto& row : rows) {
+        double total_ms = row.total_ns / 1e6;
+        double avg_ms = row.calls > 0 ? total_ms / row.calls : 0.0;
+        double pct = total_ns > 0 ? (100.0 * row.total_ns / total_ns) : 0.0;
+        std::printf("op=%s calls=%llu total_ms=%.2f avg_ms=%.2f pct=%.1f\n",
+                    op_type_name(row.op_type),
+                    (unsigned long long)row.calls,
+                    total_ms,
+                    avg_ms,
+                    pct);
+    }
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     CliCommonOptions opts;
@@ -30,6 +86,8 @@ int main(int argc, char** argv) {
     auto load_end = std::chrono::steady_clock::now();
     double load_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
 
+    engine.set_profile_enabled(opts.profile);
+
     std::vector<int> prompt_ids = tokenizer.apply_chat(opts.prompt);
     if (prompt_ids.empty()) {
         std::fprintf(stderr, "bench: prompt is empty after tokenization\n");
@@ -52,6 +110,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (opts.profile) {
+        engine.reset_profiles();
+    }
+
     GenerationResult result;
     auto total_start = std::chrono::steady_clock::now();
     if (!generate_greedy(engine, tokenizer, prompt_ids, opts.max_new_tokens,
@@ -66,6 +128,7 @@ int main(int argc, char** argv) {
     metrics.total_ms = total_ms;
 
     std::printf("load_ms=%.2f\n", load_ms);
+    std::printf("threads=%d\n", engine.config().num_threads);
     std::printf("prompt_tokens=%d\n", metrics.prompt_tokens);
     std::printf("generated_tokens=%d\n", metrics.generated_tokens);
     std::printf("decode_tokens=%d\n", metrics.decode_tokens);
@@ -78,6 +141,11 @@ int main(int argc, char** argv) {
     std::printf("total_ms=%.2f\n", metrics.total_ms);
     std::printf("hit_eos=%s\n", result.hit_eos ? "true" : "false");
     std::printf("generated_text=%s\n", result.text.c_str());
+
+    if (opts.profile) {
+        print_profile_section("prefill_profile", engine.prefill_exec_ctx());
+        print_profile_section("decode_profile", engine.decode_exec_ctx());
+    }
 
     return 0;
 }
