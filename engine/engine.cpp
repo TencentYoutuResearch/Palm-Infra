@@ -101,8 +101,6 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
     exec_ctx.pool  = &g.runtime.pool;
     prepare_execution(exec_ctx);
 
-    printf("Engine: loaded graph %s (%zu nodes, %zu shared weights)\n",
-           path, g.nodes.size(), shared_weights_.size());
     return true;
 }
 
@@ -112,7 +110,6 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
 
 void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
     // Find cache INPUT nodes and initialise their tensor shapes
-    int n_layers = 0;
     for (auto& node : g.nodes) {
         if (node.op_type != OpType::INPUT || node.params.str.empty()) continue;
         const std::string& name = node.params.str[0];
@@ -130,7 +127,6 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             caches_[layer_idx].k = &t;
             caches_[layer_idx].k_head_dim = (int)node.out_shape[0];
             caches_[layer_idx].k_num_heads = (int)node.out_shape[2];
-            if (layer_idx >= n_layers) n_layers = layer_idx + 1;
         } else if (name.find("cache_v") == 0) {
             int layer_idx = std::stoi(name.substr(7));
             if (layer_idx >= (int)caches_.size()) caches_.resize(layer_idx + 1);
@@ -144,10 +140,8 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             caches_[layer_idx].v = &t;
             caches_[layer_idx].v_head_dim = (int)node.out_shape[0];
             caches_[layer_idx].v_num_heads = (int)node.out_shape[2];
-            if (layer_idx >= n_layers) n_layers = layer_idx + 1;
         }
     }
-    printf("Engine: %d layers, %zu cache pairs\n", n_layers, caches_.size());
 }
 
 // ---------------------------------------------------------------------------

@@ -309,39 +309,6 @@ void execute_graph(ExecContext& ctx) {
         // dispatch
         dispatch_kernel(node.op_type, node.params, inputs, &out);
 
-        // Debug: capture layer-0 post-attention outputs and final layer-1 input
-        // on the first prefill run.
-        static int post_attn_dbg = 0;
-        static bool expect_layer0_residual = false;
-        static bool expect_layer1_input = false;
-        if (post_attn_dbg == 0 && node.op_type == OpType::MATMUL && node.inputs.size() >= 2 && out.shape[1] > 1) {
-            const auto& wnode = nodes[node.inputs[1]];
-            if (wnode.op_type == OpType::CONSTANT && !wnode.params.str.empty()) {
-                if (wnode.params.str[0].find("model_layers_0_self_attn_o_proj_weight.weights") != std::string::npos) {
-                    const float* r0 = out.ptr<float>();
-                    const float* r1 = out.ptr<float>() + out.stride[1] / sizeof(float);
-                    fprintf(stderr, "  POST-ATTN DBG: out_proj[0..2,0]=%.6f %.6f %.6f\n", r0[0], r0[1], r0[2]);
-                    fprintf(stderr, "  POST-ATTN DBG: out_proj[0..2,1]=%.6f %.6f %.6f\n", r1[0], r1[1], r1[2]);
-                    expect_layer0_residual = true;
-                } else if (wnode.params.str[0].find("model_layers_0_mlp_down_proj_weight.weights") != std::string::npos) {
-                    expect_layer1_input = true;
-                }
-            }
-        } else if (post_attn_dbg == 0 && expect_layer0_residual && node.op_type == OpType::ADD && out.shape[1] > 1) {
-            const float* r0 = out.ptr<float>();
-            const float* r1 = out.ptr<float>() + out.stride[1] / sizeof(float);
-            fprintf(stderr, "  POST-ATTN DBG: residual[0..2,0]=%.6f %.6f %.6f\n", r0[0], r0[1], r0[2]);
-            fprintf(stderr, "  POST-ATTN DBG: residual[0..2,1]=%.6f %.6f %.6f\n", r1[0], r1[1], r1[2]);
-            expect_layer0_residual = false;
-        } else if (post_attn_dbg == 0 && expect_layer1_input && node.op_type == OpType::ADD && out.shape[1] > 1) {
-            const float* r0 = out.ptr<float>();
-            const float* r1 = out.ptr<float>() + out.stride[1] / sizeof(float);
-            fprintf(stderr, "  LAYER1 INPUT DBG: x[0..2,0]=%.6f %.6f %.6f\n", r0[0], r0[1], r0[2]);
-            fprintf(stderr, "  LAYER1 INPUT DBG: x[0..2,1]=%.6f %.6f %.6f\n", r1[0], r1[1], r1[2]);
-            expect_layer1_input = false;
-            post_attn_dbg++;
-        }
-
         // release completed tensors
         for (uint32_t rel_id : ctx.release_queue[i]) {
             auto& t = tensors[rel_id];

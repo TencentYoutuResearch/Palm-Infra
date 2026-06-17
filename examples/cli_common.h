@@ -1,0 +1,54 @@
+#pragma once
+
+#include "engine/engine.h"
+#include "engine/tokenizer.h"
+
+#include <functional>
+#include <string>
+#include <vector>
+
+struct CliCommonOptions {
+    std::string tokenizer_path;
+    std::string artifacts_dir;
+    std::string prompt;
+    int max_new_tokens = 128;
+    int n_ctx = 4096;
+    int rope_dim = 64;
+    float rope_theta = 1600000.f;
+    int warmup = 1;
+};
+
+struct GenerationResult {
+    std::vector<int> token_ids;
+    std::string text;
+    double prefill_ms = 0.0;
+    double decode_ms = 0.0;
+    bool hit_eos = false;
+};
+
+struct GenerationMetrics {
+    int prompt_tokens = 0;
+    int generated_tokens = 0;
+    int decode_tokens = 0;
+    double ttft_ms = 0.0;
+    double tpot_ms = 0.0;
+    double prefill_tps = 0.0;
+    double decode_tps = 0.0;
+    double total_ms = 0.0;
+};
+
+bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
+                       std::string& error);
+void print_common_usage(const char* program_name, const char* extra_usage = nullptr);
+EngineConfig make_engine_config(const CliCommonOptions& opts);
+bool inspect_prefill_seq_len(const std::string& graph_path, int& seq_len,
+                             std::string& error);
+bool load_runtime(const CliCommonOptions& opts, Tokenizer& tokenizer,
+                  LLMEngine& engine, int& prefill_seq_len, std::string& error);
+std::string decode_piece(const Tokenizer& tokenizer, int token_id);
+GenerationMetrics compute_generation_metrics(size_t prompt_tokens,
+                                             const GenerationResult& result);
+bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
+                     const std::vector<int>& prompt_ids, int max_new_tokens,
+                     int eos_id, GenerationResult& result, std::string& error,
+                     const std::function<void(int, const std::string&)>& on_token = {});

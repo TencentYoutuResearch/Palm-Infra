@@ -81,8 +81,17 @@ endif()
 # ---------------------------------------------------------------------------
 
 if(MLLLM_BUILD_EXAMPLE)
-    add_executable(mlllm_example examples/main.cpp)
-    target_link_libraries(mlllm_example PRIVATE mlllm_lib)
+    add_executable(mlllm_chat
+        examples/main.cpp
+        examples/cli_common.cpp
+    )
+    target_link_libraries(mlllm_chat PRIVATE mlllm_lib)
+
+    add_executable(mlllm_bench
+        examples/bench.cpp
+        examples/cli_common.cpp
+    )
+    target_link_libraries(mlllm_bench PRIVATE mlllm_lib)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -110,6 +119,7 @@ if(MLLLM_BUILD_TESTS)
     add_mlllm_test(test_attention     tests/test_attention.cpp)
     add_mlllm_test(test_engine        tests/test_engine.cpp)
     add_mlllm_test(test_tokenizer     tests/test_tokenizer.cpp)
+    add_mlllm_test(test_e2e           tests/test_e2e.cpp)
 endif()
 
 # ---------------------------------------------------------------------------

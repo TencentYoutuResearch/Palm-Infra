@@ -109,8 +109,6 @@ bool Tokenizer::load(const std::string& path) {
     if (added_tokens_.count("<|end_of_text|>"))
         eos_id_ = added_tokens_["<|end_of_text|>"];
 
-    fprintf(stderr, "Tokenizer: %d vocab + %d added tokens, %d merges\n",
-           (int)vocab_obj.size(), (int)added_tokens_.size(), (int)merges_.size());
     return true;
 }
 
