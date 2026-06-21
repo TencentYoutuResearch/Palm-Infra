@@ -44,6 +44,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         // Helper: set up weight tensor.
         // Weight is stored as [N, K] row-major: W[n,k] = data[n*K + k].
         // The matmul uses B[n*K + k] directly (not B[n + k*stride]).
+        // If repacked, B is stored as [K, N] with stride K (interleaved by 8).
         auto setup_weight = [&](void* data) {
             t.prec = node.out_prec;
             int64_t dim0 = node.out_shape[0];  // N

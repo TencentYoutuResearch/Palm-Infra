@@ -275,6 +275,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     const float* b_ptr = B.ptr<float>();
     float* c_ptr = C.ptr<float>();
 
+    // K_weight is the stride between consecutive k rows in the repacked layout.
+    // For repacked [K, N]: K_weight = original N.
+    // For non-repacked [N, K]: K_weight = original K (the inner dim of B).
+    // We determine this by comparing K_weight with K: if they differ, it's repacked.
+    bool is_repacked = (K_weight != K);
+
     constexpr int tile_m = HAS_NEON ? 8 : 1;
     int n_threads = thread_pool ? thread_pool->num_threads() : 1;
 
@@ -295,23 +301,46 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     bool use_parallel = n_threads > 1 && n_chunks > 1;
 
     if (!use_parallel) {
-        matmul_fp32_range(a_ptr, b_ptr, c_ptr, M, N, K, lda, K_weight, ldc, 0, M);
+        if (is_repacked) {
+            matmul_fp32_neon_8x8_range(a_ptr, b_ptr, c_ptr, M, N, K, lda, K_weight, ldc, 0, M);
+        } else {
+            matmul_fp32_range(a_ptr, b_ptr, c_ptr, M, N, K, lda, K_weight, ldc, 0, M);
+        }
         return;
     }
 
-    if (shard_by_n) {
+    if (is_repacked) {
+        thread_pool->parallel_for(0, M, chunk_size,
+                                  [&](int, int m_begin, int m_end) {
+                                      matmul_fp32_neon_8x8_range(a_ptr, b_ptr, c_ptr,
+                                                                 M, N, K, lda, K_weight, ldc,
+                                                                 m_begin, m_end);
+                                  });
+    } else if (shard_by_n) {
         thread_pool->parallel_for(0, N, chunk_size,
                                   [&](int, int n_begin, int n_end) {
-                                      matmul_fp32_range_n(a_ptr, b_ptr, c_ptr,
-                                                          M, N, K, lda, K_weight, ldc,
-                                                          n_begin, n_end);
+                                      if (is_repacked) {
+                                          matmul_fp32_neon_8x8_range(a_ptr, b_ptr + n_begin, c_ptr + n_begin,
+                                                                     M, n_end - n_begin, K,
+                                                                     lda, K_weight, ldc, 0, M);
+                                      } else {
+                                          matmul_fp32_range_n(a_ptr, b_ptr, c_ptr,
+                                                              M, N, K, lda, K_weight, ldc,
+                                                              n_begin, n_end);
+                                      }
                                   });
     } else {
         thread_pool->parallel_for(0, M, chunk_size,
                                   [&](int, int m_begin, int m_end) {
-                                      matmul_fp32_range(a_ptr, b_ptr, c_ptr,
-                                                        M, N, K, lda, K_weight, ldc,
-                                                        m_begin, m_end);
+                                      if (is_repacked) {
+                                          matmul_fp32_neon_8x8_range(a_ptr, b_ptr, c_ptr,
+                                                                     M, N, K, lda, K_weight, ldc,
+                                                                     m_begin, m_end);
+                                      } else {
+                                          matmul_fp32_range(a_ptr, b_ptr, c_ptr,
+                                                            M, N, K, lda, K_weight, ldc,
+                                                            m_begin, m_end);
+                                      }
                                   });
     }
 }

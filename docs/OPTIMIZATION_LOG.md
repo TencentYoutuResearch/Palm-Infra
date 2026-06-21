@@ -106,3 +106,34 @@ K=2048 时 buffer 约 64KB。仅对 K > 64 启用。
 1. 在更外层做一次性 repack（不是 per-tile），或
 2. 用栈分配的固定大小 buffer（避免 heap 分配）
 
+---
+
+## 尝试 4：Load-time B repacking（一次性转置）
+
+**决策理由**：前次尝试 per-tile repack 开销太大。改为在 `LLMEngine::load_graph` 时
+一次性将所有权重从 row-major [N, K] 转置为 [K, N]，matmul 内核用 `vld1q_f32` 连续加载。
+repack 成本只在加载时付一次。
+
+**实现**：
+- `engine/engine.cpp`: 加载 mmap 后立即 `repacked[k*N+n] = src[n*K+k]`
+- `kernels/matmul.cpp`: 内核自动检测 `K_weight != K` 判断是否 repacked
+
+**结果 (vs 8×8 无 repack 基线)**：
+| 指标 | 8×8 基线 | Load-time repack | 变化 |
+|------|----------|-----------------|------|
+| load_ms | 328 | 5645 | **+1621%** |
+| prefill_tps | 7.02 | 5.56 | -21% |
+| decode_tps | 5.15 | 5.13 | ~持平 |
+| prefill MATMUL | 2426ms | 3326ms | **+37%** |
+| decode MATMUL | 503ms | 503ms | ~持平 |
+
+**结论**：加载时间暴涨 17 倍（~5.3GB 权重的 O(N*K) 转置），但推理速度反而下降。
+根因：repacked [K, N] layout 虽然让 B 加载连续了，但每次访问 `B[k*N + n]` 时
+N 很大（如 2048），跨 K 步长从原来的 K 变成了 N，对 cache 反而不利。
+decode 持平说明 repack 对小 shape 确实没帮助。
+
+**决定**：**不采用**。当前最优方案仍是 8×8 tile + K_BLOCK=512 无 repack。
+
+**教训**：对于 FP32 权重、K ≈ N 的场景，简单的 gather 加载（4 个 float 从 stride-K 取）
+在 Apple Silicon 上已经足够高效，transpose repack 的 cache 副作用反而更差。
+
