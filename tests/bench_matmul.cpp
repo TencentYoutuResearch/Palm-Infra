@@ -28,6 +28,9 @@ struct BenchConfig {
     int num_threads = 1;
     int warmup = 3;
     int repeat = 10;
+    int k_block = 0;       // 0 = use default (256)
+    int chunk_size = 0;    // 0 = use adaptive
+    bool disable_k_block = false;
 };
 
 struct BenchResult {
@@ -91,6 +94,20 @@ static BenchConfig parse_args(int argc, char** argv) {
             std::printf("M=1 K=2048 N=128256\n");
             std::printf("M=128 K=2048 N=128256\n");
             std::exit(0);
+        } else if (arg == "--k-block") {
+            if (!require_value(argc, argv, i, "--k-block", value)) std::exit(1);
+            if (!parse_int(value, cfg.k_block) || cfg.k_block < 0) {
+                std::fprintf(stderr, "bench_matmul: invalid --k-block\n");
+                std::exit(1);
+            }
+        } else if (arg == "--chunk-size") {
+            if (!require_value(argc, argv, i, "--chunk-size", value)) std::exit(1);
+            if (!parse_int(value, cfg.chunk_size) || cfg.chunk_size < 1) {
+                std::fprintf(stderr, "bench_matmul: invalid --chunk-size\n");
+                std::exit(1);
+            }
+        } else if (arg == "--no-k-block") {
+            cfg.disable_k_block = true;
         } else {
             // positional: M K N
             static int pos = 0;
@@ -107,6 +124,16 @@ static BenchConfig parse_args(int argc, char** argv) {
 
 static BenchResult run_bench(const BenchConfig& cfg) {
     int M = cfg.M, K = cfg.K, N = cfg.N;
+
+    // Apply config overrides
+    if (cfg.disable_k_block) {
+        g_matmul_config.k_block = 0;
+    } else if (cfg.k_block > 0) {
+        g_matmul_config.k_block = cfg.k_block;
+    }
+    if (cfg.chunk_size > 0) {
+        g_matmul_config.gemv_chunk_size = cfg.chunk_size;
+    }
 
     float* a_data = new float[M * K];
     float* b_data = new float[N * K];

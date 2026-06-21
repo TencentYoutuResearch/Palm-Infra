@@ -4,6 +4,14 @@
 
 class ThreadPool;
 
+// Runtime-configurable matmul parameters (for benchmarking).
+struct MatmulConfig {
+    int k_block = 512;          // 0 = disable K-blocking
+    int gemv_chunk_size = 64;   // chunk size for M==1 or N==1 shapes
+};
+
+extern MatmulConfig g_matmul_config;
+
 // ---------------------------------------------------------------------------
 // PROJECT_NAME — Matmul kernels
 //

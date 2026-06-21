@@ -3,6 +3,8 @@
 
 #include <algorithm>
 
+MatmulConfig g_matmul_config;
+
 // ---------------------------------------------------------------------------
 // NEON intrinsics (ARM only)
 // ---------------------------------------------------------------------------
@@ -55,7 +57,7 @@ static void matmul_fp32_neon_4x4_range(const float* A, const float* B, float* C,
     //   per K-step: B loads 4 floats  → 16 bytes
     //               A loads 1 scalar  → 4 bytes
     //   4096 / 16 ≈ 256, so K_BLOCK = 256 is a reasonable default.
-    constexpr int K_BLOCK = 256;
+    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
 
     for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK) {
         int k_end = std::min(k_outer + K_BLOCK, K);
@@ -208,7 +210,7 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     // For GEMV-like shapes, use a larger chunk to reduce per-chunk overhead.
     int chunk_size = tile_m;
     if (M == 1 || N == 1) {
-        chunk_size = 64;
+        chunk_size = g_matmul_config.gemv_chunk_size;
     }
 
     int total_dim = shard_by_n ? N : M;
