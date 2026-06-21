@@ -68,3 +68,41 @@ GEMV（M=1）基本持平。
 
 **决定**：**采用 8×8 tile 作为默认**。
 
+---
+
+## 尝试 3：B repacking（interleaved layout）
+
+**决策理由**：当前 B 是 row-major [N, K]，内层加载 8 个 B 值需要 gather（stride K_weight）。
+Repacking 把每个 8×K_BLOCK 子块转置，使得对固定 k，n..n+7 列的值在内存中连续，
+可以用单条 `vld1q_f32` 代替栈临时数组 + gather。
+
+**实现**：每个 8 列 panel 做一次 repack：`repacked[k*8 + j] = B[(n+j)*K_weight + k]`。
+K=2048 时 buffer 约 64KB。仅对 K > 64 启用。
+
+**结果 (microbench vs 8×8 baseline)**：
+| Shape | 8×8 基线 | B repack | 变化 |
+|-------|----------|----------|------|
+| 128×2048×6144 t=1 | 84.87ms | 78.19ms | -8% |
+| 128×2048×6144 t=4 | 22.38ms | 20.89ms | -7% |
+| 1×2048×2048 t=1 | 1.04ms | 1.35ms | +30% |
+| 1×2048×128k t=4 | 22.51ms | 27.40ms | +22% |
+
+**结果 (端到端 vs 8×8 baseline, 4 threads)**：
+| 指标 | 8×8 基线 | B repack | 变化 |
+|------|----------|----------|------|
+| prefill_tps | 7.02 | 6.20 | -12% |
+| decode_tps | 5.15 | 4.09 | -21% |
+| prefill MATMUL | 2426ms | 2908ms | +20% |
+
+**结论**：microbench 上大 matmul 有微弱提升（-7~8%），但小 matmul 和 lm_head 明显退化（+22~30%）。
+端到端 prefill 和 decode 都变差了。根因分析：
+- repack 本身的 cost（per-tile 拷贝）抵消了加载收益
+- 对于 GEMV 场景（M=1），repack 开销占比太高
+- 8×8 tile 已经在一定程度上摊销了 B 的 gather 成本，repack 的增量收益有限
+- 在多线程场景下，repack 的堆分配（new/delete）引入了额外开销
+
+**决定**：**不采用，已回滚到 8×8 无 repack 版本**。
+如果未来要做 repack，需要：
+1. 在更外层做一次性 repack（不是 per-tile），或
+2. 用栈分配的固定大小 buffer（避免 heap 分配）
+
