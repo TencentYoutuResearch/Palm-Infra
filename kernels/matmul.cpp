@@ -41,22 +41,99 @@ static void matmul_fp32_scalar_range(const float* A, const float* B, float* C,
 }
 
 // ---------------------------------------------------------------------------
-// NEON matmul — TILE_M=4, TILE_N=4
+// NEON matmul — TILE_M=8, TILE_N=8
+//
+// Rationale: a larger tile (8x8 vs 4x4) amortises the cost of B's scatter
+// gather across more output elements per inner-loop iteration.  Each K step
+// loads 8 B values (two vld1q_f32) and broadcasts them to 8 A rows via
+// 16 vfmaq_n_f32, for a 2:1 compute-to-load ratio (vs 1:1 for the 4x4 tile).
 // ---------------------------------------------------------------------------
 #if HAS_NEON
 
+static void matmul_fp32_neon_8x8_range(const float* A, const float* B, float* C,
+                                       int M, int N, int K,
+                                       int lda, int K_weight, int ldc,
+                                       int m_begin, int m_end) {
+    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
+
+    for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK) {
+        int k_end = std::min(k_outer + K_BLOCK, K);
+
+        for (int m = m_begin; m < m_end; m += 8) {
+            int m_tile_end = std::min(m + 8, m_end);
+            int m_global_end = std::min(m + 8, M);
+
+            for (int n = 0; n < N; n += 8) {
+                int n_end = std::min(n + 8, N);
+
+                float32x4_t c[8][2]; // c[row][col_hi/lo]: hi=cols 0-3, lo=cols 4-7
+                bool first_block = (k_outer == 0);
+                if (first_block) {
+                    for (int r = 0; r < 8; r++) {
+                        c[r][0] = vdupq_n_f32(0.f);
+                        c[r][1] = vdupq_n_f32(0.f);
+                    }
+                } else {
+                    for (int r = 0; r < 8; r++) {
+                        int row = m + r;
+                        if (row < m_tile_end && row < m_global_end) {
+                            c[r][0] = vld1q_f32(&C[row * ldc + n]);
+                            if (n + 4 < n_end) {
+                                c[r][1] = vld1q_f32(&C[row * ldc + n + 4]);
+                            } else {
+                                c[r][1] = vdupq_n_f32(0.f);
+                            }
+                        } else {
+                            c[r][0] = vdupq_n_f32(0.f);
+                            c[r][1] = vdupq_n_f32(0.f);
+                        }
+                    }
+                }
+
+                for (int k = k_outer; k < k_end; k++) {
+                    // Load B columns n..n+3
+                    float tmp_b0[4] = {0.f, 0.f, 0.f, 0.f};
+                    float tmp_b1[4] = {0.f, 0.f, 0.f, 0.f};
+                    for (int j = 0; j < 4 && n + j < n_end; j++) {
+                        tmp_b0[j] = B[(n + j) * K_weight + k];
+                    }
+                    for (int j = 0; j < 4 && n + 4 + j < n_end; j++) {
+                        tmp_b1[j] = B[(n + 4 + j) * K_weight + k];
+                    }
+                    float32x4_t b0 = vld1q_f32(tmp_b0);
+                    float32x4_t b1 = vld1q_f32(tmp_b1);
+
+                    for (int r = 0; r < 8; r++) {
+                        int row = m + r;
+                        if (row < m_tile_end && row < m_global_end) {
+                            float a_val = A[k + row * lda];
+                            c[r][0] = vfmaq_n_f32(c[r][0], b0, a_val);
+                            c[r][1] = vfmaq_n_f32(c[r][1], b1, a_val);
+                        }
+                    }
+                }
+
+                // Write back
+                for (int r = 0; r < 8; r++) {
+                    int row = m + r;
+                    if (row < m_tile_end && row < m_global_end) {
+                        float tmp[4];
+                        vst1q_f32(tmp, c[r][0]);
+                        for (int j = 0; j < 4 && n + j < n_end; j++) C[row * ldc + n + j] = tmp[j];
+                        vst1q_f32(tmp, c[r][1]);
+                        for (int j = 0; j < 4 && n + 4 + j < n_end; j++) C[row * ldc + n + 4 + j] = tmp[j];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- legacy 4x4 tile (kept for reference) ----
 static void matmul_fp32_neon_4x4_range(const float* A, const float* B, float* C,
                                        int M, int N, int K,
                                        int lda, int K_weight, int ldc,
                                        int m_begin, int m_end) {
-    // K-blocking: split K into blocks that fit in L1 cache.
-    // A typical L1 data cache is 32-64 KB.  Each K-step touches 4 rows of A
-    // (one scalar per row) and up to 4 columns of B (4 floats).  Keeping
-    // the working set around 16 KB is safe.  With float32 elements:
-    //   16 KB / 4 bytes = 4096 elements
-    //   per K-step: B loads 4 floats  → 16 bytes
-    //               A loads 1 scalar  → 4 bytes
-    //   4096 / 16 ≈ 256, so K_BLOCK = 256 is a reasonable default.
     const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
 
     for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK) {
@@ -152,7 +229,7 @@ static void matmul_fp32_range(const float* A, const float* B, float* C,
                               int lda, int K_weight, int ldc,
                               int m_begin, int m_end) {
 #if HAS_NEON
-    matmul_fp32_neon_4x4_range(A, B, C, M, N, K, lda, K_weight, ldc, m_begin, m_end);
+    matmul_fp32_neon_8x8_range(A, B, C, M, N, K, lda, K_weight, ldc, m_begin, m_end);
 #else
     matmul_fp32_scalar_range(A, B, C, M, N, K, lda, K_weight, ldc, m_begin, m_end);
 #endif
@@ -165,10 +242,10 @@ static void matmul_fp32_range_n(const float* A, const float* B, float* C,
                                 int lda, int K_weight, int ldc,
                                 int n_begin, int n_end) {
 #if HAS_NEON
-    // Decompose into the existing 4x4 NEON kernel by limiting N range.
+    // Decompose into the existing 8x8 NEON kernel by limiting N range.
     // We pass the full M range but only the [n_begin, n_end) columns of C.
     // The NEON kernel writes to C[row * ldc + col], so we offset C by n_begin.
-    matmul_fp32_neon_4x4_range(A, B + n_begin * K_weight, C + n_begin,
+    matmul_fp32_neon_8x8_range(A, B + n_begin * K_weight, C + n_begin,
                                M, n_end - n_begin, K,
                                lda, K_weight, ldc,
                                0, M);
@@ -198,7 +275,7 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     const float* b_ptr = B.ptr<float>();
     float* c_ptr = C.ptr<float>();
 
-    constexpr int tile_m = HAS_NEON ? 4 : 1;
+    constexpr int tile_m = HAS_NEON ? 8 : 1;
     int n_threads = thread_pool ? thread_pool->num_threads() : 1;
 
     // Decide sharding dimension adaptively, similar to ggml:
