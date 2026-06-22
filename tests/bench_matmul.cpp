@@ -31,6 +31,10 @@ struct BenchConfig {
     int k_block = 0;       // 0 = use default (256)
     int chunk_size = 0;    // 0 = use adaptive
     bool disable_k_block = false;
+    bool use_fp16 = false; // FP16 weight storage
+    bool use_fp32 = false; // explicitly FP32 (default)
+    bool interleave_pack = true;   // B interleaved packing (FP16 only)
+    bool no_interleave_pack = false;
 };
 
 struct BenchResult {
@@ -108,6 +112,14 @@ static BenchConfig parse_args(int argc, char** argv) {
             }
         } else if (arg == "--no-k-block") {
             cfg.disable_k_block = true;
+        } else if (arg == "--fp16") {
+            cfg.use_fp16 = true;
+        } else if (arg == "--fp32") {
+            cfg.use_fp32 = true;
+        } else if (arg == "--interleave-pack") {
+            cfg.interleave_pack = true;
+        } else if (arg == "--no-interleave-pack") {
+            cfg.no_interleave_pack = true;
         } else {
             // positional: M K N
             static int pos = 0;
@@ -134,15 +146,38 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     if (cfg.chunk_size > 0) {
         g_matmul_config.gemv_chunk_size = cfg.chunk_size;
     }
+    if (cfg.no_interleave_pack) {
+        g_matmul_config.use_interleave_pack = false;
+    } else {
+        g_matmul_config.use_interleave_pack = cfg.interleave_pack;
+    }
+
+    bool is_fp16 = cfg.use_fp16;
 
     float* a_data = new float[M * K];
-    float* b_data = new float[N * K];
     float* c_data = new float[M * N];
     fill_rand(a_data, M * K);
-    fill_rand(b_data, N * K);
+
+    void* b_raw = nullptr;
+    float* b_fp32_data = nullptr;
+    __fp16* b_fp16_data = nullptr;
+
+    if (is_fp16) {
+        b_fp16_data = new __fp16[N * K];
+        float* tmp = new float[N * K];
+        fill_rand(tmp, N * K);
+        for (int i = 0; i < N * K; i++) b_fp16_data[i] = (__fp16)tmp[i];
+        delete[] tmp;
+        b_raw = b_fp16_data;
+    } else {
+        b_fp32_data = new float[N * K];
+        fill_rand(b_fp32_data, N * K);
+        b_raw = b_fp32_data;
+    }
 
     Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-    Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+    Tensor B = Tensor::create(is_fp16 ? Precision::FP16 : Precision::FP32,
+                              MemoryType::EXTERNAL, N, K, 1, 1, b_raw);
     Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
     ThreadPool pool(cfg.num_threads);
@@ -179,8 +214,9 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     result.gflops = (result.avg_ms > 0.0) ? (flops / (result.avg_ms * 1e6)) : 0.0;
 
     delete[] a_data;
-    delete[] b_data;
     delete[] c_data;
+    if (is_fp16) delete[] b_fp16_data;
+    else delete[] b_fp32_data;
     return result;
 }
 
@@ -189,7 +225,8 @@ int main(int argc, char** argv) {
     BenchConfig cfg = parse_args(argc, argv);
     BenchResult result = run_bench(cfg);
 
-    std::printf("M=%d K=%d N=%d threads=%d\n", cfg.M, cfg.K, cfg.N, cfg.num_threads);
+    std::printf("M=%d K=%d N=%d threads=%d prec=%s\n", cfg.M, cfg.K, cfg.N, cfg.num_threads,
+                cfg.use_fp16 ? "FP16" : "FP32");
     std::printf("  warmup=%d repeat=%d\n", cfg.warmup, cfg.repeat);
     std::printf("  avg=%.2fms min=%.2fms max=%.2fms p50=%.2fms\n",
                 result.avg_ms, result.min_ms, result.max_ms, result.p50_ms);

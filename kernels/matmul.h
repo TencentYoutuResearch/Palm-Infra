@@ -8,6 +8,7 @@ class ThreadPool;
 struct MatmulConfig {
     int k_block = 512;          // 0 = disable K-blocking
     int gemv_chunk_size = 64;   // chunk size for M==1 or N==1 shapes
+    bool use_interleave_pack = true;  // B interleaved packing for FP16
 };
 
 extern MatmulConfig g_matmul_config;

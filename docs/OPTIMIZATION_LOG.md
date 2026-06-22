@@ -233,18 +233,92 @@ FP16 直接减半了 B 的内存流量。prefill 提升不大说明 compute boun
 | B repacking (load-time) | -21% | cache 副作用 > 加载收益 |
 | K 展开 (FP16) | 0~7% 退化 | 同上，B gather+vcvt 是瓶颈 |
 
+---
+
+## 尝试 7：A 加载 SIMD 化 (vld1q + vgetq_lane + vfmaq_n)
+
+**决策理由**：当前 K 循环内 A 的加载是 8 次标量 load（`a_val = A[k + row * lda]`），
+但同一 k 下 A[m..m+7][k] 在内存中是连续的（A 为列主序 [K, M]）。
+改为用 `vld1q_f32` 一次加载 4 个连续 A 值到 NEON 寄存器，
+用 `vgetq_lane_f32` 提取标量，保持 `vfmaq_n_f32` 不变。
+理论上减少 8 次内存 load → 2 次向量 load。
+
+**结果 (FP32 vs 基线)**：
+| Shape | 基线 (标量A) | SIMD A load | 变化 |
+|-------|-------------|-------------|------|
+| 128×2048×6144 t=1 | 85.15ms (37.8GF) | 63.86ms (50.4GF) | **-25%** |
+| 128×2048×6144 t=4 | 22.42ms (143.7GF) | 16.09ms (200.2GF) | **-28%** |
+| 1×2048×2048 t=1 | 1.02ms (8.2GF) | 1.32ms (6.3GF) | +29% |
+| 1×2048×128k t=4 | 22.81ms (23.0GF) | 24.77ms (21.2GF) | +8.6% |
+
+**结果 (FP16 vs 基线)**：
+| Shape | 基线 (标量A) | SIMD A load | 变化 |
+|-------|-------------|-------------|------|
+| 128×2048×6144 t=1 | 60.79ms (53.0GF) | 62.47ms (51.6GF) | +2.8% |
+| 128×2048×6144 t=4 | 15.74ms (204.6GF) | 15.77ms (204.3GF) | ~持平 |
+| 1×2048×2048 t=1 | 1.09ms (7.7GF) | 1.26ms (6.6GF) | +15.6% |
+| 1×2048×128k t=4 | 17.78ms (29.5GF) | 21.87ms (24.0GF) | **+23%** |
+
+**结论**：FP32 GEMM 有效（-25~28%），但 FP16 场景无效（持平或退化）。
+根因：`vgetq_lane_f32` 涉及 NEON→通用寄存器传输，有额外延迟；
+FP16 场景下 B 的 gather+vcvt 已经是瓶颈，A 的加载方式不是瓶颈；
+GEMV (M=1) 场景退化最严重（+23%），因为 8 个 lane 只有 1 个有效。
+
+**决定**：**不采用**。当前默认路径是 FP16，此优化对 FP16 无效且 GEMV 退化。
+保留代码作为 FP32 fallback 的优化参考。
+
+---
+
+## 尝试 8：B Interleaved Packing (tile-of-8 transpose)
+
+**决策理由**：当前 B 是 row-major [N, K]，内层加载 8 个 B 值需要 gather（stride K_weight）。
+改为在 K_BLOCK 外层将每个 K_BLOCK 切片按 tile-of-8 转置：
+`B_packed[tile_base + k*8 + j] = B_original[(n_tile + j) * K_weight + k]`
+使得固定 k 下 8 个 B 值连续 → 用 `vld1q_f16` 一条指令加载，无需 gather。
+Packing 用 thread_local 堆缓冲，按需扩容复用。
+
+**实现**：
+- `kernels/matmul.h`: 新增 `use_interleave_pack` 配置标志
+- `kernels/matmul.cpp`: 新增 `pack_b_interleaved` + `matmul_fp16_neon_8x8_range_packed`
+- `kernel_matmul_fp32`: 当 FP16 + NEON + M>=8 时走 packed 路径
+- M=1 (GEMV) 自动回退，因为 packing 开销 > 计算收益
+
+**结果 (FP16 vs 基线, M>=8 启用)**：
+| Shape | 基线 | Interleave Pack | 变化 |
+|-------|------|-----------------|------|
+| 128×2048×6144 t=1 | 60.47ms (53.3GF) | 32.44ms (99.3GF) | **-46%** |
+| 128×2048×6144 t=4 | 15.82ms (203.7GF) | 11.54ms (279.3GF) | **-27%** |
+| 1×2048×2048 t=1 | 1.05ms | 1.06ms | ~持平 (回退) |
+| 1×2048×128k t=4 | 17.77ms | 17.78ms | ~持平 (回退) |
+
+**结果 (端到端 Youtu-LLM-2B, 4 threads)**：
+| 指标 | 基线 | Interleave | 变化 |
+|------|------|-----------|------|
+| prefill_tps | 7.55 | 8.54 | **+13%** |
+| decode_tps | 6.07 | 6.27 | +3.3% |
+| prefill MATMUL | 1986ms | 1751ms | **-12%** |
+| decode MATMUL | 17159ms | 16616ms | -3.2% |
+
+**结论**：**显著有效**。GEMM 场景（prefill 的 MATMUL 占 80%+）单线程 -46%，多线程 -27%。
+GFLOPS 从 203 提升到 279。GEMV 自动回退无退化。
+
+**决定**：**采用。M>=8 启用 interleaved packing 作为默认。**
+
+---
+
 ## 当前最优配置
 
 - **TILE**: 8×8 (NEON)
 - **K_BLOCK**: 512
 - **精度**: FP16 权重 + FP32 累加
+- **B packing**: Interleaved (tile-of-8 transpose), M>=8 启用
 - **线程**: 自定义线程池, per-op split work
 - **分片**: 自适应 (M vs N 维度)
-- **无**: repack, K 展开
+- **无**: repack, K 展开, A SIMD load
 
 ## 下一步方向
 
-1. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only fallback）
-2. **SDPA 优化** — prefill 占 14%, naive O(n²)
-3. **量化 (INT4/INT8)** — 最大杠杆，预计 3-5x
-4. **其他算子并行** — RMSNorm, SiLU 等（当前占比小，优先级低）
+1. **SDPA 优化** — prefill 占 14%, naive O(n²)
+2. **量化 (INT4/INT8)** — 最大杠杆，预计 3-5x
+3. **其他算子并行** — RMSNorm, SiLU 等（当前占比小，优先级低）
+4. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）

@@ -215,6 +215,77 @@ int main() {
         delete[] a_data; delete[] b_data; delete[] c_data; delete[] ref_c;
     }
 
+    // ---- FP16 tests with interleaved packing ----
+    {
+        // Helper to create FP16 B tensor and run matmul
+        auto test_fp16 = [&](int M, int K, int N, const char* label) {
+            float* a_data = new float[M * K];
+            __fp16* b_data = new __fp16[N * K];
+            float* c_data = new float[M * N];
+            float* ref_c  = new float[M * N];
+            float* tmp_b  = new float[N * K];
+
+            fill_rand(a_data, M * K);
+            fill_rand(tmp_b, N * K);
+            for (int i = 0; i < N * K; i++) b_data[i] = (__fp16)tmp_b[i];
+
+            Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
+            Tensor B = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+            Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
+
+            // Enable interleaved packing
+            g_matmul_config.use_interleave_pack = true;
+            kernel_matmul_fp32(A, B, C);
+
+            ref_matmul(a_data, tmp_b, ref_c, M, N, K);
+
+            // Use larger tolerance for FP16 due to truncation error accumulation
+            float tol = 1e-2f;
+            CHECK(check_approx(c_data, ref_c, M * N, tol), label);
+
+            delete[] a_data; delete[] b_data; delete[] c_data; delete[] ref_c; delete[] tmp_b;
+        };
+
+        test_fp16(32, 256, 128, "FP16 32x256 * 256x128 (interleave)");
+        test_fp16(1, 256, 64, "FP16 1x256 * 256x64 GEMV (interleave)");
+        test_fp16(4, 8, 3, "FP16 4x8 * 8x3 odd N (interleave)");
+        test_fp16(4, 8, 5, "FP16 4x8 * 8x5 odd N (interleave)");
+        test_fp16(4, 8, 7, "FP16 4x8 * 8x7 odd N (interleave)");
+        test_fp16(4, 8, 9, "FP16 4x8 * 8x9 N=9 (interleave)");
+        test_fp16(4, 8, 16, "FP16 4x8 * 8x16 N=16 (interleave)");
+        test_fp16(1, 8, 3, "FP16 1x8 * 8x3 GEMV odd N (interleave)");
+    }
+
+    // ---- FP16 with interleave disabled (fallback path) ----
+    {
+        int M = 32, K = 256, N = 128;
+        float* a_data = new float[M * K];
+        __fp16* b_data = new __fp16[N * K];
+        float* c_data = new float[M * N];
+        float* ref_c  = new float[M * N];
+        float* tmp_b  = new float[N * K];
+
+        fill_rand(a_data, M * K);
+        fill_rand(tmp_b, N * K);
+        for (int i = 0; i < N * K; i++) b_data[i] = (__fp16)tmp_b[i];
+
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
+        Tensor B = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
+
+        // Disable interleaved packing
+        g_matmul_config.use_interleave_pack = false;
+        kernel_matmul_fp32(A, B, C);
+
+        ref_matmul(a_data, tmp_b, ref_c, M, N, K);
+        CHECK(check_approx(c_data, ref_c, M * N, 1e-2f), "FP16 32x256 * 256x128 (no interleave)");
+
+        delete[] a_data; delete[] b_data; delete[] c_data; delete[] ref_c; delete[] tmp_b;
+
+        // Restore default
+        g_matmul_config.use_interleave_pack = true;
+    }
+
     if (failures == 0) {
         printf("\nAll matmul tests passed!\n");
     } else {
