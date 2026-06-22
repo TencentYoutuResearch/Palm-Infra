@@ -97,39 +97,20 @@ static void matmul_fp16_neon_8x8_range(const float* A, const __fp16* B, float* C
 
                 for (int k = k_outer; k < k_end; k++) {
                     // Load 8 FP16 B values, convert to FP32.
-                    // Row-major [N, K]: B[n,k] = data[n*K_weight + k] (gather).
-                    // Repacked [K, N]: B[n,k] = data[k*K_weight + n] (contiguous).
-                    bool is_repacked = (K_weight != K);
-
                     float32x4_t b0, b1;
-                    if (is_repacked) {
-                        // Contiguous load from repacked [K, N].
-                        float16x8_t h = vld1q_f16(&B[k * K_weight + n]);
-                        b0 = vcvt_f32_f16(vget_low_f16(h));
-                        if (n + 4 < n_end) {
-                            b1 = vcvt_f32_f16(vget_high_f16(h));
-                        } else {
-                            b1 = vdupq_n_f32(0.f);
+                    {
+                        __fp16 tmp[4] = {(__fp16)0.f, (__fp16)0.f, (__fp16)0.f, (__fp16)0.f};
+                        for (int j = 0; j < 4 && n + j < n_end; j++) {
+                            tmp[j] = B[(n + j) * K_weight + k];
                         }
-                    } else {
-                        // Gather from row-major [N, K].
-                        float16x4_t h0, h1;
-                        {
-                            __fp16 tmp[4] = {(__fp16)0.f, (__fp16)0.f, (__fp16)0.f, (__fp16)0.f};
-                            for (int j = 0; j < 4 && n + j < n_end; j++) {
-                                tmp[j] = B[(n + j) * K_weight + k];
-                            }
-                            h0 = vld1_f16(tmp);
+                        b0 = vcvt_f32_f16(vld1_f16(tmp));
+                    }
+                    {
+                        __fp16 tmp[4] = {(__fp16)0.f, (__fp16)0.f, (__fp16)0.f, (__fp16)0.f};
+                        for (int j = 0; j < 4 && n + 4 + j < n_end; j++) {
+                            tmp[j] = B[(n + 4 + j) * K_weight + k];
                         }
-                        {
-                            __fp16 tmp[4] = {(__fp16)0.f, (__fp16)0.f, (__fp16)0.f, (__fp16)0.f};
-                            for (int j = 0; j < 4 && n + 4 + j < n_end; j++) {
-                                tmp[j] = B[(n + 4 + j) * K_weight + k];
-                            }
-                            h1 = vld1_f16(tmp);
-                        }
-                        b0 = vcvt_f32_f16(h0);
-                        b1 = vcvt_f32_f16(h1);
+                        b1 = vcvt_f32_f16(vld1_f16(tmp));
                     }
 
                     for (int r = 0; r < 8; r++) {
