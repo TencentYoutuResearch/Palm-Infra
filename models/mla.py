@@ -53,8 +53,9 @@ def load_safetensors(path: str) -> dict[str, np.ndarray]:
             }[dtype_str]
             arr = np.frombuffer(data, dtype=np_dtype).reshape(shape)
             if dtype_str == 'F16':
-                arr = arr.astype(np.float32)
+                arr = arr.astype(np.float16)  # keep FP16
             elif dtype_str == 'BF16':
+                # BF16 → FP32 (no native FP16 BF16 support)
                 as_u32 = arr.astype(np.uint32) << 16
                 arr = as_u32.view(np.float32)
             tensors[name] = arr
@@ -69,13 +70,15 @@ def export_weights(weights: dict, weights_dir: str):
         wpath = os.path.join(weights_dir, f"{name}.weights")
         _write_weight_file(wpath, data)
 
-    # All projection weights (non-norm)
+    # All projection weights (non-norm) — keep as FP16.
     for wname, wdata in weights.items():
         if 'layernorm' in wname.lower() or 'norm' in wname.lower():
             continue
         if 'embed_tokens' in wname:
             continue
-        save(wname.replace('.', '_'), wdata)
+        # Convert to float16 for FP16 storage.
+        d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
+        save(wname.replace('.', '_'), d)
 
     # embed_tokens as FP32 for lookup
     embed_w = weights['model.embed_tokens.weight'].astype(np.float32)
@@ -173,7 +176,7 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
 
     # ---- Q path ----
     w_q_a = g.weight(os.path.join(weights_dir, f"{pfx.replace('.', '_')}_q_a_proj_weight.weights"),
-                     (q_lora_rank, hidden_size), Precision.FP32)
+                     (q_lora_rank, hidden_size), Precision.FP16)
     q_comp = g.matmul(x_normed, w_q_a)
 
     w_q_a_norm = g.weight(os.path.join(weights_dir, f"{pfx.replace('.', '_')}_q_a_layernorm_weight.weights"),
@@ -181,7 +184,7 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     q_comp = g.rms_norm(q_comp, w_q_a_norm, eps=eps)
 
     w_q_b = g.weight(os.path.join(weights_dir, f"{pfx.replace('.', '_')}_q_b_proj_weight.weights"),
-                     (num_heads * qk_head_dim, q_lora_rank), Precision.FP32)
+                     (num_heads * qk_head_dim, q_lora_rank), Precision.FP16)
     q = g.matmul(q_comp, w_q_b)
 
     # reshape + permute: (num_heads*qk_head_dim, seq) → [hd, seq, heads]
@@ -192,7 +195,7 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
 
     # ---- KV path ----
     w_kv_a = g.weight(os.path.join(weights_dir, f"{pfx.replace('.', '_')}_kv_a_proj_with_mqa_weight.weights"),
-                      (kv_lora_rank + qk_rope_dim, hidden_size), Precision.FP32)
+                      (kv_lora_rank + qk_rope_dim, hidden_size), Precision.FP16)
     kv = g.matmul(x_normed, w_kv_a)
     kv_compressed, k_rope_raw = g.slice(kv, [kv_lora_rank, qk_rope_dim], dim=0)
 
@@ -201,7 +204,7 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     kv_normed = g.rms_norm(kv_compressed, w_kv_a_norm, eps=eps)
 
     w_kv_b = g.weight(os.path.join(weights_dir, f"{pfx.replace('.', '_')}_kv_b_proj_weight.weights"),
-                      (num_heads * (qk_nope_dim + v_head_dim), kv_lora_rank), Precision.FP32)
+                      (num_heads * (qk_nope_dim + v_head_dim), kv_lora_rank), Precision.FP16)
     kv_expanded = g.matmul(kv_normed, w_kv_b)
     kv_expanded = g.reshape(kv_expanded, (num_heads * (qk_nope_dim + v_head_dim), seq_len))
     kv_expanded = g.reshape(kv_expanded, (qk_nope_dim + v_head_dim, num_heads, seq_len))
@@ -229,7 +232,7 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     attn_out = g.permute(attn_out, (0, 2, 1, 3))  # [v, heads, seq]
     attn_out = g.reshape(attn_out, (num_heads * v_head_dim, seq_len))
     w_o = g.weight(os.path.join(weights_dir, f"{pfx.replace('.', '_')}_o_proj_weight.weights"),
-                   (hidden_size, num_heads * v_head_dim), Precision.FP32)
+                   (hidden_size, num_heads * v_head_dim), Precision.FP16)
     out = g.matmul(attn_out, w_o)
     x = g.add(x, out)
 
@@ -241,11 +244,11 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     x_normed2 = g.rms_norm(x, w_ln2, eps=eps)
 
     w_gate = g.weight(os.path.join(weights_dir, f"{mlp_pfx.replace('.', '_')}_gate_proj_weight.weights"),
-                      (cfg_intermediate_size(cfg), hidden_size), Precision.FP32)
+                      (cfg_intermediate_size(cfg), hidden_size), Precision.FP16)
     w_up   = g.weight(os.path.join(weights_dir, f"{mlp_pfx.replace('.', '_')}_up_proj_weight.weights"),
-                      (cfg_intermediate_size(cfg), hidden_size), Precision.FP32)
+                      (cfg_intermediate_size(cfg), hidden_size), Precision.FP16)
     w_down = g.weight(os.path.join(weights_dir, f"{mlp_pfx.replace('.', '_')}_down_proj_weight.weights"),
-                      (hidden_size, cfg_intermediate_size(cfg)), Precision.FP32)
+                      (hidden_size, cfg_intermediate_size(cfg)), Precision.FP16)
 
     gate = g.matmul(x_normed2, w_gate)
     up   = g.matmul(x_normed2, w_up)

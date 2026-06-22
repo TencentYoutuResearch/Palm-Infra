@@ -137,3 +137,29 @@ decode 持平说明 repack 对小 shape 确实没帮助。
 **教训**：对于 FP32 权重、K ≈ N 的场景，简单的 gather 加载（4 个 float 从 stride-K 取）
 在 Apple Silicon 上已经足够高效，transpose repack 的 cache 副作用反而更差。
 
+---
+
+## 尝试 5：FP16 存储 + FP32 累加
+
+**决策理由**：模型原始权重是 BF16，之前导出时全部转成了 FP32，浪费了 2x 内存带宽。
+改为权重 FP16 存储，matmul 内层用 NEON `vld1q_f16` + `vcvt_f32_f16` 解量化到 FP32 再 FMA。
+
+**实现**：
+- `models/mla.py`: 投影权重保持 FP16 导出（`astype(np.float16)`）
+- `kernels/matmul.cpp`: 新增 `matmul_fp16_neon_8x8_range`，用 `float16x8_t vld1q_f16` 一次加载 8 个 FP16
+- `kernel_matmul_fp32`: 检测 `B.prec == FP16` 自动走 FP16 路径
+
+**结果 (vs FP32 8×8 基线, 4 threads)**：
+| 指标 | FP32 基线 | FP16 | 变化 |
+|------|----------|------|------|
+| prefill_tps | 7.02 | 7.21 | +3% |
+| decode_tps | 5.15 | 6.55 | **+27%** |
+| prefill_ms | 3276 | 3188 | -3% |
+| decode_ms | 583 | 458 | -21% |
+
+**结论**：**decode 显著受益**（+27%），prefill 小幅提升（+3%）。decode 是带宽瓶颈更明显的场景，
+FP16 直接减半了 B 的内存流量。prefill 提升不大说明 compute bound 更重。
+权重文件大小从 50MB 降到 25MB。
+
+**决定**：**采用 FP16 作为默认权重存储格式**。
+

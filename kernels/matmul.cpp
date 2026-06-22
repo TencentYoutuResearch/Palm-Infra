@@ -41,15 +41,124 @@ static void matmul_fp32_scalar_range(const float* A, const float* B, float* C,
 }
 
 // ---------------------------------------------------------------------------
-// NEON matmul — TILE_M=8, TILE_N=8
+// NEON matmul — TILE_M=8, TILE_N=8, FP16 storage + FP32 accumulate
 //
-// Rationale: a larger tile (8x8 vs 4x4) amortises the cost of B's scatter
-// gather across more output elements per inner-loop iteration.  Each K step
-// loads 8 B values (two vld1q_f32) and broadcasts them to 8 A rows via
-// 16 vfmaq_n_f32, for a 2:1 compute-to-load ratio (vs 1:1 for the 4x4 tile).
+// B is stored as float16 ([N, K] or [K, N] repacked).
+// Each inner iteration loads 8 float16 values (one vld1q_f16 or gather),
+// converts to float32 via vcvt_f32_f16, then FMA into float32 accumulators.
+// This halves the memory bandwidth for B compared to FP32 storage.
+//
+// For gather (row-major) layout, we load via uint16x4_t + vget_lane + vcvt
+// to avoid stack temporaries.
 // ---------------------------------------------------------------------------
 #if HAS_NEON
 
+static void matmul_fp16_neon_8x8_range(const float* A, const __fp16* B, float* C,
+                                       int M, int N, int K,
+                                       int lda, int K_weight, int ldc,
+                                       int m_begin, int m_end) {
+    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
+    // FP16: twice as many elements fit in cache, so double K_BLOCK.
+    const int K_BLOCK_FP16 = K_BLOCK * 2;
+
+    for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK_FP16) {
+        int k_end = std::min(k_outer + K_BLOCK_FP16, K);
+
+        for (int m = m_begin; m < m_end; m += 8) {
+            int m_tile_end = std::min(m + 8, m_end);
+            int m_global_end = std::min(m + 8, M);
+
+            for (int n = 0; n < N; n += 8) {
+                int n_end = std::min(n + 8, N);
+
+                float32x4_t c[8][2];
+                bool first_block = (k_outer == 0);
+                if (first_block) {
+                    for (int r = 0; r < 8; r++) {
+                        c[r][0] = vdupq_n_f32(0.f);
+                        c[r][1] = vdupq_n_f32(0.f);
+                    }
+                } else {
+                    for (int r = 0; r < 8; r++) {
+                        int row = m + r;
+                        if (row < m_tile_end && row < m_global_end) {
+                            c[r][0] = vld1q_f32(&C[row * ldc + n]);
+                            if (n + 4 < n_end) {
+                                c[r][1] = vld1q_f32(&C[row * ldc + n + 4]);
+                            } else {
+                                c[r][1] = vdupq_n_f32(0.f);
+                            }
+                        } else {
+                            c[r][0] = vdupq_n_f32(0.f);
+                            c[r][1] = vdupq_n_f32(0.f);
+                        }
+                    }
+                }
+
+                for (int k = k_outer; k < k_end; k++) {
+                    // Load 8 FP16 B values, convert to FP32.
+                    // Row-major [N, K]: B[n,k] = data[n*K_weight + k] (gather).
+                    // Repacked [K, N]: B[n,k] = data[k*K_weight + n] (contiguous).
+                    bool is_repacked = (K_weight != K);
+
+                    float32x4_t b0, b1;
+                    if (is_repacked) {
+                        // Contiguous load from repacked [K, N].
+                        float16x8_t h = vld1q_f16(&B[k * K_weight + n]);
+                        b0 = vcvt_f32_f16(vget_low_f16(h));
+                        if (n + 4 < n_end) {
+                            b1 = vcvt_f32_f16(vget_high_f16(h));
+                        } else {
+                            b1 = vdupq_n_f32(0.f);
+                        }
+                    } else {
+                        // Gather from row-major [N, K].
+                        float16x4_t h0, h1;
+                        {
+                            __fp16 tmp[4] = {(__fp16)0.f, (__fp16)0.f, (__fp16)0.f, (__fp16)0.f};
+                            for (int j = 0; j < 4 && n + j < n_end; j++) {
+                                tmp[j] = B[(n + j) * K_weight + k];
+                            }
+                            h0 = vld1_f16(tmp);
+                        }
+                        {
+                            __fp16 tmp[4] = {(__fp16)0.f, (__fp16)0.f, (__fp16)0.f, (__fp16)0.f};
+                            for (int j = 0; j < 4 && n + 4 + j < n_end; j++) {
+                                tmp[j] = B[(n + 4 + j) * K_weight + k];
+                            }
+                            h1 = vld1_f16(tmp);
+                        }
+                        b0 = vcvt_f32_f16(h0);
+                        b1 = vcvt_f32_f16(h1);
+                    }
+
+                    for (int r = 0; r < 8; r++) {
+                        int row = m + r;
+                        if (row < m_tile_end && row < m_global_end) {
+                            float a_val = A[k + row * lda];
+                            c[r][0] = vfmaq_n_f32(c[r][0], b0, a_val);
+                            c[r][1] = vfmaq_n_f32(c[r][1], b1, a_val);
+                        }
+                    }
+                }
+
+                // Write back
+                for (int r = 0; r < 8; r++) {
+                    int row = m + r;
+                    if (row < m_tile_end && row < m_global_end) {
+                        float tmp[4];
+                        vst1q_f32(tmp, c[r][0]);
+                        for (int j = 0; j < 4 && n + j < n_end; j++) C[row * ldc + n + j] = tmp[j];
+                        vst1q_f32(tmp, c[r][1]);
+                        for (int j = 0; j < 4 && n + 4 + j < n_end; j++) C[row * ldc + n + 4 + j] = tmp[j];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- FP32 kernel (kept for backward compat) ----
 static void matmul_fp32_neon_8x8_range(const float* A, const float* B, float* C,
                                        int M, int N, int K,
                                        int lda, int K_weight, int ldc,
@@ -235,6 +344,28 @@ static void matmul_fp32_range(const float* A, const float* B, float* C,
 #endif
 }
 
+// FP16 variant: B is __fp16*, A and C are float*.
+static void matmul_fp16_range(const float* A, const __fp16* B, float* C,
+                              int M, int N, int K,
+                              int lda, int K_weight, int ldc,
+                              int m_begin, int m_end) {
+#if HAS_NEON
+    matmul_fp16_neon_8x8_range(A, B, C, M, N, K, lda, K_weight, ldc, m_begin, m_end);
+#else
+    // Scalar fallback: convert each FP16 to FP32 on the fly.
+    for (int m = m_begin; m < m_end; m++) {
+        float* c_row = C + m * ldc;
+        for (int n = 0; n < N; n++) {
+            float sum = 0.f;
+            for (int k = 0; k < K; k++) {
+                sum += A[k + m * lda] * (float)B[n * K_weight + k];
+            }
+            c_row[n] = sum;
+        }
+    }
+#endif
+}
+
 // Like matmul_fp32_range but shards by N (output dimension) instead of M.
 // Used when N >> M (e.g. lm_head where M=1, N=vocab_size).
 static void matmul_fp32_range_n(const float* A, const float* B, float* C,
@@ -272,8 +403,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     int K_weight = (int)B.shape[1];
 
     const float* a_ptr = A.ptr<float>();
-    const float* b_ptr = B.ptr<float>();
     float* c_ptr = C.ptr<float>();
+
+    // Detect FP16 weight: B.prec == FP16.
+    bool is_fp16 = (B.prec == Precision::FP16);
+    const __fp16* b_fp16 = is_fp16 ? reinterpret_cast<const __fp16*>(B.data) : nullptr;
+    const float* b_fp32 = is_fp16 ? nullptr : B.ptr<float>();
 
     // K_weight is the stride between consecutive k rows in the repacked layout.
     // For repacked [K, N]: K_weight = original N.
@@ -301,46 +436,44 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     bool use_parallel = n_threads > 1 && n_chunks > 1;
 
     if (!use_parallel) {
-        if (is_repacked) {
-            matmul_fp32_neon_8x8_range(a_ptr, b_ptr, c_ptr, M, N, K, lda, K_weight, ldc, 0, M);
+        if (is_fp16) {
+            matmul_fp16_range(a_ptr, b_fp16, c_ptr, M, N, K, lda, K_weight, ldc, 0, M);
         } else {
-            matmul_fp32_range(a_ptr, b_ptr, c_ptr, M, N, K, lda, K_weight, ldc, 0, M);
+            matmul_fp32_range(a_ptr, b_fp32, c_ptr, M, N, K, lda, K_weight, ldc, 0, M);
         }
         return;
     }
 
-    if (is_repacked) {
-        thread_pool->parallel_for(0, M, chunk_size,
-                                  [&](int, int m_begin, int m_end) {
-                                      matmul_fp32_neon_8x8_range(a_ptr, b_ptr, c_ptr,
-                                                                 M, N, K, lda, K_weight, ldc,
-                                                                 m_begin, m_end);
-                                  });
-    } else if (shard_by_n) {
-        thread_pool->parallel_for(0, N, chunk_size,
-                                  [&](int, int n_begin, int n_end) {
-                                      if (is_repacked) {
-                                          matmul_fp32_neon_8x8_range(a_ptr, b_ptr + n_begin, c_ptr + n_begin,
-                                                                     M, n_end - n_begin, K,
-                                                                     lda, K_weight, ldc, 0, M);
-                                      } else {
-                                          matmul_fp32_range_n(a_ptr, b_ptr, c_ptr,
+    if (shard_by_n) {
+        if (is_fp16) {
+            thread_pool->parallel_for(0, N, chunk_size,
+                                      [&](int, int n_begin, int n_end) {
+                                          matmul_fp16_range(a_ptr, b_fp16 + n_begin * K_weight, c_ptr + n_begin,
+                                                            M, n_end - n_begin, K, lda, K_weight, ldc, 0, M);
+                                      });
+        } else {
+            thread_pool->parallel_for(0, N, chunk_size,
+                                      [&](int, int n_begin, int n_end) {
+                                          matmul_fp32_range_n(a_ptr, b_fp32, c_ptr,
                                                               M, N, K, lda, K_weight, ldc,
                                                               n_begin, n_end);
-                                      }
-                                  });
+                                      });
+        }
     } else {
-        thread_pool->parallel_for(0, M, chunk_size,
-                                  [&](int, int m_begin, int m_end) {
-                                      if (is_repacked) {
-                                          matmul_fp32_neon_8x8_range(a_ptr, b_ptr, c_ptr,
-                                                                     M, N, K, lda, K_weight, ldc,
-                                                                     m_begin, m_end);
-                                      } else {
-                                          matmul_fp32_range(a_ptr, b_ptr, c_ptr,
+        if (is_fp16) {
+            thread_pool->parallel_for(0, M, chunk_size,
+                                      [&](int, int m_begin, int m_end) {
+                                          matmul_fp16_range(a_ptr, b_fp16, c_ptr,
                                                             M, N, K, lda, K_weight, ldc,
                                                             m_begin, m_end);
-                                      }
-                                  });
+                                      });
+        } else {
+            thread_pool->parallel_for(0, M, chunk_size,
+                                      [&](int, int m_begin, int m_end) {
+                                          matmul_fp32_range(a_ptr, b_fp32, c_ptr,
+                                                            M, N, K, lda, K_weight, ldc,
+                                                            m_begin, m_end);
+                                      });
+        }
     }
 }
