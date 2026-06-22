@@ -185,3 +185,66 @@ FP16 直接减半了 B 的内存流量。prefill 提升不大说明 compute boun
 
 **决定**：**不采用，已回滚**。FP16 + 8×8 tile 无 K 展开仍是当前最优。
 
+---
+
+# 整体进度总结
+
+## 端到端性能演进 (Youtu-LLM-2B, M5 Pro, 4 threads)
+
+| 版本 | prefill_tps | decode_tps | 关键改动 |
+|------|------------|------------|---------|
+| 初始 | 1.52 | 1.55 | FP32 4×4 tile, 单线程 |
+| + 线程池 | 4.54 | 1.54 | 自定义线程池 + parallel_for |
+| + lm_head 走 matmul | 4.18 | 3.54 | 复用 matmul 内核 + N 分片 |
+| + 8×8 tile | 7.02 | 5.15 | TILE_M=8, TILE_N=8 |
+| + K_BLOCK=512 | 4.41→7.02 | 4.45→5.15 | K-blocking 参数调优 |
+| + FP16 权重 | 7.21 | 6.55 | FP16 存储 + FP32 累加 |
+
+**累计提升**：prefill **4.7x**, decode **4.2x**
+
+## 当前热点 (profiler, FP16, 4 threads)
+
+### Prefill (3188ms)
+| Op | Time | % |
+|----|------|---|
+| MATMUL | 2481ms | 80.9% |
+| SDPA | 437ms | 14.3% |
+| 其他 | <5% | — |
+
+### Decode (458ms total, 153ms/token)
+| Op | Time | % |
+|----|------|---|
+| MATMUL | 380ms | 98.3% |
+| 其他 | <2% | — |
+
+## 与现有框架的差距 (同为 FP16, M5 Pro, 4 threads)
+
+| 指标 | mlllm | ncnn | llama.cpp | 差距 |
+|------|-------|------|-----------|------|
+| prefill (pp256) | ~7 tok/s | 202 tok/s | 264 tok/s | ~30-38x |
+| decode (tg64) | ~6.5 tok/s | 33 tok/s | 41 tok/s | ~5-6x |
+
+## 已尝试但未采用的优化
+
+| 尝试 | 结果 | 原因 |
+|------|------|------|
+| K 展开 (FP32) | -35~58% | vfmaq_laneq_f32 延迟高 |
+| B repacking (per-tile) | -12~58% | per-tile 拷贝开销太大 |
+| B repacking (load-time) | -21% | cache 副作用 > 加载收益 |
+| K 展开 (FP16) | 0~7% 退化 | 同上，B gather+vcvt 是瓶颈 |
+
+## 当前最优配置
+
+- **TILE**: 8×8 (NEON)
+- **K_BLOCK**: 512
+- **精度**: FP16 权重 + FP32 累加
+- **线程**: 自定义线程池, per-op split work
+- **分片**: 自适应 (M vs N 维度)
+- **无**: repack, K 展开
+
+## 下一步方向
+
+1. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only fallback）
+2. **SDPA 优化** — prefill 占 14%, naive O(n²)
+3. **量化 (INT4/INT8)** — 最大杠杆，预计 3-5x
+4. **其他算子并行** — RMSNorm, SiLU 等（当前占比小，优先级低）
