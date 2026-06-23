@@ -258,6 +258,12 @@ int main() {
         test_fp16(4, 8, 9, "FP16 4x8 * 8x9 N=9 (interleave)");
         test_fp16(4, 8, 16, "FP16 4x8 * 8x16 N=16 (interleave)");
         test_fp16(1, 8, 3, "FP16 1x8 * 8x3 GEMV odd N (interleave)");
+        // Lane-FMA path (M >= 8)
+        test_fp16(8, 64, 8, "FP16 8x64 * 64x8 M=8 (lane-fma)");
+        test_fp16(16, 128, 32, "FP16 16x128 * 128x32 (lane-fma)");
+        test_fp16(64, 256, 64, "FP16 64x256 * 256x64 (lane-fma)");
+        test_fp16(8, 17, 8, "FP16 8x17 * 17x8 odd K (lane-fma)");
+        test_fp16(8, 64, 3, "FP16 8x64 * 64x3 odd N (lane-fma)");
     }
 
     // ---- FP16 with interleave disabled (fallback path) ----

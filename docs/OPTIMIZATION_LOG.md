@@ -345,13 +345,61 @@ load time 增加 ~4s（一次性 pack 全部权重），可接受。
 
 ---
 
+## 尝试 10：A Packing + vfmlalq_laneq_f16 (lane-FMA kernel)
+
+**决策理由**：ncnn 的核心技巧。当前 kernel 用 `vfmaq_n_f32`（标量 A broadcast × 4 路 B），
+每 K 步 27 指令/32 FLOPs。改为 A 也 pack 到 interleaved FP16，用 `vfmlalq_laneq_f16`
+（FP16 向量 A × lane B → FP32 累加），每 K 步 18 指令/64 FLOPs，指令效率 3.5x。
+
+**算法**：
+- A: `[K, M]` FP32 column-major → `pack_a_interleaved_full` → `[M/8, K, 8]` FP16
+- B: 已 load-time packed `[N/8, K, 8]` FP16
+- 累加器：column-major `c[j][0/1]` = rows 0..3/4..7 for N column j
+- 内层：`vfmlalq_laneq_low/high_f16(c[j], a_vec, b_vec, lane)` × 16 = 64 FLOPs/K-step
+- A 是动态 activations，per-call pack（O(M×K)，远小于 B 的 N×K）
+- M>=8 走 lane-FMA kernel，M<8 (GEMV) 保持 scalar-A kernel
+
+**实现**：
+- `kernels/matmul.h`: 新增 `pack_a_interleaved_full` 公开 API
+- `kernels/matmul.cpp`: 新增 `matmul_fp16_neon_8x8_range_packed_a` lane-FMA kernel
+- `kernel_matmul_fp32`: M>=8 走 lane-FMA + per-call A pack，M<8 走 scalar-A
+- 修复 `pack_b/a_interleaved_full` 的 buffer 大小（需 pad 到 8 的倍数）
+- 多线程路径：每个 worker 独立 pack 自己的 M-slice
+
+**结果 (FP16 microbench vs 尝试 9)**：
+| Shape | 尝试 9 (scalar-A) | 尝试 10 (lane-FMA) | 变化 |
+|-------|------------------|-------------------|------|
+| 128×2048×6144 t=1 | 31.83ms (101.2GF) | 29.74ms (108.3GF) | **-7%** |
+| 128×2048×6144 t=4 | 8.84ms (364.4GF) | 8.90ms (362.0GF) | ~持平 |
+| 1×2048×2048 t=1 | 0.56ms (14.9GF) | 0.66ms (12.8GF) | +18% (波动) |
+| 1×2048×128k t=4 | 9.44ms (55.7GF) | 9.42ms (55.8GF) | ~持平 |
+
+**结果 (端到端 Youtu-LLM-2B, 4 threads)**：
+| 指标 | 尝试 9 | 尝试 10 | 变化 |
+|------|-------|--------|------|
+| prefill_tps | 8.67 | **9.89** | **+14%** |
+| decode_tps | 10.51 | 10.23 | -2.7% |
+| prefill MATMUL | 1317ms | 1211ms | **-8%** |
+| decode MATMUL | 8384ms | 8625ms | +2.9% |
+
+**结论**：**prefill 显著提升** (+14%)，GEMM 单线程 -7%。decode 略有退化 (-2.7%)，
+可能是 A pack overhead 在 GEMV 路径的微小影响（M<8 不走 lane-FMA 但有额外分支）。
+GEMM 多线程持平，可能因为 A pack 在 worker 线程内串行。
+
+**决定**：**采用。prefill 提升明显，decode 退化在波动范围内。**
+后续可优化：GEMV 路径完全不走 pack 分支，减少 dispatch 开销。
+
+---
+
 ## 当前最优配置
 
 - **TILE**: 8×8 (NEON)
 - **K_BLOCK**: 512
-- **精度**: FP16 权重 + FP32 累加
+- **精度**: FP16 权重 + FP16 activations (GEMM) + FP32 累加
+- **A packing**: Per-call interleaved (M>=8), FP32→FP16
 - **B packing**: Load-time interleaved (tile-of-8 transpose), GEMV+GEMM 共用
-- **线程**: 自定义线程池, per-op split work
+- **FMA**: vfmlalq_laneq_f16 (M>=8), vfmaq_n_f32 (M<8)
+- **线程**: 自定义线程池, per-op split work, per-worker A pack
 - **分片**: 自适应 (M vs N 维度)
 - **无**: repack, K 展开, A SIMD load
 

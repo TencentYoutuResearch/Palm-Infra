@@ -54,15 +54,42 @@ static void matmul_fp32_scalar_range(const float* A, const float* B, float* C,
 // Caller owns the returned buffer (must delete[]).
 // ---------------------------------------------------------------------------
 __fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K, int K_weight) {
-    __fp16* dst = new __fp16[(size_t)N * K];
-    for (int n_tile = 0; n_tile < N; n_tile += 8) {
+    int N_padded = ((N + 7) / 8) * 8;  // round up to multiple of 8
+    __fp16* dst = new __fp16[(size_t)N_padded * K];
+    for (int n_tile = 0; n_tile < N_padded; n_tile += 8) {
         int tile_valid = std::min(8, N - n_tile);
+        if (tile_valid < 0) tile_valid = 0;
         for (int k = 0; k < K; k++) {
             for (int j = 0; j < tile_valid; j++) {
                 dst[n_tile * K + k * 8 + j] = B_original[(n_tile + j) * K_weight + k];
             }
             for (int j = tile_valid; j < 8; j++) {
                 dst[n_tile * K + k * 8 + j] = (__fp16)0.f;
+            }
+        }
+    }
+    return dst;
+}
+
+// ---------------------------------------------------------------------------
+// A interleaved packing — FP32 [K, M] column-major → FP16 [M/8, K, 8].
+//
+// For each M-tile of 8 rows, 8 M values at the same k are stored consecutively.
+// Enables vld1q_f16 contiguous load of A + vfmlalq_laneq_f16 lane-broadcast.
+// FP32→FP16 conversion happens during pack (one-time precision loss).
+// ---------------------------------------------------------------------------
+__fp16* pack_a_interleaved_full(const float* A_original, int M, int K, int lda) {
+    int M_padded = ((M + 7) / 8) * 8;  // round up to multiple of 8
+    __fp16* dst = new __fp16[(size_t)M_padded * K];
+    for (int m_tile = 0; m_tile < M_padded; m_tile += 8) {
+        int tile_valid = std::min(8, M - m_tile);
+        if (tile_valid < 0) tile_valid = 0;
+        for (int k = 0; k < K; k++) {
+            for (int j = 0; j < tile_valid; j++) {
+                dst[m_tile * K + k * 8 + j] = (__fp16)A_original[k + (m_tile + j) * lda];
+            }
+            for (int j = tile_valid; j < 8; j++) {
+                dst[m_tile * K + k * 8 + j] = (__fp16)0.f;
             }
         }
     }
@@ -229,6 +256,120 @@ static void matmul_fp16_neon_8x8_range_packed(
                         vst1q_f32(tmp, c[r][1]);
                         for (int j = 0; j < 4 && n + 4 + j < n_end; j++) C[row * ldc + n + 4 + j] = tmp[j];
                     }
+                }
+            }
+        }
+    }
+}
+
+// ---- FP16 lane-FMA kernel (A + B both pre-packed interleaved) ----
+//
+// A_packed: [M/8, K, 8] FP16 — 8 M values at same k are contiguous.
+// B_packed: [N/8, K, 8] FP16 — 8 N values at same k are contiguous.
+// Uses vfmlalq_laneq_low/high_f16 for FP16×FP16→FP32 widening FMA with
+// lane broadcast: one A vector × one B lane → 4-way FP32 accumulate.
+// Per K step: 2 loads + 16 FMLAL = 64 FLOPs in 18 instructions.
+//
+// Accumulator layout (column-major for efficient lane-FMA):
+//   c[j][0] = rows 0..3 for N column n+j  (float32x4_t)
+//   c[j][1] = rows 4..7 for N column n+j  (float32x4_t)
+// C is row-major: C[row * ldc + col]. Transpose needed at init/writeback.
+static void matmul_fp16_neon_8x8_range_packed_a(
+    const __fp16* A_packed, const __fp16* B_packed, float* C,
+    int M, int N, int K,
+    int ldc, int m_begin, int m_end)
+{
+    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
+    const int K_BLOCK_FP16 = K_BLOCK * 2;
+
+    for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK_FP16) {
+        int k_end = std::min(k_outer + K_BLOCK_FP16, K);
+        bool first_block = (k_outer == 0);
+
+        for (int m = m_begin; m < m_end; m += 8) {
+            int m_tile_end = std::min(m + 8, m_end);
+            int m_global_end = std::min(m + 8, M);
+
+            for (int n = 0; n < N; n += 8) {
+                int n_end = std::min(n + 8, N);
+
+                // Column-major accumulators: c[j][half]
+                // c[j][0] = [C[m+0][n+j], C[m+1][n+j], C[m+2][n+j], C[m+3][n+j]]
+                // c[j][1] = [C[m+4][n+j], C[m+5][n+j], C[m+6][n+j], C[m+7][n+j]]
+                float32x4_t c[8][2];
+                if (first_block) {
+                    for (int j = 0; j < 8; j++) {
+                        c[j][0] = vdupq_n_f32(0.f);
+                        c[j][1] = vdupq_n_f32(0.f);
+                    }
+                } else {
+                    // Gather C columns into column-major accumulators.
+                    // C is row-major: C[(m+r) * ldc + (n+j)].
+                    // Build c[j][0] = [C[m+0][n+j], C[m+1][n+j], C[m+2][n+j], C[m+3][n+j]]
+                    // Use vld4q_f32 to de-interleave 4 rows × 4 cols block.
+                    // For each 4x4 block, load 4 rows and transpose.
+                    auto load_col4 = [&](int col, int row_start) -> float32x4_t {
+                        // Gather C[row_start..row_start+3][col] into a vector
+                        float tmp[4];
+                        for (int r = 0; r < 4; r++) {
+                            int row = row_start + r;
+                            if (row < m_tile_end && row < m_global_end && col < n_end) {
+                                tmp[r] = C[row * ldc + col];
+                            } else {
+                                tmp[r] = 0.f;
+                            }
+                        }
+                        return vld1q_f32(tmp);
+                    };
+                    for (int j = 0; j < 8; j++) {
+                        c[j][0] = load_col4(n + j, m + 0);
+                        c[j][1] = load_col4(n + j, m + 4);
+                    }
+                }
+
+                // K loop: lane-FMA
+                // A_packed: A_packed[(m & ~7) * K + k * 8 + 0..7] = 8 M values at K=k
+                // B_packed: B_packed[(n & ~7) * K + k * 8 + 0..7] = 8 N values at K=k
+                for (int k = k_outer; k < k_end; k++) {
+                    float16x8_t a_vec = vld1q_f16(&A_packed[(m & ~7) * K + k * 8]);
+                    float16x8_t b_vec = vld1q_f16(&B_packed[(n & ~7) * K + k * 8]);
+
+                    // For each N column j, broadcast b_vec[j] and FMA with a_vec
+                    // low half (rows 0..3) and high half (rows 4..7)
+                    c[0][0] = vfmlalq_laneq_low_f16 (c[0][0], a_vec, b_vec, 0);
+                    c[0][1] = vfmlalq_laneq_high_f16(c[0][1], a_vec, b_vec, 0);
+                    c[1][0] = vfmlalq_laneq_low_f16 (c[1][0], a_vec, b_vec, 1);
+                    c[1][1] = vfmlalq_laneq_high_f16(c[1][1], a_vec, b_vec, 1);
+                    c[2][0] = vfmlalq_laneq_low_f16 (c[2][0], a_vec, b_vec, 2);
+                    c[2][1] = vfmlalq_laneq_high_f16(c[2][1], a_vec, b_vec, 2);
+                    c[3][0] = vfmlalq_laneq_low_f16 (c[3][0], a_vec, b_vec, 3);
+                    c[3][1] = vfmlalq_laneq_high_f16(c[3][1], a_vec, b_vec, 3);
+                    c[4][0] = vfmlalq_laneq_low_f16 (c[4][0], a_vec, b_vec, 4);
+                    c[4][1] = vfmlalq_laneq_high_f16(c[4][1], a_vec, b_vec, 4);
+                    c[5][0] = vfmlalq_laneq_low_f16 (c[5][0], a_vec, b_vec, 5);
+                    c[5][1] = vfmlalq_laneq_high_f16(c[5][1], a_vec, b_vec, 5);
+                    c[6][0] = vfmlalq_laneq_low_f16 (c[6][0], a_vec, b_vec, 6);
+                    c[6][1] = vfmlalq_laneq_high_f16(c[6][1], a_vec, b_vec, 6);
+                    c[7][0] = vfmlalq_laneq_low_f16 (c[7][0], a_vec, b_vec, 7);
+                    c[7][1] = vfmlalq_laneq_high_f16(c[7][1], a_vec, b_vec, 7);
+                }
+
+                // Write back: column-major → row-major C
+                // c[j][0] = [C[m+0][n+j], C[m+1][n+j], C[m+2][n+j], C[m+3][n+j]]
+                // Need: C[(m+r) * ldc + (n+j)] = c[j][half][r]
+                auto store_col4 = [&](int col, int row_start, float32x4_t val) {
+                    float tmp[4];
+                    vst1q_f32(tmp, val);
+                    for (int r = 0; r < 4; r++) {
+                        int row = row_start + r;
+                        if (row < m_tile_end && row < m_global_end && col < n_end) {
+                            C[row * ldc + col] = tmp[r];
+                        }
+                    }
+                };
+                for (int j = 0; j < 8; j++) {
+                    store_col4(n + j, m + 0, c[j][0]);
+                    store_col4(n + j, m + 4, c[j][1]);
                 }
             }
         }
@@ -402,9 +543,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
 
     // ---- Interleaved packing path (FP16 + NEON) ----
     // B is pre-packed at load time (engine) or by the caller (bench/test).
-    // No per-call packing overhead — works for both GEMM and GEMV.
+    // A is packed per-call (small overhead, M×K << N×K).
+    // - M >= 8: lane-FMA kernel (vfmlalq_laneq_f16, A+B both packed)
+    // - M <  8: scalar-A kernel (vfmaq_n_f32, only B packed) — GEMV path
     bool use_interleave = is_fp16 && HAS_NEON && !is_repacked
                        && g_matmul_config.use_interleave_pack;
+    bool use_lane_fma = use_interleave && (M >= 8);
 
     if (use_interleave) {
         constexpr int tile_m = HAS_NEON ? 8 : 1;
@@ -417,32 +561,52 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         int n_chunks = (total_dim + chunk_size - 1) / chunk_size;
         bool use_parallel = n_threads > 1 && n_chunks > 1;
 
-        // B is already packed: B_packed layout is [N/8, K, 8]
         const __fp16* b_packed = b_fp16;
 
+        // Pack A per-call for lane-FMA path (M >= 8).
+        // Each thread packs its own M-slice inside the parallel_for lambda.
+        // For single-threaded, pack the whole A.
+        __fp16* a_packed = nullptr;
+        if (use_lane_fma && !use_parallel) {
+            a_packed = pack_a_interleaved_full(a_ptr, M, K, lda);
+        }
+
         if (!use_parallel) {
-            matmul_fp16_neon_8x8_range_packed(
-                a_ptr, b_packed, c_ptr,
-                M, N, K, lda, ldc, 0, M);
+            if (use_lane_fma) {
+                matmul_fp16_neon_8x8_range_packed_a(
+                    a_packed, b_packed, c_ptr,
+                    M, N, K, ldc, 0, M);
+                delete[] a_packed;
+            } else {
+                matmul_fp16_neon_8x8_range_packed(
+                    a_ptr, b_packed, c_ptr,
+                    M, N, K, lda, ldc, 0, M);
+            }
         } else if (shard_by_n) {
+            // GEMV: M==1, shard by N. Use scalar-A kernel (M<8).
             int n_chunk = std::max(chunk_size, 8);
-            n_chunk = ((n_chunk + 7) / 8) * 8;  // round up to multiple of 8
+            n_chunk = ((n_chunk + 7) / 8) * 8;
             thread_pool->parallel_for(0, N, n_chunk,
                 [&](int, int n_begin, int n_end) {
                     int n_begin_aligned = n_begin & ~7;
                     matmul_fp16_neon_8x8_range_packed(
                         a_ptr,
-                        b_packed + n_begin_aligned * K,  // offset to tile start
+                        b_packed + n_begin_aligned * K,
                         c_ptr + n_begin,
                         M, n_end - n_begin,
                         K, lda, ldc, 0, M);
                 });
         } else {
+            // GEMM: shard by M. Each thread packs its own A slice.
             thread_pool->parallel_for(0, M, chunk_size,
                 [&](int, int m_begin, int m_end) {
-                    matmul_fp16_neon_8x8_range_packed(
-                        a_ptr, b_packed, c_ptr,
-                        M, N, K, lda, ldc, m_begin, m_end);
+                    int m_len = m_end - m_begin;
+                    __fp16* a_slice_packed = pack_a_interleaved_full(
+                        a_ptr + m_begin * lda, m_len, K, lda);
+                    matmul_fp16_neon_8x8_range_packed_a(
+                        a_slice_packed, b_packed, c_ptr,
+                        m_len, N, K, ldc, 0, m_len);
+                    delete[] a_slice_packed;
                 });
         }
         return;

@@ -36,3 +36,9 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
 // K_weight is the stride between consecutive k rows in B_original
 // (typically == K for row-major).
 __fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K, int K_weight);
+
+// Pack A [K, M] column-major FP32 → interleaved [M/8, K, 8] FP16.
+// For each M-tile of 8 rows, 8 M values at the same k are stored consecutively.
+// Enables vld1q_f16 contiguous load + vfmlalq_laneq_f16 lane-broadcast FMA.
+// Returns newly allocated buffer (caller owns, must delete[]).
+__fp16* pack_a_interleaved_full(const float* A_original, int M, int K, int lda);
