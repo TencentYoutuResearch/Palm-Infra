@@ -4,13 +4,6 @@
 #include <cmath>
 #include <cstring>
 
-#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
-#include <arm_neon.h>
-#define HAS_NEON 1
-#else
-#define HAS_NEON 0
-#endif
-
 // ---------------------------------------------------------------------------
 // scalar RoPE
 // ---------------------------------------------------------------------------
