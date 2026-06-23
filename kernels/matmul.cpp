@@ -103,6 +103,24 @@ static const __fp16* pack_b_interleaved(
     return buf.data;
 }
 
+// Full-matrix version: pack entire B [N, K] → interleaved [N/8, K, 8].
+// Caller owns the returned buffer (must delete[]).
+__fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K, int K_weight) {
+    __fp16* dst = new __fp16[(size_t)N * K];
+    for (int n_tile = 0; n_tile < N; n_tile += 8) {
+        int tile_valid = std::min(8, N - n_tile);
+        for (int k = 0; k < K; k++) {
+            for (int j = 0; j < tile_valid; j++) {
+                dst[n_tile * K + k * 8 + j] = B_original[(n_tile + j) * K_weight + k];
+            }
+            for (int j = tile_valid; j < 8; j++) {
+                dst[n_tile * K + k * 8 + j] = (__fp16)0.f;
+            }
+        }
+    }
+    return dst;
+}
+
 static void matmul_fp16_neon_8x8_range(const float* A, const __fp16* B, float* C,
                                        int M, int N, int K,
                                        int lda, int K_weight, int ldc,
@@ -189,73 +207,80 @@ static void matmul_fp16_neon_8x8_range(const float* A, const __fp16* B, float* C
     }
 }
 
-// ---- FP16 packed kernel (B interleaved, contiguous load) ----
+// ---- FP16 packed kernel (B pre-packed interleaved, contiguous load) ----
 //
-// A is pre-offset by k_begin so kernel uses simple k-based indexing.
-// B_packed: interleaved layout (tile-of-8 transposed), k_len columns wide.
-// first_block: true for first K block (zero accumulators), false for reload from C.
+// B_packed: load-time interleaved layout [N/8, K, 8].
+// For fixed k, B_packed[(n & ~7) * K + k * 8 + 0..7] are 8 consecutive FP16.
+// K-blocking loop is internal (cache blocking only, no packing).
 static void matmul_fp16_neon_8x8_range_packed(
     const float* A, const __fp16* B_packed, float* C,
-    int M, int N, int k_len,
+    int M, int N, int K,
     int lda, int ldc,
-    int m_begin, int m_end,
-    bool first_block)
+    int m_begin, int m_end)
 {
-    for (int m = m_begin; m < m_end; m += 8) {
-        int m_tile_end = std::min(m + 8, m_end);
-        int m_global_end = std::min(m + 8, M);
+    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
+    const int K_BLOCK_FP16 = K_BLOCK * 2;  // FP16: 2x cache density
 
-        for (int n = 0; n < N; n += 8) {
-            int n_end = std::min(n + 8, N);
+    for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK_FP16) {
+        int k_end = std::min(k_outer + K_BLOCK_FP16, K);
+        bool first_block = (k_outer == 0);
 
-            float32x4_t c[8][2];
-            if (first_block) {
-                for (int r = 0; r < 8; r++) {
-                    c[r][0] = vdupq_n_f32(0.f);
-                    c[r][1] = vdupq_n_f32(0.f);
-                }
-            } else {
-                for (int r = 0; r < 8; r++) {
-                    int row = m + r;
-                    if (row < m_tile_end && row < m_global_end) {
-                        c[r][0] = vld1q_f32(&C[row * ldc + n]);
-                        if (n + 4 < n_end) {
-                            c[r][1] = vld1q_f32(&C[row * ldc + n + 4]);
-                        } else {
-                            c[r][1] = vdupq_n_f32(0.f);
-                        }
-                    } else {
+        for (int m = m_begin; m < m_end; m += 8) {
+            int m_tile_end = std::min(m + 8, m_end);
+            int m_global_end = std::min(m + 8, M);
+
+            for (int n = 0; n < N; n += 8) {
+                int n_end = std::min(n + 8, N);
+
+                float32x4_t c[8][2];
+                if (first_block) {
+                    for (int r = 0; r < 8; r++) {
                         c[r][0] = vdupq_n_f32(0.f);
                         c[r][1] = vdupq_n_f32(0.f);
                     }
+                } else {
+                    for (int r = 0; r < 8; r++) {
+                        int row = m + r;
+                        if (row < m_tile_end && row < m_global_end) {
+                            c[r][0] = vld1q_f32(&C[row * ldc + n]);
+                            if (n + 4 < n_end) {
+                                c[r][1] = vld1q_f32(&C[row * ldc + n + 4]);
+                            } else {
+                                c[r][1] = vdupq_n_f32(0.f);
+                            }
+                        } else {
+                            c[r][0] = vdupq_n_f32(0.f);
+                            c[r][1] = vdupq_n_f32(0.f);
+                        }
+                    }
                 }
-            }
 
-            for (int k = 0; k < k_len; k++) {
-                // Load 8 contiguous FP16 values from packed B
-                float16x8_t b_vec = vld1q_f16(&B_packed[(n & ~7) * k_len + k * 8]);
-                float32x4_t b0 = vcvt_f32_f16(vget_low_f16(b_vec));
-                float32x4_t b1 = vcvt_f32_f16(vget_high_f16(b_vec));
+                for (int k = k_outer; k < k_end; k++) {
+                    // Load 8 contiguous FP16 values from pre-packed B
+                    float16x8_t b_vec = vld1q_f16(&B_packed[(n & ~7) * K + k * 8]);
+                    float32x4_t b0 = vcvt_f32_f16(vget_low_f16(b_vec));
+                    float32x4_t b1 = vcvt_f32_f16(vget_high_f16(b_vec));
 
+                    for (int r = 0; r < 8; r++) {
+                        int row = m + r;
+                        if (row < m_tile_end && row < m_global_end) {
+                            float a_val = A[k + row * lda];
+                            c[r][0] = vfmaq_n_f32(c[r][0], b0, a_val);
+                            c[r][1] = vfmaq_n_f32(c[r][1], b1, a_val);
+                        }
+                    }
+                }
+
+                // Write back
                 for (int r = 0; r < 8; r++) {
                     int row = m + r;
                     if (row < m_tile_end && row < m_global_end) {
-                        float a_val = A[k + row * lda];
-                        c[r][0] = vfmaq_n_f32(c[r][0], b0, a_val);
-                        c[r][1] = vfmaq_n_f32(c[r][1], b1, a_val);
+                        float tmp[4];
+                        vst1q_f32(tmp, c[r][0]);
+                        for (int j = 0; j < 4 && n + j < n_end; j++) C[row * ldc + n + j] = tmp[j];
+                        vst1q_f32(tmp, c[r][1]);
+                        for (int j = 0; j < 4 && n + 4 + j < n_end; j++) C[row * ldc + n + 4 + j] = tmp[j];
                     }
-                }
-            }
-
-            // Write back
-            for (int r = 0; r < 8; r++) {
-                int row = m + r;
-                if (row < m_tile_end && row < m_global_end) {
-                    float tmp[4];
-                    vst1q_f32(tmp, c[r][0]);
-                    for (int j = 0; j < 4 && n + j < n_end; j++) C[row * ldc + n + j] = tmp[j];
-                    vst1q_f32(tmp, c[r][1]);
-                    for (int j = 0; j < 4 && n + 4 + j < n_end; j++) C[row * ldc + n + 4 + j] = tmp[j];
                 }
             }
         }
@@ -521,16 +546,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     bool is_repacked = (K_weight != K);
 
     // ---- Interleaved packing path (FP16 + NEON) ----
-    // Only use packing for GEMM-like shapes (M >= 8).
-    // For GEMV (M=1) the packing overhead dominates the tiny compute.
+    // B is pre-packed at load time (engine) or by the caller (bench/test).
+    // No per-call packing overhead — works for both GEMM and GEMV.
     bool use_interleave = is_fp16 && HAS_NEON && !is_repacked
-                       && g_matmul_config.use_interleave_pack
-                       && M >= 8;
+                       && g_matmul_config.use_interleave_pack;
 
     if (use_interleave) {
-        const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
-        const int K_BLOCK_FP16 = K_BLOCK * 2;
-
         constexpr int tile_m = HAS_NEON ? 8 : 1;
         int n_threads = thread_pool ? thread_pool->num_threads() : 1;
         bool shard_by_n = (N > M * 8 && M == 1);
@@ -541,44 +562,38 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         int n_chunks = (total_dim + chunk_size - 1) / chunk_size;
         bool use_parallel = n_threads > 1 && n_chunks > 1;
 
-        for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK_FP16) {
-            int k_end = std::min(k_outer + K_BLOCK_FP16, K);
-            int k_len = k_end - k_outer;
-            bool first_block = (k_outer == 0);
+        // B is already packed: B_packed layout is [N/8, K, 8]
+        const __fp16* b_packed = b_fp16;
 
-            const __fp16* b_packed = pack_b_interleaved(b_fp16, N, K, K_weight, k_outer, k_end);
-            const float* a_slice = a_ptr + k_outer;
-
-            if (!use_parallel) {
-                matmul_fp16_neon_8x8_range_packed(
-                    a_slice, b_packed, c_ptr,
-                    M, N, k_len, lda, ldc, 0, M, first_block);
-            } else if (shard_by_n) {
-                int n_chunk = std::max(chunk_size, 8);
-                n_chunk = ((n_chunk + 7) / 8) * 8;  // round up to multiple of 8
-                thread_pool->parallel_for(0, N, n_chunk,
-                    [&](int, int n_begin, int n_end) {
-                        int n_begin_aligned = n_begin & ~7;
-                        matmul_fp16_neon_8x8_range_packed(
-                            a_slice,
-                            b_packed + n_begin_aligned * k_len,
-                            c_ptr + n_begin,
-                            M, n_end - n_begin,
-                            k_len, lda, ldc, 0, M, first_block);
-                    });
-            } else {
-                thread_pool->parallel_for(0, M, chunk_size,
-                    [&](int, int m_begin, int m_end) {
-                        matmul_fp16_neon_8x8_range_packed(
-                            a_slice, b_packed, c_ptr,
-                            M, N, k_len, lda, ldc, m_begin, m_end, first_block);
-                    });
-            }
+        if (!use_parallel) {
+            matmul_fp16_neon_8x8_range_packed(
+                a_ptr, b_packed, c_ptr,
+                M, N, K, lda, ldc, 0, M);
+        } else if (shard_by_n) {
+            int n_chunk = std::max(chunk_size, 8);
+            n_chunk = ((n_chunk + 7) / 8) * 8;  // round up to multiple of 8
+            thread_pool->parallel_for(0, N, n_chunk,
+                [&](int, int n_begin, int n_end) {
+                    int n_begin_aligned = n_begin & ~7;
+                    matmul_fp16_neon_8x8_range_packed(
+                        a_ptr,
+                        b_packed + n_begin_aligned * K,  // offset to tile start
+                        c_ptr + n_begin,
+                        M, n_end - n_begin,
+                        K, lda, ldc, 0, M);
+                });
+        } else {
+            thread_pool->parallel_for(0, M, chunk_size,
+                [&](int, int m_begin, int m_end) {
+                    matmul_fp16_neon_8x8_range_packed(
+                        a_ptr, b_packed, c_ptr,
+                        M, N, K, lda, ldc, m_begin, m_end);
+                });
         }
         return;
     }
 
-    // ---- Standard path (unchanged) ----
+    // ---- Standard path (FP32 or non-packed FP16) ----
 
     constexpr int tile_m = HAS_NEON ? 8 : 1;
     int n_threads = thread_pool ? thread_pool->num_threads() : 1;

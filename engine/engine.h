@@ -115,6 +115,9 @@ private:
     std::unordered_map<std::string, size_t> weight_map_;  // path → index into shared_weights_
     std::vector<MappedFile> shared_weights_;
 
+    // Load-time interleaved-packed FP16 weights (path → packed buffer)
+    std::unordered_map<std::string, std::vector<uint8_t>> packed_weights_;
+
     // KV cache tensor pointers (per layer)
     struct CachePair {
         Tensor* k = nullptr;

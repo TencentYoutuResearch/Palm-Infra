@@ -27,3 +27,12 @@ extern MatmulConfig g_matmul_config;
 
 void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         ThreadPool* thread_pool = nullptr);
+
+// Pack full B [N, K] row-major → interleaved [N/8, K, 8] layout.
+// For each N-tile of 8 rows, transpose so that for fixed k,
+// B_packed[tile_base + k*8 + 0..7] are 8 consecutive FP16 values.
+// Enables vld1q_f16 contiguous load instead of strided gather.
+// Returns newly allocated buffer (caller owns, must delete[]).
+// K_weight is the stride between consecutive k rows in B_original
+// (typically == K for row-major).
+__fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K, int K_weight);

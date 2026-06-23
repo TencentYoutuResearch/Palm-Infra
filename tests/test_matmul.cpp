@@ -215,9 +215,9 @@ int main() {
         delete[] a_data; delete[] b_data; delete[] c_data; delete[] ref_c;
     }
 
-    // ---- FP16 tests with interleaved packing ----
+    // ---- FP16 tests with interleaved packing (pre-packed B) ----
     {
-        // Helper to create FP16 B tensor and run matmul
+        // Helper: pack B then run matmul
         auto test_fp16 = [&](int M, int K, int N, const char* label) {
             float* a_data = new float[M * K];
             __fp16* b_data = new __fp16[N * K];
@@ -229,8 +229,11 @@ int main() {
             fill_rand(tmp_b, N * K);
             for (int i = 0; i < N * K; i++) b_data[i] = (__fp16)tmp_b[i];
 
+            // Pre-pack B (mirrors engine load-time packing)
+            __fp16* b_packed = pack_b_interleaved_full(b_data, N, K, K);
+
             Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-            Tensor B = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, N, K, 1, 1, b_data);
+            Tensor B = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, N, K, 1, 1, b_packed);
             Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
             // Enable interleaved packing
@@ -243,7 +246,8 @@ int main() {
             float tol = 1e-2f;
             CHECK(check_approx(c_data, ref_c, M * N, tol), label);
 
-            delete[] a_data; delete[] b_data; delete[] c_data; delete[] ref_c; delete[] tmp_b;
+            delete[] a_data; delete[] b_data; delete[] b_packed;
+            delete[] c_data; delete[] ref_c; delete[] tmp_b;
         };
 
         test_fp16(32, 256, 128, "FP16 32x256 * 256x128 (interleave)");

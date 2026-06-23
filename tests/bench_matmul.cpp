@@ -161,6 +161,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     void* b_raw = nullptr;
     float* b_fp32_data = nullptr;
     __fp16* b_fp16_data = nullptr;
+    __fp16* b_packed_data = nullptr;  // owns packed buffer if interleave on
 
     if (is_fp16) {
         b_fp16_data = new __fp16[N * K];
@@ -168,7 +169,14 @@ static BenchResult run_bench(const BenchConfig& cfg) {
         fill_rand(tmp, N * K);
         for (int i = 0; i < N * K; i++) b_fp16_data[i] = (__fp16)tmp[i];
         delete[] tmp;
-        b_raw = b_fp16_data;
+
+        // Pre-pack B for interleaved path (mirrors engine load-time packing)
+        if (g_matmul_config.use_interleave_pack) {
+            b_packed_data = pack_b_interleaved_full(b_fp16_data, N, K, K);
+            b_raw = b_packed_data;
+        } else {
+            b_raw = b_fp16_data;
+        }
     } else {
         b_fp32_data = new float[N * K];
         fill_rand(b_fp32_data, N * K);
@@ -215,6 +223,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
 
     delete[] a_data;
     delete[] c_data;
+    if (b_packed_data) delete[] b_packed_data;
     if (is_fp16) delete[] b_fp16_data;
     else delete[] b_fp32_data;
     return result;

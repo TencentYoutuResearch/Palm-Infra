@@ -73,21 +73,42 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         if (it != weight_map_.end()) {
             // Reuse existing mmap
             setup_weight(const_cast<void*>(shared_weights_[it->second].data()));
-            continue;
+        } else {
+            // Load new mmap
+            MappedFile mf;
+            if (!mf.open(wpath.c_str())) {
+                fprintf(stderr, "Engine: failed to load weight %s\n", wpath.c_str());
+                return false;
+            }
+
+            size_t idx = shared_weights_.size();
+            weight_map_[wpath] = idx;
+            shared_weights_.push_back(std::move(mf));
+
+            setup_weight(const_cast<void*>(shared_weights_[idx].data()));
         }
 
-        // Load new mmap
-        MappedFile mf;
-        if (!mf.open(wpath.c_str())) {
-            fprintf(stderr, "Engine: failed to load weight %s\n", wpath.c_str());
-            return false;
+        // Load-time B interleaved packing for FP16 weights (skip embed_tokens)
+        if (t.prec == Precision::FP16) {
+            bool is_embed = (node.params.str[0].find("embed_tokens") != std::string::npos);
+            if (!is_embed) {
+                auto pack_it = packed_weights_.find(wpath);
+                if (pack_it == packed_weights_.end()) {
+                    int N = (int)t.shape[0];
+                    int K = (int)t.shape[1];
+                    int K_weight = K;  // row-major, K_weight == K
+                    const __fp16* b_orig = reinterpret_cast<const __fp16*>(t.data);
+                    __fp16* b_packed = pack_b_interleaved_full(b_orig, N, K, K_weight);
+                    size_t buf_size = (size_t)N * K * sizeof(__fp16);
+                    std::vector<uint8_t> buf((uint8_t*)b_packed,
+                                             (uint8_t*)b_packed + buf_size);
+                    delete[] b_packed;
+                    packed_weights_[wpath] = std::move(buf);
+                }
+                t.data = packed_weights_[wpath].data();
+                // mem_type stays EXTERNAL (vector owns the buffer)
+            }
         }
-
-        size_t idx = shared_weights_.size();
-        weight_map_[wpath] = idx;
-        shared_weights_.push_back(std::move(mf));
-
-        setup_weight(const_cast<void*>(shared_weights_[idx].data()));
     }
 
     // Find embed_tokens weight

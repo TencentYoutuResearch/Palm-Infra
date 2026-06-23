@@ -306,19 +306,59 @@ GFLOPS 从 203 提升到 279。GEMV 自动回退无退化。
 
 ---
 
+## 尝试 9：Load-Time B Packing (一次性 interleaved pack)
+
+**决策理由**：尝试 8 的 per-K_BLOCK packing 每次 matmul 调用都重新 pack B，
+GEMV (M=1) 因 pack overhead 太大只能回退。改为在 `LLMEngine::load_graph` 时
+一次性将所有 FP16 权重（除 embed_tokens）pack 成 interleaved `[N/8, K, 8]` layout，
+推理时零 packing 开销，GEMV 和 GEMM 共用同一份 packed B。
+
+**实现**：
+- `kernels/matmul.h`: 新增 `pack_b_interleaved_full` 公开 API
+- `kernels/matmul.cpp`: packed kernel 内部 K-blocking (无 per-call pack)
+- `engine/engine.h`: 新增 `packed_weights_` map (path → packed buffer)
+- `engine/engine.cpp`: `load_graph` 在 `setup_weight` 后 pack FP16 权重（跳过 embed_tokens）
+- 移除 M>=8 守卫，GEMV 也走 packed 路径
+
+**结果 (FP16 microbench vs 尝试 8)**：
+| Shape | 尝试 8 (per-call pack) | 尝试 9 (load-time pack) | 变化 |
+|-------|----------------------|------------------------|------|
+| 128×2048×6144 t=1 | 32.44ms (99.3GF) | 31.83ms (101.2GF) | -1.9% |
+| 128×2048×6144 t=4 | 11.54ms (279.3GF) | 8.84ms (364.4GF) | **-23%** |
+| 1×2048×2048 t=1 | 1.06ms (回退) | **0.56ms (14.9GF)** | **-47%** |
+| 1×2048×128k t=4 | 17.78ms (回退) | **9.44ms (55.7GF)** | **-47%** |
+
+**结果 (端到端 Youtu-LLM-2B, 4 threads)**：
+| 指标 | 尝试 8 | 尝试 9 | 变化 |
+|------|-------|-------|------|
+| load_ms | 328 | 4254 | +1197% (一次性 pack) |
+| prefill_tps | 8.54 | 8.67 | +1.5% |
+| decode_tps | 6.27 | **10.51** | **+68%** |
+| prefill MATMUL | 1751ms | 1317ms | -25% |
+| decode MATMUL | 16616ms | 8384ms | **-50%** |
+
+**结论**：**GEMV 场景大幅提升**。decode_tps 从 6.27 提升到 10.51 (+68%)，
+decode MATMUL 时间减半。GEMM 多线程也提升 23%（无 per-call pack overhead）。
+load time 增加 ~4s（一次性 pack 全部权重），可接受。
+
+**决定**：**采用。load-time packing 替代 per-call packing。**
+
+---
+
 ## 当前最优配置
 
 - **TILE**: 8×8 (NEON)
 - **K_BLOCK**: 512
 - **精度**: FP16 权重 + FP32 累加
-- **B packing**: Interleaved (tile-of-8 transpose), M>=8 启用
+- **B packing**: Load-time interleaved (tile-of-8 transpose), GEMV+GEMM 共用
 - **线程**: 自定义线程池, per-op split work
 - **分片**: 自适应 (M vs N 维度)
 - **无**: repack, K 展开, A SIMD load
 
 ## 下一步方向
 
-1. **SDPA 优化** — prefill 占 14%, naive O(n²)
-2. **量化 (INT4/INT8)** — 最大杠杆，预计 3-5x
-3. **其他算子并行** — RMSNorm, SiLU 等（当前占比小，优先级低）
-4. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）
+1. **A packing + vfmaq_lane_f16** — ncnn 风格, A 也 pack + lane-wise FMA
+2. **SDPA 优化** — prefill 占 14%, naive O(n²)
+3. **量化 (INT4/INT8)** — 最大杠杆，预计 3-5x
+4. **其他算子并行** — RMSNorm, SiLU 等（当前占比小，优先级低）
+5. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）
