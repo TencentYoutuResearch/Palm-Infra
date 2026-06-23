@@ -376,6 +376,94 @@ static void matmul_fp16_neon_8x8_range_packed_a(
     }
 }
 
+// ---- FP16 lane-FMA kernel with FP16 accumulation ----
+//
+// Same interface as above but accumulates in float16x8_t using vfmaq_lane_f16.
+// 2x FMA throughput vs FP32 widening path. Accumulator is row-major
+// (c[j] = 8 M rows for N column j), writeback is direct store.
+//
+// Precision: FP16 accumulation over K_BLOCK (1024) terms. Between K-blocks,
+// partial results are stored to C (FP32) and reloaded (FP16), providing
+// FP32 intermediate precision across blocks.
+static void matmul_fp16_neon_8x8_range_packed_a_fp16acc(
+    const __fp16* A_packed, const __fp16* B_packed, float* C,
+    int M, int N, int K,
+    int ldc, int m_begin, int m_end)
+{
+    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
+    const int K_BLOCK_FP16 = K_BLOCK * 2;
+
+    for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK_FP16) {
+        int k_end = std::min(k_outer + K_BLOCK_FP16, K);
+        bool first_block = (k_outer == 0);
+
+        for (int m = m_begin; m < m_end; m += 8) {
+            int m_tile_end = std::min(m + 8, m_end);
+            int m_global_end = std::min(m + 8, M);
+
+            for (int n = 0; n < N; n += 8) {
+                int n_end = std::min(n + 8, N);
+
+                // Row-major accumulators: c[j] = 8 M values for N column n+j
+                // Layout matches C: c[j][r] = C[(m+r)][n+j]
+                float16x8_t c[8];
+                if (first_block) {
+                    for (int j = 0; j < 8; j++) c[j] = vdupq_n_f16((__fp16)0.f);
+                } else {
+                    // Reload from C (FP32 → FP16)
+                    for (int j = 0; j < 8; j++) {
+                        if (n + j < n_end) {
+                            float tmp[8];
+                            for (int r = 0; r < 8; r++) {
+                                int row = m + r;
+                                tmp[r] = (row < m_tile_end && row < m_global_end)
+                                       ? C[row * ldc + n + j] : 0.f;
+                            }
+                            c[j] = vcombine_f16(
+                                vcvt_f16_f32(vld1q_f32(tmp)),
+                                vcvt_f16_f32(vld1q_f32(tmp + 4)));
+                        } else {
+                            c[j] = vdupq_n_f16((__fp16)0.f);
+                        }
+                    }
+                }
+
+                // K loop: FP16 lane-FMA
+                for (int k = k_outer; k < k_end; k++) {
+                    float16x8_t a_vec = vld1q_f16(&A_packed[(m & ~7) * K + k * 8]);
+                    float16x8_t b_vec = vld1q_f16(&B_packed[(n & ~7) * K + k * 8]);
+                    float16x4_t b_low = vget_low_f16(b_vec);
+                    float16x4_t b_high = vget_high_f16(b_vec);
+
+                    c[0] = vfmaq_lane_f16(c[0], a_vec, b_low, 0);
+                    c[1] = vfmaq_lane_f16(c[1], a_vec, b_low, 1);
+                    c[2] = vfmaq_lane_f16(c[2], a_vec, b_low, 2);
+                    c[3] = vfmaq_lane_f16(c[3], a_vec, b_low, 3);
+                    c[4] = vfmaq_lane_f16(c[4], a_vec, b_high, 0);
+                    c[5] = vfmaq_lane_f16(c[5], a_vec, b_high, 1);
+                    c[6] = vfmaq_lane_f16(c[6], a_vec, b_high, 2);
+                    c[7] = vfmaq_lane_f16(c[7], a_vec, b_high, 3);
+                }
+
+                // Write back: FP16 → FP32, store to C
+                for (int j = 0; j < 8 && n + j < n_end; j++) {
+                    float32x4_t lo = vcvt_f32_f16(vget_low_f16(c[j]));
+                    float32x4_t hi = vcvt_f32_f16(vget_high_f16(c[j]));
+                    float tmp[8];
+                    vst1q_f32(tmp, lo);
+                    vst1q_f32(tmp + 4, hi);
+                    for (int r = 0; r < 8; r++) {
+                        int row = m + r;
+                        if (row < m_tile_end && row < m_global_end) {
+                            C[row * ldc + n + j] = tmp[r];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---- FP32 kernel (kept for backward compat) ----
 static void matmul_fp32_neon_8x8_range(const float* A, const float* B, float* C,
                                        int M, int N, int K,
@@ -544,11 +632,27 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     // ---- Interleaved packing path (FP16 + NEON) ----
     // B is pre-packed at load time (engine) or by the caller (bench/test).
     // A is packed per-call (small overhead, M×K << N×K).
-    // - M >= 8: lane-FMA kernel (vfmlalq_laneq_f16, A+B both packed)
+    // - M >= 8: lane-FMA kernel (A+B both packed)
+    //   - FP16 accumulate: vfmaq_lane_f16 (2x throughput, default)
+    //   - FP32 widen accumulate: vfmlalq_laneq_f16 (precision fallback)
     // - M <  8: scalar-A kernel (vfmaq_n_f32, only B packed) — GEMV path
     bool use_interleave = is_fp16 && HAS_NEON && !is_repacked
                        && g_matmul_config.use_interleave_pack;
     bool use_lane_fma = use_interleave && (M >= 8);
+    bool use_fp16_acc = g_matmul_config.use_fp16_accumulate;
+
+    // Select lane-FMA kernel based on accumulation mode
+    auto dispatch_lane_fma = [&](const __fp16* a_packed, const __fp16* b_packed,
+                                 float* c, int m_len, int n_len,
+                                 int ldc_, int m_begin_, int m_end_) {
+        if (use_fp16_acc) {
+            matmul_fp16_neon_8x8_range_packed_a_fp16acc(
+                a_packed, b_packed, c, m_len, n_len, K, ldc_, m_begin_, m_end_);
+        } else {
+            matmul_fp16_neon_8x8_range_packed_a(
+                a_packed, b_packed, c, m_len, n_len, K, ldc_, m_begin_, m_end_);
+        }
+    };
 
     if (use_interleave) {
         constexpr int tile_m = HAS_NEON ? 8 : 1;
@@ -563,9 +667,6 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
 
         const __fp16* b_packed = b_fp16;
 
-        // Pack A per-call for lane-FMA path (M >= 8).
-        // Each thread packs its own M-slice inside the parallel_for lambda.
-        // For single-threaded, pack the whole A.
         __fp16* a_packed = nullptr;
         if (use_lane_fma && !use_parallel) {
             a_packed = pack_a_interleaved_full(a_ptr, M, K, lda);
@@ -573,9 +674,8 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
 
         if (!use_parallel) {
             if (use_lane_fma) {
-                matmul_fp16_neon_8x8_range_packed_a(
-                    a_packed, b_packed, c_ptr,
-                    M, N, K, ldc, 0, M);
+                dispatch_lane_fma(a_packed, b_packed, c_ptr,
+                                  M, N, ldc, 0, M);
                 delete[] a_packed;
             } else {
                 matmul_fp16_neon_8x8_range_packed(
@@ -583,7 +683,6 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                     M, N, K, lda, ldc, 0, M);
             }
         } else if (shard_by_n) {
-            // GEMV: M==1, shard by N. Use scalar-A kernel (M<8).
             int n_chunk = std::max(chunk_size, 8);
             n_chunk = ((n_chunk + 7) / 8) * 8;
             thread_pool->parallel_for(0, N, n_chunk,
@@ -597,15 +696,13 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         K, lda, ldc, 0, M);
                 });
         } else {
-            // GEMM: shard by M. Each thread packs its own A slice.
             thread_pool->parallel_for(0, M, chunk_size,
                 [&](int, int m_begin, int m_end) {
                     int m_len = m_end - m_begin;
                     __fp16* a_slice_packed = pack_a_interleaved_full(
                         a_ptr + m_begin * lda, m_len, K, lda);
-                    matmul_fp16_neon_8x8_range_packed_a(
-                        a_slice_packed, b_packed, c_ptr,
-                        m_len, N, K, ldc, 0, m_len);
+                    dispatch_lane_fma(a_slice_packed, b_packed, c_ptr,
+                                      m_len, N, ldc, 0, m_len);
                     delete[] a_slice_packed;
                 });
         }
