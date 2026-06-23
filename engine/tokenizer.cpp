@@ -575,10 +575,13 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
 // --- Chat template ----------------------------------------------------------
 
 std::vector<int> Tokenizer::apply_chat(const std::string& user_message) const {
+    // Llama-3 chat format
     std::string prompt =
-        "<|begin_of_text|>system\nYou are a helpful assistant.<|end_of_text|>\n"
-        "<|begin_of_text|>user\n" + user_message + "<|end_of_text|>\n"
-        "<|begin_of_text|>assistant\n";
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        "You are a helpful assistant.<|eot_id|>"
+        "<|start_header_id|>user<|end_header_id|>\n\n" +
+        user_message + "<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n\n";
     return encode(prompt);
 }
 

@@ -89,7 +89,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         }
 
         // Load-time B interleaved packing for FP16 weights (skip embed_tokens)
-        if (t.prec == Precision::FP16) {
+        if (t.prec == Precision::FP16 && g_matmul_config.use_interleave_pack) {
             bool is_embed = (node.params.str[0].find("embed_tokens") != std::string::npos);
             if (!is_embed) {
                 auto pack_it = packed_weights_.find(wpath);
@@ -106,6 +106,32 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     packed_weights_[wpath] = std::move(buf);
                 }
                 t.data = packed_weights_[wpath].data();
+
+                // Debug: verify packing
+                if (getenv("MLLLM_DEBUG_PACK")) {
+                    int N2 = (int)t.shape[0];
+                    int K2 = (int)t.shape[1];
+                    const __fp16* orig = reinterpret_cast<const __fp16*>(
+                        shared_weights_[weight_map_[wpath]].data());
+                    const __fp16* packed = reinterpret_cast<const __fp16*>(t.data);
+                    int n_check = std::min(N2, 16);
+                    int k_check = std::min(K2, 4);
+                    int errors = 0;
+                    for (int n = 0; n < n_check; n++) {
+                        for (int k = 0; k < k_check; k++) {
+                            __fp16 v_orig = orig[n * K2 + k];
+                            __fp16 v_packed = packed[(n & ~7) * K2 + k * 8 + (n & 7)];
+                            if (fabsf((float)v_orig - (float)v_packed) > 0.001f) {
+                                if (errors < 5)
+                                    fprintf(stderr, "  PACK ERR n=%d k=%d: orig=%f packed=%f\n",
+                                            n, k, (float)v_orig, (float)v_packed);
+                                errors++;
+                            }
+                        }
+                    }
+                    fprintf(stderr, "  pack check %s: N=%d K=%d errors=%d/%d\n",
+                            wpath.c_str(), N2, K2, errors, n_check * k_check);
+                }
                 // mem_type stays EXTERNAL (vector owns the buffer)
             }
         }
@@ -341,7 +367,12 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
     void* c_buf = graph_prefill_.runtime.pool.acquire(vocab_size * sizeof(float));
     Tensor C = Tensor::create(Precision::FP32, MemoryType::POOLED, vocab_size, 1, 1, 1, c_buf);
 
+    // embed_weight is NOT interleaved-packed (skipped in load_graph to preserve
+    // embed() direct indexing). Disable interleave path for this matmul.
+    bool saved_pack = g_matmul_config.use_interleave_pack;
+    g_matmul_config.use_interleave_pack = false;
     kernel_matmul_fp32(A, *embed_weight_, C, exec_ctx_decode_.thread_pool);
+    g_matmul_config.use_interleave_pack = saved_pack;
 
     const float* scores = C.ptr<float>();
     struct Candidate { int id; float score; };

@@ -701,7 +701,8 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                     int m_len = m_end - m_begin;
                     __fp16* a_slice_packed = pack_a_interleaved_full(
                         a_ptr + m_begin * lda, m_len, K, lda);
-                    dispatch_lane_fma(a_slice_packed, b_packed, c_ptr,
+                    dispatch_lane_fma(a_slice_packed, b_packed,
+                                      c_ptr + m_begin * ldc,
                                       m_len, N, ldc, 0, m_len);
                     delete[] a_slice_packed;
                 });
