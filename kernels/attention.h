@@ -4,6 +4,8 @@
 #include "graph/graph.h"
 #include <vector>
 
+class ThreadPool;
+
 // ---------------------------------------------------------------------------
 // PROJECT_NAME — SDPA kernels
 //
@@ -37,4 +39,5 @@
 ///   f32[0] = scale (0 → 1/sqrt(head_dim))
 void kernel_sdpa(const OpParams& params,
                  const std::vector<const Tensor*>& inputs,
-                 std::vector<Tensor*>& outputs);
+                 std::vector<Tensor*>& outputs,
+                 ThreadPool* thread_pool = nullptr);

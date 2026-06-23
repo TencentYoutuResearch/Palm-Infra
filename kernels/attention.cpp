@@ -1,5 +1,6 @@
 #include "kernels/attention.h"
 #include "kernels/matmul.h"
+#include "kernels/threading.h"
 #include "engine/engine.h"  // for CacheMetadata, cache_meta, cache_data
 
 #include <algorithm>
@@ -256,7 +257,8 @@ static void naive_sdpa_head(
 
 void kernel_sdpa(const OpParams& params,
                  const std::vector<const Tensor*>& inputs,
-                 std::vector<Tensor*>& outputs) {
+                 std::vector<Tensor*>& outputs,
+                 ThreadPool* thread_pool) {
     int kv_cache    = graph_params::get_i32(params, 0, 2);
     int causal      = graph_params::get_i32(params, 1, 1);
     int num_heads   = graph_params::get_i32(params, 2, 16);
@@ -348,22 +350,30 @@ void kernel_sdpa(const OpParams& params,
     }
 
 #if HAS_NEON
-    // ---- Flash attention path ----
-    for (int h = 0; h < num_heads; h++) {
-        int kv_h = h / heads_per_group;
-        const float* Q_head = (const float*)Q.channel<unsigned char>(h);
-        const float* K_head = get_k_ptr(kv_h);
-        const float* V_head = get_v_ptr(kv_h);
-        float* O_head = (float*)out.channel<unsigned char>(h);
+    // ---- Flash attention path (parallel across heads) ----
+    auto run_head = [&](int, int h_begin, int h_end) {
+        for (int h = h_begin; h < h_end; h++) {
+            int kv_h = h / heads_per_group;
+            const float* Q_head = (const float*)Q.channel<unsigned char>(h);
+            const float* K_head = get_k_ptr(kv_h);
+            const float* V_head = get_v_ptr(kv_h);
+            float* O_head = (float*)out.channel<unsigned char>(h);
 
-        if (src_seqlen == 1) {
-            flash_attn_fp32_decode(Q_head, K_head, V_head, O_head,
-                                   dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);
-        } else {
-            flash_attn_fp32_prefill(Q_head, K_head, V_head, O_head,
-                                    src_seqlen, dst_seqlen, head_dim, v_head_dim,
-                                    scale, mask_ptr);
+            if (src_seqlen == 1) {
+                flash_attn_fp32_decode(Q_head, K_head, V_head, O_head,
+                                       dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);
+            } else {
+                flash_attn_fp32_prefill(Q_head, K_head, V_head, O_head,
+                                        src_seqlen, dst_seqlen, head_dim, v_head_dim,
+                                        scale, mask_ptr);
+            }
         }
+    };
+
+    if (thread_pool && num_heads >= 2) {
+        thread_pool->parallel_for(0, num_heads, 1, run_head);
+    } else {
+        run_head(0, 0, num_heads);
     }
 #else
     // ---- Naive scalar fallback ----

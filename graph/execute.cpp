@@ -109,7 +109,7 @@ static void dispatch_kernel(OpType op, const OpParams& params,
     case OpType::SDPA:
     case OpType::SDPA_MLA: {
         std::vector<Tensor*> sdpa_outs = { output };
-        kernel_sdpa(params, inputs, sdpa_outs);
+        kernel_sdpa(params, inputs, sdpa_outs, thread_pool);
         break;
     }
     case OpType::ROTARY_EMBED:
