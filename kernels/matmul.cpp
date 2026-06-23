@@ -11,14 +11,6 @@ MatmulConfig g_matmul_config;
 #if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
 #include <arm_neon.h>
 #define HAS_NEON 1
-
-// Thread-local packing buffer for B interleaved packing
-struct PackedBuffer {
-    __fp16* data = nullptr;
-    size_t capacity = 0;  // in __fp16 elements
-    ~PackedBuffer() { delete[] data; }
-};
-static thread_local PackedBuffer g_pack_buf;
 #else
 #define HAS_NEON 0
 #endif
@@ -67,44 +59,10 @@ static void matmul_fp32_scalar_range(const float* A, const float* B, float* C,
 // For each N-tile of 8 rows, transpose so that for fixed k,
 // B_packed[tile_base + k*8 + 0..7] are 8 consecutive FP16 values.
 // This enables vld1q_f16 contiguous load instead of strided gather.
-// ---------------------------------------------------------------------------
-static const __fp16* pack_b_interleaved(
-    const __fp16* B_original, int N, int K, int K_weight,
-    int k_begin, int k_end)
-{
-    int k_len = k_end - k_begin;
-    size_t needed = (size_t)N * k_len;
-
-    PackedBuffer& buf = g_pack_buf;
-    if (buf.capacity < needed) {
-        delete[] buf.data;
-        buf.data = new __fp16[needed];
-        buf.capacity = needed;
-    }
-
-    __fp16* dst = buf.data;
-
-    for (int n_tile = 0; n_tile < N; n_tile += 8) {
-        int n_tile_end = std::min(n_tile + 8, N);
-        int tile_valid = n_tile_end - n_tile;  // 1..8
-
-        for (int k = k_begin; k < k_end; k++) {
-            int k_offset = k - k_begin;
-            for (int j = 0; j < tile_valid; j++) {
-                dst[n_tile * k_len + k_offset * 8 + j] =
-                    B_original[(n_tile + j) * K_weight + k];
-            }
-            for (int j = tile_valid; j < 8; j++) {
-                dst[n_tile * k_len + k_offset * 8 + j] = (__fp16)0.f;
-            }
-        }
-    }
-
-    return buf.data;
-}
-
+//
 // Full-matrix version: pack entire B [N, K] → interleaved [N/8, K, 8].
 // Caller owns the returned buffer (must delete[]).
+// ---------------------------------------------------------------------------
 __fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K, int K_weight) {
     __fp16* dst = new __fp16[(size_t)N * K];
     for (int n_tile = 0; n_tile < N; n_tile += 8) {
@@ -361,99 +319,6 @@ static void matmul_fp32_neon_8x8_range(const float* A, const float* B, float* C,
                         vst1q_f32(tmp, c[r][1]);
                         for (int j = 0; j < 4 && n + 4 + j < n_end; j++) C[row * ldc + n + 4 + j] = tmp[j];
                     }
-                }
-            }
-        }
-    }
-}
-
-// ---- legacy 4x4 tile (kept for reference) ----
-static void matmul_fp32_neon_4x4_range(const float* A, const float* B, float* C,
-                                       int M, int N, int K,
-                                       int lda, int K_weight, int ldc,
-                                       int m_begin, int m_end) {
-    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
-
-    for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK) {
-        int k_end = std::min(k_outer + K_BLOCK, K);
-
-        for (int m = m_begin; m < m_end; m += 4) {
-            int m_tile_end = std::min(m + 4, m_end);
-            int m_global_end = std::min(m + 4, M);
-
-            for (int n = 0; n < N; n += 4) {
-                int n_end = std::min(n + 4, N);
-
-                // For the first K block, zero the accumulators.
-                // For subsequent blocks, reload the partial sums so we can
-                // continue accumulating.
-                float32x4_t c0, c1, c2, c3;
-                bool first_block = (k_outer == 0);
-                if (first_block) {
-                    c0 = vdupq_n_f32(0.f);
-                    c1 = vdupq_n_f32(0.f);
-                    c2 = vdupq_n_f32(0.f);
-                    c3 = vdupq_n_f32(0.f);
-                } else {
-                    float tmp[4];
-                    int row0 = m + 0, row1 = m + 1, row2 = m + 2, row3 = m + 3;
-                    if (row0 < m_tile_end && row0 < m_global_end) {
-                        for (int j = 0; j < 4 && n + j < n_end; j++) tmp[j] = C[row0 * ldc + n + j];
-                        c0 = vld1q_f32(tmp);
-                    } else { c0 = vdupq_n_f32(0.f); }
-                    if (row1 < m_tile_end && row1 < m_global_end) {
-                        for (int j = 0; j < 4 && n + j < n_end; j++) tmp[j] = C[row1 * ldc + n + j];
-                        c1 = vld1q_f32(tmp);
-                    } else { c1 = vdupq_n_f32(0.f); }
-                    if (row2 < m_tile_end && row2 < m_global_end) {
-                        for (int j = 0; j < 4 && n + j < n_end; j++) tmp[j] = C[row2 * ldc + n + j];
-                        c2 = vld1q_f32(tmp);
-                    } else { c2 = vdupq_n_f32(0.f); }
-                    if (row3 < m_tile_end && row3 < m_global_end) {
-                        for (int j = 0; j < 4 && n + j < n_end; j++) tmp[j] = C[row3 * ldc + n + j];
-                        c3 = vld1q_f32(tmp);
-                    } else { c3 = vdupq_n_f32(0.f); }
-                }
-
-                for (int k = k_outer; k < k_end; k++) {
-                    float tmp_b[4] = {0.f, 0.f, 0.f, 0.f};
-                    for (int j = 0; j < 4 && n + j < n_end; j++) {
-                        tmp_b[j] = B[(n + j) * K_weight + k];
-                    }
-                    float32x4_t b_vec = vld1q_f32(tmp_b);
-
-                    if (m + 0 < m_tile_end && m + 0 < m_global_end) {
-                        c0 = vfmaq_n_f32(c0, b_vec, A[k + (m + 0) * lda]);
-                    }
-                    if (m + 1 < m_tile_end && m + 1 < m_global_end) {
-                        c1 = vfmaq_n_f32(c1, b_vec, A[k + (m + 1) * lda]);
-                    }
-                    if (m + 2 < m_tile_end && m + 2 < m_global_end) {
-                        c2 = vfmaq_n_f32(c2, b_vec, A[k + (m + 2) * lda]);
-                    }
-                    if (m + 3 < m_tile_end && m + 3 < m_global_end) {
-                        c3 = vfmaq_n_f32(c3, b_vec, A[k + (m + 3) * lda]);
-                    }
-                }
-
-                // Write back after every K block so the output is always
-                // up-to-date (needed because the next block will reload).
-                float tmp_out[4];
-                if (m + 0 < m_tile_end && m + 0 < m_global_end) {
-                    vst1q_f32(tmp_out, c0);
-                    for (int j = 0; j < n_end - n; j++) C[(m + 0) * ldc + n + j] = tmp_out[j];
-                }
-                if (m + 1 < m_tile_end && m + 1 < m_global_end) {
-                    vst1q_f32(tmp_out, c1);
-                    for (int j = 0; j < n_end - n; j++) C[(m + 1) * ldc + n + j] = tmp_out[j];
-                }
-                if (m + 2 < m_tile_end && m + 2 < m_global_end) {
-                    vst1q_f32(tmp_out, c2);
-                    for (int j = 0; j < n_end - n; j++) C[(m + 2) * ldc + n + j] = tmp_out[j];
-                }
-                if (m + 3 < m_tile_end && m + 3 < m_global_end) {
-                    vst1q_f32(tmp_out, c3);
-                    for (int j = 0; j < n_end - n; j++) C[(m + 3) * ldc + n + j] = tmp_out[j];
                 }
             }
         }
