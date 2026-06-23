@@ -442,10 +442,55 @@ GEMM 多线程持平，可能因为 A pack 在 worker 线程内串行。
 - **分片**: 自适应 (M vs N 维度)
 - **无**: repack, K 展开, A SIMD load
 
+---
+
+## 尝试 11：FlashAttention-2 FP32 (ARM NEON)
+
+**决策理由**：pp256 时 SDPA 占 40.6%（1805ms），是 naive O(n²) 标量实现。
+移植 ncnn-upstream 中自写的 FlashAttention-2 FP32 kernel：
+- 2D tiled (Br=4, Bc=32) + online softmax，避免 materialize 全 QK 矩阵
+- NEON 向量化 dot product (`dot_fp32_neon`) + fast exp (`fast_exp_f32x4`)
+- decode 专用路径 (M=1, Bc=32)
+
+**实现**：
+- `kernels/attention.cpp`: 移植 `flash_attn_fp32_decode` + `flash_attn_fp32_prefill`
+- KV cache append 后 K/V per-head 连续，直接传给 flash kernel
+- causal mask 在无显式 mask 时动态构建
+- 非 NEON 平台保留 naive scalar fallback
+
+**结果 (端到端 Youtu-LLM-2B, 4 threads, pp256 graph)**：
+| 指标 | 尝试 10 | 尝试 11 | 变化 |
+|------|--------|--------|------|
+| prefill_ms (220 tok) | 4678ms | **3532ms** | **-24%** |
+| prefill_tps (220 tok) | 47.0 | **62.3** | **+32%** |
+| prefill_tps (pp256 equiv) | ~55 | **~72.5** | +32% |
+| decode_tps | 10.23 | 9.88 | -3% (噪声) |
+| SDPA time (pp256) | 1805ms (40.6%) | **603ms (18.5%)** | **-67%** |
+
+**结论**：**SDPA 大幅提升** (-67%)，prefill +32%。SDPA 占比从 40.6% 降到 18.5%。
+decode 基本持平（flash decode kernel 对小 N 的 overhead 被向量化收益抵消）。
+
+**决定**：**采用。FP32 flash attention 作为默认。**
+后续可移植 FP16FML kernel 进一步提升。
+
+---
+
+## 当前最优配置
+
+- **TILE**: 8×8 (NEON)
+- **K_BLOCK**: 512
+- **精度**: FP16 权重 + FP16 activations (GEMM) + FP32 累加
+- **A packing**: Per-call interleaved (M>=8), FP32→FP16
+- **B packing**: Load-time interleaved (tile-of-8 transpose), GEMV+GEMM 共用
+- **FMA**: vfmlalq_laneq_f16 (M>=8), vfmaq_n_f32 (M<8)
+- **SDPA**: FlashAttention-2 FP32 (Br=4, Bc=32, online softmax)
+- **线程**: 自定义线程池, per-op split work, per-worker A pack
+
 ## 下一步方向
 
-1. **A packing + vfmaq_lane_f16** — ncnn 风格, A 也 pack + lane-wise FMA
-2. **SDPA 优化** — prefill 占 14%, naive O(n²)
-3. **量化 (INT4/INT8)** — 最大杠杆，预计 3-5x
+1. **量化 (INT4/INT8)** — MATMUL 仍占 70%, 最大杠杆
+2. **FP16 SDPA** — 移植 FP16FML flash kernel, SDPA 仍占 18.5%
+3. **SDPA 多线程** — 当前 flash kernel 串行, 可按 head 并行
+4. **其他算子并行** — RMSNorm, SiLU 等（当前占比小）
 4. **其他算子并行** — RMSNorm, SiLU 等（当前占比小，优先级低）
 5. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）
