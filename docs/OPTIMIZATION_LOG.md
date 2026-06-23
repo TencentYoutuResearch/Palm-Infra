@@ -191,20 +191,27 @@ FP16 直接减半了 B 的内存流量。prefill 提升不大说明 compute boun
 
 ## 端到端性能演进 (Youtu-LLM-2B, M5 Pro, 4 threads)
 
-| 版本 | prefill_tps | decode_tps | 关键改动 |
-|------|------------|------------|---------|
-| 初始 | 1.52 | 1.55 | FP32 4×4 tile, 单线程 |
-| + 线程池 | 4.54 | 1.54 | 自定义线程池 + parallel_for |
-| + lm_head 走 matmul | 4.18 | 3.54 | 复用 matmul 内核 + N 分片 |
-| + 8×8 tile | 7.02 | 5.15 | TILE_M=8, TILE_N=8 |
-| + K_BLOCK=512 | 4.41→7.02 | 4.45→5.15 | K-blocking 参数调优 |
-| + FP16 权重 | 7.21 | 6.55 | FP16 存储 + FP32 累加 |
+注：prefill_tps 早期用短 prompt (23 token) 测，被 graph padding 严重低估。
+pp256 = 256-token prompt 满载，与 ncnn/llama.cpp 对齐。
+
+| 版本 | prefill (pp256) | decode (tg) | 关键改动 |
+|------|----------------|------------|---------|
+| 初始 | — | 1.55 | FP32 4×4 tile, 单线程 |
+| + 线程池 | — | 1.54 | 自定义线程池 + parallel_for |
+| + lm_head 走 matmul | — | 3.54 | 复用 matmul 内核 + N 分片 |
+| + 8×8 tile | — | 5.15 | TILE_M=8, TILE_N=8 |
+| + FP16 权重 | — | 6.55 | FP16 存储 + FP32 累加 |
+| + per-K_BLOCK B pack | — | 6.27 | GEMM only, GEMV 回退 |
+| + load-time B pack | — | 10.51 | GEMV 也用 packed B |
+| + A pack + lane-FMA | **~55 tok/s** | 10.23 | ncnn 风格 lane-FMA |
+
+**累计提升**：prefill ~55 tok/s, decode **6.6x**
 
 **累计提升**：prefill **4.7x**, decode **4.2x**
 
-## 当前热点 (profiler, FP16, 4 threads)
+## 历史热点快照 (早期 FP16, 4 threads, 23-token prompt)
 
-### Prefill (3188ms)
+### Prefill (3188ms, seq_len=128, 23 actual tokens)
 | Op | Time | % |
 |----|------|---|
 | MATMUL | 2481ms | 80.9% |
@@ -221,8 +228,37 @@ FP16 直接减半了 B 的内存流量。prefill 提升不大说明 compute boun
 
 | 指标 | mlllm | ncnn | llama.cpp | 差距 |
 |------|-------|------|-----------|------|
-| prefill (pp256) | ~7 tok/s | 202 tok/s | 264 tok/s | ~30-38x |
-| decode (tg64) | ~6.5 tok/s | 33 tok/s | 41 tok/s | ~5-6x |
+| prefill (pp256) | ~55 tok/s | 202 tok/s | 264 tok/s | ~3.7-4.8x |
+| decode (tg64) | ~10.5 tok/s | 33 tok/s | 41 tok/s | ~3.2-3.9x |
+
+注：之前 "~7 tok/s" 是用 23 token prompt 测的，graph seq_len=128 padding 导致
+tps 被严重低估。实际满载 128 token 约 58 tok/s，256 token 约 55 tok/s。
+
+## 当前热点 (pp256, 4 threads, FP16 + load-time pack + lane-FMA)
+
+### Prefill (4678ms, 256 tokens)
+| Op | Time | % |
+|----|------|---|
+| MATMUL | 2309ms | 51.9% |
+| SDPA | 1805ms | **40.6%** |
+| CONCAT | 124ms | 2.8% |
+| SILU | 67ms | 1.5% |
+| 其他 | <1% | — |
+
+### Prefill (2202ms, 128 tokens)
+| Op | Time | % |
+|----|------|---|
+| MATMUL | 1150ms | 61.5% |
+| SDPA | 469ms | 25.1% |
+| CONCAT | 73ms | 3.9% |
+| SILU | 52ms | 2.8% |
+| 其他 | <2% | — |
+
+### Decode (458ms/token, FP16 + load-time pack)
+| Op | Time | % |
+|----|------|---|
+| MATMUL | 380ms | 98.3% |
+| 其他 | <2% | — |
 
 ## 已尝试但未采用的优化
 
@@ -381,6 +417,9 @@ load time 增加 ~4s（一次性 pack 全部权重），可接受。
 | decode_tps | 10.51 | 10.23 | -2.7% |
 | prefill MATMUL | 1317ms | 1211ms | **-8%** |
 | decode MATMUL | 8384ms | 8625ms | +2.9% |
+
+注：以上 prefill_tps 是用 23-token prompt 测的（graph seq_len=128 padding）。
+满载 128 token 实际约 58 tok/s，256 token 约 55 tok/s。
 
 **结论**：**prefill 显著提升** (+14%)，GEMM 单线程 -7%。decode 略有退化 (-2.7%)，
 可能是 A pack overhead 在 GEMV 路径的微小影响（M<8 不走 lane-FMA 但有额外分支）。

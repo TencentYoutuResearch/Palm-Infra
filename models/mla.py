@@ -270,6 +270,9 @@ def convert_mla(model_dir: str, output_dir: str, num_layers: int = 32,
     model_dir = Path(model_dir)
     output_dir = Path(output_dir)
     weights_dir = output_dir / "weights"
+    # Graph stores paths relative to the graph file's directory.
+    # The graph is saved in output_dir/, so weights paths should be "weights/...".
+    weights_rel = "weights"
 
     with open(model_dir / 'config.json') as f:
         cfg = json.load(f)
@@ -282,12 +285,12 @@ def convert_mla(model_dir: str, output_dir: str, num_layers: int = 32,
 
     # ---- Step 2: Build prefill graph ----
     print(f"\nBuilding prefill graph (seq_len={prefill_seq_len})...")
-    g_prefill = build_graph(str(weights_dir), cfg, seq_len=prefill_seq_len, n_ctx=n_ctx)
+    g_prefill = build_graph(weights_rel, cfg, seq_len=prefill_seq_len, n_ctx=n_ctx)
     g_prefill.save(str(output_dir / "model_prefill"))
 
     # ---- Step 3: Build decode graph ----
     print(f"\nBuilding decode graph (seq_len=1)...")
-    g_decode = build_graph(str(weights_dir), cfg, seq_len=1, n_ctx=n_ctx)
+    g_decode = build_graph(weights_rel, cfg, seq_len=1, n_ctx=n_ctx)
     g_decode.save(str(output_dir / "model_decode"))
 
     print(f"\nDone! Output in {output_dir}/")
@@ -298,9 +301,10 @@ def convert_mla(model_dir: str, output_dir: str, num_layers: int = 32,
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output_dir> [num_layers]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output_dir> [num_layers] [prefill_seq_len]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_dir = sys.argv[2]
     num_layers = int(sys.argv[3]) if len(sys.argv) > 3 else 32
-    convert_mla(model_dir, output_dir, num_layers)
+    prefill_seq_len = int(sys.argv[4]) if len(sys.argv) > 4 else 128
+    convert_mla(model_dir, output_dir, num_layers, prefill_seq_len)
