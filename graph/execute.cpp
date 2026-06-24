@@ -164,94 +164,46 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         break;
 
     case OpType::CONCAT:
-        // Concatenate inputs along specified dimension.
-        //
-        // Fast path: when dim==0 and inputs are contiguous (or inner-dim contiguous),
-        // copy each input's inner block (i1×i2×i3) as a single memcpy.
-        //
-        // dim==0 concat: for fixed (i1, i2, i3), all i0 elements are contiguous
-        // in both src and dst (if strides are row-major). One memcpy per (i1,i2,i3).
-        //
-        // General path: 4D nested loop with per-element memcpy (slow fallback).
+        // Concatenate inputs along specified dimension. Materializes output and
+        // respects input strides, so view inputs remain correct.
         if (!inputs.empty() && output) {
             int dim = graph_params::get_i32(params, 0, 0);
             size_t es = output->element_size();
             int64_t dim_offset = 0;
             char* dst_base = static_cast<char*>(output->data);
+            for (size_t i = 0; i < inputs.size(); i++) {
+                if (!inputs[i] || !inputs[i]->data) continue;
+                const Tensor& src = *inputs[i];
+                const char* src_base = static_cast<const char*>(src.data);
+                for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
+                    for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
+                        for (int64_t i1 = 0; i1 < src.shape[1]; i1++) {
+                            for (int64_t i0 = 0; i0 < src.shape[0]; i0++) {
+                                int64_t o0 = i0;
+                                int64_t o1 = i1;
+                                int64_t o2 = i2;
+                                int64_t o3 = i3;
+                                if (dim == 0) o0 += dim_offset;
+                                else if (dim == 1) o1 += dim_offset;
+                                else if (dim == 2) o2 += dim_offset;
+                                else if (dim == 3) o3 += dim_offset;
 
-            // Fast path: concat along dim=0.
-            // For each (i1, i2, i3): src[i0=0..shape[0]-1] is contiguous
-            // (stride[0] == es), and dst[i0=offset..offset+shape[0]-1] is also
-            // contiguous (stride[0] == es). Copy the whole i0 block at once.
-            if (dim == 0) {
-                for (size_t i = 0; i < inputs.size(); i++) {
-                    if (!inputs[i] || !inputs[i]->data) continue;
-                    const Tensor& src = *inputs[i];
-                    const char* src_base = static_cast<const char*>(src.data);
-
-                    int64_t n_inner = src.shape[1] * src.shape[2] * src.shape[3];
-                    bool src_contig = src.is_contiguous();
-                    bool dst_contig = output->is_contiguous();
-
-                    if (src_contig && dst_contig) {
-                        // Bulk copy: whole src tensor → dst at dim_offset
-                        size_t total_bytes = (size_t)src.nelements() * es;
-                        char* dst_ptr = dst_base + dim_offset * output->stride[0];
-                        std::memcpy(dst_ptr, src_base, total_bytes);
-                    } else {
-                        // Per-(i1,i2,i3) copy: each i0 block is contiguous
-                        int64_t i0_bytes = (size_t)src.shape[0] * es;
-                        int64_t dst_i0_offset = dim_offset * output->stride[0];
-                        for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
-                            for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
-                                for (int64_t i1 = 0; i1 < src.shape[1]; i1++) {
-                                    const char* src_ptr = src_base
-                                        + i1 * src.stride[1]
-                                        + i2 * src.stride[2]
-                                        + i3 * src.stride[3];
-                                    char* dst_ptr = dst_base + dst_i0_offset
-                                        + i1 * output->stride[1]
-                                        + i2 * output->stride[2]
-                                        + i3 * output->stride[3];
-                                    std::memcpy(dst_ptr, src_ptr, i0_bytes);
-                                }
+                                const char* src_ptr = src_base
+                                    + i0 * src.stride[0]
+                                    + i1 * src.stride[1]
+                                    + i2 * src.stride[2]
+                                    + i3 * src.stride[3];
+                                char* dst_ptr = dst_base
+                                    + o0 * output->stride[0]
+                                    + o1 * output->stride[1]
+                                    + o2 * output->stride[2]
+                                    + o3 * output->stride[3];
+                                std::memcpy(dst_ptr, src_ptr, es);
                             }
                         }
                     }
-                    dim_offset += src.shape[0];
                 }
-            } else {
-                // General path (dim != 0): per-element copy
-                for (size_t i = 0; i < inputs.size(); i++) {
-                    if (!inputs[i] || !inputs[i]->data) continue;
-                    const Tensor& src = *inputs[i];
-                    const char* src_base = static_cast<const char*>(src.data);
-                    for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
-                        for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
-                            for (int64_t i1 = 0; i1 < src.shape[1]; i1++) {
-                                for (int64_t i0 = 0; i0 < src.shape[0]; i0++) {
-                                    int64_t o0 = i0, o1 = i1, o2 = i2, o3 = i3;
-                                    if (dim == 1) o1 += dim_offset;
-                                    else if (dim == 2) o2 += dim_offset;
-                                    else if (dim == 3) o3 += dim_offset;
-
-                                    const char* src_ptr = src_base
-                                        + i0 * src.stride[0]
-                                        + i1 * src.stride[1]
-                                        + i2 * src.stride[2]
-                                        + i3 * src.stride[3];
-                                    char* dst_ptr = dst_base
-                                        + o0 * output->stride[0]
-                                        + o1 * output->stride[1]
-                                        + o2 * output->stride[2]
-                                        + o3 * output->stride[3];
-                                    std::memcpy(dst_ptr, src_ptr, es);
-                                }
-                            }
-                        }
-                    }
-                    dim_offset += src.shape[dim];
-                }
+                dim_offset += src.shape[dim];
             }
         }
         break;
@@ -362,12 +314,6 @@ static void dispatch_kernel(OpType op, const OpParams& params,
 
     case OpType::TILE:
         // Tile: replicate input along each dimension by the given multipliers.
-        //
-        // Fast path: when only dim=2 is replicated (common MLA case:
-        // k_rope [rope_dim, seq, 1] → [rope_dim, seq, num_heads]) and
-        // src is contiguous, copy the whole src tensor reps[2] times.
-        //
-        // General path: per-element copy with div/mod (slow fallback).
         if (!inputs.empty() && inputs[0] && output) {
             const Tensor& src = *inputs[0];
             size_t es = src.element_size();
@@ -375,37 +321,19 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             for (int d = 0; d < 4 && d < (int)params.i32.size(); d++) {
                 reps[d] = params.i32[d];
             }
+            int64_t total = output->nelements();
             char* dst = static_cast<char*>(output->data);
             const char* s = static_cast<const char*>(src.data);
-
-            // Fast path: tile along dim=2 only, src contiguous
-            // Output layout: [src.shape[0], src.shape[1], reps[2], 1]
-            // Each rep is a contiguous copy of src (shape[0]*shape[1]*es bytes)
-            bool only_dim2 = (reps[0] == 1 && reps[1] == 1 && reps[3] == 1 && reps[2] > 1);
-            bool src_contig = src.is_contiguous();
-
-            if (only_dim2 && src_contig) {
-                size_t block_bytes = (size_t)src.shape[0] * src.shape[1] * es;
-                // output stride[2] should == block_bytes (contiguous)
-                char* dst_base = dst;
-                for (int r = 0; r < reps[2]; r++) {
-                    std::memcpy(dst_base, s, block_bytes);
-                    dst_base += block_bytes;
+            for (int64_t o = 0; o < total; o++) {
+                int64_t idx = o;
+                int64_t src_off = 0;
+                for (int d = 0; d < 4; d++) {
+                    int64_t dim_idx = idx % output->shape[d];
+                    idx /= output->shape[d];
+                    int64_t src_idx = dim_idx % src.shape[d];
+                    src_off += src_idx * (int64_t)(src.stride[d] / es);
                 }
-            } else {
-                // General path
-                int64_t total = output->nelements();
-                for (int64_t o = 0; o < total; o++) {
-                    int64_t idx = o;
-                    int64_t src_off = 0;
-                    for (int d = 0; d < 4; d++) {
-                        int64_t dim_idx = idx % output->shape[d];
-                        idx /= output->shape[d];
-                        int64_t src_idx = dim_idx % src.shape[d];
-                        src_off += src_idx * (int64_t)(src.stride[d] / es);
-                    }
-                    std::memcpy(dst + o * es, s + src_off * es, es);
-                }
+                std::memcpy(dst + o * es, s + src_off * es, es);
             }
         }
         break;
