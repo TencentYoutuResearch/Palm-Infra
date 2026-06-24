@@ -730,6 +730,105 @@ attention 是 FP16 输入 + FP32 累加（FP16FML `vfmlalq_lane_low/high_f16`）
 
 ---
 
+## 尝试 18：Thread pool 改 spin-wait（降低 dispatch overhead）
+
+**决策理由**：decode 每 token 调用 196 次 matmul，每次 `parallel_for` 的
+mutex + condition variable 同步开销 ~11us → 196 × 11us = 2.2ms/token 纯 dispatch
+overhead，占 decode 总时间 ~8%。decode 4-thread scaling 只有 3.2x（理想 4x）。
+
+**测量**：
+- `parallel_for(0, 128, 32, trivial_fn)` 耗时：
+  - mutex+CV 版：**10.7 us/call**
+  - spin-wait 版：**0.59 us/call**（**18x 提升**）
+- `parallel_for(0, 6144, 192, trivial_fn)`：
+  - mutex+CV 版：11.7 us/call
+  - spin-wait 版：3.47 us/call
+
+**实现**：
+- `kernels/threading.h`: 移除 `mutex_`, `cv_job_`, `cv_done_`，改用
+  `std::atomic<bool> stop_`, `std::atomic<int> pending_workers_`,
+  `std::unique_ptr<std::atomic<bool>[]> worker_ready_`（per-worker ready flag）
+- `kernels/threading.cpp`:
+  - `parallel_for_impl`: 设置 job → 设 worker_ready_[t]=true → 主线程跑 shard 0
+    → spin on `pending_workers_ == 0`（用 `yield` 指令降低功耗）
+  - `worker_loop`: spin on `worker_ready_[t]` → 读 job → 清 flag → 跑 shard
+    → `pending_workers_.fetch_sub(1)`
+  - `stop_workers`: 设 stop_=true + 唤醒所有 worker_ready_
+  - 析构/resize 时 join worker 线程
+
+**结果 (端到端, 4 threads, pp256, warmup=5, 3-run avg)**：
+| 指标 | 尝试 17 (mutex+CV) | 尝试 18 (spin-wait) | 变化 |
+|------|---------------------|---------------------|------|
+| prefill_tps | ~136.6 | ~133.7 | -2% (噪声) |
+| decode_tps | ~27.3 | **~29.2** | **+7%** |
+| decode SDPA | ~79ms | **~54ms** | **-32%** |
+| decode MATMUL | ~1774ms | ~1764ms | 持平 |
+
+**Scaling 改善**：
+| threads | decode (mutex) | decode (spin) | scaling (spin) |
+|---------|----------------|---------------|----------------|
+| 1 | 9.15 | 8.99 | 1.0x |
+| 2 | 16.6 | 17.3 | 1.9x |
+| 3 | 23.3 | 24.6 | 2.7x |
+| 4 | 29.0 | **30.3** | **3.4x** |
+
+**关键发现**：
+1. dispatch overhead 从 11us 降到 0.6us（18x），decode_tps +7%
+2. decode SDPA 时间从 79ms 降到 54ms（-32%）——SDPA 也用 parallel_for，
+   dispatch 开销占比大
+3. decode scaling 从 3.2x → 3.4x，更接近理想 4x
+4. spin-wait 不会显著增加 CPU 功耗（用 `yield` 指令），且 worker 在
+   等待时不会竞争 cache
+5. prefill 持平——prefill 的 parallel_for 调用少（288 次），dispatch 不是瓶颈
+
+**决定**：**采用。spin-wait thread pool 作为默认。**
+
+---
+
+## 尝试 19：CONCAT/TILE 快路径（bulk memcpy）
+
+**决策理由**：prefill 中 CONCAT 占 7.3%（111ms），TILE 占 2.2%（33ms）。
+当前实现是 4 层嵌套循环逐元素 `memcpy(dst, src, 4)`——每个元素单独 4 字节拷贝，
+`memcpy` 调用开销远大于数据搬运。
+
+**分析**：
+- MLA 的 CONCAT 都在 dim=0：`q_full = concat(q_nope, q_rope, dim=0)`
+- dim=0 concat 时，对固定 (i1, i2, i3)，所有 i0 元素在 src 和 dst 中都连续
+- 如果 src/dst 是 contiguous，可以一次 `memcpy` 整个 tensor
+- 即使不 contiguous（view 输入），也可以 per-(i1,i2,i3) 拷贝 i0 块
+
+**实现**：
+- `graph/execute.cpp` CONCAT:
+  - dim==0 快路径：检查 `is_contiguous()`，bulk copy 整个 tensor
+  - 否则 per-(i1,i2,i3) copy i0 块（stride[0]==es 保证 i0 连续）
+  - dim!=0 保留原 4D 逐元素路径
+- `graph/execute.cpp` TILE:
+  - dim=2-only 快路径（MLA 的 `k_rope [rope_dim, seq, 1] → [rope_dim, seq, num_heads]`）：
+    contiguous src 时，`memcpy` 整个 src tensor `reps[2]` 次
+  - 否则保留原逐元素路径
+
+**结果 (端到端, 4 threads, pp256, warmup=5, 3-run avg)**：
+| 指标 | 尝试 18 | 尝试 19 | 变化 |
+|------|---------|---------|------|
+| prefill_tps | ~133.7 | **~162.0** | **+21%** |
+| decode_tps | ~30.3 | ~30.7 | 持平 |
+| prefill CONCAT | 111ms (7.3%) | **8ms (0.6%)** | **-93%** |
+| prefill TILE | 33ms (2.2%) | **0.3ms (0.0%)** | **-99%** |
+| decode CONCAT | 28ms | **1.8ms** | **-94%** |
+| decode TILE | 8ms | **0.1ms** | **-99%** |
+
+**关键发现**：
+1. CONCAT/TILE 是纯 memcpy 场景，逐元素拷贝的 `memcpy` 调用开销是瓶颈
+2. dim=0 concat 的 bulk copy 把 192×256×16×4B = 3MB 数据从 192×256=49152 次 memcpy
+   降到 1 次，性能提升 14x
+3. TILE 的 dim=2-only 快路径同理，1 次 memcpy 替代 49152 次
+4. prefill 提升明显（+21%），decode 提升小（CONCAT/TILE 占比本就小）
+5. 副作用：CPU 提速也改善了热点的 cache 局部性（bulk memcpy 对 prefetcher 友好）
+
+**决定**：**采用。CONCAT dim=0 bulk copy + TILE dim=2-only bulk copy 作为默认。**
+
+---
+
 ## 当前最优配置
 
 - **TILE**: 8×8 (NEON, M>=2) / dedicated GEMV (M=1)
@@ -742,7 +841,7 @@ attention 是 FP16 输入 + FP32 累加（FP16FML `vfmlalq_lane_low/high_f16`）
 - **GEMV n_chunk**: 自适应 max(N/(n_threads*8), 64) 对齐到 8
 - **KV cache**: FP16 存储（cache buffer 减半，FP16FML SDPA 直接用，无需 per-call 转换）
 - **SDPA**: FlashAttention-2 FP16FML (FP16 输入 + FP32 累加) + head 并行
-- **线程**: 自定义线程池, per-op split work, per-worker A pack
+- **线程**: 自定义线程池 (spin-wait + `yield`), per-op split work, per-worker A pack
 - **Bench**: `--prompt-tokens <N>` 支持固定 token 数满载测量
 
 ## 端到端性能 (Youtu-LLM-2B, M5 Pro, 4 threads, pp256)
@@ -757,20 +856,22 @@ attention 是 FP16 输入 + FP32 累加（FP16FML `vfmlalq_lane_low/high_f16`）
 | + dedicated GEMV kernel | ~101 | ~16.6 | 1243 |
 | + GEMV FP16 acc + 2-way unroll | ~106 | ~28.2 | 1243 |
 | + GEMM lane-FMA 2-way unroll | ~131.5 | ~27.9 | 1243 |
-| + FP16 KV cache + FP16FML SDPA | **~136.6** | **~27.3** | 1243 |
+| + FP16 KV cache + FP16FML SDPA | ~136.6 | ~27.3 | 1243 |
+| + spin-wait thread pool | ~133.7 | ~30.3 | 1243 |
+| + CONCAT/TILE bulk memcpy | **~162.0** | **~30.7** | 1243 |
 
 | 框架 | prefill (pp256) | decode (tg) |
 |------|----------------|------------|
-| **mlllm** | **~136.6** | **~27.3** |
+| **mlllm** | **~162.0** | **~30.7** |
 | ncnn | 202 | 33 |
 | llama.cpp | 264 | 41 |
 
-差距：prefill **1.5-1.9x**, decode **1.2-1.5x**
+差距：prefill **1.2-1.6x**, decode **1.1-1.3x**
 
 ## 下一步方向
 
 1. **量化 (INT4/INT8)** — MATMUL 仍占 80%+, 最大杠杆
-2. **Thread pool overhead** — decode 196 次 matmul 调用 × mutex+CV 同步，可能改 spin-wait
-3. **FP16 activations** — 前一个算子输出 FP16，matmul 跳过 per-call A pack
+2. **FP16 activations** — 前一个算子输出 FP16，matmul 跳过 per-call A pack
+3. **SILU 向量化** — prefill 占 3.3%, 当前是标量 exp
 4. **4-way unroll** — 如果 issue-bound 仍存在，可尝试 4-way 进一步摊销 overhead
 5. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）

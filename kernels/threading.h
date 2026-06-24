@@ -1,9 +1,9 @@
 #pragma once
 
-#include <condition_variable>
+#include <atomic>
 #include <cstddef>
 #include <functional>
-#include <mutex>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -35,20 +35,22 @@ private:
         int end = 0;
         int grain_size = 1;
         int active_threads = 1;
-        size_t generation = 0;
+        std::atomic<size_t> generation{0};
         ParallelForFn fn;
     };
 
     void parallel_for_impl(int begin, int end, int grain_size, ParallelForFn fn);
     void worker_loop(int thread_id);
-    void stop_locked();
+    void stop_workers();
 
-    std::mutex mutex_;
-    std::condition_variable cv_job_;
-    std::condition_variable cv_done_;
     std::vector<std::thread> workers_;
     Job job_;
     int num_threads_ = 1;
-    int pending_workers_ = 0;
-    bool stop_ = false;
+
+    // Sync primitives (spin-wait based for low dispatch latency)
+    std::atomic<bool> stop_{false};
+    std::atomic<int>  pending_workers_{0};
+    // Per-worker ready flags: workers spin on these instead of CV.
+    // unique_ptr<atomic[]> avoids vector<atomic> non-movable issues.
+    std::unique_ptr<std::atomic<bool>[]> worker_ready_;
 };
