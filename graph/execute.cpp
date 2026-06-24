@@ -3,10 +3,46 @@
 #include "kernels/norm.h"
 #include "kernels/rope.h"
 #include "kernels/attention.h"
+#include "kernels/tensor.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+
+#if HAS_NEON
+#include <arm_neon.h>
+
+// Vectorized sigmoid: x = -v, exp(x), 1/(1+exp(x))
+// Uses polynomial exp approximation good to ~7 bits in [-88, 88].
+static inline float32x4_t sigmoid_f32_neon(float32x4_t x) {
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    float32x4_t neg_x = vnegq_f32(x);
+    // Clamp to avoid overflow
+    neg_x = vmaxq_f32(neg_x, vdupq_n_f32(-88.f));
+    neg_x = vminq_f32(neg_x, vdupq_n_f32(88.f));
+    // exp approximation: 2^(n+f) where n=floor(x*log2e), f=frac
+    const float32x4_t log2e = vdupq_n_f32(1.4426950408889634f);
+    float32x4_t t = vmulq_f32(neg_x, log2e);
+    float32x4_t n = vrndmq_f32(t);
+    float32x4_t f = vsubq_f32(t, n);
+    int32x4_t ni = vcvtq_s32_f32(n);
+    float32x4_t pow2n = vreinterpretq_f32_s32(
+        vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23));
+    const float32x4_t c0 = vdupq_n_f32(1.0f);
+    const float32x4_t c1 = vdupq_n_f32(0.6931472f);
+    const float32x4_t c2 = vdupq_n_f32(0.2402265f);
+    const float32x4_t c3 = vdupq_n_f32(0.0555049f);
+    const float32x4_t c4 = vdupq_n_f32(0.0096813f);
+    float32x4_t pow2f = vfmaq_f32(c3, c4, f);
+    pow2f = vfmaq_f32(c2, pow2f, f);
+    pow2f = vfmaq_f32(c1, pow2f, f);
+    pow2f = vfmaq_f32(c0, pow2f, f);
+    float32x4_t ex = vmulq_f32(pow2n, pow2f);
+    // 1 / (1 + ex)
+    float32x4_t one = vdupq_n_f32(1.0f);
+    return vrecpeq_f32(vaddq_f32(one, ex));
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // prepare_execution
@@ -228,6 +264,27 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             float* o = output->ptr<float>();
             const float* ap = a.ptr<float>();
             const float* bp = b.ptr<float>();
+#if HAS_NEON
+            if (a.nelements() == b.nelements()) {
+                int i = 0;
+                for (; i + 7 < N; i += 8) {
+                    vst1q_f32(o + i,     vaddq_f32(vld1q_f32(ap + i),     vld1q_f32(bp + i)));
+                    vst1q_f32(o + i + 4, vaddq_f32(vld1q_f32(ap + i + 4), vld1q_f32(bp + i + 4)));
+                }
+                for (; i < N; i++) o[i] = ap[i] + bp[i];
+            } else if (b.nelements() == 1) {
+                float bv = bp[0];
+                float32x4_t bv4 = vdupq_n_f32(bv);
+                int i = 0;
+                for (; i + 7 < N; i += 8) {
+                    vst1q_f32(o + i,     vaddq_f32(vld1q_f32(ap + i),     bv4));
+                    vst1q_f32(o + i + 4, vaddq_f32(vld1q_f32(ap + i + 4), bv4));
+                }
+                for (; i < N; i++) o[i] = ap[i] + bv;
+            } else {
+                for (int i = 0; i < N; i++) o[i] = ap[i] + bp[i];
+            }
+#else
             if (a.nelements() == b.nelements()) {
                 for (int i = 0; i < N; i++) o[i] = ap[i] + bp[i];
             } else if (b.nelements() == 1) {
@@ -236,6 +293,7 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             } else {
                 for (int i = 0; i < N; i++) o[i] = ap[i] + bp[i];
             }
+#endif
         }
         break;
 
@@ -246,19 +304,43 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             float* o = output->ptr<float>();
             const float* ap = a.ptr<float>();
             const float* bp = inputs[1]->ptr<float>();
+#if HAS_NEON
+            int i = 0;
+            for (; i + 7 < N; i += 8) {
+                vst1q_f32(o + i,     vmulq_f32(vld1q_f32(ap + i),     vld1q_f32(bp + i)));
+                vst1q_f32(o + i + 4, vmulq_f32(vld1q_f32(ap + i + 4), vld1q_f32(bp + i + 4)));
+            }
+            for (; i < N; i++) o[i] = ap[i] * bp[i];
+#else
             for (int i = 0; i < N; i++) o[i] = ap[i] * bp[i];
+#endif
         }
         break;
 
     case OpType::SILU:
+        // SiLU: x * sigmoid(x)
+        // Vectorized with NEON: 4 elements per iteration using polynomial exp.
         if (inputs.size() >= 1 && inputs[0] && output) {
             int N = (int)inputs[0]->nelements();
             const float* x = inputs[0]->ptr<float>();
             float* o = output->ptr<float>();
+#if HAS_NEON
+            int i = 0;
+            for (; i + 3 < N; i += 4) {
+                float32x4_t xv = vld1q_f32(x + i);
+                float32x4_t sv = sigmoid_f32_neon(xv);
+                vst1q_f32(o + i, vmulq_f32(xv, sv));
+            }
+            for (; i < N; i++) {
+                float sx = 1.f / (1.f + std::exp(-x[i]));
+                o[i] = x[i] * sx;
+            }
+#else
             for (int i = 0; i < N; i++) {
                 float sx = 1.f / (1.f + std::exp(-x[i]));
                 o[i] = x[i] * sx;
             }
+#endif
         }
         break;
 
