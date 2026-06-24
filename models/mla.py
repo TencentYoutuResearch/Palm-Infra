@@ -80,9 +80,10 @@ def export_weights(weights: dict, weights_dir: str):
         d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
         save(wname.replace('.', '_'), d)
 
-    # embed_tokens as FP32 for lookup
-    embed_w = weights['model.embed_tokens.weight'].astype(np.float32)
-    save('embed_tokens', embed_w)
+    # embed_tokens — FP16, packed at load time (tied with lm_head)
+    embed_w = weights['model.embed_tokens.weight']
+    d = embed_w.astype(np.float16) if embed_w.dtype != np.float16 else embed_w
+    save('embed_tokens', d)
 
     # norm weights (FP32)
     for wname, wdata in weights.items():
@@ -122,7 +123,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     # ---- embed_tokens weight node ----
     embed_path = os.path.join(weights_dir, "embed_tokens.weights")
     embed_shape = (cfg['vocab_size'], hidden_size)
-    embed_node = g.weight(embed_path, embed_shape, Precision.FP32)
+    embed_node = g.weight(embed_path, embed_shape, Precision.FP16)
 
     # ---- graph inputs ----
     hidden = g.input('hidden', (hidden_size, seq_len))

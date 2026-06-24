@@ -53,17 +53,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.shape[1] = dim1;
             t.shape[2] = node.out_shape[2];
             t.shape[3] = node.out_shape[3];
-            // For embed_tokens, the stride should be hidden_dim, not vocab_size
-            bool is_embed = (node.params.str[0].find("embed_tokens") != std::string::npos);
-            if (is_embed) {
-                size_t es = t.element_size();
-                t.stride[0] = es;
-                t.stride[1] = es * dim1;  // hidden_dim, not vocab_size!
-                t.stride[2] = t.stride[1] * dim0;
-                t.stride[3] = t.stride[2] * t.shape[2];
-            } else {
-                t.compute_strides();
-            }
+            t.compute_strides();
             t.data = data;
             t.mem_type = MemoryType::EXTERNAL;
         };
@@ -89,59 +79,45 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         }
 
         // Load-time B interleaved packing for FP16 weights (skip embed_tokens)
+        // embed_tokens stays row-major FP16 for simple embed() lookup.
+        // A packed copy is created separately for lm_head matmul.
         if (t.prec == Precision::FP16 && g_matmul_config.use_interleave_pack) {
             bool is_embed = (node.params.str[0].find("embed_tokens") != std::string::npos);
             if (!is_embed) {
                 auto pack_it = packed_weights_.find(wpath);
                 if (pack_it == packed_weights_.end()) {
-                    int N = (int)t.shape[0];
-                    int K = (int)t.shape[1];
-                    int K_weight = K;  // row-major, K_weight == K
-                    const __fp16* b_orig = reinterpret_cast<const __fp16*>(t.data);
-                    __fp16* b_packed = pack_b_interleaved_full(b_orig, N, K, K_weight);
-                    size_t buf_size = (size_t)N * K * sizeof(__fp16);
-                    std::vector<uint8_t> buf((uint8_t*)b_packed,
-                                             (uint8_t*)b_packed + buf_size);
-                    delete[] b_packed;
-                    packed_weights_[wpath] = std::move(buf);
+                int N = (int)t.shape[0];
+                int K = (int)t.shape[1];
+                int K_weight = K;
+                const __fp16* b_orig = reinterpret_cast<const __fp16*>(t.data);
+                __fp16* b_packed = pack_b_interleaved_full(b_orig, N, K, K_weight);
+                size_t buf_size = (size_t)N * K * sizeof(__fp16);
+                std::vector<uint8_t> buf((uint8_t*)b_packed,
+                                         (uint8_t*)b_packed + buf_size);
+                delete[] b_packed;
+                packed_weights_[wpath] = std::move(buf);
                 }
                 t.data = packed_weights_[wpath].data();
-
-                // Debug: verify packing
-                if (getenv("MLLLM_DEBUG_PACK")) {
-                    int N2 = (int)t.shape[0];
-                    int K2 = (int)t.shape[1];
-                    const __fp16* orig = reinterpret_cast<const __fp16*>(
-                        shared_weights_[weight_map_[wpath]].data());
-                    const __fp16* packed = reinterpret_cast<const __fp16*>(t.data);
-                    int n_check = std::min(N2, 16);
-                    int k_check = std::min(K2, 4);
-                    int errors = 0;
-                    for (int n = 0; n < n_check; n++) {
-                        for (int k = 0; k < k_check; k++) {
-                            __fp16 v_orig = orig[n * K2 + k];
-                            __fp16 v_packed = packed[(n & ~7) * K2 + k * 8 + (n & 7)];
-                            if (fabsf((float)v_orig - (float)v_packed) > 0.001f) {
-                                if (errors < 5)
-                                    fprintf(stderr, "  PACK ERR n=%d k=%d: orig=%f packed=%f\n",
-                                            n, k, (float)v_orig, (float)v_packed);
-                                errors++;
-                            }
-                        }
-                    }
-                    fprintf(stderr, "  pack check %s: N=%d K=%d errors=%d/%d\n",
-                            wpath.c_str(), N2, K2, errors, n_check * k_check);
-                }
-                // mem_type stays EXTERNAL (vector owns the buffer)
             }
         }
     }
 
-    // Find embed_tokens weight
+    // Find embed_tokens weight and create packed copy for lm_head
     for (auto& node : g.nodes) {
         if (node.op_type == OpType::CONSTANT && !node.params.str.empty()) {
             if (node.params.str[0].find("embed_tokens") != std::string::npos) {
                 embed_weight_ = &g.runtime.tensors[node.id];
+                // Create packed copy for lm_head matmul (one-time cost)
+                if (embed_weight_->prec == Precision::FP16 && g_matmul_config.use_interleave_pack
+                    && embed_packed_.empty()) {
+                    int N = (int)embed_weight_->shape[0];
+                    int K = (int)embed_weight_->shape[1];
+                    const __fp16* orig = reinterpret_cast<const __fp16*>(embed_weight_->data);
+                    __fp16* packed = pack_b_interleaved_full(orig, N, K, K);
+                    size_t buf_size = (size_t)N * K * sizeof(__fp16);
+                    embed_packed_.assign((uint8_t*)packed, (uint8_t*)packed + buf_size);
+                    delete[] packed;
+                }
             }
         }
     }
@@ -295,37 +271,33 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
     int seq_len = (int)token_ids.size();
 
     if (embed_weight_ && embed_weight_->data) {
-        // embed_weight_ shape: [vocab_size, hidden_dim] with compute_strides()
-        // stride[0]=4, stride[1]=4*vocab_size
-        // weight_stride = stride[1]/4 = vocab_size
-        // Access: embed_data[d + tid * vocab_size] → row tid, col d ✓
         int vocab_size = (int)embed_weight_->shape[0];
         int hidden_dim = (int)embed_weight_->shape[1];
-        int weight_stride = (int)(embed_weight_->stride[1] / sizeof(float));
-
-        // Verify: check that vocab_size * hidden_dim fits in the mmap region
-        size_t embed_nbytes = embed_weight_->nbytes();
-        size_t expected = (size_t)vocab_size * hidden_dim * sizeof(float);
-        if (embed_nbytes < expected) {
-            fprintf(stderr, "  embed: weight buffer too small! nbytes=%zu expected=%zu\n", embed_nbytes, expected);
-        }
 
         float* buf = new float[hidden_dim * seq_len];
         Tensor t = Tensor::create(Precision::FP32, MemoryType::OWNED, hidden_dim, seq_len, 1, 1, buf);
 
-        const float* embed_data = embed_weight_->ptr<float>();
-        for (int s = 0; s < seq_len; s++) {
-            int tid = token_ids[s];
-            if (tid < 0 || tid >= vocab_size) tid = 0;
-            float* dst = t.ptr<float>() + s * hidden_dim;
-            // embed_weight is [vocab_size, hidden_dim] row-major
-            // W[tid, d] = data[tid * hidden_dim + d]
-            // But our stride says stride[1] = vocab_size*4, so:
-            //   w[d + tid * weight_stride] = data[tid * vocab_size + d]
-            // That's WRONG! We need data[tid * hidden_dim + d]
-            // weight_stride should be hidden_dim, not vocab_size!
-            for (int d = 0; d < hidden_dim; d++) {
-                dst[d] = embed_data[d + tid * weight_stride];
+        if (embed_weight_->prec == Precision::FP16) {
+            // Row-major FP16 — simple direct access
+            const __fp16* embed_data = reinterpret_cast<const __fp16*>(embed_weight_->data);
+            for (int s = 0; s < seq_len; s++) {
+                int tid = token_ids[s];
+                if (tid < 0 || tid >= vocab_size) tid = 0;
+                float* dst = t.ptr<float>() + s * hidden_dim;
+                for (int d = 0; d < hidden_dim; d++) {
+                    dst[d] = (float)embed_data[tid * hidden_dim + d];
+                }
+            }
+        } else {
+            // Row-major FP32
+            const float* embed_data = embed_weight_->ptr<float>();
+            for (int s = 0; s < seq_len; s++) {
+                int tid = token_ids[s];
+                if (tid < 0 || tid >= vocab_size) tid = 0;
+                float* dst = t.ptr<float>() + s * hidden_dim;
+                for (int d = 0; d < hidden_dim; d++) {
+                    dst[d] = embed_data[tid * hidden_dim + d];
+                }
             }
         }
         return t;
@@ -367,12 +339,15 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
     void* c_buf = graph_prefill_.runtime.pool.acquire(vocab_size * sizeof(float));
     Tensor C = Tensor::create(Precision::FP32, MemoryType::POOLED, vocab_size, 1, 1, 1, c_buf);
 
-    // embed_weight is NOT interleaved-packed (skipped in load_graph to preserve
-    // embed() direct indexing). Disable interleave path for this matmul.
-    bool saved_pack = g_matmul_config.use_interleave_pack;
-    g_matmul_config.use_interleave_pack = false;
-    kernel_matmul_fp32(A, *embed_weight_, C, exec_ctx_decode_.thread_pool);
-    g_matmul_config.use_interleave_pack = saved_pack;
+    // Use packed embed copy for fast lm_head matmul (if available)
+    if (!embed_packed_.empty()) {
+        Tensor B_packed = Tensor::create(Precision::FP16, MemoryType::EXTERNAL,
+                                         vocab_size, hidden_dim, 1, 1,
+                                         embed_packed_.data());
+        kernel_matmul_fp32(A, B_packed, C, exec_ctx_decode_.thread_pool);
+    } else {
+        kernel_matmul_fp32(A, *embed_weight_, C, exec_ctx_decode_.thread_pool);
+    }
 
     const float* scores = C.ptr<float>();
     struct Candidate { int id; float score; };

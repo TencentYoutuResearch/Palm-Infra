@@ -118,6 +118,9 @@ private:
     // Load-time interleaved-packed FP16 weights (path → packed buffer)
     std::unordered_map<std::string, std::vector<uint8_t>> packed_weights_;
 
+    // Packed copy of embed_tokens for lm_head matmul (row-major original stays for embed lookup)
+    std::vector<uint8_t> embed_packed_;
+
     // KV cache tensor pointers (per layer)
     struct CachePair {
         Tensor* k = nullptr;
