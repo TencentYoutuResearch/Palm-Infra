@@ -46,8 +46,9 @@ bool run_prompt(LLMEngine& engine, const Tokenizer& tokenizer,
     GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
 
     std::printf("\n");
-    std::printf("generated_tokens=%d decode_tokens=%d\n",
-                metrics.generated_tokens, metrics.decode_tokens);
+    std::printf("generated_tokens=%d decode_tokens=%d hit_eos=%s\n",
+                metrics.generated_tokens, metrics.decode_tokens,
+                result.hit_eos ? "true" : "false");
     std::printf("ttft_ms=%.2f tpot_ms=%.2f\n",
                 metrics.ttft_ms, metrics.tpot_ms);
     std::printf("prefill_tps=%.2f decode_tps=%.2f\n",

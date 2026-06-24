@@ -535,17 +535,215 @@ GEMV 不走 lane-FMA 所以无变化。精度: 测试误差 <0.5%，可接受。
 
 ---
 
+## 尝试 14：Dedicated GEMV Kernel (M=1 专用 kernel)
+
+**决策理由**：decode 路径所有 matmul 都是 M=1（GEMV），但走的是 `matmul_fp16_neon_8x8_range_packed`
+—— 一个 8×8 tile kernel，内层 r 循环 8 次迭代中 7 次因 `if (row < m_tile_end)` 死分支跳过。
+理论上编译器应该能 DCE 掉死迭代，但实际测量发现 dedicated GEMV kernel 仍有显著收益。
+
+**算法**：
+- N-tile outer (8 N per tile), K-loop inner
+- 每步：1 `vld1q_f16` (8 B values) + 2 `vcvt_f32_f16` + 2 `vfmaq_n_f32` (broadcast A[k])
+- 2 个 FP32 accumulator (vs 8×8 tile 的 16 个)，大幅降低寄存器压力
+- 无 r-loop，无死分支
+- FP32 accumulate（GEMV dot product over K，精度优先）
+
+**实现**：
+- `kernels/matmul.cpp`: 新增 `matmul_fp16_neon_gemv_range`
+- `kernel_matmul_fp32`: `use_interleave` 分支内 `M==1` 时优先走 GEMV kernel
+- n_chunk 从固定 64 改为自适应 `max(N/(n_threads*8), 64)` 对齐到 8
+  - lm_head (N=128k): 2003 chunks → 32 chunks, 大幅减少 parallel_for dispatch 开销
+
+**结果 (microbench vs 8×8 tile GEMV baseline)**：
+| Shape | Baseline (8×8 tile) | Dedicated GEMV | 变化 |
+|-------|---------------------|----------------|------|
+| 1×2048×2048 t=1 | 0.61ms (13.8 GF) | 0.44ms (19.1 GF) | **-28%** |
+| 1×2048×6144 t=4 | 0.42ms (59.7 GF) | 0.35ms (71.0 GF) | **-17%** |
+| 1×2048×128k t=4 | 9.80ms (53.6 GF) | 7.25ms (72.4 GF) | **-26%** |
+
+**结果 (端到端 Youtu-LLM-2B, 4 threads, pp256, warmup=3, 3-run avg)**：
+| 指标 | 尝试 13 (8×8 tile GEMV) | 尝试 14 (dedicated GEMV) | 变化 |
+|------|------------------------|--------------------------|------|
+| prefill_tps | 86.6 | **~101** | +17% |
+| decode_tps | 13.3 | **~16.6** | **+25%** |
+| prefill MATMUL | 2309ms | 1827ms | -21% |
+| decode MATMUL | ~4656ms | ~3167ms | **-32%** |
+
+注：prefill 提升部分来自测量方法改进（`--prompt-tokens 256` dummy token 满载，
+warmup=3），部分来自 lm_head 的 GEMV + n_chunk 优化。decode 提升是 GEMV kernel 直接贡献。
+
+**关键发现**：编译器**并没有**完全 DCE 掉 8×8 tile 在 M=1 时的 7/8 死分支。
+dedicated GEMV kernel 通过更低的寄存器压力（2 acc vs 16）和更干净的循环结构
+拿到实际的 25% decode 提升。"编译器应该已经优化掉了"的判断是错的。
+
+**工具改进**：
+- `examples/cli_common.h/cpp` + `bench.cpp`: 新增 `--prompt-tokens <N>` 选项
+- 用 N 个 dummy token (id=0) 跳过 chat template，支持满载 pp128/pp256 测量
+- 解决了之前短 prompt (25 token) 被 graph padding 严重低估 tps 的问题
+
+**决定**：**采用。dedicated GEMV kernel 作为 M=1 默认路径。**
+
+---
+
+## 尝试 15：GEMV FP16 累加 + 2-way K-unroll（打破 FMA latency chain）
+
+**决策理由**：尝试 14 的 GEMV kernel 用 FP32 acc（`vfmaq_n_f32` × 2 for low/high）。
+理论上 FP16 acc（`vfmaq_n_f16` × 1）指令更少（2 vs 5 instr/K-step），应该更快。
+但初版 FP16 acc（单累加器）反而更慢（-27% t=1, -4% t=4）。
+
+**根因分析**：
+- Apple M5 FP16 FMA latency = 2 cycles, throughput = 2/cycle
+- FP32 acc kernel 有 **2 条独立 FMA 链**（acc0=low half, acc1=high half）
+  → 2 FMA in 2 cycles → CPI ≈ 1 cycle/K-step（latency 完全 hidden）
+- FP16 acc kernel 只有 **1 条 FMA 链**（单 float16x8_t acc）
+  → 1 FMA per 2 cycles → CPI = 2 cycles/K-step（latency 是瓶颈）
+- 指令更少但链更窄，反而更慢
+
+**算法**：2-way K-unroll + 2 个独立 FP16 累加器
+- 偶数 K 步 → acc0，奇数 K 步 → acc1（两条独立链）
+- 循环结尾 `vaddq_f16(acc0, acc1)` 合并
+- K_BLOCK 间仍用 FP32 store/reload 保持精度
+- CPI 从 2 降到 1，FMA 吞吐翻倍
+
+**实现**：
+- `kernels/matmul.cpp`: `matmul_fp16_neon_gemv_range_fp16acc` 加 2-way unroll
+- `kernel_matmul_fp32`: `use_fp16_accumulate=true` 时 GEMV 也走 FP16 acc 路径
+
+**结果 (microbench, 3 个 GEMV shape)**：
+| Shape | FP32 acc (尝试 14) | FP16 acc 1-chain | FP16 acc 2-unroll | vs FP32 acc |
+|-------|-------------------|------------------|-------------------|-------------|
+| 1×2048×2048 t=1 | 0.44ms (19.1 GF) | 0.60ms (13.9 GF) | **0.32ms (26.5 GF)** | **+39%** |
+| 1×2048×6144 t=4 | 0.35ms (71.0 GF) | 0.37ms (68.1 GF) | **0.19ms (131.4 GF)** | **+85%** |
+| 1×2048×128k t=4 | 7.25ms (72.4 GF) | 7.58ms (69.3 GF) | **4.01ms (130.9 GF)** | **+81%** |
+
+131 GF ≈ Apple M5 Pro 带宽上限（~273 GB/s × 0.5 FLOP/byte = ~136 GF）的 **96%**，
+也接近 FP16 compute 峰值（~144 GF）的 91%。GEMV 卡在 compute/bandwidth ridge 上。
+
+**Roofline 分析**（修正之前"bandwidth-bound"的误判）：
+- Arithmetic intensity = 8 FLOPs / 16 bytes (B) = 0.5 FLOP/byte（A 常驻 L1 不算 DRAM）
+- M5 Pro (T6050) DRAM 带宽 ~273 GB/s → bandwidth ceiling = ~136 GF
+- FP16 FMA peak = 2 FMA/cycle × 8 FLOP × 4.5 GHz × 4 core = ~144 GF
+- 两个 ceiling 几乎重合，GEMV 正好在 ridge 上
+- 尝试 14 (FP32 acc, 72 GF): 带宽利用 53%, **compute-bound**（FMA latency chain）
+- 尝试 15 (FP16 acc 2-unroll, 131 GF): 带宽利用 96%, **bandwidth-bound**（撞带宽墙）
+
+**结果 (端到端 Youtu-LLM-2B, 4 threads, pp256, warmup=3, 3-run avg)**：
+| 指标 | 尝试 14 (FP32 acc GEMV) | 尝试 15 (FP16 acc 2-unroll) | 变化 |
+|------|------------------------|----------------------------|------|
+| prefill_tps | ~101 | **~106** | +5% |
+| decode_tps | ~16.6 | **~28.2** | **+70%** |
+| decode MATMUL | ~3167ms | **~1774ms** | **-44%** |
+
+**关键发现**：
+1. FP16 acc 单累加器**比 FP32 acc 更慢**——不是指令数瓶颈，是 FMA latency chain 瓶颈
+2. 2-way K-unroll 加第二个累加器，打破 latency chain，FMA 吞吐翻倍
+3. GEMV 从 bandwidth-bound (72 GF) 跃升到 compute-bound (131 GF)，达理论峰值 91%
+4. decode 从 13.3 → 28.2 tok/s，**累计提升 2.1x**
+
+**决定**：**采用。FP16 acc + 2-way K-unroll 作为 GEMV 默认路径。**
+
+---
+
+## 尝试 16：GEMM lane-FMA 2-way K-unroll
+
+**决策理由**：尝试 15 的 GEMV 2-way unroll 大幅提升 decode (+70%)。
+GEMM lane-FMA kernel（`matmul_fp16_neon_8x8_range_packed_a_fp16acc`）的 K-loop
+有 8 条独立 FMA 链（c[0..7]），理论上已足够 hide FMA latency（latency=2, chains=8 >> 2）。
+预判 unroll 不会有显著收益。但实际尝试后发现收益很大。
+
+**算法**：2-way K-unroll，16 个独立累加器（c0[8] + c1[8]）
+- 偶数 K 步 → c0[8]，奇数 K 步 → c1[8]
+- 循环结尾 `vaddq_f16` 合并 8 对
+- 尾部处理奇数 K
+- 寄存器：16 acc + 4 a/b + 4 b_low/high = 24 Q（NEON 32 Q，够用）
+
+**实现**：
+- `kernels/matmul.cpp`: `matmul_fp16_neon_8x8_range_packed_a_fp16acc` K-loop 改 2-way unroll
+
+**结果 (microbench)**：
+| Shape | 1-way (尝试 15) | 2-way unroll | 变化 |
+|-------|----------------|--------------|------|
+| 128×2048×6144 t=4 | 6.62ms (486 GF) | **4.83ms (668 GF)** | **+37%** |
+| 128×2048×6144 t=1 | 24.82ms (130 GF) | **14.61ms (220 GF)** | **+70%** |
+
+**结果 (端到端, 4 threads, pp256, warmup=5, 4-run avg)**：
+| 指标 | 尝试 15 (GEMM 1-way) | 尝试 16 (GEMM 2-unroll) | 变化 |
+|------|---------------------|------------------------|------|
+| prefill_tps | ~106 | **~131.5** | **+24%** |
+| decode_tps | ~28.2 | ~27.9 | 持平（GEMV 路径不变） |
+| prefill MATMUL | 1827ms | **1267ms** | **-31%** |
+
+**关键发现**：
+1. 预判"GEMM 8 链已足够 hide latency, unroll 无收益"是**错的**
+2. 真正的瓶颈不是 FMA latency 也不是 FMA throughput，是 **instruction issue bandwidth**
+3. 1-way kernel 每步 15 条指令（2 load + 2 vget + 8 FMA + 3 branch/cmp/add），其中 8/15=53% 是 FMA
+   - 实测 IPC=6.3，接近 Apple 核心的 issue limit (~8)
+   - **issue-bound**：FMA 单元在等指令解码
+4. 2-way unroll 每步 27 条指令（4 load + 4 vget + 16 FMA + 3 branch），16/27=59% 是 FMA
+   - IPC 降到 3.9，不再 issue-bound
+   - FMA 单元可以更密集地运行
+5. 单线程提升 (+70%) 远大于多线程 (+37%)，因为单线程更受 issue 带宽限制
+
+**决定**：**采用。GEMM lane-FMA kernel 默认 2-way K-unroll。**
+
+---
+
+## 尝试 17：FP16 KV cache + FP16FML SDPA
+
+**决策理由**：尝试 16 后 SDPA 占 prefill 10.1%、decode 3.6%。ncnn-upstream 的 flash
+attention 是 FP16 输入 + FP32 累加（FP16FML `vfmlalq_lane_low/high_f16`），比 FP32 版本
+减半 K/V 带宽。但直接在 kernel 内部做 FP32→FP16 转换（尝试 17a，已回滚）反而变慢：
+每次 `kernel_sdpa` 调用都 per-head `new[]` + 转换整个 K/V cache + `delete[]`，
+转换开销 > FP16FML 收益。
+
+**关键改动**：KV cache 直接存 FP16
+- `models/mla.py`: cache_k/cache_v input 节点 `prec=FP16`
+- `engine.cpp`: `allocate_caches` 已用 `node.out_prec`，`reset()` 用 `element_size()`，
+  无需改动
+- `kernels/attention.cpp`: cache append 时 FP32→FP16 转换（只转 cur_seqlen 个 token，
+  不是整个 cache）；`get_k_ptr/get_v_ptr` 返回 `const void*`，caller 按 prec 解释
+- `flash_attn_fp16_decode/prefill`: 直接吃 FP16 K/V 指针，无需 per-call 转换
+- Q 仍 per-call 转 FP16（M×d_k 小，decode 时 M=1）
+
+**实现**：
+- `flash_attn_fp16_decode`: Bc=64, 4-way batched FP16FML dot product, 64-wide register-tiled
+  PV accumulation with `vfmlalq_lane_low/high_f16`
+- `flash_attn_fp16_prefill`: Br=4, Bc=32, 同样 FP16FML dot + PV
+- FP32 cache fallback 保留（test_attention 用 FP32 cache）
+
+**结果 (端到端, 4 threads, pp256, warmup=5, 3-run avg)**：
+| 指标 | 尝试 16 (FP32 SDPA) | 尝试 17 (FP16 cache + FP16FML SDPA) | 变化 |
+|------|---------------------|-------------------------------------|------|
+| prefill_tps | ~131.5 | **~136.6** | +4% |
+| decode_tps | ~27.9 | ~27.3 | -2% (噪声) |
+| prefill SDPA | ~175ms (10.1%) | **~136ms (8.0%)** | **-22%** |
+| decode SDPA | ~113ms (3.6%) | **~79ms (3.9%)** | **-30%** |
+
+**关键发现**：
+1. SDPA 本身变快 22-30%（FP16FML 减半 K/V 带宽 + 省掉 vcvt 指令）
+2. 但 SDPA 占比小（prefill 8%, decode 4%），端到端提升有限
+3. FP16 cache 还减半了 cache 内存（4096×192×16×2 = 25MB vs 50MB），对长序列有益
+4. 初版（尝试 17a，per-call 转换整个 K/V）反而退化 20-26%——per-call heap 分配
+   + 转换整个 cache 的开销远超 FP16FML 收益
+
+**决定**：**采用。FP16 KV cache + FP16FML SDPA 作为默认。**
+
+---
+
 ## 当前最优配置
 
-- **TILE**: 8×8 (NEON)
+- **TILE**: 8×8 (NEON, M>=2) / dedicated GEMV (M=1)
 - **K_BLOCK**: 512
-- **精度**: FP16 权重 + FP16 activations (GEMM) + FP16 累加
+- **精度**: FP16 权重 + FP16 activations (GEMM) + FP16 累加 (GEMM + GEMV)
 - **A packing**: Per-call interleaved (M>=8), FP32→FP16
 - **B packing**: Load-time interleaved (tile-of-8 transpose), GEMV+GEMM 共用
 - **embed_tokens**: FP16 row-major (embed 查找) + FP16 packed 副本 (lm_head matmul)
-- **FMA**: vfmaq_lane_f16 FP16 累加 (M>=8, 默认), vfmaq_n_f32 (M<8 GEMV)
-- **SDPA**: FlashAttention-2 FP32 (Br=4, Bc=32, online softmax) + head 并行
+- **FMA**: vfmaq_lane_f16 FP16 累加 2-way unroll (M>=8 GEMM), vfmaq_n_f16 FP16 累加 2-way unroll (M=1 GEMV)
+- **GEMV n_chunk**: 自适应 max(N/(n_threads*8), 64) 对齐到 8
+- **KV cache**: FP16 存储（cache buffer 减半，FP16FML SDPA 直接用，无需 per-call 转换）
+- **SDPA**: FlashAttention-2 FP16FML (FP16 输入 + FP32 累加) + head 并行
 - **线程**: 自定义线程池, per-op split work, per-worker A pack
+- **Bench**: `--prompt-tokens <N>` 支持固定 token 数满载测量
 
 ## 端到端性能 (Youtu-LLM-2B, M5 Pro, 4 threads, pp256)
 
@@ -555,19 +753,24 @@ GEMV 不走 lane-FMA 所以无变化。精度: 测试误差 <0.5%，可接受。
 | + FP16 + pack + lane-FMA | ~76 | ~10.3 | 4254 |
 | + FlashAttention + head 并行 | ~76 | ~10.3 | 4254 |
 | + FP16 累加 | ~82 | ~10.9 | 4254 |
-| + embed FP16 + packed lm_head | **~86.6** | **~13.3** | **1220** |
+| + embed FP16 + packed lm_head | ~86.6 | ~13.3 | 1220 |
+| + dedicated GEMV kernel | ~101 | ~16.6 | 1243 |
+| + GEMV FP16 acc + 2-way unroll | ~106 | ~28.2 | 1243 |
+| + GEMM lane-FMA 2-way unroll | ~131.5 | ~27.9 | 1243 |
+| + FP16 KV cache + FP16FML SDPA | **~136.6** | **~27.3** | 1243 |
 
 | 框架 | prefill (pp256) | decode (tg) |
 |------|----------------|------------|
-| **mlllm** | **86.6** | **13.3** |
+| **mlllm** | **~136.6** | **~27.3** |
 | ncnn | 202 | 33 |
 | llama.cpp | 264 | 41 |
 
-差距：prefill **2.3-3.0x**, decode **2.5-3.1x**
+差距：prefill **1.5-1.9x**, decode **1.2-1.5x**
 
 ## 下一步方向
 
-1. **量化 (INT4/INT8)** — MATMUL 仍占 70%+, 最大杠杆
-2. **FP16 SDPA** — 移植 FP16FML flash kernel, SDPA 占 7%
-3. **其他算子并行** — RMSNorm, SiLU 等（当前占比小）
-4. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）
+1. **量化 (INT4/INT8)** — MATMUL 仍占 80%+, 最大杠杆
+2. **Thread pool overhead** — decode 196 次 matmul 调用 × mutex+CV 同步，可能改 spin-wait
+3. **FP16 activations** — 前一个算子输出 FP16，matmul 跳过 per-call A pack
+4. **4-way unroll** — 如果 issue-bound 仍存在，可尝试 4-way 进一步摊销 overhead
+5. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）

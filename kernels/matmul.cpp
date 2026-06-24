@@ -262,6 +262,120 @@ static void matmul_fp16_neon_8x8_range_packed(
     }
 }
 
+// ---- FP16 GEMV kernel (M=1, B pre-packed interleaved) ----
+//
+// C[n] = sum_k A[k] * B[n, k]
+//
+// A:        FP32 [K]              (single row, M=1)
+// B_packed: interleaved FP16 [N/8, K, 8]
+//           For fixed k, B_packed[(n & ~7) * K + k * 8 + 0..7] = 8 N values
+// C:        FP32 [N] output
+//
+// n_begin must be 8-aligned (parallel_for grain_size is aligned). n_end may
+// be any value; the trailing partial tile is masked on store.
+//
+// Two accumulate modes:
+//   FP32 acc (default fallback): 1 vld + 2 vcvt + 2 vfmaq_n_f32 = 5 instr/K-step
+//     FMA-bound at ~48 GF/s (4 threads). Higher precision.
+//   FP16 acc (use_fp16_accumulate=true): 1 vld + 1 vfmaq_n_f16 = 2 instr/K-step
+//     Bandwidth-bound at ~60 GF/s (4 threads). K_BLOCK store/reload for precision.
+
+static void matmul_fp16_neon_gemv_range(
+    const float* A, const __fp16* B_packed, float* C,
+    int K, int n_begin, int n_end)
+{
+    for (int n = n_begin; n < n_end; n += 8) {
+        int n_tile_end = std::min(n + 8, n_end);
+
+        float32x4_t acc0 = vdupq_n_f32(0.f);  // n+0..n+3
+        float32x4_t acc1 = vdupq_n_f32(0.f);  // n+4..n+7
+
+        const __fp16* b_tile = &B_packed[(n & ~7) * K];
+        for (int k = 0; k < K; k++) {
+            float a_val = A[k];
+            float16x8_t b_vec = vld1q_f16(b_tile + k * 8);
+            acc0 = vfmaq_n_f32(acc0, vcvt_f32_f16(vget_low_f16(b_vec)), a_val);
+            acc1 = vfmaq_n_f32(acc1, vcvt_f32_f16(vget_high_f16(b_vec)), a_val);
+        }
+
+        // Store partial tile (handles n_end not 8-aligned).
+        float tmp[4];
+        vst1q_f32(tmp, acc0);
+        for (int j = 0; j < 4 && n + j < n_tile_end; j++) C[n + j] = tmp[j];
+        vst1q_f32(tmp, acc1);
+        for (int j = 0; j < 4 && n + 4 + j < n_tile_end; j++) C[n + 4 + j] = tmp[j];
+    }
+}
+
+// FP16 accumulate variant: vfmaq_n_f16 does 8-lane FP16×FP16→FP16 FMA with
+// scalar broadcast. K_BLOCK store/reload (FP16→FP32→FP16) between blocks
+// limits within-block FP16 accumulation range for precision.
+//
+// 2-way K-unroll with 2 independent FP16 accumulators to hide FMA latency
+// (single-acc chain is CPI=4 on Apple Silicon; 2 chains → CPI=2).
+static void matmul_fp16_neon_gemv_range_fp16acc(
+    const float* A, const __fp16* B_packed, float* C,
+    int K, int n_begin, int n_end)
+{
+    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
+    const int K_BLOCK_FP16 = K_BLOCK * 2;  // FP16: 2x cache density
+
+    for (int n = n_begin; n < n_end; n += 8) {
+        int n_tile_end = std::min(n + 8, n_end);
+        const __fp16* b_tile = &B_packed[(n & ~7) * K];
+
+        float16x8_t acc0 = vdupq_n_f16((__fp16)0.f);
+        float16x8_t acc1 = vdupq_n_f16((__fp16)0.f);
+
+        int k_outer = 0;
+        for (; k_outer < K; k_outer += K_BLOCK_FP16) {
+            int k_end = std::min(k_outer + K_BLOCK_FP16, K);
+
+            // Reload partial sums from C (FP32 → FP16) between K-blocks.
+            if (k_outer > 0) {
+                float tmp[8];
+                for (int j = 0; j < 8; j++) {
+                    tmp[j] = (n + j < n_tile_end) ? C[n + j] : 0.f;
+                }
+                acc0 = vcombine_f16(
+                    vcvt_f16_f32(vld1q_f32(tmp)),
+                    vcvt_f16_f32(vld1q_f32(tmp + 4)));
+                acc1 = vdupq_n_f16((__fp16)0.f);
+            }
+
+            // 2-way K-unroll: two independent FMA chains.
+            int k = k_outer;
+            for (; k + 1 < k_end; k += 2) {
+                __fp16 a0 = (__fp16)A[k];
+                __fp16 a1 = (__fp16)A[k + 1];
+                float16x8_t b0 = vld1q_f16(b_tile + k * 8);
+                float16x8_t b1 = vld1q_f16(b_tile + (k + 1) * 8);
+                acc0 = vfmaq_n_f16(acc0, b0, a0);
+                acc1 = vfmaq_n_f16(acc1, b1, a1);
+            }
+            // Tail (odd K within block)
+            if (k < k_end) {
+                __fp16 a0 = (__fp16)A[k];
+                float16x8_t b0 = vld1q_f16(b_tile + k * 8);
+                acc0 = vfmaq_n_f16(acc0, b0, a0);
+            }
+
+            // Merge acc0 + acc1
+            acc0 = vaddq_f16(acc0, acc1);
+
+            // Store partial sums to C as FP32 (reloaded if more blocks remain).
+            float tmp[4];
+            vst1q_f32(tmp, vcvt_f32_f16(vget_low_f16(acc0)));
+            for (int j = 0; j < 4 && n + j < n_tile_end; j++) C[n + j] = tmp[j];
+            vst1q_f32(tmp, vcvt_f32_f16(vget_high_f16(acc0)));
+            for (int j = 0; j < 4 && n + 4 + j < n_tile_end; j++) C[n + 4 + j] = tmp[j];
+
+            // Reset acc1 for next block (acc0 carries the merged partial)
+            acc1 = vdupq_n_f16((__fp16)0.f);
+        }
+    }
+}
+
 // ---- FP16 lane-FMA kernel (A + B both pre-packed interleaved) ----
 //
 // A_packed: [M/8, K, 8] FP16 — 8 M values at same k are contiguous.
@@ -428,22 +542,55 @@ static void matmul_fp16_neon_8x8_range_packed_a_fp16acc(
                     }
                 }
 
-                // K loop: FP16 lane-FMA
-                for (int k = k_outer; k < k_end; k++) {
-                    float16x8_t a_vec = vld1q_f16(&A_packed[(m & ~7) * K + k * 8]);
-                    float16x8_t b_vec = vld1q_f16(&B_packed[(n & ~7) * K + k * 8]);
-                    float16x4_t b_low = vget_low_f16(b_vec);
-                    float16x4_t b_high = vget_high_f16(b_vec);
+                // K loop: FP16 lane-FMA, 2-way unroll for branch overhead reduction
+                // 16 independent acc chains (c0[8] + c1[8]). GEMM already has enough
+                // chains (8) to hide FMA latency — unroll mainly amortizes loop branch.
+                float16x8_t c1[8];
+                for (int j = 0; j < 8; j++) c1[j] = vdupq_n_f16((__fp16)0.f);
 
-                    c[0] = vfmaq_lane_f16(c[0], a_vec, b_low, 0);
-                    c[1] = vfmaq_lane_f16(c[1], a_vec, b_low, 1);
-                    c[2] = vfmaq_lane_f16(c[2], a_vec, b_low, 2);
-                    c[3] = vfmaq_lane_f16(c[3], a_vec, b_low, 3);
-                    c[4] = vfmaq_lane_f16(c[4], a_vec, b_high, 0);
-                    c[5] = vfmaq_lane_f16(c[5], a_vec, b_high, 1);
-                    c[6] = vfmaq_lane_f16(c[6], a_vec, b_high, 2);
-                    c[7] = vfmaq_lane_f16(c[7], a_vec, b_high, 3);
+                int k = k_outer;
+                for (; k + 1 < k_end; k += 2) {
+                    float16x8_t a0 = vld1q_f16(&A_packed[(m & ~7) * K + k * 8]);
+                    float16x8_t a1 = vld1q_f16(&A_packed[(m & ~7) * K + (k + 1) * 8]);
+                    float16x8_t b0 = vld1q_f16(&B_packed[(n & ~7) * K + k * 8]);
+                    float16x8_t b1 = vld1q_f16(&B_packed[(n & ~7) * K + (k + 1) * 8]);
+                    float16x4_t b0_low = vget_low_f16(b0), b0_high = vget_high_f16(b0);
+                    float16x4_t b1_low = vget_low_f16(b1), b1_high = vget_high_f16(b1);
+
+                    c[0] = vfmaq_lane_f16(c[0], a0, b0_low, 0);
+                    c[1] = vfmaq_lane_f16(c[1], a0, b0_low, 1);
+                    c[2] = vfmaq_lane_f16(c[2], a0, b0_low, 2);
+                    c[3] = vfmaq_lane_f16(c[3], a0, b0_low, 3);
+                    c[4] = vfmaq_lane_f16(c[4], a0, b0_high, 0);
+                    c[5] = vfmaq_lane_f16(c[5], a0, b0_high, 1);
+                    c[6] = vfmaq_lane_f16(c[6], a0, b0_high, 2);
+                    c[7] = vfmaq_lane_f16(c[7], a0, b0_high, 3);
+
+                    c1[0] = vfmaq_lane_f16(c1[0], a1, b1_low, 0);
+                    c1[1] = vfmaq_lane_f16(c1[1], a1, b1_low, 1);
+                    c1[2] = vfmaq_lane_f16(c1[2], a1, b1_low, 2);
+                    c1[3] = vfmaq_lane_f16(c1[3], a1, b1_low, 3);
+                    c1[4] = vfmaq_lane_f16(c1[4], a1, b1_high, 0);
+                    c1[5] = vfmaq_lane_f16(c1[5], a1, b1_high, 1);
+                    c1[6] = vfmaq_lane_f16(c1[6], a1, b1_high, 2);
+                    c1[7] = vfmaq_lane_f16(c1[7], a1, b1_high, 3);
                 }
+                // Tail (odd K within block)
+                if (k < k_end) {
+                    float16x8_t a0 = vld1q_f16(&A_packed[(m & ~7) * K + k * 8]);
+                    float16x8_t b0 = vld1q_f16(&B_packed[(n & ~7) * K + k * 8]);
+                    float16x4_t b0_low = vget_low_f16(b0), b0_high = vget_high_f16(b0);
+                    c[0] = vfmaq_lane_f16(c[0], a0, b0_low, 0);
+                    c[1] = vfmaq_lane_f16(c[1], a0, b0_low, 1);
+                    c[2] = vfmaq_lane_f16(c[2], a0, b0_low, 2);
+                    c[3] = vfmaq_lane_f16(c[3], a0, b0_low, 3);
+                    c[4] = vfmaq_lane_f16(c[4], a0, b0_high, 0);
+                    c[5] = vfmaq_lane_f16(c[5], a0, b0_high, 1);
+                    c[6] = vfmaq_lane_f16(c[6], a0, b0_high, 2);
+                    c[7] = vfmaq_lane_f16(c[7], a0, b0_high, 3);
+                }
+                // Merge c += c1
+                for (int j = 0; j < 8; j++) c[j] = vaddq_f16(c[j], c1[j]);
 
                 // Write back: FP16 → FP32, store to C
                 for (int j = 0; j < 8 && n + j < n_end; j++) {
@@ -666,6 +813,41 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         bool use_parallel = n_threads > 1 && n_chunks > 1;
 
         const __fp16* b_packed = b_fp16;
+
+        // ---- GEMV path: M == 1, dedicated kernel ----
+        // Skips the 8x8 tile structure (no dead r-loop iterations, lower
+        // register pressure). Adaptive n_chunk targets ~8 chunks per thread
+        // to balance parallel overhead vs load balancing.
+        // FP16 acc (vfmaq_n_f16) when use_fp16_accumulate is set: 2 instr/K-step
+        // vs 5 for FP32 acc, reaching bandwidth bound.
+        if (M == 1) {
+            if (use_fp16_acc) {
+                if (!use_parallel) {
+                    matmul_fp16_neon_gemv_range_fp16acc(a_ptr, b_packed, c_ptr, K, 0, N);
+                } else {
+                    int n_chunk = std::max(N / (n_threads * 8), 64);
+                    n_chunk = ((n_chunk + 7) / 8) * 8;
+                    thread_pool->parallel_for(0, N, n_chunk,
+                        [&](int, int n_begin, int n_end) {
+                            matmul_fp16_neon_gemv_range_fp16acc(a_ptr, b_packed, c_ptr,
+                                                                  K, n_begin, n_end);
+                        });
+                }
+            } else {
+                if (!use_parallel) {
+                    matmul_fp16_neon_gemv_range(a_ptr, b_packed, c_ptr, K, 0, N);
+                } else {
+                    int n_chunk = std::max(N / (n_threads * 8), 64);
+                    n_chunk = ((n_chunk + 7) / 8) * 8;
+                    thread_pool->parallel_for(0, N, n_chunk,
+                        [&](int, int n_begin, int n_end) {
+                            matmul_fp16_neon_gemv_range(a_ptr, b_packed, c_ptr,
+                                                        K, n_begin, n_end);
+                        });
+                }
+            }
+            return;
+        }
 
         __fp16* a_packed = nullptr;
         if (use_lane_fma && !use_parallel) {

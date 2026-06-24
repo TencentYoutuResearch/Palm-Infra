@@ -132,10 +132,12 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     sin    = g.input('sin', (qk_rope_dim // 2, seq_len))
 
     # KV cache inputs (preallocated, metadata in header)
+    # FP16 storage: halves cache memory, enables FP16FML SDPA without per-call
+    # FP32→FP16 conversion of the entire KV cache.
     cache_inputs = []
     for i in range(n_layers):
-        ck = g.input(f'cache_k{i}', (qk_head_dim, n_ctx, num_heads))
-        cv = g.input(f'cache_v{i}', (v_head_dim, n_ctx, num_heads))
+        ck = g.input(f'cache_k{i}', (qk_head_dim, n_ctx, num_heads), prec=Precision.FP16)
+        cv = g.input(f'cache_v{i}', (v_head_dim, n_ctx, num_heads), prec=Precision.FP16)
         cache_inputs.append((ck, cv))
 
     # ---- build layers ----

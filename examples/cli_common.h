@@ -11,6 +11,7 @@ struct CliCommonOptions {
     std::string tokenizer_path;
     std::string artifacts_dir;
     std::string prompt;
+    int prompt_tokens = 0;   // >0: use N dummy tokens instead of --prompt text
     int max_new_tokens = 128;
     int n_ctx = 4096;
     int rope_dim = 64;

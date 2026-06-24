@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
         return error == "help" ? 0 : 1;
     }
 
-    if (opts.prompt.empty()) opts.prompt = "Hello, world!";
+    if (opts.prompt.empty() && opts.prompt_tokens <= 0) opts.prompt = "Hello, world!";
 
     Tokenizer tokenizer;
     LLMEngine engine;
@@ -88,7 +88,14 @@ int main(int argc, char** argv) {
 
     engine.set_profile_enabled(opts.profile);
 
-    std::vector<int> prompt_ids = tokenizer.apply_chat(opts.prompt);
+    std::vector<int> prompt_ids;
+    if (opts.prompt_tokens > 0) {
+        // Dummy-token mode: skip chat template, use raw token IDs.
+        // Token 0 is always valid (embed() falls back to it for OOB).
+        prompt_ids.assign(opts.prompt_tokens, 0);
+    } else {
+        prompt_ids = tokenizer.apply_chat(opts.prompt);
+    }
     if (prompt_ids.empty()) {
         std::fprintf(stderr, "bench: prompt is empty after tokenization\n");
         return 1;
