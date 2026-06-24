@@ -311,8 +311,14 @@ static void matmul_fp16_neon_gemv_range(
 // scalar broadcast. K_BLOCK store/reload (FP16→FP32→FP16) between blocks
 // limits within-block FP16 accumulation range for precision.
 //
-// 2-way K-unroll with 2 independent FP16 accumulators to hide FMA latency
-// (single-acc chain is CPI=4 on Apple Silicon; 2 chains → CPI=2).
+// 8-way K-unroll with 8 independent FP16 accumulators to fully hide FMA
+// latency. Apple M5 FP16 FMA latency = 2 cycles, throughput = 2/cycle.
+// With N independent acc chains, CPI = max(1, 2/N) cycles/K-step.
+//   N=1 (single-acc):  CPI=2  → latency-bound
+//   N=2 (2-way unroll): CPI=1  → at FMA throughput ceiling
+//   N=8 (8-way unroll): CPI=1  → same throughput, but lower loop overhead
+//                                 per FMA, better ILP for issue stage.
+// Inspired by ggml's SVE GEMV which uses 4-acc × 8-way K-unroll.
 static void matmul_fp16_neon_gemv_range_fp16acc(
     const float* A, const __fp16* B_packed, float* C,
     int K, int n_begin, int n_end)
@@ -324,54 +330,85 @@ static void matmul_fp16_neon_gemv_range_fp16acc(
         int n_tile_end = std::min(n + 8, n_end);
         const __fp16* b_tile = &B_packed[(n & ~7) * K];
 
-        float16x8_t acc0 = vdupq_n_f16((__fp16)0.f);
-        float16x8_t acc1 = vdupq_n_f16((__fp16)0.f);
+        // 8 independent FP16 acc chains to fully hide FMA latency.
+        // Each K step writes to one acc, rotating through acc[0..7].
+        // After 8 K steps, every acc has exactly 1 FMA → fully independent.
+        float16x8_t acc[8];
 
         int k_outer = 0;
         for (; k_outer < K; k_outer += K_BLOCK_FP16) {
             int k_end = std::min(k_outer + K_BLOCK_FP16, K);
 
-            // Reload partial sums from C (FP32 → FP16) between K-blocks.
-            if (k_outer > 0) {
+            // Initialize acc for this K-block.
+            if (k_outer == 0) {
+                for (int i = 0; i < 8; i++) acc[i] = vdupq_n_f16((__fp16)0.f);
+            } else {
+                // Reload partial sums from C (FP32 → FP16) — split into 8 chains.
+                // acc[0] carries the merged partial from prior block.
                 float tmp[8];
                 for (int j = 0; j < 8; j++) {
                     tmp[j] = (n + j < n_tile_end) ? C[n + j] : 0.f;
                 }
-                acc0 = vcombine_f16(
+                acc[0] = vcombine_f16(
                     vcvt_f16_f32(vld1q_f32(tmp)),
                     vcvt_f16_f32(vld1q_f32(tmp + 4)));
-                acc1 = vdupq_n_f16((__fp16)0.f);
+                for (int i = 1; i < 8; i++) acc[i] = vdupq_n_f16((__fp16)0.f);
             }
 
-            // 2-way K-unroll: two independent FMA chains.
+            // 8-way K-unroll: 8 independent FMA chains.
+            // Each K step: load A[k], load B[k*8], FMA into acc[k%8].
+            // 8 acc chains → FMA latency (2 cycles) fully hidden.
             int k = k_outer;
-            for (; k + 1 < k_end; k += 2) {
-                __fp16 a0 = (__fp16)A[k];
+            int k_unrolled_end = k_outer + ((k_end - k_outer) & ~7);
+            for (; k < k_unrolled_end; k += 8) {
+                __fp16 a0 = (__fp16)A[k + 0];
                 __fp16 a1 = (__fp16)A[k + 1];
-                float16x8_t b0 = vld1q_f16(b_tile + k * 8);
+                __fp16 a2 = (__fp16)A[k + 2];
+                __fp16 a3 = (__fp16)A[k + 3];
+                __fp16 a4 = (__fp16)A[k + 4];
+                __fp16 a5 = (__fp16)A[k + 5];
+                __fp16 a6 = (__fp16)A[k + 6];
+                __fp16 a7 = (__fp16)A[k + 7];
+                float16x8_t b0 = vld1q_f16(b_tile + (k + 0) * 8);
                 float16x8_t b1 = vld1q_f16(b_tile + (k + 1) * 8);
-                acc0 = vfmaq_n_f16(acc0, b0, a0);
-                acc1 = vfmaq_n_f16(acc1, b1, a1);
+                float16x8_t b2 = vld1q_f16(b_tile + (k + 2) * 8);
+                float16x8_t b3 = vld1q_f16(b_tile + (k + 3) * 8);
+                float16x8_t b4 = vld1q_f16(b_tile + (k + 4) * 8);
+                float16x8_t b5 = vld1q_f16(b_tile + (k + 5) * 8);
+                float16x8_t b6 = vld1q_f16(b_tile + (k + 6) * 8);
+                float16x8_t b7 = vld1q_f16(b_tile + (k + 7) * 8);
+                acc[0] = vfmaq_n_f16(acc[0], b0, a0);
+                acc[1] = vfmaq_n_f16(acc[1], b1, a1);
+                acc[2] = vfmaq_n_f16(acc[2], b2, a2);
+                acc[3] = vfmaq_n_f16(acc[3], b3, a3);
+                acc[4] = vfmaq_n_f16(acc[4], b4, a4);
+                acc[5] = vfmaq_n_f16(acc[5], b5, a5);
+                acc[6] = vfmaq_n_f16(acc[6], b6, a6);
+                acc[7] = vfmaq_n_f16(acc[7], b7, a7);
             }
-            // Tail (odd K within block)
-            if (k < k_end) {
+            // Tail (K % 8 != 0 within block): fall back to rotating acc[0..7].
+            for (; k < k_end; k++) {
                 __fp16 a0 = (__fp16)A[k];
                 float16x8_t b0 = vld1q_f16(b_tile + k * 8);
-                acc0 = vfmaq_n_f16(acc0, b0, a0);
+                int idx = (k - k_outer) & 7;
+                acc[idx] = vfmaq_n_f16(acc[idx], b0, a0);
             }
 
-            // Merge acc0 + acc1
-            acc0 = vaddq_f16(acc0, acc1);
+            // Merge 8 acc chains into acc[0] (pairwise reduction).
+            acc[0] = vaddq_f16(acc[0], acc[1]);
+            acc[2] = vaddq_f16(acc[2], acc[3]);
+            acc[4] = vaddq_f16(acc[4], acc[5]);
+            acc[6] = vaddq_f16(acc[6], acc[7]);
+            acc[0] = vaddq_f16(acc[0], acc[2]);
+            acc[4] = vaddq_f16(acc[4], acc[6]);
+            acc[0] = vaddq_f16(acc[0], acc[4]);
 
             // Store partial sums to C as FP32 (reloaded if more blocks remain).
             float tmp[4];
-            vst1q_f32(tmp, vcvt_f32_f16(vget_low_f16(acc0)));
+            vst1q_f32(tmp, vcvt_f32_f16(vget_low_f16(acc[0])));
             for (int j = 0; j < 4 && n + j < n_tile_end; j++) C[n + j] = tmp[j];
-            vst1q_f32(tmp, vcvt_f32_f16(vget_high_f16(acc0)));
+            vst1q_f32(tmp, vcvt_f32_f16(vget_high_f16(acc[0])));
             for (int j = 0; j < 4 && n + 4 + j < n_tile_end; j++) C[n + 4 + j] = tmp[j];
-
-            // Reset acc1 for next block (acc0 carries the merged partial)
-            acc1 = vdupq_n_f16((__fp16)0.f);
         }
     }
 }
