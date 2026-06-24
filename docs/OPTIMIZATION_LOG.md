@@ -539,18 +539,35 @@ GEMV 不走 lane-FMA 所以无变化。精度: 测试误差 <0.5%，可接受。
 
 - **TILE**: 8×8 (NEON)
 - **K_BLOCK**: 512
-- **精度**: FP16 权重 + FP16 activations (GEMM) + FP32 累加
+- **精度**: FP16 权重 + FP16 activations (GEMM) + FP16 累加
 - **A packing**: Per-call interleaved (M>=8), FP32→FP16
 - **B packing**: Load-time interleaved (tile-of-8 transpose), GEMV+GEMM 共用
+- **embed_tokens**: FP16 row-major (embed 查找) + FP16 packed 副本 (lm_head matmul)
 - **FMA**: vfmaq_lane_f16 FP16 累加 (M>=8, 默认), vfmaq_n_f32 (M<8 GEMV)
 - **SDPA**: FlashAttention-2 FP32 (Br=4, Bc=32, online softmax) + head 并行
 - **线程**: 自定义线程池, per-op split work, per-worker A pack
 
+## 端到端性能 (Youtu-LLM-2B, M5 Pro, 4 threads, pp256)
+
+| 版本 | prefill_tps | decode_tps | load_ms |
+|------|------------|------------|---------|
+| FP32 baseline | ~60 | ~5 | 328 |
+| + FP16 + pack + lane-FMA | ~76 | ~10.3 | 4254 |
+| + FlashAttention + head 并行 | ~76 | ~10.3 | 4254 |
+| + FP16 累加 | ~82 | ~10.9 | 4254 |
+| + embed FP16 + packed lm_head | **~86.6** | **~13.3** | **1220** |
+
+| 框架 | prefill (pp256) | decode (tg) |
+|------|----------------|------------|
+| **mlllm** | **86.6** | **13.3** |
+| ncnn | 202 | 33 |
+| llama.cpp | 264 | 41 |
+
+差距：prefill **2.3-3.0x**, decode **2.5-3.1x**
+
 ## 下一步方向
 
-1. **量化 (INT4/INT8)** — MATMUL 仍占 70%, 最大杠杆
-2. **FP16 SDPA** — 移植 FP16FML flash kernel, SDPA 仍占 18.5%
-3. **SDPA 多线程** — 当前 flash kernel 串行, 可按 head 并行
-4. **其他算子并行** — RMSNorm, SiLU 等（当前占比小）
-4. **其他算子并行** — RMSNorm, SiLU 等（当前占比小，优先级低）
-5. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）
+1. **量化 (INT4/INT8)** — MATMUL 仍占 70%+, 最大杠杆
+2. **FP16 SDPA** — 移植 FP16FML flash kernel, SDPA 占 7%
+3. **其他算子并行** — RMSNorm, SiLU 等（当前占比小）
+4. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）
