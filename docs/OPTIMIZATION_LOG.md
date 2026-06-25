@@ -1048,16 +1048,17 @@ latency=2 cycles，2 chains 已经达到 CPI=1（FMA throughput ceiling），但
 | + GEMV FP16 acc 8-way K-unroll (尝试 23) | **138.6** | **49.6** | 1243 | 5-run 中位数校准 |
 | + ThreadPool park/resume (尝试 24) | **149.5** | **52.4** | 1243 | 5-run 中位数校准 |
 | + GEMM 2D 调度 + pre-pack A (尝试 25) | **151.3** | **51.5** | 1243 | 10-run 中位数校准 |
-| + K_BLOCK 512→2048 (尝试 26, 当前) | **159.2** | **52.1** | 1243 | 10-run 中位数校准 |
+| + K_BLOCK 512→2048 (尝试 26) | **159.2** | **52.1** | 1243 | 10-run 中位数校准 |
+| + SDPA prefill kernel rewrite (尝试 27, 当前) | **220.3** | **52.4** | 1126 | 5-run 中位数校准 |
 
 | 框架 | prefill (pp256) | decode (tg) |
 |------|----------------|------------|
-| **mlllm** | **~159.2** | **~52.1** ✅ |
+| **mlllm** | **~220.3** | **~52.4** ✅ |
 | ncnn | 202 | 33 |
 | llama.cpp | 264 | 41 |
 
-**decode 1.27x 超过 llama.cpp**（52.1 vs 41 tok/s）。
-prefill 1.66x 差距（159 vs 264），非量化路径接近瓶颈。
+**prefill 超过 ncnn (220 vs 202)**，距 llama.cpp 仅 1.20x 差距（之前 1.66x）。
+decode 持平，仍 1.28x 超过 llama.cpp。
 
 ---
 
@@ -1186,14 +1187,92 @@ store/reload 4 次。K_BLOCK=2048 时只有 1 个 block，无 store/reload。
 
 **决定**：**采用。K_BLOCK=2048 作为默认。**
 
+## 尝试 27：SDPA prefill kernel 重写（Br=8 Bc=64 + register-tiled PV + dot_fp16_8x）
+
+**决策理由**：尝试 26 后 SDPA 占 prefill 13.2%（158 ms / 32 layers × 4.95 ms/layer），
+是仅次于 MATMUL 的第二大热点。MATMUL 已达 FP16FML peak 80%（920 GF/s），无明显空间。
+分析 SDPA prefill kernel（`flash_attn_fp16_prefill`）发现三个瓶颈：
+
+1. **Br=4 Bc=32 太小** — 每 block 只做 4×32=128 个 dot，PV 内循环只 32 步，loop overhead 占比高
+2. **PV loop 非 register-tiled** — 每个 j 迭代都 `vld1q_f32(oi+d)` + `vst1q_f32(oi+d)` for O，
+   而非像 `flash_attn_fp16_decode` 那样把 16 个 FP32x4 acc 寄存在 NEON 寄存器里跨 j 持有
+3. **dot_fp16_4x 只 4 acc chains** — FP16FML latency=2cyc, throughput=2/cyc, 4 chains → CPI 0.5
+   issue-bound。扩到 8 chains → CPI 0.25，更接近 FMA throughput 上限
+
+实测：4.37 ms/layer × 32 ≈ 140 ms / prefill（与端到端 158 ms 相符，profile 含 dispatch overhead）。
+单线程仅 34 GF/s/head = **3% FP16FML peak**，远未到 compute 或 bandwidth bound。
+
+**算法**：Br=8 Bc=64 + dot_fp16_8x + register-tiled PV
+
+- **QK**：`dot_fp16_8x(qi, K0..K7, d_k, out[8])` — 1 Q load × 8 K loads × 8 independent
+  FP32x4 acc chains，CPI 0.25 → FMA throughput bound
+- **PV**：每个 Q 行 i 在内层 j=0..bc=64 循环外先 load 16 个 FP32x4 acc（`o0..o15`），
+  跨整个 j 循环只在寄存器内做 `vfmlalq_lane_low/high_f16`，循环结束才 store。
+  Direct port from `flash_attn_fp16_decode` lines 407-474.
+- **d_v 分块**：TILE_DV=64，d_v=128 → 2 个 64-wide tile。8-wide/4-wide/scalar tail 处理非 64 倍数
+- **Online softmax**：保持原 `alpha` rescale + `m_new/l_new` 逻辑，跨 block 累积
+
+**寄存器预算**（NEON 32 个 Q）：
+- QK 路径：8 acc + 2 Q + 2 K (reused) = 12 Q ✓
+- PV 路径：16 acc + 8 V = 24 Q ✓（编译器可调度，无 spill）
+
+**实现**：
+- `kernels/attention.cpp`: 新增 `dot_fp16_8x`（attention.cpp:322-455，扩展 `dot_fp16_4x` 到 8 K 行）
+- `kernels/attention.cpp`: 重写 `flash_attn_fp16_prefill`（attention.cpp:673-918）
+  - Br=8, Bc=64, TILE_DV=64
+  - QK: `dot_fp16_8x` 主路径 + `dot_fp16_4x` 4-tail + scalar tail
+  - PV: 16-register-tiled 主循环，8-wide/4-wide/scalar tail
+  - Stack `S[8][64] = 2 KB` per call
+- `tests/test_attention.cpp`: 新增 4 个 MLA prefill 测试用例（src=256, src=20 非 tile M, vd=100 非 tile d_v, past=128）
+- `tests/bench_sdpa.cpp` + `CMakeLists.txt`: 新增 SDPA microbench（mirror bench_matmul 结构）
+
+**结果 (microbench, MLA shape: H=16, src=256, dk=192, dv=128, 4 threads, warmup=5, repeat=10)**：
+| 指标 | 尝试 26 (Br=4 Bc=32) | 尝试 27 (Br=8 Bc=64 + tiled PV) | 变化 |
+|------|---------------------|---------------------------------|------|
+| SDPA/layer | 4.37 ms | **2.11 ms** | **-52%** |
+| SDPA GFLOPS (4-thread) | 310 | **623** | +101% |
+| scaling 1→4 thread | 7.4 ms → 4.4 ms (1.7x) | 7.4 ms → 2.1 ms (3.5x) | 调度改善 |
+
+**结果 (端到端, 4 threads, pp256, warmup=3, 5-run 中位数)**：
+| 指标 | 尝试 26 (Br=4 Bc=32) | 尝试 27 (Br=8 Bc=64) | 变化 |
+|------|---------------------|---------------------|------|
+| prefill_tps | 159.2 (历史值) | **220.3** (217-221) | **+38%** |
+| prefill_ms | ~1613 | **1163** | -28% |
+| SDPA (pp256) | 158 ms (13.2%) | **70 ms (6.3%)** | **-56%** |
+| MATMUL (pp256) | 957 ms (80%) | 957 ms (86%) | 持平 |
+| decode_tps | 52.1 | 52.4 | 持平 |
+
+注：尝试 26 的 prefill_tps=159.2 是机器冷态历史测量。本次重测前先跑了一次完整 5-run
+确认机器温度稳定（机器过热会让 matmul microbench 退化 5-16%，故关键改动需冷却后重测）。
+
+**关键发现**：
+1. **SDPA 大幅提升** (-56%)，从 13.2% 降到 6.3%，prefill_tps +38%
+2. microbench +52% (4.37 → 2.11 ms) 与端到端 -56% 一致，无 surprise
+3. 单线程 scaling 从 1.7x → 3.5x，说明 Br=8 更适合 multi-thread contention 模式
+4. **prefill 超过 ncnn (220 vs 202)**，距 llama.cpp 仅 1.20x（之前 1.66x）
+5. dot_fp16_8x 与 register-tiled PV 是 ncnn-upstream decode kernel 已有的技巧，
+   prefill 之前未做是历史疏漏
+6. 热管理很重要：机器过热会让 FP16FML 路径性能下降 10-20%。Bench 时需要 warmup
+   + 5-run 中位数排除热噪声
+
+**实施过程中发现的关键 bug**：
+- 初次实施后 microbench 显示 -50% 但端到端无变化。排查发现 `test_output_fp16/model_prefill.graph`
+  的 cache_k/cache_v 节点 `out_prec=0`（FP32），尽管 `mla.py` 已指定 `Precision::FP16`。
+  原因：旧的 `.graph` 文件是早期 mla.py 版本生成的，未重新导出。
+  修复：重新跑 `python3 -c "from mla import convert_mla; convert_mla(...)"` 生成新 graph
+  才能让 `cache_is_fp16=true` 路径生效，端到端收益才得以显现。
+
+**工具改进**：
+- `tests/bench_sdpa.cpp`: 新增 SDPA microbench，支持 `--threads/--warmup/--repeat/--src/--heads/--hd/--vd`
+  以及 `--fp32-cache`（默认 FP16）/`--no-causal` flags
+- `tests/test_attention.cpp`: 新增 4 个 MLA prefill 测试用例覆盖 tile 边界条件
+
+**决定**：**采用。Br=8 Bc=64 + dot_fp16_8x + register-tiled PV 作为 FP16 SDPA prefill 默认。**
+FP32 fallback（`flash_attn_fp32_prefill`）保留不变，仅 NEON+FP16 路径走新 kernel。
+
+**后续可探索**：
+- 2D atomic-steal 跨 head 调度（16 heads × 2D = 更细粒度 work-stealing）
+- causal mask 跳过最后 jb 块（自然被 causal 裁剪）
+- head 间共享 Q tile（如果 RoPE 后 Q 数据可复用）
+
 ---
-
-## 下一步方向
-
-1. **量化 (INT4/INT8)** — MATMUL 仍占 85%+, **唯一大杠杆**
-2. **FP16 activations** — 前一个算子输出 FP16，matmul 跳过 per-call A pack（~1% 收益）
-3. **Accelerate BLAS** — 快速验证 matmul 上限（Apple only, 低优先级）
-
-非量化路径下，非 MATMUL/SDPA 优化已到瓶颈（占比从 40% 降到 ~6%）。
-MATMUL 已接近 FP16 compute ceiling。要继续缩小与 ncnn/llama.cpp 的差距，
-量化是必经之路。

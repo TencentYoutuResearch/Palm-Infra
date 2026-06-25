@@ -319,6 +319,141 @@ static inline void dot_fp16_4x(const __fp16* Q,
     }
 }
 
+// 8-way batched FP16 dot product: 8 K rows share one Q load.
+// FP32 accumulate via FP16FML. Output 8 FP32 scores.
+//
+// Extension of dot_fp16_4x to 8 K rows: more independent acc chains (8 vs 4)
+// better hides FP16FML latency (lat=2 cycles, throughput=2/cycle → 8 chains
+// = CPI 0.25 issue-side, fully FMA-throughput bound).
+//
+// Register budget: 8 acc (a0..a7) + 2 Q + 2 K (reused) = 12 vector regs.
+static inline void dot_fp16_8x(const __fp16* Q,
+    const __fp16* K0, const __fp16* K1, const __fp16* K2, const __fp16* K3,
+    const __fp16* K4, const __fp16* K5, const __fp16* K6, const __fp16* K7,
+    int d_k, float* out)
+{
+    float32x4_t a0 = vdupq_n_f32(0.f);
+    float32x4_t a1 = vdupq_n_f32(0.f);
+    float32x4_t a2 = vdupq_n_f32(0.f);
+    float32x4_t a3 = vdupq_n_f32(0.f);
+    float32x4_t a4 = vdupq_n_f32(0.f);
+    float32x4_t a5 = vdupq_n_f32(0.f);
+    float32x4_t a6 = vdupq_n_f32(0.f);
+    float32x4_t a7 = vdupq_n_f32(0.f);
+
+    int k = 0;
+    for (; k + 15 < d_k; k += 16) {
+        float16x8_t qh0 = vld1q_f16(Q + k);
+        float16x8_t qh1 = vld1q_f16(Q + k + 8);
+
+        float16x8_t kh0 = vld1q_f16(K0 + k);
+        float16x8_t kh1 = vld1q_f16(K0 + k + 8);
+        a0 = vfmlalq_low_f16(a0, qh0, kh0);
+        a0 = vfmlalq_high_f16(a0, qh0, kh0);
+        a0 = vfmlalq_low_f16(a0, qh1, kh1);
+        a0 = vfmlalq_high_f16(a0, qh1, kh1);
+
+        kh0 = vld1q_f16(K1 + k);
+        kh1 = vld1q_f16(K1 + k + 8);
+        a1 = vfmlalq_low_f16(a1, qh0, kh0);
+        a1 = vfmlalq_high_f16(a1, qh0, kh0);
+        a1 = vfmlalq_low_f16(a1, qh1, kh1);
+        a1 = vfmlalq_high_f16(a1, qh1, kh1);
+
+        kh0 = vld1q_f16(K2 + k);
+        kh1 = vld1q_f16(K2 + k + 8);
+        a2 = vfmlalq_low_f16(a2, qh0, kh0);
+        a2 = vfmlalq_high_f16(a2, qh0, kh0);
+        a2 = vfmlalq_low_f16(a2, qh1, kh1);
+        a2 = vfmlalq_high_f16(a2, qh1, kh1);
+
+        kh0 = vld1q_f16(K3 + k);
+        kh1 = vld1q_f16(K3 + k + 8);
+        a3 = vfmlalq_low_f16(a3, qh0, kh0);
+        a3 = vfmlalq_high_f16(a3, qh0, kh0);
+        a3 = vfmlalq_low_f16(a3, qh1, kh1);
+        a3 = vfmlalq_high_f16(a3, qh1, kh1);
+
+        kh0 = vld1q_f16(K4 + k);
+        kh1 = vld1q_f16(K4 + k + 8);
+        a4 = vfmlalq_low_f16(a4, qh0, kh0);
+        a4 = vfmlalq_high_f16(a4, qh0, kh0);
+        a4 = vfmlalq_low_f16(a4, qh1, kh1);
+        a4 = vfmlalq_high_f16(a4, qh1, kh1);
+
+        kh0 = vld1q_f16(K5 + k);
+        kh1 = vld1q_f16(K5 + k + 8);
+        a5 = vfmlalq_low_f16(a5, qh0, kh0);
+        a5 = vfmlalq_high_f16(a5, qh0, kh0);
+        a5 = vfmlalq_low_f16(a5, qh1, kh1);
+        a5 = vfmlalq_high_f16(a5, qh1, kh1);
+
+        kh0 = vld1q_f16(K6 + k);
+        kh1 = vld1q_f16(K6 + k + 8);
+        a6 = vfmlalq_low_f16(a6, qh0, kh0);
+        a6 = vfmlalq_high_f16(a6, qh0, kh0);
+        a6 = vfmlalq_low_f16(a6, qh1, kh1);
+        a6 = vfmlalq_high_f16(a6, qh1, kh1);
+
+        kh0 = vld1q_f16(K7 + k);
+        kh1 = vld1q_f16(K7 + k + 8);
+        a7 = vfmlalq_low_f16(a7, qh0, kh0);
+        a7 = vfmlalq_high_f16(a7, qh0, kh0);
+        a7 = vfmlalq_low_f16(a7, qh1, kh1);
+        a7 = vfmlalq_high_f16(a7, qh1, kh1);
+    }
+    for (; k + 7 < d_k; k += 8) {
+        float16x8_t qh0 = vld1q_f16(Q + k);
+
+        float16x8_t kh0 = vld1q_f16(K0 + k);
+        a0 = vfmlalq_low_f16(a0, qh0, kh0);
+        a0 = vfmlalq_high_f16(a0, qh0, kh0);
+        kh0 = vld1q_f16(K1 + k);
+        a1 = vfmlalq_low_f16(a1, qh0, kh0);
+        a1 = vfmlalq_high_f16(a1, qh0, kh0);
+        kh0 = vld1q_f16(K2 + k);
+        a2 = vfmlalq_low_f16(a2, qh0, kh0);
+        a2 = vfmlalq_high_f16(a2, qh0, kh0);
+        kh0 = vld1q_f16(K3 + k);
+        a3 = vfmlalq_low_f16(a3, qh0, kh0);
+        a3 = vfmlalq_high_f16(a3, qh0, kh0);
+        kh0 = vld1q_f16(K4 + k);
+        a4 = vfmlalq_low_f16(a4, qh0, kh0);
+        a4 = vfmlalq_high_f16(a4, qh0, kh0);
+        kh0 = vld1q_f16(K5 + k);
+        a5 = vfmlalq_low_f16(a5, qh0, kh0);
+        a5 = vfmlalq_high_f16(a5, qh0, kh0);
+        kh0 = vld1q_f16(K6 + k);
+        a6 = vfmlalq_low_f16(a6, qh0, kh0);
+        a6 = vfmlalq_high_f16(a6, qh0, kh0);
+        kh0 = vld1q_f16(K7 + k);
+        a7 = vfmlalq_low_f16(a7, qh0, kh0);
+        a7 = vfmlalq_high_f16(a7, qh0, kh0);
+    }
+
+    out[0] = vaddvq_f32(a0);
+    out[1] = vaddvq_f32(a1);
+    out[2] = vaddvq_f32(a2);
+    out[3] = vaddvq_f32(a3);
+    out[4] = vaddvq_f32(a4);
+    out[5] = vaddvq_f32(a5);
+    out[6] = vaddvq_f32(a6);
+    out[7] = vaddvq_f32(a7);
+
+    // Scalar tail
+    for (; k < d_k; k++) {
+        float q = (float)Q[k];
+        out[0] += q * (float)K0[k];
+        out[1] += q * (float)K1[k];
+        out[2] += q * (float)K2[k];
+        out[3] += q * (float)K3[k];
+        out[4] += q * (float)K4[k];
+        out[5] += q * (float)K5[k];
+        out[6] += q * (float)K6[k];
+        out[7] += q * (float)K7[k];
+    }
+}
+
 // FP16 decode kernel: M=1, Bc=64, online softmax, FP16FML PV accumulation.
 // Q/K/V are FP16 (caller converts from FP32). O is FP32 output.
 static void flash_attn_fp16_decode(
@@ -539,8 +674,22 @@ static void flash_attn_fp16_prefill(
     const __fp16* Q, const __fp16* K, const __fp16* V, float* O,
     int M, int N, int d_k, int d_v, float scale, const float* mask)
 {
-    const int Br = 4;
-    const int Bc = 32;
+    // Rewritten kernel (尝试 27): Br=8, Bc=64, register-tiled PV.
+    //
+    // Why: previous Br=4 Bc=32 with non-tiled PV was issue-bound at ~34 GF/s/head
+    // (3% of FP16FML peak). Three key changes:
+    //   1. dot_fp16_8x (8 K rows × 1 Q row) — 8 independent acc chains, fully
+    //      hides FMA latency (lat=2, throughput=2/cyc, 8 chains → CPI 0.25).
+    //   2. PV loop holds 16 FP32x4 accumulators in registers across the whole
+    //      bc=64 j loop (port from flash_attn_fp16_decode lines 407-474).
+    //      No per-iter vld1q/vst1q on O.
+    //   3. Br=8 Bc=64 → 4× more work per inner block, fewer outer iterations.
+    //
+    // For MLA (d_v=128): 2 tiles of 64-wide d_v per Q row.
+    // For general d_v: tile loop handles arbitrary d_v with 64/8/4/scalar tails.
+    const int Br = 8;
+    const int Bc = 64;
+    const int TILE_DV = 64;  // 16 FP32x4 registers per tile
     float* row_m = (float*)malloc(M * sizeof(float));
     float* row_l = (float*)malloc(M * sizeof(float));
     memset(O, 0, M * d_v * sizeof(float));
@@ -550,40 +699,59 @@ static void flash_attn_fp16_prefill(
         const int bc = (jb + Bc <= N) ? Bc : (N - jb);
         for (int ib = 0; ib < M; ib += Br) {
             const int br = (ib + Br <= M) ? Br : (M - ib);
-            float S[4][32];
+            // Scores: br × bc. Br=8, Bc=64 → 2 KB on stack.
+            float S[8][64];
+
+            // ---- QK: 8 K rows × 1 Q row per dot_fp16_8x call ----
             for (int i = 0; i < br; i++) {
                 const __fp16* qi = Q + (ib + i) * d_k;
-                // 4-way batched dot for first 4 K rows, then scalar loop
                 int j = 0;
-                for (; j + 3 < bc; j += 4) {
-                    dot_fp16_4x(qi,
-                                K + (jb + j) * d_k, K + (jb + j + 1) * d_k,
+                for (; j + 7 < bc; j += 8) {
+                    dot_fp16_8x(qi,
+                                K + (jb + j + 0) * d_k, K + (jb + j + 1) * d_k,
                                 K + (jb + j + 2) * d_k, K + (jb + j + 3) * d_k,
+                                K + (jb + j + 4) * d_k, K + (jb + j + 5) * d_k,
+                                K + (jb + j + 6) * d_k, K + (jb + j + 7) * d_k,
                                 d_k, &S[i][j]);
-                    S[i][j]   *= scale; S[i][j+1] *= scale;
-                    S[i][j+2] *= scale; S[i][j+3] *= scale;
-                    if (mask) {
-                        S[i][j]   += mask[(ib + i) * N + jb + j];
-                        S[i][j+1] += mask[(ib + i) * N + jb + j + 1];
-                        S[i][j+2] += mask[(ib + i) * N + jb + j + 2];
-                        S[i][j+3] += mask[(ib + i) * N + jb + j + 3];
+                    for (int jj = 0; jj < 8; jj++) {
+                        S[i][j + jj] *= scale;
+                        if (mask) S[i][j + jj] += mask[(ib + i) * N + jb + j + jj];
                     }
                 }
+                // 4-way tail
+                if (j + 3 < bc) {
+                    dot_fp16_4x(qi,
+                                K + (jb + j + 0) * d_k, K + (jb + j + 1) * d_k,
+                                K + (jb + j + 2) * d_k, K + (jb + j + 3) * d_k,
+                                d_k, &S[i][j]);
+                    for (int jj = 0; jj < 4; jj++) {
+                        S[i][j + jj] *= scale;
+                        if (mask) S[i][j + jj] += mask[(ib + i) * N + jb + j + jj];
+                    }
+                    j += 4;
+                }
+                // Scalar tail
                 for (; j < bc; j++) {
                     S[i][j] = dot_fp16_neon(qi, K + (jb + j) * d_k, d_k) * scale;
                     if (mask) S[i][j] += mask[(ib + i) * N + jb + j];
                 }
             }
+
+            // ---- Online softmax + register-tiled PV (per Q row) ----
             for (int i = 0; i < br; i++) {
                 const int row = ib + i;
                 float m_old = row_m[row];
                 float l_old = row_l[row];
                 float* oi = O + row * d_v;
+
+                // Block max
                 float m_block = S[i][0];
                 for (int j = 1; j < bc; j++) m_block = fmaxf(m_block, S[i][j]);
                 float m_new = fmaxf(m_old, m_block);
                 float alpha = fast_exp_f32(m_old - m_new);
-                {
+
+                // Rescale existing O by alpha (only if alpha != 1, i.e. not first block)
+                if (l_old != 0.f) {
                     float32x4_t valpha = vdupq_n_f32(alpha);
                     int d = 0;
                     for (; d + 7 < d_v; d += 8) {
@@ -594,45 +762,143 @@ static void flash_attn_fp16_prefill(
                         vst1q_f32(oi + d, vmulq_f32(vld1q_f32(oi + d), valpha));
                     for (; d < d_v; d++) oi[d] *= alpha;
                 }
+
+                // Convert scores → P = exp(s - m_new), compute l_block.
+                // PV then accumulates P[j] × V[j] into O.
                 float l_block = 0.f;
-                // PV accumulation: FP16FML
-                for (int j = 0; j < bc; j++) {
-                    float p = fast_exp_f32(S[i][j] - m_new);
-                    l_block += p;
-                    const __fp16* vj = V + (jb + j) * d_v;
-                    float16x4_t vp = vdup_n_f16((__fp16)p);
-                    int d = 0;
-                    for (; d + 15 < d_v; d += 16) {
-                        float16x8_t v0 = vld1q_f16(vj + d);
-                        float16x8_t v1 = vld1q_f16(vj + d + 8);
-                        vst1q_f32(oi + d,     vfmlalq_lane_low_f16 (
-                                    vld1q_f32(oi + d),     v0, vp, 0));
-                        vst1q_f32(oi + d + 4, vfmlalq_lane_high_f16(
-                                    vld1q_f32(oi + d + 4), v0, vp, 0));
-                        vst1q_f32(oi + d + 8, vfmlalq_lane_low_f16 (
-                                    vld1q_f32(oi + d + 8), v1, vp, 0));
-                        vst1q_f32(oi + d + 12, vfmlalq_lane_high_f16(
-                                    vld1q_f32(oi + d + 12), v1, vp, 0));
+                // Compute P first into a small bc-wide buffer so PV loop is clean.
+                // bc ≤ 64, so 256 B on stack.
+                float P[64];
+                {
+                    float32x4_t vm_new = vdupq_n_f32(m_new);
+                    float32x4_t vl = vdupq_n_f32(0.f);
+                    int j = 0;
+                    for (; j + 3 < bc; j += 4) {
+                        float32x4_t s4 = vsubq_f32(vld1q_f32(&S[i][j]), vm_new);
+                        float32x4_t p4 = fast_exp_f32x4(s4);
+                        vst1q_f32(P + j, p4);
+                        vl = vaddq_f32(vl, p4);
                     }
-                    for (; d + 7 < d_v; d += 8) {
-                        float16x8_t v0 = vld1q_f16(vj + d);
-                        vst1q_f32(oi + d,     vfmlalq_lane_low_f16 (
-                                    vld1q_f32(oi + d),     v0, vp, 0));
-                        vst1q_f32(oi + d + 4, vfmlalq_lane_high_f16(
-                                    vld1q_f32(oi + d + 4), v0, vp, 0));
+                    l_block = vaddvq_f32(vl);
+                    for (; j < bc; j++) {
+                        P[j] = fast_exp_f32(S[i][j] - m_new);
+                        l_block += P[j];
                     }
-                    for (; d + 3 < d_v; d += 4) {
-                        float16x8_t v0 = vld1q_f16(vj + d);
-                        vst1q_f32(oi + d, vfmlalq_lane_low_f16(
-                                    vld1q_f32(oi + d), v0, vp, 0));
-                    }
-                    for (; d < d_v; d++) oi[d] += p * (float)vj[d];
                 }
+
+                // ---- PV: register-tiled, 64-wide ----
+                // For each d_v tile of 64 elements, hold 16 FP32x4 acc across
+                // the entire bc j loop. Direct port from flash_attn_fp16_decode.
+                int d_start = 0;
+                for (; d_start + TILE_DV <= d_v; d_start += TILE_DV) {
+                    float32x4_t o0  = vld1q_f32(oi + d_start + 0);
+                    float32x4_t o1  = vld1q_f32(oi + d_start + 4);
+                    float32x4_t o2  = vld1q_f32(oi + d_start + 8);
+                    float32x4_t o3  = vld1q_f32(oi + d_start + 12);
+                    float32x4_t o4  = vld1q_f32(oi + d_start + 16);
+                    float32x4_t o5  = vld1q_f32(oi + d_start + 20);
+                    float32x4_t o6  = vld1q_f32(oi + d_start + 24);
+                    float32x4_t o7  = vld1q_f32(oi + d_start + 28);
+                    float32x4_t o8  = vld1q_f32(oi + d_start + 32);
+                    float32x4_t o9  = vld1q_f32(oi + d_start + 36);
+                    float32x4_t oa  = vld1q_f32(oi + d_start + 40);
+                    float32x4_t ob  = vld1q_f32(oi + d_start + 44);
+                    float32x4_t oc  = vld1q_f32(oi + d_start + 48);
+                    float32x4_t od  = vld1q_f32(oi + d_start + 52);
+                    float32x4_t oe  = vld1q_f32(oi + d_start + 56);
+                    float32x4_t of  = vld1q_f32(oi + d_start + 60);
+
+                    for (int j = 0; j < bc; j++) {
+                        float p = P[j];
+                        const __fp16* vj = V + (jb + j) * d_v + d_start;
+                        float16x4_t vp = vdup_n_f16((__fp16)p);
+                        float16x8_t v01 = vld1q_f16(vj + 0);
+                        float16x8_t v23 = vld1q_f16(vj + 8);
+                        float16x8_t v45 = vld1q_f16(vj + 16);
+                        float16x8_t v67 = vld1q_f16(vj + 24);
+                        float16x8_t v89 = vld1q_f16(vj + 32);
+                        float16x8_t vab = vld1q_f16(vj + 40);
+                        float16x8_t vcd = vld1q_f16(vj + 48);
+                        float16x8_t vef = vld1q_f16(vj + 56);
+
+                        o0 = vfmlalq_lane_low_f16 (o0, v01, vp, 0);
+                        o1 = vfmlalq_lane_high_f16(o1, v01, vp, 0);
+                        o2 = vfmlalq_lane_low_f16 (o2, v23, vp, 0);
+                        o3 = vfmlalq_lane_high_f16(o3, v23, vp, 0);
+                        o4 = vfmlalq_lane_low_f16 (o4, v45, vp, 0);
+                        o5 = vfmlalq_lane_high_f16(o5, v45, vp, 0);
+                        o6 = vfmlalq_lane_low_f16 (o6, v67, vp, 0);
+                        o7 = vfmlalq_lane_high_f16(o7, v67, vp, 0);
+                        o8 = vfmlalq_lane_low_f16 (o8, v89, vp, 0);
+                        o9 = vfmlalq_lane_high_f16(o9, v89, vp, 0);
+                        oa = vfmlalq_lane_low_f16 (oa, vab, vp, 0);
+                        ob = vfmlalq_lane_high_f16(ob, vab, vp, 0);
+                        oc = vfmlalq_lane_low_f16 (oc, vcd, vp, 0);
+                        od = vfmlalq_lane_high_f16(od, vcd, vp, 0);
+                        oe = vfmlalq_lane_low_f16 (oe, vef, vp, 0);
+                        of = vfmlalq_lane_high_f16(of, vef, vp, 0);
+                    }
+
+                    vst1q_f32(oi + d_start + 0,  o0);
+                    vst1q_f32(oi + d_start + 4,  o1);
+                    vst1q_f32(oi + d_start + 8,  o2);
+                    vst1q_f32(oi + d_start + 12, o3);
+                    vst1q_f32(oi + d_start + 16, o4);
+                    vst1q_f32(oi + d_start + 20, o5);
+                    vst1q_f32(oi + d_start + 24, o6);
+                    vst1q_f32(oi + d_start + 28, o7);
+                    vst1q_f32(oi + d_start + 32, o8);
+                    vst1q_f32(oi + d_start + 36, o9);
+                    vst1q_f32(oi + d_start + 40, oa);
+                    vst1q_f32(oi + d_start + 44, ob);
+                    vst1q_f32(oi + d_start + 48, oc);
+                    vst1q_f32(oi + d_start + 52, od);
+                    vst1q_f32(oi + d_start + 56, oe);
+                    vst1q_f32(oi + d_start + 60, of);
+                }
+                // 8-wide d_v tail
+                for (; d_start + 7 < d_v; d_start += 8) {
+                    float32x4_t o0 = vld1q_f32(oi + d_start + 0);
+                    float32x4_t o1 = vld1q_f32(oi + d_start + 4);
+                    for (int j = 0; j < bc; j++) {
+                        float p = P[j];
+                        const __fp16* vj = V + (jb + j) * d_v + d_start;
+                        float16x4_t vp = vdup_n_f16((__fp16)p);
+                        float16x8_t v0 = vld1q_f16(vj);
+                        o0 = vfmlalq_lane_low_f16 (o0, v0, vp, 0);
+                        o1 = vfmlalq_lane_high_f16(o1, v0, vp, 0);
+                    }
+                    vst1q_f32(oi + d_start + 0, o0);
+                    vst1q_f32(oi + d_start + 4, o1);
+                }
+                // 4-wide d_v tail
+                for (; d_start + 3 < d_v; d_start += 4) {
+                    float32x4_t o0 = vld1q_f32(oi + d_start);
+                    for (int j = 0; j < bc; j++) {
+                        float p = P[j];
+                        const __fp16* vj = V + (jb + j) * d_v + d_start;
+                        float16x4_t vp = vdup_n_f16((__fp16)p);
+                        // Load 4 FP16 values into low half of a FP16x8 for FMLAL.
+                        float16x8_t v0 = vld1q_f16(vj);
+                        o0 = vfmlalq_lane_low_f16(o0, v0, vp, 0);
+                    }
+                    vst1q_f32(oi + d_start, o0);
+                }
+                // Scalar tail
+                for (; d_start < d_v; d_start++) {
+                    float acc = oi[d_start];
+                    for (int j = 0; j < bc; j++) {
+                        acc += P[j] * (float)V[(jb + j) * d_v + d_start];
+                    }
+                    oi[d_start] = acc;
+                }
+
                 row_l[row] = alpha * l_old + l_block;
                 row_m[row] = m_new;
             }
         }
     }
+    // ---- Final 1/l normalization ----
     for (int i = 0; i < M; i++) {
         float* oi = O + i * d_v;
         float inv_l = (row_l[i] > 0.f) ? 1.f / row_l[i] : 0.f;

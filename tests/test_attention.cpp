@@ -162,6 +162,19 @@ int main() {
           "GQA causal prefill: H=8 KV=4 src=4 past=0");
     CHECK(test_case(16, 16, 64, 64, 1, 1, 0, 256, false),
           "decode: H=16 KV=16 src=1 past=0");
+    // Production-shaped MLA prefill: 16 heads × src=256 × past=0, causal.
+    // Exercises the rewritten flash_attn_fp16_prefill kernel.
+    CHECK(test_case(16, 16, 192, 128, 256, 256, 0, 512, true),
+          "MLA prefill: H=16 KV=16 src=256 past=0 causal");
+    // Smaller prefill: M not multiple of Br=8 (M=20 exercises tile tail).
+    CHECK(test_case(16, 16, 192, 128, 20, 20, 0, 64, true),
+          "MLA prefill: H=16 KV=16 src=20 past=0 causal (non-tile M)");
+    // MLA prefill with non-tile d_v (vd=100 exercises d_v tail).
+    CHECK(test_case(16, 16, 192, 100, 64, 64, 0, 128, true),
+          "MLA prefill: H=16 KV=16 src=64 past=0 causal (non-tile d_v)");
+    // MLA prefill with past > 0 (exercises cache append + prefill).
+    CHECK(test_case(16, 16, 192, 128, 128, 128, 128, 512, true),
+          "MLA prefill: H=16 KV=16 src=128 past=128 causal");
 
     printf(failures ? "\n%d FAILED\n" : "\nAll attention tests passed!\n", failures);
     return failures;
