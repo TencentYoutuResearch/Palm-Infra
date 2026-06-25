@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernels/tensor.h"
+#include "kernels/activations.h"  // for Activation enum
 
 class ThreadPool;
 
@@ -22,12 +23,21 @@ extern MatmulConfig g_matmul_config;
 //   B: K×N, row-major
 //   C: M×N, row-major
 //
+// `act` is an optional fused activation applied to C at writeback time
+// (avoids a separate SILU/GELU op + memory round-trip). When act != NONE,
+// only output columns in [act_n_begin, act_n_begin + act_n_len) get the
+// activation applied; the rest are written raw. Set act_n_len = -1 for
+// "apply to whole N" (fast path, no per-column check).
+//
 // kernel_matmul_fp32 dispatches to the best available implementation
 // (NEON SIMD for ARM, scalar fallback otherwise).
 // ---------------------------------------------------------------------------
 
 void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
-                        ThreadPool* thread_pool = nullptr);
+                        ThreadPool* thread_pool = nullptr,
+                        Activation act = Activation::NONE,
+                        int act_n_begin = 0,
+                        int act_n_len = -1);
 
 // Pack full B [N, K] row-major → interleaved [N/8, K, 8] layout.
 // For each N-tile of 8 rows, transpose so that for fixed k,

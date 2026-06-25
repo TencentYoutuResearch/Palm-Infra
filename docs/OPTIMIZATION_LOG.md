@@ -1050,7 +1050,8 @@ latency=2 cycles，2 chains 已经达到 CPI=1（FMA throughput ceiling），但
 | + GEMM 2D 调度 + pre-pack A (尝试 25) | **151.3** | **51.5** | 1243 | 10-run 中位数校准 |
 | + K_BLOCK 512→2048 (尝试 26) | **159.2** | **52.1** | 1243 | 10-run 中位数校准 |
 | + SDPA prefill kernel rewrite (尝试 27) | **220.3** | **52.4** | 1126 | 5-run 中位数校准 |
-| + MLP gate/up merge (尝试 28, 当前) | **224.3** | **54.5** | 910 | 5-run 中位数校准 |
+| + MLP gate/up merge (尝试 28) | **224.3** | **54.5** | 910 | 5-run 中位数校准 |
+| + Fused SILU in matmul (尝试 29, 当前) | **225.7** | **53.7** | 910 | 5-run 中位数校准 |
 
 | 框架 | prefill (pp256) | decode (tg) |
 |------|----------------|------------|
@@ -1356,76 +1357,95 @@ GFLOPS 一致（743-745），merged matmul 时间 ≈ 2× 单 matmul（FLOPs 翻
 
 ---
 
-## 尝试 28：MLP gate/up merge + stride-aware SILU/MUL
+## 尝试 29：Fused SILU in matmul writeback（activation infrastructure）
 
-**决策理由**：尝试 27 后 prefill MATMUL 占 86% (957 ms / 32 layers × 8 matmul/layer)。
-其中 gate/up 两个 matmul（M=256, K=2048, N=6144 each）共占 MATMUL 时间的 47%。
-分析发现可合并：
-- gate/up 输入相同（都是 x_normed2 = post_attention_layernorm output）
-- weights 形状相同 (6144, 2048)，可沿 N 维 concat → (12288, 2048)
-- 一次 matmul 后 slice 成两半，再 silu/mul
+**决策理由**：尝试 28 后 SILU op 仍占 prefill 1.3%（15 ms / 32 calls × 0.47 ms each）。
+虽然绝对值小，但每次 SILU dispatch 是独立的 graph op（每次 ~120 us dispatch overhead），
+加上一次额外内存 round-trip（读 matmul 输出 → 写 SILU 输出）。
 
-预期收益：
-- A-pack 减半（gate/up 共享一次 A pack）
-- matmul dispatch 减半
-- microbench 已验证：2×6144 单次 (8.65ms) vs 1×12288 单次 (17.30ms) — matmul 时间持平
+更重要的理由是**基础设施**：建立 matmul→activation fused path，让未来 GELU/RELU 等
+激活函数直接复用，无需新 dispatch op。同时为后续 fused-mul（SwiGLU 完整融合）铺路。
 
-**算法**：
-1. `export_weights` 时 concat `mlp.gate_proj.weight` + `mlp.up_proj.weight` 沿 dim=0
-2. graph builder: 一个 `w_gate_up` weight + 一个 matmul + 一个 slice(dim=0, [6144, 6144])
-3. SLICE 是 zero-copy view（保留 parent stride[1] = 12288*es，非 contiguous）
+**算法**：在 matmul kernel 的 writeback 阶段（FP16 acc → FP32 store）直接 apply activation。
+避免额外内存 round-trip。
 
-**关键改动 - C++ executor SILU/MUL stride-aware**：
-原 SILU/MUL 假设 input contiguous，用 `ptr<float>() + i` 线性读。
-slice view 的 stride[1] 是 parent 的 N (12288)，不是 sliced N (6144) — 线性读会读到错误数据。
+- 新增 `Activation` enum: NONE, SILU, GELU, RELU（未来可加 GELU_ERF / SIGMOID / TANH）
+- 新增 `kernels/activations.h`: 包含 `apply_activation_scalar` + `apply_activation_f32_neon`
+  + `sigmoid_f32_neon`（从 execute.cpp 移过来共享）
+- `OpType::MATMUL` 复用 `params_i32` 携带 `[activation, act_n_begin, act_n_len]`
+- matmul kernel signature 扩展：`kernel_matmul_fp32(A, B, C, tp, act, act_n_begin, act_n_len)`
 
-新增 `unary_stride_aware` / `binary_stride_aware` helper（graph/execute.cpp）：
-- 检测 input 是否 contiguous → 走原 fast path
-- 否则按 (d3, d2, d1) 外层 + d0 内层连续 run 遍历
-- 二元 op 支持两个 input 有不同 stride（gate_silu 输出 contiguous，up 是 strided view）
-- 仍用 NEON vld1q_f32 4-wide vectorize
+**`act_n_begin` / `act_n_len` 的作用**：
+- MLP merge 后 gate/up 都在一个 matmul 输出里（N=12288），只需对前半（N=[0, 6144)）
+  apply SILU。`act_n_begin=0, act_n_len=intermediate` 让 kernel 只对 gate 列 apply。
+- `act_n_len == -1` 表示 "全部 N"（fast path，无 per-column branch）。
+- 对其他场景（非 merge）用默认参数 `act_n_len=-1` 即可全 N apply。
 
 **实现**：
-- `models/mla.py`: export_weights 加 merged weight 导出（per layer）
-- `models/mla.py`: _build_mla_layer 替换 2 matmul → 1 matmul + slice
-- `graph/execute.cpp`: 新增 `StrideIter` / `unary_stride_aware` / `binary_stride_aware` helper
-- `graph/execute.cpp`: 重写 SILU/MUL 用 stride-aware path
+- `kernels/activations.h`（新文件）: enum + scalar + NEON 4-wide activation helpers
+- `kernels/matmul.h`: kernel signature 加 `Activation act, int act_n_begin, int act_n_len`
+- `kernels/matmul.cpp`:
+  - GEMV FP16 acc kernel: store 阶段判断 `is_last_block`，inline apply activation
+    （单 K-block 时直接 inline，避免独立 pass）
+  - lane-FMA FP16 acc GEMM kernel: writeback 阶段判断 `last_block`，
+    per-column 检查 `activation_applies_at` 后 apply
+  - FP32 acc fallback + standard path: 调用 `apply_activation_to_range` post-hoc pass
+  - parallel 路径: 每个 shard 翻译 global act range 到 local coords
+- `graph/execute.cpp`: MATMUL case 读 `params.i32[0..2]`，传给 `kernel_matmul_fp32`
+  + 删除 `sigmoid_f32_neon`（移到 activations.h）
+- `python/transpile.py`: 新增 `Activation(IntEnum)`；`matmul(activation=, act_n_begin=, act_n_len=)` 加 3 个 params
+- `models/mla.py`: MLP 用 `g.matmul(x, w_gate_up, activation=Activation.SILU,
+  act_n_begin=0, act_n_len=intermediate)`，移除独立 `g.silu(gate)`
 
 **结果 (端到端, 4 threads, pp256, warmup=3, 5-run 中位数)**：
-| 指标 | 尝试 27 | 尝试 28 | 变化 |
+| 指标 | 尝试 28 | 尝试 29 | 变化 |
 |------|--------|--------|------|
-| prefill_tps | 220.3 | **224.3** (221-227) | +1.8% |
-| prefill_ms | 1163 | **1135** | -2.4% |
-| MATMUL (pp256) | 957 ms (80%) | **929 ms (86%)** | **-3.0%** (-28 ms) |
-| SDPA (pp256) | 70 ms (6%) | 68 ms (6%) | 持平 |
-| RESHAPE | 30 ms | 30 ms | 持平（无新增 materialize） |
-| pack_a_calls | 8192 | **7168** | -12.5% (-1024 calls) |
-| pack_a_ms | 30 ms | **27 ms** | -10% |
+| prefill_tps | 224.3 | **225.7** (222-227) | +0.6% |
+| prefill_ms | 1130 | 1134 | 持平 |
+| MATMUL | 929 ms | **929 ms** | 持平 |
+| SDPA | 68 ms | 70 ms | 持平 |
+| **SILU op** | 15 ms (32 calls) | **0** | ✅ 完全消除 |
+| RESHAPE | 30 ms | 36 ms | +6 ms (噪声) |
+| pack_a | 27 ms | 27 ms | 持平 |
 
-**decode 收益更大 (4%)**：
-| 指标 | 尝试 27 | 尝试 28 | 变化 |
+**decode (10-run 中位数)**：
+| 指标 | 尝试 28 | 尝试 29 | 变化 |
 |------|--------|--------|------|
-| decode_tps | 52.4 | **54.5** | **+4.0%** |
-| decode MATMUL calls | 7936 | **6944** | -12.5% (-992 calls/token) |
-| decode MATMUL time | 458 ms | 467 ms | 持平 |
-
-decode 收益大于 prefill 因为 GEMV dispatch overhead 占比更高（M=1 时单次 matmul 才几 us，dispatch 0.6us 占比明显）。
-
-**实施过程中遇到的坑**：
-1. 初版用 RESHAPE 强制 materialize slice view → 新增 223 ms RESHAPE 开销（每层 2 个 × 32 layer × 0.7ms = 45 ms 理论，实测 223 ms 因 RESHAPE materialize 路径是逐元素拷贝）。net 性能退化 15%。回滚。
-2. 改为让 SILU/MUL 支持 strided input（无 materialize）。但 binary_stride_aware 初版假设 a/b 同 stride → 错。gate_silu 是 contiguous 输出，up 是 strided view，stride 不同。修复：分别按各自 stride 迭代。
+| decode_tps | 54.5 | **53.7** | -1.5% (噪声) |
+| decode SILU | 1.6 ms (992 calls) | **0** | ✅ 完全消除 |
 
 **关键发现**：
-1. MLP merge 在 microbench 上 matmul 时间无变化（2×6144 == 1×12288），但端到端 MATMUL 时间 -28 ms — 来自 pack-A 节省 3 ms + cache/GEMM 效率提升 25 ms
-2. decode +4% > prefill +1.8%，因为 GEMV dispatch overhead 占比更高
-3. SLICE zero-copy view 的 stride-aware 处理是必须的，否则读错数据。这是 mlllm 之前没暴露的 latent bug — 任何 eltwise op 接 strided view 都会出错，只是之前 graph 里的 slice 输出都直接喂给下一个 matmul（matmul 自己处理 stride），没暴露
-4. RESHAPE materialize 路径非常慢（逐元素 memcpy），不能用作 workaround
+1. **SILU op 从 profile 完全消失** —— fused 路径在 matmul writeback 内 inline apply
+2. **净性能持平**（prefill +0.6%, decode -1.5%）—— 都在噪声范围
+3. **GEMV 路径（decode）的 inline apply 实现**：
+   - 初版用独立 pass（K-block 循环后再 load/store 一次）→ 多一次内存 round-trip
+   - 改为 `is_last_block` 判断 inline 到 store：单 K-block（K=2048<K_BLOCK=4096）时
+     `last_block=true`，直接在 store 前 apply，避免额外 load/store
+4. **lane-FMA GEMM 路径**：`last_block` 判断 + per-column `activation_applies_at` 检查
+   - SwiGLU 场景下 `act_n_len=intermediate=6144`，N-tile 大小 8，columns 0..7 全在 gate 区间，
+     fast path 全 vectorize
+5. matmul writeback 多余工作（per-column check）实际开销极小，MATMUL 时间几乎没变化
+6. **基础设施价值** > 性能价值：
+   - 未来加 GELU 等只需改 `apply_activation_*` 函数
+   - 未来 fused-mul (SwiGLU gate*up 完整融合) 可以复用 act_n_begin/len 机制
+   - `Activation` enum 在 graph level 暴露，其他模型可直接用 `g.matmul(activation=Activation.GELU)`
 
-**决定**：**采用。MLP gate/up merge + stride-aware SILU/MUL 作为默认。**
-所有 ctest 14/14 + bench_sdpa 通过，mlllm_chat 输出正常中文。
+**实施过程中遇到的坑**：
+1. NEON `vfmaq_f32` 不接受标量第三参数 — 需用 `vfmaq_n_f32`（scalar broadcast 版本）
+2. GEMV kernel 的 K-block store 是 "store partial sums + reload" 模式，
+   activation 不能在中间 block store 时 apply（会污染 reload 值）。
+   初版用独立 post-loop pass，后发现单 K-block 时可 inline 判断 `is_last_block`
+3. parallel 路径的 shard 需要把 global act range `[act_n_begin, act_n_begin+act_n_len)`
+   翻译到 shard-local coords（每个 shard 看到的 N 是局部 [0, shard_len)）
+4. binary_stride_aware 已支持 a/b 不同 stride（gate_silu contiguous, up strided view），
+   所以 fused SILU 后的 MUL op 不需要改
+
+**决定**：**采用。Fused SILU in matmul + Activation enum infrastructure 作为默认。**
+所有 ctest 15/15 通过，mlllm_chat 输出正常。
 
 **后续可探索**：
-- ADD op 也改为 stride-aware（目前未改，但 graph 里 add 输入都是 contiguous，暂无 bug）
-- RESHAPE materialize 路径用 bulk memcpy 替代逐元素拷贝
-- 重新审视 graph 里所有 eltwise op 是否需要 stride-aware（RMS_NORM、RoPE 等）
+- **fused MUL** (SwiGLU `gate*up` 完整融合) — 需要 matmul 同时读 up 视图并输出 product
+- 把 ADD op 也改成 stride-aware（暂未做，graph 里 add 输入都 contiguous，无 bug）
+- RESHAPE materialize 路径用 bulk memcpy（解决尝试 28 提到的逐元素 memcpy 慢的问题）
 
+---

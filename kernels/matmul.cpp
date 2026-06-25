@@ -6,6 +6,73 @@
 #include <mutex>
 #include <vector>
 
+// ---------------------------------------------------------------------------
+// Post-hoc activation helpers (used by FP32 acc fallback kernels + standard
+// FP32 path + parallel M-sharded paths that can't fuse activation into their
+// writeback). Applied as a separate pass over the matmul output.
+//
+// For the fused path (FP16 acc lane-FMA kernel and GEMV FP16 acc kernel),
+// activation is applied in the kernel writeback directly — see
+// matmul_fp16_neon_8x8_range_packed_a_fp16acc / matmul_fp16_neon_gemv_range_fp16acc.
+// ---------------------------------------------------------------------------
+
+// Apply activation to C[m_begin..m_end, n_begin..n_end) where C is row-major
+// with leading dim ldc (in float elements, not bytes).
+// act_n_begin/act_n_len are LOCAL coords (already translated by caller).
+static void apply_activation_to_range(float* C, int M, int N, int ldc,
+                                       int m_begin, int m_end,
+                                       Activation act,
+                                       int act_n_begin, int act_n_len) {
+    if (act == Activation::NONE || act_n_len == 0) return;
+
+    bool full_N = (act_n_len < 0) || (act_n_begin == 0 && act_n_len >= N);
+#if HAS_NEON
+    for (int m = m_begin; m < m_end; m++) {
+        float* row = C + m * ldc;
+        if (full_N) {
+            int n = 0;
+            for (; n + 3 < N; n += 4) {
+                float32x4_t v = vld1q_f32(row + n);
+                v = apply_activation_f32_neon(v, act);
+                vst1q_f32(row + n, v);
+            }
+            for (; n < N; n++) {
+                row[n] = apply_activation_scalar(row[n], act);
+            }
+        } else {
+            int n_end_act = std::min(act_n_begin + act_n_len, N);
+            int n = act_n_begin;
+            // Vectorized 4-wide run when fully inside active range.
+            for (; n + 3 < n_end_act; n += 4) {
+                float32x4_t v = vld1q_f32(row + n);
+                v = apply_activation_f32_neon(v, act);
+                vst1q_f32(row + n, v);
+            }
+            for (; n < n_end_act; n++) {
+                row[n] = apply_activation_scalar(row[n], act);
+            }
+        }
+    }
+#else
+    for (int m = m_begin; m < m_end; m++) {
+        float* row = C + m * ldc;
+        int n_end_act = full_N ? N : std::min(act_n_begin + act_n_len, N);
+        int n = full_N ? 0 : act_n_begin;
+        for (; n < n_end_act; n++) {
+            row[n] = apply_activation_scalar(row[n], act);
+        }
+    }
+#endif
+}
+
+// Apply activation to a GEMV output (M=1, single row of N elements).
+// C is contiguous (GEMV output always is).
+static void apply_activation_to_range_gemv(float* C, int N,
+                                            Activation act,
+                                            int act_n_begin, int act_n_len) {
+    apply_activation_to_range(C, 1, N, N, 0, 1, act, act_n_begin, act_n_len);
+}
+
 // Profiling counters for A pack overhead (reset by bench).
 // Read via pack_a_total_ms() / matmul_total_ms().
 // std::atomic<double> has no fetch_add, use mutex-protected doubles.
@@ -357,7 +424,9 @@ static void matmul_fp16_neon_gemv_range(
 // Inspired by ggml's SVE GEMV which uses 4-acc × 8-way K-unroll.
 static void matmul_fp16_neon_gemv_range_fp16acc(
     const float* A, const __fp16* B_packed, float* C,
-    int K, int n_begin, int n_end)
+    int K, int n_begin, int n_end,
+    Activation act = Activation::NONE,
+    int act_n_begin = 0, int act_n_len = -1)
 {
     const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
     const int K_BLOCK_FP16 = K_BLOCK * 2;  // FP16: 2x cache density
@@ -440,12 +509,65 @@ static void matmul_fp16_neon_gemv_range_fp16acc(
             acc[0] = vaddq_f16(acc[0], acc[4]);
 
             // Store partial sums to C as FP32 (reloaded if more blocks remain).
+            // On the last K-block, also apply fused activation in-place.
+            // Single-store path: convert FP16 acc → FP32, apply act if needed,
+            // store. Avoids a separate activation pass after the K-block loop.
+            bool is_last_block = (k_outer + K_BLOCK_FP16 >= K);
+            bool apply_act = (act != Activation::NONE) && is_last_block;
+
+            float32x4_t lo = vcvt_f32_f16(vget_low_f16(acc[0]));
+            float32x4_t hi = vcvt_f32_f16(vget_high_f16(acc[0]));
+            if (apply_act) {
+                // Apply activation per-column.
+                // For typical 8-wide N-tile, columns are either all-active or
+                // all-inactive (since act_n_len is multiple of 8 for SwiGLU gate).
+                // Fast path: if all 4 in [act_n_begin, act_n_begin+act_n_len),
+                // vectorize; else scalar per-column.
+                bool lo_active = (act_n_len < 0) ||
+                                 (activation_applies_at(n + 0, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 1, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 2, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 3, act_n_begin, act_n_len));
+                if (lo_active) {
+                    lo = apply_activation_f32_neon(lo, act);
+                } else {
+                    float tmp[4];
+                    vst1q_f32(tmp, lo);
+                    for (int jj = 0; jj < 4; jj++) {
+                        if (activation_applies_at(n + jj, act_n_begin, act_n_len)) {
+                            tmp[jj] = apply_activation_scalar(tmp[jj], act);
+                        }
+                    }
+                    lo = vld1q_f32(tmp);
+                }
+                bool hi_active = (act_n_len < 0) ||
+                                 (activation_applies_at(n + 4, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 5, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 6, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 7, act_n_begin, act_n_len));
+                if (hi_active) {
+                    hi = apply_activation_f32_neon(hi, act);
+                } else {
+                    float tmp[4];
+                    vst1q_f32(tmp, hi);
+                    for (int jj = 0; jj < 4; jj++) {
+                        if (activation_applies_at(n + 4 + jj, act_n_begin, act_n_len)) {
+                            tmp[jj] = apply_activation_scalar(tmp[jj], act);
+                        }
+                    }
+                    hi = vld1q_f32(tmp);
+                }
+            }
+
             float tmp[4];
-            vst1q_f32(tmp, vcvt_f32_f16(vget_low_f16(acc[0])));
+            vst1q_f32(tmp, lo);
             for (int j = 0; j < 4 && n + j < n_tile_end; j++) C[n + j] = tmp[j];
-            vst1q_f32(tmp, vcvt_f32_f16(vget_high_f16(acc[0])));
+            vst1q_f32(tmp, hi);
             for (int j = 0; j < 4 && n + 4 + j < n_tile_end; j++) C[n + 4 + j] = tmp[j];
         }
+
+        // Note: fused activation is applied inline above on the last K-block
+        // store, so no separate post-loop pass is needed here.
     }
 }
 
@@ -575,14 +697,24 @@ static void matmul_fp16_neon_8x8_range_packed_a(
 static void matmul_fp16_neon_8x8_range_packed_a_fp16acc(
     const __fp16* A_packed, const __fp16* B_packed, float* C,
     int M, int N, int K,
-    int ldc, int m_begin, int m_end)
+    int ldc, int m_begin, int m_end,
+    Activation act = Activation::NONE,
+    int act_n_begin = 0, int act_n_len = -1)
 {
     const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
     const int K_BLOCK_FP16 = K_BLOCK * 2;
 
+    // Fused activation fast path: when act == NONE or act_n_len covers whole N,
+    // we can skip per-column check. We still need to apply after all K-blocks
+    // (activation must not be applied to intermediate partial sums).
+    bool act_enabled = (act != Activation::NONE) && (act_n_len != 0);
+    bool act_full_N = act_enabled && (act_n_len < 0 ||
+                                      (act_n_begin == 0 && act_n_len >= N));
+
     for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK_FP16) {
         int k_end = std::min(k_outer + K_BLOCK_FP16, K);
         bool first_block = (k_outer == 0);
+        bool last_block = (k_outer + K_BLOCK_FP16 >= K);
 
         for (int m = m_begin; m < m_end; m += 8) {
             int m_tile_end = std::min(m + 8, m_end);
@@ -669,9 +801,16 @@ static void matmul_fp16_neon_8x8_range_packed_a_fp16acc(
                 for (int j = 0; j < 8; j++) c[j] = vaddq_f16(c[j], c1[j]);
 
                 // Write back: FP16 → FP32, store to C
+                // On the last K-block, also apply fused activation if enabled.
                 for (int j = 0; j < 8 && n + j < n_end; j++) {
                     float32x4_t lo = vcvt_f32_f16(vget_low_f16(c[j]));
                     float32x4_t hi = vcvt_f32_f16(vget_high_f16(c[j]));
+                    if (act_enabled && last_block) {
+                        if (act_full_N || activation_applies_at(n + j, act_n_begin, act_n_len)) {
+                            lo = apply_activation_f32_neon(lo, act);
+                            hi = apply_activation_f32_neon(hi, act);
+                        }
+                    }
                     float tmp[8];
                     vst1q_f32(tmp, lo);
                     vst1q_f32(tmp + 4, hi);
@@ -829,7 +968,10 @@ static void matmul_fp32_range_n(const float* A, const float* B, float* C,
 // ---------------------------------------------------------------------------
 
 void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
-                        ThreadPool* thread_pool) {
+                        ThreadPool* thread_pool,
+                        Activation act,
+                        int act_n_begin,
+                        int act_n_len) {
     MatmulTimer _timer;  // captures all return paths
     int M = (int)A.shape[1];
     int K = (int)A.shape[0];
@@ -865,18 +1007,33 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     bool use_lane_fma = use_interleave && (M >= 8);
     bool use_fp16_acc = g_matmul_config.use_fp16_accumulate;
 
-    // Select lane-FMA kernel based on accumulation mode
+    // Select lane-FMA kernel based on accumulation mode.
+    // `act`/`act_n_begin`/`act_n_len` are in local shard coords (caller already
+    // translated global → local).
     auto dispatch_lane_fma = [&](const __fp16* a_packed, const __fp16* b_packed,
                                  float* c, int m_len, int n_len,
-                                 int ldc_, int m_begin_, int m_end_) {
+                                 int ldc_, int m_begin_, int m_end_,
+                                 Activation act_, int act_n_begin_, int act_n_len_) {
         if (use_fp16_acc) {
             matmul_fp16_neon_8x8_range_packed_a_fp16acc(
-                a_packed, b_packed, c, m_len, n_len, K, ldc_, m_begin_, m_end_);
+                a_packed, b_packed, c, m_len, n_len, K, ldc_, m_begin_, m_end_,
+                act_, act_n_begin_, act_n_len_);
         } else {
+            // FP32 acc lane-FMA kernel — activation not yet supported here.
+            // Fall back: run kernel without act, then apply act in a separate pass.
             matmul_fp16_neon_8x8_range_packed_a(
                 a_packed, b_packed, c, m_len, n_len, K, ldc_, m_begin_, m_end_);
+            if (act_ != Activation::NONE && act_n_len_ != 0) {
+                apply_activation_to_range(c, m_len, n_len, ldc_, m_begin_, m_end_,
+                                          act_, act_n_begin_, act_n_len_);
+            }
         }
     };
+
+    // Helper: apply activation post-hoc to a [M, N] C row-major block,
+    // for columns in [act_n_begin, act_n_begin + act_n_len).
+    // Used by FP32 acc fallback kernels that don't fuse activation in writeback.
+    // (Defined below as a lambda for closure over nothing — pure function.)
 
     if (use_interleave) {
         constexpr int tile_m = HAS_NEON ? 8 : 1;
@@ -892,27 +1049,42 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         const __fp16* b_packed = b_fp16;
 
         // ---- GEMV path: M == 1, dedicated kernel ----
-        // Skips the 8x8 tile structure (no dead r-loop iterations, lower
-        // register pressure). Adaptive n_chunk targets ~8 chunks per thread
-        // to balance parallel overhead vs load balancing.
-        // FP16 acc (vfmaq_n_f16) when use_fp16_accumulate is set: 2 instr/K-step
-        // vs 5 for FP32 acc, reaching bandwidth bound.
         if (M == 1) {
             if (use_fp16_acc) {
                 if (!use_parallel) {
-                    matmul_fp16_neon_gemv_range_fp16acc(a_ptr, b_packed, c_ptr, K, 0, N);
+                    matmul_fp16_neon_gemv_range_fp16acc(a_ptr, b_packed, c_ptr, K, 0, N,
+                                                         act, act_n_begin, act_n_len);
                 } else {
                     int n_chunk = std::max(N / (n_threads * 8), 64);
                     n_chunk = ((n_chunk + 7) / 8) * 8;
                     thread_pool->parallel_for(0, N, n_chunk,
                         [&](int, int n_begin, int n_end) {
+                            // Translate global act range to local shard coords.
+                            // GEMV kernel uses absolute n indices (C + n_begin offset
+                            // is added by kernel itself), so pass global range
+                            // intersected with shard.
+                            int local_act_begin = std::max(0, act_n_begin - n_begin);
+                            int local_act_end;
+                            if (act_n_len < 0) {
+                                local_act_end = n_end - n_begin;
+                            } else {
+                                local_act_end = std::min(n_end - n_begin,
+                                                          act_n_begin + act_n_len - n_begin);
+                            }
+                            int local_act_len = (act_n_len < 0) ? -1 :
+                                                  std::max(0, local_act_end - local_act_begin);
                             matmul_fp16_neon_gemv_range_fp16acc(a_ptr, b_packed, c_ptr,
-                                                                  K, n_begin, n_end);
+                                                                  K, n_begin, n_end,
+                                                                  act, n_begin + local_act_begin,
+                                                                  local_act_len);
                         });
                 }
             } else {
                 if (!use_parallel) {
                     matmul_fp16_neon_gemv_range(a_ptr, b_packed, c_ptr, K, 0, N);
+                    if (act != Activation::NONE && act_n_len != 0) {
+                        apply_activation_to_range_gemv(c_ptr, N, act, act_n_begin, act_n_len);
+                    }
                 } else {
                     int n_chunk = std::max(N / (n_threads * 8), 64);
                     n_chunk = ((n_chunk + 7) / 8) * 8;
@@ -920,6 +1092,18 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         [&](int, int n_begin, int n_end) {
                             matmul_fp16_neon_gemv_range(a_ptr, b_packed, c_ptr,
                                                         K, n_begin, n_end);
+                            int local_act_begin = std::max(0, act_n_begin - n_begin);
+                            int local_act_end;
+                            if (act_n_len < 0) {
+                                local_act_end = n_end - n_begin;
+                            } else {
+                                local_act_end = std::min(n_end - n_begin,
+                                                          act_n_begin + act_n_len - n_begin);
+                            }
+                            int local_act_len = (act_n_len < 0) ? -1 :
+                                                  std::max(0, local_act_end - local_act_begin);
+                            apply_activation_to_range_gemv(c_ptr + n_begin, n_end - n_begin,
+                                                             act, local_act_begin, local_act_len);
                         });
                 }
             }
@@ -934,12 +1118,17 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         if (!use_parallel) {
             if (use_lane_fma) {
                 dispatch_lane_fma(a_packed, b_packed, c_ptr,
-                                  M, N, ldc, 0, M);
+                                  M, N, ldc, 0, M,
+                                  act, act_n_begin, act_n_len);
                 delete[] a_packed;
             } else {
                 matmul_fp16_neon_8x8_range_packed(
                     a_ptr, b_packed, c_ptr,
                     M, N, K, lda, ldc, 0, M);
+                if (act != Activation::NONE && act_n_len != 0) {
+                    apply_activation_to_range(c_ptr, M, N, ldc, 0, M,
+                                                act, act_n_begin, act_n_len);
+                }
             }
         } else if (shard_by_n) {
             // GEMV-ish: shard_by_n with M<8 (use the scalar-A kernel).
@@ -954,6 +1143,20 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         c_ptr + n_begin,
                         M, n_end - n_begin,
                         K, lda, ldc, 0, M);
+                    int local_act_begin = std::max(0, act_n_begin - n_begin);
+                    int local_act_end;
+                    if (act_n_len < 0) {
+                        local_act_end = n_end - n_begin;
+                    } else {
+                        local_act_end = std::min(n_end - n_begin,
+                                                  act_n_begin + act_n_len - n_begin);
+                    }
+                    int local_act_len = (act_n_len < 0) ? -1 :
+                                          std::max(0, local_act_end - local_act_begin);
+                    if (act != Activation::NONE && local_act_len != 0) {
+                        apply_activation_to_range(c_ptr + n_begin, M, n_end - n_begin,
+                                                    ldc, 0, M, act, local_act_begin, local_act_len);
+                    }
                 });
         } else {
             // GEMM (M>=8): 2D atomic-steal scheduling.
@@ -964,9 +1167,6 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
             if (n_block > N) n_block = ((N + 7) / 8) * 8;
 
             // Pre-pack A per M-tile ONCE (not per job).
-            // Without this, each N-block job would re-pack the same M-tile's
-            // A slice, inflating pack_a_calls from M/8 to M/8 * N/N_BLOCK.
-            // Pre-packing trades a small barrier for big pack savings.
             int m_tiles = (M + tile_m - 1) / tile_m;
             std::vector<__fp16*> a_packed_tiles(m_tiles, nullptr);
             for (int i = 0; i < m_tiles; i++) {
@@ -981,14 +1181,27 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                 [&](int, int m_begin, int m_end, int n_begin, int n_end) {
                     int m_len = m_end - m_begin;
                     int n_len = n_end - n_begin;
-                    // Reuse pre-packed A slice for this M-tile.
                     int tile_idx = m_begin / tile_m;
                     __fp16* a_slice_packed = a_packed_tiles[tile_idx];
                     int n_begin_aligned = n_begin & ~7;
+
+                    // Translate global act range to local shard coords.
+                    int local_act_begin = std::max(0, act_n_begin - n_begin);
+                    int local_act_end;
+                    if (act_n_len < 0) {
+                        local_act_end = n_len;
+                    } else {
+                        local_act_end = std::min(n_len,
+                                                  act_n_begin + act_n_len - n_begin);
+                    }
+                    int local_act_len = (act_n_len < 0) ? -1 :
+                                          std::max(0, local_act_end - local_act_begin);
+
                     dispatch_lane_fma(a_slice_packed,
                                       b_packed + n_begin_aligned * K,
                                       c_ptr + m_begin * ldc + n_begin,
-                                      m_len, n_len, ldc, 0, m_len);
+                                      m_len, n_len, ldc, 0, m_len,
+                                      act, local_act_begin, local_act_len);
                 });
 
             // Free pre-packed A slices.
@@ -1026,6 +1239,9 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         } else {
             matmul_fp32_range(a_ptr, b_fp32, c_ptr, M, N, K, lda, K_weight, ldc, 0, M);
         }
+        if (act != Activation::NONE && act_n_len != 0) {
+            apply_activation_to_range(c_ptr, M, N, ldc, 0, M, act, act_n_begin, act_n_len);
+        }
         return;
     }
 
@@ -1035,6 +1251,20 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                                       [&](int, int n_begin, int n_end) {
                                           matmul_fp16_range(a_ptr, b_fp16 + n_begin * K_weight, c_ptr + n_begin,
                                                             M, n_end - n_begin, K, lda, K_weight, ldc, 0, M);
+                                          int local_act_begin = std::max(0, act_n_begin - n_begin);
+                                          int local_act_end;
+                                          if (act_n_len < 0) {
+                                              local_act_end = n_end - n_begin;
+                                          } else {
+                                              local_act_end = std::min(n_end - n_begin,
+                                                                        act_n_begin + act_n_len - n_begin);
+                                          }
+                                          int local_act_len = (act_n_len < 0) ? -1 :
+                                                                std::max(0, local_act_end - local_act_begin);
+                                          if (act != Activation::NONE && local_act_len != 0) {
+                                              apply_activation_to_range(c_ptr + n_begin, M, n_end - n_begin,
+                                                                        ldc, 0, M, act, local_act_begin, local_act_len);
+                                          }
                                       });
         } else {
             thread_pool->parallel_for(0, N, chunk_size,
@@ -1042,6 +1272,20 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                                           matmul_fp32_range_n(a_ptr, b_fp32, c_ptr,
                                                               M, N, K, lda, K_weight, ldc,
                                                               n_begin, n_end);
+                                          int local_act_begin = std::max(0, act_n_begin - n_begin);
+                                          int local_act_end;
+                                          if (act_n_len < 0) {
+                                              local_act_end = n_end - n_begin;
+                                          } else {
+                                              local_act_end = std::min(n_end - n_begin,
+                                                                        act_n_begin + act_n_len - n_begin);
+                                          }
+                                          int local_act_len = (act_n_len < 0) ? -1 :
+                                                                std::max(0, local_act_end - local_act_begin);
+                                          if (act != Activation::NONE && local_act_len != 0) {
+                                              apply_activation_to_range(c_ptr + n_begin, M, n_end - n_begin,
+                                                                        ldc, 0, M, act, local_act_begin, local_act_len);
+                                          }
                                       });
         }
     } else {
@@ -1060,5 +1304,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                                                             m_begin, m_end);
                                       });
         }
+    }
+
+    // M-sharded path: activation can't be applied per-shard (shards split M,
+    // not N). Apply once after all shards complete.
+    // (shard_by_n branches above already apply per-shard.)
+    if (!shard_by_n && act != Activation::NONE && act_n_len != 0) {
+        apply_activation_to_range(c_ptr, M, N, ldc, 0, M, act, act_n_begin, act_n_len);
     }
 }

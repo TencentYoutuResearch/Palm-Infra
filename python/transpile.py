@@ -58,6 +58,17 @@ class Precision(IntEnum):
 
 
 # ---------------------------------------------------------------------------
+# Activation functions (fused into MATMUL at writeback time).
+# Values must match `enum class Activation` in kernels/activations.h.
+# ---------------------------------------------------------------------------
+class Activation(IntEnum):
+    NONE = 0   # identity — fast path, no per-column branch
+    SILU = 1   # x * sigmoid(x)  — SwiGLU gate
+    GELU = 2   # 0.5 * x * (1 + tanh(...))  — tanh approximation
+    RELU = 3   # max(0, x)
+
+
+# ---------------------------------------------------------------------------
 # internal node representation
 # ---------------------------------------------------------------------------
 
@@ -133,7 +144,9 @@ class GraphBuilder:
 
     # ---- linear ----
 
-    def matmul(self, a: int, b: int, trans_b: bool = False) -> int:
+    def matmul(self, a: int, b: int, trans_b: bool = False,
+               activation: Activation = Activation.NONE,
+               act_n_begin: int = 0, act_n_len: int = -1) -> int:
         sa = self._nodes[a].out_shape
         sb = self._nodes[b].out_shape
         # A: [K, M], B: weight matrix (either [K, N] or [N, K])
@@ -151,7 +164,13 @@ class GraphBuilder:
                 N = sb[0]  # sb[1]=K (inner), sb[0]=N (output)
             else:
                 raise AssertionError(f"matmul K mismatch: {sa} vs {sb}")
-        return self._add(OpType.MATMUL, [a, b], (N, M), prec=self._nodes[a].out_prec)
+        # Fused activation params: [activation, act_n_begin, act_n_len].
+        # act_n_len == -1 means "apply to whole N" (fast path).
+        # act_n_len == 0 means "don't apply" (handled identically to NONE).
+        # act_n_len > 0 means "apply to columns [act_n_begin, act_n_begin+act_n_len)".
+        return self._add(OpType.MATMUL, [a, b], (N, M),
+                         prec=self._nodes[a].out_prec,
+                         i32=[int(activation), int(act_n_begin), int(act_n_len)])
 
     # ---- normalisation ----
 

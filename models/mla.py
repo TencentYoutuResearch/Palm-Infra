@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from python.transpile import GraphBuilder, OpType, Precision, _write_weight_file
+from python.transpile import GraphBuilder, OpType, Precision, Activation, _write_weight_file
 
 
 def load_safetensors(path: str) -> dict[str, np.ndarray]:
@@ -279,10 +279,15 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     # Single merged matmul → slice into gate/up halves (slice is zero-copy view).
     # SILU/MUL are stride-aware and read the view directly (no materialize).
     # Halves A-pack overhead vs two separate matmuls.
+    #
+    # Fused SILU: applied in the matmul writeback to the gate half of the
+    # output (columns [0, intermediate)). Saves a standalone SILU op dispatch.
     intermediate = cfg_intermediate_size(cfg)
-    merged = g.matmul(x_normed2, w_gate_up)
+    merged = g.matmul(x_normed2, w_gate_up,
+                      activation=Activation.SILU,
+                      act_n_begin=0, act_n_len=intermediate)
     gate, up = g.slice(merged, [intermediate, intermediate], dim=0)
-    gate = g.silu(gate)
+    # gate already has silu applied — no standalone SILU op
     mlp_hidden = g.mul(gate, up)
     mlp_out = g.matmul(mlp_hidden, w_down)
     x = g.add(x, mlp_out)

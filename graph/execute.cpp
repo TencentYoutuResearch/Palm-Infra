@@ -4,6 +4,7 @@
 #include "kernels/rope.h"
 #include "kernels/attention.h"
 #include "kernels/tensor.h"
+#include "kernels/activations.h"  // for Activation enum + sigmoid_f32_neon
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -12,36 +13,8 @@
 #if HAS_NEON
 #include <arm_neon.h>
 
-// Vectorized sigmoid: x = -v, exp(x), 1/(1+exp(x))
-// Uses polynomial exp approximation good to ~7 bits in [-88, 88].
-static inline float32x4_t sigmoid_f32_neon(float32x4_t x) {
-    // sigmoid(x) = 1 / (1 + exp(-x))
-    float32x4_t neg_x = vnegq_f32(x);
-    // Clamp to avoid overflow
-    neg_x = vmaxq_f32(neg_x, vdupq_n_f32(-88.f));
-    neg_x = vminq_f32(neg_x, vdupq_n_f32(88.f));
-    // exp approximation: 2^(n+f) where n=floor(x*log2e), f=frac
-    const float32x4_t log2e = vdupq_n_f32(1.4426950408889634f);
-    float32x4_t t = vmulq_f32(neg_x, log2e);
-    float32x4_t n = vrndmq_f32(t);
-    float32x4_t f = vsubq_f32(t, n);
-    int32x4_t ni = vcvtq_s32_f32(n);
-    float32x4_t pow2n = vreinterpretq_f32_s32(
-        vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23));
-    const float32x4_t c0 = vdupq_n_f32(1.0f);
-    const float32x4_t c1 = vdupq_n_f32(0.6931472f);
-    const float32x4_t c2 = vdupq_n_f32(0.2402265f);
-    const float32x4_t c3 = vdupq_n_f32(0.0555049f);
-    const float32x4_t c4 = vdupq_n_f32(0.0096813f);
-    float32x4_t pow2f = vfmaq_f32(c3, c4, f);
-    pow2f = vfmaq_f32(c2, pow2f, f);
-    pow2f = vfmaq_f32(c1, pow2f, f);
-    pow2f = vfmaq_f32(c0, pow2f, f);
-    float32x4_t ex = vmulq_f32(pow2n, pow2f);
-    // 1 / (1 + ex)
-    float32x4_t one = vdupq_n_f32(1.0f);
-    return vrecpeq_f32(vaddq_f32(one, ex));
-}
+// sigmoid_f32_neon is now defined in kernels/activations.h (shared with
+// matmul kernel for fused activation). Include that header above.
 #endif
 
 // ---------------------------------------------------------------------------
@@ -294,7 +267,13 @@ static void dispatch_kernel(OpType op, const OpParams& params,
 
     case OpType::MATMUL:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
-            kernel_matmul_fp32(*inputs[0], *inputs[1], *output, thread_pool);
+            // Fused activation: params.i32[0]=activation, [1]=act_n_begin, [2]=act_n_len.
+            // Default: NONE, 0, -1 (whole output).
+            Activation act = (Activation)graph_params::get_i32(params, 0, 0);
+            int act_n_begin = graph_params::get_i32(params, 1, 0);
+            int act_n_len = graph_params::get_i32(params, 2, -1);
+            kernel_matmul_fp32(*inputs[0], *inputs[1], *output, thread_pool,
+                                act, act_n_begin, act_n_len);
         }
         break;
 
