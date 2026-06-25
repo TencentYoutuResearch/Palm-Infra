@@ -1045,16 +1045,60 @@ latency=2 cycles，2 chains 已经达到 CPI=1（FMA throughput ceiling），但
 | + spin-wait + CONCAT/TILE bulk (尝试 18-19, 80d6048) | **138.3** | **28.0** | 1243 | pp256 校准 |
 | + SILU/ADD/MUL NEON (尝试 20, 40f2684) | **141.0** | **29.3** | 1243 | pp256 校准 |
 | + CONCAT/TILE 修复正确性 (尝试 22, 5af2fb1) | **138.5** | **28.7** | 1243 | 5-run 中位数校准 |
-| + GEMV FP16 acc 8-way K-unroll (尝试 23, 当前) | **138.6** | **49.6** | 1243 | 5-run 中位数校准 |
+| + GEMV FP16 acc 8-way K-unroll (尝试 23) | **138.6** | **49.6** | 1243 | 5-run 中位数校准 |
+| + ThreadPool park/resume (尝试 24, 当前) | **149.5** | **52.4** | 1243 | 5-run 中位数校准 |
 
 | 框架 | prefill (pp256) | decode (tg) |
 |------|----------------|------------|
-| **mlllm** | **~138.6** | **~49.6** ✅ |
+| **mlllm** | **~149.5** | **~52.4** ✅ |
 | ncnn | 202 | 33 |
 | llama.cpp | 264 | 41 |
 
-**decode 已超过 llama.cpp**（49.6 vs 41 tok/s, +1.21x）。
-prefill 仍有 1.5-1.9x 差距，瞄准 GEMM tile/pack/调度优化。
+**decode 已超过 llama.cpp**（52.4 vs 41 tok/s, +1.28x）。
+prefill 仍有 1.3-1.8x 差距，瞄准 GEMM tile/pack/调度优化。
+
+---
+
+## 尝试 24：ThreadPool park/resume（消除 idle CPU 占用）
+
+**决策理由**：`mlllm_chat` REPL 模式下，用户在输入提示前和读输出时，worker
+线程持续 spin-wait 烧 CPU（4 核 100%）。需要让 worker 在 generation 结束后
+真正阻塞，下次 prefill 时再唤醒。
+
+**算法**：CV-based park + spin-based dispatch
+- `ThreadPool::park()`: 设 `parked_=true`，worker 完成当前 shard 后在
+  `condition_variable.wait()` 阻塞
+- `ThreadPool::resume()`: `parked_=false` + `notify_all()`，worker 醒来重新 spin
+- `parallel_for_impl`: 入口自动 `resume()`，热路径保持纯 spin（0 dispatch overhead）
+- `LLMEngine::park_workers()`: 暴露给上层，`generate_greedy` 在 decode 结束后调用
+
+**实现**：
+- `kernels/threading.h`: 新增 `park()`, `resume()`, `park_mtx_`, `park_cv_`,
+  `parked_` 成员；`ensure_workers_started()` 懒启动 worker
+- `kernels/threading.cpp`: worker_loop 在 `fetch_sub(pending_workers_)` 后检查
+  `parked_`，true 则阻塞在 CV
+- `engine/engine.h`: `park_workers()` 转发到 `thread_pool_.park()`
+- `examples/cli_common.cpp`: `generate_greedy` 返回前调 `engine.park_workers()`
+
+**结果 (端到端, 4 threads, pp256, warmup=3, 5-run 中位数)**：
+| 指标 | 尝试 23 (纯 spin) | 尝试 24 (park/resume) | 变化 |
+|------|--------------------|----------------------|------|
+| prefill_tps | 138.6 | **149.5** | +8% |
+| decode_tps | 49.6 | **52.4** | +5.6% |
+| idle CPU (REPL) | 4 核 100% | **~0%** | ✅ |
+
+**关键发现**：
+1. park/resume 不仅消除 idle CPU，反而**提升**了性能（decode +5.6%, prefill +8%）
+2. 根因推测：park 期间 worker 释放 cache，下次 resume 时 L1/L2 更干净，
+   减少了与主线程的 cache 竞争
+3. 懒启动（`ensure_workers_started`）让 `mlllm_chat` 启动后到第一次输入
+   期间也无 CPU 占用
+4. 实测 `mlllm_chat "给我讲一个故事"` (25 token prompt, 128 token gen)：
+   `decode_tps=51.27, tpot_ms=19.51`，与 bench 一致
+
+**决定**：**采用。park/resume 作为默认 ThreadPool 行为。**
+
+---
 
 ## 下一步方向
 

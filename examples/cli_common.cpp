@@ -1,6 +1,7 @@
 #include "examples/cli_common.h"
 
 #include "graph/graph.h"
+#include "kernels/threading.h"
 
 #include <chrono>
 #include <cstdio>
@@ -263,5 +264,9 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
     }
     auto decode_end = std::chrono::steady_clock::now();
     result.decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+    // Park workers after generation completes to drop idle CPU to ~0%
+    // while the user is reading the output / typing the next prompt.
+    // Auto-resumes on the next prefill() call.
+    engine.park_workers();
     return true;
 }

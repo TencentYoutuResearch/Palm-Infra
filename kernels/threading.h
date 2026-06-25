@@ -24,6 +24,13 @@ public:
     void resize(int num_threads);
     int num_threads() const { return num_threads_; }
 
+    // Park all workers: they exit their spin loop and block on a CV until
+    // the next parallel_for. Use between generation steps to drop idle CPU.
+    void park();
+    // Resume workers (no-op if already running). Next parallel_for also
+    // implicitly resumes.
+    void resume();
+
     template <typename Fn>
     void parallel_for(int begin, int end, int grain_size, Fn&& fn) {
         parallel_for_impl(begin, end, grain_size, ParallelForFn(std::forward<Fn>(fn)));
@@ -42,15 +49,19 @@ private:
     void parallel_for_impl(int begin, int end, int grain_size, ParallelForFn fn);
     void worker_loop(int thread_id);
     void stop_workers();
+    void ensure_workers_started();
 
     std::vector<std::thread> workers_;
     Job job_;
     int num_threads_ = 1;
+    bool workers_started_ = false;
+    bool parked_ = false;  // workers blocked on park_cv_
 
     // Sync primitives (spin-wait based for low dispatch latency)
     std::atomic<bool> stop_{false};
     std::atomic<int>  pending_workers_{0};
-    // Per-worker ready flags: workers spin on these instead of CV.
-    // unique_ptr<atomic[]> avoids vector<atomic> non-movable issues.
     std::unique_ptr<std::atomic<bool>[]> worker_ready_;
+    // Park support: workers block on park_cv_ when idle instead of spinning.
+    std::mutex park_mtx_;
+    std::condition_variable park_cv_;
 };

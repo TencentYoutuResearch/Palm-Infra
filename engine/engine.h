@@ -97,6 +97,9 @@ public:
     const ExecContext& prefill_exec_ctx() const { return exec_ctx_prefill_; }
     const ExecContext& decode_exec_ctx() const { return exec_ctx_decode_; }
 
+    /// Park worker threads (drop idle CPU). Auto-resumes on next prefill/decode.
+    void park_workers() { thread_pool_.park(); }
+
     // exposed for testing
     Tensor build_causal_mask(int seq_len, int past_len);
     void generate_rope_cache(int seq_len, int start_pos,
