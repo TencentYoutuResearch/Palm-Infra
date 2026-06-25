@@ -1051,7 +1051,9 @@ latency=2 cycles，2 chains 已经达到 CPI=1（FMA throughput ceiling），但
 | + K_BLOCK 512→2048 (尝试 26) | **159.2** | **52.1** | 1243 | 10-run 中位数校准 |
 | + SDPA prefill kernel rewrite (尝试 27) | **220.3** | **52.4** | 1126 | 5-run 中位数校准 |
 | + MLP gate/up merge (尝试 28) | **224.3** | **54.5** | 910 | 5-run 中位数校准 |
-| + Fused SILU in matmul (尝试 29, 当前) | **225.7** | **53.7** | 910 | 5-run 中位数校准 |
+| + Fused SILU in matmul (尝试 29) | **225.7** | **53.7** | 910 | 5-run 中位数校准 |
+| + Skip 1.3 GB cache memset (尝试 30) | **234.2** | **53.7** | 910 | 5-run 中位数校准 |
+| + Cache lifecycle refactor (尝试 31, 当前) | **235.2** | **53.7** | 910 | 5-run 中位数校准 |
 
 | 框架 | prefill (pp256) | decode (tg) |
 |------|----------------|------------|
@@ -1447,5 +1449,78 @@ GFLOPS 一致（743-745），merged matmul 时间 ≈ 2× 单 matmul（FLOPs 翻
 - **fused MUL** (SwiGLU `gate*up` 完整融合) — 需要 matmul 同时读 up 视图并输出 product
 - 把 ADD op 也改成 stride-aware（暂未做，graph 里 add 输入都 contiguous，无 bug）
 - RESHAPE materialize 路径用 bulk memcpy（解决尝试 28 提到的逐元素 memcpy 慢的问题）
+
+---
+
+## 尝试 30：跳过 1.3 GB cache memset（reset 只清 metadata header）
+
+**决策理由**：尝试 29 后 prefill_ms=1134，但 profile 内 op 总和 ~1107 ms。
+差距 ~27 ms 来自 `reset()` 在 `prefill()` 内部调用的 `memset(buf, 0, total)`，
+total = 32 层 × 2 cache × ~21 MB = **1.3 GB**。按 ~30 GB/s memset 带宽 → ~45 ms 纯浪费。
+
+**分析**：cache buffer 从 pool freelist 复用（同一物理内存）。memset 清零不必要：
+- SDPA 的 causal mask 保证只读 `[0, past+cur)` 范围
+- `current_seq_len` metadata 让 SDPA 知道 cache 有效长度
+- cache append 只写 `[past, past+cur)` 位置
+- 未写位置的 stale 数据不会被读
+
+**实现**：`engine/engine.cpp:reset()` 把 `std::memset(buf, 0, total)` 改为
+`std::memset(buf, 0, CacheMetadata::SIZE)`（只清 64 字节 header）。
+
+**结果 (5-run 中位数, pp256, 4 threads)**：
+| 指标 | 尝试 29 | 尝试 30 | 变化 |
+|------|--------|--------|------|
+| prefill_tps | 225.7 | **234.2** | +3.8% |
+| prefill_ms | 1134 | **1093** | -41 ms |
+| MATMUL | 929 ms | 929 ms | 持平 |
+| decode_tps | 53.7 | 53.7 | 持平 |
+
+-41 ms 正好匹配 ~45 ms 的理论 memset 时间。这是"graph dispatch overhead"谜团的真正来源。
+
+**关键发现**：之前 profile 中 `prefill_ms - sum(op times) = 43 ms` 不是 graph dispatch，
+而是 `reset()` 的 cache memset。消除后 prefill_ms 直接对齐 op 总和。
+
+**决定**：采用。`reset()` 只清 metadata header，不清 1.3 GB 数据区。
+
+---
+
+## 尝试 31：Cache 生命周期重构（预分配 + 多轮对话支持）
+
+**决策理由**：尝试 30 后发现 `reset()` 仍在 `prefill()` 内部调用，每次 prefill 都重新
+`pool.acquire(1.3 GB)` + 创建 tensor。而且 `prefill()` 写死 `current_seq_len = 0`，
+**破坏多轮对话**（之前的上下文丢失）。用户指出这是功能 bug，不只是性能问题。
+
+**问题**：
+1. `allocate_caches()` (load 时) 只设 shape，不分配 data
+2. `reset()` 每次 acquire 1.3 GB + memset
+3. `prefill()` 调 `reset()` → 每次对话重新分配 cache
+4. `prefill()` 写死 `current_seq_len = 0` → 多轮时历史上下文丢失
+5. cache migration (prefill→decode graph) 每次 prefill 重复做
+
+**重构**：
+- `allocate_caches()`: load 时一次性分配 cache buffer + 初始化 metadata
+- `reset()`: 简化为 metadata-only（`current_seq_len = 0`），~0 ms
+- `prefill()`: 不再调 `reset()`；用 `past_len_` 设置 cache metadata、RoPE offset、causal mask
+- cache migration: 移到 `load()`，只做一次
+- `generate_greedy()`: 显式调 `engine.reset()` 保持单轮语义
+
+多轮对话：`prefill()` 现在正确追加到现有 cache（`past_len_ > 0` 时 RoPE position = past，
+causal mask key range = [0, past+cur)）。如果 `past + n > graph_seq_len` 返回错误
+（chunked prefill 是后续功能）。
+
+**结果 (5-run 中位数, pp256, 4 threads)**：
+| 指标 | 尝试 30 | 尝试 31 | 变化 |
+|------|--------|--------|------|
+| prefill_tps | 234.2 | **235.2** | +0.4% |
+| prefill_ms | 1093 | **1089** | -4 ms |
+| MATMUL | 929 ms | 929 ms | 持平 |
+| decode_tps | 53.7 | 53.7 | 持平 |
+
+收益小（-4 ms，省 pool.acquire），主要是架构正确性：
+- 多轮对话支持（prefill 追加到现有 cache）
+- 清晰分离：reset = 显式清空，prefill = 计算
+- 为 chunked prefill 铺路
+
+**决定**：采用。cache 预分配 + prefill 用 past_len_ 作为默认行为。
 
 ---
