@@ -6,7 +6,7 @@ class ThreadPool;
 
 // Runtime-configurable matmul parameters (for benchmarking).
 struct MatmulConfig {
-    int k_block = 512;          // 0 = disable K-blocking
+    int k_block = 2048;          // 0 = disable K-blocking (sweep: 512→2048 = +4-8%)
     int gemv_chunk_size = 64;   // chunk size for M==1 or N==1 shapes
     bool use_interleave_pack = true;  // B interleaved packing for FP16
     bool use_fp16_accumulate = true;  // FP16 accumulate (2x throughput, may lose precision)

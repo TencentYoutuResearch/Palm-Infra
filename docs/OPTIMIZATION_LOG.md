@@ -1047,16 +1047,17 @@ latency=2 cycles，2 chains 已经达到 CPI=1（FMA throughput ceiling），但
 | + CONCAT/TILE 修复正确性 (尝试 22, 5af2fb1) | **138.5** | **28.7** | 1243 | 5-run 中位数校准 |
 | + GEMV FP16 acc 8-way K-unroll (尝试 23) | **138.6** | **49.6** | 1243 | 5-run 中位数校准 |
 | + ThreadPool park/resume (尝试 24) | **149.5** | **52.4** | 1243 | 5-run 中位数校准 |
-| + GEMM 2D 调度 + pre-pack A (尝试 25, 当前) | **151.3** | **51.5** | 1243 | 10-run 中位数校准 |
+| + GEMM 2D 调度 + pre-pack A (尝试 25) | **151.3** | **51.5** | 1243 | 10-run 中位数校准 |
+| + K_BLOCK 512→2048 (尝试 26, 当前) | **159.2** | **52.1** | 1243 | 10-run 中位数校准 |
 
 | 框架 | prefill (pp256) | decode (tg) |
 |------|----------------|------------|
-| **mlllm** | **~151.3** | **~51.5** ✅ |
+| **mlllm** | **~159.2** | **~52.1** ✅ |
 | ncnn | 202 | 33 |
 | llama.cpp | 264 | 41 |
 
-**decode 1.26x 超过 llama.cpp**（51.5 vs 41 tok/s）。
-prefill 1.75x 差距（151 vs 264），仍需进一步优化 GEMM tile/microkernel。
+**decode 1.27x 超过 llama.cpp**（52.1 vs 41 tok/s）。
+prefill 1.66x 差距（159 vs 264），非量化路径接近瓶颈。
 
 ---
 
@@ -1144,6 +1145,46 @@ prefill 1.75x 差距（151 vs 264），仍需进一步优化 GEMM tile/microkern
 5. 2D 调度与 microkernel 类型 (outer-product vs dot-product) 无关，只改 job 调度
 
 **决定**：**采用。2D atomic-steal + pre-pack A + N_BLOCK=256 作为 GEMM 默认。**
+
+---
+
+## 尝试 26：K_BLOCK 从 512 调到 2048
+
+**决策理由**：K_BLOCK 控制 K 维分块大小，block 间需要 store/reload
+acc（FP16→FP32→FP16）保持精度。K_BLOCK=512 时 K=2048 有 4 个 block，
+store/reload 4 次。K_BLOCK=2048 时只有 1 个 block，无 store/reload。
+
+**microbench sweep** (128×2048×6144, t=4)：
+| K_BLOCK | GFLOPS | vs 512 |
+|---------|--------|--------|
+| 512 (default) | 880 | baseline |
+| 1024 | 932 | +6% |
+| **2048** | **924** | **+5%** |
+| 4096 | 937 | +6% |
+
+多 shape sweep 确认 K_BLOCK=2048 在所有 GEMM shape 上都是最优或接近最优：
+| Shape | k=512 | k=2048 | 变化 |
+|-------|-------|-------|------|
+| 128×2048×2048 | 851 | 911 | +7% |
+| 128×6144×2048 | 849 | 890 | +5% |
+| 128×2048×128k | 867 | 935 | +8% |
+| 256×2048×6144 | 902 | 935 | +4% |
+
+**实现**：`kernels/matmul.h` 中 `MatmulConfig::k_block` 从 512 改成 2048。
+
+**结果 (端到端, 4 threads, pp256, warmup=3, 10-run 中位数)**：
+| 指标 | 尝试 25 (K_BLOCK=512) | 尝试 26 (K_BLOCK=2048) | 变化 |
+|------|------------------------|------------------------|------|
+| prefill_tps | 151.3 | **159.2** | +5.2% |
+| decode_tps | 51.5 | 52.1 | +1.2% |
+
+**关键发现**：
+1. K_BLOCK=2048 对 K=2048 的 shape 等于完全消除 store/reload
+2. 精度未受影响（K=2048 的 FP16 acc 范围在安全区间内，ctest 全通过）
+3. GEMV 路径不受影响（GEMV 用独立的 K_BLOCK_FP16）
+4. 收益边际递减：4096 不比 2048 显著更好
+
+**决定**：**采用。K_BLOCK=2048 作为默认。**
 
 ---
 
