@@ -168,6 +168,54 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             caches_[layer_idx].v_num_heads = (int)node.out_shape[2];
         }
     }
+
+    // Allocate cache data buffers (once, at load time).
+    // Buffer layout: [CacheMetadata (64B)] + [data: head_dim * n_ctx * num_heads * es]
+    // The tensor's shape[0] stores total_bytes / es so nbytes() covers the whole buffer.
+    for (auto& cp : caches_) {
+        if (cp.k) {
+            int hd = cp.k_head_dim;
+            int nkv = cp.k_num_heads;
+            size_t es = cp.k->element_size();
+            size_t data_bytes = (size_t)hd * n_ctx * nkv * es;
+            size_t total = CacheMetadata::SIZE + data_bytes;
+
+            void* buf = g.runtime.pool.acquire(total);
+            std::memset(buf, 0, CacheMetadata::SIZE);  // zero header only
+
+            auto* meta = cache_meta(buf);
+            meta->current_seq_len = 0;
+            meta->max_seq_len     = (uint64_t)n_ctx;
+            meta->num_kv_heads    = (uint64_t)nkv;
+            meta->head_dim        = (uint64_t)hd;
+
+            cp.k->data     = buf;
+            cp.k->mem_type = MemoryType::POOLED;
+            cp.k->shape[0] = (int64_t)total / (int64_t)es;
+            cp.k->compute_strides();
+        }
+        if (cp.v) {
+            int vd = cp.v_head_dim;
+            int nkv = cp.v_num_heads;
+            size_t es = cp.v->element_size();
+            size_t data_bytes = (size_t)vd * n_ctx * nkv * es;
+            size_t total = CacheMetadata::SIZE + data_bytes;
+
+            void* buf = g.runtime.pool.acquire(total);
+            std::memset(buf, 0, CacheMetadata::SIZE);
+
+            auto* meta = cache_meta(buf);
+            meta->current_seq_len = 0;
+            meta->max_seq_len     = (uint64_t)n_ctx;
+            meta->num_kv_heads    = (uint64_t)nkv;
+            meta->v_head_dim      = (uint64_t)vd;
+
+            cp.v->data     = buf;
+            cp.v->mem_type = MemoryType::POOLED;
+            cp.v->shape[0] = (int64_t)total / (int64_t)es;
+            cp.v->compute_strides();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -202,8 +250,25 @@ bool LLMEngine::load(const EngineConfig& cfg) {
         return false;
     }
 
-    // After decode graph load, cache pointers still point to prefill graph.
-    // We'll migrate them after prefill completes.
+    // Migrate cache tensor pointers from prefill graph to decode graph.
+    // Done once at load time — the physical cache buffers are shared across
+    // both graphs for the engine's entire lifetime.
+    for (auto& node : graph_decode_.nodes) {
+        if (node.op_type != OpType::INPUT || node.params.str.empty()) continue;
+        const std::string& name = node.params.str[0];
+
+        if (name.find("cache_k") == 0) {
+            int layer_idx = std::stoi(name.substr(7));
+            if (layer_idx < (int)caches_.size() && caches_[layer_idx].k) {
+                graph_decode_.runtime.tensors[node.id] = *caches_[layer_idx].k;
+            }
+        } else if (name.find("cache_v") == 0) {
+            int layer_idx = std::stoi(name.substr(7));
+            if (layer_idx < (int)caches_.size() && caches_[layer_idx].v) {
+                graph_decode_.runtime.tensors[node.id] = *caches_[layer_idx].v;
+            }
+        }
+    }
 
     reset();
     return true;
@@ -215,61 +280,13 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 
 void LLMEngine::reset() {
     past_len_ = 0;
-
-    // Note: we do NOT memset the cache buffers. They are reused from the pool
-    // (same physical memory across prefill calls), so they contain stale data
-    // from the previous prefill. This is safe because:
-    //   - SDPA's causal mask ensures only [0, past+cur) positions are read
-    //   - current_seq_len metadata is reset to 0 below, so SDPA only reads
-    //     what the current prefill writes
-    //   - cache append in kernel_sdpa only writes to [past, past+cur) positions
-    // Skipping the 1.3 GB memset saves ~45 ms per prefill (pp256, 32 layers).
+    // Cache buffers are pre-allocated in allocate_caches() at load time.
+    // reset() only clears the metadata — current_seq_len = 0 tells SDPA
+    // the cache is empty. The data region keeps stale data but is never
+    // read outside [0, current_seq_len) due to causal masking.
     for (auto& cp : caches_) {
-        if (cp.k) {
-            int hd = cp.k_head_dim;
-            int nkv = cp.k_num_heads;
-            size_t es = cp.k->element_size();
-
-            // Total buffer size = metadata (64 bytes) + data
-            size_t data_bytes = (size_t)hd * cfg_.n_ctx * nkv * es;
-            size_t total = CacheMetadata::SIZE + data_bytes;
-
-            void* buf = graph_prefill_.runtime.pool.acquire(total);
-            // Only zero the metadata header (64 bytes), not the entire data region.
-            std::memset(buf, 0, CacheMetadata::SIZE);
-
-            // Init metadata
-            auto* meta = cache_meta(buf);
-            meta->current_seq_len = 0;
-            meta->max_seq_len     = cfg_.n_ctx;
-            meta->num_kv_heads    = (uint64_t)nkv;
-            meta->head_dim        = (uint64_t)hd;
-
-            // The tensor shape is the full buffer size in dim0, cache metadata in header
-            *cp.k = Tensor::create(cp.k->prec, MemoryType::POOLED,
-                                   (int64_t)total / (int64_t)es, 1, 1, 1, buf);
-        }
-        if (cp.v) {
-            int vd = cp.v_head_dim;
-            int nkv = cp.v_num_heads;
-            size_t es = cp.v->element_size();
-
-            size_t data_bytes = (size_t)vd * cfg_.n_ctx * nkv * es;
-            size_t total = CacheMetadata::SIZE + data_bytes;
-
-            void* buf = graph_prefill_.runtime.pool.acquire(total);
-            // Only zero the metadata header (64 bytes), not the entire data region.
-            std::memset(buf, 0, CacheMetadata::SIZE);
-
-            auto* meta = cache_meta(buf);
-            meta->current_seq_len = 0;
-            meta->max_seq_len     = cfg_.n_ctx;
-            meta->num_kv_heads    = (uint64_t)nkv;
-            meta->v_head_dim      = (uint64_t)vd;
-
-            *cp.v = Tensor::create(cp.v->prec, MemoryType::POOLED,
-                                   (int64_t)total / (int64_t)es, 1, 1, 1, buf);
-        }
+        if (cp.k) cache_meta(cp.k->data)->current_seq_len = 0;
+        if (cp.v) cache_meta(cp.v->data)->current_seq_len = 0;
     }
 }
 
@@ -476,20 +493,31 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         }
     }
 
-    reset();
+    // Multi-turn: use existing past_len_ for RoPE position offset and causal mask.
+    // Caller is responsible for calling reset() when starting a new conversation.
+    int past = past_len_;
+
+    // Check that the prompt fits in the prefill graph's static seq_len.
+    // (Chunked prefill for multi-turn is a future feature — for now, error out.)
+    if (past + n > graph_seq_len) {
+        fprintf(stderr, "prefill: past=%d + n=%d > graph_seq_len=%d (need chunked prefill)\n",
+                past, n, graph_seq_len);
+        return -1;
+    }
 
     Tensor h = embed(token_ids);
-    // Pad hidden to the graph's seq_len if needed (graph may expect 128 tokens
-    // but we only have n tokens).  The causal mask ensures padded positions
+    // Pad hidden to the graph's seq_len if needed (graph may expect 256 tokens
+    // but we only have n tokens). The causal mask ensures padded positions
     // don't affect real tokens, but we must provide a valid buffer.
+    // Embeddings go at positions [0, n) in the graph's seq dimension.
+    // `past` only affects RoPE position offset and causal mask key range.
     if (n < graph_seq_len) {
         int hidden_dim = (int)h.shape[0];
         size_t padded_bytes = (size_t)hidden_dim * graph_seq_len * sizeof(float);
         void* padded_buf = graph_prefill_.runtime.pool.acquire(padded_bytes);
         std::memset(padded_buf, 0, padded_bytes);
-        // Copy real embeddings to the start
+        // Copy real embeddings to positions [0, n)
         std::memcpy(padded_buf, h.data, (size_t)hidden_dim * n * sizeof(float));
-        // Create new padded tensor
         h = Tensor::create(Precision::FP32, MemoryType::POOLED,
                            hidden_dim, graph_seq_len, 1, 1, padded_buf);
     }
@@ -497,43 +525,28 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     h.compute_strides();
 
     Tensor cos, sin;
-    generate_rope_cache(graph_seq_len, 0, cos, sin);
+    generate_rope_cache(graph_seq_len, past, cos, sin);
 
-    Tensor mask = build_causal_mask(graph_seq_len, 0);
+    Tensor mask = build_causal_mask(graph_seq_len, past);
 
-    // Update cache metadata: set current_seq_len = 0 (fresh prefill)
+    // Set cache metadata so SDPA knows the existing context length.
     for (auto& cp : caches_) {
-        if (cp.k) cache_meta(cp.k->data)->current_seq_len = 0;
-        if (cp.v) cache_meta(cp.v->data)->current_seq_len = 0;
+        if (cp.k) cache_meta(cp.k->data)->current_seq_len = (uint64_t)past;
+        if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past;
     }
 
     Tensor out = run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
 
-    past_len_ = n;
+    past_len_ = past + n;
 
-    // Update cache metadata for decode
+    // Update cache metadata for decode (past + current prefill tokens)
     for (auto& cp : caches_) {
-        if (cp.k) cache_meta(cp.k->data)->current_seq_len = (uint64_t)n;
-        if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)n;
+        if (cp.k) cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
+        if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
     }
 
-    // Migrate cache tensors from prefill graph to decode graph
-    for (auto& node : graph_decode_.nodes) {
-        if (node.op_type != OpType::INPUT || node.params.str.empty()) continue;
-        const std::string& name = node.params.str[0];
-
-        if (name.find("cache_k") == 0) {
-            int layer_idx = std::stoi(name.substr(7));
-            if (layer_idx < (int)caches_.size() && caches_[layer_idx].k) {
-                graph_decode_.runtime.tensors[node.id] = *caches_[layer_idx].k;
-            }
-        } else if (name.find("cache_v") == 0) {
-            int layer_idx = std::stoi(name.substr(7));
-            if (layer_idx < (int)caches_.size() && caches_[layer_idx].v) {
-                graph_decode_.runtime.tensors[node.id] = *caches_[layer_idx].v;
-            }
-        }
-    }
+    // Cache migration (prefill→decode graph) is done once at load time.
+    // Both graphs share the same physical cache buffers.
 
     return run_lmhead(out, n);
 }

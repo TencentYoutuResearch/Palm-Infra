@@ -227,6 +227,10 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
         return false;
     }
 
+    // Reset context before each generation (bench/chat assumes fresh conversation).
+    // Multi-turn would skip this and let prefill() append to existing cache.
+    engine.reset();
+
     auto prefill_start = std::chrono::steady_clock::now();
     int next = engine.prefill(prompt_ids);
     auto prefill_end = std::chrono::steady_clock::now();
