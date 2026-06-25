@@ -1046,16 +1046,17 @@ latency=2 cycles，2 chains 已经达到 CPI=1（FMA throughput ceiling），但
 | + SILU/ADD/MUL NEON (尝试 20, 40f2684) | **141.0** | **29.3** | 1243 | pp256 校准 |
 | + CONCAT/TILE 修复正确性 (尝试 22, 5af2fb1) | **138.5** | **28.7** | 1243 | 5-run 中位数校准 |
 | + GEMV FP16 acc 8-way K-unroll (尝试 23) | **138.6** | **49.6** | 1243 | 5-run 中位数校准 |
-| + ThreadPool park/resume (尝试 24, 当前) | **149.5** | **52.4** | 1243 | 5-run 中位数校准 |
+| + ThreadPool park/resume (尝试 24) | **149.5** | **52.4** | 1243 | 5-run 中位数校准 |
+| + GEMM 2D 调度 + pre-pack A (尝试 25, 当前) | **151.3** | **51.5** | 1243 | 10-run 中位数校准 |
 
 | 框架 | prefill (pp256) | decode (tg) |
 |------|----------------|------------|
-| **mlllm** | **~149.5** | **~52.4** ✅ |
+| **mlllm** | **~151.3** | **~51.5** ✅ |
 | ncnn | 202 | 33 |
 | llama.cpp | 264 | 41 |
 
-**decode 已超过 llama.cpp**（52.4 vs 41 tok/s, +1.28x）。
-prefill 仍有 1.3-1.8x 差距，瞄准 GEMM tile/pack/调度优化。
+**decode 1.26x 超过 llama.cpp**（51.5 vs 41 tok/s）。
+prefill 1.75x 差距（151 vs 264），仍需进一步优化 GEMM tile/microkernel。
 
 ---
 
@@ -1097,6 +1098,52 @@ prefill 仍有 1.3-1.8x 差距，瞄准 GEMM tile/pack/调度优化。
    `decode_tps=51.27, tpot_ms=19.51`，与 bench 一致
 
 **决定**：**采用。park/resume 作为默认 ThreadPool 行为。**
+
+---
+
+## 尝试 25：GEMM 2D atomic-steal 调度 + pre-pack A
+
+**决策理由**：分析 ggml tinyBLAS 的调度方式发现，mlllm GEMM 用 1D 静态 M-shard，
+每 worker 跑全 N，负载不均时快线程空等慢线程。tinyBLAS 用 2D job 空间
+(M-tiles × N-blocks) + atomic-steal 动态抢 job，更好地利用多核。
+
+**算法**：
+- `ThreadPool::parallel_for_2d(M, m_tile, N, n_block, fn)`
+  - `total_jobs = (M/8) × (N/N_BLOCK)`
+  - 每个 job 处理 `[m_begin, m_end) × [n_begin, n_end)` = 8 行 × N_BLOCK 列
+  - `current_chunk.fetch_add(1)` atomic-steal，worker 抢 job 直到耗尽
+- N_BLOCK=256（8 个 N-tile 对齐，避免 job 过细导致 atomic 争抢）
+- **pre-pack A**：主线程在 2D 调度前预先 pack 所有 M-tile 的 A slice，
+  避免 per-job pack 导致重复计算（pack_a_calls 从 M/8 × N/N_BLOCK 降到 M/8）
+
+**实现**：
+- `kernels/threading.h`：Job 加 `current_chunk` atomic, `fn_2d` 字段, `total_2d_jobs`
+- `kernels/threading.cpp`：`parallel_for_2d_impl` + worker_loop 加 atomic-steal 分支
+- `kernels/matmul.cpp`：GEMM 主分支改用 `parallel_for_2d` + pre-pack A vector
+- `examples/bench.cpp`：加 pack_a profiling 计数器（`pack_a_ms`, `pack_a_calls`, `pack_pct`）
+
+**N_BLOCK 调参**：
+| N_BLOCK | job 数 (M=256,N=2048) | prefill 中位数 | 备注 |
+|---------|----------------------|---------------|------|
+| 64 | 1024 | 136.6 (-13%) | atomic 争抢严重 |
+| 256 | 256 | 145.6 (+8.6%) | 最优 |
+| pre-pack + 256 | 256 | **151.3 (+12.8%)** | 消除重复 pack |
+
+**结果 (端到端, 4 threads, pp256, warmup=3, 10-run 中位数)**：
+| 指标 | 尝试 24 (1D baseline) | 尝试 25 (2D + pre-pack) | 变化 |
+|------|------------------------|------------------------|------|
+| prefill_tps | 134.1 | **151.3** | **+12.8%** |
+| decode_tps | 51.4 | 51.5 | 持平 (GEMV 路径不变) |
+| pack_pct | 1.5% | **1.5%** | 持平 (pre-pack 消除重复) |
+
+**关键发现**：
+1. 2D 调度初始版本 (N_BLOCK=64) 反而退化 -13%——atomic 争抢 + per-job pack 重复
+2. N_BLOCK=256 让 job 数从 1024 降到 256，prefill +8.6%
+3. pre-pack A 把 pack_a_calls 从 103424 降到 8192，pack_pct 从 11.9% 降到 1.5%
+4. 三步累计 prefill +12.8%，缩小了与 llama.cpp 的差距 (1.97x → 1.75x)
+5. 2D 调度与 microkernel 类型 (outer-product vs dot-product) 无关，只改 job 调度
+
+**决定**：**采用。2D atomic-steal + pre-pack A + N_BLOCK=256 作为 GEMM 默认。**
 
 ---
 

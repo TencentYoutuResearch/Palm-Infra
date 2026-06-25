@@ -2,6 +2,38 @@
 #include "kernels/threading.h"
 
 #include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <vector>
+
+// Profiling counters for A pack overhead (reset by bench).
+// Read via pack_a_total_ms() / matmul_total_ms().
+// std::atomic<double> has no fetch_add, use mutex-protected doubles.
+static double g_pack_a_ms = 0;
+static double g_matmul_ms = 0;
+static long long g_pack_a_calls = 0;
+static std::mutex g_prof_mtx;
+
+extern "C" double mlllm_pack_a_total_ms() { return g_pack_a_ms; }
+extern "C" long long mlllm_pack_a_calls() { return g_pack_a_calls; }
+extern "C" double mlllm_matmul_total_ms() { return g_matmul_ms; }
+extern "C" void mlllm_reset_pack_counters() {
+    std::lock_guard<std::mutex> lk(g_prof_mtx);
+    g_pack_a_ms = 0;
+    g_pack_a_calls = 0;
+    g_matmul_ms = 0;
+}
+
+// RAII timer for kernel_matmul_fp32 — captures all return paths.
+struct MatmulTimer {
+    std::chrono::steady_clock::time_point t0;
+    MatmulTimer() : t0(std::chrono::steady_clock::now()) {}
+    ~MatmulTimer() {
+        auto t1 = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lk(g_prof_mtx);
+        g_matmul_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+};
 
 MatmulConfig g_matmul_config;
 
@@ -79,6 +111,7 @@ __fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K, int K_we
 // FP32→FP16 conversion happens during pack (one-time precision loss).
 // ---------------------------------------------------------------------------
 __fp16* pack_a_interleaved_full(const float* A_original, int M, int K, int lda) {
+    auto t0 = std::chrono::steady_clock::now();
     int M_padded = ((M + 7) / 8) * 8;  // round up to multiple of 8
     __fp16* dst = new __fp16[(size_t)M_padded * K];
     for (int m_tile = 0; m_tile < M_padded; m_tile += 8) {
@@ -93,6 +126,9 @@ __fp16* pack_a_interleaved_full(const float* A_original, int M, int K, int lda) 
             }
         }
     }
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    { std::lock_guard<std::mutex> lk(g_prof_mtx); g_pack_a_ms += ms; g_pack_a_calls++; }
     return dst;
 }
 
@@ -579,9 +615,12 @@ static void matmul_fp16_neon_8x8_range_packed_a_fp16acc(
                     }
                 }
 
-                // K loop: FP16 lane-FMA, 2-way unroll for branch overhead reduction
-                // 16 independent acc chains (c0[8] + c1[8]). GEMM already has enough
-                // chains (8) to hide FMA latency — unroll mainly amortizes loop branch.
+                // K loop: FP16 lane-FMA, 2-way unroll.
+                // 8 N-columns already provide 8 independent acc chains (>>2),
+                // enough to hide FMA latency (lat=2, throughput=2/cycle).
+                // 2-way unroll mainly amortizes loop branch overhead.
+                // Note: 8-way unroll (64 acc) was tried and reverted — it caused
+                // register spill on Apple Silicon (32 NEON Q regs), hurting prefill.
                 float16x8_t c1[8];
                 for (int j = 0; j < 8; j++) c1[j] = vdupq_n_f16((__fp16)0.f);
 
@@ -791,6 +830,7 @@ static void matmul_fp32_range_n(const float* A, const float* B, float* C,
 
 void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         ThreadPool* thread_pool) {
+    MatmulTimer _timer;  // captures all return paths
     int M = (int)A.shape[1];
     int K = (int)A.shape[0];
     int N = (int)B.shape[0];
@@ -902,6 +942,7 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                     M, N, K, lda, ldc, 0, M);
             }
         } else if (shard_by_n) {
+            // GEMV-ish: shard_by_n with M<8 (use the scalar-A kernel).
             int n_chunk = std::max(chunk_size, 8);
             n_chunk = ((n_chunk + 7) / 8) * 8;
             thread_pool->parallel_for(0, N, n_chunk,
@@ -915,16 +956,45 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         K, lda, ldc, 0, M);
                 });
         } else {
-            thread_pool->parallel_for(0, M, chunk_size,
-                [&](int, int m_begin, int m_end) {
+            // GEMM (M>=8): 2D atomic-steal scheduling.
+            // Jobs = (M/8) × (N/N_BLOCK), each job = 8 rows × N_BLOCK cols.
+            // N_BLOCK=256 reduces job count + atomic contention.
+            constexpr int N_BLOCK = 256;
+            int n_block = ((N_BLOCK + 7) / 8) * 8;  // align to 8
+            if (n_block > N) n_block = ((N + 7) / 8) * 8;
+
+            // Pre-pack A per M-tile ONCE (not per job).
+            // Without this, each N-block job would re-pack the same M-tile's
+            // A slice, inflating pack_a_calls from M/8 to M/8 * N/N_BLOCK.
+            // Pre-packing trades a small barrier for big pack savings.
+            int m_tiles = (M + tile_m - 1) / tile_m;
+            std::vector<__fp16*> a_packed_tiles(m_tiles, nullptr);
+            for (int i = 0; i < m_tiles; i++) {
+                int m_begin = i * tile_m;
+                int m_len = std::min(tile_m, M - m_begin);
+                a_packed_tiles[i] = pack_a_interleaved_full(
+                    a_ptr + m_begin * lda, m_len, K, lda);
+            }
+
+            thread_pool->parallel_for_2d(
+                M, tile_m, N, n_block,
+                [&](int, int m_begin, int m_end, int n_begin, int n_end) {
                     int m_len = m_end - m_begin;
-                    __fp16* a_slice_packed = pack_a_interleaved_full(
-                        a_ptr + m_begin * lda, m_len, K, lda);
-                    dispatch_lane_fma(a_slice_packed, b_packed,
-                                      c_ptr + m_begin * ldc,
-                                      m_len, N, ldc, 0, m_len);
-                    delete[] a_slice_packed;
+                    int n_len = n_end - n_begin;
+                    // Reuse pre-packed A slice for this M-tile.
+                    int tile_idx = m_begin / tile_m;
+                    __fp16* a_slice_packed = a_packed_tiles[tile_idx];
+                    int n_begin_aligned = n_begin & ~7;
+                    dispatch_lane_fma(a_slice_packed,
+                                      b_packed + n_begin_aligned * K,
+                                      c_ptr + m_begin * ldc + n_begin,
+                                      m_len, n_len, ldc, 0, m_len);
                 });
+
+            // Free pre-packed A slices.
+            for (int i = 0; i < m_tiles; i++) {
+                if (a_packed_tiles[i]) delete[] a_packed_tiles[i];
+            }
         }
         return;
     }
