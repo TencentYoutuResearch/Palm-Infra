@@ -45,6 +45,162 @@ static inline float32x4_t sigmoid_f32_neon(float32x4_t x) {
 #endif
 
 // ---------------------------------------------------------------------------
+// Stride-aware elementwise iteration helper.
+//
+// Tensors are row-major 4-D [d0, d1, d2, d3] with stride[0] = es (innermost).
+// "Contiguous" means all strides match the default row-major layout.
+// When a tensor is a view (e.g. SLICE produces a non-contiguous dim-1 stride),
+// we still want to read it efficiently.
+//
+// Layout invariant: stride[0] == es always (the dim-0 elements are always
+// contiguous in memory). For non-contiguous tensors, stride[1] may be larger
+// than shape[0]*es (e.g. SLICE dim=0 produces a view with stride[1] inherited
+// from the parent's full N, not the sliced N/2).
+//
+// The iteration: outer loop over (d3, d2, d1), inner loop over d0 contiguous
+// elements. Each inner run has `shape[0]` elements at stride es.
+//
+// `fn(float* dst_row, const float* src_row, int n)` is called per outer step
+// with a contiguous run of n elements.
+// ---------------------------------------------------------------------------
+struct StrideIter {
+    // Pre-compute outer-loop bounds and step sizes.
+    int d1, d2, d3;             // outer-loop dims (excluding d0)
+    size_t s1, s2, s3;          // byte strides for outer dims
+    int n_inner;                // d0 (contiguous run length)
+};
+
+static inline StrideIter compute_stride_iter(const Tensor& t) {
+    StrideIter it;
+    it.n_inner = (int)t.shape[0];
+    it.d1 = (int)t.shape[1];
+    it.d2 = (int)t.shape[2];
+    it.d3 = (int)t.shape[3];
+    it.s1 = t.stride[1];
+    it.s2 = t.stride[2];
+    it.s3 = t.stride[3];
+    return it;
+}
+
+// Check if a tensor has the default contiguous row-major layout.
+static inline bool is_contiguous_layout(const Tensor& t) {
+    if (t.stride[0] != t.element_size()) return false;
+    size_t expected = t.element_size();
+    if (t.stride[1] != expected * t.shape[0]) return false;
+    if (t.stride[2] != t.stride[1] * t.shape[1]) return false;
+    if (t.stride[3] != t.stride[2] * t.shape[2]) return false;
+    return true;
+}
+
+// Apply a unary op (sigmoid/silu/etc) reading from `src` (may be strided view),
+// writing to `dst` (assumed contiguous, freshly allocated).
+// `kernel_4(dst, src)` processes 4 contiguous FP32 elements via NEON.
+template <typename Kernel4>
+static inline void unary_stride_aware(float* dst, const Tensor& src,
+                                       Kernel4 kernel_4) {
+    const char* src_base = static_cast<const char*>(src.data);
+    int n_inner = (int)src.shape[0];
+
+    if (is_contiguous_layout(src)) {
+        // Fast path: linear memcpy-friendly layout.
+        const float* sp = src.ptr<float>();
+        int N = (int)src.nelements();
+        int i = 0;
+        for (; i + 3 < N; i += 4) {
+            float32x4_t v = vld1q_f32(sp + i);
+            vst1q_f32(dst + i, kernel_4(v));
+        }
+        for (; i < N; i++) {
+            float32x4_t v = vld1q_f32(sp + i);
+            float32x4_t r = kernel_4(v);
+            dst[i] = vgetq_lane_f32(r, 0);
+        }
+        return;
+    }
+
+    // Strided view: iterate (d3, d2, d1) outer, d0 contiguous inner.
+    StrideIter it = compute_stride_iter(src);
+    float* dst_row = dst;
+    for (int i3 = 0; i3 < it.d3; i3++) {
+        const char* p3 = src_base + i3 * it.s3;
+        for (int i2 = 0; i2 < it.d2; i2++) {
+            const char* p2 = p3 + i2 * it.s2;
+            for (int i1 = 0; i1 < it.d1; i1++) {
+                const float* sp = reinterpret_cast<const float*>(p2 + i1 * it.s1);
+                int i = 0;
+                for (; i + 3 < n_inner; i += 4) {
+                    float32x4_t v = vld1q_f32(sp + i);
+                    vst1q_f32(dst_row + i, kernel_4(v));
+                }
+                for (; i < n_inner; i++) {
+                    float32x4_t v = vld1q_f32(sp + i);
+                    float32x4_t r = kernel_4(v);
+                    dst_row[i] = vgetq_lane_f32(r, 0);
+                }
+                dst_row += n_inner;
+            }
+        }
+    }
+}
+
+// Apply a binary op reading from `a` and `b` (either may be strided view),
+// writing to `dst` (contiguous).
+//
+// `a` and `b` may have different strides — both are iterated by their own
+// shape/stride. Their shapes (d0..d3) must match.
+template <typename Kernel4>
+static inline void binary_stride_aware(float* dst,
+                                        const Tensor& a, const Tensor& b,
+                                        Kernel4 kernel_4) {
+    const char* a_base = static_cast<const char*>(a.data);
+    const char* b_base = static_cast<const char*>(b.data);
+
+    bool a_contig = is_contiguous_layout(a);
+    bool b_contig = is_contiguous_layout(b);
+
+    if (a_contig && b_contig) {
+        // Fast path: both contiguous.
+        const float* ap = a.ptr<float>();
+        const float* bp = b.ptr<float>();
+        int N = (int)a.nelements();
+        int i = 0;
+        for (; i + 7 < N; i += 8) {
+            vst1q_f32(dst + i,     kernel_4(vld1q_f32(ap + i),     vld1q_f32(bp + i)));
+            vst1q_f32(dst + i + 4, kernel_4(vld1q_f32(ap + i + 4), vld1q_f32(bp + i + 4)));
+        }
+        for (; i < N; i++) dst[i] = kernel_4(vdupq_n_f32(ap[i]), vdupq_n_f32(bp[i]))[0];
+        return;
+    }
+
+    // At least one is strided. Iterate outer dims; inner dim-0 (shape[0]) is
+    // always contiguous (stride[0] == es) for both inputs, but their outer
+    // strides may differ.
+    StrideIter ita = compute_stride_iter(a);
+    StrideIter itb = compute_stride_iter(b);
+    int n_inner = ita.n_inner;  // a.shape[0] == b.shape[0]
+    float* dst_row = dst;
+    for (int i3 = 0; i3 < ita.d3; i3++) {
+        const char* pa3 = a_base + i3 * ita.s3;
+        const char* pb3 = b_base + i3 * itb.s3;
+        for (int i2 = 0; i2 < ita.d2; i2++) {
+            const char* pa2 = pa3 + i2 * ita.s2;
+            const char* pb2 = pb3 + i2 * itb.s2;
+            for (int i1 = 0; i1 < ita.d1; i1++) {
+                const float* ap = reinterpret_cast<const float*>(pa2 + i1 * ita.s1);
+                const float* bp = reinterpret_cast<const float*>(pb2 + i1 * itb.s1);
+                int i = 0;
+                for (; i + 7 < n_inner; i += 8) {
+                    vst1q_f32(dst_row + i,     kernel_4(vld1q_f32(ap + i),     vld1q_f32(bp + i)));
+                    vst1q_f32(dst_row + i + 4, kernel_4(vld1q_f32(ap + i + 4), vld1q_f32(bp + i + 4)));
+                }
+                for (; i < n_inner; i++) dst_row[i] = kernel_4(vdupq_n_f32(ap[i]), vdupq_n_f32(bp[i]))[0];
+                dst_row += n_inner;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // prepare_execution
 // ---------------------------------------------------------------------------
 
@@ -288,45 +444,65 @@ static void dispatch_kernel(OpType op, const OpParams& params,
     case OpType::MUL:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             const Tensor& a = *inputs[0];
-            int N = (int)a.nelements();
+            const Tensor& b = *inputs[1];
             float* o = output->ptr<float>();
-            const float* ap = a.ptr<float>();
-            const float* bp = inputs[1]->ptr<float>();
 #if HAS_NEON
-            int i = 0;
-            for (; i + 7 < N; i += 8) {
-                vst1q_f32(o + i,     vmulq_f32(vld1q_f32(ap + i),     vld1q_f32(bp + i)));
-                vst1q_f32(o + i + 4, vmulq_f32(vld1q_f32(ap + i + 4), vld1q_f32(bp + i + 4)));
-            }
-            for (; i < N; i++) o[i] = ap[i] * bp[i];
+            binary_stride_aware(o, a, b,
+                [](float32x4_t av, float32x4_t bv) { return vmulq_f32(av, bv); });
 #else
-            for (int i = 0; i < N; i++) o[i] = ap[i] * bp[i];
+            // Scalar fallback: iterate outer dims, inner contiguous run.
+            const char* a_base = static_cast<const char*>(a.data);
+            const char* b_base = static_cast<const char*>(b.data);
+            StrideIter it = compute_stride_iter(a);
+            float* dst_row = o;
+            for (int i3 = 0; i3 < it.d3; i3++) {
+                const char* pa3 = a_base + i3 * it.s3;
+                const char* pb3 = b_base + i3 * it.s3;
+                for (int i2 = 0; i2 < it.d2; i2++) {
+                    const char* pa2 = pa3 + i2 * it.s2;
+                    const char* pb2 = pb3 + i2 * it.s2;
+                    for (int i1 = 0; i1 < it.d1; i1++) {
+                        const float* ap = reinterpret_cast<const float*>(pa2 + i1 * it.s1);
+                        const float* bp = reinterpret_cast<const float*>(pb2 + i1 * it.s1);
+                        for (int i = 0; i < it.n_inner; i++) dst_row[i] = ap[i] * bp[i];
+                        dst_row += it.n_inner;
+                    }
+                }
+            }
 #endif
         }
         break;
 
     case OpType::SILU:
-        // SiLU: x * sigmoid(x)
-        // Vectorized with NEON: 4 elements per iteration using polynomial exp.
+        // SiLU: x * sigmoid(x). Stride-aware — handles SLICE views (gate/up
+        // halves of merged gate_up matmul).
         if (inputs.size() >= 1 && inputs[0] && output) {
-            int N = (int)inputs[0]->nelements();
-            const float* x = inputs[0]->ptr<float>();
             float* o = output->ptr<float>();
 #if HAS_NEON
-            int i = 0;
-            for (; i + 3 < N; i += 4) {
-                float32x4_t xv = vld1q_f32(x + i);
-                float32x4_t sv = sigmoid_f32_neon(xv);
-                vst1q_f32(o + i, vmulq_f32(xv, sv));
-            }
-            for (; i < N; i++) {
-                float sx = 1.f / (1.f + std::exp(-x[i]));
-                o[i] = x[i] * sx;
-            }
+            unary_stride_aware(o, *inputs[0],
+                [](float32x4_t x) {
+                    float32x4_t sv = sigmoid_f32_neon(x);
+                    return vmulq_f32(x, sv);
+                });
 #else
-            for (int i = 0; i < N; i++) {
-                float sx = 1.f / (1.f + std::exp(-x[i]));
-                o[i] = x[i] * sx;
+            // Scalar fallback (stride-aware).
+            const Tensor& src = *inputs[0];
+            const char* src_base = static_cast<const char*>(src.data);
+            StrideIter it = compute_stride_iter(src);
+            float* dst_row = o;
+            for (int i3 = 0; i3 < it.d3; i3++) {
+                const char* p3 = src_base + i3 * it.s3;
+                for (int i2 = 0; i2 < it.d2; i2++) {
+                    const char* p2 = p3 + i2 * it.s2;
+                    for (int i1 = 0; i1 < it.d1; i1++) {
+                        const float* sp = reinterpret_cast<const float*>(p2 + i1 * it.s1);
+                        for (int i = 0; i < it.n_inner; i++) {
+                            float sx = 1.f / (1.f + std::exp(-sp[i]));
+                            dst_row[i] = sp[i] * sx;
+                        }
+                        dst_row += it.n_inner;
+                    }
+                }
             }
 #endif
         }

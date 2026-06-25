@@ -76,9 +76,34 @@ def export_weights(weights: dict, weights_dir: str):
             continue
         if 'embed_tokens' in wname:
             continue
+        # Skip mlp.gate_proj / mlp.up_proj — they will be merged below.
+        if '.mlp.gate_proj.' in wname or '.mlp.up_proj.' in wname:
+            continue
         # Convert to float16 for FP16 storage.
         d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
         save(wname.replace('.', '_'), d)
+
+    # Merge mlp.gate_proj + mlp.up_proj per layer into a single weight
+    # (one matmul + slice at inference, halves A-pack overhead).
+    # Both shapes are [intermediate, hidden]; concat along dim=0 (N) → [2*intermediate, hidden].
+    import re
+    layer_pattern = re.compile(r'^model\.layers\.(\d+)\.mlp\.gate_proj\.weight$')
+    layer_ids = set()
+    for wname in weights.keys():
+        m = layer_pattern.match(wname)
+        if m:
+            layer_ids.add(int(m.group(1)))
+    for layer_idx in sorted(layer_ids):
+        gate_name = f"model.layers.{layer_idx}.mlp.gate_proj.weight"
+        up_name   = f"model.layers.{layer_idx}.mlp.up_proj.weight"
+        if up_name not in weights:
+            continue
+        gate_w = weights[gate_name]
+        up_w   = weights[up_name]
+        merged = np.concatenate([gate_w, up_w], axis=0)
+        if merged.dtype != np.float16:
+            merged = merged.astype(np.float16)
+        save(f"model_layers_{layer_idx}_mlp_gate_up_proj_weight", merged)
 
     # embed_tokens — FP16, packed at load time (tied with lm_head)
     embed_w = weights['model.embed_tokens.weight']
@@ -246,15 +271,17 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
                      (hidden_size,), Precision.FP32)
     x_normed2 = g.rms_norm(x, w_ln2, eps=eps)
 
-    w_gate = g.weight(os.path.join(weights_dir, f"{mlp_pfx.replace('.', '_')}_gate_proj_weight.weights"),
-                      (cfg_intermediate_size(cfg), hidden_size), Precision.FP16)
-    w_up   = g.weight(os.path.join(weights_dir, f"{mlp_pfx.replace('.', '_')}_up_proj_weight.weights"),
-                      (cfg_intermediate_size(cfg), hidden_size), Precision.FP16)
+    w_gate_up = g.weight(os.path.join(weights_dir, f"{mlp_pfx.replace('.', '_')}_gate_up_proj_weight.weights"),
+                          (2 * cfg_intermediate_size(cfg), hidden_size), Precision.FP16)
     w_down = g.weight(os.path.join(weights_dir, f"{mlp_pfx.replace('.', '_')}_down_proj_weight.weights"),
                       (hidden_size, cfg_intermediate_size(cfg)), Precision.FP16)
 
-    gate = g.matmul(x_normed2, w_gate)
-    up   = g.matmul(x_normed2, w_up)
+    # Single merged matmul → slice into gate/up halves (slice is zero-copy view).
+    # SILU/MUL are stride-aware and read the view directly (no materialize).
+    # Halves A-pack overhead vs two separate matmuls.
+    intermediate = cfg_intermediate_size(cfg)
+    merged = g.matmul(x_normed2, w_gate_up)
+    gate, up = g.slice(merged, [intermediate, intermediate], dim=0)
     gate = g.silu(gate)
     mlp_hidden = g.mul(gate, up)
     mlp_out = g.matmul(mlp_hidden, w_down)
