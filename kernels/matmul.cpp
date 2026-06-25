@@ -802,13 +802,28 @@ static void matmul_fp16_neon_8x8_range_packed_a_fp16acc(
 
                 // Write back: FP16 → FP32, store to C
                 // On the last K-block, also apply fused activation if enabled.
+                // Batch-check activation status per N-tile (8 columns): SwiGLU
+                // gate (act_n_len multiple of 8) → all 8 columns same status,
+                // so we can skip per-column check entirely.
+                bool tile_active = act_enabled && last_block &&
+                                   (act_full_N ||
+                                    (activation_applies_at(n + 0, act_n_begin, act_n_len) &&
+                                     activation_applies_at(n + 7, act_n_begin, act_n_len)));
                 for (int j = 0; j < 8 && n + j < n_end; j++) {
                     float32x4_t lo = vcvt_f32_f16(vget_low_f16(c[j]));
                     float32x4_t hi = vcvt_f32_f16(vget_high_f16(c[j]));
-                    if (act_enabled && last_block) {
-                        if (act_full_N || activation_applies_at(n + j, act_n_begin, act_n_len)) {
-                            lo = apply_activation_f32_neon(lo, act);
-                            hi = apply_activation_f32_neon(hi, act);
+                    if (tile_active) {
+                        lo = apply_activation_f32_neon(lo, act);
+                        hi = apply_activation_f32_neon(hi, act);
+                    } else if (act_enabled && last_block) {
+                        // Mixed tile (rare — only at gate/up boundary).
+                        // Per-column scalar apply via lane extract/insert.
+                        if (activation_applies_at(n + j, act_n_begin, act_n_len)) {
+                            // Apply to all 8 M-rows for this N column.
+                            // lo = [m0,m1,m2,m3], hi = [m4,m5,m6,m7]
+                            float32x4_t a_lo = apply_activation_f32_neon(lo, act);
+                            float32x4_t a_hi = apply_activation_f32_neon(hi, act);
+                            lo = a_lo; hi = a_hi;
                         }
                     }
                     float tmp[8];
