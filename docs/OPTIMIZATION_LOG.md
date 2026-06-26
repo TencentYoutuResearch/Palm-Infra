@@ -1525,18 +1525,16 @@ causal mask key range = [0, past+cur)）。如果 `past + n > graph_seq_len` 返
 
 ---
 
-## Qwen3.5-0.8B llama.cpp baseline (FP16, M5 Pro, 4 threads)
+## Qwen3.5-0.8B llama.cpp baseline (FP16, M5 Pro, 4 threads, pp256 + tg64)
 
 llama.cpp build: 5c7c22c3e (9803), BLAS backend, Qwen3.5-0.8B-F16.gguf
 
 | 测试 | t/s | 备注 |
 |------|-----|------|
-| pp256 | **748** ± 1 | 3-run: 712-748（第 1 run 高，后续降，热效应） |
-| tg64 | **98.6** ± 0.6 | 3-run: 98-99 |
-| pp512 | 815 ± 21 | 3-run: 813-816（参考） |
-| tg128 | 99 ± 1 | 3-run: 98-99（参考） |
+| pp256 | **717** ± 37 | 3-run: 713-748 |
+| tg64 | **98.6** ± 0.6 | 3-run: 97.9-99.2 |
 
 注：Qwen3.5-0.8B 是 772M 参数模型（vs Youtu-LLM-2B 的 ~2B）。
-mlllm 对比时用 pp256 + tg64（与 Youtu-LLM-2B 测试协议一致）。
+与 Youtu-LLM-2B 测试协议一致（pp256 + tg64, 4 threads, M5 Pro）。
 
 ---
