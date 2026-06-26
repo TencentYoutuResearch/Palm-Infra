@@ -1531,13 +1531,12 @@ llama.cpp build: 5c7c22c3e (9803), BLAS backend, Qwen3.5-0.8B-F16.gguf
 
 | 测试 | t/s | 备注 |
 |------|-----|------|
-| pp512 | **815** ± 21 | 3-run: 813-816 |
-| tg128 | **99** ± 1 | 3-run: 98-99 |
-| pp256* | ~815 (估) | 未单独测，prefill compute-bound，tps 与 seq_len 弱相关 |
-| tg64* | ~99 (估) | 未单独测，decode per-token bound |
+| pp256 | **748** ± 1 | 3-run: 712-748（第 1 run 高，后续降，热效应） |
+| tg64 | **98.6** ± 0.6 | 3-run: 98-99 |
+| pp512 | 815 ± 21 | 3-run: 813-816（参考） |
+| tg128 | 99 ± 1 | 3-run: 98-99（参考） |
 
 注：Qwen3.5-0.8B 是 772M 参数模型（vs Youtu-LLM-2B 的 ~2B）。
-pp = prompt processing (prefill), tg = text generation (decode)。
 mlllm 对比时用 pp256 + tg64（与 Youtu-LLM-2B 测试协议一致）。
 
 ---
