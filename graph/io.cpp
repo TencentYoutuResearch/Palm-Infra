@@ -37,7 +37,7 @@
 namespace {
 
 static constexpr uint32_t GRAPH_MAGIC   = 0x4D4C4C47;  // "GLLM"
-static constexpr uint32_t GRAPH_VERSION = 1;
+static constexpr uint32_t GRAPH_VERSION = 2;  // v2: added metadata in header
 
 // ---- low-level I/O helpers ----
 
@@ -62,15 +62,15 @@ static bool read_str(FILE* f, std::string& s) {
     uint32_t len = 0;
     if (!read_u32(f, &len)) return false;
     s.resize(len);
-    if (len == 0) return true;
-    return fread(&s[0], 1, len, f) == len;
+    if (len > 0 && fread(&s[0], 1, len, f) != len) return false;
+    return true;
 }
 
 static bool write_str(FILE* f, const std::string& s) {
     uint32_t len = (uint32_t)s.size();
     if (!write_u32(f, len)) return false;
-    if (len == 0) return true;
-    return fwrite(s.data(), 1, len, f) == len;
+    if (len > 0 && fwrite(s.data(), 1, len, f) != len) return false;
+    return true;
 }
 
 } // anonymous namespace
@@ -93,10 +93,19 @@ bool graph_load(Graph& g, const char* path) {
         fclose(f); return false;
     }
     if (!read_u32(f, &version) || version != GRAPH_VERSION) {
-        fprintf(stderr, "graph_load: unsupported version %u\n", version);
+        fprintf(stderr, "graph_load: unsupported version %u (expected %u)\n", version, GRAPH_VERSION);
         fclose(f); return false;
     }
     if (!read_u32(f, &node_count)) { fclose(f); return false; }
+
+    // metadata (key=value string pairs)
+    uint32_t meta_count = 0;
+    if (!read_u32(f, &meta_count)) { fclose(f); return false; }
+    for (uint32_t i = 0; i < meta_count; i++) {
+        std::string key, val;
+        if (!read_str(f, key) || !read_str(f, val)) { fclose(f); return false; }
+        g.metadata[key] = val;
+    }
 
     // graph inputs
     uint32_t input_count = 0;
@@ -184,6 +193,15 @@ bool graph_save(const Graph& g, const char* path) {
     write_u32(f, GRAPH_MAGIC);
     write_u32(f, GRAPH_VERSION);
     write_u32(f, node_count);
+
+    // metadata
+    uint32_t meta_count = (uint32_t)g.metadata.size();
+    write_u32(f, meta_count);
+    for (const auto& [key, val] : g.metadata) {
+        write_str(f, key);
+        write_str(f, val);
+    }
+
     write_u32(f, input_count);
     write_vec_u32(f, g.graph_inputs);
     write_u32(f, output_count);

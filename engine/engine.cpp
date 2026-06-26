@@ -300,6 +300,23 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     if (!load_graph(graph_prefill_, exec_ctx_prefill_, cfg.prefill_graph_path.c_str())) {
         return false;
     }
+
+    // Override config from graph metadata (takes precedence over CLI defaults)
+    auto get_meta = [&](const char* key, const char* def) -> const char* {
+        auto it = graph_prefill_.metadata.find(key);
+        return it != graph_prefill_.metadata.end() ? it->second.c_str() : def;
+    };
+    auto get_meta_int = [&](const char* key, int def) -> int {
+        const char* v = get_meta(key, nullptr);
+        return v ? std::atoi(v) : def;
+    };
+    auto get_meta_float = [&](const char* key, float def) -> float {
+        const char* v = get_meta(key, nullptr);
+        return v ? (float)std::atof(v) : def;
+    };
+    cfg_.rope_dim = get_meta_int("rope_dim", cfg_.rope_dim);
+    cfg_.rope_theta = get_meta_float("rope_theta", cfg_.rope_theta);
+
     allocate_caches(graph_prefill_, cfg.n_ctx);
 
     // Load decode graph (reuses shared weights via weight_map_)

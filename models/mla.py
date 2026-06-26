@@ -145,6 +145,16 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     print(f"MLA graph: seq_len={seq_len}, heads={num_heads}, "
           f"qk_nope={qk_nope_dim}, qk_rope={qk_rope_dim}, v={v_head_dim}")
 
+    # ---- set graph metadata (engine reads these instead of CLI args) ----
+    g.set_model_config(
+        rope_dim=qk_rope_dim,
+        rope_theta=cfg.get('rope_theta', 1600000),
+        hidden_size=hidden_size,
+        num_layers=n_layers,
+        vocab_size=cfg['vocab_size'],
+        model_type='mla',
+    )
+
     # ---- embed_tokens weight node ----
     embed_path = os.path.join(weights_dir, "embed_tokens.weights")
     embed_shape = (cfg['vocab_size'], hidden_size)

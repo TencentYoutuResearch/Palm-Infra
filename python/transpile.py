@@ -26,7 +26,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 GRAPH_MAGIC   = 0x4D4C4C47  # "GLLM"
-GRAPH_VERSION = 1
+GRAPH_VERSION = 2  # v2: added metadata in header
 
 WEIGHT_MAGIC  = 0x50414D58  # "XMAP"
 
@@ -101,6 +101,23 @@ class GraphBuilder:
         self._nodes: list[_Node] = []
         self._next_id = 0
         self._weight_files: dict[str, bytes] = {}  # path → binary content
+        self.metadata: dict[str, str] = {}  # graph-level config (rope_theta, etc.)
+
+    def set_metadata(self, key: str, value):
+        """Set a graph metadata field. Stored in the .graph file header.
+        The engine reads these to configure rope_theta, rope_dim, etc."""
+        self.metadata[key] = str(value)
+
+    def set_model_config(self, rope_dim: int, rope_theta: float,
+                         hidden_size: int = 0, num_layers: int = 0,
+                         vocab_size: int = 0, model_type: str = ''):
+        """Convenience method to set common model config fields."""
+        self.metadata['rope_dim'] = str(rope_dim)
+        self.metadata['rope_theta'] = str(rope_theta)
+        if hidden_size: self.metadata['hidden_size'] = str(hidden_size)
+        if num_layers: self.metadata['num_layers'] = str(num_layers)
+        if vocab_size: self.metadata['vocab_size'] = str(vocab_size)
+        if model_type: self.metadata['model_type'] = model_type
 
     # ---- helpers ----
 
@@ -398,6 +415,16 @@ class GraphBuilder:
             f.write(struct.pack('<I', GRAPH_MAGIC))
             f.write(struct.pack('<I', GRAPH_VERSION))
             f.write(struct.pack('<I', len(self._nodes)))
+
+            # metadata (key=value string pairs)
+            f.write(struct.pack('<I', len(self.metadata)))
+            for key, val in self.metadata.items():
+                kb = key.encode('utf-8')
+                vb = val.encode('utf-8')
+                f.write(struct.pack('<I', len(kb)))
+                f.write(kb)
+                f.write(struct.pack('<I', len(vb)))
+                f.write(vb)
             f.write(struct.pack('<I', len(graph_inputs)))
             for gid in graph_inputs:
                 f.write(struct.pack('<I', gid))

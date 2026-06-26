@@ -136,6 +136,16 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
           f"linear_heads={linear_num_heads}, linear_k={linear_k_dim}, "
           f"linear_v={linear_v_dim}, conv_kernel={conv_kernel}")
 
+    # ---- set graph metadata (engine reads these instead of CLI args) ----
+    g.set_model_config(
+        rope_dim=rope_dim,
+        rope_theta=rope_theta,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        vocab_size=tc['vocab_size'],
+        model_type='qwen3_5',
+    )
+
     # ---- embed_tokens ----
     embed_path = os.path.join(weights_dir, "embed_tokens.weights")
     embed_shape = (tc['vocab_size'], hidden_size)

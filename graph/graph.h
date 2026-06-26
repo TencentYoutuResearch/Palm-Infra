@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -134,6 +135,11 @@ struct Graph {
     // to know which tensors to feed / extract.
     std::vector<uint32_t> graph_inputs;
     std::vector<uint32_t> graph_outputs;
+
+    // ---- graph metadata (serialised in header, after magic/version) ----
+    // Model-specific config that the engine needs to set up RoPE, caches, etc.
+    // Stored as key=value string pairs for extensibility.
+    std::unordered_map<std::string, std::string> metadata;
 
     // ---- runtime state (not serialised) ----
     struct Runtime {
