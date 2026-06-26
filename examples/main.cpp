@@ -14,13 +14,13 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
                        int max_new_tokens) {
     std::vector<int> prompt_ids = tokenizer.apply_chat(prompt);
     if (prompt_ids.empty()) {
-        std::fprintf(stderr, "chat: prompt is empty after tokenization\n");
+        std::fprintf(stderr, "Chat: prompt is empty after tokenization\n");
         return false;
     }
     // No length check here — engine.prefill() handles chunked prefill for
     // prompts longer than graph_seq_len.
 
-    std::printf("assistant> ");
+    std::printf("Assistant> ");
     std::fflush(stdout);
 
     GenerationResult result;
@@ -36,12 +36,12 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
         });
 
     if (!ok) {
-        std::fprintf(stderr, "\nchat: %s\n", error.c_str());
+        std::fprintf(stderr, "\nChat: %s\n", error.c_str());
         return false;
     }
 
     GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
-    std::printf("\n[ttft=%.2fs tpot=%.1fms prefill=%.1f tps decode=%.1f tps tokens=%d]\n",
+    std::printf("\n\n[ttft=%.2fs tpot=%.1fms prefill=%.1f tps decode=%.1f tps tokens=%d]\n",
                 metrics.ttft_ms / 1000.0, metrics.tpot_ms,
                 metrics.prefill_tps, metrics.decode_tps,
                 metrics.generated_tokens);
@@ -54,12 +54,12 @@ bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
     history.push_back({"user", user_input});
     std::vector<int> prompt_ids = tokenizer.apply_chat(history);
     if (prompt_ids.empty()) {
-        std::fprintf(stderr, "chat: prompt is empty after tokenization\n");
+        std::fprintf(stderr, "Chat: prompt is empty after tokenization\n");
         history.pop_back();
         return false;
     }
 
-    std::printf("assistant> ");
+    std::printf("Assistant> ");
     std::fflush(stdout);
 
     GenerationResult result;
@@ -77,7 +77,7 @@ bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
         /*reset_context=*/false);
 
     if (!ok) {
-        std::fprintf(stderr, "\nchat: %s\n", error.c_str());
+        std::fprintf(stderr, "\nChat: %s\n", error.c_str());
         history.pop_back();
         return false;
     }
@@ -86,7 +86,7 @@ bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
     history.push_back({"assistant", result.text});
 
     GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
-    std::printf("\n[ttft=%.2fs tpot=%.1fms prefill=%.1f tps decode=%.1f tps tokens=%d ctx=%d]\n",
+    std::printf("\n\n[ttft=%.2fs tpot=%.1fms prefill=%.1f tps decode=%.1f tps tokens=%d ctx=%d]\n",
                 metrics.ttft_ms / 1000.0, metrics.tpot_ms,
                 metrics.prefill_tps, metrics.decode_tps,
                 metrics.generated_tokens, engine.past_len());
@@ -137,14 +137,14 @@ int main(int argc, char** argv) {
     // REPL mode: multi-turn conversation
     std::printf("mlllm_chat ready. prefill_seq_len=%d threads=%d ctx=%d\n",
                 prefill_seq_len, engine.config().num_threads, opts.n_ctx);
-    std::printf("Type /reset to clear context, /quit to exit.\n\n");
+    std::printf("Type /reset to clear context, /quit to exit.\n");
 
     std::vector<ChatMessage> history;
     history.push_back({"system", "You are a helpful assistant."});
 
     std::string line;
     while (true) {
-        std::printf("user> ");
+        std::printf("\nUser> ");
         std::fflush(stdout);
         if (!std::getline(std::cin, line)) break;
         if (line.empty()) continue;
@@ -153,9 +153,10 @@ int main(int argc, char** argv) {
             engine.reset();
             history.clear();
             history.push_back({"system", "You are a helpful assistant."});
-            std::printf("context cleared.\n");
+            std::printf("\nContext cleared.\n");
             continue;
         }
+        std::printf("\n");
         run_turn_multi(engine, tokenizer, history, line, opts.max_new_tokens);
     }
 
