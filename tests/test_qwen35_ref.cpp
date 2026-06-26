@@ -275,17 +275,57 @@ int main() {
         kernel_gdn_prefill(params, inputs, outputs, nullptr);
     }
 
+    // Debug: print head=0, seq=0 intermediate values
+    printf("\n  Debug head=0 seq=0:\n");
+    printf("  q_ml[0:3] = %.8e %.8e %.8e\n", q_ml[0], q_ml[1], q_ml[2]);
+    printf("  k_ml[0:3] = %.8e %.8e %.8e\n", k_ml[0], k_ml[1], k_ml[2]);
+    printf("  v_ml[0:3] = %.8e %.8e %.8e\n", v_ml[0], v_ml[1], v_ml[2]);
+    printf("  g_ml[0] = %.8e\n", g_ml[0]);
+    printf("  beta_ml[0] = %.8e\n", beta_ml[0]);
+    // After L2 norm (compute manually)
+    float q_ss = 0; for (int d = 0; d < k_dim; d++) q_ss += q_ml[d]*q_ml[d];
+    float q_inv = 1.0f/sqrtf(q_ss + 1e-6f);
+    float k_ss = 0; for (int d = 0; d < k_dim; d++) k_ss += k_ml[d]*k_ml[d];
+    float k_inv = 1.0f/sqrtf(k_ss + 1e-6f);
+    printf("  q_norm[0:3] = %.8e %.8e %.8e\n", q_ml[0]*q_inv, q_ml[1]*q_inv, q_ml[2]*q_inv);
+    printf("  k_norm[0:3] = %.8e %.8e %.8e\n", k_ml[0]*k_inv, k_ml[1]*k_inv, k_ml[2]*k_inv);
+    // Manual GDN for head=0, seq=0
+    {
+        float scale = 1.0f / sqrtf((float)k_dim);
+        float g_exp = expf(g_ml[0]);
+        float beta_t = beta_ml[0];
+        // state is all zeros, so kv_mem = 0, delta = v * beta
+        // state = outer(k_norm, v * beta)
+        // out = state.T @ q_norm * scale = (k_norm . q_norm) * v * beta * scale
+        float dot = 0;
+        for (int d = 0; d < k_dim; d++) dot += q_ml[d]*q_inv * k_ml[d]*k_inv;
+        printf("  k_norm . q_norm = %.8e\n", dot);
+        printf("  manual out[0:3] = %.8e %.8e %.8e\n",
+               dot * v_ml[0] * beta_t * scale,
+               dot * v_ml[1] * beta_t * scale,
+               dot * v_ml[2] * beta_t * scale);
+        printf("  kernel out[0:3] = %.8e %.8e %.8e\n",
+               out_ml[0], out_ml[1], out_ml[2]);
+        // ref
+        printf("  ref out[0:3]    = %.8e %.8e %.8e\n",
+               ref_core_attn_out[0], ref_core_attn_out[1], ref_core_attn_out[2]);
+    }
+
     // Compare GDN output — also check per-seq error
     // HF core_attn_out: [1, 4, 16, 128] = [batch, seq, heads, head_dim]
-    // mlllm out: [128, 4, 16] = [head_dim, seq, heads]
+    // kernel output: [head, seq, v_dim] = [16, 4, 128]
+    // HF expects: [seq, heads, v_dim] = [4, 16, 128]
     float* out_hf_layout = new float[seq_len * num_heads * v_dim]();
     for (int s = 0; s < seq_len; s++)
         for (int h = 0; h < num_heads; h++)
             for (int d = 0; d < v_dim; d++) {
-                int ml_idx = d * (seq_len * num_heads) + s * num_heads + h;
+                int ml_idx = h * (seq_len * v_dim) + s * v_dim + d;
                 int hf_idx = s * (num_heads * v_dim) + h * v_dim + d;
                 out_hf_layout[hf_idx] = out_ml[ml_idx];
             }
+    printf("  out_ml[0:3]     = %.8e %.8e %.8e\n", out_ml[0], out_ml[1], out_ml[2]);
+    printf("  out_hf[0:3]     = %.8e %.8e %.8e\n", out_hf_layout[0], out_hf_layout[1], out_hf_layout[2]);
+    printf("  ref[0:3]        = %.8e %.8e %.8e\n", ref_core_attn_out[0], ref_core_attn_out[1], ref_core_attn_out[2]);
 
     // Per-seq comparison
     for (int s = 0; s < seq_len; s++) {
