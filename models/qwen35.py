@@ -322,6 +322,8 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
                      i32=[num_heads, k_dim, v_dim, 1])  # use_qk_l2norm=1
 
     # ---- Gate: out = gdn_out * silu(z) ----
+    # gdn_out is [v_dim, seq, num_heads] → reshape to [num_heads*v_dim, seq]
+    gdn_out = g.reshape(gdn_out, (num_heads * v_dim, seq_len))
     z_silu = g.silu(z_out)
     gated = g.mul(gdn_out, z_silu)
 

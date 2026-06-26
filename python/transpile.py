@@ -144,7 +144,9 @@ class GraphBuilder:
     def constant(self, data: np.ndarray) -> int:
         shape = tuple(data.shape)
         prec = _numpy_to_precision(data.dtype)
-        nid = self._add(OpType.CONSTANT, [], shape, prec)
+        # Use a placeholder path that save() will replace with the actual
+        # const file path (basename_const_<id>.weights).
+        nid = self._add(OpType.CONSTANT, [], shape, prec, s=[f"__inline_const__"])
         self._nodes[nid].weight_data = data.copy()
         return nid
 
@@ -381,6 +383,14 @@ class GraphBuilder:
             if use_count[i] == 0 and node.op_type not in (OpType.INPUT, OpType.CONSTANT):
                 graph_outputs.append(node.id)
 
+        # Fix inline constant paths before serialization.
+        # Inline constants have weight_data set but need their params_str
+        # updated to point at the const file that will be written below.
+        for node in self._nodes:
+            if node.weight_data is not None:
+                const_fname = f"{os.path.basename(path_prefix)}_const_{node.id}.weights"
+                node.params_str = [const_fname]
+
         # write graph binary
         graph_path = f"{path_prefix}.graph"
         with open(graph_path, 'wb') as f:
@@ -427,8 +437,8 @@ class GraphBuilder:
         # write weight files for inline constants
         for node in self._nodes:
             if node.weight_data is not None:
-                wpath = os.path.join(os.path.dirname(path_prefix) or '.',
-                                     f"{os.path.basename(path_prefix)}_const_{node.id}.weights")
+                const_fname = f"{os.path.basename(path_prefix)}_const_{node.id}.weights"
+                wpath = os.path.join(os.path.dirname(path_prefix) or '.', const_fname)
                 _write_weight_file(wpath, node.weight_data)
 
 

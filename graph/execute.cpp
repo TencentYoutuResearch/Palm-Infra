@@ -503,6 +503,14 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             const Tensor& a = *inputs[0];
             const Tensor& b = *inputs[1];
+            if (!a.data || !b.data) {
+                fprintf(stderr, "MUL: null data! a.data=%p b.data=%p a_shape=[%lld,%lld,%lld,%lld] b_shape=[%lld,%lld,%lld,%lld] a_prec=%d b_prec=%d\n",
+                        a.data, b.data,
+                        a.shape[0], a.shape[1], a.shape[2], a.shape[3],
+                        b.shape[0], b.shape[1], b.shape[2], b.shape[3],
+                        (int)a.prec, (int)b.prec);
+                break;
+            }
             float* o = output->ptr<float>();
 #if HAS_NEON
             binary_stride_aware(o, a, b,
