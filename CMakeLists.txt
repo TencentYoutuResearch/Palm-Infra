@@ -27,6 +27,7 @@ set(SOURCES
     kernels/norm.cpp
     kernels/rope.cpp
     kernels/attention.cpp
+    kernels/gdn.cpp
     kernels/threading.cpp
     # engine
     engine/engine.cpp
@@ -121,6 +122,7 @@ if(MLLLM_BUILD_TESTS)
     add_mlllm_test(test_norm          tests/test_norm.cpp)
     add_mlllm_test(test_rope          tests/test_rope.cpp)
     add_mlllm_test(test_attention     tests/test_attention.cpp)
+    add_mlllm_test(test_gdn           tests/test_gdn.cpp)
     add_mlllm_test(test_engine        tests/test_engine.cpp)
     add_mlllm_test(test_tokenizer     tests/test_tokenizer.cpp)
     add_mlllm_test(test_e2e           tests/test_e2e.cpp)
