@@ -104,10 +104,18 @@ bool Tokenizer::load(const std::string& path) {
         merges_[{a, b}] = (int)i;
     }
 
+    // Auto-detect bos/eos from added_tokens.
+    // Supports both Llama-3 (<|begin_of_text|>/<|end_of_text|>) and
+    // Qwen3.5 (<|im_start|>/<|im_end|>) conventions.
     if (added_tokens_.count("<|begin_of_text|>"))
         bos_id_ = added_tokens_["<|begin_of_text|>"];
+    else if (added_tokens_.count("<|im_start|>"))
+        bos_id_ = added_tokens_["<|im_start|>"];
+
     if (added_tokens_.count("<|end_of_text|>"))
         eos_id_ = added_tokens_["<|end_of_text|>"];
+    else if (added_tokens_.count("<|im_end|>"))
+        eos_id_ = added_tokens_["<|im_end|>"];
 
     return true;
 }
@@ -583,24 +591,33 @@ std::vector<int> Tokenizer::apply_chat(const std::string& user_message) const {
 }
 
 std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages) const {
-    // Llama-3 chat format.
-    // Each message: <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
-    // The final assistant turn is left open (no <|eot_id|>) for the model to continue.
-    std::string prompt = "<|begin_of_text|>";
+    // Detect chat format from available special tokens.
+    // ChatML (Qwen3.5): <|im_start|>{role}\n{content}<|im_end|>\n
+    // Llama-3 (Youtu-LLM-2B): <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
+    bool use_chatml = (added_tokens_.count("<|im_start|>") > 0);
 
-    for (size_t i = 0; i < messages.size(); i++) {
-        const auto& msg = messages[i];
-        prompt += "<|start_header_id|>" + msg.role + "<|end_header_id|>\n\n" + msg.content;
+    std::string prompt;
+    if (use_chatml) {
+        // ChatML format (no BOS token for Qwen3.5)
+        for (size_t i = 0; i < messages.size(); i++) {
+            const auto& msg = messages[i];
+            prompt += "<|im_start|>" + msg.role + "\n" + msg.content + "<|im_end|>\n";
+        }
+        // Prime assistant response
+        prompt += "<|im_start|>assistant\n";
+    } else {
+        // Llama-3 format
+        prompt = "<|begin_of_text|>";
+        for (size_t i = 0; i < messages.size(); i++) {
+            const auto& msg = messages[i];
+            prompt += "<|start_header_id|>" + msg.role + "<|end_header_id|>\n\n" + msg.content;
 
-        // Close with <|eot_id|> unless this is the last message AND it's from "user"
-        // (leave assistant header open for generation).
-        bool is_last = (i == messages.size() - 1);
-        if (is_last && msg.role == "user") {
-            // Don't close — the model will generate the assistant response.
-            // But we need the assistant header to prime generation.
-            prompt += "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
-        } else {
-            prompt += "<|eot_id|>";
+            bool is_last = (i == messages.size() - 1);
+            if (is_last && msg.role == "user") {
+                prompt += "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+            } else {
+                prompt += "<|eot_id|>";
+            }
         }
     }
 

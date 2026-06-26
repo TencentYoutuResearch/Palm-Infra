@@ -68,6 +68,12 @@ def export_weights(weights: dict, weights_dir: str):
         if 'language_model' not in wname:
             continue
 
+        # Final norm (check before generic norm)
+        if wname.endswith('model.language_model.norm.weight'):
+            d = wdata.astype(np.float32) if wdata.dtype != np.float32 else wdata
+            save('final_norm', d)
+            continue
+
         # Norms → FP32
         if 'norm' in wname.lower() or 'layernorm' in wname.lower():
             d = wdata.astype(np.float32) if wdata.dtype != np.float32 else wdata
@@ -84,12 +90,6 @@ def export_weights(weights: dict, weights_dir: str):
         if 'embed_tokens' in wname:
             d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
             save('embed_tokens', d)
-            continue
-
-        # Final norm
-        if wname.endswith('model.language_model.norm.weight'):
-            d = wdata.astype(np.float32) if wdata.dtype != np.float32 else wdata
-            save('final_norm', d)
             continue
 
         # conv1d.weight → FP32 (used by ShortConv scalar kernel, needs FP32)
@@ -314,7 +314,8 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     beta_val = g.reshape(beta_val, (seq_len, num_heads))
 
     scale = k_dim ** -0.5
-    gdn_out = g._add(OpType.GATED_DELTANET_PREFILL,
+    gdn_op = OpType.GATED_DELTANET_DECODE if seq_len == 1 else OpType.GATED_DELTANET_PREFILL
+    gdn_out = g._add(gdn_op,
                      [q, k, v, g_val, beta_val, gs_in],
                      (v_dim, seq_len, num_heads),
                      prec=Precision.FP32,
@@ -354,33 +355,30 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     k = g.matmul(x, w_k)
     v = g.matmul(x, w_v)
 
-    # ---- QK norm (RMSNorm) ----
+    # ---- QK norm (RMSNorm per head) ----
+    # q_norm/k_norm weight shape: [head_dim]
+    # query before reshape: [num_heads*head_dim, seq] → reshape to [head_dim, num_heads*seq]
+    # RMSNorm operates on dim0 (head_dim), treating each column as a separate vector.
     w_qn = g.weight(os.path.join(weights_dir, f"{pfx}_q_norm_weight.weights"),
                     (head_dim,), Precision.FP32)
     w_kn = g.weight(os.path.join(weights_dir, f"{pfx}_k_norm_weight.weights"),
                     (head_dim,), Precision.FP32)
-    # TODO: need per-head RMSNorm — current rms_norm operates on entire tensor.
-    # For now, skip QK norm (will be implemented as a new op or per-head reshape).
-    # query = g.rms_norm(query, w_qn, eps=eps)
-    # k = g.rms_norm(k, w_kn, eps=eps)
+    query = g.reshape(query, (head_dim, num_heads * seq_len))
+    query = g.rms_norm(query, w_qn, eps=eps)
+    k = g.reshape(k, (head_dim, num_kv_heads * seq_len))
+    k = g.rms_norm(k, w_kn, eps=eps)
 
     # ---- Reshape for multi-head: [head_dim, seq, num_heads] ----
-    query = g.reshape(query, (head_dim, num_heads, seq_len))
-    query = g.permute(query, (0, 2, 1, 3))  # [head_dim, seq, num_heads]
-    k = g.reshape(k, (head_dim, num_kv_heads, seq_len))
-    k = g.permute(k, (0, 2, 1, 3))
-    v = g.reshape(v, (head_dim, num_kv_heads, seq_len))
-    v = g.permute(v, (0, 2, 1, 3))
+    query = g.reshape(query, (head_dim, seq_len, num_heads))
+    k = g.reshape(k, (head_dim, seq_len, num_kv_heads))
+    v = g.reshape(v, (head_dim, seq_len, num_kv_heads))
 
-    # ---- RoPE ----
-    # TODO: partial rotary (only 25% of head_dim). Current rope applies to full dim.
-    # Need to split query/key into rotary + non-rotary parts, apply rope to rotary part only.
-    # For now, skip RoPE (placeholder).
-    # query = g.rope(query, cos, sin, rope_dim=rope_dim)
-    # k = g.rope(k, cos, sin, rope_dim=rope_dim)
+    # ---- RoPE (partial: only rope_dim=64 out of head_dim=256) ----
+    # kernel_rope applies rotation to [0, rope_dim) and copies [rope_dim, D) unchanged.
+    query = g.rope(query, cos, sin, rope_dim=rope_dim, interleave=True)
+    k = g.rope(k, cos, sin, rope_dim=rope_dim, interleave=True)
 
     # ---- SDPA ----
-    # TODO: attn_output_gate requires sigmoid(gate) multiply after SDPA
     scale = head_dim ** -0.5
     attn, ck_out, cv_out = g.sdpa(
         query, k, v, mask, ck_in, cv_in,
@@ -388,15 +386,15 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
         num_heads=num_heads, num_kv_heads=num_kv_heads,
         head_dim=head_dim, v_head_dim=head_dim)
 
+    # ---- Reshape attn from [head_dim, seq, num_heads] → [num_heads*head_dim, seq] ----
+    attn = g.reshape(attn, (num_heads * head_dim, seq_len))
+
     # ---- Output gate: attn * sigmoid(gate) ----
-    # TODO: need sigmoid + mul. Can use silu as approximation or add sigmoid op.
-    # For now, skip gate (placeholder).
-    # gate = g.sigmoid(gate)  # need new op
-    # attn = g.mul(attn, gate)
+    # gate shape: [num_heads*head_dim, seq] — same as reshaped attn
+    gate_sigmoid = g.sigmoid(gate)
+    attn = g.mul(attn, gate_sigmoid)
 
     # ---- o_proj ----
-    # Reshape attn from [head_dim, seq, num_heads] → [num_heads*head_dim, seq]
-    attn = g.reshape(attn, (num_heads * head_dim, seq_len))
     w_o = g.weight(os.path.join(weights_dir, f"{pfx}_o_proj_weight.weights"),
                    (hidden_size, num_heads * head_dim), Precision.FP16)
     out = g.matmul(attn, w_o)

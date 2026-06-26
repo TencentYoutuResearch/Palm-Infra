@@ -296,14 +296,9 @@ static void dispatch_kernel(OpType op, const OpParams& params,
     }
     case OpType::SHORTCONV: {
         // ShortConv: depth-wise causal conv1d + silu.
-        // Inputs: [0]=x [groups, seq], [1]=weight [groups, kernel_size],
-        //         [2]=conv_state [groups, kernel_size-1] (persistent, in-place modified)
-        // Output: [0]=out [groups, seq]
-        // Params: i32[0]=kernel_size
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
             const Tensor& x = *inputs[0];
             const Tensor& w = *inputs[1];
-            // conv_state is input[2], modified in-place via data pointer.
             Tensor& out = *output;
 
             int kernel_size = graph_params::get_i32(params, 0, 4);

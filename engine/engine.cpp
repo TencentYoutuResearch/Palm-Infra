@@ -466,6 +466,10 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
         }
     }
 
+    // Release lm_head output buffer back to pool (prevents pool exhaustion
+    // across many decode steps — each lm_head allocates ~1MB for vocab=248K).
+    graph_prefill_.runtime.pool.release(c_buf, vocab_size * sizeof(float));
+
     return top5[0].id;
 }
 
