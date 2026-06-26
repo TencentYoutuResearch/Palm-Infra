@@ -3,6 +3,7 @@
 #include "kernels/norm.h"
 #include "kernels/rope.h"
 #include "kernels/attention.h"
+#include "kernels/gdn.h"
 #include "kernels/tensor.h"
 #include "kernels/activations.h"  // for Activation enum + sigmoid_f32_neon
 #include <algorithm>
@@ -281,6 +282,16 @@ static void dispatch_kernel(OpType op, const OpParams& params,
     case OpType::SDPA_MLA: {
         std::vector<Tensor*> sdpa_outs = { output };
         kernel_sdpa(params, inputs, sdpa_outs, thread_pool);
+        break;
+    }
+    case OpType::GATED_DELTANET_PREFILL: {
+        std::vector<Tensor*> gdn_outs = { output };
+        kernel_gdn_prefill(params, inputs, gdn_outs, thread_pool);
+        break;
+    }
+    case OpType::GATED_DELTANET_DECODE: {
+        std::vector<Tensor*> gdn_outs = { output };
+        kernel_gdn_decode(params, inputs, gdn_outs, thread_pool);
         break;
     }
     case OpType::ROTARY_EMBED:

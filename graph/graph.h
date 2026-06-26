@@ -57,8 +57,8 @@ enum class OpType : uint32_t {
 
     // ---- Phase 2+ (reserved) ----
     // FLASH_ATTN         = 100,
-    // GATED_DELTANET_DECODE  = 110,
-    // GATED_DELTANET_PREFILL = 111,
+    GATED_DELTANET_DECODE  = 110,
+    GATED_DELTANET_PREFILL = 111,
     // MOE_DISPATCH       = 120,
     // MOE_COMBINE        = 121,
     // GATED_ATTENTION    = 130,
@@ -86,6 +86,8 @@ inline const char* op_type_name(OpType op) {
     case OpType::MUL: return "MUL";
     case OpType::QUANTIZE_KV: return "QUANTIZE_KV";
     case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";
+    case OpType::GATED_DELTANET_DECODE: return "GATED_DELTANET_DECODE";
+    case OpType::GATED_DELTANET_PREFILL: return "GATED_DELTANET_PREFILL";
     }
     return "UNKNOWN";
 }

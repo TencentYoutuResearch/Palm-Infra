@@ -104,7 +104,7 @@ static bool test_prefill_basic() {
     OpParams params;
     params.i32 = {num_heads, k_dim, v_dim, 0}; // use_l2norm=0
     std::vector<const Tensor*> inputs = {&q_t, &k_t, &v_t, &g_t, &beta_t, &state_t};
-    std::vector<Tensor*> outputs = {&state_t, &out_t};
+    std::vector<Tensor*> outputs = {&out_t};
     kernel_gdn_prefill(params, inputs, outputs, nullptr);
 
     // Compare
@@ -167,7 +167,7 @@ static bool test_decode_basic() {
     OpParams params;
     params.i32 = {num_heads, k_dim, v_dim, 0};
     std::vector<const Tensor*> inputs = {&q_t, &k_t, &v_t, &g_t, &beta_t, &state_t};
-    std::vector<Tensor*> outputs = {&state_t, &out_t};
+    std::vector<Tensor*> outputs = {&out_t};
     kernel_gdn_decode(params, inputs, outputs, nullptr);
 
     bool ok = true;
@@ -223,7 +223,7 @@ static bool test_prefill_then_decode() {
     OpParams params;
     params.i32 = {num_heads, k_dim, v_dim, 0};
     std::vector<const Tensor*> inputs = {&q_t, &k_t, &v_t, &g_t, &beta_t, &state_t};
-    std::vector<Tensor*> outputs = {&state_t, &out_t};
+    std::vector<Tensor*> outputs = {&out_t};
     kernel_gdn_prefill(params, inputs, outputs, nullptr);
 
     // Now decode one more token using the updated state
@@ -240,10 +240,9 @@ static bool test_prefill_then_decode() {
     Tensor beta_dt = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 1, num_heads, 1, 1, beta_d);
     float* out_d_buf = new float[num_heads * v_dim]();
     Tensor out_dt = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, v_dim, 1, num_heads, 1, out_d_buf);
-    memset(out_d_buf, 0, num_heads * v_dim * sizeof(float));
 
     std::vector<const Tensor*> inputs_d = {&q_dt, &k_dt, &v_dt, &g_dt, &beta_dt, &state_t};
-    std::vector<Tensor*> outputs_d = {&state_t, &out_dt};
+    std::vector<Tensor*> outputs_d = {&out_dt};
     kernel_gdn_decode(params, inputs_d, outputs_d, nullptr);
 
     // Verify: decode output should be non-trivial (state was updated by prefill)
