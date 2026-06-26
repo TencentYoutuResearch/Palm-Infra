@@ -10,19 +10,15 @@
 namespace {
 
 bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
-                       const std::string& prompt, int prefill_seq_len,
+                       const std::string& prompt, int /*prefill_seq_len*/,
                        int max_new_tokens) {
     std::vector<int> prompt_ids = tokenizer.apply_chat(prompt);
     if (prompt_ids.empty()) {
         std::fprintf(stderr, "chat: prompt is empty after tokenization\n");
         return false;
     }
-    if ((int)prompt_ids.size() > prefill_seq_len) {
-        std::fprintf(stderr,
-                     "chat: prompt too long (%zu tokens > prefill seq_len %d)\n",
-                     prompt_ids.size(), prefill_seq_len);
-        return false;
-    }
+    // No length check here — engine.prefill() handles chunked prefill for
+    // prompts longer than graph_seq_len.
 
     std::printf("assistant> ");
     std::fflush(stdout);
