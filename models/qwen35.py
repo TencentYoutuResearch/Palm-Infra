@@ -306,12 +306,11 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     # ---- GDN op ----
     # g_val is [num_heads, seq] (shape [16, seq, 1, 1] after add/softplus)
     # beta_val is [num_heads, seq]
-    # Need to reshape to [seq, num_heads] for the kernel.
-    g_val = g.permute(g_val, (1, 0, 2, 3))  # [seq, num_heads, 1, 1] → [num_heads, seq, 1, 1]→ hmm
-    # Actually g_val started as A_log [16,1,1,1] broadcast with sp [16,seq,1,1] → [16,seq,1,1].
-    # Kernel expects [seq, num_heads]. Need reshape.
-    g_val = g.reshape(g_val, (seq_len, num_heads))
-    beta_val = g.reshape(beta_val, (seq_len, num_heads))
+    # g_val is [num_heads, seq, 1, 1], beta_val is [num_heads, seq, 1, 1].
+    # GDN kernel expects [num_heads, seq] (reads g_data + h * seq_len).
+    # Just reshape — no permute needed.
+    g_val = g.reshape(g_val, (num_heads, seq_len))
+    beta_val = g.reshape(beta_val, (num_heads, seq_len))
 
     scale = k_dim ** -0.5
     gdn_op = OpType.GATED_DELTANET_DECODE if seq_len == 1 else OpType.GATED_DELTANET_PREFILL
@@ -321,8 +320,15 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
                      prec=Precision.FP32,
                      i32=[num_heads, k_dim, v_dim, 1])  # use_qk_l2norm=1
 
-    # ---- Gate: out = gdn_out * silu(z) ----
-    # gdn_out is [v_dim, seq, num_heads] → reshape to [num_heads*v_dim, seq]
+    # ---- RMSNormGated: norm(gdn_out) * silu(z) ----
+    # HF: core_attn_out = self.norm(core_attn_out, z)
+    #     = rms_norm(core_attn_out, norm.weight) * silu(z)
+    # gdn_out is [v_dim, seq, num_heads] → reshape to [v_dim, num_heads*seq]
+    # for per-head RMSNorm (dim0 = v_dim), then reshape back.
+    w_norm = g.weight(os.path.join(weights_dir, f"{pfx}_norm_weight.weights"),
+                     (v_dim,), Precision.FP32)
+    gdn_out = g.reshape(gdn_out, (v_dim, num_heads * seq_len))
+    gdn_out = g.rms_norm(gdn_out, w_norm, eps=eps)
     gdn_out = g.reshape(gdn_out, (num_heads * v_dim, seq_len))
     z_silu = g.silu(z_out)
     gated = g.mul(gdn_out, z_silu)
