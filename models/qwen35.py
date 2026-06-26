@@ -295,13 +295,17 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     # q = qkv[0 : 16*128, :], k = qkv[16*128 : 32*128, :], v = qkv[32*128 : 48*128, :]
     qkv_dim = num_heads * k_dim  # 16 * 128 = 2048
     q, k, v = g.slice(qkv_conv, [qkv_dim, qkv_dim, qkv_dim], dim=0)
-    # q, k are [qkv_dim, seq] = [16*128, seq], reshaped to [k_dim, seq, num_heads]
-    q = g.reshape(q, (k_dim, num_heads, seq_len))
-    q = g.permute(q, (0, 2, 1, 3))  # [k_dim, seq, num_heads]
-    k = g.reshape(k, (k_dim, num_heads, seq_len))
+    # q/k/v are [qkv_dim, seq] = [16*128, seq]
+    # GDN kernel expects [head, seq, k_dim] = [16, seq, 128]
+    # qkv_dim flat order: head0_dim0, head0_dim1, ..., head0_dim127, head1_dim0, ...
+    # = [head, k_dim] per seq position
+    # reshape to [head, k_dim, seq] then permute to [head, seq, k_dim]
+    q = g.reshape(q, (num_heads, k_dim, seq_len))
+    q = g.permute(q, (0, 2, 1, 3))  # [head, seq, k_dim]
+    k = g.reshape(k, (num_heads, k_dim, seq_len))
     k = g.permute(k, (0, 2, 1, 3))
-    v = g.reshape(v, (v_dim, num_heads, seq_len))
-    v = g.permute(v, (0, 2, 1, 3))
+    v = g.reshape(v, (num_heads, v_dim, seq_len))
+    v = g.permute(v, (0, 2, 1, 3))  # [head, seq, v_dim]
 
     # ---- GDN op ----
     # g_val is [num_heads, seq] (shape [16, seq, 1, 1] after add/softplus)
@@ -316,15 +320,21 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     gdn_op = OpType.GATED_DELTANET_DECODE if seq_len == 1 else OpType.GATED_DELTANET_PREFILL
     gdn_out = g._add(gdn_op,
                      [q, k, v, g_val, beta_val, gs_in],
-                     (v_dim, seq_len, num_heads),
+                     (v_dim, seq_len, num_heads),  # kernel writes [head, seq, v_dim] but Tensor shape is [v_dim, seq, heads]
                      prec=Precision.FP32,
                      i32=[num_heads, k_dim, v_dim, 1])  # use_qk_l2norm=1
 
     # ---- RMSNormGated: norm(gdn_out) * silu(z) ----
     # HF: core_attn_out = self.norm(core_attn_out, z)
     #     = rms_norm(core_attn_out, norm.weight) * silu(z)
-    # gdn_out is [v_dim, seq, num_heads] → reshape to [v_dim, num_heads*seq]
-    # for per-head RMSNorm (dim0 = v_dim), then reshape back.
+    # Kernel output layout: [head, seq, v_dim] in memory.
+    # Tensor shape declared as (v_dim, seq, num_heads) but actual data is [head, seq, v_dim].
+    # Need to reshape to [v_dim, num_heads*seq] for per-head RMSNorm.
+    # But reshape preserves flat order: [head, seq, v_dim] flat = head0_seq0_v0..v127, head0_seq1_v0.., head1_seq0_v0..
+    # = [head, seq*v_dim] if we think of it as [head, seq*v_dim]
+    # For rms_norm on v_dim: need [v_dim, num_heads*seq] where each column is (head, seq) combo.
+    # [head, seq, v_dim] → permute to [v_dim, seq, head] → reshape to [v_dim, seq*head]
+    gdn_out = g.permute(gdn_out, (2, 1, 0, 3))  # [v_dim, seq, head, 1]
     w_norm = g.weight(os.path.join(weights_dir, f"{pfx}_norm_weight.weights"),
                      (v_dim,), Precision.FP32)
     gdn_out = g.reshape(gdn_out, (v_dim, num_heads * seq_len))
