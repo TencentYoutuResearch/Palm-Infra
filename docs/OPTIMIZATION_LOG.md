@@ -1527,15 +1527,17 @@ causal mask key range = [0, past+cur)）。如果 `past + n > graph_seq_len` 返
 
 ## Qwen3.5-0.8B llama.cpp baseline (FP16, M5 Pro, 4 threads)
 
-| 测试 | t/s |
-|------|-----|
-| pp512 (prefill) | **815** |
-| tg128 (decode) | **99** |
-
 llama.cpp build: 5c7c22c3e (9803), BLAS backend, Qwen3.5-0.8B-F16.gguf
-3-run: pp512=813-816, tg128=98-99
 
-注：Qwen3.5-0.8B 是 772M 参数模型（vs Youtu-LLM-2B 的 ~2B），pp512 是 512-token prefill。
-这个 baseline 后续用于对比 mlllm 在 Qwen3.5 上的性能。
+| 测试 | t/s | 备注 |
+|------|-----|------|
+| pp512 | **815** ± 21 | 3-run: 813-816 |
+| tg128 | **99** ± 1 | 3-run: 98-99 |
+| pp256* | ~815 (估) | 未单独测，prefill compute-bound，tps 与 seq_len 弱相关 |
+| tg64* | ~99 (估) | 未单独测，decode per-token bound |
+
+注：Qwen3.5-0.8B 是 772M 参数模型（vs Youtu-LLM-2B 的 ~2B）。
+pp = prompt processing (prefill), tg = text generation (decode)。
+mlllm 对比时用 pp256 + tg64（与 Youtu-LLM-2B 测试协议一致）。
 
 ---
