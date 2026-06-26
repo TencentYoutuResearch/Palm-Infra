@@ -498,6 +498,151 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         }
         break;
 
+    case OpType::SIGMOID:
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            float* o = output->ptr<float>();
+#if HAS_NEON
+            unary_stride_aware(o, *inputs[0],
+                [](float32x4_t x) { return sigmoid_f32_neon(x); });
+#else
+            const Tensor& src = *inputs[0];
+            const char* src_base = static_cast<const char*>(src.data);
+            StrideIter it = compute_stride_iter(src);
+            float* dst_row = o;
+            for (int i3 = 0; i3 < it.d3; i3++) {
+                const char* p3 = src_base + i3 * it.s3;
+                for (int i2 = 0; i2 < it.d2; i2++) {
+                    const char* p2 = p3 + i2 * it.s2;
+                    for (int i1 = 0; i1 < it.d1; i1++) {
+                        const float* sp = reinterpret_cast<const float*>(p2 + i1 * it.s1);
+                        for (int i = 0; i < it.n_inner; i++)
+                            dst_row[i] = 1.f / (1.f + std::exp(-sp[i]));
+                        dst_row += it.n_inner;
+                    }
+                }
+            }
+#endif
+        }
+        break;
+
+    case OpType::EXP:
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            float* o = output->ptr<float>();
+#if HAS_NEON
+            unary_stride_aware(o, *inputs[0],
+                [](float32x4_t x) {
+                    // Reuse fast_exp from sigmoid: exp(x) = sigmoid(x) / (1 - sigmoid(x))
+                    // But simpler: use the polynomial exp approximation directly.
+                    // Clamp to avoid overflow.
+                    x = vmaxq_f32(x, vdupq_n_f32(-88.f));
+                    x = vminq_f32(x, vdupq_n_f32(88.f));
+                    const float32x4_t log2e = vdupq_n_f32(1.4426950408889634f);
+                    float32x4_t t = vmulq_f32(x, log2e);
+                    float32x4_t n = vrndmq_f32(t);
+                    float32x4_t f = vsubq_f32(t, n);
+                    int32x4_t ni = vcvtq_s32_f32(n);
+                    float32x4_t pow2n = vreinterpretq_f32_s32(
+                        vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23));
+                    const float32x4_t c0 = vdupq_n_f32(1.0f);
+                    const float32x4_t c1 = vdupq_n_f32(0.6931472f);
+                    const float32x4_t c2 = vdupq_n_f32(0.2402265f);
+                    const float32x4_t c3 = vdupq_n_f32(0.0555049f);
+                    const float32x4_t c4 = vdupq_n_f32(0.0096813f);
+                    float32x4_t pow2f = vfmaq_f32(c3, c4, f);
+                    pow2f = vfmaq_f32(c2, pow2f, f);
+                    pow2f = vfmaq_f32(c1, pow2f, f);
+                    pow2f = vfmaq_f32(c0, pow2f, f);
+                    return vmulq_f32(pow2n, pow2f);
+                });
+#else
+            const Tensor& src = *inputs[0];
+            const char* src_base = static_cast<const char*>(src.data);
+            StrideIter it = compute_stride_iter(src);
+            float* dst_row = o;
+            for (int i3 = 0; i3 < it.d3; i3++) {
+                const char* p3 = src_base + i3 * it.s3;
+                for (int i2 = 0; i2 < it.d2; i2++) {
+                    const char* p2 = p3 + i2 * it.s2;
+                    for (int i1 = 0; i1 < it.d1; i1++) {
+                        const float* sp = reinterpret_cast<const float*>(p2 + i1 * it.s1);
+                        for (int i = 0; i < it.n_inner; i++)
+                            dst_row[i] = std::exp(sp[i]);
+                        dst_row += it.n_inner;
+                    }
+                }
+            }
+#endif
+        }
+        break;
+
+    case OpType::SOFTPLUS:
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            float* o = output->ptr<float>();
+#if HAS_NEON
+            unary_stride_aware(o, *inputs[0],
+                [](float32x4_t x) {
+                    // softplus(x) = log(1 + exp(x))
+                    // For large x, softplus ≈ x. For small x, ≈ exp(x).
+                    x = vmaxq_f32(x, vdupq_n_f32(-20.f));
+                    x = vminq_f32(x, vdupq_n_f32(20.f));
+                    // exp(x) via the same polynomial as EXP
+                    const float32x4_t log2e = vdupq_n_f32(1.4426950408889634f);
+                    float32x4_t t = vmulq_f32(x, log2e);
+                    float32x4_t n = vrndmq_f32(t);
+                    float32x4_t f = vsubq_f32(t, n);
+                    int32x4_t ni = vcvtq_s32_f32(n);
+                    float32x4_t pow2n = vreinterpretq_f32_s32(
+                        vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23));
+                    const float32x4_t c0 = vdupq_n_f32(1.0f);
+                    const float32x4_t c1 = vdupq_n_f32(0.6931472f);
+                    const float32x4_t c2 = vdupq_n_f32(0.2402265f);
+                    const float32x4_t c3 = vdupq_n_f32(0.0555049f);
+                    const float32x4_t c4 = vdupq_n_f32(0.0096813f);
+                    float32x4_t pow2f = vfmaq_f32(c3, c4, f);
+                    pow2f = vfmaq_f32(c2, pow2f, f);
+                    pow2f = vfmaq_f32(c1, pow2f, f);
+                    pow2f = vfmaq_f32(c0, pow2f, f);
+                    float32x4_t ex = vmulq_f32(pow2n, pow2f);
+                    // log(1 + ex) — approximate via log2:
+                    // log2(1+ex) ≈ log2(max(ex, 1)) for ex >> 1
+                    // But for correctness, use: vlogq_f32 if available, else scalar fallback.
+                    // NEON doesn't have vlogq_f32, so we do scalar for the log part.
+                    // Fast path: if x > 10, return x (softplus ≈ x).
+                    float32x4_t mask_large = vcgtq_f32(x, vdupq_n_f32(10.f));
+                    float32x4_t result = x;  // fallback for large x
+                    // For smaller values, compute log(1+exp) scalar.
+                    float tmp[4];
+                    vst1q_f32(tmp, ex);
+                    for (int i = 0; i < 4; i++) tmp[i] = std::log1pf(tmp[i]);
+                    float32x4_t log_result = vld1q_f32(tmp);
+                    // Select: large x → x, small x → log(1+exp)
+                    return vbslq_f32(mask_large, result, log_result);
+                });
+#else
+            const Tensor& src = *inputs[0];
+            const char* src_base = static_cast<const char*>(src.data);
+            StrideIter it = compute_stride_iter(src);
+            float* dst_row = o;
+            for (int i3 = 0; i3 < it.d3; i3++) {
+                const char* p3 = src_base + i3 * it.s3;
+                for (int i2 = 0; i2 < it.d2; i2++) {
+                    const char* p2 = p3 + i2 * it.s2;
+                    for (int i1 = 0; i1 < it.d1; i1++) {
+                        const float* sp = reinterpret_cast<const float*>(p2 + i1 * it.s1);
+                        for (int i = 0; i < it.n_inner; i++) {
+                            float v = sp[i];
+                            if (v > 20.f) dst_row[i] = v;
+                            else if (v < -20.f) dst_row[i] = std::exp(v);
+                            else dst_row[i] = std::log1pf(std::exp(v));
+                        }
+                        dst_row += it.n_inner;
+                    }
+                }
+            }
+#endif
+        }
+        break;
+
     case OpType::SLICE:
         // zero-copy: slice produces a view of the parent and must preserve the
         // parent's stride layout.

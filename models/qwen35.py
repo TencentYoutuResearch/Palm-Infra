@@ -239,58 +239,89 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     """Build a linear attention (Gated Delta Rule) layer."""
     pfx = f'model_language_model_layers_{layer_idx}_linear_attn'
 
-    # ---- in_proj_qkv: x → [6144, seq] = 3 × (16 × 128) ----
+    # ---- Projections ----
     w_qkv = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_qkv_weight.weights"),
                      (num_heads * k_dim * 3, hidden_size), Precision.FP16)
-    qkv = g.matmul(x, w_qkv)
+    qkv = g.matmul(x, w_qkv)  # [16*128*3, seq]
 
-    # ---- in_proj_a: x → [16, seq] (delta rate) ----
     w_a = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_a_weight.weights"),
                    (num_heads, hidden_size), Precision.FP16)
     a_out = g.matmul(x, w_a)  # [16, seq]
 
-    # ---- in_proj_b: x → [16, seq] (beta) ----
     w_b = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_b_weight.weights"),
                    (num_heads, hidden_size), Precision.FP16)
     b_out = g.matmul(x, w_b)  # [16, seq]
 
-    # ---- in_proj_z: x → [2048, seq] (gate) ----
     w_z = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_z_weight.weights"),
                    (num_heads * v_dim, hidden_size), Precision.FP16)
-    z_out = g.matmul(x, w_z)  # [16×128, seq]
+    z_out = g.matmul(x, w_z)  # [16*128, seq]
 
-    # TODO: compute g = -exp(A_log) * softplus(a + dt_bias)
-    #       beta = sigmoid(b)
-    #       short conv on qkv (conv1d + silu)
-    #       split qkv into q, k, v
-    #       L2 norm q, k
-    #       GDN op
-    #       gate: out * silu(z)
-    #       out_proj
-    #
-    # For now, this is a placeholder — the GDN op + short conv + g/beta computation
-    # need to be wired up once the graph builder supports them.
-    #
-    # The full pipeline:
-    #   qkv_conv = shortconv(conv1d.weight, qkv, gc_in)  → silu
-    #   q, k, v = split(qkv_conv, [num_heads*k_dim]*3)
-    #   g = -exp(A_log) * softplus(a + dt_bias)  (element-wise)
-    #   beta = sigmoid(b)
-    #   gdn_out = GATED_DELTANET_PREFILL(q, k, v, g, beta, gs_in)
-    #   gated = gdn_out * silu(z_out)
-    #   out = out_proj(gated)
-    #
-    # This requires:
-    #   1. A new "element-wise op" for g/beta computation (exp, softplus, sigmoid, multiply)
-    #   2. ShortConv op or inline in GDN
-    #   3. GDN op dispatch
-    #
-    # For Phase 3, we'll implement these step by step.
+    # ---- A_log and dt_bias (per-head constants) ----
+    A_log = g.weight(os.path.join(weights_dir, f"{pfx}_A_log.weights"),
+                     (num_heads,), Precision.FP32)
+    dt_bias = g.weight(os.path.join(weights_dir, f"{pfx}_dt_bias.weights"),
+                       (num_heads,), Precision.FP32)
 
-    # Placeholder: just return out_proj of z_out (wrong, but lets graph compile)
+    # ---- Compute g = -exp(A_log) * softplus(a + dt_bias) ----
+    # A_log is [16], dt_bias is [16]. Need to broadcast to [16, seq].
+    # a_out is [16, seq]. We need a + dt_bias (broadcast dt_bias across seq).
+    # Use scalar_add per-head? No — dt_bias is per-head, a_out is [16, seq].
+    # Since A_log/dt_bias are CONSTANT nodes (shape [16, 1, 1, 1]),
+    # and a_out is [16, seq, 1, 1], ADD will broadcast.
+    # But ADD broadcasts by taking max of each dim — [16,1,1,1] + [16,seq,1,1] → [16,seq,1,1]. OK.
+    a_plus_dt = g.add(a_out, dt_bias)
+    sp = g.softplus(a_plus_dt)          # softplus(a + dt_bias)
+    neg_exp_A = g.scalar_mul(g.exp(A_log), -1.0)  # -exp(A_log)
+    g_val = g.mul(neg_exp_A, sp)        # g = -exp(A_log) * softplus(a + dt_bias)
+
+    # ---- Compute beta = sigmoid(b) ----
+    beta_val = g.sigmoid(b_out)
+
+    # ---- Short conv on qkv (conv1d + silu) ----
+    # TODO: implement short conv as a separate op or inline.
+    # For now, skip conv (use raw qkv). Will be added as SHORTCONV op.
+    # The conv1d weight is [6144, 1, 4] — kernel_size=4.
+    # conv_state [6144, 3] is for cross-chunk continuity.
+    qkv_conv = qkv  # placeholder: no conv yet
+
+    # ---- Split qkv into q, k, v ----
+    # qkv layout: [num_heads*k_dim*3, seq] = [16*128*3, seq]
+    # q = qkv[0 : 16*128, :], k = qkv[16*128 : 32*128, :], v = qkv[32*128 : 48*128, :]
+    qkv_dim = num_heads * k_dim  # 16 * 128 = 2048
+    q, k, v = g.slice(qkv_conv, [qkv_dim, qkv_dim, qkv_dim], dim=0)
+    # q, k are [qkv_dim, seq] = [16*128, seq], reshaped to [k_dim, seq, num_heads]
+    q = g.reshape(q, (k_dim, num_heads, seq_len))
+    q = g.permute(q, (0, 2, 1, 3))  # [k_dim, seq, num_heads]
+    k = g.reshape(k, (k_dim, num_heads, seq_len))
+    k = g.permute(k, (0, 2, 1, 3))
+    v = g.reshape(v, (v_dim, num_heads, seq_len))
+    v = g.permute(v, (0, 2, 1, 3))
+
+    # ---- GDN op ----
+    # g_val is [num_heads, seq] (shape [16, seq, 1, 1] after add/softplus)
+    # beta_val is [num_heads, seq]
+    # Need to reshape to [seq, num_heads] for the kernel.
+    g_val = g.permute(g_val, (1, 0, 2, 3))  # [seq, num_heads, 1, 1] → [num_heads, seq, 1, 1]→ hmm
+    # Actually g_val started as A_log [16,1,1,1] broadcast with sp [16,seq,1,1] → [16,seq,1,1].
+    # Kernel expects [seq, num_heads]. Need reshape.
+    g_val = g.reshape(g_val, (seq_len, num_heads))
+    beta_val = g.reshape(beta_val, (seq_len, num_heads))
+
+    scale = k_dim ** -0.5
+    gdn_out = g._add(OpType.GATED_DELTANET_PREFILL,
+                     [q, k, v, g_val, beta_val, gs_in],
+                     (v_dim, seq_len, num_heads),
+                     prec=Precision.FP32,
+                     i32=[num_heads, k_dim, v_dim, 1])  # use_qk_l2norm=1
+
+    # ---- Gate: out = gdn_out * silu(z) ----
+    z_silu = g.silu(z_out)
+    gated = g.mul(gdn_out, z_silu)
+
+    # ---- out_proj ----
     w_out = g.weight(os.path.join(weights_dir, f"{pfx}_out_proj_weight.weights"),
                      (hidden_size, num_heads * v_dim), Precision.FP16)
-    out = g.matmul(z_out, w_out)
+    out = g.matmul(gated, w_out)
     return out
 
 

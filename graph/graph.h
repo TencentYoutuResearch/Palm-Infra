@@ -50,6 +50,9 @@ enum class OpType : uint32_t {
     // element-wise
     ADD = 70,
     MUL = 71,
+    SIGMOID  = 72,   // 1 / (1 + exp(-x))
+    EXP      = 73,   // exp(x)
+    SOFTPLUS = 74,   // log(1 + exp(x))
 
     // KV cache
     QUANTIZE_KV   = 80,
@@ -84,6 +87,9 @@ inline const char* op_type_name(OpType op) {
     case OpType::TILE: return "TILE";
     case OpType::ADD: return "ADD";
     case OpType::MUL: return "MUL";
+    case OpType::SIGMOID: return "SIGMOID";
+    case OpType::EXP: return "EXP";
+    case OpType::SOFTPLUS: return "SOFTPLUS";
     case OpType::QUANTIZE_KV: return "QUANTIZE_KV";
     case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";
     case OpType::GATED_DELTANET_DECODE: return "GATED_DELTANET_DECODE";

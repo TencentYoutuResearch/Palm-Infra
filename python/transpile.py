@@ -48,8 +48,13 @@ class OpType(IntEnum):
     TILE           = 64
     ADD            = 70
     MUL            = 71
+    SIGMOID        = 72
+    EXP            = 73
+    SOFTPLUS       = 74
     QUANTIZE_KV    = 80
     DEQUANTIZE_KV  = 81
+    GATED_DELTANET_DECODE  = 110
+    GATED_DELTANET_PREFILL = 111
 
 class Precision(IntEnum):
     FP32 = 0
@@ -189,6 +194,18 @@ class GraphBuilder:
         return self._add(OpType.GELU, [x], self._nodes[x].out_shape,
                          prec=self._nodes[x].out_prec)
 
+    def sigmoid(self, x: int) -> int:
+        return self._add(OpType.SIGMOID, [x], self._nodes[x].out_shape,
+                         prec=self._nodes[x].out_prec)
+
+    def exp(self, x: int) -> int:
+        return self._add(OpType.EXP, [x], self._nodes[x].out_shape,
+                         prec=self._nodes[x].out_prec)
+
+    def softplus(self, x: int) -> int:
+        return self._add(OpType.SOFTPLUS, [x], self._nodes[x].out_shape,
+                         prec=self._nodes[x].out_prec)
+
     # ---- position encoding ----
 
     def rope(self, x: int, cos: int, sin: int,
@@ -305,6 +322,16 @@ class GraphBuilder:
         out = tuple(max(sa[i], sb[i]) for i in range(4))
         return self._add(OpType.MUL, [a, b], out,
                          prec=self._nodes[a].out_prec)
+
+    def scalar_mul(self, a: int, scalar: float) -> int:
+        """Multiply tensor by a scalar (creates a 1-element CONSTANT node)."""
+        scalar_node = self.constant(np.array([scalar], dtype=np.float32))
+        return self.mul(a, scalar_node)
+
+    def scalar_add(self, a: int, scalar: float) -> int:
+        """Add a scalar to a tensor (creates a 1-element CONSTANT node)."""
+        scalar_node = self.constant(np.array([scalar], dtype=np.float32))
+        return self.add(a, scalar_node)
 
     # ---- save ----
 

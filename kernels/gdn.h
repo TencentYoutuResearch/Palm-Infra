@@ -20,8 +20,8 @@
 //   [0] q       [k_head_dim, seq, num_heads] FP32
 //   [1] k       [k_head_dim, seq, num_heads] FP32
 //   [2] v       [v_head_dim, seq, num_heads] FP32
-//   [3] g       [seq, num_heads] FP32
-//   [4] beta    [seq, num_heads] FP32
+//   [3] g       [seq, num_heads] FP32 (decay, pre-computed: -exp(A_log)*softplus(a+dt_bias))
+//   [4] beta    [seq, num_heads] FP32 (pre-computed: sigmoid(b))
 //   [5] state   [v_head_dim, k_head_dim, num_heads] FP32 (in-place modified)
 //
 // Output:
