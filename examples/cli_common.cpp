@@ -58,6 +58,9 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         } else if (arg == "--prompt") {
             if (!require_value(argc, argv, i, "--prompt", value, error)) return false;
             opts.prompt = value;
+        } else if (arg == "--prompt-file") {
+            if (!require_value(argc, argv, i, "--prompt-file", value, error)) return false;
+            opts.prompt_file = value;
         } else if (arg == "--prompt-tokens") {
             if (!require_value(argc, argv, i, "--prompt-tokens", value, error)) return false;
             if (!parse_int(value, opts.prompt_tokens) || opts.prompt_tokens < 1) {
@@ -124,6 +127,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("Usage: %s --tokenizer <tokenizer.json> --artifacts <dir> [options]\n", program_name);
     std::printf("Options:\n");
     std::printf("  --prompt <text>           Run one prompt and exit\n");
+    std::printf("  --prompt-file <path>      Read prompt text from file, run and exit\n");
     std::printf("  --prompt-tokens <int>     Use N dummy tokens (skip chat template)\n");
     std::printf("  --max-new-tokens <int>    Default: 128\n");
     std::printf("  --n-ctx <int>             Default: 4096\n");

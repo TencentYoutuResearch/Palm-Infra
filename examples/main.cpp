@@ -1,7 +1,9 @@
 #include "examples/cli_common.h"
 
 #include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -117,9 +119,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Single-shot mode: --prompt "text"
-    if (!opts.prompt.empty()) {
-        return run_prompt_single(engine, tokenizer, opts.prompt,
+    // Single-shot mode: --prompt "text" or --prompt-file <path>
+    std::string prompt_text = opts.prompt;
+    if (prompt_text.empty() && !opts.prompt_file.empty()) {
+        std::ifstream f(opts.prompt_file);
+        if (!f) {
+            std::fprintf(stderr, "chat: cannot open --prompt-file: %s\n", opts.prompt_file.c_str());
+            return 1;
+        }
+        std::stringstream ss;
+        ss << f.rdbuf();
+        prompt_text = ss.str();
+    }
+    if (!prompt_text.empty()) {
+        return run_prompt_single(engine, tokenizer, prompt_text,
                                   prefill_seq_len, opts.max_new_tokens)
                    ? 0
                    : 1;
