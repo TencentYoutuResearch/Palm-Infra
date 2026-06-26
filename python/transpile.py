@@ -55,6 +55,7 @@ class OpType(IntEnum):
     DEQUANTIZE_KV  = 81
     GATED_DELTANET_DECODE  = 110
     GATED_DELTANET_PREFILL = 111
+    SHORTCONV      = 140
 
 class Precision(IntEnum):
     FP32 = 0
@@ -332,6 +333,24 @@ class GraphBuilder:
         """Add a scalar to a tensor (creates a 1-element CONSTANT node)."""
         scalar_node = self.constant(np.array([scalar], dtype=np.float32))
         return self.add(a, scalar_node)
+
+    def shortconv(self, x: int, weight: int, conv_state: int,
+                  kernel_size: int) -> int:
+        """Depth-wise causal conv1d + silu.
+
+        Args:
+            x: input [groups, seq_len] FP32
+            weight: [groups, kernel_size] FP32 (CONSTANT)
+            conv_state: [groups, kernel_size-1] FP32 (persistent INPUT, in-place modified)
+            kernel_size: conv kernel size (e.g. 4)
+
+        Returns:
+            output [groups, seq_len] FP32
+        """
+        sx = self._nodes[x].out_shape
+        return self._add(OpType.SHORTCONV, [x, weight, conv_state], sx,
+                         prec=self._nodes[x].out_prec,
+                         i32=[kernel_size])
 
     # ---- save ----
 

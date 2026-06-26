@@ -65,7 +65,7 @@ enum class OpType : uint32_t {
     // MOE_DISPATCH       = 120,
     // MOE_COMBINE        = 121,
     // GATED_ATTENTION    = 130,
-    // CONV1D             = 140,
+    SHORTCONV      = 140,
 };
 
 inline const char* op_type_name(OpType op) {
@@ -94,6 +94,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";
     case OpType::GATED_DELTANET_DECODE: return "GATED_DELTANET_DECODE";
     case OpType::GATED_DELTANET_PREFILL: return "GATED_DELTANET_PREFILL";
+    case OpType::SHORTCONV: return "SHORTCONV";
     }
     return "UNKNOWN";
 }

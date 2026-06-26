@@ -92,6 +92,13 @@ def export_weights(weights: dict, weights_dir: str):
             save('final_norm', d)
             continue
 
+        # conv1d.weight → FP32 (used by ShortConv scalar kernel, needs FP32)
+        if 'conv1d' in wname:
+            d = wdata.reshape(wdata.shape[0], wdata.shape[2])  # [6144, 1, 4] → [6144, 4]
+            d = d.astype(np.float32) if d.dtype != np.float32 else d
+            save(wname.replace('.', '_'), d)
+            continue
+
         # All projection weights → FP16
         d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
         save(wname.replace('.', '_'), d)
@@ -278,13 +285,12 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     beta_val = g.sigmoid(b_out)
 
     # ---- Short conv on qkv (conv1d + silu) ----
-    # TODO: implement short conv as a separate op or inline.
-    # For now, skip conv (use raw qkv). Will be added as SHORTCONV op.
-    # The conv1d weight is [6144, 1, 4] — kernel_size=4.
-    # conv_state [6144, 3] is for cross-chunk continuity.
-    qkv_conv = qkv  # placeholder: no conv yet
+    # conv1d.weight: [6144, 1, 4] → reshape to [6144, 4] (groups=6144, kernel_size=4)
+    w_conv = g.weight(os.path.join(weights_dir, f"{pfx}_conv1d_weight.weights"),
+                     (num_heads * k_dim * 3, conv_kernel), Precision.FP32)
+    qkv_conv = g.shortconv(qkv, w_conv, gc_in, kernel_size=conv_kernel)
 
-    # ---- Split qkv into q, k, v ----
+    # ---- Split qkv_conv into q, k, v ----
     # qkv layout: [num_heads*k_dim*3, seq] = [16*128*3, seq]
     # q = qkv[0 : 16*128, :], k = qkv[16*128 : 32*128, :], v = qkv[32*128 : 48*128, :]
     qkv_dim = num_heads * k_dim  # 16 * 128 = 2048

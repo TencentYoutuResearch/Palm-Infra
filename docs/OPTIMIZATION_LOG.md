@@ -1524,3 +1524,18 @@ causal mask key range = [0, past+cur)）。如果 `past + n > graph_seq_len` 返
 **决定**：采用。cache 预分配 + prefill 用 past_len_ 作为默认行为。
 
 ---
+
+## Qwen3.5-0.8B llama.cpp baseline (FP16, M5 Pro, 4 threads)
+
+| 测试 | t/s |
+|------|-----|
+| pp512 (prefill) | **815** |
+| tg128 (decode) | **99** |
+
+llama.cpp build: 5c7c22c3e (9803), BLAS backend, Qwen3.5-0.8B-F16.gguf
+3-run: pp512=813-816, tg128=98-99
+
+注：Qwen3.5-0.8B 是 772M 参数模型（vs Youtu-LLM-2B 的 ~2B），pp512 是 512-token prefill。
+这个 baseline 后续用于对比 mlllm 在 Qwen3.5 上的性能。
+
+---

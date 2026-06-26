@@ -294,6 +294,79 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         kernel_gdn_decode(params, inputs, gdn_outs, thread_pool);
         break;
     }
+    case OpType::SHORTCONV: {
+        // ShortConv: depth-wise causal conv1d + silu.
+        // Inputs: [0]=x [groups, seq], [1]=weight [groups, kernel_size],
+        //         [2]=conv_state [groups, kernel_size-1] (persistent, in-place modified)
+        // Output: [0]=out [groups, seq]
+        // Params: i32[0]=kernel_size
+        if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
+            const Tensor& x = *inputs[0];
+            const Tensor& w = *inputs[1];
+            // conv_state is input[2], modified in-place via data pointer.
+            Tensor& out = *output;
+
+            int kernel_size = graph_params::get_i32(params, 0, 4);
+            int groups = (int)x.shape[0];
+            int seq_len = (int)x.shape[1];
+
+            const float* x_data = x.ptr<float>();
+            const float* w_data = w.ptr<float>();
+            float* conv_state_data = reinterpret_cast<float*>(inputs[2]->data);
+            float* out_data = out.ptr<float>();
+
+            // Build stated input: [groups, kernel_size-1 + seq_len]
+            // First kernel_size-1 rows come from conv_state, rest from x.
+            int prefix_len = kernel_size - 1;
+            int total_len = prefix_len + seq_len;
+
+            // Allocate a temp buffer for the stated input.
+            // For small kernel_size (4) and typical groups (6144), this is 6144*3 = 18K floats.
+            std::vector<float> stated(groups * total_len);
+
+            // Copy conv_state [groups, kernel_size-1] into stated [groups, 0..prefix-1]
+            for (int g = 0; g < groups; g++) {
+                const float* cs = conv_state_data + g * prefix_len;
+                float* dst = stated.data() + g * total_len;
+                for (int p = 0; p < prefix_len; p++) dst[p] = cs[p];
+            }
+            // Copy x [groups, seq] into stated [groups, prefix..prefix+seq-1]
+            for (int g = 0; g < groups; g++) {
+                const float* xs = x_data + g * seq_len;
+                float* dst = stated.data() + g * total_len + prefix_len;
+                for (int s = 0; s < seq_len; s++) dst[s] = xs[s];
+            }
+
+            // Conv1d + silu for each group, each position
+            for (int g = 0; g < groups; g++) {
+                const float* w_ptr = w_data + g * kernel_size;
+                const float* st = stated.data() + g * total_len;
+                float* ot = out_data + g * seq_len;
+
+                for (int i = 0; i < seq_len; i++) {
+                    float sum = 0.f;
+                    int base = prefix_len + i;
+                    for (int k = 0; k < kernel_size; k++) {
+                        int src_i = base - (kernel_size - 1) + k;
+                        sum += st[src_i] * w_ptr[k];
+                    }
+                    // silu(sum) = sum * sigmoid(sum)
+                    float sig = 1.f / (1.f + std::exp(-sum));
+                    ot[i] = sum * sig;
+                }
+            }
+
+            // Update conv_state: last kernel_size-1 rows of stated
+            for (int g = 0; g < groups; g++) {
+                const float* st = stated.data() + g * total_len;
+                float* cs = conv_state_data + g * prefix_len;
+                for (int p = 0; p < prefix_len; p++) {
+                    cs[p] = st[total_len - prefix_len + p];
+                }
+            }
+        }
+        break;
+    }
     case OpType::ROTARY_EMBED:
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
             int rope_dim = graph_params::get_i32(params, 0, 64);
