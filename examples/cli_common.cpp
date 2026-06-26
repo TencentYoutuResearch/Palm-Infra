@@ -216,7 +216,8 @@ GenerationMetrics compute_generation_metrics(size_t prompt_tokens,
 bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
                      const std::vector<int>& prompt_ids, int max_new_tokens,
                      int eos_id, GenerationResult& result, std::string& error,
-                     const std::function<void(int, const std::string&)>& on_token) {
+                     const std::function<void(int, const std::string&)>& on_token,
+                     bool reset_context) {
     result = GenerationResult();
     if (prompt_ids.empty()) {
         error = "prompt is empty after tokenization";
@@ -227,9 +228,11 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
         return false;
     }
 
-    // Reset context before each generation (bench/chat assumes fresh conversation).
-    // Multi-turn would skip this and let prefill() append to existing cache.
-    engine.reset();
+    // Reset context for single-turn mode (bench, --prompt).
+    // Multi-turn REPL passes reset_context=false to preserve history.
+    if (reset_context) {
+        engine.reset();
+    }
 
     auto prefill_start = std::chrono::steady_clock::now();
     int next = engine.prefill(prompt_ids);

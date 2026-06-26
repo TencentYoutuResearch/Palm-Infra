@@ -575,13 +575,35 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
 // --- Chat template ----------------------------------------------------------
 
 std::vector<int> Tokenizer::apply_chat(const std::string& user_message) const {
-    // Llama-3 chat format
-    std::string prompt =
-        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-        "You are a helpful assistant.<|eot_id|>"
-        "<|start_header_id|>user<|end_header_id|>\n\n" +
-        user_message + "<|eot_id|>"
-        "<|start_header_id|>assistant<|end_header_id|>\n\n";
+    // Single-turn convenience: wrap one user message with default system prompt.
+    std::vector<ChatMessage> messages;
+    messages.push_back({"system", "You are a helpful assistant."});
+    messages.push_back({"user", user_message});
+    return apply_chat(messages);
+}
+
+std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages) const {
+    // Llama-3 chat format.
+    // Each message: <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
+    // The final assistant turn is left open (no <|eot_id|>) for the model to continue.
+    std::string prompt = "<|begin_of_text|>";
+
+    for (size_t i = 0; i < messages.size(); i++) {
+        const auto& msg = messages[i];
+        prompt += "<|start_header_id|>" + msg.role + "<|end_header_id|>\n\n" + msg.content;
+
+        // Close with <|eot_id|> unless this is the last message AND it's from "user"
+        // (leave assistant header open for generation).
+        bool is_last = (i == messages.size() - 1);
+        if (is_last && msg.role == "user") {
+            // Don't close — the model will generate the assistant response.
+            // But we need the assistant header to prime generation.
+            prompt += "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+        } else {
+            prompt += "<|eot_id|>";
+        }
+    }
+
     return encode(prompt);
 }
 

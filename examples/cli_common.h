@@ -54,4 +54,5 @@ GenerationMetrics compute_generation_metrics(size_t prompt_tokens,
 bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
                      const std::vector<int>& prompt_ids, int max_new_tokens,
                      int eos_id, GenerationResult& result, std::string& error,
-                     const std::function<void(int, const std::string&)>& on_token = {});
+                     const std::function<void(int, const std::string&)>& on_token = {},
+                     bool reset_context = true);

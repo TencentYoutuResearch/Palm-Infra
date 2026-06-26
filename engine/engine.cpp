@@ -480,10 +480,6 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     if (n == 0) return -1;
 
     // Determine the graph's expected seq_len from its hidden input shape.
-    // For prefill graph, this is typically 128; for decode graph, it's 1.
-    // We need to generate rope cache and mask matching the graph's seq_len,
-    // not the actual token count, because all intermediate tensors have
-    // the graph's seq_len baked into their static shapes.
     int graph_seq_len = 1;
     for (auto& node : graph_prefill_.nodes) {
         if (node.op_type == OpType::INPUT && !node.params.str.empty()
@@ -493,15 +489,49 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         }
     }
 
-    // Multi-turn: use existing past_len_ for RoPE position offset and causal mask.
-    // Caller is responsible for calling reset() when starting a new conversation.
-    int past = past_len_;
+    // Chunked prefill: split long prompts into graph_seq_len-sized chunks.
+    // Each chunk is processed independently, appending to the KV cache.
+    // past_len_ can exceed graph_seq_len (cache supports n_ctx); only each
+    // chunk's token count must be <= graph_seq_len.
+    int offset = 0;
+    int last_token = -1;
+    while (offset < n) {
+        int remaining = n - offset;
+        if (past_len_ >= cfg_.n_ctx) {
+            fprintf(stderr, "prefill: context full (past=%d >= n_ctx=%d). Use /reset.\n",
+                    past_len_, cfg_.n_ctx);
+            return -1;
+        }
+        int chunk_size = std::min(remaining, graph_seq_len);
+        std::vector<int> chunk(token_ids.begin() + offset,
+                               token_ids.begin() + offset + chunk_size);
+        last_token = prefill_chunk(chunk, past_len_);
+        if (last_token < 0) return -1;
+        offset += chunk_size;
+    }
+    return last_token;
+}
 
-    // Check that the prompt fits in the prefill graph's static seq_len.
-    // (Chunked prefill for multi-turn is a future feature — for now, error out.)
-    if (past + n > graph_seq_len) {
-        fprintf(stderr, "prefill: past=%d + n=%d > graph_seq_len=%d (need chunked prefill)\n",
-                past, n, graph_seq_len);
+int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
+    int n = (int)token_ids.size();
+    if (n == 0) return -1;
+
+    // Determine the graph's expected seq_len from its hidden input shape.
+    int graph_seq_len = 1;
+    for (auto& node : graph_prefill_.nodes) {
+        if (node.op_type == OpType::INPUT && !node.params.str.empty()
+            && node.params.str[0] == "hidden") {
+            graph_seq_len = (int)node.out_shape[1];
+            break;
+        }
+    }
+
+    // Check that this chunk fits in the prefill graph's static seq_len.
+    // `past` can be >= graph_seq_len (cache supports n_ctx=4096); only the
+    // chunk size n must be <= graph_seq_len.
+    if (n > graph_seq_len) {
+        fprintf(stderr, "prefill_chunk: n=%d > graph_seq_len=%d\n",
+                n, graph_seq_len);
         return -1;
     }
 

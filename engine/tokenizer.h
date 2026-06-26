@@ -9,6 +9,12 @@
 #include <unordered_map>
 #include <vector>
 
+// A single message in a chat conversation.
+struct ChatMessage {
+    std::string role;      // "system", "user", "assistant"
+    std::string content;   // message text
+};
+
 class Tokenizer {
 public:
     bool load(const std::string& tokenizer_json_path);
@@ -21,8 +27,20 @@ public:
     int eos_id() const { return eos_id_; }
     int vocab_size() const { return (int)id_to_piece_.size(); }
 
-    // Wrap a user message in the model's chat template and return token IDs.
+    // Wrap a single user message in the model's chat template.
+    // Convenience wrapper for single-turn prompts.
     std::vector<int> apply_chat(const std::string& user_message) const;
+
+    // Build a multi-turn chat prompt from a list of messages.
+    // Produces Llama-3 format:
+    //   <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|>
+    //   <|start_header_id|>user<|end_header_id|>\n\n{user1}<|eot_id|>
+    //   <|start_header_id|>assistant<|end_header_id|>\n\n{asst1}<|eot_id|>
+    //   ...
+    //   <|start_header_id|>assistant<|end_header_id|>\n\n
+    // The last message should be from "user" — the template leaves the
+    // assistant header open for the model to continue.
+    std::vector<int> apply_chat(const std::vector<ChatMessage>& messages) const;
 
 private:
     std::unordered_map<std::string, int> vocab_;

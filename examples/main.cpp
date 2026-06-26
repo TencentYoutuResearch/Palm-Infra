@@ -7,9 +7,9 @@
 
 namespace {
 
-bool run_prompt(LLMEngine& engine, const Tokenizer& tokenizer,
-                const std::string& prompt, int prefill_seq_len,
-                int max_new_tokens) {
+bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
+                       const std::string& prompt, int prefill_seq_len,
+                       int max_new_tokens) {
     std::vector<int> prompt_ids = tokenizer.apply_chat(prompt);
     if (prompt_ids.empty()) {
         std::fprintf(stderr, "chat: prompt is empty after tokenization\n");
@@ -22,7 +22,6 @@ bool run_prompt(LLMEngine& engine, const Tokenizer& tokenizer,
         return false;
     }
 
-    std::printf("prompt_tokens=%zu\n", prompt_ids.size());
     std::printf("assistant> ");
     std::fflush(stdout);
 
@@ -44,15 +43,55 @@ bool run_prompt(LLMEngine& engine, const Tokenizer& tokenizer,
     }
 
     GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
+    std::printf("\n[ttft=%.2fs tpot=%.1fms prefill=%.1f tps decode=%.1f tps tokens=%d]\n",
+                metrics.ttft_ms / 1000.0, metrics.tpot_ms,
+                metrics.prefill_tps, metrics.decode_tps,
+                metrics.generated_tokens);
+    return true;
+}
 
-    std::printf("\n");
-    std::printf("generated_tokens=%d decode_tokens=%d hit_eos=%s\n",
-                metrics.generated_tokens, metrics.decode_tokens,
-                result.hit_eos ? "true" : "false");
-    std::printf("ttft_ms=%.2f tpot_ms=%.2f\n",
-                metrics.ttft_ms, metrics.tpot_ms);
-    std::printf("prefill_tps=%.2f decode_tps=%.2f\n",
-                metrics.prefill_tps, metrics.decode_tps);
+bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
+                    std::vector<ChatMessage>& history,
+                    const std::string& user_input, int max_new_tokens) {
+    history.push_back({"user", user_input});
+    std::vector<int> prompt_ids = tokenizer.apply_chat(history);
+    if (prompt_ids.empty()) {
+        std::fprintf(stderr, "chat: prompt is empty after tokenization\n");
+        history.pop_back();
+        return false;
+    }
+
+    std::printf("assistant> ");
+    std::fflush(stdout);
+
+    GenerationResult result;
+    std::string error;
+    // reset_context=false: multi-turn, don't wipe KV cache.
+    bool ok = generate_greedy(
+        engine, tokenizer, prompt_ids, max_new_tokens, tokenizer.eos_id(), result,
+        error,
+        [](int, const std::string& piece) {
+            if (!piece.empty()) {
+                std::printf("%s", piece.c_str());
+                std::fflush(stdout);
+            }
+        },
+        /*reset_context=*/false);
+
+    if (!ok) {
+        std::fprintf(stderr, "\nchat: %s\n", error.c_str());
+        history.pop_back();
+        return false;
+    }
+
+    // Add assistant response to history for next turn.
+    history.push_back({"assistant", result.text});
+
+    GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
+    std::printf("\n[ttft=%.2fs tpot=%.1fms prefill=%.1f tps decode=%.1f tps tokens=%d ctx=%d]\n",
+                metrics.ttft_ms / 1000.0, metrics.tpot_ms,
+                metrics.prefill_tps, metrics.decode_tps,
+                metrics.generated_tokens, engine.past_len());
     return true;
 }
 
@@ -65,7 +104,7 @@ int main(int argc, char** argv) {
         if (error != "help") std::fprintf(stderr, "chat: %s\n", error.c_str());
         print_common_usage(argv[0],
                            "Commands in REPL:\n"
-                           "  /reset   Reset engine state\n"
+                           "  /reset   Reset conversation\n"
                            "  /quit    Exit\n");
         return error == "help" ? 0 : 1;
     }
@@ -78,16 +117,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Single-shot mode: --prompt "text"
     if (!opts.prompt.empty()) {
-        return run_prompt(engine, tokenizer, opts.prompt, prefill_seq_len,
-                          opts.max_new_tokens)
+        return run_prompt_single(engine, tokenizer, opts.prompt,
+                                  prefill_seq_len, opts.max_new_tokens)
                    ? 0
                    : 1;
     }
 
-    std::printf("mlllm_chat ready. single-turn mode, prefill_seq_len=%d threads=%d\n",
-                prefill_seq_len, engine.config().num_threads);
-    std::printf("Type /quit to exit.\n");
+    // REPL mode: multi-turn conversation
+    std::printf("mlllm_chat ready. prefill_seq_len=%d threads=%d ctx=%d\n",
+                prefill_seq_len, engine.config().num_threads, opts.n_ctx);
+    std::printf("Type /reset to clear context, /quit to exit.\n\n");
+
+    std::vector<ChatMessage> history;
+    history.push_back({"system", "You are a helpful assistant."});
 
     std::string line;
     while (true) {
@@ -98,10 +142,12 @@ int main(int argc, char** argv) {
         if (line == "/quit" || line == "/exit") break;
         if (line == "/reset") {
             engine.reset();
-            std::printf("reset done\n");
+            history.clear();
+            history.push_back({"system", "You are a helpful assistant."});
+            std::printf("context cleared.\n");
             continue;
         }
-        run_prompt(engine, tokenizer, line, prefill_seq_len, opts.max_new_tokens);
+        run_turn_multi(engine, tokenizer, history, line, opts.max_new_tokens);
     }
 
     return 0;

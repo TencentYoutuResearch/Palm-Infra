@@ -152,6 +152,10 @@ private:
     /// Allocate KV cache buffers with metadata header.
     void allocate_caches(Graph& g, int n_ctx);
 
+    /// Process a single chunk of tokens (≤ graph_seq_len).
+    /// Called by prefill() in a loop for chunked prefill.
+    int prefill_chunk(const std::vector<int>& token_ids, int past);
+
     // weight tensors
     Tensor* embed_weight_ = nullptr;  // [vocab_size, hidden_dim]
 };
