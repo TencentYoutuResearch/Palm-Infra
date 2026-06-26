@@ -126,12 +126,24 @@ private:
 
     // KV cache tensor pointers (per layer)
     struct CachePair {
+        // Standard KV cache (full attention layers)
         Tensor* k = nullptr;
         Tensor* v = nullptr;
-        int k_head_dim = 0;      // head_dim for K cache (constant)
-        int k_num_heads = 0;     // num_kv_heads for K cache (constant)
-        int v_head_dim = 0;      // head_dim for V cache (constant)
-        int v_num_heads = 0;     // num_kv_heads for V cache (constant)
+        int k_head_dim = 0;
+        int k_num_heads = 0;
+        int v_head_dim = 0;
+        int v_num_heads = 0;
+
+        // GDN recurrent state (linear attention layers)
+        Tensor* gdn_state = nullptr;   // [v_dim, k_dim, num_heads] FP32
+        Tensor* gdn_conv = nullptr;     // [groups, kernel-1] FP32
+        int gdn_v_dim = 0;
+        int gdn_k_dim = 0;
+        int gdn_num_heads = 0;
+        int gdn_conv_groups = 0;
+        int gdn_conv_kernel = 0;
+
+        bool is_linear_attn = false;
     };
     std::vector<CachePair> caches_;
 

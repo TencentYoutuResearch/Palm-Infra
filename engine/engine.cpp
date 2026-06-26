@@ -135,7 +135,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
 // ---------------------------------------------------------------------------
 
 void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
-    // Find cache INPUT nodes and initialise their tensor shapes
+    // Find cache INPUT nodes and initialise their tensor shapes.
+    // Supports both KV cache (cache_k/cache_v) and GDN state (gdn_state/gdn_conv).
     for (auto& node : g.nodes) {
         if (node.op_type != OpType::INPUT || node.params.str.empty()) continue;
         const std::string& name = node.params.str[0];
@@ -166,13 +167,40 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             caches_[layer_idx].v = &t;
             caches_[layer_idx].v_head_dim = (int)node.out_shape[0];
             caches_[layer_idx].v_num_heads = (int)node.out_shape[2];
+        } else if (name.find("gdn_state") == 0) {
+            int layer_idx = std::stoi(name.substr(9));
+            if (layer_idx >= (int)caches_.size()) caches_.resize(layer_idx + 1);
+            Tensor& t = g.runtime.tensors[node.id];
+            t.prec = node.out_prec;
+            t.shape[0] = node.out_shape[0];
+            t.shape[1] = node.out_shape[1];
+            t.shape[2] = node.out_shape[2];
+            t.shape[3] = node.out_shape[3];
+            t.compute_strides();
+            caches_[layer_idx].gdn_state = &t;
+            caches_[layer_idx].gdn_v_dim = (int)node.out_shape[0];
+            caches_[layer_idx].gdn_k_dim = (int)node.out_shape[1];
+            caches_[layer_idx].gdn_num_heads = (int)node.out_shape[2];
+            caches_[layer_idx].is_linear_attn = true;
+        } else if (name.find("gdn_conv") == 0) {
+            int layer_idx = std::stoi(name.substr(8));
+            if (layer_idx >= (int)caches_.size()) caches_.resize(layer_idx + 1);
+            Tensor& t = g.runtime.tensors[node.id];
+            t.prec = node.out_prec;
+            t.shape[0] = node.out_shape[0];
+            t.shape[1] = node.out_shape[1];
+            t.shape[2] = node.out_shape[2];
+            t.shape[3] = node.out_shape[3];
+            t.compute_strides();
+            caches_[layer_idx].gdn_conv = &t;
+            caches_[layer_idx].gdn_conv_groups = (int)node.out_shape[0];
+            caches_[layer_idx].gdn_conv_kernel = (int)node.out_shape[1] + 1;  // kernel-1 stored, kernel = dim+1
         }
     }
 
     // Allocate cache data buffers (once, at load time).
-    // Buffer layout: [CacheMetadata (64B)] + [data: head_dim * n_ctx * num_heads * es]
-    // The tensor's shape[0] stores total_bytes / es so nbytes() covers the whole buffer.
     for (auto& cp : caches_) {
+        // Standard KV cache
         if (cp.k) {
             int hd = cp.k_head_dim;
             int nkv = cp.k_num_heads;
@@ -181,7 +209,7 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             size_t total = CacheMetadata::SIZE + data_bytes;
 
             void* buf = g.runtime.pool.acquire(total);
-            std::memset(buf, 0, CacheMetadata::SIZE);  // zero header only
+            std::memset(buf, 0, CacheMetadata::SIZE);
 
             auto* meta = cache_meta(buf);
             meta->current_seq_len = 0;
@@ -214,6 +242,35 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             cp.v->mem_type = MemoryType::POOLED;
             cp.v->shape[0] = (int64_t)total / (int64_t)es;
             cp.v->compute_strides();
+        }
+
+        // GDN recurrent state: [v_dim, k_dim, num_heads] FP32
+        // No CacheMetadata header — GDN state is a plain FP32 buffer.
+        if (cp.gdn_state) {
+            size_t data_bytes = (size_t)cp.gdn_v_dim * cp.gdn_k_dim * cp.gdn_num_heads * sizeof(float);
+            void* buf = g.runtime.pool.acquire(data_bytes);
+            std::memset(buf, 0, data_bytes);
+            cp.gdn_state->data     = buf;
+            cp.gdn_state->mem_type = MemoryType::POOLED;
+            cp.gdn_state->shape[0] = (int64_t)cp.gdn_v_dim;
+            cp.gdn_state->shape[1] = (int64_t)cp.gdn_k_dim;
+            cp.gdn_state->shape[2] = (int64_t)cp.gdn_num_heads;
+            cp.gdn_state->shape[3] = 1;
+            cp.gdn_state->compute_strides();
+        }
+        // GDN conv state: [groups, kernel-1] FP32
+        if (cp.gdn_conv) {
+            int kernel_m1 = cp.gdn_conv_kernel - 1;
+            size_t data_bytes = (size_t)cp.gdn_conv_groups * kernel_m1 * sizeof(float);
+            void* buf = g.runtime.pool.acquire(data_bytes);
+            std::memset(buf, 0, data_bytes);
+            cp.gdn_conv->data     = buf;
+            cp.gdn_conv->mem_type = MemoryType::POOLED;
+            cp.gdn_conv->shape[0] = (int64_t)cp.gdn_conv_groups;
+            cp.gdn_conv->shape[1] = (int64_t)kernel_m1;
+            cp.gdn_conv->shape[2] = 1;
+            cp.gdn_conv->shape[3] = 1;
+            cp.gdn_conv->compute_strides();
         }
     }
 }
@@ -267,6 +324,16 @@ bool LLMEngine::load(const EngineConfig& cfg) {
             if (layer_idx < (int)caches_.size() && caches_[layer_idx].v) {
                 graph_decode_.runtime.tensors[node.id] = *caches_[layer_idx].v;
             }
+        } else if (name.find("gdn_state") == 0) {
+            int layer_idx = std::stoi(name.substr(9));
+            if (layer_idx < (int)caches_.size() && caches_[layer_idx].gdn_state) {
+                graph_decode_.runtime.tensors[node.id] = *caches_[layer_idx].gdn_state;
+            }
+        } else if (name.find("gdn_conv") == 0) {
+            int layer_idx = std::stoi(name.substr(8));
+            if (layer_idx < (int)caches_.size() && caches_[layer_idx].gdn_conv) {
+                graph_decode_.runtime.tensors[node.id] = *caches_[layer_idx].gdn_conv;
+            }
         }
     }
 
@@ -280,13 +347,21 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 
 void LLMEngine::reset() {
     past_len_ = 0;
-    // Cache buffers are pre-allocated in allocate_caches() at load time.
-    // reset() only clears the metadata — current_seq_len = 0 tells SDPA
-    // the cache is empty. The data region keeps stale data but is never
-    // read outside [0, current_seq_len) due to causal masking.
+    // KV cache: only clear metadata header (current_seq_len = 0).
+    // GDN state: zero the entire recurrent state buffer (it's small, ~256KB
+    // per layer, and GDN reads stale state without causal mask protection).
+    // GDN conv state: also zero (short conv uses conv_state for continuity).
     for (auto& cp : caches_) {
         if (cp.k) cache_meta(cp.k->data)->current_seq_len = 0;
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = 0;
+        if (cp.gdn_state) {
+            size_t sz = (size_t)cp.gdn_v_dim * cp.gdn_k_dim * cp.gdn_num_heads * sizeof(float);
+            std::memset(cp.gdn_state->data, 0, sz);
+        }
+        if (cp.gdn_conv) {
+            size_t sz = (size_t)cp.gdn_conv_groups * (cp.gdn_conv_kernel - 1) * sizeof(float);
+            std::memset(cp.gdn_conv->data, 0, sz);
+        }
     }
 }
 
