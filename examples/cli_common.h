@@ -16,7 +16,7 @@ struct CliCommonOptions {
     int max_new_tokens = 128;
     int n_ctx = 4096;
     int rope_dim = 64;
-    float rope_theta = 1600000.f;
+    float rope_theta = 10000000.f;
     int num_threads = 4;
     bool profile = false;
     int warmup = 1;
