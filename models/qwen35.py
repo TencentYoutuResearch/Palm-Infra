@@ -285,21 +285,29 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     beta_val = g.sigmoid(b_out)
 
     # ---- Short conv on qkv (conv1d + silu) ----
+    # matmul output Tensor shape is [qkv_total, seq] but data is [seq, qkv_total]
+    # (transposed). ShortConv expects [groups, seq] = [qkv_total, seq] data.
+    # Reshape to [seq, qkv_total] (matching data) then permute to [qkv_total, seq].
+    qkv_fixed = g.reshape(qkv, (seq_len, num_heads * k_dim * 3))  # materialize
+    qkv_fixed = g.permute(qkv_fixed, (1, 0, 2, 3))  # [qkv_total, seq, 1, 1]
     # conv1d.weight: [6144, 1, 4] → reshape to [6144, 4] (groups=6144, kernel_size=4)
     w_conv = g.weight(os.path.join(weights_dir, f"{pfx}_conv1d_weight.weights"),
                      (num_heads * k_dim * 3, conv_kernel), Precision.FP32)
-    qkv_conv = g.shortconv(qkv, w_conv, gc_in, kernel_size=conv_kernel)
+    qkv_conv = g.shortconv(qkv_fixed, w_conv, gc_in, kernel_size=conv_kernel)
 
     # ---- Split qkv_conv into q, k, v ----
-    # qkv layout: [num_heads*k_dim*3, seq] = [16*128*3, seq]
-    # q = qkv[0 : 16*128, :], k = qkv[16*128 : 32*128, :], v = qkv[32*128 : 48*128, :]
-    qkv_dim = num_heads * k_dim  # 16 * 128 = 2048
-    q, k, v = g.slice(qkv_conv, [qkv_dim, qkv_dim, qkv_dim], dim=0)
-    # q/k/v are [qkv_dim, seq] = [16*128, seq]
-    # GDN kernel expects [head, seq, k_dim] = [16, seq, 128]
-    # qkv_dim flat order: head0_dim0, head0_dim1, ..., head0_dim127, head1_dim0, ...
-    # = [head, k_dim] per seq position
-    # reshape to [head, k_dim, seq] then permute to [head, seq, k_dim]
+    # matmul output Tensor shape is [qkv_total, seq] but data is [seq, qkv_total]
+    # row-major (transposed). shortconv preserves this layout.
+    # Need to reshape to [seq, qkv_total] (matching data), then permute to
+    # [qkv_total, seq], then split into q/k/v.
+    # Actually: reshape [qkv_total, seq] → materialize to [seq, qkv_total] by
+    # reshaping to (seq_len, qkv_total) which triggers a copy (non-contiguous).
+    qkv_t = g.reshape(qkv_conv, (seq_len, num_heads * k_dim * 3))  # materialize [seq, qkv_total]
+    qkv_t = g.permute(qkv_t, (1, 0, 2, 3))  # [qkv_total, seq, 1, 1]
+    # Now split on dim=0: q=[0:2048], k=[2048:4096], v=[4096:6144]
+    qkv_dim = num_heads * k_dim  # 2048
+    q, k, v = g.slice(qkv_t, [qkv_dim, qkv_dim, qkv_dim], dim=0)
+    # q/k: [qkv_dim, seq] = [2048, seq], reshape to [head, k_dim, seq] → permute [head, seq, k_dim]
     q = g.reshape(q, (num_heads, k_dim, seq_len))
     q = g.permute(q, (0, 2, 1, 3))  # [head, seq, k_dim]
     k = g.reshape(k, (num_heads, k_dim, seq_len))
