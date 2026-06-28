@@ -8,8 +8,8 @@
 |------|------|-----------|----------|
 | **llama.cpp** | 0.8B | **749.44** | **100.44** |
 | **llama.cpp** | 4B | **143.32** | **22.87** |
-| **mlllm** | 0.8B | 207.50 | 89.74 |
-| **mlllm** | 4B | 70.68 | 23.29 |
+| **mlllm** | 0.8B | 199.20 | 85.29 |
+| **mlllm** | 4B | 52.07 | 22.19 |
 
 llama.cpp build: 5c7c22c3e, BLAS backend, gguf F16.
 
@@ -54,7 +54,10 @@ rank-1 update (128×128 FMA), RMSNormGated (128-dim reduce)。k_dim=128, v_dim=1
 
 | 指标 | 优化前 | 优化后 |
 |------|--------|--------|
-| — | — | — |
+| decode_tps | — | 22.19 |
+| prefill_tps | — | 52.07 |
+
+> 4B 适配完成（修复 num_v_heads params、multi-file safetensors、state 大小等），chat 测试输出正确。
 
 ### 验证
 
