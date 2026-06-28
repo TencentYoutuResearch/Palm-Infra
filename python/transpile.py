@@ -431,7 +431,7 @@ class GraphBuilder:
                          (num_v_heads * v_dim, seq_len),
                          prec=Precision.FP32,
                          i32=[num_heads, k_dim, v_dim, seq_len,
-                              1 if use_qk_l2norm else 0, 4],
+                              1 if use_qk_l2norm else 0, 4, 0, num_v_heads],
                          f32=[rms_eps, 1e-6, scale])
 
     # ---- save ----
