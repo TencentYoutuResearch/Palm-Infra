@@ -148,12 +148,13 @@ static void gdn_decode_head_neon(
 void kernel_gdn_decode_neon(const OpParams& params,
                              const std::vector<const Tensor*>& inputs,
                              std::vector<Tensor*>& outputs) {
-    int num_heads  = graph_params::get_i32(params, 0, 16);
-    int k_head_dim = graph_params::get_i32(params, 1, 128);
-    int v_head_dim = graph_params::get_i32(params, 2, 128);
-    float rms_eps  = graph_params::get_f32(params, 0, 1e-6f);
-    float l2_eps   = graph_params::get_f32(params, 1, 1e-6f);
-    float scale    = graph_params::get_f32(params, 2, 0.f);
+    int num_heads   = graph_params::get_i32(params, 0, 16);
+    int k_head_dim  = graph_params::get_i32(params, 1, 128);
+    int v_head_dim  = graph_params::get_i32(params, 2, 128);
+    int num_v_heads = graph_params::get_i32(params, 7, num_heads);
+    float rms_eps   = graph_params::get_f32(params, 0, 1e-6f);
+    float l2_eps    = graph_params::get_f32(params, 1, 1e-6f);
+    float scale     = graph_params::get_f32(params, 2, 0.f);
     if (scale == 0.f) scale = 1.f / std::sqrt((float)k_head_dim);
 
     if (inputs.size() < 8 || outputs.empty()) return;
@@ -168,24 +169,27 @@ void kernel_gdn_decode_neon(const OpParams& params,
     float* state_data       = reinterpret_cast<float*>(inputs[7]->data);
     float* out_data         = outputs[0]->ptr<float>();
 
-    int qkv_dim  = num_heads * k_head_dim;   // 2048
-    int z_dim    = num_heads * v_head_dim;   // 2048
-    int state_sz = k_head_dim * v_head_dim;  // 16384
+    int qkv_dim  = num_heads * k_head_dim;           // key_dim
+    int qkv_total = qkv_dim * 2 + num_v_heads * v_head_dim; // key_dim*2 + value_dim
+    int z_dim    = num_v_heads * v_head_dim;
+    int state_sz = k_head_dim * v_head_dim;
+    int repeat   = num_v_heads / num_heads;  // 1 for 0.8B, 2 for 4B
 
-    // Precompute neg_exp_A
+    // Precompute neg_exp_A (per key_head)
     alignas(16) float neg_exp_A[16];
     for (int h = 0; h < num_heads; h++)
         neg_exp_A[h] = -std::exp(A_log_data[h]);
 
-    // decode: seq_len=1, data at t=0
-    for (int h = 0; h < num_heads; h++) {
-        float* state_h = state_data + h * state_sz;
+    // decode: seq_len=1, data at t=0. Loop over value heads.
+    for (int vh = 0; vh < num_v_heads; vh++) {
+        int kh = vh / repeat;  // key head index
+        float* state_h = state_data + kh * state_sz;
 
-        // Extract q, k, v from qkv_conv
+        // Extract q, k from key_heads, v from value_heads
         alignas(16) float q[128], k_buf[128], v_buf[128];
-        int q_base = h * k_head_dim;
-        int k_base = qkv_dim + h * k_head_dim;
-        int v_base = 2 * qkv_dim + h * v_head_dim;
+        int q_base = kh * k_head_dim;
+        int k_base = qkv_dim + kh * k_head_dim;
+        int v_base = 2 * qkv_dim + vh * v_head_dim;
         for (int d = 0; d < k_head_dim; d++) {
             q[d]     = qkv_data[(q_base + d) * 1 + 0];
             k_buf[d] = qkv_data[(k_base + d) * 1 + 0];
@@ -197,17 +201,17 @@ void kernel_gdn_decode_neon(const OpParams& params,
         l2norm_neon(q, k_head_dim, l2_eps);
         l2norm_neon(k_buf, k_head_dim, l2_eps);
 
-        // g, beta
-        float a_h = a_data[h];  // a[t=0, h]
-        float b_h = b_data[h];
-        float sp = softplusf(a_h + dtb_data[h]);
-        float g_t = neg_exp_A[h] * sp;
+        // g, beta — a/b indexed by value head
+        float a_h = a_data[vh];
+        float b_h = b_data[vh];
+        float sp = softplusf(a_h + dtb_data[kh]);
+        float g_t = neg_exp_A[kh] * sp;
         float g_t_exp = std::exp(g_t);
         float beta_t = sigmoidf(b_h);
 
         // Core recurrence + RMSNormGated
-        const float* z_row = z_data + h * v_head_dim;  // t=0
-        float* out_head = out_data + h * v_head_dim;   // t=0
+        const float* z_row = z_data + vh * v_head_dim;  // t=0
+        float* out_head = out_data + vh * v_head_dim;   // t=0
 
         gdn_decode_head_neon(q, k_buf, v_buf,
                              g_t_exp, beta_t, state_h,

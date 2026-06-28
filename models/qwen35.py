@@ -135,6 +135,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     linear_num_heads = tc['linear_num_key_heads']   # 16
     linear_k_dim = tc['linear_key_head_dim']         # 128
     linear_v_dim = tc['linear_value_head_dim']      # 128
+    linear_num_v_heads = tc.get('linear_num_value_heads', linear_num_heads)  # 0.8B=16, 4B=32
     conv_kernel = tc['linear_conv_kernel_dim']       # 4
 
     # MLP
@@ -142,8 +143,8 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
 
     print(f"Qwen3.5 graph: seq_len={seq_len}, layers={num_layers}, "
           f"heads={num_heads}, kv_heads={num_kv_heads}, head_dim={head_dim}, "
-          f"linear_heads={linear_num_heads}, linear_k={linear_k_dim}, "
-          f"linear_v={linear_v_dim}, conv_kernel={conv_kernel}")
+          f"linear_heads={linear_num_heads}, linear_v_heads={linear_num_v_heads}, "
+          f"linear_k={linear_k_dim}, linear_v={linear_v_dim}, conv_kernel={conv_kernel}")
 
     # ---- set graph metadata (engine reads these instead of CLI args) ----
     g.set_model_config(
@@ -175,11 +176,11 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
             cv = g.input(f'cache_v{i}', (head_dim, n_ctx, num_kv_heads), prec=Precision.FP16)
             cache_inputs.append(('kv', ck, cv))
         else:
-            # GDN recurrent state: [v_dim, k_dim, num_heads] FP32
+            # GDN recurrent state: [v_dim, k_dim, num_key_heads] FP32
             gs = g.input(f'gdn_state{i}', (linear_v_dim, linear_k_dim, linear_num_heads), prec=Precision.FP32)
-            # Conv state: [qkv_dim, conv_kernel-1] FP16
-            qkv_dim = linear_num_heads * linear_k_dim * 3  # 16 * 128 * 3 = 6144
-            gc = g.input(f'gdn_conv{i}', (qkv_dim, conv_kernel - 1), prec=Precision.FP16)
+            # Conv state: [qkv_total, conv_kernel-1] FP16
+            qkv_total = linear_num_heads * linear_k_dim * 2 + linear_num_v_heads * linear_v_dim
+            gc = g.input(f'gdn_conv{i}', (qkv_total, conv_kernel - 1), prec=Precision.FP16)
             cache_inputs.append(('gdn', gs, gc))
 
     # ---- build layers ----
@@ -194,6 +195,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                         eps, seq_len, rope_dim, rope_theta,
                         num_heads, num_kv_heads, head_dim,
                         linear_num_heads, linear_k_dim, linear_v_dim,
+                        linear_num_v_heads,
                         conv_kernel, intermediate, hidden_size, lt)
 
     # ---- final norm ----
@@ -210,6 +212,7 @@ def _build_layer(g, x, layer_idx, weights_dir, cfg, tc,
                  eps, seq_len, rope_dim, rope_theta,
                  num_heads, num_kv_heads, head_dim,
                  linear_num_heads, linear_k_dim, linear_v_dim,
+                 linear_num_v_heads,
                  conv_kernel, intermediate, hidden_size, layer_type):
     """Build one layer (linear_attention or full_attention)."""
 
@@ -224,6 +227,7 @@ def _build_layer(g, x, layer_idx, weights_dir, cfg, tc,
         attn_out = _build_linear_attn_layer(g, x_normed, layer_idx, weights_dir,
                                              gs_in, gc_in, eps, seq_len,
                                              linear_num_heads, linear_k_dim, linear_v_dim,
+                                             linear_num_v_heads,
                                              conv_kernel, hidden_size)
     else:
         attn_out = _build_full_attn_layer(g, x_normed, layer_idx, weights_dir,
@@ -261,7 +265,8 @@ def _build_layer(g, x, layer_idx, weights_dir, cfg, tc,
 
 def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
                               gs_in, gc_in, eps, seq_len,
-                              num_heads, k_dim, v_dim, conv_kernel, hidden_size):
+                              num_heads, k_dim, v_dim, num_v_heads,
+                              conv_kernel, hidden_size):
     """Build a linear attention (Gated Delta Rule) layer.
 
     Uses the fused `gated_deltanet` op for the GDN core + RMSNormGated.
@@ -272,20 +277,20 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
 
     # ---- Projections ----
     w_qkv = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_qkv_weight.weights"),
-                     (num_heads * k_dim * 3, hidden_size), Precision.FP16)
+                     (num_heads * k_dim * 2 + num_v_heads * v_dim, hidden_size), Precision.FP16)
     qkv = g.matmul(x, w_qkv)  # shape [qkv_total, seq], data [seq, qkv_total]
 
     w_a = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_a_weight.weights"),
-                   (num_heads, hidden_size), Precision.FP16)
-    a_out = g.matmul(x, w_a)  # shape [num_heads, seq], data [seq, num_heads]
+                   (num_v_heads, hidden_size), Precision.FP16)
+    a_out = g.matmul(x, w_a)  # shape [num_v_heads, seq], data [seq, num_v_heads]
 
     w_b = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_b_weight.weights"),
-                   (num_heads, hidden_size), Precision.FP16)
-    b_out = g.matmul(x, w_b)  # shape [num_heads, seq], data [seq, num_heads]
+                   (num_v_heads, hidden_size), Precision.FP16)
+    b_out = g.matmul(x, w_b)  # shape [num_v_heads, seq], data [seq, num_v_heads]
 
     w_z = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_z_weight.weights"),
-                   (num_heads * v_dim, hidden_size), Precision.FP16)
-    z_out = g.matmul(x, w_z)  # shape [num_heads*v_dim, seq], data [seq, num_heads*v_dim]
+                   (num_v_heads * v_dim, hidden_size), Precision.FP16)
+    z_out = g.matmul(x, w_z)  # shape [num_v_heads*v_dim, seq], data [seq, num_v_heads*v_dim]
 
     # ---- A_log and dt_bias (per-head constants) ----
     A_log = g.weight(os.path.join(weights_dir, f"{pfx}_A_log.weights"),
@@ -298,8 +303,9 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     # ShortConv kernel reads data as [seq, groups] (x_data[s*groups + g]), so it
     # consumes the matmul output directly — no reshape/permute needed.
     # conv1d.weight: [6144, 1, 4] → reshape to [6144, 4] (groups=6144, kernel_size=4)
+    qkv_total = num_heads * k_dim * 2 + num_v_heads * v_dim
     w_conv = g.weight(os.path.join(weights_dir, f"{pfx}_conv1d_weight.weights"),
-                     (num_heads * k_dim * 3, conv_kernel), Precision.FP32)
+                     (qkv_total, conv_kernel), Precision.FP32)
     qkv_conv = g.shortconv(qkv, w_conv, gc_in, kernel_size=conv_kernel)
     # qkv_conv data is [qkv_total, seq] (shortconv materializes [groups, seq]).
     # The fused kernel reads this layout directly — do NOT reshape (mlllm reshape
@@ -307,18 +313,19 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
 
     # ---- Fused GDN core + RMSNormGated ----
     # Replaces: split qkv, g/beta compute, GDN recurrence, RMSNormGated chain.
-    # Output: shape [num_heads*v_dim, seq], data [seq, num_heads*v_dim] row-major.
+    # Output: shape [num_v_heads*v_dim, seq], data [seq, num_v_heads*v_dim] row-major.
     w_norm = g.weight(os.path.join(weights_dir, f"{pfx}_norm_weight.weights"),
                      (v_dim,), Precision.FP32)
     gated = g.gated_deltanet(
         qkv_conv, a_out, b_out, z_out,
         A_log, dt_bias, w_norm, gs_in,
         num_heads=num_heads, k_dim=k_dim, v_dim=v_dim, seq_len=seq_len,
-        use_qk_l2norm=True, rms_eps=eps)
+        use_qk_l2norm=True, rms_eps=eps,
+        num_v_heads=num_v_heads)
 
     # ---- out_proj ----
     w_out = g.weight(os.path.join(weights_dir, f"{pfx}_out_proj_weight.weights"),
-                     (hidden_size, num_heads * v_dim), Precision.FP16)
+                     (hidden_size, num_v_heads * v_dim), Precision.FP16)
     out = g.matmul(gated, w_out)
     return out
 
@@ -479,14 +486,17 @@ def convert_qwen35(model_dir: str, output_dir: str, num_layers: int = 24,
     with open(model_dir / 'config.json') as f:
         cfg = json.load(f)
 
-    # Find safetensors file
-    st_files = list(model_dir.glob('model.safetensors-*.safetensors'))
+    # Find safetensors files (may be sharded)
+    st_files = sorted(model_dir.glob('model.safetensors-*.safetensors'))
     if not st_files:
         st_files = list(model_dir.glob('model.safetensors'))
     if not st_files:
         raise FileNotFoundError(f"No safetensors file in {model_dir}")
 
-    weights = load_safetensors(str(st_files[0]))
+    # Load all shards and merge
+    weights = {}
+    for st_path in st_files:
+        weights.update(load_safetensors(str(st_path)))
 
     # ---- Step 1: Export weights ----
     print("Exporting weights...")

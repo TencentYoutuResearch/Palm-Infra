@@ -60,45 +60,48 @@ static void fused_gdn_head(
     const float* qkv, const float* a, const float* b, const float* z,
     const float* neg_exp_A, const float* dt_bias, const float* norm_w,
     float* state, float* out,
-    int num_heads, int k_dim, int v_dim, int seq_len,
-    int data_seq_len,  // actual seq_len of the data buffer (may be > seq_len for padded prefill)
+    int num_heads, int k_dim, int v_dim, int num_v_heads, int seq_len,
+    int data_seq_len,
     bool use_l2norm, float rms_eps, float l2norm_eps, float scale)
 {
-    int qkv_dim   = num_heads * k_dim;  // 2048
-    int z_dim     = num_heads * v_dim;  // 2048
-    int state_size = k_dim * v_dim;     // 16384
+    int qkv_dim   = num_heads * k_dim;       // key_dim (q/k are key_heads * k_dim)
+    int qkv_total = qkv_dim * 2 + num_v_heads * v_dim;  // key_dim*2 + value_dim
+    int z_dim     = num_v_heads * v_dim;
+    int state_size = k_dim * v_dim;
+    int repeat    = num_v_heads / num_heads;  // 1 for 0.8B, 2 for 4B
 
     std::vector<float> q_pre(k_dim), k_pre(k_dim), v_t(v_dim);
     std::vector<float> q_n(k_dim), k_n(k_dim);
     std::vector<float> kv_mem(v_dim), delta(v_dim), attn_out(v_dim);
 
-    for (int h = 0; h < num_heads; h++) {
-        float* state_h = state + h * state_size;
-        float nea = neg_exp_A[h];
-        float dtb = dt_bias[h];
+    for (int vh = 0; vh < num_v_heads; vh++) {
+        int kh = vh / repeat;  // key head index (0.8B: vh==kh, 4B: vh/2)
+
+        float* state_h = state + kh * state_size;
+        float nea = neg_exp_A[kh];
+        float dtb = dt_bias[kh];
 
         for (int t = 0; t < seq_len; t++) {
-            // Extract q, k, v from qkv_conv [qkv_total, data_seq_len] row-major.
-            // qkv index: dim_idx = h * k_dim + d  for q,
-            //            dim_idx = qkv_dim + h * k_dim + d  for k,
-            //            dim_idx = 2 * qkv_dim + h * v_dim + d  for v.
-            // Data: qkv[dim_idx * data_seq_len + t]
-            int qkv_total = qkv_dim * 3;
+            // Extract q, k from key_heads section of qkv
+            // qkv layout: [qkv_total, data_seq_len] row-major
+            //   q: dim_idx = kh * k_dim + d
+            //   k: dim_idx = qkv_dim + kh * k_dim + d
+            //   v: dim_idx = 2 * qkv_dim + vh * v_dim + d
             for (int d = 0; d < k_dim; d++) {
-                q_pre[d] = qkv[(h * k_dim + d) * data_seq_len + t];
-                k_pre[d] = qkv[(qkv_dim + h * k_dim + d) * data_seq_len + t];
+                q_pre[d] = qkv[(kh * k_dim + d) * data_seq_len + t];
+                k_pre[d] = qkv[(qkv_dim + kh * k_dim + d) * data_seq_len + t];
             }
             for (int d = 0; d < v_dim; d++)
-                v_t[d] = qkv[(2 * qkv_dim + h * v_dim + d) * data_seq_len + t];
+                v_t[d] = qkv[(2 * qkv_dim + vh * v_dim + d) * data_seq_len + t];
 
-            // g = -exp(A_log[h]) * softplus(a[t,h] + dt_bias[h])
-            float a_ht = a[t * num_heads + h];
+            // g = -exp(A_log[kh]) * softplus(a[t, vh] + dt_bias[kh])
+            float a_ht = a[t * num_v_heads + vh];
             float sp = softplusf(a_ht + dtb);
             float g_t = nea * sp;
             float g_t_exp = std::exp(g_t);
 
-            // beta = sigmoid(b[t,h])
-            float b_ht = b[t * num_heads + h];
+            // beta = sigmoid(b[t, vh])
+            float b_ht = b[t * num_v_heads + vh];
             float beta_t = sigmoidf(b_ht);
 
             // L2 normalize q, k (if enabled)
@@ -146,14 +149,14 @@ static void fused_gdn_head(
             // 6. RMSNormGated: out = rms_norm(attn_out, norm_w) * silu(z)
             // Output layout: [z_dim, seq] row-major. Matmul reads lda = stride[1]/es = z_dim.
             // out[global_dim + t * z_dim] matches matmul's A[m*z_dim + k] for out_proj.
-            const float* z_row = z + t * z_dim + h * v_dim;
+            const float* z_row = z + t * z_dim + vh * v_dim;
             float sum_sq = 0.f;
             for (int d = 0; d < v_dim; d++) sum_sq += attn_out[d] * attn_out[d];
             float rms = 1.f / std::sqrt(sum_sq / (float)v_dim + rms_eps);
             for (int d = 0; d < v_dim; d++) {
                 float normed = attn_out[d] * rms * norm_w[d];
                 float silu_z = z_row[d] * sigmoidf(z_row[d]);
-                int global_dim = h * v_dim + d;
+                int global_dim = vh * v_dim + d;
                 out[global_dim + t * z_dim] = normed * silu_z;
             }
         }
@@ -173,7 +176,8 @@ void kernel_gdn_prefill(const OpParams& params,
     int seq_len     = graph_params::get_i32(params, 3, 4);
     bool use_l2norm = graph_params::get_i32(params, 4, 1) != 0;
     // params.i32[5] = conv_kernel (unused)
-    int n_real      = graph_params::get_i32(params, 6, seq_len); // 0 or missing → all positions
+    int n_real      = graph_params::get_i32(params, 6, seq_len);
+    int num_v_heads = graph_params::get_i32(params, 7, num_heads);
     float rms_eps   = graph_params::get_f32(params, 0, 1e-6f);
     float l2norm_eps= graph_params::get_f32(params, 1, 1e-6f);
     float scale     = graph_params::get_f32(params, 2, 0.f);
@@ -197,8 +201,7 @@ void kernel_gdn_prefill(const OpParams& params,
         neg_exp_A[h] = -std::exp(A_log_data[h]);
 
     // Zero out output for padding positions.
-    // Output layout is [z_dim, seq_len] row-major → zero columns process_len..seq_len-1
-    int z_dim = num_heads * v_head_dim;
+    int z_dim = num_v_heads * v_head_dim;
     int process_len = (n_real > 0 && n_real < seq_len) ? n_real : seq_len;
     if (process_len < seq_len) {
         for (int t = process_len; t < seq_len; t++) {
@@ -209,7 +212,8 @@ void kernel_gdn_prefill(const OpParams& params,
     fused_gdn_head(qkv_data, a_data, b_data, z_data,
                    neg_exp_A.data(), dtb_data, norm_data,
                    state_data, out_data,
-                   num_heads, k_head_dim, v_head_dim, process_len, seq_len,
+                   num_heads, k_head_dim, v_head_dim, num_v_heads,
+                   process_len, seq_len,
                    use_l2norm, rms_eps, l2norm_eps, scale);
 }
 

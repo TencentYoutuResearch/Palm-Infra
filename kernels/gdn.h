@@ -34,7 +34,7 @@
 //   inputs[0] qkv_conv     FP32  data [seq, qkv_total=3*num_heads*k_dim]  (post-shortconv, post-reshape)
 //   inputs[1] a_out        FP32  data [seq, num_heads]
 //   inputs[2] b_out        FP32  data [seq, num_heads]
-//   inputs[3] z_out        FP32  data [seq, num_heads*v_dim]
+//   inputs[3] z_out        FP32  data [seq, num_v_heads*v_dim]  (z_proj output)
 //   inputs[4] A_log        FP32  [num_heads]               (CONSTANT)
 //   inputs[5] dt_bias      FP32  [num_heads]               (CONSTANT)
 //   inputs[6] norm_weight  FP32  [v_dim]                    (CONSTANT, RMSNorm gamma)
@@ -42,16 +42,18 @@
 //                          layout: state[h*k_dim*v_dim + dk*v_dim + dv]
 //
 // Output:
-//   outputs[0] out         FP32  data [seq, num_heads*v_dim] row-major
+//   outputs[0] out         FP32  data [seq, num_v_heads*v_dim] row-major
 //                          (= RMSNormGated result, ready for out_proj matmul)
 //
 // Params:
-//   i32[0] = num_heads
+//   i32[0] = num_heads         (key heads, used for q/k/a/b)
 //   i32[1] = k_head_dim
 //   i32[2] = v_head_dim
 //   i32[3] = seq_len           (prefill: N, decode: 1)
 //   i32[4] = use_qk_l2norm     (1 for Qwen3.5)
 //   i32[5] = conv_kernel       (informational, unused — shortconv already done)
+//   i32[6] = n_real_tokens     (runtime-injected by engine, 0 = all)
+//   i32[7] = num_v_heads       (value heads, for z/out dim; defaults to num_heads)
 //
 //   f32[0] = rms_eps           (1e-6, RMSNorm eps)
 //   f32[1] = l2norm_eps        (1e-6, L2 norm eps)
