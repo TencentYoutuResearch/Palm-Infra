@@ -82,11 +82,6 @@ static void fused_gdn_head(
         float dtb = dt_bias[vh];
 
         for (int t = 0; t < seq_len; t++) {
-            // Extract q, k from key_heads section of qkv
-            // qkv layout: [qkv_total, data_seq_len] row-major
-            //   q: dim_idx = kh * k_dim + d
-            //   k: dim_idx = qkv_dim + kh * k_dim + d
-            //   v: dim_idx = 2 * qkv_dim + vh * v_dim + d
             for (int d = 0; d < k_dim; d++) {
                 q_pre[d] = qkv[(kh * k_dim + d) * data_seq_len + t];
                 k_pre[d] = qkv[(qkv_dim + kh * k_dim + d) * data_seq_len + t];
