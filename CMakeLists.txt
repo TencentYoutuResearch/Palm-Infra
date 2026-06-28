@@ -29,6 +29,7 @@ set(SOURCES
     kernels/attention.cpp
     kernels/gdn.cpp
     kernels/gdn_decode.cpp
+    kernels/gdn_prefill.cpp
     kernels/threading.cpp
     # engine
     engine/engine.cpp
