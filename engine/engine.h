@@ -67,6 +67,12 @@ struct EngineConfig {
     int rope_dim = 64;
     float rope_theta = 500000.f;
     int num_threads = 4;
+
+    // Sampling params
+    float temperature = 0.6f;         // 0 = greedy (argmax)
+    int top_k = 50;                   // 0 = disabled
+    float top_p = 0.9f;              // 0 = disabled
+    unsigned int seed = 42;          // random seed for sampling
 };
 
 // ---------------------------------------------------------------------------

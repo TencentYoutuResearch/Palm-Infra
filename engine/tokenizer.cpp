@@ -583,9 +583,10 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
 // --- Chat template ----------------------------------------------------------
 
 std::vector<int> Tokenizer::apply_chat(const std::string& user_message) const {
-    // Single-turn convenience: wrap one user message with default system prompt.
+    // Single-turn: wrap one user message WITHOUT system prompt
+    // (matches transformers default behavior).
+    // For ChatML models (Qwen3.5), the template includes <think> tags.
     std::vector<ChatMessage> messages;
-    messages.push_back({"system", "You are a helpful assistant."});
     messages.push_back({"user", user_message});
     return apply_chat(messages);
 }
@@ -598,13 +599,15 @@ std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages)
 
     std::string prompt;
     if (use_chatml) {
-        // ChatML format (no BOS token for Qwen3.5)
+        // ChatML format (no BOS token for Qwen3.5).
+        // Qwen3.5 template: appends \n<think>\n\n</think>\n\n after assistant header
+        // when enable_thinking is true (default).
         for (size_t i = 0; i < messages.size(); i++) {
             const auto& msg = messages[i];
             prompt += "<|im_start|>" + msg.role + "\n" + msg.content + "<|im_end|>\n";
         }
-        // Prime assistant response
-        prompt += "<|im_start|>assistant\n";
+        // Prime assistant response with thinking tags
+        prompt += "<|im_start|>assistant\n<think>\n\n</think>\n\n";
     } else {
         // Llama-3 format
         prompt = "<|begin_of_text|>";

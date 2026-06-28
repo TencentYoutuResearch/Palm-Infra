@@ -1538,3 +1538,62 @@ llama.cpp build: 5c7c22c3e (9803), BLAS backend, Qwen3.5-0.8B-F16.gguf
 与 Youtu-LLM-2B 测试协议一致（pp256 + tg64, 4 threads, M5 Pro）。
 
 ---
+
+## Qwen3.5-0.8B Fused GDN Op (2026-06-26)
+
+**问题**：Qwen3.5 linear_attention 路径输出乱码。根因是 `_build_linear_attn_layer` 把 Gated Delta Rule 拆成 ~25 个细粒度 op（reshape/permute/slice/add/softplus/exp/mul/sigmoid/gdn/rms_norm/silu），而 mlllm 的 reshape/permute/slice 是 zero-copy 元数据操作，对 matmul 输出（shape `[N,seq]` 但数据 `[seq,N]` row-major）的布局推理全部错位。
+
+**修复**：把 split qkv + g/beta 计算 + GDN recurrence + RMSNormGated 融合成单个 `GATED_DELTANET_PREFILL/DECODE` op（复用已有枚举 110/111）。kernel 直接按 matmul 输出的 `[seq, dim]` row-major 布局读 a_out/b_out/z_out，按 shortconv 输出的 `[qkv_total, seq]` 布局读 qkv_conv。
+
+**关键改动**：
+- `kernels/gdn.{h,cpp}`：重写为 8-input fused op（qkv_conv/a/b/z/A_log/dt_bias/norm_w/gdn_state），内联 g/beta + L2 norm + delta-rule recurrence + RMSNormGated。scalar FP32 实现（NEON 优化留后续）。
+- `python/transpile.py`：加 `GraphBuilder.gated_deltanet` helper。
+- `models/qwen35.py`：`_build_linear_attn_layer` 删除 ~65 行细粒度 op 链，替换为单次 `g.gated_deltanet` 调用。shortconv 保留（已验证正确）。
+- `graph/execute.cpp`：SHORTCONV kernel 修复——输入按 `[seq, groups]` 数据布局读（`x_data[s*groups + g]`），而不是误以为 `[groups, seq]`。
+- `tests/test_gdn.cpp`：重写为 8-input 接口，3 个场景（prefill/decode/prefill→decode）全 PASS，max_err 1e-7。
+- `tests/test_qwen35_ref.cpp` + `tests/dump_qwen35_ref_np.py`：用真实 layer 0 权重对照 numpy reference，全 PASS。
+
+**验证**：
+- test_gdn: 全 PASS（合成数据，scalar reference 对照）
+- test_qwen35_ref: 全 PASS（真实 layer 0 权重，numpy reference 对照，max_err 2.4e-7）
+- e2e: prefill 4 tokens "Hello, world!" 返回 token 393（numpy reference 返回 271，接近但不同——剩余差异来自 full_attention 层的 QK norm reshape materialize bug，见下）
+
+**剩余问题（full_attention 层）**：
+- `qwen35.py:348` `g.reshape(query, (head_dim, num_heads*seq_len))` 对 slice view materialize 时，mlllm 的 reshape 按旧 shape 逻辑顺序复制，产出数据布局是 `[num_heads, head_dim, seq]` 而非期望的 `[head_dim, num_heads, seq]`。导致 RMSNorm 归一化维度错位。
+- 这是 mlllm reshape 对非 contiguous view materialize 的根本问题：不保证元素顺序与新 shape 一致。
+- 修复方向：把 QK norm 也融合进 SDPA op（类似 fused GDN），或用显式 permute+materialize 替代 reshape。
+
+**RoPE 修复**：Qwen3.5 用 `rotate_half`（halves 模式），不是 interleave。`qwen35.py:360` 从 `interleave=True` 改为 `False`。
+
+## reshape materialize 修复 (2026-06-26, 同日)
+
+**问题**：`execute.cpp` 的 RESHAPE 对非 contiguous view materialize 时，按 src.shape 顺序写入 dst flat，但 dst 按新 shape 解释。当 reshape 跨维度边界（如 `[N, seq]` → `[head_dim, N/head_dim * seq]`）时，flat 顺序不一致导致错位。
+
+**修复**：materialize 按**新 shape** 迭代，每个新逻辑 flat 索引映射回 src 的逻辑索引（divmod src shape），再按 src stride 读取。保证元素逻辑顺序一致。
+
+**验证**：test_execute 的 "reshape after permute preserves logical element order" 测试通过。test_gdn/test_qwen35_ref/test_e2e 全过。
+
+**注意**：此修复对 full_attention 的 QK norm reshape 正确，但 full_attn 仍有 **v 布局 bug**：v 是 matmul 输出（contiguous, 数据 `[seq, num_kv_heads*head_dim]`），reshape 到 `[head_dim, seq, num_kv_heads]` 是 zero-copy，但 SDPA kernel 期望 `[head_dim, seq, num_kv_heads]` row-major 数据布局，实际数据是 `[seq, num_kv_heads, head_dim]`。需要融合 SDPA op 或让 SDPA 按 matmul 布局读 v。这是 prefill 返回 393（vs numpy 271）的剩余根因。
+
+## v layout fix (2026-06-27)
+
+**问题**：`qwen35.py:377-378` 对 v 做 `reshape(v, (head_dim, seq, num_kv_heads))` → `contiguous(v)`，但 v 来自 matmul，数据布局是 `[seq, num_kv_heads*head_dim]` row-major，不是 `[head_dim, seq, num_kv_heads]`。contiguous 按错误的 shape 解释复制，导致 SDPA kernel 读到错位的 v 数据。
+
+**修复**：
+```python
+# v is matmul output: data layout [seq, num_kv_heads * head_dim]
+# First reshape to the data's native layout [seq, num_kv_heads, head_dim]
+v = g.reshape(v, (seq_len, num_kv_heads, head_dim))
+# Then permute to SDPA-expected [head_dim, seq, num_kv_heads]
+v = g.permute(v, (2, 0, 1, 3))
+# Materialize so the kernel sees the correct contiguous layout
+v = g.contiguous(v)
+```
+
+- reshape 到 `(seq, num_kv_heads, head_dim)` 匹配数据原生布局（zero-copy）
+- permute `(2,0,1,3)` → `[head_dim, seq, num_kv_heads]`（zero-copy 元数据变换）
+- contiguous materialize 产生 SDPA kernel 期望的正确布局
+
+**同时修复**：GDN kernel 从旧 6-input 接口（q, k, v, g, beta, state）重写为 fused 8-input 接口（qkv_conv, a, b, z, A_log, dt_bias, norm_w, state），与 `gated_deltanet` 模型 builder 一致。内核内部计算 g = -exp(A_log)*softplus(a+dt_bias)、beta = sigmoid(b)，运行 recurrence + RMSNormGated。
+
+**验证**：test_gdn 全 PASS（prefill/decode/prefill→decode 3 场景），test_qwen35_ref 全 PASS（真实 layer 0 权重，max_err=3e-7），ctest 17/17 PASS。

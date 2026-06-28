@@ -46,6 +46,7 @@ class OpType(IntEnum):
     CONCAT         = 62
     SLICE          = 63
     TILE           = 64
+    CONTIGUOUS     = 65
     ADD            = 70
     MUL            = 71
     SIGMOID        = 72
@@ -327,6 +328,21 @@ class GraphBuilder:
                          prec=self._nodes[x].out_prec,
                          i32=r)
 
+    def contiguous(self, x: int) -> int:
+        """Materialize to a row-major contiguous buffer.
+        
+        Copies the input tensor in stride order into a new buffer whose
+        physical layout matches the declared shape.  Essential after
+        zero-copy permute/reshape when downstream kernels (e.g. SDPA)
+        read via channel() + raw pointer arithmetic.
+        
+        Returns a new node with the same shape as x, backed by a
+        contiguous buffer.
+        """
+        sx = self._nodes[x].out_shape
+        return self._add(OpType.CONTIGUOUS, [x], sx,
+                         prec=self._nodes[x].out_prec)
+
     # ---- element-wise ----
 
     def add(self, a: int, b: int) -> int:
@@ -370,6 +386,49 @@ class GraphBuilder:
         return self._add(OpType.SHORTCONV, [x, weight, conv_state], sx,
                          prec=self._nodes[x].out_prec,
                          i32=[kernel_size])
+
+    def gated_deltanet(self, qkv_conv: int, a_out: int, b_out: int, z_out: int,
+                       A_log: int, dt_bias: int, norm_weight: int, gdn_state: int,
+                       num_heads: int, k_dim: int, v_dim: int, seq_len: int,
+                       use_qk_l2norm: bool = True, rms_eps: float = 1e-6) -> int:
+        """Fused Gated Delta Rule linear-attention core for Qwen3.5.
+
+        Replaces: split qkv, g/beta compute, GDN recurrence, RMSNormGated.
+
+        All four matmul-derived inputs (qkv_conv/a_out/b_out/z_out) MUST be in
+        their native [seq, dim] row-major data layout (the layout matmul writes
+        C in). The builder emits a `reshape` materialize on qkv_conv (shortconv
+        output, which is [groups, seq]) to bring it to [seq, qkv_total] so all
+        four inputs share the same convention. The kernel indexes ptr[t*dim+d]
+        directly and does NOT consult Tensor shape/stride.
+
+        Args:
+            qkv_conv:    shortconv output reshaped to [seq, qkv_total] data
+                         (qkv_total = 3*num_heads*k_dim)
+            a_out:       matmul x@w_a, data [seq, num_heads]
+            b_out:       matmul x@w_b, data [seq, num_heads]
+            z_out:       matmul x@w_z, data [seq, num_heads*v_dim]
+            A_log:       CONSTANT [num_heads] FP32
+            dt_bias:     CONSTANT [num_heads] FP32
+            norm_weight: CONSTANT [v_dim] FP32 (RMSNormGated gamma)
+            gdn_state:   INPUT [num_heads, k_dim, v_dim] FP32, in-place modified
+            seq_len:     1 for decode, N for prefill
+
+        Returns:
+            output node, declared shape [num_heads*v_dim, seq], data
+            [seq, num_heads*v_dim] row-major (ready for out_proj matmul).
+        """
+        op = (OpType.GATED_DELTANET_DECODE if seq_len == 1
+              else OpType.GATED_DELTANET_PREFILL)
+        scale = float(k_dim ** -0.5)
+        return self._add(op,
+                         [qkv_conv, a_out, b_out, z_out,
+                          A_log, dt_bias, norm_weight, gdn_state],
+                         (num_heads * v_dim, seq_len),
+                         prec=Precision.FP32,
+                         i32=[num_heads, k_dim, v_dim, seq_len,
+                              1 if use_qk_l2norm else 0, 4],
+                         f32=[rms_eps, 1e-6, scale])
 
     # ---- save ----
 

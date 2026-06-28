@@ -296,6 +296,8 @@ static void dispatch_kernel(OpType op, const OpParams& params,
     }
     case OpType::SHORTCONV: {
         // ShortConv: depth-wise causal conv1d + silu.
+        // Input x comes from matmul: shape [groups, seq], data [seq, groups] row-major.
+        //   x_data[s * groups + g] = value at (group g, position s).
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
             const Tensor& x = *inputs[0];
             const Tensor& w = *inputs[1];
@@ -304,59 +306,66 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             int kernel_size = graph_params::get_i32(params, 0, 4);
             int groups = (int)x.shape[0];
             int seq_len = (int)x.shape[1];
+            int n_real = graph_params::get_i32(params, 1, seq_len); // 0 or missing → all positions
 
             const float* x_data = x.ptr<float>();
             const float* w_data = w.ptr<float>();
             float* conv_state_data = reinterpret_cast<float*>(inputs[2]->data);
             float* out_data = out.ptr<float>();
 
-            // Build stated input: [groups, kernel_size-1 + seq_len]
-            // First kernel_size-1 rows come from conv_state, rest from x.
             int prefix_len = kernel_size - 1;
             int total_len = prefix_len + seq_len;
 
-            // Allocate a temp buffer for the stated input.
-            // For small kernel_size (4) and typical groups (6144), this is 6144*3 = 18K floats.
             std::vector<float> stated(groups * total_len);
 
-            // Copy conv_state [groups, kernel_size-1] into stated [groups, 0..prefix-1]
+            // Copy conv_state [groups, prefix_len] into stated
             for (int g = 0; g < groups; g++) {
                 const float* cs = conv_state_data + g * prefix_len;
                 float* dst = stated.data() + g * total_len;
                 for (int p = 0; p < prefix_len; p++) dst[p] = cs[p];
             }
-            // Copy x [groups, seq] into stated [groups, prefix..prefix+seq-1]
-            for (int g = 0; g < groups; g++) {
-                const float* xs = x_data + g * seq_len;
-                float* dst = stated.data() + g * total_len + prefix_len;
-                for (int s = 0; s < seq_len; s++) dst[s] = xs[s];
+            // Copy x into stated. x data layout: [seq, groups] → x_data[s*groups + g].
+            for (int s = 0; s < seq_len; s++) {
+                for (int g = 0; g < groups; g++) {
+                    stated[g * total_len + prefix_len + s] = x_data[s * groups + g];
+                }
             }
 
-            // Conv1d + silu for each group, each position
+            // Conv1d + silu for each group, each position.
+            // Only process real tokens [0, n_real); padding positions remain zero.
+            int process_len = (n_real > 0 && n_real < seq_len) ? n_real : seq_len;
             for (int g = 0; g < groups; g++) {
                 const float* w_ptr = w_data + g * kernel_size;
                 const float* st = stated.data() + g * total_len;
                 float* ot = out_data + g * seq_len;
 
-                for (int i = 0; i < seq_len; i++) {
+                // Zero out all positions first
+                for (int i = 0; i < seq_len; i++) ot[i] = 0.f;
+
+                for (int i = 0; i < process_len; i++) {
                     float sum = 0.f;
                     int base = prefix_len + i;
                     for (int k = 0; k < kernel_size; k++) {
                         int src_i = base - (kernel_size - 1) + k;
                         sum += st[src_i] * w_ptr[k];
                     }
-                    // silu(sum) = sum * sigmoid(sum)
                     float sig = 1.f / (1.f + std::exp(-sum));
                     ot[i] = sum * sig;
                 }
             }
 
-            // Update conv_state: last kernel_size-1 rows of stated
-            for (int g = 0; g < groups; g++) {
-                const float* st = stated.data() + g * total_len;
-                float* cs = conv_state_data + g * prefix_len;
-                for (int p = 0; p < prefix_len; p++) {
-                    cs[p] = st[total_len - prefix_len + p];
+            // Update conv_state: save the last prefix_len positions of the
+            // LAST REAL TOKEN's window (not the padded end).
+            // For process_len tokens, the last relevant position in stated is
+            // prefix_len + process_len - 1. We save the window ending there.
+            if (process_len > 0) {
+                int last_real_pos = prefix_len + process_len - 1;
+                for (int g = 0; g < groups; g++) {
+                    const float* st = stated.data() + g * total_len;
+                    float* cs = conv_state_data + g * prefix_len;
+                    for (int p = 0; p < prefix_len; p++) {
+                        cs[p] = st[last_real_pos - prefix_len + 1 + p];
+                    }
                 }
             }
         }
@@ -797,6 +806,32 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             *output = inputs[0]->permute(params.i32[0], params.i32[1],
                                          params.i32[2], params.i32[3]);
         }
+        break;
+
+    case OpType::CONTIGUOUS:
+        // Materialize to row-major contiguous buffer.
+        if (!inputs.empty() && inputs[0] && inputs[0]->data && output && output->data) {
+            const Tensor& src = *inputs[0];
+            size_t es = src.element_size();
+            char* dst = static_cast<char*>(output->data);
+            int64_t flat = 0;
+            for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
+                for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
+                    for (int64_t i1 = 0; i1 < src.shape[1]; i1++) {
+                        for (int64_t i0 = 0; i0 < src.shape[0]; i0++) {
+                            const char* src_ptr = static_cast<const char*>(src.data)
+                                + i0 * src.stride[0]
+                                + i1 * src.stride[1]
+                                + i2 * src.stride[2]
+                                + i3 * src.stride[3];
+                            std::memcpy(dst + flat * es, src_ptr, es);
+                            flat++;
+                        }
+                    }
+                }
+            }
+        }
+        break;
         break;
 
     default:

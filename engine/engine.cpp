@@ -4,11 +4,123 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 // ---------------------------------------------------------------------------
-// LLMEngine
+// Sampler
 // ---------------------------------------------------------------------------
+
+namespace {
+
+/// Temperature scaling + softmax in-place.
+/// Returns the softmax sum (should be ~1.0).
+float softmax_inplace(float* logits, int n, float temperature) {
+    float max_val = logits[0];
+    for (int i = 1; i < n; i++) max_val = std::max(max_val, logits[i]);
+
+    float inv_t = (temperature > 0.0f) ? (1.0f / temperature) : 1.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        logits[i] = std::exp((logits[i] - max_val) * inv_t);
+        sum += logits[i];
+    }
+    if (sum > 0.0f) {
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < n; i++) logits[i] *= inv_sum;
+    }
+    return sum;
+}
+
+/// Top-k filtering: zero out probabilities below the k-th largest.
+void top_k_filter(float* probs, int n, int top_k) {
+    if (top_k <= 0 || top_k >= n) return;
+
+    // Partial sort: find the top_k-th largest element
+    std::vector<float> copy(probs, probs + n);
+    std::nth_element(copy.begin(), copy.begin() + top_k - 1, copy.end(),
+                     std::greater<float>());
+    float threshold = copy[top_k - 1];
+
+    for (int i = 0; i < n; i++) {
+        if (probs[i] < threshold) probs[i] = 0.0f;
+    }
+}
+
+/// Top-p (nucleus) filtering: keep smallest set of tokens whose cumulative
+/// probability >= top_p.
+void top_p_filter(float* probs, int n, float top_p) {
+    if (top_p <= 0.0f || top_p >= 1.0f) return;
+
+    // Sort indices by probability descending
+    std::vector<int> indices(n);
+    for (int i = 0; i < n; i++) indices[i] = i;
+    std::sort(indices.begin(), indices.end(),
+              [&](int a, int b) { return probs[a] > probs[b]; });
+
+    float cumsum = 0.0f;
+    int cutoff = 0;
+    for (int i = 0; i < n; i++) {
+        cumsum += probs[indices[i]];
+        if (cumsum >= top_p) { cutoff = i + 1; break; }
+    }
+
+    // Zero out everything below cutoff
+    float threshold = probs[indices[std::min(cutoff, n - 1)]];
+    for (int i = 0; i < n; i++) {
+        if (probs[i] < threshold) probs[i] = 0.0f;
+    }
+}
+
+/// Multinomial sample from probability distribution.
+int sample_multinomial(const float* probs, int n, float random_val) {
+    float cumsum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cumsum += probs[i];
+        if (random_val < cumsum) return i;
+    }
+    // Fallback: argmax
+    int best = 0;
+    for (int i = 1; i < n; i++) if (probs[i] > probs[best]) best = i;
+    return best;
+}
+
+/// Full sample pipeline: logits → temperature → softmax → top-k → top-p → sample.
+int sample_token(float* logits, int vocab_size,
+                  float temperature, int top_k, float top_p,
+                  unsigned int* seed) {
+    if (temperature <= 0.0f) {
+        // Greedy: just argmax
+        int best = 0;
+        for (int i = 1; i < vocab_size; i++)
+            if (logits[i] > logits[best]) best = i;
+        return best;
+    }
+
+    softmax_inplace(logits, vocab_size, temperature);
+    top_k_filter(logits, vocab_size, top_k);
+    top_p_filter(logits, vocab_size, top_p);
+
+    // Re-normalize after filtering
+    float sum = 0.0f;
+    for (int i = 0; i < vocab_size; i++) sum += logits[i];
+    if (sum > 0.0f) {
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < vocab_size; i++) logits[i] *= inv_sum;
+    } else {
+        // All probs zeroed — fallback to argmax
+        int best = 0;
+        for (int i = 1; i < vocab_size; i++)
+            if (logits[i] > logits[best]) best = i;
+        return best;
+    }
+
+    float r = (float)rand_r(seed) / (float)RAND_MAX;
+    return sample_multinomial(logits, vocab_size, r);
+}
+
+} // namespace
 
 LLMEngine::~LLMEngine() {
     // Tensor data owned by BufferPool or EXTERNAL — no explicit free needed
@@ -468,26 +580,15 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
         kernel_matmul_fp32(A, *embed_weight_, C, exec_ctx_decode_.thread_pool);
     }
 
-    const float* scores = C.ptr<float>();
-    struct Candidate { int id; float score; };
-    Candidate top5[5] = {{0,-1e38f},{0,-1e38f},{0,-1e38f},{0,-1e38f},{0,-1e38f}};
+    float* scores = C.ptr<float>();
+    int token = sample_token(scores, vocab_size,
+                              cfg_.temperature, cfg_.top_k, cfg_.top_p,
+                              &cfg_.seed);
 
-    for (int v = 0; v < vocab_size; v++) {
-        float score = scores[v];
-        for (int i = 0; i < 5; i++) {
-            if (score > top5[i].score) {
-                for (int j = 4; j > i; j--) top5[j] = top5[j-1];
-                top5[i] = {v, score};
-                break;
-            }
-        }
-    }
-
-    // Release lm_head output buffer back to pool (prevents pool exhaustion
-    // across many decode steps — each lm_head allocates ~1MB for vocab=248K).
+    // Release lm_head output buffer back to pool
     graph_prefill_.runtime.pool.release(c_buf, vocab_size * sizeof(float));
 
-    return top5[0].id;
+    return token;
 }
 
 // ---------------------------------------------------------------------------
@@ -545,13 +646,44 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
         Tensor* t = &tensors[node.id];
 
         if (name == "hidden") {
-            *t = hidden;
+            // hidden is OWNED by caller, copy data into graph's pool
+            size_t nbytes = hidden.nbytes();
+            void* buf = graph.runtime.pool.acquire(nbytes);
+            if (!buf) {
+                fprintf(stderr, "FATAL: pool acquire failed for hidden (%zu bytes)\n", nbytes);
+                return Tensor();
+            }
+            std::memcpy(buf, hidden.data, nbytes);
+            *t = Tensor::create(hidden.prec, MemoryType::POOLED,
+                                hidden.shape[0], hidden.shape[1],
+                                hidden.shape[2], hidden.shape[3], buf);
         } else if (name == "mask") {
-            *t = mask;
+            size_t nbytes = mask.nbytes();
+            void* buf = graph.runtime.pool.acquire(nbytes);
+            if (buf) {
+                std::memcpy(buf, mask.data, nbytes);
+                *t = Tensor::create(mask.prec, MemoryType::POOLED,
+                                    mask.shape[0], mask.shape[1],
+                                    mask.shape[2], mask.shape[3], buf);
+            }
         } else if (name == "cos") {
-            *t = cos;
+            size_t nbytes = cos.nbytes();
+            void* buf = graph.runtime.pool.acquire(nbytes);
+            if (buf) {
+                std::memcpy(buf, cos.data, nbytes);
+                *t = Tensor::create(cos.prec, MemoryType::POOLED,
+                                    cos.shape[0], cos.shape[1],
+                                    cos.shape[2], cos.shape[3], buf);
+            }
         } else if (name == "sin") {
-            *t = sin;
+            size_t nbytes = sin.nbytes();
+            void* buf = graph.runtime.pool.acquire(nbytes);
+            if (buf) {
+                std::memcpy(buf, sin.data, nbytes);
+                *t = Tensor::create(sin.prec, MemoryType::POOLED,
+                                    sin.shape[0], sin.shape[1],
+                                    sin.shape[2], sin.shape[3], buf);
+            }
         }
         // cache_k/cache_v are set in reset() and updated by SDPA
     }
@@ -632,17 +764,12 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     }
 
     Tensor h = embed(token_ids);
-    // Pad hidden to the graph's seq_len if needed (graph may expect 256 tokens
-    // but we only have n tokens). The causal mask ensures padded positions
-    // don't affect real tokens, but we must provide a valid buffer.
-    // Embeddings go at positions [0, n) in the graph's seq dimension.
-    // `past` only affects RoPE position offset and causal mask key range.
+    // Pad hidden to the graph's seq_len if needed
     if (n < graph_seq_len) {
         int hidden_dim = (int)h.shape[0];
         size_t padded_bytes = (size_t)hidden_dim * graph_seq_len * sizeof(float);
         void* padded_buf = graph_prefill_.runtime.pool.acquire(padded_bytes);
         std::memset(padded_buf, 0, padded_bytes);
-        // Copy real embeddings to positions [0, n)
         std::memcpy(padded_buf, h.data, (size_t)hidden_dim * n * sizeof(float));
         h = Tensor::create(Precision::FP32, MemoryType::POOLED,
                            hidden_dim, graph_seq_len, 1, 1, padded_buf);
@@ -654,6 +781,24 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     generate_rope_cache(graph_seq_len, past, cos, sin);
 
     Tensor mask = build_causal_mask(graph_seq_len, past);
+
+    // Inject n_real_tokens into SHORTCONV and GATED_DELTANET_PREFILL params
+    // so kernels can skip padding positions (stateful ops).
+    if (n < graph_seq_len) {
+        for (auto& node : graph_prefill_.nodes) {
+            if (node.op_type == OpType::GATED_DELTANET_PREFILL) {
+                if (node.params.i32.size() <= 6) {
+                    node.params.i32.resize(7, 0);
+                }
+                node.params.i32[6] = n;
+            } else if (node.op_type == OpType::SHORTCONV) {
+                if (node.params.i32.size() <= 1) {
+                    node.params.i32.resize(2, 0);
+                }
+                node.params.i32[1] = n;
+            }
+        }
+    }
 
     // Set cache metadata so SDPA knows the existing context length.
     for (auto& cp : caches_) {

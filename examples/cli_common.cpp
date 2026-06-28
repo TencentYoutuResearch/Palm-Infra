@@ -105,6 +105,24 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 error = "invalid value for --warmup";
                 return false;
             }
+        } else if (arg == "--temperature") {
+            if (!require_value(argc, argv, i, "--temperature", value, error)) return false;
+            opts.temperature = (float)std::atof(value);
+        } else if (arg == "--top-k") {
+            if (!require_value(argc, argv, i, "--top-k", value, error)) return false;
+            if (!parse_int(value, opts.top_k) || opts.top_k < 0) {
+                error = "invalid value for --top-k";
+                return false;
+            }
+        } else if (arg == "--top-p") {
+            if (!require_value(argc, argv, i, "--top-p", value, error)) return false;
+            opts.top_p = (float)std::atof(value);
+        } else if (arg == "--seed") {
+            if (!require_value(argc, argv, i, "--seed", value, error)) return false;
+            if (!parse_int(value, opts.seed)) {
+                error = "invalid value for --seed";
+                return false;
+            }
         } else {
             error = std::string("unknown argument: ") + arg;
             return false;
@@ -136,6 +154,10 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --threads <int>          Default: 4\n");
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
     std::printf("  --warmup <int>            Default: 1 (used by benchmark)\n");
+    std::printf("  --temperature <float>     Default: 0.6 (0 = greedy)\n");
+    std::printf("  --top-k <int>             Default: 50 (0 = disabled)\n");
+    std::printf("  --top-p <float>           Default: 0.9 (0 = disabled)\n");
+    std::printf("  --seed <int>              Default: 42\n");
     if (extra_usage && *extra_usage) {
         std::printf("%s", extra_usage);
         if (extra_usage[std::strlen(extra_usage) - 1] != '\n') std::printf("\n");
@@ -150,6 +172,10 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.rope_dim = opts.rope_dim;
     cfg.rope_theta = opts.rope_theta;
     cfg.num_threads = opts.num_threads;
+    cfg.temperature = opts.temperature;
+    cfg.top_k = opts.top_k;
+    cfg.top_p = opts.top_p;
+    cfg.seed = (unsigned int)opts.seed;
     return cfg;
 }
 
@@ -280,4 +306,55 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
     // Auto-resumes on the next prefill() call.
     engine.park_workers();
     return true;
+}
+
+std::vector<int> apply_chat_template(const Tokenizer& tokenizer,
+                                      const std::string& user_message,
+                                      const std::string& system_prompt) {
+    // Qwen3.5 ChatML format:
+    // <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n
+    //
+    // Special token IDs (fixed for Qwen3.5 tokenizer):
+    //   248045 = <|im_start|>
+    //   248046 = <|im_end|>
+    //   198    = \n (newline)
+    //
+    // "system", "user", "assistant" are regular tokens encoded by the tokenizer.
+    std::vector<int> ids;
+
+    auto encode_str = [&](const std::string& text) {
+        auto encoded = tokenizer.encode(text);
+        ids.insert(ids.end(), encoded.begin(), encoded.end());
+    };
+
+    // <|im_start|>system\n
+    ids.push_back(248045);  // <|im_start|>
+    encode_str("system");
+    ids.push_back(198);     // \n
+
+    // {system_prompt}
+    encode_str(system_prompt);
+
+    // <|im_end|>\n
+    ids.push_back(248046);  // <|im_end|>
+    ids.push_back(198);     // \n
+
+    // <|im_start|>user\n
+    ids.push_back(248045);  // <|im_start|>
+    encode_str("user");
+    ids.push_back(198);     // \n
+
+    // {user_message}
+    encode_str(user_message);
+
+    // <|im_end|>\n
+    ids.push_back(248046);  // <|im_end|>
+    ids.push_back(198);     // \n
+
+    // <|im_start|>assistant\n
+    ids.push_back(248045);  // <|im_start|>
+    encode_str("assistant");
+    ids.push_back(198);     // \n
+
+    return ids;
 }

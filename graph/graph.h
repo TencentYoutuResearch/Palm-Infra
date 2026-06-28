@@ -47,6 +47,7 @@ enum class OpType : uint32_t {
     CONCAT   = 62,
     SLICE    = 63,
     TILE     = 64,
+    CONTIGUOUS = 65,  // materialize to row-major contiguous
 
     // element-wise
     ADD = 70,
@@ -86,6 +87,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::CONCAT: return "CONCAT";
     case OpType::SLICE: return "SLICE";
     case OpType::TILE: return "TILE";
+    case OpType::CONTIGUOUS: return "CONTIGUOUS";
     case OpType::ADD: return "ADD";
     case OpType::MUL: return "MUL";
     case OpType::SIGMOID: return "SIGMOID";

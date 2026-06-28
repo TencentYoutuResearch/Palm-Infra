@@ -20,6 +20,12 @@ struct CliCommonOptions {
     int num_threads = 4;
     bool profile = false;
     int warmup = 1;
+
+    // Sampling
+    float temperature = 0.6f;
+    int top_k = 50;
+    float top_p = 0.9f;
+    int seed = 42;
 };
 
 struct GenerationResult {
@@ -57,3 +63,9 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
                      int eos_id, GenerationResult& result, std::string& error,
                      const std::function<void(int, const std::string&)>& on_token = {},
                      bool reset_context = true);
+
+/// Apply Qwen3.5 ChatML template: wrap user message with special tokens.
+/// Format: <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n
+std::vector<int> apply_chat_template(const Tokenizer& tokenizer,
+                                      const std::string& user_message,
+                                      const std::string& system_prompt = "You are a helpful assistant.");

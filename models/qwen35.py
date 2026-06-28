@@ -13,13 +13,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import struct
 from pathlib import Path
 
 import numpy as np
 
-from python.transpile import GraphBuilder, OpType, Precision, Activation, _write_weight_file
+from python.transpile import GraphBuilder, Precision, _write_weight_file
 
 
 def load_safetensors(path: str) -> dict[str, np.ndarray]:
@@ -74,9 +73,18 @@ def export_weights(weights: dict, weights_dir: str):
             save('final_norm', d)
             continue
 
-        # Norms → FP32
+        # RMSNorm weights → FP32.
+        # Qwen3_5RMSNorm (input_layernorm, post_attention_layernorm, q_norm, k_norm) uses:
+        #   output * (1.0 + weight)  →  pre-compute (1.0 + weight)
+        # Qwen3_5RMSNormGated (linear_attn.norm) uses:
+        #   output * weight  →  standard RMSNorm, no conversion needed
         if 'norm' in wname.lower() or 'layernorm' in wname.lower():
             d = wdata.astype(np.float32) if wdata.dtype != np.float32 else wdata
+            # Add 1.0 for all Qwen3_5RMSNorm variants
+            # (input_layernorm, post_attention_layernorm, q_norm, k_norm)
+            # but NOT for linear_attn.norm which is RMSNormGated
+            if 'linear_attn' not in wname:
+                d = 1.0 + d
             save(wname.replace('.', '_'), d)
             continue
 
@@ -253,25 +261,30 @@ def _build_layer(g, x, layer_idx, weights_dir, cfg, tc,
 def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
                               gs_in, gc_in, eps, seq_len,
                               num_heads, k_dim, v_dim, conv_kernel, hidden_size):
-    """Build a linear attention (Gated Delta Rule) layer."""
+    """Build a linear attention (Gated Delta Rule) layer.
+
+    Uses the fused `gated_deltanet` op for the GDN core + RMSNormGated.
+    See kernels/gdn.h for the op's data-layout contract — all matmul-derived
+    inputs are consumed in their native [seq, dim] row-major data layout.
+    """
     pfx = f'model_language_model_layers_{layer_idx}_linear_attn'
 
     # ---- Projections ----
     w_qkv = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_qkv_weight.weights"),
                      (num_heads * k_dim * 3, hidden_size), Precision.FP16)
-    qkv = g.matmul(x, w_qkv)  # [16*128*3, seq]
+    qkv = g.matmul(x, w_qkv)  # shape [qkv_total, seq], data [seq, qkv_total]
 
     w_a = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_a_weight.weights"),
                    (num_heads, hidden_size), Precision.FP16)
-    a_out = g.matmul(x, w_a)  # [16, seq]
+    a_out = g.matmul(x, w_a)  # shape [num_heads, seq], data [seq, num_heads]
 
     w_b = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_b_weight.weights"),
                    (num_heads, hidden_size), Precision.FP16)
-    b_out = g.matmul(x, w_b)  # [16, seq]
+    b_out = g.matmul(x, w_b)  # shape [num_heads, seq], data [seq, num_heads]
 
     w_z = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_z_weight.weights"),
                    (num_heads * v_dim, hidden_size), Precision.FP16)
-    z_out = g.matmul(x, w_z)  # [16*128, seq]
+    z_out = g.matmul(x, w_z)  # shape [num_heads*v_dim, seq], data [seq, num_heads*v_dim]
 
     # ---- A_log and dt_bias (per-head constants) ----
     A_log = g.weight(os.path.join(weights_dir, f"{pfx}_A_log.weights"),
@@ -279,87 +292,28 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     dt_bias = g.weight(os.path.join(weights_dir, f"{pfx}_dt_bias.weights"),
                        (num_heads,), Precision.FP32)
 
-    # ---- Compute g = -exp(A_log) * softplus(a + dt_bias) ----
-    # A_log is [16], dt_bias is [16]. Need to broadcast to [16, seq].
-    # a_out is [16, seq]. We need a + dt_bias (broadcast dt_bias across seq).
-    # Use scalar_add per-head? No — dt_bias is per-head, a_out is [16, seq].
-    # Since A_log/dt_bias are CONSTANT nodes (shape [16, 1, 1, 1]),
-    # and a_out is [16, seq, 1, 1], ADD will broadcast.
-    # But ADD broadcasts by taking max of each dim — [16,1,1,1] + [16,seq,1,1] → [16,seq,1,1]. OK.
-    a_plus_dt = g.add(a_out, dt_bias)
-    sp = g.softplus(a_plus_dt)          # softplus(a + dt_bias)
-    neg_exp_A = g.scalar_mul(g.exp(A_log), -1.0)  # -exp(A_log)
-    g_val = g.mul(neg_exp_A, sp)        # g = -exp(A_log) * softplus(a + dt_bias)
-
-    # ---- Compute beta = sigmoid(b) ----
-    beta_val = g.sigmoid(b_out)
-
     # ---- Short conv on qkv (conv1d + silu) ----
-    # matmul output Tensor shape is [qkv_total, seq] but data is [seq, qkv_total]
-    # (transposed). ShortConv expects [groups, seq] = [qkv_total, seq] data.
-    # Reshape to [seq, qkv_total] (matching data) then permute to [qkv_total, seq].
-    qkv_fixed = g.reshape(qkv, (seq_len, num_heads * k_dim * 3))  # materialize
-    qkv_fixed = g.permute(qkv_fixed, (1, 0, 2, 3))  # [qkv_total, seq, 1, 1]
+    # matmul output shape [qkv_total, seq], data [seq, qkv_total] (matmul convention).
+    # ShortConv kernel reads data as [seq, groups] (x_data[s*groups + g]), so it
+    # consumes the matmul output directly — no reshape/permute needed.
     # conv1d.weight: [6144, 1, 4] → reshape to [6144, 4] (groups=6144, kernel_size=4)
     w_conv = g.weight(os.path.join(weights_dir, f"{pfx}_conv1d_weight.weights"),
                      (num_heads * k_dim * 3, conv_kernel), Precision.FP32)
-    qkv_conv = g.shortconv(qkv_fixed, w_conv, gc_in, kernel_size=conv_kernel)
+    qkv_conv = g.shortconv(qkv, w_conv, gc_in, kernel_size=conv_kernel)
+    # qkv_conv data is [qkv_total, seq] (shortconv materializes [groups, seq]).
+    # The fused kernel reads this layout directly — do NOT reshape (mlllm reshape
+    # is metadata-only and would not transpose the data).
 
-    # ---- Split qkv_conv into q, k, v ----
-    # matmul output Tensor shape is [qkv_total, seq] but data is [seq, qkv_total]
-    # row-major (transposed). shortconv preserves this layout.
-    # Need to reshape to [seq, qkv_total] (matching data), then permute to
-    # [qkv_total, seq], then split into q/k/v.
-    # Actually: reshape [qkv_total, seq] → materialize to [seq, qkv_total] by
-    # reshaping to (seq_len, qkv_total) which triggers a copy (non-contiguous).
-    qkv_t = g.reshape(qkv_conv, (seq_len, num_heads * k_dim * 3))  # materialize [seq, qkv_total]
-    qkv_t = g.permute(qkv_t, (1, 0, 2, 3))  # [qkv_total, seq, 1, 1]
-    # Now split on dim=0: q=[0:2048], k=[2048:4096], v=[4096:6144]
-    qkv_dim = num_heads * k_dim  # 2048
-    q, k, v = g.slice(qkv_t, [qkv_dim, qkv_dim, qkv_dim], dim=0)
-    # q/k: [qkv_dim, seq] = [2048, seq], reshape to [head, k_dim, seq] → permute [head, seq, k_dim]
-    q = g.reshape(q, (num_heads, k_dim, seq_len))
-    q = g.permute(q, (0, 2, 1, 3))  # [head, seq, k_dim]
-    k = g.reshape(k, (num_heads, k_dim, seq_len))
-    k = g.permute(k, (0, 2, 1, 3))
-    v = g.reshape(v, (num_heads, v_dim, seq_len))
-    v = g.permute(v, (0, 2, 1, 3))  # [head, seq, v_dim]
-
-    # ---- GDN op ----
-    # g_val is [num_heads, seq] (shape [16, seq, 1, 1] after add/softplus)
-    # beta_val is [num_heads, seq]
-    # g_val is [num_heads, seq, 1, 1], beta_val is [num_heads, seq, 1, 1].
-    # GDN kernel expects [num_heads, seq] (reads g_data + h * seq_len).
-    # Just reshape — no permute needed.
-    g_val = g.reshape(g_val, (num_heads, seq_len))
-    beta_val = g.reshape(beta_val, (num_heads, seq_len))
-
-    scale = k_dim ** -0.5
-    gdn_op = OpType.GATED_DELTANET_DECODE if seq_len == 1 else OpType.GATED_DELTANET_PREFILL
-    gdn_out = g._add(gdn_op,
-                     [q, k, v, g_val, beta_val, gs_in],
-                     (v_dim, seq_len, num_heads),  # kernel writes [head, seq, v_dim] but Tensor shape is [v_dim, seq, heads]
-                     prec=Precision.FP32,
-                     i32=[num_heads, k_dim, v_dim, 1])  # use_qk_l2norm=1
-
-    # ---- RMSNormGated: norm(gdn_out) * silu(z) ----
-    # HF: core_attn_out = self.norm(core_attn_out, z)
-    #     = rms_norm(core_attn_out, norm.weight) * silu(z)
-    # Kernel output layout: [head, seq, v_dim] in memory.
-    # Tensor shape declared as (v_dim, seq, num_heads) but actual data is [head, seq, v_dim].
-    # Need to reshape to [v_dim, num_heads*seq] for per-head RMSNorm.
-    # But reshape preserves flat order: [head, seq, v_dim] flat = head0_seq0_v0..v127, head0_seq1_v0.., head1_seq0_v0..
-    # = [head, seq*v_dim] if we think of it as [head, seq*v_dim]
-    # For rms_norm on v_dim: need [v_dim, num_heads*seq] where each column is (head, seq) combo.
-    # [head, seq, v_dim] → permute to [v_dim, seq, head] → reshape to [v_dim, seq*head]
-    gdn_out = g.permute(gdn_out, (2, 1, 0, 3))  # [v_dim, seq, head, 1]
+    # ---- Fused GDN core + RMSNormGated ----
+    # Replaces: split qkv, g/beta compute, GDN recurrence, RMSNormGated chain.
+    # Output: shape [num_heads*v_dim, seq], data [seq, num_heads*v_dim] row-major.
     w_norm = g.weight(os.path.join(weights_dir, f"{pfx}_norm_weight.weights"),
                      (v_dim,), Precision.FP32)
-    gdn_out = g.reshape(gdn_out, (v_dim, num_heads * seq_len))
-    gdn_out = g.rms_norm(gdn_out, w_norm, eps=eps)
-    gdn_out = g.reshape(gdn_out, (num_heads * v_dim, seq_len))
-    z_silu = g.silu(z_out)
-    gated = g.mul(gdn_out, z_silu)
+    gated = g.gated_deltanet(
+        qkv_conv, a_out, b_out, z_out,
+        A_log, dt_bias, w_norm, gs_in,
+        num_heads=num_heads, k_dim=k_dim, v_dim=v_dim, seq_len=seq_len,
+        use_qk_l2norm=True, rms_eps=eps)
 
     # ---- out_proj ----
     w_out = g.weight(os.path.join(weights_dir, f"{pfx}_out_proj_weight.weights"),
@@ -379,9 +333,26 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     # q_proj output is chunked: first half = query, second half = gate
     w_q = g.weight(os.path.join(weights_dir, f"{pfx}_q_proj_weight.weights"),
                    (num_heads * head_dim * 2, hidden_size), Precision.FP16)
-    qg = g.matmul(x, w_q)  # [8 × 512, seq]
-    # Split: query [8 × 256], gate [8 × 256]
-    query, gate = g.slice(qg, [num_heads * head_dim, num_heads * head_dim], dim=0)
+    qg = g.matmul(x, w_q)  # [8 × 512, seq] = [4096, 4], data [4, 4096]
+
+    # ---- Split query and gate (matching HF's view+chunk) ----
+    # HF: q_proj_out.view(seq, NH, HD*2).chunk(2, dim=-1)
+    #   In row-major [seq, NH, HD*2]: (s, h, d2) at s*4096 + h*512 + d2.
+    #   query = d2[0:256], gate = d2[256:511].
+    #
+    # To match this in C++:
+    #   qg [4096,4], data [4,4096] → contiguous → reshape [512, 8, 4]
+    #   In [512, 8, 4] row-major: (d2, h, s) at d2 + h*512 + s*4096.
+    #   Same as HF! d2 + h*512 + s*4096 = s*4096 + h*512 + d2. ✓
+    #   slice dim=0: query = [256, 8, 4] (d2=0..255), gate = [256, 8, 4] (d2=256..511)
+    #   reshape query → [2048, 4]: (dim, s) at dim + s*2048.
+    #     dim = d + h*256, so (s, h, d) at s*2048 + h*256 + d. ✓
+    #   reshape gate → [2048, 4]: same layout. ✓
+    qg = g.contiguous(qg)                                          # [4096, 4] row-major
+    qg = g.reshape(qg, (head_dim * 2, num_heads, seq_len))        # [512, 8, 4]
+    query, gate = g.slice(qg, [head_dim, head_dim], dim=0)         # [256, 8, 4] each
+    query = g.reshape(query, (num_heads * head_dim, seq_len))      # [2048, 4]
+    gate = g.reshape(gate, (num_heads * head_dim, seq_len))        # [2048, 4]
 
     # ---- k_proj, v_proj ----
     w_k = g.weight(os.path.join(weights_dir, f"{pfx}_k_proj_weight.weights"),
@@ -393,26 +364,69 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
 
     # ---- QK norm (RMSNorm per head) ----
     # q_norm/k_norm weight shape: [head_dim]
-    # query before reshape: [num_heads*head_dim, seq] → reshape to [head_dim, num_heads*seq]
-    # RMSNorm operates on dim0 (head_dim), treating each column as a separate vector.
+    # query/k are matmul outputs: declared [NH*HD, seq], data [seq, NH*HD] row-major.
+    #
+    # The RMSNorm kernel normalizes over dim0 (contiguous elements). We need
+    # each (head, token) pair's head_dim=256 elements to be contiguous and
+    # grouped into one "column" for RMSNorm.
+    #
+    # Correct pipeline:
+    #   1. contiguous(matm_out) → reshape(HD, NH, seq)
+    #      Matmul data layout [seq, NH*HD] matches [HD, NH, seq] row-major:
+    #      element (d, h, s) at d + h*HD + s*HD*NH.
+    #   2. permute(HD, NH, seq) → (HD, seq, NH) → contiguous
+    #      Materializes as [HD, seq, NH] row-major. Each (s, h) pair's 256
+    #      elements are at the correct positions.
+    #   3. reshape(HD, seq, NH) → (HD, NH*seq)
+    #      Columns: k = s + h*seq_len. This is s-major interleaved:
+    #      s0_h0, s1_h0, s2_h0, s3_h0, s0_h1, s1_h1, ...
+    #      Each column has the correct (s, h) pair's 256 elements.
+    #   4. RMSNorm over dim0
+    #   5. reshape(HD, NH*seq) → (HD, seq, NH)
+    #      Maps column k back to (d, s=k%seq_len, h=k/seq_len).
+    #      Since columns are s-major, this gives correct (s, h) pairs.
+    #   6. contiguous → RoPE/SDPA expects [HD, seq, NH] row-major.
     w_qn = g.weight(os.path.join(weights_dir, f"{pfx}_q_norm_weight.weights"),
                     (head_dim,), Precision.FP32)
     w_kn = g.weight(os.path.join(weights_dir, f"{pfx}_k_norm_weight.weights"),
                     (head_dim,), Precision.FP32)
-    query = g.reshape(query, (head_dim, num_heads * seq_len))
-    query = g.rms_norm(query, w_qn, eps=eps)
-    k = g.reshape(k, (head_dim, num_kv_heads * seq_len))
-    k = g.rms_norm(k, w_kn, eps=eps)
 
-    # ---- Reshape for multi-head: [head_dim, seq, num_heads] ----
-    query = g.reshape(query, (head_dim, seq_len, num_heads))
-    k = g.reshape(k, (head_dim, seq_len, num_kv_heads))
-    v = g.reshape(v, (head_dim, seq_len, num_kv_heads))
+    # --- Query ---
+    query = g.contiguous(query)                               # [NH*HD, seq] row-major
+    query = g.reshape(query, (head_dim, num_heads, seq_len))  # [HD, NH, seq]
+    query = g.permute(query, (0, 2, 1, 3))                   # [HD, seq, NH]
+    query = g.contiguous(query)                                # materialize
+    query = g.reshape(query, (head_dim, num_heads * seq_len)) # [HD, NH*seq], cols s-major
+    query = g.rms_norm(query, w_qn, eps=eps)
+    query = g.reshape(query, (head_dim, seq_len, num_heads))  # [HD, seq, NH]
+    query = g.contiguous(query)                                # for RoPE/SDPA
+
+    # --- Key ---
+    k = g.contiguous(k)                                        # [NKV*HD, seq] row-major
+    k = g.reshape(k, (head_dim, num_kv_heads, seq_len))       # [HD, NKV, seq]
+    k = g.permute(k, (0, 2, 1, 3))                            # [HD, seq, NKV]
+    k = g.contiguous(k)                                         # materialize
+    k = g.reshape(k, (head_dim, num_kv_heads * seq_len))      # [HD, NKV*seq], cols s-major
+    k = g.rms_norm(k, w_kn, eps=eps)
+    k = g.reshape(k, (head_dim, seq_len, num_kv_heads))       # [HD, seq, NKV]
+    k = g.contiguous(k)                                         # for RoPE/SDPA
+    # v is matmul output: declared shape [nkv*hd, seq], data [seq, nkv*hd] row-major.
+    # Step 1: contiguous — materialize to [nkv*hd, seq] row-major (d0=nkv*hd innermost).
+    #   flat[0..hd-1] = (s=0, nkv=0, d=0..hd-1) ✓
+    # Step 2: reshape (hd, nkv, seq) — zero-copy, d0=hd innermost.
+    #   flat[0..hd-1] = (d=0..hd-1, nkv=0, s=0) = (s=0, nkv=0, d=0..hd-1) ✓
+    # Step 3: permute (hd, nkv, seq) → (hd, seq, nkv)
+    # Step 4: contiguous → SDPA-expected [hd, seq, nkv] row-major
+    v = g.contiguous(v)
+    v = g.reshape(v, (head_dim, num_kv_heads, seq_len))
+    v = g.permute(v, (0, 2, 1, 3))
+    v = g.contiguous(v)
 
     # ---- RoPE (partial: only rope_dim=64 out of head_dim=256) ----
     # kernel_rope applies rotation to [0, rope_dim) and copies [rope_dim, D) unchanged.
-    query = g.rope(query, cos, sin, rope_dim=rope_dim, interleave=True)
-    k = g.rope(k, cos, sin, rope_dim=rope_dim, interleave=True)
+    # Qwen3.5 uses rotate_half (halves mode), NOT interleave.
+    query = g.rope(query, cos, sin, rope_dim=rope_dim, interleave=False)
+    k = g.rope(k, cos, sin, rope_dim=rope_dim, interleave=False)
 
     # ---- SDPA ----
     scale = head_dim ** -0.5
@@ -423,10 +437,26 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
         head_dim=head_dim, v_head_dim=head_dim)
 
     # ---- Reshape attn from [head_dim, seq, num_heads] → [num_heads*head_dim, seq] ----
-    attn = g.reshape(attn, (num_heads * head_dim, seq_len))
+    # SDPA output is [hd, seq, nheads] row-major: element (d, s, h) at d + s*hd + h*hd*seq.
+    # To get [NH*HD, seq] with correct (s,h,d) ordering:
+    #   permute [HD, seq, NH] → [HD, NH, seq] (zero-copy)
+    #   contiguous → materialize [HD, NH, seq] row-major
+    #   reshape [HD, NH, seq] → [NH*HD, seq] (zero-copy)
+    # In [HD, NH, seq] row-major: (d, h, s) at d + h*HD + s*HD*NH.
+    # Reshape: (dim, s) at dim + s*NH*HD, where dim = d + h*HD.
+    #   flat[s*2048 + h*256 + d] = SDPA(s, h, d). ✓
+    attn = g.permute(attn, (0, 2, 1, 3))     # [HD, NH, seq]
+    attn = g.contiguous(attn)                  # materialize
+    attn = g.reshape(attn, (num_heads * head_dim, seq_len))  # [NH*HD, seq]
 
     # ---- Output gate: attn * sigmoid(gate) ----
-    # gate shape: [num_heads*head_dim, seq] — same as reshaped attn
+    # gate is matmul output (qg_proj second half): [NH*HD, seq], data [seq, NH*HD].
+    # contiguous → materialize as [NH*HD, seq] row-major.
+    # HF gate layout: gate_raw.reshape(batch, seq, NH*HD) = [seq, NH*HD] row-major.
+    #   element (s, h, d) at s*NH*HD + h*HD + d = s*2048 + h*256 + d.
+    # C++ contiguous → [NH*HD, seq] row-major:
+    #   element (dim, s) at dim + s*NH*HD = h*HD + d + s*2048. ✓
+    gate = g.contiguous(gate)
     gate_sigmoid = g.sigmoid(gate)
     attn = g.mul(attn, gate_sigmoid)
 

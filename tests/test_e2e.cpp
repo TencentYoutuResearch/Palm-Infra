@@ -8,9 +8,9 @@ static int failures = 0;
 
 int main(int argc, char** argv) {
     const char* tokenizer_path = argc > 1 ? argv[1] :
-        "/Users/molly/workspace-youtulm-ncnn/Youtu-LLM-2B/tokenizer.json";
+        "/Users/molly/workspace-youtulm-ncnn/Qwen3.5-0.8B/tokenizer.json";
     const char* output_dir = argc > 2 ? argv[2] :
-        "/Users/molly/workspace-youtulm-ncnn/mlllm/test_output";
+        "/Users/molly/workspace-youtulm-ncnn/mlllm/test_output_qwen35_s4";
 
     Tokenizer tokenizer;
     CHECK(tokenizer.load(tokenizer_path), "tokenizer load");
@@ -54,6 +54,7 @@ int main(int argc, char** argv) {
     cfg2.n_ctx = 512;
     cfg2.rope_dim = 64;
     cfg2.rope_theta = 1600000.f;
+    cfg2.temperature = 0.0f;  // greedy for deterministic output
 
     ok = eng2.load(cfg2);
     CHECK(ok, "engine load prefill+decode graphs");
