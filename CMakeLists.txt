@@ -127,6 +127,8 @@ if(MLLLM_BUILD_TESTS)
     add_mlllm_test(test_engine        tests/test_engine.cpp)
     add_mlllm_test(test_tokenizer     tests/test_tokenizer.cpp)
     add_mlllm_test(test_e2e           tests/test_e2e.cpp)
+    add_mlllm_test(dump_4b            /tmp/dump_4b.cpp)
+    add_mlllm_test(dump_08b           /tmp/dump_08b_shortconv.cpp)
 endif()
 
 # ---------------------------------------------------------------------------

@@ -175,15 +175,16 @@ void kernel_gdn_decode_neon(const OpParams& params,
     int state_sz = k_head_dim * v_head_dim;
     int repeat   = num_v_heads / num_heads;  // 1 for 0.8B, 2 for 4B
 
-    // Precompute neg_exp_A (per key_head)
-    alignas(16) float neg_exp_A[16];
-    for (int h = 0; h < num_heads; h++)
-        neg_exp_A[h] = -std::exp(A_log_data[h]);
+    // Precompute neg_exp_A (per value head)
+    std::vector<float> neg_exp_A_vec(num_v_heads);
+    for (int h = 0; h < num_v_heads; h++)
+        neg_exp_A_vec[h] = -std::exp(A_log_data[h]);
+    const float* neg_exp_A = neg_exp_A_vec.data();
 
     // decode: seq_len=1, data at t=0. Loop over value heads.
     for (int vh = 0; vh < num_v_heads; vh++) {
         int kh = vh / repeat;  // key head index
-        float* state_h = state_data + kh * state_sz;
+        float* state_h = state_data + vh * state_sz;
 
         // Extract q, k from key_heads, v from value_heads
         alignas(16) float q[128], k_buf[128], v_buf[128];
@@ -204,8 +205,8 @@ void kernel_gdn_decode_neon(const OpParams& params,
         // g, beta — a/b indexed by value head
         float a_h = a_data[vh];
         float b_h = b_data[vh];
-        float sp = softplusf(a_h + dtb_data[kh]);
-        float g_t = neg_exp_A[kh] * sp;
+        float sp = softplusf(a_h + dtb_data[vh]);
+        float g_t = neg_exp_A[vh] * sp;
         float g_t_exp = std::exp(g_t);
         float beta_t = sigmoidf(b_h);
 

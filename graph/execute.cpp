@@ -854,6 +854,28 @@ void execute_graph(ExecContext& ctx) {
     auto& tensors = ctx.graph->runtime.tensors;
     auto* pool   = ctx.pool;
 
+    // Debug: dump hidden INPUT node (embedding) for 4B
+    {
+        static bool dump4b = (getenv("DUMP_4B") != nullptr);
+        if (dump4b) {
+            for (auto& node : nodes) {
+                if (node.op_type == OpType::INPUT && !node.params.str.empty()
+                    && node.params.str[0] == "hidden") {
+                    auto& t = tensors[node.id];
+                    if (t.data) {
+                        FILE* f = fopen("/tmp/cpp4b_embed.f32", "wb");
+                        if (f) {
+                            int64_t d0 = t.shape[0];
+                            fwrite(t.ptr<float>(), sizeof(float), (size_t)d0, f);
+                            fclose(f);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < nodes.size(); i++) {
         auto& node = nodes[i];
 
@@ -900,6 +922,32 @@ void execute_graph(ExecContext& ctx) {
 
         // dispatch
         dispatch_kernel(node.op_type, node.params, inputs, &out, ctx.thread_pool);
+
+        // Debug: dump MATMUL and RMS_NORM outputs for 4B
+        {
+            static bool dump4b = (getenv("DUMP_4B") != nullptr);
+            static int dump4b_idx = 0;
+            if (dump4b && (node.op_type == OpType::MATMUL || node.op_type == OpType::RMS_NORM
+                         || node.op_type == OpType::SHORTCONV || node.op_type == OpType::ADD
+                         || node.op_type == OpType::GATED_DELTANET_PREFILL)) {
+                if (out.data) {
+                    int64_t d0 = out.shape[0], d1 = out.shape[1];
+                    char fname[256];
+                    const char* opname = op_type_name(node.op_type);
+                    snprintf(fname, sizeof(fname), "/tmp/cpp4b_%s_d%lldx%lld_N%03d.f32",
+                             opname, (long long)d0, (long long)d1, (long long)dump4b_idx);
+                    FILE* f = fopen(fname, "wb");
+                    if (f) {
+                        // Dump all positions
+                        fwrite(out.ptr<float>(), sizeof(float), (size_t)(d0 * d1), f);
+                        fclose(f);
+                    }
+                    fprintf(stderr, "DUMP %s d0=%lld d1=%lld -> %s\n",
+                            opname, (long long)d0, (long long)d1, fname);
+                    dump4b_idx++;
+                }
+            }
+        }
 
         // release completed tensors
         for (uint32_t rel_id : ctx.release_queue[i]) {

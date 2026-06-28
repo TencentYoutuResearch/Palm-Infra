@@ -77,9 +77,9 @@ static void fused_gdn_head(
     for (int vh = 0; vh < num_v_heads; vh++) {
         int kh = vh / repeat;  // key head index (0.8B: vh==kh, 4B: vh/2)
 
-        float* state_h = state + kh * state_size;
-        float nea = neg_exp_A[kh];
-        float dtb = dt_bias[kh];
+        float* state_h = state + vh * state_size;
+        float nea = neg_exp_A[vh];
+        float dtb = dt_bias[vh];
 
         for (int t = 0; t < seq_len; t++) {
             // Extract q, k from key_heads section of qkv
@@ -195,9 +195,9 @@ void kernel_gdn_prefill(const OpParams& params,
     float* state_data       = reinterpret_cast<float*>(inputs[7]->data);
     float* out_data         = outputs[0]->ptr<float>();
 
-    // Precompute neg_exp_A = -exp(A_log[h])
-    std::vector<float> neg_exp_A(num_heads);
-    for (int h = 0; h < num_heads; h++)
+    // Precompute neg_exp_A = -exp(A_log[vh]) — per value head
+    std::vector<float> neg_exp_A(num_v_heads);
+    for (int h = 0; h < num_v_heads; h++)
         neg_exp_A[h] = -std::exp(A_log_data[h]);
 
     // Zero out output for padding positions.

@@ -176,8 +176,8 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
             cv = g.input(f'cache_v{i}', (head_dim, n_ctx, num_kv_heads), prec=Precision.FP16)
             cache_inputs.append(('kv', ck, cv))
         else:
-            # GDN recurrent state: [v_dim, k_dim, num_key_heads] FP32
-            gs = g.input(f'gdn_state{i}', (linear_v_dim, linear_k_dim, linear_num_heads), prec=Precision.FP32)
+            # GDN recurrent state: [v_dim, k_dim, num_value_heads] FP32
+            gs = g.input(f'gdn_state{i}', (linear_v_dim, linear_k_dim, linear_num_v_heads), prec=Precision.FP32)
             # Conv state: [qkv_total, conv_kernel-1] FP16
             qkv_total = linear_num_heads * linear_k_dim * 2 + linear_num_v_heads * linear_v_dim
             gc = g.input(f'gdn_conv{i}', (qkv_total, conv_kernel - 1), prec=Precision.FP16)
@@ -292,11 +292,11 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
                    (num_v_heads * v_dim, hidden_size), Precision.FP16)
     z_out = g.matmul(x, w_z)  # shape [num_v_heads*v_dim, seq], data [seq, num_v_heads*v_dim]
 
-    # ---- A_log and dt_bias (per-head constants) ----
+    # ---- A_log and dt_bias (per-value-head constants for 4B, per-key-head for 0.8B) ----
     A_log = g.weight(os.path.join(weights_dir, f"{pfx}_A_log.weights"),
-                     (num_heads,), Precision.FP32)
+                     (num_v_heads,), Precision.FP32)
     dt_bias = g.weight(os.path.join(weights_dir, f"{pfx}_dt_bias.weights"),
-                       (num_heads,), Precision.FP32)
+                       (num_v_heads,), Precision.FP32)
 
     # ---- Short conv on qkv (conv1d + silu) ----
     # matmul output shape [qkv_total, seq], data [seq, qkv_total] (matmul convention).
