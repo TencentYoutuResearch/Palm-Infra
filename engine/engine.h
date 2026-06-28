@@ -89,6 +89,13 @@ public:
     /// Process a full sequence of tokens (prefill).
     int prefill(const std::vector<int>& token_ids);
 
+    /// Like prefill() but returns the raw hidden states instead of the sampled token.
+    /// Used by tests for perplexity computation.
+    Tensor prefill_hidden(const std::vector<int>& token_ids);
+
+    /// Like decode() but returns the raw hidden state instead of the sampled token.
+    Tensor decode_hidden(int token_id);
+
     /// Process a single token (decode step).
     int decode(int token_id);
 
@@ -110,6 +117,10 @@ public:
     Tensor build_causal_mask(int seq_len, int past_len);
     void generate_rope_cache(int seq_len, int start_pos,
                              Tensor& cos, Tensor& sin);
+    /// Return raw logits. If all_positions=true, returns vocab_size*seq_len
+    /// floats (seq_len blocks of vocab_size). Otherwise just the last position.
+    std::vector<float> run_lmhead_raw(const Tensor& hidden, int n_tokens = 1,
+                                       bool all_positions = false);
 
 private:
     EngineConfig cfg_;

@@ -70,6 +70,7 @@ def export_weights(weights: dict, weights_dir: str):
         # Final norm (check before generic norm)
         if wname.endswith('model.language_model.norm.weight'):
             d = wdata.astype(np.float32) if wdata.dtype != np.float32 else wdata
+            d = 1.0 + d  # Qwen3_5RMSNorm: output * rms(x) * (1.0 + weight)
             save('final_norm', d)
             continue
 

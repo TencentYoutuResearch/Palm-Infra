@@ -144,40 +144,8 @@ static void fused_gdn_head(
             }
 
             // 6. RMSNormGated: out = rms_norm(attn_out, norm_w) * silu(z)
-            // Output layout: [z_dim, seq_len] row-major.
-            // out[global_dim * seq_len + t] = value at (dim=global_dim, pos=t)
-            //   where global_dim = h * v_dim + d
-            // This matches matmul's lda = seq_len (which is shape[1] / es? No, lda = stride[1]/es = z_dim)
-            // Actually lda = z_dim. So out[global_dim + t * z_dim] is correct for matmul.
-            // Wait - matmul reads A[k + m*lda] where lda = stride[1]/es = z_dim.
-            // For row m (output dim), reads A[m*z_dim + k] for k=0..K-1.
-            // In [z_dim, seq] row-major: flat[m*z_dim + k]... no.
-            // [z_dim=2048, seq=4] row-major: flat[0..3]=pos0..3,dim0; flat[4..7]=pos0..3,dim1.
-            // dim m=1 starts at flat[m*seq=4] not flat[m*z_dim=2048]!
-            // So matmul expects A[k + m*lda] where lda = z_dim (stride[1]/es).
-            // A[0 + 1*2048] = A[2048] in [z_dim,seq] = dim0,pos1?? No.
-            // [2048,4] row-major: flat[2048] = dim=0,pos=1 (since 2048=0*2048+1*4? no)
-            // Actually: flat index f = dim * 4 + pos. f=2048 => dim=512, pos=0.
-            // A[2048] = dim 512, pos 0. But lda=2048 means matmul expects row 1 at offset 2048.
-            // Row 1 = dim 1. dim 1 starts at flat[1*4]=flat[4].
-            // matmul reads A[4] as the first element of row 1. But it reads A[2048]!
-            // MISMATCH!
-            //
-            // The issue: matmul uses stride[1]=z_dim*es as lda. lda = 2048.
-            // But [z_dim,seq] row-major has row stride = seq, not z_dim!
-            // [z_dim,seq] row-major: d0=z_dim innermost, d1=seq outer.
-            // Row d (dim d) starts at flat[d * seq] = flat[d * 4].
-            // lda should be seq=4, but matmul uses stride[1]/es=z_dim=2048.
-            //
-            // ROOT CAUSE: mlllm's d0-innermost convention!
-            // In mlllm, [z_dim, seq] means d0=z_dim innermost, d1=seq outer.
-            // compute_strides: stride[0]=es, stride[1]=z_dim*es.
-            // matmul lda = stride[1]/es = z_dim.
-            // In flat data [z_dim, seq] row-major: flat[d + t*z_dim].
-            // Row d starts at flat[d] (since d0=z_dim innermost).
-            // So matmul reads A[m*z_dim + k] and GDN must write out[d + t*z_dim].
-            // 
-            // out[global_dim + t * z_dim] is CORRECT!
+            // Output layout: [z_dim, seq] row-major. Matmul reads lda = stride[1]/es = z_dim.
+            // out[global_dim + t * z_dim] matches matmul's A[m*z_dim + k] for out_proj.
             const float* z_row = z + t * z_dim + h * v_dim;
             float sum_sq = 0.f;
             for (int d = 0; d < v_dim; d++) sum_sq += attn_out[d] * attn_out[d];

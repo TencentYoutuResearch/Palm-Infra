@@ -591,6 +591,41 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
     return token;
 }
 
+std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
+                                               bool all_positions) {
+    if (!embed_weight_ || !embed_weight_->data) return {};
+
+    int vocab_size = (int)embed_weight_->shape[0];
+    int hidden_dim = (int)embed_weight_->shape[1];
+    int seq_len = (int)hidden.shape[1];
+
+    int n_pos = all_positions ? n_tokens : 1;
+    std::vector<float> logits(n_pos * vocab_size);
+
+    for (int p = 0; p < n_pos; p++) {
+        int pos = all_positions ? p : ((n_tokens > 0 && n_tokens <= seq_len) ? n_tokens - 1 : seq_len - 1);
+
+        Tensor A = hidden;
+        A.shape[1] = 1;
+        A.data = static_cast<char*>(hidden.data) + pos * hidden_dim * sizeof(float);
+        A.compute_strides();
+
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  vocab_size, 1, 1, 1, logits.data() + p * vocab_size);
+
+        if (!embed_packed_.empty()) {
+            Tensor B_packed = Tensor::create(Precision::FP16, MemoryType::EXTERNAL,
+                                             vocab_size, hidden_dim, 1, 1,
+                                             embed_packed_.data());
+            kernel_matmul_fp32(A, B_packed, C, exec_ctx_decode_.thread_pool);
+        } else {
+            kernel_matmul_fp32(A, *embed_weight_, C, exec_ctx_decode_.thread_pool);
+        }
+    }
+
+    return logits;
+}
+
 // ---------------------------------------------------------------------------
 // rope / mask helpers
 // ---------------------------------------------------------------------------
@@ -740,6 +775,75 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     return last_token;
 }
 
+Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
+    int n = (int)token_ids.size();
+    if (n == 0) return Tensor();
+
+    int graph_seq_len = 1;
+    for (auto& node : graph_prefill_.nodes) {
+        if (node.op_type == OpType::INPUT && !node.params.str.empty()
+            && node.params.str[0] == "hidden") {
+            graph_seq_len = (int)node.out_shape[1];
+            break;
+        }
+    }
+
+    if (n > graph_seq_len) {
+        fprintf(stderr, "prefill_hidden: n=%d > graph_seq_len=%d, chunked mode not supported\n",
+                n, graph_seq_len);
+        return Tensor();
+    }
+
+    Tensor h = embed(token_ids);
+    int hidden_dim = (int)h.shape[0];
+
+    // Pad to graph seq_len
+    if (n < graph_seq_len) {
+        size_t padded_bytes = (size_t)hidden_dim * graph_seq_len * sizeof(float);
+        void* padded_buf = graph_prefill_.runtime.pool.acquire(padded_bytes);
+        std::memset(padded_buf, 0, padded_bytes);
+        std::memcpy(padded_buf, h.data, (size_t)hidden_dim * n * sizeof(float));
+        h = Tensor::create(Precision::FP32, MemoryType::POOLED,
+                           hidden_dim, graph_seq_len, 1, 1, padded_buf);
+    }
+    h.shape[1] = graph_seq_len;
+    h.compute_strides();
+
+    Tensor cos, sin;
+    generate_rope_cache(graph_seq_len, past_len_, cos, sin);
+    Tensor mask = build_causal_mask(graph_seq_len, past_len_);
+
+    // Inject n_real_tokens (same as prefill_chunk)
+    if (n < graph_seq_len) {
+        for (auto& node : graph_prefill_.nodes) {
+            if (node.op_type == OpType::GATED_DELTANET_PREFILL) {
+                if (node.params.i32.size() <= 6) node.params.i32.resize(7, 0);
+                node.params.i32[6] = n;
+            } else if (node.op_type == OpType::SHORTCONV) {
+                if (node.params.i32.size() <= 1) node.params.i32.resize(2, 0);
+                node.params.i32[1] = n;
+            }
+        }
+    }
+
+    // Set cache metadata
+    for (auto& cp : caches_) {
+        if (cp.k) cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
+        if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    }
+
+    Tensor out = run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
+
+    past_len_ += n;
+
+    for (auto& cp : caches_) {
+        if (cp.k) cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
+        if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    }
+
+    return out;
+}
+
 int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     int n = (int)token_ids.size();
     if (n == 0) return -1;
@@ -843,4 +947,26 @@ int LLMEngine::decode(int token_id) {
     }
 
     return run_lmhead(out);
+}
+
+Tensor LLMEngine::decode_hidden(int token_id) {
+    Tensor h = embed({token_id});
+    h.shape[1] = 1;
+    h.compute_strides();
+
+    Tensor cos, sin;
+    generate_rope_cache(1, past_len_, cos, sin);
+
+    Tensor mask = build_causal_mask(1, past_len_);
+
+    Tensor out = run_graph(graph_decode_, exec_ctx_decode_, h, mask, cos, sin);
+
+    past_len_++;
+
+    for (auto& cp : caches_) {
+        if (cp.k) cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
+        if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    }
+
+    return out;
 }
