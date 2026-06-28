@@ -83,11 +83,19 @@ GDN decode (seq_len=1) 的核心操作：
 
 | 指标 | 优化前 (scalar) | 优化后 (NEON) | 提升 |
 |------|----------------|---------------|------|
-| GDN decode 总耗时 | 84.99ms | 84.99ms | — (此数据已是 NEON) |
-| decode_tps | 89.74 | 89.74 | — |
+| GDN decode 总耗时 | 197.56ms | 84.99ms | **2.32x** |
+| GDN decode % | 35.0% | 19.2% | -15.8pp |
+| decode_tps | 76.12 | **89.74** | +18% |
+| tpot (ms/token) | 13.14 | 11.14 | -15% |
 
-> 注: pp256+tg64 的基线数据是在 NEON GDN decode 已启用后采集的。
-> 小 prompt (16 tokens) 下 decode_tps 从 73.26 → 82.85 (+13%)。
+**Decode profile 变化**:
+
+| Op | 优化前 | 优化后 |
+|---|---|---|
+| MATMUL | 295.73ms (52.4%) | 287.62ms (64.8%) |
+| GDN decode | 197.56ms (35.0%) | **84.99ms (19.2%)** |
+| SHORTCONV | 45.12ms (8.0%) | 45.57ms (10.3%) |
+| 其他 | 25.9ms | 25.7ms |
 
 ### 验证
 
