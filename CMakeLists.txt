@@ -28,6 +28,7 @@ set(SOURCES
     kernels/rope.cpp
     kernels/attention.cpp
     kernels/gdn.cpp
+    kernels/gdn_decode.cpp
     kernels/threading.cpp
     # engine
     engine/engine.cpp

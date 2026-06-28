@@ -216,11 +216,22 @@ void kernel_gdn_prefill(const OpParams& params,
 // ---------------------------------------------------------------------------
 // Decode: single token (seq_len=1).
 // ---------------------------------------------------------------------------
+
+#if HAS_NEON
+// NEON-optimised decode path (declared in gdn_decode.cpp)
+void kernel_gdn_decode_neon(const OpParams& params,
+                             const std::vector<const Tensor*>& inputs,
+                             std::vector<Tensor*>& outputs);
+#endif
+
 void kernel_gdn_decode(const OpParams& params,
                        const std::vector<const Tensor*>& inputs,
                        std::vector<Tensor*>& outputs,
                        ThreadPool* thread_pool) {
-    // Decode uses the same params and inputs as prefill.
-    // seq_len is 1 for decode.
+#if HAS_NEON
+    kernel_gdn_decode_neon(params, inputs, outputs);
+#else
+    // Fallback: reuse prefill scalar path
     kernel_gdn_prefill(params, inputs, outputs, thread_pool);
+#endif
 }
