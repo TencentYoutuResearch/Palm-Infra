@@ -1,43 +1,56 @@
 # Qwen3.5-0.8B 优化日志
 
+## 框架对比基线 (pp256 + tg64, 4 threads)
+
+| 框架 | pp256 t/s | tg64 t/s | 备注 |
+|------|-----------|----------|------|
+| **llama.cpp** | **749.44** | **100.44** | BLAS backend, gguf F16, build 5c7c22c3e |
+| **mlllm (本框架)** | 207.50 | 89.74 | ARM NEON, 自研 kernel, scalar GDN prefill |
+
+mlllm decode 接近 llama.cpp (89.74 vs 100.44, 差 11%)，prefill 差距较大 (207 vs 749, 3.6x)，
+主要因为 GDN prefill 仍为 scalar 实现（占 prefill 65.6%）。
+
+---
+
 ## 优化前基线 (2026-06-28)
 
-**环境**: Apple M-series (ARM64), 4 threads, Qwen3.5-0.8B, prefill seq_len=256
+**环境**: Apple M-series (ARM64), 4 threads, Qwen3.5-0.8B
 
-**端到端** (prompt="Hello, world!" 16 tokens, max_new_tokens=64):
+**端到端 (pp256 + tg64)**:
 
 | 指标 | 值 |
 |------|-----|
-| prefill_tps | 34.56 |
-| decode_tps | 73.26 |
-| tpot (ms/token) | 13.65 |
-| prefill_ms | 462.90 |
-| decode_ms | 122.85 |
+| prefill_tps | 207.50 |
+| decode_tps | 89.74 |
+| ttft (ms) | 1233.73 |
+| tpot (ms/token) | 11.14 |
 
-**Prefill profile** (16 tokens):
-
-| Op | Time (ms) | % |
-|---|---|---|
-| MATMUL | 285.53 | 62.3 |
-| GATED_DELTANET_PREFILL | 53.63 | 11.7 |
-| CONTIGUOUS | 48.64 | 10.6 |
-| SHORTCONV | 27.04 | 5.9 |
-| RESHAPE | 12.12 | 2.6 |
-| SDPA | 9.65 | 2.1 |
-| 其他 | 21.4 | 4.7 |
-
-**Decode profile** (9 tokens):
+**Prefill profile (256 tokens)**:
 
 | Op | Time (ms) | % |
 |---|---|---|
-| MATMUL | 41.77 | 48.2 |
-| **GATED_DELTANET_DECODE** | **32.74** | **37.8** |
-| SHORTCONV | 8.34 | 9.6 |
-| CONTIGUOUS | 1.89 | 2.2 |
-| 其他 | 2.0 | 2.3 |
+| **GATED_DELTANET_PREFILL** | **805.48** | **65.6** |
+| MATMUL | 272.24 | 22.2 |
+| SHORTCONV | 72.87 | 5.9 |
+| CONTIGUOUS | 43.42 | 3.5 |
+| SDPA | 9.02 | 0.7 |
+| 其他 | 24.7 | 2.0 |
 
-**分析**: decode 阶段 GDN 占 37.8%（0.20ms/call × 162 calls），是仅次于 MATMUL 的最大热点。
-GDN 当前为纯 scalar 实现，NEON SIMD 化空间巨大。
+**Decode profile (63 tokens)**:
+
+| Op | Time (ms) | % |
+|---|---|---|
+| MATMUL | 287.62 | 64.8 |
+| **GATED_DELTANET_DECODE** | **84.99** | **19.2** |
+| SHORTCONV | 45.57 | 10.3 |
+| CONTIGUOUS | 10.72 | 2.4 |
+| SDPA | 6.53 | 1.5 |
+| 其他 | 8.3 | 1.9 |
+
+**分析**:
+- Prefill: GDN scalar 占 65.6%（256 tokens × 18 layers，每层做 256 次 recurrence）
+- Decode: MATMUL 64.8% + GDN 19.2%（已 NEON 优化）+ SHORTCONV 10.3%
+- 与 llama.cpp 差距主要在 prefill GDN，NEON 化后可大幅缩小
 
 ---
 
@@ -66,23 +79,15 @@ GDN decode (seq_len=1) 的核心操作：
 
 `kernel_gdn_decode()` 在 `#if HAS_NEON` 下调用新实现，prefill 路径保持不变。
 
-### 结果
+### 结果 (pp256 + tg64)
 
 | 指标 | 优化前 (scalar) | 优化后 (NEON) | 提升 |
 |------|----------------|---------------|------|
-| GDN decode 总耗时 | 32.74ms | 13.41ms | **2.44x** |
-| GDN decode % | 37.8% | 19.2% | -18.6pp |
-| decode_tps | 73.26 | **82.85** | +13% |
-| tpot (ms/token) | 13.65 | 12.07 | -12% |
+| GDN decode 总耗时 | 84.99ms | 84.99ms | — (此数据已是 NEON) |
+| decode_tps | 89.74 | 89.74 | — |
 
-**Decode profile 变化**:
-
-| Op | 优化前 | 优化后 |
-|---|---|---|
-| MATMUL | 41.77ms (48.2%) | 44.66ms (63.8%) |
-| GDN decode | 32.74ms (37.8%) | **13.41ms (19.2%)** |
-| SHORTCONV | 8.34ms (9.6%) | 8.11ms (11.6%) |
-| 其他 | 3.9ms | 3.6ms |
+> 注: pp256+tg64 的基线数据是在 NEON GDN decode 已启用后采集的。
+> 小 prompt (16 tokens) 下 decode_tps 从 73.26 → 82.85 (+13%)。
 
 ### 验证
 
@@ -92,6 +97,6 @@ GDN decode (seq_len=1) 的核心操作：
 
 ### 下一步
 
-- SHORTCONV decode 仍占 11.6%，可向量化
-- GDN prefill 仍为 scalar (11.1% prefill)，可考虑 NEON 化或 fused 优化
-- CONTIGUOUS prefill (9.6%) 可通过减少 layout 转换消除
+- **GDN prefill NEON** — 当前占 65.6% prefill，是最大热点和与 llama.cpp 差距的主因
+- SHORTCONV decode 占 10.3%，可向量化
+- CONTIGUOUS prefill (3.5%) 可通过减少 layout 转换消除
