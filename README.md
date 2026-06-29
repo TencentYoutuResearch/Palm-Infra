@@ -17,9 +17,9 @@ Benchmarks vs llama.cpp (Apple M5, 4 threads, pp256 + tg64, warmup=3):
 
 | Model | mollm pp/tg | llama.cpp pp/tg | prefill gap | decode gap |
 |-------|------------|-----------------|-------------|------------|
-| Qwen3.5-4B | 115 / 25 | 143 / 23 | 1.25x | **0.92x (faster)** |
+| Qwen3.5-4B | 115 / **25** | 143 / 23 | 1.25x | **0.92x (faster)** |
 | Qwen3.5-0.8B | 550 / 95 | 749 / 100 | 1.36x | 1.05x |
-| Youtu-LLM-2B | 235 / 54 | 264 / 41 | 1.12x | **0.76x (faster)** |
+| Youtu-LLM-2B | 235 / **54** | 264 / 41 | 1.12x | **0.76x (faster)** |
 
 Decode already beats llama.cpp on 4B and Youtu-LLM. Prefill gaps are MATMUL-bound
 and await weight quantization.
