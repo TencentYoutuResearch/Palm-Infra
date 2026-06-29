@@ -10,7 +10,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// mlllm — LLM inference engine
+// mollm — LLM inference engine
 //
 // Multi-graph: prefill graph (seq_len=N) + decode graph (seq_len=1).
 // KV cache with embedded metadata header.

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(mlllm VERSION 0.1.0 LANGUAGES CXX)
+project(mollm VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,8 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # options
 # ---------------------------------------------------------------------------
 
-option(MLLLM_BUILD_TESTS "Build tests" ON)
-option(MLLLM_BUILD_EXAMPLE "Build example CLI" ON)
+option(MOLLM_BUILD_TESTS "Build tests" ON)
+option(MOLLM_BUILD_EXAMPLE "Build example CLI" ON)
 
 # ---------------------------------------------------------------------------
 # library sources
@@ -50,12 +50,12 @@ set(HEADERS
     graph/execute.h
 )
 
-add_library(mlllm_lib STATIC ${SOURCES})
-target_include_directories(mlllm_lib PUBLIC
+add_library(mollm_lib STATIC ${SOURCES})
+target_include_directories(mollm_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann
 )
-target_link_libraries(mlllm_lib PUBLIC)
+target_link_libraries(mollm_lib PUBLIC)
 
 # ---------------------------------------------------------------------------
 # platform detection for SIMD
@@ -63,10 +63,10 @@ target_link_libraries(mlllm_lib PUBLIC)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     message(STATUS "Target: ARM64 (NEON enabled)")
-    target_compile_definitions(mlllm_lib PRIVATE __ARM_NEON=1)
+    target_compile_definitions(mollm_lib PRIVATE __ARM_NEON=1)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     message(STATUS "Target: ARM32")
-    target_compile_definitions(mlllm_lib PRIVATE __ARM_NEON=1)
+    target_compile_definitions(mollm_lib PRIVATE __ARM_NEON=1)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     message(STATUS "Target: x86_64 (scalar fallback)")
 else()
@@ -77,7 +77,7 @@ endif()
 if(APPLE)
     find_library(ACCELERATE_LIBRARY Accelerate)
     if(ACCELERATE_LIBRARY)
-        target_link_libraries(mlllm_lib PUBLIC ${ACCELERATE_LIBRARY})
+        target_link_libraries(mollm_lib PUBLIC ${ACCELERATE_LIBRARY})
     endif()
 endif()
 
@@ -85,54 +85,54 @@ endif()
 # example CLI
 # ---------------------------------------------------------------------------
 
-if(MLLLM_BUILD_EXAMPLE)
-    add_executable(mlllm_chat
+if(MOLLM_BUILD_EXAMPLE)
+    add_executable(mollm_chat
         examples/main.cpp
         examples/cli_common.cpp
     )
-    target_link_libraries(mlllm_chat PRIVATE mlllm_lib)
+    target_link_libraries(mollm_chat PRIVATE mollm_lib)
 
-    add_executable(mlllm_bench
+    add_executable(mollm_bench
         examples/bench.cpp
         examples/cli_common.cpp
     )
-    target_link_libraries(mlllm_bench PRIVATE mlllm_lib)
+    target_link_libraries(mollm_bench PRIVATE mollm_lib)
 endif()
 
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
 
-if(MLLLM_BUILD_TESTS)
+if(MOLLM_BUILD_TESTS)
     enable_testing()
 
-    function(add_mlllm_test name src)
+    function(add_mollm_test name src)
         add_executable(${name} ${src})
-        target_link_libraries(${name} PRIVATE mlllm_lib)
+        target_link_libraries(${name} PRIVATE mollm_lib)
         add_test(NAME ${name} COMMAND ${name})
     endfunction()
 
-    add_mlllm_test(test_tensor        tests/test_tensor.cpp)
-    add_mlllm_test(test_buffer_pool   tests/test_buffer_pool.cpp)
-    add_mlllm_test(test_mmap_file     tests/test_mmap_file.cpp)
-    add_mlllm_test(test_graph         tests/test_graph.cpp)
-    add_mlllm_test(test_io            tests/test_io.cpp)
-    add_mlllm_test(test_execute       tests/test_execute.cpp)
-    add_mlllm_test(test_matmul        tests/test_matmul.cpp)
-    add_mlllm_test(bench_matmul       tests/bench_matmul.cpp)
-    add_mlllm_test(bench_sdpa         tests/bench_sdpa.cpp)
-    add_mlllm_test(test_norm          tests/test_norm.cpp)
-    add_mlllm_test(test_rope          tests/test_rope.cpp)
-    add_mlllm_test(test_attention     tests/test_attention.cpp)
-    add_mlllm_test(test_gdn           tests/test_gdn.cpp)
-    add_mlllm_test(test_engine        tests/test_engine.cpp)
-    add_mlllm_test(test_tokenizer     tests/test_tokenizer.cpp)
-    add_mlllm_test(test_e2e           tests/test_e2e.cpp)
+    add_mollm_test(test_tensor        tests/test_tensor.cpp)
+    add_mollm_test(test_buffer_pool   tests/test_buffer_pool.cpp)
+    add_mollm_test(test_mmap_file     tests/test_mmap_file.cpp)
+    add_mollm_test(test_graph         tests/test_graph.cpp)
+    add_mollm_test(test_io            tests/test_io.cpp)
+    add_mollm_test(test_execute       tests/test_execute.cpp)
+    add_mollm_test(test_matmul        tests/test_matmul.cpp)
+    add_mollm_test(bench_matmul       tests/bench_matmul.cpp)
+    add_mollm_test(bench_sdpa         tests/bench_sdpa.cpp)
+    add_mollm_test(test_norm          tests/test_norm.cpp)
+    add_mollm_test(test_rope          tests/test_rope.cpp)
+    add_mollm_test(test_attention     tests/test_attention.cpp)
+    add_mollm_test(test_gdn           tests/test_gdn.cpp)
+    add_mollm_test(test_engine        tests/test_engine.cpp)
+    add_mollm_test(test_tokenizer     tests/test_tokenizer.cpp)
+    add_mollm_test(test_e2e           tests/test_e2e.cpp)
 endif()
 
 # ---------------------------------------------------------------------------
 # install
 # ---------------------------------------------------------------------------
 
-install(TARGETS mlllm_lib ARCHIVE DESTINATION lib)
-install(FILES ${HEADERS} DESTINATION include/mlllm)
+install(TARGETS mollm_lib ARCHIVE DESTINATION lib)
+install(FILES ${HEADERS} DESTINATION include/mollm)

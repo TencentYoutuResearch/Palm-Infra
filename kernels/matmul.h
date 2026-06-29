@@ -16,7 +16,7 @@ struct MatmulConfig {
 extern MatmulConfig g_matmul_config;
 
 // ---------------------------------------------------------------------------
-// PROJECT_NAME — Matmul kernels
+// mollm — Matmul kernels
 //
 // C[M,N] = A[M,K] * B[K,N]
 //   A: M×K, row-major (stride[1] = row stride)

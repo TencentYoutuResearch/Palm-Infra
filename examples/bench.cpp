@@ -6,10 +6,10 @@
 
 // Pack-A profiling counters (defined in kernels/matmul.cpp)
 extern "C" {
-double mlllm_pack_a_total_ms();
-long long mlllm_pack_a_calls();
-double mlllm_matmul_total_ms();
-void mlllm_reset_pack_counters();
+double mollm_pack_a_total_ms();
+long long mollm_pack_a_calls();
+double mollm_matmul_total_ms();
+void mollm_reset_pack_counters();
 }
 #include <string>
 #include <vector>
@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    mlllm_reset_pack_counters();
+    mollm_reset_pack_counters();
 
     if (opts.profile) {
         engine.reset_profiles();
@@ -160,9 +160,9 @@ int main(int argc, char** argv) {
     std::printf("generated_text=%s\n", result.text.c_str());
 
     // Pack-A profiling: show how much of the run is spent packing A.
-    double pack_ms = mlllm_pack_a_total_ms();
-    long long pack_calls = mlllm_pack_a_calls();
-    double mm_ms = mlllm_matmul_total_ms();
+    double pack_ms = mollm_pack_a_total_ms();
+    long long pack_calls = mollm_pack_a_calls();
+    double mm_ms = mollm_matmul_total_ms();
     std::printf("pack_a_ms=%.2f pack_a_calls=%lld matmul_ms=%.2f pack_pct=%.1f%%\n",
                 pack_ms, pack_calls, mm_ms,
                 mm_ms > 0 ? (pack_ms / mm_ms * 100.0) : 0.0);

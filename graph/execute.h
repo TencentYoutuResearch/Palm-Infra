@@ -6,7 +6,7 @@
 class ThreadPool;
 
 // ---------------------------------------------------------------------------
-// PROJECT_NAME — Execution context
+// mollm — Execution context
 //
 // prepare_execution() computes liveness information from the graph.
 // execute_graph() runs one full pass.

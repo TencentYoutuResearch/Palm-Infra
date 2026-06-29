@@ -54,7 +54,7 @@ int main(int argc, char** argv) {
     const char* tokenizer_path = argc > 1 ? argv[1] :
         "/Users/molly/workspace-youtulm-ncnn/Qwen3.5-0.8B/tokenizer.json";
     const char* output_dir = argc > 2 ? argv[2] :
-        "/Users/molly/workspace-youtulm-ncnn/mlllm/test_output_qwen35_s4";
+        "/Users/molly/workspace-youtulm-ncnn/mollm/test_output_qwen35_s4";
 
     Tokenizer tokenizer;
     CHECK(tokenizer.load(tokenizer_path), "tokenizer load");

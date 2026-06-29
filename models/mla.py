@@ -1,5 +1,5 @@
 """
-Youtu-LLM MLA model → mlllm graph converter.
+Youtu-LLM MLA model → mollm graph converter.
 
 Usage:
     python models/mla.py /path/to/Youtu-LLM-2B /path/to/output_dir

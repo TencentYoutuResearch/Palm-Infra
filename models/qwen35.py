@@ -1,5 +1,5 @@
 """
-mlllm model builder for Qwen3.5-0.8B (text only).
+mollm model builder for Qwen3.5-0.8B (text only).
 
 Hybrid architecture:
   - 18 layers of linear attention (Gated Delta Rule)
@@ -308,7 +308,7 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
                      (qkv_total, conv_kernel), Precision.FP32)
     qkv_conv = g.shortconv(qkv, w_conv, gc_in, kernel_size=conv_kernel)
     # qkv_conv data is [qkv_total, seq] (shortconv materializes [groups, seq]).
-    # The fused kernel reads this layout directly — do NOT reshape (mlllm reshape
+    # The fused kernel reads this layout directly — do NOT reshape (mollm reshape
     # is metadata-only and would not transpose the data).
 
     # ---- Fused GDN core + RMSNormGated ----

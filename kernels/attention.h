@@ -7,7 +7,7 @@
 class ThreadPool;
 
 // ---------------------------------------------------------------------------
-// PROJECT_NAME — SDPA kernels
+// mollm — SDPA kernels
 //
 // Standard SDPA (kv_cache=2):
 //   Q:       [head_dim, src_seqlen, num_heads]

@@ -10,7 +10,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// PROJECT_NAME — Graph definition
+// mollm — Graph definition
 //
 // A Graph is a linear (topologically-sorted) list of nodes.  Execution walks
 // the list once, dispatching each node to its kernel.  All graph construction

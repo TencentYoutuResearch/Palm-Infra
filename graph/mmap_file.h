@@ -4,7 +4,7 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
-// PROJECT_NAME — MappedFile
+// mollm — MappedFile
 //
 // Memory-mapped read-only file for zero-copy weight loading.
 //

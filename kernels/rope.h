@@ -3,7 +3,7 @@
 #include "kernels/tensor.h"
 
 // ---------------------------------------------------------------------------
-// PROJECT_NAME — Rotary Embedding
+// mollm — Rotary Embedding
 //
 // Applies RoPE to input tensor x.
 //

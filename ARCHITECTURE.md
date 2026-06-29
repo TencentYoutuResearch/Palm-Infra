@@ -1,6 +1,6 @@
-# PROJECT_NAME — ARM-first LLM inference engine
+# mollm — ARM-first LLM inference engine
 
-> **项目名占位符**: `PROJECT_NAME` — 所有文档和代码中的项目名均使用此占位符，待正式命名后全局替换。
+> **项目名占位符**: `mollm` — 所有文档和代码中的项目名均使用此占位符，待正式命名后全局替换。
 
 ## 1. 定位
 
@@ -14,7 +14,7 @@
 
 ### 2.1 图构建在 Python 端，C++ 端是纯执行器
 
-- 借鉴 cactus：Python 转译 PyTorch 模型 → 序列化 `.PROJECT_NAME_graph` 文件
+- 借鉴 cactus：Python 转译 PyTorch 模型 → 序列化 `.mollm_graph` 文件
 - C++ 端：顺序遍历节点列表，每个节点调用对应的 kernel
 - 不做运行时 JIT、不做运行时 op fusion（所有融合在 Python 端完成）
 - 优势：C++ 代码极简（cactus 的 execute.cpp 只有 ~500 行）
@@ -28,7 +28,7 @@
 
 ### 2.3 mmap 权重
 
-- 权重单独存 `.PROJECT_NAME_weights` 文件
+- 权重单独存 `.mollm_weights` 文件
 - 运行时 mmap，OS 按需分页
 - 支持 `MADV_WILLNEED` / `MADV_DONTNEED` 控制
 - 量化时：scales/codebook 也在 mmap 文件中
@@ -102,7 +102,7 @@ struct Tensor {
 ## 4. 项目结构
 
 ```
-PROJECT_NAME/
+mollm/
 ├── kernels/              # ARM NEON SIMD 内核
 │   ├── matmul.cpp        # FP16 GEMM/GEMV
 │   ├── attention.cpp     # SDPA + MLA + flash attention
@@ -140,7 +140,7 @@ PROJECT_NAME/
 
 ## 5. 与现有框架的关键差异
 
-| | PROJECT_NAME | cactus | ggml | ncnn |
+| | mollm | cactus | ggml | ncnn |
 |---|---|---|---|---|
 | 图构建 | Python 端 | Python 端 | C 运行时 lazy | .param 文本 |
 | Tensor 含 graph info | 否 | 否 | 是 (op/src) | 否 |

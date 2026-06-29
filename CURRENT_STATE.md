@@ -2,7 +2,7 @@
 
 ## Overall status
 
-The core `mlllm` inference path is now in a good state for the current debug target:
+The core `mollm` inference path is now in a good state for the current debug target:
 
 - End-to-end generation for the test prompt is working.
 - Greedy generation from the C++ engine matches the Python/HF-style reference implementation for both:

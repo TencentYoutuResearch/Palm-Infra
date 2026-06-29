@@ -7,7 +7,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// PROJECT_NAME — BufferPool
+// mollm — BufferPool
 //
 // Power-of-2 bucketed freelist allocator.
 //   - acquire(size) → reuses a free buffer from the matching bucket, or

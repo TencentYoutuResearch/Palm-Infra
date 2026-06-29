@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
     }
 
     // REPL mode: multi-turn conversation
-    std::printf("mlllm_chat ready. prefill_seq_len=%d threads=%d ctx=%d\n",
+    std::printf("mollm_chat ready. prefill_seq_len=%d threads=%d ctx=%d\n",
                 prefill_seq_len, engine.config().num_threads, opts.n_ctx);
     std::printf("Type /reset to clear context, /quit to exit.\n");
 

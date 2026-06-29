@@ -81,10 +81,10 @@ static double g_matmul_ms = 0;
 static long long g_pack_a_calls = 0;
 static std::mutex g_prof_mtx;
 
-extern "C" double mlllm_pack_a_total_ms() { return g_pack_a_ms; }
-extern "C" long long mlllm_pack_a_calls() { return g_pack_a_calls; }
-extern "C" double mlllm_matmul_total_ms() { return g_matmul_ms; }
-extern "C" void mlllm_reset_pack_counters() {
+extern "C" double mollm_pack_a_total_ms() { return g_pack_a_ms; }
+extern "C" long long mollm_pack_a_calls() { return g_pack_a_calls; }
+extern "C" double mollm_matmul_total_ms() { return g_matmul_ms; }
+extern "C" void mollm_reset_pack_counters() {
     std::lock_guard<std::mutex> lk(g_prof_mtx);
     g_pack_a_ms = 0;
     g_pack_a_calls = 0;

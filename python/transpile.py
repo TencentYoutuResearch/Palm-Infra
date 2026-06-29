@@ -1,5 +1,5 @@
 """
-PROJECT_NAME — Python graph builder + serialiser
+mollm — Python graph builder + serialiser
 
 Usage:
     g = GraphBuilder()

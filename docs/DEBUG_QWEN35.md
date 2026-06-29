@@ -21,18 +21,18 @@
 
 ```bash
 # 构建
-cd mlllm/build && make -j$(sysctl -n hw.ncpu)
+cd mollm/build && make -j$(sysctl -n hw.ncpu)
 
 # 运行测试
-cd mlllm/build && ctest
+cd mollm/build && ctest
 
 # 生成 HF reference
-cd mlllm && KMP_DUPLICATE_LIB_OK=TRUE python3 tests/dump_qwen35_full_np.py
+cd mollm && KMP_DUPLICATE_LIB_OK=TRUE python3 tests/dump_qwen35_full_np.py
 
 # 逐层对比（需要先生成 C++ dumps 和 HF reference）
-cd mlllm && python3 tests/compare_layers.py
+cd mollm && python3 tests/compare_layers.py
 
 # 重新导出权重 + graph
-cd mlllm && PYTHONPATH=. python3 models/qwen35.py \
+cd mollm && PYTHONPATH=. python3 models/qwen35.py \
     /path/to/Qwen3.5-0.8B test_output_qwen35_s4 24 256
 ```

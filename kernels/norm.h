@@ -3,7 +3,7 @@
 #include "kernels/tensor.h"
 
 // ---------------------------------------------------------------------------
-// PROJECT_NAME — Normalization kernels
+// mollm — Normalization kernels
 //
 // RMSNorm: out = x / rms(x) * weight
 //   rms(x) = sqrt(mean(x^2) + eps)
