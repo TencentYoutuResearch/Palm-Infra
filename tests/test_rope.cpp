@@ -173,6 +173,63 @@ int main() {
         delete[] o_data; delete[] ref;
     }
 
+    // ---- strided input: ldx > D (simulates permuted view in qwen35 full_attn) ----
+    // Validates that kernel_rope correctly uses stride[1] instead of assuming
+    // row-major contiguous layout. Qwen3.5 full_attn feeds a permuted (strided)
+    // tensor to RoPE without an explicit contiguous() copy.
+    // Uses halves mode (Qwen3.5 path) with D=256, rope_dim=64.
+    {
+        int D = 256, N = 4, rope_dim = 64, half = rope_dim / 2;
+        int ldx = D + 48;  // strided: 48 floats of padding between rows
+        float* x_buf   = new float[N * ldx];
+        float* cos_data = new float[half * N];
+        float* sin_data = new float[half * N];
+        fill_rand(x_buf, N * ldx);
+        fill_rand(cos_data, half * N);
+        fill_rand(sin_data, half * N);
+
+        Tensor x = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, D, N, 1, 1, x_buf);
+        x.stride[1] = (size_t)ldx * sizeof(float);
+
+        float* o_buf = new float[N * ldx]();
+        Tensor o = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, D, N, 1, 1, o_buf);
+        o.stride[1] = (size_t)ldx * sizeof(float);
+
+        Tensor c = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, half, N, 1, 1, cos_data);
+        Tensor s = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, half, N, 1, 1, sin_data);
+
+        kernel_rope(x, c, s, rope_dim, false, o);
+
+        // Reference with same strided layout (halves mode)
+        bool ok = true;
+        for (int n = 0; n < N; n++) {
+            for (int i = 0; i < half; i++) {
+                float x0 = x_buf[n * ldx + i];
+                float x1 = x_buf[n * ldx + i + half];
+                float cv = cos_data[n * half + i];
+                float sv = sin_data[n * half + i];
+                float exp0 = x0 * cv - x1 * sv;
+                float exp1 = x0 * sv + x1 * cv;
+                if (std::fabs(o_buf[n * ldx + i] - exp0) > 1e-5f ||
+                    std::fabs(o_buf[n * ldx + i + half] - exp1) > 1e-5f) {
+                    fprintf(stderr, "  strided halves mismatch n=%d i=%d: got (%f,%f) expected (%f,%f)\n",
+                            n, i, o_buf[n * ldx + i], o_buf[n * ldx + i + half], exp0, exp1);
+                    ok = false;
+                }
+            }
+            // non-rope part must be copied unchanged
+            for (int d = rope_dim; d < D; d++) {
+                if (std::fabs(o_buf[n * ldx + d] - x_buf[n * ldx + d]) > 1e-5f) {
+                    fprintf(stderr, "  strided non-rope mismatch n=%d d=%d\n", n, d);
+                    ok = false;
+                }
+            }
+        }
+        CHECK(ok, "RoPE halves strided D=256 rope=64 N=4 ldx=304");
+
+        delete[] x_buf; delete[] cos_data; delete[] sin_data; delete[] o_buf;
+    }
+
     if (failures == 0) {
         printf("\nAll rope tests passed!\n");
     } else {

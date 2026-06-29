@@ -19,6 +19,59 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Materialize a strided tensor into a contiguous row-major buffer.
+//
+// Used by RESHAPE (non-contiguous input) and CONTIGUOUS ops. The generic
+// 4-loop elementwise memcpy is slow when dim0 is contiguous (stride[0]==es):
+// each iteration does a 4-byte memcpy with loop overhead. This helper detects
+// the contiguous-inner-dim case and falls back to a single memcpy per (i1,i2,i3)
+// row, cutting loop overhead by shape[0]×.
+//
+// For the fully contiguous case it collapses to a single memcpy.
+static inline void materialize_strided(const Tensor& src, void* dst) {
+    size_t es = src.element_size();
+    char* dst_base = static_cast<char*>(dst);
+    int64_t d0 = src.shape[0];
+    int64_t row_bytes = d0 * es;
+
+    // Fast path: dim0 contiguous → memcpy each row in one call.
+    if (src.stride[0] == (size_t)es) {
+        int64_t flat = 0;
+        for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
+            for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
+                for (int64_t i1 = 0; i1 < src.shape[1]; i1++) {
+                    const char* src_ptr = static_cast<const char*>(src.data)
+                        + i1 * src.stride[1]
+                        + i2 * src.stride[2]
+                        + i3 * src.stride[3];
+                    std::memcpy(dst_base + flat * es, src_ptr, row_bytes);
+                    flat += d0;
+                }
+            }
+        }
+        return;
+    }
+
+    // Slow path: element-wise copy (dim0 not contiguous).
+    int64_t flat = 0;
+    for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
+        for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
+            for (int64_t i1 = 0; i1 < src.shape[1]; i1++) {
+                for (int64_t i0 = 0; i0 < d0; i0++) {
+                    const char* src_ptr = static_cast<const char*>(src.data)
+                        + i0 * src.stride[0]
+                        + i1 * src.stride[1]
+                        + i2 * src.stride[2]
+                        + i3 * src.stride[3];
+                    std::memcpy(dst_base + flat * es, src_ptr, es);
+                    flat++;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stride-aware elementwise iteration helper.
 //
 // Tensors are row-major 4-D [d0, d1, d2, d3] with stride[0] = es (innermost).
@@ -243,25 +296,7 @@ static void dispatch_kernel(OpType op, const OpParams& params,
                 output->shape[2] = new_shape[2];
                 output->shape[3] = new_shape[3];
                 output->compute_strides();
-
-                size_t es = src.element_size();
-                char* dst = static_cast<char*>(output->data);
-                int64_t flat = 0;
-                for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
-                    for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
-                        for (int64_t i1 = 0; i1 < src.shape[1]; i1++) {
-                            for (int64_t i0 = 0; i0 < src.shape[0]; i0++) {
-                                const char* src_ptr = static_cast<const char*>(src.data)
-                                    + i0 * src.stride[0]
-                                    + i1 * src.stride[1]
-                                    + i2 * src.stride[2]
-                                    + i3 * src.stride[3];
-                                std::memcpy(dst + flat * es, src_ptr, es);
-                                flat++;
-                            }
-                        }
-                    }
-                }
+                materialize_strided(src, output->data);
             }
         }
         break;
@@ -341,61 +376,67 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             int n_real = graph_params::get_i32(params, 1, seq_len);
             int prefix_len = kernel_size - 1;
             int total_len = prefix_len + seq_len;
+            int process_len = (n_real > 0 && n_real < seq_len) ? n_real : seq_len;
 
             std::vector<float> stated(groups * total_len);
 
-            // Copy conv_state [groups, prefix_len] into stated
-            for (int g = 0; g < groups; g++) {
-                const float* cs = conv_state_data + g * prefix_len;
-                float* dst = stated.data() + g * total_len;
-                for (int p = 0; p < prefix_len; p++) dst[p] = cs[p];
-            }
-            // Copy x into stated. x data layout: [seq, groups] → x_data[s*groups + g].
-            for (int s = 0; s < seq_len; s++) {
-                for (int g = 0; g < groups; g++) {
-                    stated[g * total_len + prefix_len + s] = x_data[s * groups + g];
-                }
-            }
+            // Process groups in parallel. Each group's 3 phases (stated fill,
+            // conv1d+silu, conv_state update) are independent across groups —
+            // each touches only stated[g*total_len .. (g+1)*total_len) and
+            // out_data[g*seq_len .. (g+1)*seq_len). No cross-group aliasing.
+            auto process_group_range = [&](int /*tid*/, int g_start, int g_end) {
+                for (int g = g_start; g < g_end; g++) {
+                    float* dst = stated.data() + g * total_len;
+                    float* cs = conv_state_data + g * prefix_len;
 
-            // Conv1d + silu for each group, each position.
-            int process_len = (n_real > 0 && n_real < seq_len) ? n_real : seq_len;
-            for (int g = 0; g < groups; g++) {
-                const float* w_ptr = w_data + g * kernel_size;
-                const float* st = stated.data() + g * total_len;
-                float* ot = out_data + g * seq_len;
+                    // Phase 1: fill stated[g] = conv_state[g] || x[:, g]
+                    for (int p = 0; p < prefix_len; p++) dst[p] = cs[p];
+                    for (int s = 0; s < seq_len; s++)
+                        dst[prefix_len + s] = x_data[s * groups + g];
 
-                // Zero out all positions first
-                for (int i = 0; i < seq_len; i++) ot[i] = 0.f;
+                    // Phase 2: conv1d + silu
+                    const float* w_ptr = w_data + g * kernel_size;
+                    const float* st = stated.data() + g * total_len;
+                    float* ot = out_data + g * seq_len;
+                    for (int i = 0; i < seq_len; i++) ot[i] = 0.f;
 
 #if HAS_NEON
-                float32x4_t w4 = vld1q_f32(w_ptr);
-                for (int i = 0; i < process_len; i++) {
-                    float32x4_t st4 = vld1q_f32(st + i);
-                    float sum = vaddvq_f32(vmulq_f32(st4, w4));
-                    float sig = 1.f / (1.f + std::exp(-sum));
-                    ot[i] = sum * sig;
-                }
+                    float32x4_t w4 = vld1q_f32(w_ptr);
+                    for (int i = 0; i < process_len; i++) {
+                        float32x4_t st4 = vld1q_f32(st + i);
+                        float sum = vaddvq_f32(vmulq_f32(st4, w4));
+                        float sig = 1.f / (1.f + std::exp(-sum));
+                        ot[i] = sum * sig;
+                    }
 #else
-                for (int i = 0; i < process_len; i++) {
-                    float sum = 0.f;
-                    for (int k = 0; k < kernel_size; k++)
-                        sum += st[i + k] * w_ptr[k];
-                    float sig = 1.f / (1.f + std::exp(-sum));
-                    ot[i] = sum * sig;
-                }
+                    for (int i = 0; i < process_len; i++) {
+                        float sum = 0.f;
+                        for (int k = 0; k < kernel_size; k++)
+                            sum += st[i + k] * w_ptr[k];
+                        float sig = 1.f / (1.f + std::exp(-sum));
+                        ot[i] = sum * sig;
+                    }
 #endif
-            }
 
-            // Update conv_state
-            if (process_len > 0) {
-                int last_real_pos = prefix_len + process_len - 1;
-                for (int g = 0; g < groups; g++) {
-                    const float* st = stated.data() + g * total_len;
-                    float* cs = conv_state_data + g * prefix_len;
-                    for (int p = 0; p < prefix_len; p++) {
-                        cs[p] = st[last_real_pos - prefix_len + 1 + p];
+                    // Phase 3: update conv_state (last prefix_len of stated)
+                    if (process_len > 0) {
+                        int last_real_pos = prefix_len + process_len - 1;
+                        for (int p = 0; p < prefix_len; p++)
+                            cs[p] = st[last_real_pos - prefix_len + 1 + p];
                     }
                 }
+            };
+
+            // Parallelize over groups when worthwhile (same pattern as
+            // gdn_prefill.cpp:100-103). groups is large (6144 for 0.8B,
+            // 8192 for 4B), so 4 threads each get ~1500-2000 groups.
+            if (thread_pool && groups >= 4) {
+                int chunk = (groups + thread_pool->num_threads() - 1)
+                            / thread_pool->num_threads();
+                if (chunk < 1) chunk = 1;
+                thread_pool->parallel_for(0, groups, chunk, process_group_range);
+            } else {
+                process_group_range(0, 0, groups);
             }
         }
         break;
@@ -840,25 +881,7 @@ static void dispatch_kernel(OpType op, const OpParams& params,
     case OpType::CONTIGUOUS:
         // Materialize to row-major contiguous buffer.
         if (!inputs.empty() && inputs[0] && inputs[0]->data && output && output->data) {
-            const Tensor& src = *inputs[0];
-            size_t es = src.element_size();
-            char* dst = static_cast<char*>(output->data);
-            int64_t flat = 0;
-            for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
-                for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
-                    for (int64_t i1 = 0; i1 < src.shape[1]; i1++) {
-                        for (int64_t i0 = 0; i0 < src.shape[0]; i0++) {
-                            const char* src_ptr = static_cast<const char*>(src.data)
-                                + i0 * src.stride[0]
-                                + i1 * src.stride[1]
-                                + i2 * src.stride[2]
-                                + i3 * src.stride[3];
-                            std::memcpy(dst + flat * es, src_ptr, es);
-                            flat++;
-                        }
-                    }
-                }
-            }
+            materialize_strided(*inputs[0], output->data);
         }
         break;
         break;

@@ -58,6 +58,10 @@ static inline void gdn_rank1_update_neon(float* M, const float* k,
 
 // Core GDN recurrence + RMSNormGated for one (head, token).
 // q, k must already be L2-normalised.
+//
+// Fused passes reduce state memory traffic from 5 passes (3 read + 2 write)
+// to 2 passes (1 read+write each). State is 128×128=64KB, so this cuts
+// memory traffic from ~320KB to ~128KB per (head, token).
 static inline void gdn_recurrence_neon(
     const float* q, const float* k, const float* v,
     float g_t_exp, float beta_t, float* state_h,
@@ -65,18 +69,26 @@ static inline void gdn_recurrence_neon(
     float* out_head, int k_dim, int v_dim,
     float scale, float rms_eps)
 {
-    int state_size = k_dim * v_dim;
+    alignas(16) float kv_mem[128] = {0};
+    alignas(16) float attn_out[128] = {0};
 
-    // 1. Decay: state *= exp(g_t)
+    // ---- Pass 1: fused decay + matvec1 (kv_mem = state @ k) ----
+    // For each row dk: row = state[dk]; row *= g; kv_mem += row * k[dk]; state[dk] = row
     {
         float32x4_t g4 = vdupq_n_f32(g_t_exp);
-        for (int i = 0; i < state_size; i += 4)
-            vst1q_f32(state_h + i, vmulq_f32(vld1q_f32(state_h + i), g4));
+        for (int dk = 0; dk < k_dim; dk++) {
+            float32x4_t k4 = vdupq_n_f32(k[dk]);
+            float* row = state_h + dk * v_dim;
+            for (int dv = 0; dv < v_dim; dv += 4) {
+                float32x4_t rv = vld1q_f32(row + dv);
+                rv = vmulq_f32(rv, g4);                  // decay in-place
+                vst1q_f32(row + dv, rv);                  // write back decayed row
+                float32x4_t kv = vld1q_f32(kv_mem + dv);
+                kv = vmlaq_f32(kv, rv, k4);               // kv_mem += row * k[dk]
+                vst1q_f32(kv_mem + dv, kv);
+            }
+        }
     }
-
-    // 2. kv_mem = state @ k
-    alignas(16) float kv_mem[128] = {0};
-    gdn_matvec_neon(state_h, k, kv_mem, k_dim, v_dim);
 
     // 3. delta = (v - kv_mem) * beta_t
     alignas(16) float delta[128];
@@ -89,12 +101,26 @@ static inline void gdn_recurrence_neon(
         }
     }
 
-    // 4. state += outer(k, delta)
-    gdn_rank1_update_neon(state_h, k, delta, k_dim, v_dim);
+    // ---- Pass 2: fused rank1_update + matvec2 (attn_out = state @ q) ----
+    // For each row dk: row = state[dk]; row += k[dk] * delta; attn_out += row * q[dk]; state[dk] = row
+    {
+        for (int dk = 0; dk < k_dim; dk++) {
+            float32x4_t k4 = vdupq_n_f32(k[dk]);
+            float32x4_t q4 = vdupq_n_f32(q[dk]);
+            float* row = state_h + dk * v_dim;
+            for (int dv = 0; dv < v_dim; dv += 4) {
+                float32x4_t rv = vld1q_f32(row + dv);
+                float32x4_t dv4 = vld1q_f32(delta + dv);
+                rv = vmlaq_f32(rv, dv4, k4);              // row += k[dk] * delta
+                vst1q_f32(row + dv, rv);                  // write back updated row
+                float32x4_t av = vld1q_f32(attn_out + dv);
+                av = vmlaq_f32(av, rv, q4);               // attn_out += row * q[dk]
+                vst1q_f32(attn_out + dv, av);
+            }
+        }
+    }
 
-    // 5. attn_out = (state @ q) * scale
-    alignas(16) float attn_out[128];
-    gdn_matvec_neon(state_h, q, attn_out, k_dim, v_dim);
+    // 5b. attn_out *= scale
     {
         float32x4_t sc4 = vdupq_n_f32(scale);
         for (int dv = 0; dv < v_dim; dv += 4)

@@ -3,12 +3,14 @@
 
 #include "kernels/gdn.h"
 #include "kernels/gdn_neon.h"
+#include "kernels/threading.h"
 
 #if HAS_NEON
 
 void kernel_gdn_decode_neon(const OpParams& params,
                              const std::vector<const Tensor*>& inputs,
-                             std::vector<Tensor*>& outputs) {
+                             std::vector<Tensor*>& outputs,
+                             ThreadPool* thread_pool) {
     int num_heads   = graph_params::get_i32(params, 0, 16);
     int k_head_dim  = graph_params::get_i32(params, 1, 128);
     int v_head_dim  = graph_params::get_i32(params, 2, 128);
@@ -41,38 +43,63 @@ void kernel_gdn_decode_neon(const OpParams& params,
     const float* neg_exp_A = neg_exp_A_vec.data();
 
     // decode: seq_len=1, data at t=0
-    for (int vh = 0; vh < num_v_heads; vh++) {
-        int kh = vh / repeat;
-        float* state_h = state_data + vh * state_sz;
+    // Each value head is independent (repeat=1: own state; repeat>1: heads in
+    // same key_head group share state but only read/modify disjoint slices —
+    // actually state is per-vh, so all vh are independent). Parallelise over vh.
+    auto process_head = [&](int /*tid*/, int vh_start, int vh_end) {
+        for (int vh = vh_start; vh < vh_end; vh++) {
+            int kh = vh / repeat;
+            float* state_h = state_data + vh * state_sz;
 
-        alignas(16) float q[128], k_buf[128], v_buf[128];
-        int q_base = kh * k_head_dim;
-        int k_base = qkv_dim + kh * k_head_dim;
-        int v_base = 2 * qkv_dim + vh * v_head_dim;
-        for (int d = 0; d < k_head_dim; d++) {
-            q[d]     = qkv_data[q_base + d];
-            k_buf[d] = qkv_data[k_base + d];
+            alignas(16) float q[128], k_buf[128], v_buf[128];
+            int q_base = kh * k_head_dim;
+            int k_base = qkv_dim + kh * k_head_dim;
+            int v_base = 2 * qkv_dim + vh * v_head_dim;
+            for (int d = 0; d < k_head_dim; d++) {
+                q[d]     = qkv_data[q_base + d];
+                k_buf[d] = qkv_data[k_base + d];
+            }
+            for (int d = 0; d < v_head_dim; d++)
+                v_buf[d] = qkv_data[v_base + d];
+
+            gdn_l2norm_neon(q, k_head_dim, l2_eps);
+            gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
+
+            float a_h = a_data[vh];
+            float b_h = b_data[vh];
+            float sp = gdn_softplusf(a_h + dtb_data[vh]);
+            float g_t = neg_exp_A[vh] * sp;
+            float g_t_exp = std::exp(g_t);
+            float beta_t = gdn_sigmoidf(b_h);
+
+            const float* z_row = z_data + vh * v_head_dim;
+            float* out_head = out_data + vh * v_head_dim;
+
+            gdn_recurrence_neon(q, k_buf, v_buf,
+                                g_t_exp, beta_t, state_h,
+                                norm_data, z_row, out_head,
+                                k_head_dim, v_head_dim, scale, rms_eps);
         }
-        for (int d = 0; d < v_head_dim; d++)
-            v_buf[d] = qkv_data[v_base + d];
+    };
 
-        gdn_l2norm_neon(q, k_head_dim, l2_eps);
-        gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
-
-        float a_h = a_data[vh];
-        float b_h = b_data[vh];
-        float sp = gdn_softplusf(a_h + dtb_data[vh]);
-        float g_t = neg_exp_A[vh] * sp;
-        float g_t_exp = std::exp(g_t);
-        float beta_t = gdn_sigmoidf(b_h);
-
-        const float* z_row = z_data + vh * v_head_dim;
-        float* out_head = out_data + vh * v_head_dim;
-
-        gdn_recurrence_neon(q, k_buf, v_buf,
-                            g_t_exp, beta_t, state_h,
-                            norm_data, z_row, out_head,
-                            k_head_dim, v_head_dim, scale, rms_eps);
+    // Same parallelisation pattern as gdn_prefill.cpp:100-115.
+    // repeat=1: all vh independent. repeat>1: group by key_head to keep
+    // heads sharing a key_head on the same thread (state is per-vh so
+    // actually independent, but grouping preserves cache locality of q/k).
+    if (thread_pool && repeat == 1 && num_v_heads >= 4) {
+        int chunk = (num_v_heads + thread_pool->num_threads() - 1) / thread_pool->num_threads();
+        if (chunk < 1) chunk = 1;
+        thread_pool->parallel_for(0, num_v_heads, chunk, process_head);
+    } else if (thread_pool && repeat > 1 && num_v_heads >= 8) {
+        int num_kh = num_v_heads / repeat;
+        int chunk = (num_kh + thread_pool->num_threads() - 1) / thread_pool->num_threads();
+        if (chunk < 1) chunk = 1;
+        auto process_kh = [&](int tid, int kh_start, int kh_end) {
+            process_head(tid, kh_start * repeat, kh_end * repeat);
+        };
+        thread_pool->parallel_for(0, num_kh, chunk, process_kh);
+    } else {
+        process_head(0, 0, num_v_heads);
     }
 }
 

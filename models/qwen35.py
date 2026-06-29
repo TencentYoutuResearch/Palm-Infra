@@ -356,7 +356,9 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     #   reshape query → [2048, 4]: (dim, s) at dim + s*2048.
     #     dim = d + h*256, so (s, h, d) at s*2048 + h*256 + d. ✓
     #   reshape gate → [2048, 4]: same layout. ✓
-    qg = g.contiguous(qg)                                          # [4096, 4] row-major
+    # No contiguous() needed: reshape + slice both use stride-aware accessors,
+    # and the matmul output's [seq, NH*HD*2] row-major layout already matches
+    # the [HD*2, NH, seq] view (same element ordering, see comment above).
     qg = g.reshape(qg, (head_dim * 2, num_heads, seq_len))        # [512, 8, 4]
     query, gate = g.slice(qg, [head_dim, head_dim], dim=0)         # [256, 8, 4] each
     query = g.reshape(query, (num_heads * head_dim, seq_len))      # [2048, 4]
@@ -400,32 +402,33 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
                     (head_dim,), Precision.FP32)
 
     # --- Query ---
-    query = g.contiguous(query)                               # [NH*HD, seq] row-major
+    # No contiguous() before reshape/permute: reshape inherits stride,
+    # permute is zero-copy. The downstream rms_norm kernel reads via
+    # stride[1] (ldx), so it handles the strided permuted view directly.
     query = g.reshape(query, (head_dim, num_heads, seq_len))  # [HD, NH, seq]
     query = g.permute(query, (0, 2, 1, 3))                   # [HD, seq, NH]
-    query = g.contiguous(query)                                # materialize
+    # No contiguous() before rms_norm: kernel_rms_norm uses ldx=stride[1].
     query = g.reshape(query, (head_dim, num_heads * seq_len)) # [HD, NH*seq], cols s-major
     query = g.rms_norm(query, w_qn, eps=eps)
     query = g.reshape(query, (head_dim, seq_len, num_heads))  # [HD, seq, NH]
     query = g.contiguous(query)                                # for RoPE/SDPA
 
     # --- Key ---
-    k = g.contiguous(k)                                        # [NKV*HD, seq] row-major
+    # No contiguous() before reshape/permute/rms_norm: same rationale as Query.
     k = g.reshape(k, (head_dim, num_kv_heads, seq_len))       # [HD, NKV, seq]
     k = g.permute(k, (0, 2, 1, 3))                            # [HD, seq, NKV]
-    k = g.contiguous(k)                                         # materialize
     k = g.reshape(k, (head_dim, num_kv_heads * seq_len))      # [HD, NKV*seq], cols s-major
     k = g.rms_norm(k, w_kn, eps=eps)
     k = g.reshape(k, (head_dim, seq_len, num_kv_heads))       # [HD, seq, NKV]
     k = g.contiguous(k)                                         # for RoPE/SDPA
     # v is matmul output: declared shape [nkv*hd, seq], data [seq, nkv*hd] row-major.
-    # Step 1: contiguous — materialize to [nkv*hd, seq] row-major (d0=nkv*hd innermost).
-    #   flat[0..hd-1] = (s=0, nkv=0, d=0..hd-1) ✓
-    # Step 2: reshape (hd, nkv, seq) — zero-copy, d0=hd innermost.
+    # Step 1: reshape (hd, nkv, seq) — zero-copy, d0=hd innermost.
     #   flat[0..hd-1] = (d=0..hd-1, nkv=0, s=0) = (s=0, nkv=0, d=0..hd-1) ✓
-    # Step 3: permute (hd, nkv, seq) → (hd, seq, nkv)
-    # Step 4: contiguous → SDPA-expected [hd, seq, nkv] row-major
-    v = g.contiguous(v)
+    # Step 2: permute (hd, nkv, seq) → (hd, seq, nkv)
+    # Step 3: contiguous → SDPA-expected [hd, seq, nkv] row-major
+    # No contiguous() before reshape/permute: reshape+permute are zero-copy
+    # stride-aware; the single contiguous() before SDPA materializes the
+    # layout SDPA requires (stride[1] == hd*es).
     v = g.reshape(v, (head_dim, num_kv_heads, seq_len))
     v = g.permute(v, (0, 2, 1, 3))
     v = g.contiguous(v)
