@@ -57,7 +57,8 @@ void kernel_gdn_prefill_neon(const OpParams& params,
     // Process heads in parallel. Each head's tokens are sequential (stateful).
     // Heads are independent when repeat=1; when repeat>1, heads sharing a key_head
     // must be serialised. We group by key_head for correctness.
-    auto process_head = [&](int vh_start, int vh_end, int /*tid*/) {
+    // parallel_for signature: fn(int thread_id, int begin, int end)
+    auto process_head = [&](int /*tid*/, int vh_start, int vh_end) {
         for (int vh = vh_start; vh < vh_end; vh++) {
             int kh = vh / repeat;
             float* state_h = state_data + vh * state_sz;
@@ -95,12 +96,23 @@ void kernel_gdn_prefill_neon(const OpParams& params,
         }
     };
 
-    // Serial processing. Multi-threading deferred:
-    // parallel_for causes intermittent incorrect results in ctest
-    // (possible worker thread init race). Serial-vs-parallel unit test
-    // passes when run standalone. Investigation ongoing.
-    (void)thread_pool;
-    process_head(0, num_v_heads, 0);
+    // Parallelize over heads when safe (repeat=1: independent state per head)
+    if (thread_pool && repeat == 1 && num_v_heads >= 4) {
+        int chunk = (num_v_heads + thread_pool->num_threads() - 1) / thread_pool->num_threads();
+        if (chunk < 1) chunk = 1;
+        thread_pool->parallel_for(0, num_v_heads, chunk, process_head);
+    } else if (thread_pool && repeat > 1 && num_v_heads >= 8) {
+        // Group by key_head to avoid state sharing
+        int num_kh = num_v_heads / repeat;
+        int chunk = (num_kh + thread_pool->num_threads() - 1) / thread_pool->num_threads();
+        if (chunk < 1) chunk = 1;
+        auto process_kh = [&](int tid, int kh_start, int kh_end) {
+            process_head(tid, kh_start * repeat, kh_end * repeat);
+        };
+        thread_pool->parallel_for(0, num_kh, chunk, process_kh);
+    } else {
+        process_head(0, 0, num_v_heads);
+    }
 }
 
 #endif // HAS_NEON

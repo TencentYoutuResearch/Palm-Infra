@@ -166,11 +166,69 @@ SHORTCONV decode 占 0.8B decode 的 8.8%，当前实现为通用 prefill/decode
 |------|------|-----------|----------|
 | llama.cpp | 0.8B | 749 | 100 |
 | llama.cpp | 4B | 143 | 23 |
-| mlllm | 0.8B | 328 | **92** |
-| mlllm | 4B | 73 | **23** |
+| mlllm | 0.8B | 334 | 90 |
+| mlllm | 4B | 71 | 23 |
 
-0.8B decode 92 vs llama.cpp 100，差距 8%。
-4B decode 23 vs llama.cpp 23，已持平。
+0.8B prefill 差距从 3.8x 缩小到 2.2x。
+
+---
+
+## 尝试 5: GDN prefill 多线程并行 (2026-06-29)
+
+### 决策理由
+
+GDN prefill 占 0.8B prefill 的 46.8%（358ms），heads 之间 state 独立（repeat=1 时），
+天然适合多线程并行。每个 head 处理 256 tokens 的 recurrence，16 heads 可分给 4 线程。
+
+### 实现
+
+在 `kernels/gdn_prefill.cpp` 中使用 `thread_pool->parallel_for` 将 heads 分片并行处理。
+- repeat=1 时直接按 heads 分片
+- repeat>1 时按 key_head 分组（共享 state 的 heads 必须串行）
+
+**踩坑**：`parallel_for` 的 fn 签名是 `(thread_id, begin, end)`，lambda 参数顺序必须匹配。
+初始实现参数顺序错误（`vh_start, vh_end, tid`），导致 worker 线程处理了错误的 head 范围。
+通过 standalone parallel_for 单元测试定位并修复。
+
+### 结果
+
+#### Qwen3.5-0.8B
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| GDN prefill | 358.43ms (46.8%) | 93.39ms (18.3%) | **3.84x** |
+| prefill_tps | 331.82 | **495.72** | +49% |
+
+**Prefill profile 变化**:
+
+| Op | 优化前 | 优化后 |
+|---|---|---|
+| MATMUL | 278ms (34.6%) | — |
+| GDN prefill | 358ms (46.8%) | 93ms (18.3%) |
+| SHORTCONV | 52ms (6.8%) | — |
+
+### 验证
+
+- test_e2e: PASS (PPL=8.50)
+- 4B chat: 输出正确
+
+### 框架对比 (尝试 5 后)
+
+| 框架 | 模型 | pp256 t/s | tg64 t/s |
+|------|------|-----------|----------|
+| llama.cpp | 0.8B | 749 | 100 |
+| llama.cpp | 4B | 143 | 23 |
+| mlllm | 0.8B | **496** | 90 |
+| mlllm | 4B | 71 | 23 |
+
+0.8B prefill 差距从 2.2x 缩小到 1.5x (749 vs 496)。
+0.8B decode 差距 1.1x (100 vs 90)。
+
+### 下一步
+
+- MATMUL 现在是 0.8B prefill 最大热点（~50%+），但已高度优化
+- 4B 的 MATMUL 占主导（prefill 59%, decode 82%），可考虑 weight quantization
+- GDN prefill 仍有优化空间（单 head recurrence 内的 token 循环可向量化）
 
 ---
 
