@@ -165,7 +165,8 @@ static void fused_gdn_head(
 #if HAS_NEON
 void kernel_gdn_prefill_neon(const OpParams& params,
                               const std::vector<const Tensor*>& inputs,
-                              std::vector<Tensor*>& outputs);
+                              std::vector<Tensor*>& outputs,
+                              ThreadPool* thread_pool);
 #endif
 
 void kernel_gdn_prefill(const OpParams& params,
@@ -173,7 +174,7 @@ void kernel_gdn_prefill(const OpParams& params,
                         std::vector<Tensor*>& outputs,
                         ThreadPool* thread_pool) {
 #if HAS_NEON
-    kernel_gdn_prefill_neon(params, inputs, outputs);
+    kernel_gdn_prefill_neon(params, inputs, outputs, thread_pool);
     return;
 #endif
     int num_heads   = graph_params::get_i32(params, 0, 16);

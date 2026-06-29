@@ -358,7 +358,6 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             }
 
             // Conv1d + silu for each group, each position.
-            // Only process real tokens [0, n_real); padding positions remain zero.
             int process_len = (n_real > 0 && n_real < seq_len) ? n_real : seq_len;
             for (int g = 0; g < groups; g++) {
                 const float* w_ptr = w_data + g * kernel_size;
@@ -368,22 +367,26 @@ static void dispatch_kernel(OpType op, const OpParams& params,
                 // Zero out all positions first
                 for (int i = 0; i < seq_len; i++) ot[i] = 0.f;
 
+#if HAS_NEON
+                float32x4_t w4 = vld1q_f32(w_ptr);
                 for (int i = 0; i < process_len; i++) {
-                    float sum = 0.f;
-                    int base = prefix_len + i;
-                    for (int k = 0; k < kernel_size; k++) {
-                        int src_i = base - (kernel_size - 1) + k;
-                        sum += st[src_i] * w_ptr[k];
-                    }
+                    float32x4_t st4 = vld1q_f32(st + i);
+                    float sum = vaddvq_f32(vmulq_f32(st4, w4));
                     float sig = 1.f / (1.f + std::exp(-sum));
                     ot[i] = sum * sig;
                 }
+#else
+                for (int i = 0; i < process_len; i++) {
+                    float sum = 0.f;
+                    for (int k = 0; k < kernel_size; k++)
+                        sum += st[i + k] * w_ptr[k];
+                    float sig = 1.f / (1.f + std::exp(-sum));
+                    ot[i] = sum * sig;
+                }
+#endif
             }
 
-            // Update conv_state: save the last prefix_len positions of the
-            // LAST REAL TOKEN's window (not the padded end).
-            // For process_len tokens, the last relevant position in stated is
-            // prefix_len + process_len - 1. We save the window ending there.
+            // Update conv_state
             if (process_len > 0) {
                 int last_real_pos = prefix_len + process_len - 1;
                 for (int g = 0; g < groups; g++) {

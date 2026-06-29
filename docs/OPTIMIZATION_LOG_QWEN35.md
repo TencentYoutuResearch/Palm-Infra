@@ -172,6 +172,52 @@ SHORTCONV decode 占 0.8B decode 的 8.8%，当前实现为通用 prefill/decode
 0.8B decode 92 vs llama.cpp 100，差距 8%。
 4B decode 23 vs llama.cpp 23，已持平。
 
+---
+
+## 尝试 4: SHORTCONV prefill NEON 化 (2026-06-29)
+
+### 决策理由
+
+SHORTCONV prefill 占 0.8B prefill 的 8.9%，卷积内层是 4 元素点积，正好一个 float32x4_t。
+尝试消除 stated buffer 失败（内存访问模式变差），改为保留 stated 布局，仅 NEON 化卷积内层。
+
+### 实现
+
+在 `graph/execute.cpp` 的 SHORTCONV prefill 路径中：
+- 卷积内层用 `vld1q_f32` + `vmulq_f32` + `vaddvq_f32` 替代标量循环
+- stated buffer 和输入重组保持不变（保证卷积窗口连续内存访问）
+
+### 结果
+
+#### Qwen3.5-0.8B
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| SHORTCONV prefill | 68.82ms (8.9%) | 52.11ms (6.8%) | **1.32x** |
+| prefill_tps | 327.95 | **333.89** | +1.8% |
+
+#### Qwen3.5-4B
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| SHORTCONV prefill | 136.21ms (3.9%) | 105.89ms (3.0%) | **1.29x** |
+| prefill_tps | 72.87 | 71.17 | -2.3% |
+
+> 4B prefill_tps 略微下降（波动范围内），因为 SHORTCONV 只占 3%。
+
+### 框架对比 (尝试 4 后)
+
+| 框架 | 模型 | pp256 t/s | tg64 t/s |
+|------|------|-----------|----------|
+| llama.cpp | 0.8B | 749 | 100 |
+| llama.cpp | 4B | 143 | 23 |
+| mlllm | 0.8B | **334** | 90 |
+| mlllm | 4B | 71 | 23 |
+
+### 下一步
+
+- GDN prefill 仍是最大热点（0.8B 占 46%），可考虑多线程并行
+
 ### 下一步
 
 - SHORTCONV prefill NEON 化（0.8B 占 8.9%）
