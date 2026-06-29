@@ -306,13 +306,39 @@ static void dispatch_kernel(OpType op, const OpParams& params,
             int kernel_size = graph_params::get_i32(params, 0, 4);
             int groups = (int)x.shape[0];
             int seq_len = (int)x.shape[1];
-            int n_real = graph_params::get_i32(params, 1, seq_len); // 0 or missing → all positions
 
             const float* x_data = x.ptr<float>();
             const float* w_data = w.ptr<float>();
             float* conv_state_data = reinterpret_cast<float*>(inputs[2]->data);
             float* out_data = out.ptr<float>();
 
+#if HAS_NEON
+            // Decode fast path: seq_len=1, single position per group.
+            if (seq_len == 1 && kernel_size == 4) {
+                int prefix_len = kernel_size - 1;  // 3
+
+                for (int g = 0; g < groups; g++) {
+                    float* cs = conv_state_data + g * prefix_len;
+                    float xg = x_data[g];  // layout [seq, groups], seq=1
+
+                    // Convolution: sum = cs0*w0 + cs1*w1 + cs2*w2 + xg*w3
+                    const float* wp = w_data + g * kernel_size;
+                    float sum = cs[0] * wp[0] + cs[1] * wp[1] + cs[2] * wp[2] + xg * wp[3];
+
+                    // SiLU: sum * sigmoid(sum)
+                    float sig = 1.f / (1.f + expf(-sum));
+                    out_data[g * seq_len] = sum * sig;
+
+                    // Update conv_state: shift left, append xg
+                    cs[0] = cs[1];
+                    cs[1] = cs[2];
+                    cs[2] = xg;
+                }
+                break;
+            }
+#endif
+
+            int n_real = graph_params::get_i32(params, 1, seq_len);
             int prefix_len = kernel_size - 1;
             int total_len = prefix_len + seq_len;
 

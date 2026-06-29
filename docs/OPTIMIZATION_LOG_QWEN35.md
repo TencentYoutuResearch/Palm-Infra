@@ -122,6 +122,61 @@ GDN prefill 占 prefill 65.6%（0.8B），是和 llama.cpp 差距的主因。pre
 
 0.8B prefill 差距从 3.8x 缩小到 2.3x。
 
+---
+
+## 尝试 3: SHORTCONV decode 特化 (2026-06-29)
+
+### 决策理由
+
+SHORTCONV decode 占 0.8B decode 的 8.8%，当前实现为通用 prefill/decode 路径，每次调用都分配
+`stated` 中间 buffer（~6.4MB）并做双循环重组。decode 时 seq_len=1，可以完全消除这些开销。
+
+### 实现
+
+在 `graph/execute.cpp` 的 SHORTCONV case 中增加 `if (seq_len == 1)` 快速路径：
+- 消除 `stated` 分配（省去 groups × total_len 的内存分配和初始化）
+- 消除输入重组循环（seq_len=1 时 x_data 直接按 group 索引）
+- 卷积简化为单位置：`sum = cs0*w0 + cs1*w1 + cs2*w2 + x*w3`
+- conv_state 更新简化为 shift + append
+
+### 结果
+
+#### Qwen3.5-0.8B
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| SHORTCONV decode | 44.14ms (8.8%) | 12.16ms (2.9%) | **3.63x** |
+| decode_tps | 89.12 | **92.34** | +3.6% |
+
+#### Qwen3.5-4B
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| SHORTCONV decode | 101.39ms (4.2%) | 20.33ms (0.9%) | **4.99x** |
+| decode_tps | 21.82 | **23.07** | +5.7% |
+
+### 验证
+
+- test_e2e: PASS (0.8B PPL=8.50)
+- 4B chat: 输出正确
+
+### 框架对比 (尝试 3 后)
+
+| 框架 | 模型 | pp256 t/s | tg64 t/s |
+|------|------|-----------|----------|
+| llama.cpp | 0.8B | 749 | 100 |
+| llama.cpp | 4B | 143 | 23 |
+| mlllm | 0.8B | 328 | **92** |
+| mlllm | 4B | 73 | **23** |
+
+0.8B decode 92 vs llama.cpp 100，差距 8%。
+4B decode 23 vs llama.cpp 23，已持平。
+
+### 下一步
+
+- SHORTCONV prefill NEON 化（0.8B 占 8.9%）
+- GDN prefill 进一步优化（0.8B 仍占 46.3%）
+
 ### 下一步
 
 - SHORTCONV 向量化（decode 占 10%）
