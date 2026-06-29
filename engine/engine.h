@@ -63,6 +63,8 @@ inline const void* cache_data(const void* data) {
 struct EngineConfig {
     std::string prefill_graph_path;   // .graph file for prefill
     std::string decode_graph_path;    // .graph file for decode
+    std::string package_path;         // .mollm single-file package (alternative to above)
+    std::string tokenizer_path;       // tokenizer.json path (may be set by package load)
     int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;
@@ -135,6 +137,15 @@ private:
     std::unordered_map<std::string, size_t> weight_map_;  // path → index into shared_weights_
     std::vector<MappedFile> shared_weights_;
 
+    // .mollm package: raw mmap of the whole file
+    void* package_mmap_ = nullptr;
+    size_t package_mmap_size_ = 0;
+    const uint8_t* package_weights_base_ = nullptr;
+    // weight filename → (offset, size) within weights region
+    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> package_weight_map_;
+    // prefill_seq_len from package metadata
+    int package_prefill_seq_len_ = 256;
+
     // Load-time interleaved-packed FP16 weights (path → packed buffer)
     std::unordered_map<std::string, std::vector<uint8_t>> packed_weights_;
 
@@ -177,6 +188,9 @@ private:
 
     /// Load a single graph and set up its CONSTANT nodes from shared weights.
     bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path);
+    bool load_package(const std::string& path, std::string& pf_path,
+                      std::string& dc_path, std::string& tok_path,
+                      std::string& jin_path);
 
     /// Allocate KV cache buffers with metadata header.
     void allocate_caches(Graph& g, int n_ctx);

@@ -146,7 +146,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
     for (auto& node : g.nodes) {
         if (node.op_type != OpType::CONSTANT || node.params.str.empty()) continue;
 
-        std::string wpath = node.params.str[0];
+        std::string wref = node.params.str[0];
+        std::string wpath = wref;
         if (wpath[0] != '/' && (wpath.size() < 2 || wpath[1] != ':')) {
             wpath = graph_dir + wpath;
         }
@@ -154,9 +155,6 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         auto& t = g.runtime.tensors[node.id];
 
         // Helper: set up weight tensor.
-        // Weight is stored as [N, K] row-major: W[n,k] = data[n*K + k].
-        // The matmul uses B[n*K + k] directly (not B[n + k*stride]).
-        // If repacked, B is stored as [K, N] with stride K (interleaved by 8).
         auto setup_weight = [&](void* data) {
             t.prec = node.out_prec;
             int64_t dim0 = node.out_shape[0];  // N
@@ -170,6 +168,44 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.mem_type = MemoryType::EXTERNAL;
         };
 
+        // Package mode: resolve weight from package mmap via offset map.
+        // The weight path (e.g. "./foo.weights") is looked up in
+        // package_weight_map_ to find (offset, size) within the weights region.
+        if (package_weights_base_ != nullptr) {
+            auto pit = package_weight_map_.find(wref);
+            if (pit == package_weight_map_.end()) pit = package_weight_map_.find(wpath);
+            if (pit != package_weight_map_.end()) {
+                const uint8_t* hdr = package_weights_base_ + pit->second.first;
+                // Read data_offset from weight header (byte 48, 8 bytes)
+                uint64_t data_off;
+                std::memcpy(&data_off, hdr + 48, sizeof(data_off));
+                void* data = const_cast<uint8_t*>(hdr + data_off);
+                setup_weight(data);
+
+                // Interleaved packing (same as file path)
+                if (t.prec == Precision::FP16 && g_matmul_config.use_interleave_pack) {
+                    bool is_embed = (wref.find("embed_tokens") != std::string::npos);
+                    if (!is_embed) {
+                        std::string pack_key = wref;
+                        auto pack_it = packed_weights_.find(pack_key);
+                        if (pack_it == packed_weights_.end()) {
+                            int N = (int)t.shape[0];
+                            int K = (int)t.shape[1];
+                            const __fp16* b_orig = reinterpret_cast<const __fp16*>(data);
+                            __fp16* b_packed = pack_b_interleaved_full(b_orig, N, K, K);
+                            size_t buf_size = (size_t)((N + 7) / 8) * 8 * K * sizeof(__fp16);
+                            packed_weights_[pack_key] = std::vector<uint8_t>(
+                                (uint8_t*)b_packed, (uint8_t*)b_packed + buf_size);
+                            delete[] b_packed;
+                        }
+                        t.data = packed_weights_[pack_key].data();
+                    }
+                }
+                continue;
+            }
+        }
+
+        // File mode: load weight from filesystem
         // Check if this weight is already loaded
         auto it = weight_map_.find(wpath);
         if (it != weight_map_.end()) {
@@ -408,8 +444,23 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     exec_ctx_prefill_.thread_pool = &thread_pool_;
     exec_ctx_decode_.thread_pool = &thread_pool_;
 
+    // If a .mollm package is specified, load it first (sets up weights mmap,
+    // extracts graphs to temp files, parses metadata for weight offset map)
+    std::string pf_path = cfg.prefill_graph_path;
+    std::string dc_path = cfg.decode_graph_path;
+    if (!cfg.package_path.empty()) {
+        std::string tok_tmp, jin_tmp;
+        if (!load_package(cfg.package_path, pf_path, dc_path, tok_tmp, jin_tmp)) {
+            return false;
+        }
+        // If tokenizer was extracted, use it
+        if (!tok_tmp.empty()) {
+            cfg_.tokenizer_path = tok_tmp;
+        }
+    }
+
     // Load prefill graph first (establishes shared weights)
-    if (!load_graph(graph_prefill_, exec_ctx_prefill_, cfg.prefill_graph_path.c_str())) {
+    if (!load_graph(graph_prefill_, exec_ctx_prefill_, pf_path.c_str())) {
         return false;
     }
 
@@ -432,7 +483,7 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     allocate_caches(graph_prefill_, cfg.n_ctx);
 
     // Load decode graph (reuses shared weights via weight_map_)
-    if (!load_graph(graph_decode_, exec_ctx_decode_, cfg.decode_graph_path.c_str())) {
+    if (!load_graph(graph_decode_, exec_ctx_decode_, dc_path.c_str())) {
         return false;
     }
 
@@ -969,4 +1020,111 @@ Tensor LLMEngine::decode_hidden(int token_id) {
     }
 
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// .mollm package loading
+// ---------------------------------------------------------------------------
+
+#include <fstream>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <json.hpp>
+
+using json = nlohmann::json;
+
+static constexpr uint32_t PACKAGE_MAGIC_C = 0x4D4C4F4D;  // "MOLM"
+
+bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
+                              std::string& dc_path, std::string& tok_path,
+                              std::string& jin_path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Engine: failed to open package %s\n", path.c_str());
+        return false;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return false; }
+    size_t file_size = st.st_size;
+    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) {
+        fprintf(stderr, "Engine: mmap failed for %s\n", path.c_str());
+        return false;
+    }
+    package_mmap_ = mapped;
+    package_mmap_size_ = file_size;
+
+    const uint8_t* base = static_cast<const uint8_t*>(mapped);
+
+    if (file_size < 128) {
+        fprintf(stderr, "Engine: package too small\n");
+        return false;
+    }
+
+    uint32_t magic, version;
+    std::memcpy(&magic, base + 0, 4);
+    std::memcpy(&version, base + 4, 4);
+    if (magic != PACKAGE_MAGIC_C) {
+        fprintf(stderr, "Engine: bad package magic 0x%08x\n", magic);
+        return false;
+    }
+
+    // Parse header (6 offset/len pairs at bytes 8-103)
+    uint64_t meta_off, meta_len, tok_off, tok_len, jin_off, jin_len;
+    uint64_t pf_off, pf_len, dc_off, dc_len, w_off, w_len;
+    std::memcpy(&meta_off, base + 8, 8);
+    std::memcpy(&meta_len, base + 16, 8);
+    std::memcpy(&tok_off, base + 24, 8);
+    std::memcpy(&tok_len, base + 32, 8);
+    std::memcpy(&jin_off, base + 40, 8);
+    std::memcpy(&jin_len, base + 48, 8);
+    std::memcpy(&pf_off, base + 56, 8);
+    std::memcpy(&pf_len, base + 64, 8);
+    std::memcpy(&dc_off, base + 72, 8);
+    std::memcpy(&dc_len, base + 80, 8);
+    std::memcpy(&w_off, base + 88, 8);
+    std::memcpy(&w_len, base + 96, 8);
+
+    package_weights_base_ = base + w_off;
+
+    // Parse metadata JSON
+    std::string meta_str(reinterpret_cast<const char*>(base + meta_off), meta_len);
+    try {
+        auto meta = json::parse(meta_str);
+        if (meta.contains("prefill_seq_len")) {
+            package_prefill_seq_len_ = meta["prefill_seq_len"].get<int>();
+        }
+        if (meta.contains("weights")) {
+            for (auto& [name, info] : meta["weights"].items()) {
+                uint64_t off = info[0].get<uint64_t>();
+                uint64_t sz = info[1].get<uint64_t>();
+                package_weight_map_[name] = {off, sz};
+            }
+        }
+    } catch (std::exception& e) {
+        fprintf(stderr, "Engine: failed to parse package metadata: %s\n", e.what());
+        return false;
+    }
+
+    // Extract graphs + tokenizer + jinja to temp files
+    pid_t pid = getpid();
+    auto write_tmp = [&](const char* label, uint64_t off, uint64_t len, std::string& out_path) {
+        if (len == 0) return;
+        out_path = "/tmp/mollm_pkg_" + std::to_string(pid) + "_" + label;
+        std::ofstream f(out_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(base + off), len);
+    };
+
+    write_tmp("prefill.graph", pf_off, pf_len, pf_path);
+    write_tmp("decode.graph", dc_off, dc_len, dc_path);
+    write_tmp("tokenizer.json", tok_off, tok_len, tok_path);
+    write_tmp("chat_template.jinja", jin_off, jin_len, jin_path);
+
+    fprintf(stderr, "Engine: loaded package %s (%.1f MB, %zu weights, prefill_seq=%d)\n",
+            path.c_str(), file_size / 1e6, package_weight_map_.size(),
+            package_prefill_seq_len_);
+    return true;
 }

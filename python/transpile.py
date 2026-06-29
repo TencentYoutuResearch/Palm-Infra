@@ -563,3 +563,139 @@ def _write_weight_file(path: str, data: np.ndarray):
         f.write(header)
         f.write(data.tobytes())
     print(f"  Wrote {path} ({data.shape}, {data.dtype})")
+
+
+# ---------------------------------------------------------------------------
+# .mollm single-file package format
+# ---------------------------------------------------------------------------
+#
+# Bundles prefill graph + decode graph + all weights + metadata into one file.
+# The graphs are stored in the standard .graph format (unchanged), with
+# CONSTANT nodes referencing weights by relative path (e.g. "./foo.weights").
+# The C++ loader resolves these paths against the weights region of the mmap'd
+# package instead of the filesystem.
+#
+# Layout:
+#   [Header 128 bytes]
+#     magic "MOLM" (4) + version (4)
+#     metadata_offset (8) + metadata_len (8)
+#     tokenizer_offset (8) + tokenizer_len (8)
+#     jinja_offset (8) + jinja_len (8)
+#     prefill_graph_offset (8) + prefill_graph_len (8)
+#     decode_graph_offset (8) + decode_graph_len (8)
+#     weights_offset (8) + weights_len (8)
+#     reserved (16)
+#   [metadata JSON] — includes "weights" map: {filename: [offset, len]}
+#   [tokenizer.json bytes]
+#   [chat_template.jinja bytes]
+#   [prefill graph bytes]   (standard .graph format, weight refs = "./foo.weights")
+#   [decode graph bytes]    (standard .graph format, weight refs = "./foo.weights")
+#   [weights region]        — all .weights files concatenated, each self-contained
+
+PACKAGE_MAGIC   = 0x4D4C4F4D  # "MOLM"
+PACKAGE_VERSION = 1
+PACKAGE_HEADER_SIZE = 128
+
+
+def save_package(output_path: str,
+                 g_prefill: 'GraphBuilder',
+                 g_decode: 'GraphBuilder',
+                 weights_dir: str,
+                 metadata: dict,
+                 tokenizer_path: str = "",
+                 jinja_path: str = ""):
+    """Pack prefill+decode graphs + weights + tokenizer + jinja into a single .mollm file.
+
+    Graphs are saved via the standard save() format (to temp files), then
+    their bytes are embedded in the package. Weight file paths in the graphs
+    remain as relative paths (e.g. "./foo.weights"); the C++ loader resolves
+    them against the package's weights region using the metadata offset map.
+    """
+    import json
+    import tempfile
+    import shutil
+
+    tmp_dir = tempfile.mkdtemp(prefix="mollm_pkg_")
+
+    try:
+        # Step 1: save graphs to temp dir (standard format)
+        g_prefill.save(os.path.join(tmp_dir, "model_prefill"))
+        g_decode.save(os.path.join(tmp_dir, "model_decode"))
+
+        # Step 2: read graph bytes
+        with open(os.path.join(tmp_dir, "model_prefill.graph"), 'rb') as f:
+            pf_bytes = f.read()
+        with open(os.path.join(tmp_dir, "model_decode.graph"), 'rb') as f:
+            dc_bytes = f.read()
+
+        # Step 3: collect weight files referenced by both graphs
+        weight_files = {}  # relative_name -> (offset, size)
+        weights_blob = bytearray()
+
+        for g in [g_prefill, g_decode]:
+            for node in g._nodes:
+                if node.op_type != OpType.CONSTANT or not node.params_str:
+                    continue
+                ref = node.params_str[0]
+                if ref.startswith('#') or ref == "__inline_const__":
+                    continue
+                if ref in weight_files:
+                    continue
+                # Find the weight file
+                wpath = os.path.join(weights_dir, ref) if not os.path.isabs(ref) else ref
+                if not os.path.exists(wpath):
+                    wpath = os.path.join(tmp_dir, ref)
+                if not os.path.exists(wpath):
+                    raise FileNotFoundError(f"Weight file not found: {ref}")
+                blob = open(wpath, 'rb').read()
+                offset = len(weights_blob)
+                weights_blob.extend(blob)
+                weight_files[ref] = [offset, len(blob)]
+
+        # Step 4: build metadata
+        meta = dict(metadata)
+        meta["weights"] = weight_files
+        meta_json = json.dumps(meta, ensure_ascii=False).encode('utf-8')
+
+        # Step 5: read tokenizer + jinja bytes
+        tok_bytes = b""
+        if tokenizer_path and os.path.exists(tokenizer_path):
+            with open(tokenizer_path, 'rb') as tf:
+                tok_bytes = tf.read()
+        jinja_bytes = b""
+        if jinja_path and os.path.exists(jinja_path):
+            with open(jinja_path, 'rb') as jf:
+                jinja_bytes = jf.read()
+
+        # Step 6: write package
+        hs = PACKAGE_HEADER_SIZE
+        meta_off = hs
+        tok_off = meta_off + len(meta_json)
+        jin_off = tok_off + len(tok_bytes)
+        pf_off = jin_off + len(jinja_bytes)
+        dc_off = pf_off + len(pf_bytes)
+        w_off = dc_off + len(dc_bytes)
+
+        with open(output_path, 'wb') as f:
+            f.write(struct.pack('<II', PACKAGE_MAGIC, PACKAGE_VERSION))
+            f.write(struct.pack('<QQ', meta_off, len(meta_json)))
+            f.write(struct.pack('<QQ', tok_off, len(tok_bytes)))
+            f.write(struct.pack('<QQ', jin_off, len(jinja_bytes)))
+            f.write(struct.pack('<QQ', pf_off, len(pf_bytes)))
+            f.write(struct.pack('<QQ', dc_off, len(dc_bytes)))
+            f.write(struct.pack('<QQ', w_off, len(weights_blob)))
+            f.write(b'\x00' * (hs - 4 - 4 - 8 * 12))  # pad to 128
+            f.write(meta_json)
+            f.write(tok_bytes)
+            f.write(jinja_bytes)
+            f.write(pf_bytes)
+            f.write(dc_bytes)
+            f.write(weights_blob)
+
+        total = (hs + len(meta_json) + len(tok_bytes) + len(jinja_bytes)
+                 + len(pf_bytes) + len(dc_bytes) + len(weights_blob))
+        print(f"Saved {output_path} ({len(weights_blob)} weights + {len(tok_bytes)} tokenizer + "
+              f"{len(jinja_bytes)} jinja + {len(pf_bytes)} prefill + {len(dc_bytes)} decode = {total} bytes)")
+
+    finally:
+        shutil.rmtree(tmp_dir)

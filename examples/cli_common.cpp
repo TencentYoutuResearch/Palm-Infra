@@ -55,6 +55,9 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         } else if (arg == "--artifacts") {
             if (!require_value(argc, argv, i, "--artifacts", value, error)) return false;
             opts.artifacts_dir = value;
+        } else if (arg == "--package") {
+            if (!require_value(argc, argv, i, "--package", value, error)) return false;
+            opts.package_path = value;
         } else if (arg == "--prompt") {
             if (!require_value(argc, argv, i, "--prompt", value, error)) return false;
             opts.prompt = value;
@@ -129,21 +132,24 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         }
     }
 
-    if (opts.tokenizer_path.empty()) {
-        error = "missing required --tokenizer";
-        return false;
-    }
-    if (opts.artifacts_dir.empty()) {
-        error = "missing required --artifacts";
-        return false;
+    if (opts.package_path.empty()) {
+        if (opts.tokenizer_path.empty()) {
+            error = "missing required --tokenizer (or use --package)";
+            return false;
+        }
+        if (opts.artifacts_dir.empty()) {
+            error = "missing required --artifacts (or use --package)";
+            return false;
+        }
     }
 
     return true;
 }
 
 void print_common_usage(const char* program_name, const char* extra_usage) {
-    std::printf("Usage: %s --tokenizer <tokenizer.json> --artifacts <dir> [options]\n", program_name);
+    std::printf("Usage: %s (--package <file.mollm> | --tokenizer <tok.json> --artifacts <dir>) [options]\n", program_name);
     std::printf("Options:\n");
+    std::printf("  --package <file.mollm>    Single-file model package (includes tokenizer+graphs+weights)\n");
     std::printf("  --prompt <text>           Run one prompt and exit\n");
     std::printf("  --prompt-file <path>      Read prompt text from file, run and exit\n");
     std::printf("  --prompt-tokens <int>     Use N dummy tokens (skip chat template)\n");
@@ -166,6 +172,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
 
 EngineConfig make_engine_config(const CliCommonOptions& opts) {
     EngineConfig cfg;
+    cfg.package_path = opts.package_path;
+    cfg.tokenizer_path = opts.tokenizer_path;
     cfg.prefill_graph_path = opts.artifacts_dir + "/model_prefill.graph";
     cfg.decode_graph_path = opts.artifacts_dir + "/model_decode.graph";
     cfg.n_ctx = opts.n_ctx;
@@ -201,12 +209,32 @@ bool inspect_prefill_seq_len(const std::string& graph_path, int& seq_len,
 
 bool load_runtime(const CliCommonOptions& opts, Tokenizer& tokenizer,
                   LLMEngine& engine, int& prefill_seq_len, std::string& error) {
+    EngineConfig cfg = make_engine_config(opts);
+
+    // Package mode: load engine first (extracts tokenizer + graphs), then
+    // load tokenizer from extracted temp file.
+    if (!opts.package_path.empty()) {
+        if (!engine.load(cfg)) {
+            error = "failed to load engine package";
+            return false;
+        }
+        // Load tokenizer from extracted path (engine sets cfg_.tokenizer_path)
+        std::string tok_path = engine.config().tokenizer_path;
+        if (tok_path.empty()) tok_path = opts.tokenizer_path;
+        if (!tokenizer.load(tok_path)) {
+            error = std::string("failed to load tokenizer: ") + tok_path;
+            return false;
+        }
+        prefill_seq_len = 256;  // TODO: expose from engine
+        return true;
+    }
+
+    // Artifacts mode: load tokenizer, inspect graph, then load engine
     if (!tokenizer.load(opts.tokenizer_path)) {
         error = std::string("failed to load tokenizer: ") + opts.tokenizer_path;
         return false;
     }
 
-    EngineConfig cfg = make_engine_config(opts);
     if (!inspect_prefill_seq_len(cfg.prefill_graph_path, prefill_seq_len, error)) {
         return false;
     }

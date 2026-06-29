@@ -10,6 +10,7 @@
 struct CliCommonOptions {
     std::string tokenizer_path;
     std::string artifacts_dir;
+    std::string package_path;   // .mollm single-file package (alternative to --artifacts/--tokenizer)
     std::string prompt;
     std::string prompt_file;  // read prompt text from file (--prompt-file)
     int prompt_tokens = 0;   // >0: use N dummy tokens instead of --prompt text

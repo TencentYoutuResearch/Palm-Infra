@@ -1,4 +1,4 @@
-build/
+build*/
 _build/
 *.o
 *.a
@@ -16,4 +16,6 @@ dist/
 compile_commands.json
 *.weights
 *.graph
+tmp/build_asan/
+*.mollm
 tmp/

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from python.transpile import GraphBuilder, Precision, _write_weight_file
+from python.transpile import GraphBuilder, Precision, _write_weight_file, save_package
 
 
 def load_safetensors(path: str) -> dict[str, np.ndarray]:
@@ -473,13 +473,22 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     return out
 
 
-def convert_qwen35(model_dir: str, output_dir: str, num_layers: int = 24,
+def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
                     prefill_seq_len: int = 256, n_ctx: int = 4096):
-    """Main entry point: export weights + build prefill/decode graphs."""
+    """Main entry point: export weights + build graphs → single .mollm file.
+
+    Args:
+        model_dir: path to HF model directory (with config.json + safetensors)
+        output_path: output .mollm file path
+        num_layers: number of hidden layers
+        prefill_seq_len: prefill sequence length
+        n_ctx: max context length
+    """
     model_dir = Path(model_dir)
-    output_dir = Path(output_dir)
-    weights_dir = output_dir / "weights"
-    weights_rel = "weights"
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="mollm_weights_")
+    weights_dir = tmp_dir
+    weights_rel = "."
 
     with open(model_dir / 'config.json') as f:
         cfg = json.load(f)
@@ -496,30 +505,51 @@ def convert_qwen35(model_dir: str, output_dir: str, num_layers: int = 24,
     for st_path in st_files:
         weights.update(load_safetensors(str(st_path)))
 
-    # ---- Step 1: Export weights ----
+    # ---- Step 1: Export weights to temp dir ----
     print("Exporting weights...")
     export_weights(weights, str(weights_dir))
 
     # ---- Step 2: Build prefill graph ----
     print(f"\nBuilding prefill graph (seq_len={prefill_seq_len})...")
     g_prefill = build_graph(weights_rel, cfg, seq_len=prefill_seq_len, n_ctx=n_ctx)
-    g_prefill.save(str(output_dir / "model_prefill"))
 
     # ---- Step 3: Build decode graph ----
     print(f"\nBuilding decode graph (seq_len=1)...")
     g_decode = build_graph(weights_rel, cfg, seq_len=1, n_ctx=n_ctx)
-    g_decode.save(str(output_dir / "model_decode"))
 
-    print(f"\nDone! Output in {output_dir}/")
+    # ---- Step 4: Pack into single .mollm file ----
+    print(f"\nPacking {output_path}...")
+    tc = cfg['text_config']
+    metadata = {
+        "model_name": f"Qwen3.5-{num_layers}L",
+        "architecture": "qwen3.5",
+        "num_layers": num_layers,
+        "hidden_size": tc['hidden_size'],
+        "num_heads": tc['num_attention_heads'],
+        "num_kv_heads": tc['num_key_value_heads'],
+        "head_dim": tc['head_dim'],
+        "prefill_seq_len": prefill_seq_len,
+        "n_ctx": n_ctx,
+        "vocab_size": tc['vocab_size'],
+        "layer_types": tc['layer_types'],
+    }
+    save_package(output_path, g_prefill, g_decode, weights_dir, metadata,
+                 tokenizer_path=str(model_dir / "tokenizer.json"),
+                 jinja_path=str(model_dir / "chat_template.jinja"))
+
+    # Cleanup temp dir
+    import shutil
+    shutil.rmtree(tmp_dir)
+    print(f"\nDone! Output: {output_path}")
 
 
 if __name__ == '__main__':
     import sys
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output_dir> [num_layers] [prefill_seq_len]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len]")
         sys.exit(1)
     model_dir = sys.argv[1]
-    output_dir = sys.argv[2]
+    output_path = sys.argv[2]
     num_layers = int(sys.argv[3]) if len(sys.argv) > 3 else 24
     prefill_seq_len = int(sys.argv[4]) if len(sys.argv) > 4 else 256
-    convert_qwen35(model_dir, output_dir, num_layers, prefill_seq_len)
+    convert_qwen35(model_dir, output_path, num_layers, prefill_seq_len)
