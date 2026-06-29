@@ -459,12 +459,7 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
 
     # ---- Output gate: attn * sigmoid(gate) ----
     # gate is matmul output (qg_proj second half): [NH*HD, seq], data [seq, NH*HD].
-    # contiguous → materialize as [NH*HD, seq] row-major.
-    # HF gate layout: gate_raw.reshape(batch, seq, NH*HD) = [seq, NH*HD] row-major.
-    #   element (s, h, d) at s*NH*HD + h*HD + d = s*2048 + h*256 + d.
-    # C++ contiguous → [NH*HD, seq] row-major:
-    #   element (dim, s) at dim + s*NH*HD = h*HD + d + s*2048. ✓
-    gate = g.contiguous(gate)
+    # gate is already contiguous (from qg split + reshape), skip explicit contiguous.
     gate_sigmoid = g.sigmoid(gate)
     attn = g.mul(attn, gate_sigmoid)
 
