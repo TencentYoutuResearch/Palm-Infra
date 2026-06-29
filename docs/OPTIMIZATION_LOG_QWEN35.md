@@ -767,3 +767,108 @@ static inline void materialize_strided(const Tensor& src, void* dst) {
 - matmul 算子 microbench 988 GF/s（FP16FML peak 86%），端到端 ~580 GF/s（利用率 50%）
 - **weight quantization (W4)** 是唯一大幅杠杆：理论砍 matmul 时间 2x，4B prefill 112 → ~160+
 - GDN prefill 7.1%，RMSNormGated 的 sigmoid 标量循环可 NEON 化（~5ms 小收益）
+
+---
+
+## 尝试 11: GDN RMSNormGated NEON sigmoid 向量化 (2026-06-29)
+
+### 决策理由
+
+GDN prefill 在 4B 占 7.1%（157ms）。分析 `gdn_recurrence_neon` 的步骤 6
+（RMSNormGated）发现标量循环：每 4 元素做 `vst1q→scalar loop→vld1q` 往返，
+其中 sigmoid 用 `std::exp`（标量）。项目已有 `sigmoid_f32_neon`（多项式近似，
+7-bit 精度）在 activations.h 中，可直接复用。
+
+### 实现
+
+在 `kernels/gdn_neon.h` 中：
+- 加 `#include "kernels/activations.h"`（复用 `sigmoid_f32_neon`）
+- 替换步骤 6 的标量 sigmoid 循环为 NEON 向量化：
+  ```cpp
+  float32x4_t zv = vld1q_f32(z_row + dv);
+  float32x4_t gate = vmulq_f32(zv, sigmoid_f32_neon(zv));
+  vst1q_f32(out_head + dv, vmulq_f32(normed, gate));
+  ```
+- 消除 `vst1q(result) → scalar loop → vld1q(result)` 往返
+
+### 精度影响
+
+sigmoid_f32_neon 是多项式近似（~7-bit），引入 ~1e-3 误差。
+- test_gdn 容差从 1e-5 放宽到 1e-3（注释说明原因）
+- test_e2e PPL 8.4893/8.5070 vs HF 8.50，差异可接受
+
+### 结果
+
+#### Qwen3.5-4B（风扇拉满，5 次中位数）
+
+| 指标 | 优化前（尝试 10） | 优化后（尝试 11） | 提升 |
+|------|------------------|------------------|------|
+| prefill_tps | 112.08 | **114.69** | +2.3% |
+| decode_tps | 25.01 | **25.09** | +0.3% |
+
+**GDN prefill 变化**: 157ms → 153ms（-3%）
+
+> 5 次 prefill_tps: 117.71 / 116.20 / 114.69 / 113.64 / 112.83（波动 ±2.3%）
+
+---
+
+## 尝试 12: SHORTCONV prefill x 拷贝 seq-outer 优化 (2026-06-29)
+
+### 决策理由
+
+SHORTCONV prefill 在 4B 占 2.5%（53ms），计算量仅 16.7 MFLOP/call，10x overhead
+来自内存访问。分析发现 Phase 1 的 x 拷贝 `x_data[s*groups + g]` 对固定 g 遍历 s 时
+stride=groups*4 bytes（4B: 32KB），cache 利用率仅 1/32。
+
+### 实现
+
+在 `graph/execute.cpp` SHORTCONV case 中，将 Phase 1 的 x 拷贝从 per-group 循环
+（s 内层，strided）改为 seq-outer 批量拷贝（g 内层，连续访问）：
+
+```cpp
+// Phase 1a: batch-copy x (seq-outer for cache-friendly access)
+for (int s = 0; s < seq_len; s++) {
+    const float* x_row = x_data + s * groups;      // 连续
+    float* st_row = st_base + prefix_len + s;
+    for (int g = 0; g < groups; g++)
+        st_row[g * total_len] = x_row[g];           // x_row 连续访问
+}
+```
+
+尝试过滑动窗口（无 stated buffer）方案，但因标量 shift 开销和 x strided 访问恶化，
+比原版慢 8%，已回退。
+
+### 结果
+
+SHORTCONV 从 53ms 降到 48-58ms（波动范围内，收益不确定）。理论上 seq-outer 访问
+更 cache-friendly，但 4B 的 SHORTCONV 占比小（2.5%），收益被波动掩盖。保留此优化
+（逻辑正确，理论更优）。
+
+### 验证
+
+- test_e2e: PASS（PPL 8.4893/8.5070 vs HF 8.50）
+
+### 框架对比 (尝试 11+12 后)
+
+| 框架 | 模型 | pp256 t/s | tg64 t/s |
+|------|------|-----------|----------|
+| llama.cpp | 4B | 143 | 23 |
+| mlllm | 4B | **115** | **25.1** |
+
+4B prefill 差距从 1.28x 缩小到 **1.25x**（115 vs 143）。
+
+### 累计优化进度 (尝试 5 → 尝试 12，以 4B 为准)
+
+| 指标 | 尝试 5 | 尝试 12 | 累计提升 |
+|------|--------|---------|---------|
+| 4B prefill_tps | 71 | 115 | **+62%** |
+| 4B decode_tps | 23 | 25.1 | +9% |
+
+### 下一步
+
+- 4B prefill 差距 1.25x（115 vs 143），MATMUL 占 87%
+- 非 MATMUL 优化空间已基本耗尽：GDN（融合+多线程+NEON sigmoid）、SHORTCONV（多线程+seq-outer）、
+  RESHAPE/CONTIGUOUS（行级 memcpy）、SILU/RMS_NORM（已 NEON 化）都已优化到位
+- matmul 算子 microbench 988 GF/s（FP16FML peak 86%），端到端 ~393 GF/s（利用率 40%）
+- 端到端 matmul 2.5x overhead 来自 cache/DRAM 带宽（4B 权重 280MB >> L2 16MB，每次 matmul 走 DRAM）
+- **weight quantization (W4)** 是唯一大幅杠杆：理论砍 matmul 时间 2x，4B prefill 115 → ~160+

@@ -7,8 +7,10 @@
 //
 // Each test builds synthetic inputs, runs the kernel, and compares against a
 // scalar reference implementation of the same math (g/beta → recurrence →
-// RMSNormGated). Tolerance 1e-5 (pure FP32, no NEON approximation in the
-// reference path; the kernel itself is scalar too in this revision).
+// RMSNormGated). Tolerance 1e-3: the NEON kernel uses sigmoid_f32_neon
+// (polynomial approximation, ~7-bit precision) for RMSNormGated gating,
+// which introduces ~1e-3 error vs the scalar std::exp path. This does not
+// affect end-to-end PPL (test_e2e confirms PPL 8.49 vs HF 8.50).
 
 #include "kernels/gdn.h"
 #include "graph/graph.h"
@@ -174,7 +176,7 @@ static bool run_kernel(bool prefill,
 }
 
 // Compare two buffers, print first mismatch.
-static bool compare(const float* a, const float* b, int n, const char* name, float tol = 1e-5f) {
+static bool compare(const float* a, const float* b, int n, const char* name, float tol = 1e-3f) {
     float max_err = 0; int max_idx = 0;
     for (int i = 0; i < n; i++) {
         float e = std::fabs(a[i] - b[i]);

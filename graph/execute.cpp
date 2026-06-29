@@ -380,19 +380,31 @@ static void dispatch_kernel(OpType op, const OpParams& params,
 
             std::vector<float> stated(groups * total_len);
 
-            // Process groups in parallel. Each group's 3 phases (stated fill,
-            // conv1d+silu, conv_state update) are independent across groups —
-            // each touches only stated[g*total_len .. (g+1)*total_len) and
-            // out_data[g*seq_len .. (g+1)*seq_len). No cross-group aliasing.
+            // Phase 1a: batch-copy x into stated with sequential memory access.
+            // x data layout is [seq, groups] row-major: x_data[s*groups + g].
+            // The per-group loop (s inner) has stride=groups*4 bytes → cache-thrash.
+            // Flipping to seq-outer/groups-inner makes x_data access fully sequential.
+            // stated[g*total_len + prefix_len + s] = x_data[s*groups + g]
+            {
+                float* st_base = stated.data();
+                for (int s = 0; s < seq_len; s++) {
+                    const float* x_row = x_data + s * groups;
+                    float* st_row = st_base + prefix_len + s;
+                    for (int g = 0; g < groups; g++)
+                        st_row[g * total_len] = x_row[g];
+                }
+            }
+
+            // Process groups in parallel. Each group's phases 1b/2/3 are
+            // independent across groups — each touches only its own
+            // stated[g*total_len .. (g+1)*total_len) and out_data[g*seq_len ..].
             auto process_group_range = [&](int /*tid*/, int g_start, int g_end) {
                 for (int g = g_start; g < g_end; g++) {
                     float* dst = stated.data() + g * total_len;
                     float* cs = conv_state_data + g * prefix_len;
 
-                    // Phase 1: fill stated[g] = conv_state[g] || x[:, g]
+                    // Phase 1b: prepend conv_state (prefix_len elements, contiguous)
                     for (int p = 0; p < prefix_len; p++) dst[p] = cs[p];
-                    for (int s = 0; s < seq_len; s++)
-                        dst[prefix_len + s] = x_data[s * groups + g];
 
                     // Phase 2: conv1d + silu
                     const float* w_ptr = w_data + g * kernel_size;
