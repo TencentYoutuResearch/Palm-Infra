@@ -898,12 +898,19 @@ void execute_graph(ExecContext& ctx) {
         }
 
         // initialise output shape from node definition (static!)
-        out.shape[0] = node.out_shape[0];
-        out.shape[1] = node.out_shape[1];
-        out.shape[2] = node.out_shape[2];
-        out.shape[3] = node.out_shape[3];
-        out.prec     = node.out_prec;
-        out.compute_strides();
+        // For zero-copy ops that already have data (from input sharing),
+        // skip shape init to preserve contiguity info.
+        bool skip_init = (node.op_type == OpType::RESHAPE ||
+                          node.op_type == OpType::PERMUTE ||
+                          node.op_type == OpType::SLICE) && out.data != nullptr;
+        if (!skip_init) {
+            out.shape[0] = node.out_shape[0];
+            out.shape[1] = node.out_shape[1];
+            out.shape[2] = node.out_shape[2];
+            out.shape[3] = node.out_shape[3];
+            out.prec     = node.out_prec;
+            out.compute_strides();
+        }
 
         // allocate output if needed
         if (out.data == nullptr) {
