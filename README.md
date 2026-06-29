@@ -5,7 +5,7 @@ Pure C++ runtime with a Python transpilation frontend. FP16 with FP16FML NEON ke
 
 ## Status
 
-Supports two model families:
+Supports three model families:
 
 | Model | Architecture | pp256 t/s | tg64 t/s |
 |-------|-------------|-----------|----------|
@@ -15,12 +15,14 @@ Supports two model families:
 
 Benchmarks vs llama.cpp (Apple M5, 4 threads, pp256 + tg64, warmup=3):
 
-| Model | mollm pp/tg | llama.cpp pp/tg |
-|-------|------------|-----------------|
-| Qwen3.5-4B | 115 / 25 | 143 / 23 |
-| Qwen3.5-0.8B | 550 / 95 | 749 / 100 |
+| Model | mollm pp/tg | llama.cpp pp/tg | prefill gap | decode gap |
+|-------|------------|-----------------|-------------|------------|
+| Qwen3.5-4B | 115 / 25 | 143 / 23 | 1.25x | **0.92x (faster)** |
+| Qwen3.5-0.8B | 550 / 95 | 749 / 100 | 1.36x | 1.05x |
+| Youtu-LLM-2B | 235 / 54 | 264 / 41 | 1.12x | **0.76x (faster)** |
 
-4B decode already exceeds llama.cpp; prefill gap is 1.25x (MATMUL-bound, awaits weight quantization).
+Decode already beats llama.cpp on 4B and Youtu-LLM. Prefill gaps are MATMUL-bound
+and await weight quantization.
 
 ## Architecture
 
@@ -41,6 +43,30 @@ mollm/
 ├── tests/           Unit + e2e tests
 └── docs/            Optimization logs, architecture notes
 ```
+
+### Package format (`.mollm`)
+
+A single-file container bundling graph + weights + metadata, so models ship as one
+artifact instead of a directory of loose files. Planned format:
+
+```
+[Header]
+  magic "MOLM"
+  version
+  metadata_offset, metadata_len      # JSON: model name, architecture, config,
+                                     #   tokenizer ref, prefill_seq_len, n_ctx
+  prefill_graph_offset, graph_len    # binary graph (existing format)
+  decode_graph_offset, graph_len
+  weights_offset, weights_len        # concatenated .weights blobs
+[metadata JSON]
+[prefill graph bytes]
+[decode graph bytes]
+[weights bytes]                      # mmap'd at runtime, offset within file
+```
+
+Runtime opens the `.mollm` file once, mmaps the weights region, and reads the two
+graphs. No directory sprawl, no path juggling. The transpile step can emit either
+the current directory layout or a single `.mollm` file.
 
 ## Build
 
@@ -80,3 +106,21 @@ See `docs/OPTIMIZATION_LOG_QWEN35.md` for the full Qwen3.5 optimization journey 
 - **full_attn contiguous cleanup**: verified rms_norm/rope kernels handle strided inputs via unit tests, removed 5 redundant `contiguous()` calls
 - **RESHAPE/CONTIGUOUS materialize**: row-level memcpy fast path (-94%, 85ms→5ms)
 - **FP16FML matmul**: 988 GF/s microbench (86% of FP16FML peak), lane-FMA + 2-way K-unroll GEMM, 8-way K-unroll GEMV
+
+## Roadmap
+
+### Near-term
+- **`.mollm` package format**: single-file model artifact (graph + weights + metadata), replacing the current directory layout
+- **Weight quantization (W4)**: INT4 weight-only quantization for GEMM/GEMV. Biggest remaining prefill lever — 4B MATMUL is 87% of prefill time at 988 GF/s (compute-bound at the kernel level), W4 halves weight bandwidth and should close the prefill gap to llama.cpp
+- **Graph fusion**: fuse adjacent matmul + activation + norm to reduce cache thrash between ops (end-to-end matmul utilization is 40% vs 86% microbench, the 2.5x gap is cache/DRAM traffic between matmuls)
+
+### Mid-term
+- **Continuous batching / multi-user**: serve multiple sequences with shared prefill
+- **Speculative decoding**: draft model + verify
+- **Qualcomm Oryon support**: validate NEON kernels on non-Apple ARM
+- **Vision encoder**: Qwen3.5 is multimodal — wire up the ViT side
+
+### Longer-term
+- **GPU/Vulkan backend**: roadmap item, CPU-first for now
+- **W4 KV cache**: reduce decode memory for long contexts
+- **More models**: Llama, Mistral, DeepSeek families
