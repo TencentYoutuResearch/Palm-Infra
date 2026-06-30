@@ -208,6 +208,56 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- Test 4: Youtu-LLM-2B PPL (package mode) ----
+    // Tests MLA path correctness. HF reference PPL=45.25 on 256 calibration tokens.
+    printf("\n=== Test 4: Youtu-LLM-2B PPL (MLA path) ===\n");
+    {
+        const char* youtu_package = argc > 3 ? argv[3] :
+            "/Users/molly/workspace-youtulm-ncnn/mollm/youtu-llm-2b.mollm";
+        const char* youtu_tokenizer = argc > 4 ? argv[4] :
+            "/Users/molly/workspace-youtulm-ncnn/Youtu-LLM-2B/tokenizer.json";
+
+        Tokenizer youtu_tok;
+        CHECK(youtu_tok.load(youtu_tokenizer), "Youtu tokenizer load");
+
+        LLMEngine youtu_eng;
+        EngineConfig youtu_cfg;
+        youtu_cfg.package_path = youtu_package;
+        youtu_cfg.tokenizer_path = youtu_tokenizer;
+        youtu_cfg.n_ctx = 512;
+        youtu_cfg.rope_theta = 500000.f;
+
+        ok = youtu_eng.load(youtu_cfg);
+        CHECK(ok, "Youtu engine load (package mode)");
+        if (!ok) goto skip_youtu;
+
+        // Greedy decode test
+        {
+            std::vector<int> youtu_ids = youtu_tok.encode("Hello, world!");
+            int token = youtu_eng.prefill(youtu_ids);
+            printf("  Prefill token: %d (HF ref: %d)\n", token, YOUTU_REF_DECODE[0]);
+            CHECK(token == YOUTU_REF_DECODE[0], "Youtu prefill argmax matches HF reference");
+            for (int step = 0; step < YOUTU_REF_DECODE_LEN - 1 && token >= 0; step++) {
+                token = youtu_eng.decode(token);
+                printf("  Decode step %d: token=%d (HF ref: %d)\n",
+                       step + 1, token, YOUTU_REF_DECODE[step + 1]);
+                CHECK(token == YOUTU_REF_DECODE[step + 1],
+                      "Youtu decode argmax matches HF reference");
+            }
+        }
+
+        // PPL test
+        {
+            std::vector<int> ppl_ids(YOUTU_PPL_TOKENS, YOUTU_PPL_TOKENS + YOUTU_PPL_N);
+            float ppl = compute_ppl(youtu_eng, ppl_ids);
+            printf("  Youtu PPL: %.4f (HF ref: %.2f)\n", ppl, YOUTU_REF_PPL);
+            CHECK(std::fabs(ppl - YOUTU_REF_PPL) < 2.0f,
+                  "Youtu PPL matches HF reference (tol=2.0)");
+        }
+
+    skip_youtu:;
+    }
+
     if (failures == 0) {
         printf("\nAll e2e tests passed!\n");
     } else {
