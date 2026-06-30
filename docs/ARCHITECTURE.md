@@ -222,6 +222,12 @@ C++ `load_package`：mmap 整个文件，解析 metadata JSON 建 weight filenam
 
 ## 7. 模型转译（`models/`）
 
+### 统一入口（`converter.py`）
+
+读 `config.json` 的 `model_type` 字段，自动分发到对应的 converter：
+- `qwen3_5` → `qwen35.convert_qwen35()`
+- `youtu` → `mla.convert_mla()`
+
 ### Qwen3.5（`qwen35.py`）
 
 混合线性/全注意力架构：
@@ -270,8 +276,7 @@ mollm/
 ├── engine/                 LLMEngine + tokenizer + generation
 ├── graph/                  图执行（execute, io, buffer_pool, mmap）
 ├── kernels/                NEON kernels（matmul, attention, gdn, norm, rope）
-├── models/                 Python 转译器（qwen35.py, mla.py）
-├── models/                 Python transpilers + graph builder（qwen35.py, mla.py, transpile.py）
+├── models/                 Python 转译器（converter.py, qwen35.py, mla.py, transpile.py）
 ├── examples/               mollm_chat + mollm_bench
 ├── tests/                  18 个测试
 └── third_party/nlohmann/   JSON 库

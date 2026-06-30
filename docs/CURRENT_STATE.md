@@ -60,7 +60,7 @@ Python 转译前端 → `.mollm` 单文件打包 → C++ 执行器 + NEON FP16FM
 ## 架构摘要
 
 ### 流水线
-1. **Python 转译**（`models/qwen35.py`, `models/mla.py`）：PyTorch weights → `.mollm` 单文件
+1. **Python 转译**（`models/converter.py` 自动分发 → `qwen35.py` / `mla.py`）：PyTorch weights → `.mollm` 单文件
 2. **C++ 执行器**（`graph/execute.cpp`）：顺序节点 dispatch + BufferPool 内存管理
 3. **NEON kernels**（`kernels/`）：matmul, attention, gdn, norm, rope
 
@@ -85,8 +85,7 @@ mollm/
 ├── kernels/         NEON kernels（matmul, attention, gdn, norm, rope）
 ├── graph/           执行器、图格式、BufferPool、mmap
 ├── engine/          LLMEngine、tokenizer、generation loop
-├── models/          Python 转译器（qwen35.py, mla.py）
-├── models/               Python transpilers + graph builder（qwen35.py, mla.py, transpile.py）
+├── models/          Python 转译器 + graph builder（converter.py, qwen35.py, mla.py, transpile.py）
 ├── examples/        mollm_chat (CLI), mollm_bench (benchmark)
 ├── tests/           18 个测试（unit + e2e）
 └── docs/            优化日志、架构文档
@@ -101,8 +100,8 @@ mollm/
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release
 ninja -C build
 
-# 转换模型为 .mollm 单文件
-python3 models/qwen35.py /path/to/Qwen3.5-4B model.mollm 32 256
+# 转换模型为 .mollm 单文件（自动检测模型类型）
+python3 models/converter.py /path/to/Qwen3.5-4B model.mollm
 
 # Chat（单文件，无需单独 tokenizer）
 ./build/mollm_chat --package model.mollm --prompt "Hello"
