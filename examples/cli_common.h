@@ -14,8 +14,8 @@ struct CliCommonOptions {
     std::string prompt;
     std::string prompt_file;  // read prompt text from file (--prompt-file)
     int prompt_tokens = 0;   // >0: use N dummy tokens instead of --prompt text
-    int max_new_tokens = 128;
-    int n_ctx = 4096;
+    int max_new_tokens = 2048;
+    int n_ctx = 16384;
     int rope_dim = 64;
     float rope_theta = 10000000.f;
     int num_threads = 4;
