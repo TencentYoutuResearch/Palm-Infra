@@ -83,19 +83,26 @@ Requires Apple Clang (for `__ARM_FEATURE_FP16FML`), Python 3 with `safetensors`.
 
 ```bash
 cd mollm
-python3 models/qwen35.py /path/to/Qwen3.5-4B qwen35_4b.mollm 32 256
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b.mollm
 ```
+
+The converter auto-detects the model type from `config.json` and dispatches to the appropriate converter. Supported types:
+
+| `model_type` | Model | Default layers |
+|-------------|-------|-----------------|
+| `qwen3_5` | Qwen3.5-0.8B/4B | 24 (0.8B), 32 (4B) |
+| `youtu` | Youtu-LLM-2B | 32 |
 
 **Arguments:**
 
-| # | Name | Description |
-|---|------|-------------|
-| 1 | `model_dir` | HF model directory (must contain `config.json` + `model.safetensors`) |
-| 2 | `output_path` | Output `.mollm` file path |
-| 3 | `num_layers` | Number of hidden layers (0.8B=24, 4B=32) |
-| 4 | `prefill_seq_len` | Prefill chunk size (default 256) |
+| # | Name | Required | Description |
+|---|------|----------|-------------|
+| 1 | `model_dir` | yes | HF model directory (must contain `config.json` + `model.safetensors`) |
+| 2 | `output_path` | yes | Output `.mollm` file path |
+| 3 | `num_layers` | no | Override number of hidden layers (auto-detected if omitted) |
+| 4 | `prefill_seq_len` | no | Prefill chunk size (default 256) |
 
-Produces a single `qwen35_4b.mollm` file containing graphs + weights + tokenizer + chat template.
+Produces a single `.mollm` file containing graphs + weights + tokenizer + chat template.
 
 ## Run
 
