@@ -4,7 +4,8 @@
 
 ## 1. 概述
 
-mollm 是一个 ARM-first 的 LLM 推理引擎，针对 Apple Silicon（M 系列）优化。
+mollm 是一个 mobile-oriented 的 LLM 推理引擎，面向 ARM-based 设备。
+目前在 Apple Silicon（M 系列）上开发和测试，移动端 ARM（Qualcomm Oryon、MediaTek）在 roadmap 中。
 Python 转译前端 → 二进制图 → C++ 执行器 + NEON FP16FML kernels。
 
 **设计原则**：

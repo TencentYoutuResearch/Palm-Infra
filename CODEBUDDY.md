@@ -1,6 +1,7 @@
 # mollm
 
-ARM-first LLM inference engine. Apple Silicon (FP16FML NEON).
+Mobile-oriented LLM inference engine. ARM NEON FP16FML kernels.
+Currently benchmarked on Apple Silicon; targeting mobile/edge ARM on roadmap.
 
 ## Context recovery
 

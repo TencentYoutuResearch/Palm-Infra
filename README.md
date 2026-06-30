@@ -1,6 +1,8 @@
-# mollm — ARM-first LLM inference engine
+# mollm — mobile-oriented LLM inference engine
 
-A from-scratch LLM inference engine targeting Apple Silicon (and Qualcomm Oryon).
+A from-scratch LLM inference engine for ARM-based devices.
+Currently developed and benchmarked on Apple Silicon; targeting mobile/edge
+ARM (Qualcomm Oryon, MediaTek) on the roadmap.
 Pure C++ runtime with a Python transpilation frontend. FP16 with FP16FML NEON kernels.
 
 ## Status

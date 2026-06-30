@@ -4,7 +4,8 @@
 
 ## 项目概述
 
-**mollm** — ARM-first LLM 推理引擎，针对 Apple Silicon 优化。
+**mollm** — mobile-oriented LLM 推理引擎，ARM NEON FP16FML kernels。
+目前在 Apple Silicon 上开发和测试，移动端 ARM（Qualcomm Oryon、MediaTek）在 roadmap 中。
 Python 转译前端 → `.mollm` 单文件打包 → C++ 执行器 + NEON FP16FML kernels。
 
 支持三个模型系列：
