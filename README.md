@@ -83,19 +83,28 @@ Requires Apple Clang (for `__ARM_FEATURE_FP16FML`), Python 3 with `safetensors`.
 
 ```bash
 cd mollm
-PYTHONPATH=. python3 models/qwen35.py /path/to/Qwen3.5-4B output_qwen35_4B 32 256
+PYTHONPATH=. python3 models/qwen35.py /path/to/Qwen3.5-4B qwen35_4b.mollm 32 256
 ```
 
-Produces `output_qwen35_4B/{model_prefill.graph, model_decode.graph, weights/}`.
+**Arguments:**
+
+| # | Name | Description |
+|---|------|-------------|
+| 1 | `model_dir` | HF model directory (must contain `config.json` + `model.safetensors`) |
+| 2 | `output_path` | Output `.mollm` file path |
+| 3 | `num_layers` | Number of hidden layers (0.8B=24, 4B=32) |
+| 4 | `prefill_seq_len` | Prefill chunk size (default 256) |
+
+Produces a single `qwen35_4b.mollm` file containing graphs + weights + tokenizer + chat template.
 
 ## Run
 
 ```bash
-# Chat
-./build/mollm_chat --tokenizer tokenizer.json --artifacts output_qwen35_4B --threads 4
+# Chat (single .mollm file — no separate tokenizer needed)
+./build/mollm_chat --package qwen35_4b.mollm --threads 4
 
 # Benchmark (pp256 + tg64, prints per-op profile)
-./build/mollm_bench --tokenizer tokenizer.json --artifacts output_qwen35_4B \
+./build/mollm_bench --package qwen35_4b.mollm \
     --prompt-tokens 256 --max-new-tokens 64 --warmup 3 --threads 4 --profile
 ```
 
