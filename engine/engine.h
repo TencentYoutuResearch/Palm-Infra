@@ -112,6 +112,10 @@ public:
     const ExecContext& prefill_exec_ctx() const { return exec_ctx_prefill_; }
     const ExecContext& decode_exec_ctx() const { return exec_ctx_decode_; }
 
+    // Dump ADD node outputs (last token) from prefill graph to dir.
+    // Each layer has 2 ADD nodes: attention residual + MLP residual.
+    void dump_prefill_add_outputs(const char* dir);
+
     /// Park worker threads (drop idle CPU). Auto-resumes on next prefill/decode.
     void park_workers() { thread_pool_.park(); }
 

@@ -104,6 +104,9 @@ struct MatmulTimer {
 
 MatmulConfig g_matmul_config;
 
+// Debug override: force FP32 accumulation (for precision comparison)
+bool g_mollm_force_fp32_acc = false;
+
 // ---------------------------------------------------------------------------
 // scalar matmul (fallback)
 // ---------------------------------------------------------------------------
@@ -1020,7 +1023,7 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     bool use_interleave = is_fp16 && HAS_NEON && !is_repacked
                        && g_matmul_config.use_interleave_pack;
     bool use_lane_fma = use_interleave && (M >= 8);
-    bool use_fp16_acc = g_matmul_config.use_fp16_accumulate;
+    bool use_fp16_acc = g_matmul_config.use_fp16_accumulate && !g_mollm_force_fp32_acc;
 
     // Select lane-FMA kernel based on accumulation mode.
     // `act`/`act_n_begin`/`act_n_len` are in local shard coords (caller already

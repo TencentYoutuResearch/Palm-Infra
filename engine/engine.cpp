@@ -1128,3 +1128,28 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
             package_prefill_seq_len_);
     return true;
 }
+
+void LLMEngine::dump_prefill_add_outputs(const char* dir) {
+    int add_idx = 0;
+    for (auto& node : graph_prefill_.nodes) {
+        if (node.op_type != OpType::ADD) continue;
+        auto& t = graph_prefill_.runtime.tensors[node.id];
+        if (!t.data || t.prec != Precision::FP32) continue;
+        add_idx++;
+        char fname[256];
+        snprintf(fname, sizeof(fname), "%s/add_%04d.f32", dir, add_idx);
+        FILE* f = fopen(fname, "wb");
+        if (!f) continue;
+        const float* p = t.ptr<float>();
+        int d0 = (int)t.shape[0];
+        int d1 = (int)t.shape[1];
+        if (d1 > 1) {
+            size_t ldx = t.stride[1] / sizeof(float);
+            fwrite(p + (d1 - 1) * ldx, sizeof(float), d0, f);
+        } else {
+            fwrite(p, sizeof(float), d0, f);
+        }
+        fclose(f);
+    }
+    fprintf(stderr, "Dumped %d ADD outputs to %s/\n", add_idx, dir);
+}

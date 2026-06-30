@@ -14,6 +14,7 @@ struct MatmulConfig {
 };
 
 extern MatmulConfig g_matmul_config;
+extern bool g_mollm_force_fp32_acc;  // debug: force FP32 accumulation
 
 // ---------------------------------------------------------------------------
 // mollm — Matmul kernels

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <sys/stat.h>
 
 static int failures = 0;
 #define CHECK(cond, msg) do { if(!(cond)){fprintf(stderr,"FAIL: %s\n",msg);failures++;}else{printf("  PASS: %s\n",msg);} } while(0)
@@ -51,6 +52,11 @@ static float compute_ppl(LLMEngine& eng, const std::vector<int>& token_ids) {
 }
 
 int main(int argc, char** argv) {
+    // For Youtu-LLM debugging: can test with FP32 acc
+    if (getenv("MOLLM_FP32_ACC")) {
+        extern bool g_mollm_force_fp32_acc;
+        g_mollm_force_fp32_acc = true;
+    }
     const char* tokenizer_path = argc > 1 ? argv[1] :
         "/Users/molly/workspace-youtulm-ncnn/Qwen3.5-0.8B/tokenizer.json";
     const char* output_dir = argc > 2 ? argv[2] :
@@ -250,6 +256,9 @@ int main(int argc, char** argv) {
         {
             std::vector<int> ppl_ids(YOUTU_PPL_TOKENS, YOUTU_PPL_TOKENS + YOUTU_PPL_N);
             Tensor hidden = youtu_eng.prefill_hidden(ppl_ids);
+            // Dump per-layer ADD outputs (attention residual + MLP residual per layer)
+            mkdir("/tmp/youtu_cpp_layers", 0755);
+            youtu_eng.dump_prefill_add_outputs("/tmp/youtu_cpp_layers");
             if (hidden.data) {
                 int hidden_size = (int)hidden.shape[0];  // 2048
                 int n_tokens = (int)hidden.shape[1];      // 256
