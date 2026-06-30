@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from transpile import GraphBuilder, OpType, Precision, Activation, _write_weight_file
+from transpile import GraphBuilder, OpType, Precision, Activation, _write_weight_file, save_package
 
 
 def load_safetensors(path: str) -> dict[str, np.ndarray]:
@@ -309,47 +309,62 @@ def cfg_intermediate_size(cfg: dict) -> int:
     return cfg.get('intermediate_size', cfg['hidden_size'] * 3)
 
 
-def convert_mla(model_dir: str, output_dir: str, num_layers: int = 32,
+def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
                 prefill_seq_len: int = 128, n_ctx: int = 4096):
-    """Main entry point: export weights + build prefill/decode graphs."""
+    """Main entry point: export weights + build graphs → single .mollm file."""
     model_dir = Path(model_dir)
-    output_dir = Path(output_dir)
-    weights_dir = output_dir / "weights"
-    # Graph stores paths relative to the graph file's directory.
-    # The graph is saved in output_dir/, so weights paths should be "weights/...".
-    weights_rel = "weights"
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="mollm_weights_")
+    weights_dir = tmp_dir
+    weights_rel = "."
 
     with open(model_dir / 'config.json') as f:
         cfg = json.load(f)
 
     weights = load_safetensors(str(model_dir / 'model.safetensors'))
 
-    # ---- Step 1: Export shared weights ----
+    # ---- Step 1: Export shared weights to temp dir ----
     print("Exporting weights...")
     export_weights(weights, str(weights_dir))
 
     # ---- Step 2: Build prefill graph ----
     print(f"\nBuilding prefill graph (seq_len={prefill_seq_len})...")
     g_prefill = build_graph(weights_rel, cfg, seq_len=prefill_seq_len, n_ctx=n_ctx)
-    g_prefill.save(str(output_dir / "model_prefill"))
 
     # ---- Step 3: Build decode graph ----
     print(f"\nBuilding decode graph (seq_len=1)...")
     g_decode = build_graph(weights_rel, cfg, seq_len=1, n_ctx=n_ctx)
-    g_decode.save(str(output_dir / "model_decode"))
 
-    print(f"\nDone! Output in {output_dir}/")
-    print(f"  {output_dir}/weights/  — shared weight files")
-    print(f"  {output_dir}/model_prefill.graph")
-    print(f"  {output_dir}/model_decode.graph")
+    # ---- Step 4: Pack into single .mollm file ----
+    print(f"\nPacking {output_path}...")
+    metadata = {
+        "model_name": f"Youtu-LLM-{num_layers}L",
+        "architecture": "mla",
+        "num_layers": num_layers,
+        "hidden_size": cfg['hidden_size'],
+        "num_heads": cfg['num_attention_heads'],
+        "num_kv_heads": cfg.get('num_key_value_heads', cfg['num_attention_heads']),
+        "head_dim": cfg.get('head_dim', cfg['hidden_size'] // cfg['num_attention_heads']),
+        "prefill_seq_len": prefill_seq_len,
+        "n_ctx": n_ctx,
+        "vocab_size": cfg['vocab_size'],
+    }
+    save_package(output_path, g_prefill, g_decode, weights_dir, metadata,
+                 tokenizer_path=str(model_dir / "tokenizer.json"),
+                 jinja_path=str(model_dir / "chat_template.jinja"))
+
+    # Cleanup temp dir
+    import shutil
+    shutil.rmtree(tmp_dir)
+    print(f"\nDone! Output: {output_path}")
 
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output_dir> [num_layers] [prefill_seq_len]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len]")
         sys.exit(1)
     model_dir = sys.argv[1]
-    output_dir = sys.argv[2]
+    output_path = sys.argv[2]
     num_layers = int(sys.argv[3]) if len(sys.argv) > 3 else 32
     prefill_seq_len = int(sys.argv[4]) if len(sys.argv) > 4 else 128
-    convert_mla(model_dir, output_dir, num_layers, prefill_seq_len)
+    convert_mla(model_dir, output_path, num_layers, prefill_seq_len)
