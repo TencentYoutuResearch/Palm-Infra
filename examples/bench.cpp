@@ -53,12 +53,15 @@ void print_profile_section(const char* title, const ExecContext& ctx) {
     uint64_t total_ns = 0;
     for (const auto& row : rows) total_ns += row.total_ns;
 
-    std::printf("[%s]\n", title);
+    std::printf("\n[%s]\n", title);
+    // Aligned table: op name left-aligned, numbers right-aligned
+    std::printf("  %-28s %8s %10s %10s %7s\n", "op", "calls", "total_ms", "avg_ms", "pct");
+    std::printf("  %-28s %8s %10s %10s %7s\n", "---", "---", "---", "---", "---");
     for (const auto& row : rows) {
         double total_ms = row.total_ns / 1e6;
         double avg_ms = row.calls > 0 ? total_ms / row.calls : 0.0;
         double pct = total_ns > 0 ? (100.0 * row.total_ns / total_ns) : 0.0;
-        std::printf("op=%s calls=%llu total_ms=%.2f avg_ms=%.2f pct=%.1f\n",
+        std::printf("  %-28s %8llu %10.2f %10.3f %6.1f%%\n",
                     op_type_name(row.op_type),
                     (unsigned long long)row.calls,
                     total_ms,
@@ -157,7 +160,10 @@ int main(int argc, char** argv) {
     std::printf("decode_ms=%.2f\n", result.decode_ms);
     std::printf("total_ms=%.2f\n", metrics.total_ms);
     std::printf("hit_eos=%s\n", result.hit_eos ? "true" : "false");
-    std::printf("generated_text=%s\n", result.text.c_str());
+    // Only show generated_text for real prompts (dummy-token mode produces garbage)
+    if (opts.prompt_tokens <= 0) {
+        std::printf("generated_text=%s\n", result.text.c_str());
+    }
 
     // Pack-A profiling: show how much of the run is spent packing A.
     double pack_ms = mollm_pack_a_total_ms();
