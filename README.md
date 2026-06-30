@@ -10,7 +10,7 @@ Supports three model families:
 | Model | Architecture | pp256 t/s | tg64 t/s |
 |-------|-------------|-----------|----------|
 | Qwen3.5-4B | Hybrid linear/full attention (Gated DeltaNet + GQA) | 115 | 25 |
-| Qwen3.5-0.8B | Same | ~550 | ~95 |
+| Qwen3.5-0.8B | Same | 601 | 104 |
 | Youtu-LLM-2B | MLA | 235 | 54 |
 
 Benchmarks vs llama.cpp (Apple M5, 4 threads, pp256 + tg64, warmup=3):
@@ -18,10 +18,10 @@ Benchmarks vs llama.cpp (Apple M5, 4 threads, pp256 + tg64, warmup=3):
 | Model | mollm pp/tg | llama.cpp pp/tg | prefill gap | decode gap |
 |-------|------------|-----------------|-------------|------------|
 | Qwen3.5-4B | 115 / **25** | 143 / 23 | 1.25x | **0.92x (faster)** |
-| Qwen3.5-0.8B | 550 / 95 | 749 / 100 | 1.36x | 1.05x |
+| Qwen3.5-0.8B | 601 / **104** | 749 / 100 | 1.25x | **0.96x (faster)** |
 | Youtu-LLM-2B | 235 / **54** | 264 / 41 | 1.12x | **0.76x (faster)** |
 
-Decode already beats llama.cpp on 4B and Youtu-LLM. Prefill gaps are MATMUL-bound
+Decode beats llama.cpp on all three models. Prefill gaps are MATMUL-bound
 and await weight quantization.
 
 ## Architecture
