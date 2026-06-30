@@ -254,6 +254,7 @@ int main(int argc, char** argv) {
 
         // Hidden state dump for layer comparison
         {
+            youtu_eng.reset();  // Clear cache from greedy decode test
             std::vector<int> ppl_ids(YOUTU_PPL_TOKENS, YOUTU_PPL_TOKENS + YOUTU_PPL_N);
             Tensor hidden = youtu_eng.prefill_hidden(ppl_ids);
             // Dump per-layer ADD outputs (attention residual + MLP residual per layer)
@@ -291,6 +292,7 @@ int main(int argc, char** argv) {
 
         // PPL test
         {
+            youtu_eng.reset();
             std::vector<int> ppl_ids(YOUTU_PPL_TOKENS, YOUTU_PPL_TOKENS + YOUTU_PPL_N);
             float ppl = compute_ppl(youtu_eng, ppl_ids);
             printf("  Youtu PPL: %.4f (HF ref: %.2f)\n", ppl, YOUTU_REF_PPL);
