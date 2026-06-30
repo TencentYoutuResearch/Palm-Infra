@@ -415,7 +415,7 @@ static void matmul_fp16_neon_gemv_range(
 // limits within-block FP16 accumulation range for precision.
 //
 // 8-way K-unroll with 8 independent FP16 accumulators to fully hide FMA
-// latency. Apple M5 FP16 FMA latency = 2 cycles, throughput = 2/cycle.
+// latency. Apple M5 Pro FP16 FMA latency = 2 cycles, throughput = 2/cycle.
 // With N independent acc chains, CPI = max(1, 2/N) cycles/K-step.
 //   N=1 (single-acc):  CPI=2  → latency-bound
 //   N=2 (2-way unroll): CPI=1  → at FMA throughput ceiling

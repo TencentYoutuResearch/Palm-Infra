@@ -13,7 +13,7 @@ Python 转译前端 → `.mollm` 单文件打包 → C++ 执行器 + NEON FP16FM
 - **Qwen3.5-0.8B**（同架构）
 - **Youtu-LLM-2B**（MLA）
 
-## 性能（Apple M5, 4 threads, pp256 + tg64, warmup=3, fan max）
+## 性能（Apple M5 Pro, 4 threads, pp256 + tg64, warmup=3, fan max）
 
 | Model | mollm pp/tg | llama.cpp pp/tg | prefill gap | decode gap |
 |-------|------------|-----------------|-------------|------------|
