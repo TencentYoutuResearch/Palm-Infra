@@ -17,10 +17,11 @@ Python 转译前端 → `.mollm` 单文件打包 → C++ 执行器 + NEON FP16FM
 | Model | mollm pp/tg | llama.cpp pp/tg | prefill gap | decode gap |
 |-------|------------|-----------------|-------------|------------|
 | Qwen3.5-4B | 115 / 25 | 143 / 23 | 1.25x | **0.92x (faster)** |
-| Qwen3.5-0.8B | ~550 / ~95 | 749 / 100 | 1.36x | 1.05x |
+| Qwen3.5-0.8B | 601 / 104 | 749 / 100 | 1.25x | **0.96x (faster)** |
 | Youtu-LLM-2B | 235 / 54 | 264 / 41 | 1.12x | **0.76x (faster)** |
 
-**4B 是主要基准** — 0.8B 测量不稳定（运行时间短，对调度敏感，decode_tps 5 次跑 62-99 波动）。4B 稳定（±2.3%）。
+**4B 是主要基准** — 0.8B artifacts 模式测量不稳定（运行时间短，对调度敏感，decode_tps 5 次跑 62-99 波动）。4B 稳定（±2.3%）。
+**0.8B package 模式**更稳定且更快（连续 mmap 减少 page fault），decode_tps 达 104，已超 llama.cpp。
 
 ## 优化进度（Qwen3.5-4B，尝试 5→12）
 
