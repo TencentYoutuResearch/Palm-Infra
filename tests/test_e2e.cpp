@@ -246,6 +246,40 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Hidden state dump for layer comparison
+        {
+            std::vector<int> ppl_ids(YOUTU_PPL_TOKENS, YOUTU_PPL_TOKENS + YOUTU_PPL_N);
+            Tensor hidden = youtu_eng.prefill_hidden(ppl_ids);
+            if (hidden.data) {
+                int hidden_size = (int)hidden.shape[0];  // 2048
+                int n_tokens = (int)hidden.shape[1];      // 256
+                const float* h = hidden.ptr<float>();
+                // Save last token hidden (after final norm, before lm_head)
+                // Actually prefill_hidden returns the output of the final graph node
+                // which is after final RMSNorm. Compare with HF layer_31 (last layer output
+                // BEFORE final norm — not the same). Let's just dump and compare later.
+                FILE* f = fopen("/tmp/youtu_cpp_hidden.f32", "wb");
+                if (f) {
+                    // Dump last token
+                    fwrite(h + (n_tokens - 1) * hidden_size, sizeof(float), hidden_size, f);
+                    fclose(f);
+                    printf("  Dumped last token hidden to /tmp/youtu_cpp_hidden.f32\n");
+                }
+                // Also dump logits for all tokens
+                std::vector<float> logits = youtu_eng.run_lmhead_raw(hidden, n_tokens, true);
+                if (!logits.empty()) {
+                    int vocab = (int)logits.size() / n_tokens;
+                    f = fopen("/tmp/youtu_cpp_logits.f32", "wb");
+                    if (f) {
+                        // Last token logits
+                        fwrite(logits.data() + (n_tokens - 1) * vocab, sizeof(float), vocab, f);
+                        fclose(f);
+                        printf("  Dumped last token logits to /tmp/youtu_cpp_logits.f32\n");
+                    }
+                }
+            }
+        }
+
         // PPL test
         {
             std::vector<int> ppl_ids(YOUTU_PPL_TOKENS, YOUTU_PPL_TOKENS + YOUTU_PPL_N);
