@@ -80,13 +80,17 @@ private:
     Job job_;
     int num_threads_ = 1;
     bool workers_started_ = false;
-    bool parked_ = false;  // workers blocked on park_cv_
+    std::atomic<bool> parked_{false};  // workers blocked on park_cv_
 
     // Sync primitives (spin-wait based for low dispatch latency)
     std::atomic<bool> stop_{false};
     std::atomic<int>  pending_workers_{0};
     std::unique_ptr<std::atomic<bool>[]> worker_ready_;
     // Park support: workers block on park_cv_ when idle instead of spinning.
+    // parked_ is atomic — readers in worker_loop and parallel_for_impl
+    // observe it consistently without racing with park()/resume() writers.
+    // The cv predicate re-reads parked_ under park_mtx_ for the actual
+    // wait decision (see worker_loop in threading.cpp).
     std::mutex park_mtx_;
     std::condition_variable park_cv_;
 };

@@ -150,6 +150,9 @@ private:
     // prefill_seq_len from package metadata
     int package_prefill_seq_len_ = 256;
 
+    // Temp files extracted from the package (cleaned up in destructor).
+    std::vector<std::string> temp_files_;
+
     // Load-time interleaved-packed FP16 weights (path → packed buffer)
     std::unordered_map<std::string, std::vector<uint8_t>> packed_weights_;
 

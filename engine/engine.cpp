@@ -8,6 +8,11 @@
 #include <cstring>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 // ---------------------------------------------------------------------------
 // Sampler
 // ---------------------------------------------------------------------------
@@ -125,6 +130,18 @@ int sample_token(float* logits, int vocab_size,
 LLMEngine::~LLMEngine() {
     // Tensor data owned by BufferPool or EXTERNAL — no explicit free needed
     // MappedFiles in shared_weights_ auto-close on destruction
+
+    // Release .mollm package mmap (can be many GB — qwen35_4b is 8.4 GB).
+    if (package_mmap_) {
+        munmap(package_mmap_, package_mmap_size_);
+        package_mmap_      = nullptr;
+        package_mmap_size_ = 0;
+    }
+
+    // Remove extracted temp files from /tmp.
+    for (const auto& path : temp_files_) {
+        std::remove(path.c_str());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -556,8 +573,13 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
         int vocab_size = (int)embed_weight_->shape[0];
         int hidden_dim = (int)embed_weight_->shape[1];
 
-        float* buf = new float[hidden_dim * seq_len];
-        Tensor t = Tensor::create(Precision::FP32, MemoryType::OWNED, hidden_dim, seq_len, 1, 1, buf);
+        // Allocate from the prefill graph's pool so the buffer is tracked and
+        // reused. Previously this used `new float[]` with MemoryType::OWNED,
+        // but Tensor has no destructor — the buffer leaked every call.
+        size_t nbytes = (size_t)hidden_dim * seq_len * sizeof(float);
+        void* buf = graph_prefill_.runtime.pool.acquire(nbytes);
+        Tensor t = Tensor::create(Precision::FP32, MemoryType::POOLED,
+                                  hidden_dim, seq_len, 1, 1, buf);
 
         if (embed_weight_->prec == Precision::FP16) {
             // Row-major FP16 — simple direct access
@@ -1027,10 +1049,6 @@ Tensor LLMEngine::decode_hidden(int token_id) {
 // ---------------------------------------------------------------------------
 
 #include <fstream>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <json.hpp>
 
 using json = nlohmann::json;
@@ -1116,6 +1134,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
         out_path = "/tmp/mollm_pkg_" + std::to_string(pid) + "_" + label;
         std::ofstream f(out_path, std::ios::binary);
         f.write(reinterpret_cast<const char*>(base + off), len);
+        if (f) temp_files_.push_back(out_path);
     };
 
     write_tmp("prefill.graph", pf_off, pf_len, pf_path);

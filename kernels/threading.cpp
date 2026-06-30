@@ -41,30 +41,42 @@ ThreadPool::~ThreadPool() {
 
 void ThreadPool::stop_workers() {
     stop_.store(true, std::memory_order_release);
-    // Wake all workers so they can exit
+    // Wake all spinning workers via the ready flags.
     for (int t = 0; t < num_threads_; t++) {
         if (worker_ready_) worker_ready_[t].store(true, std::memory_order_release);
     }
+    // Wake any workers blocked on park_cv_.wait. Without this notify, the
+    // worker join in ~ThreadPool / resize() would block forever if a worker
+    // was parked when stop was requested.
+    {
+        std::lock_guard<std::mutex> lk(park_mtx_);
+        // No state change needed — the wait predicate already checks stop_.
+    }
+    park_cv_.notify_all();
 }
 
 void ThreadPool::ensure_workers_started() {
     if (workers_started_) return;
     workers_started_ = true;
-    parked_ = false;
+    parked_.store(false, std::memory_order_release);
     for (int thread_id = 1; thread_id < num_threads_; thread_id++) {
         workers_.emplace_back(&ThreadPool::worker_loop, this, thread_id);
     }
 }
 
 void ThreadPool::park() {
-    // Workers will block on park_cv_ on their next idle iteration.
-    parked_ = true;
+    // Writers to parked_ take the lock so that workers re-checking parked_
+    // inside park_cv_.wait's predicate (also under the lock) never miss a
+    // transition. Readers in worker_loop (line 279) and parallel_for_impl
+    // use atomic loads so they don't race with this write.
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    parked_.store(true, std::memory_order_release);
 }
 
 void ThreadPool::resume() {
     {
         std::lock_guard<std::mutex> lk(park_mtx_);
-        parked_ = false;
+        parked_.store(false, std::memory_order_release);
     }
     park_cv_.notify_all();
 }
@@ -107,7 +119,7 @@ void ThreadPool::parallel_for_impl(int begin, int end, int grain_size, ParallelF
 
     // Lazy start + auto-resume if parked.
     ensure_workers_started();
-    if (parked_) resume();
+    if (parked_.load(std::memory_order_acquire)) resume();
 
     // Set up job
     job_.begin = begin;
@@ -178,7 +190,7 @@ void ThreadPool::parallel_for_2d_impl(int m_total, int m_tile_size,
     }
 
     ensure_workers_started();
-    if (parked_) resume();
+    if (parked_.load(std::memory_order_acquire)) resume();
 
     // Set up 2D job
     job_.m_total = m_total;
@@ -276,10 +288,16 @@ void ThreadPool::worker_loop(int thread_id) {
         // If parked, block until resume() is called. This drops idle CPU
         // to 0% between generation steps without sacrificing dispatch
         // latency during active inference.
-        if (parked_) {
+        //
+        // We re-check parked_ inside the lock so the cv predicate and the
+        // writer (park()/resume()) are mutually exclusive — eliminates the
+        // data race that previously existed when worker read parked_ here
+        // without the lock while main thread wrote it in park().
+        if (parked_.load(std::memory_order_acquire)) {
             std::unique_lock<std::mutex> lk(park_mtx_);
             park_cv_.wait(lk, [this] {
-                return !parked_ || stop_.load(std::memory_order_acquire);
+                return !parked_.load(std::memory_order_acquire) ||
+                       stop_.load(std::memory_order_acquire);
             });
         }
     }
