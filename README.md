@@ -40,7 +40,7 @@ mollm/
 ├── graph/           Executor, graph format, BufferPool, mmap
 ├── engine/          LLMEngine, tokenizer, generation loop
 ├── models/          Python transpilers (qwen35.py, mla.py)
-├── python/          Graph builder + serializer (transpile.py)
+├── models/               Python transpilers + graph builder (qwen35.py, mla.py, transpile.py)
 ├── examples/        mollm_chat (CLI), mollm_bench (benchmark)
 ├── tests/           Unit + e2e tests
 └── docs/            Optimization logs, architecture notes
@@ -83,7 +83,7 @@ Requires Apple Clang (for `__ARM_FEATURE_FP16FML`), Python 3 with `safetensors`.
 
 ```bash
 cd mollm
-PYTHONPATH=. python3 models/qwen35.py /path/to/Qwen3.5-4B qwen35_4b.mollm 32 256
+python3 models/qwen35.py /path/to/Qwen3.5-4B qwen35_4b.mollm 32 256
 ```
 
 **Arguments:**

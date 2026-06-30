@@ -86,7 +86,7 @@ mollm/
 ├── graph/           执行器、图格式、BufferPool、mmap
 ├── engine/          LLMEngine、tokenizer、generation loop
 ├── models/          Python 转译器（qwen35.py, mla.py）
-├── python/          GraphBuilder + serializer（transpile.py）
+├── models/               Python transpilers + graph builder（qwen35.py, mla.py, transpile.py）
 ├── examples/        mollm_chat (CLI), mollm_bench (benchmark)
 ├── tests/           18 个测试（unit + e2e）
 └── docs/            优化日志、架构文档
@@ -102,7 +102,7 @@ cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release
 ninja -C build
 
 # 转换模型为 .mollm 单文件
-PYTHONPATH=. python3 models/qwen35.py /path/to/Qwen3.5-4B model.mollm 32 256
+python3 models/qwen35.py /path/to/Qwen3.5-4B model.mollm 32 256
 
 # Chat（单文件，无需单独 tokenizer）
 ./build/mollm_chat --package model.mollm --prompt "Hello"

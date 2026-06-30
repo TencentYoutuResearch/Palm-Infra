@@ -202,7 +202,7 @@ Power-of-2 bucketed freelist allocator：
 - `data()` 返回 header 之后的权重数据
 - `prefetch()`（MADV_WILLNEED）/ `release_pages()`（MADV_DONTNEED）
 
-### .mollm Package（`python/transpile.py`）
+### .mollm Package（`models/transpile.py`）
 
 单文件打包格式：
 
@@ -271,7 +271,7 @@ mollm/
 ├── graph/                  图执行（execute, io, buffer_pool, mmap）
 ├── kernels/                NEON kernels（matmul, attention, gdn, norm, rope）
 ├── models/                 Python 转译器（qwen35.py, mla.py）
-├── python/                 GraphBuilder + serializer（transpile.py）
+├── models/                 Python transpilers + graph builder（qwen35.py, mla.py, transpile.py）
 ├── examples/               mollm_chat + mollm_bench
 ├── tests/                  18 个测试
 └── third_party/nlohmann/   JSON 库

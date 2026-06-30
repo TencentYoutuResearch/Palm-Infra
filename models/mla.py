@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from python.transpile import GraphBuilder, OpType, Precision, Activation, _write_weight_file
+from transpile import GraphBuilder, OpType, Precision, Activation, _write_weight_file
 
 
 def load_safetensors(path: str) -> dict[str, np.ndarray]:

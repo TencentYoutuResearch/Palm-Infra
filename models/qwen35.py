@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from python.transpile import GraphBuilder, Precision, _write_weight_file, save_package
+from transpile import GraphBuilder, Precision, _write_weight_file, save_package
 
 
 def load_safetensors(path: str) -> dict[str, np.ndarray]:
