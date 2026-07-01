@@ -54,6 +54,10 @@ struct Tensor {
     void*       data     = nullptr;
     uint32_t    owner_id = 0;  // debug owner for pooled storage; 0 = unknown/non-pooled
     uint64_t    storage_id = 0; // debug allocation identity; copied by borrowed views
+    const float* scales = nullptr; // quant scales for INT8 weights; borrowed from weight file
+    uint32_t    group_size = 0;    // K-dim quant group size; K means per-channel
+    uint32_t    num_groups = 0;    // total groups = N * groups_per_row
+    uint32_t    groups_per_row = 0;
 
     // -----------------------------------------------------------------------
     // factory

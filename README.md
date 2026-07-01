@@ -84,6 +84,8 @@ Requires Apple Clang (for `__ARM_FEATURE_FP16FML`), Python 3 with `safetensors`.
 ```bash
 cd mollm
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b.mollm
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w8pc.mollm 32 256 w8pc
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w8g128.mollm 32 256 w8g128
 ```
 
 The converter auto-detects the model type from `config.json` and dispatches to the appropriate converter. Supported types:
@@ -101,8 +103,13 @@ The converter auto-detects the model type from `config.json` and dispatches to t
 | 2 | `output_path` | yes | Output `.mollm` file path |
 | 3 | `num_layers` | no | Override number of hidden layers (auto-detected if omitted) |
 | 4 | `prefill_seq_len` | no | Prefill chunk size (default 256) |
+| 5 | `quant` | no | `none`, `w8pc`, or `w8gN` such as `w8g128` |
 
 Produces a single `.mollm` file containing graphs + weights + tokenizer + chat template.
+
+W8 quantization is currently correctness-first. The package format and runtime
+support per-channel/per-group scales, but INT8 matmul is still scalar; benchmark
+after the NEON W8 kernels land. See `docs/QUANTIZATION.md`.
 
 ## Run
 
@@ -129,7 +136,7 @@ See `docs/OPTIMIZATION_LOG_QWEN35.md` for the full Qwen3.5 optimization journey 
 
 ### Near-term
 - **`.mollm` package format**: single-file model artifact (graph + weights + metadata), replacing the current directory layout
-- **Weight quantization (W4)**: INT4 weight-only quantization for GEMM/GEMV. Biggest remaining prefill lever — 4B MATMUL is 87% of prefill time at 988 GF/s (compute-bound at the kernel level), W4 halves weight bandwidth and should close the prefill gap to llama.cpp
+- **W8/W4 weight quantization**: W8 weight-only format/runtime is in place as a correctness baseline; optimized W8 NEON kernels and then W4 are the next prefill levers
 - **Graph fusion**: fuse adjacent matmul + activation + norm to reduce cache thrash between ops (end-to-end matmul utilization is 40% vs 86% microbench, the 2.5x gap is cache/DRAM traffic between matmuls)
 
 ### Mid-term

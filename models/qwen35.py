@@ -18,7 +18,17 @@ from pathlib import Path
 
 import numpy as np
 
-from transpile import GraphBuilder, Precision, _write_weight_file, save_package
+from transpile import GraphBuilder, Precision, _write_weight_file, quantize_weight_w8_group, save_package
+
+
+def _quant_group_size(quant: str, k: int) -> int | None:
+    if quant == "none":
+        return None
+    if quant == "w8pc":
+        return k
+    if quant.startswith("w8g"):
+        return int(quant[3:])
+    raise ValueError(f"unsupported quant mode: {quant}")
 
 
 def load_safetensors(path: str) -> dict[str, np.ndarray]:
@@ -52,13 +62,18 @@ def load_safetensors(path: str) -> dict[str, np.ndarray]:
     return tensors
 
 
-def export_weights(weights: dict, weights_dir: str):
+def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
     """Export text model weights. Skip vision encoder."""
     os.makedirs(weights_dir, exist_ok=True)
 
-    def save(name: str, data: np.ndarray):
+    def save(name: str, data: np.ndarray, quantizable: bool = False):
         wpath = os.path.join(weights_dir, f"{name}.weights")
-        _write_weight_file(wpath, data)
+        group_size = _quant_group_size(quant, data.shape[1]) if quantizable and data.ndim == 2 else None
+        if group_size is not None:
+            q, scales, gs, ng = quantize_weight_w8_group(data, group_size)
+            _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng)
+        else:
+            _write_weight_file(wpath, data)
 
     # Skip all visual/vision weights
     for wname, wdata in weights.items():
@@ -108,9 +123,9 @@ def export_weights(weights: dict, weights_dir: str):
             save(wname.replace('.', '_'), d)
             continue
 
-        # All projection weights → FP16
+        # Projection weights are FP16 by default, optionally W8 quantized.
         d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
-        save(wname.replace('.', '_'), d)
+        save(wname.replace('.', '_'), d, quantizable=True)
 
 
 def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
@@ -498,7 +513,8 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
 
 
 def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
-                    prefill_seq_len: int = 256, n_ctx: int = 4096):
+                    prefill_seq_len: int = 256, n_ctx: int = 4096,
+                    quant: str = "none"):
     """Main entry point: export weights + build graphs → single .mollm file.
 
     Args:
@@ -531,7 +547,7 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
 
     # ---- Step 1: Export weights to temp dir ----
     print("Exporting weights...")
-    export_weights(weights, str(weights_dir))
+    export_weights(weights, str(weights_dir), quant=quant)
 
     # ---- Step 2: Build prefill graph ----
     print(f"\nBuilding prefill graph (seq_len={prefill_seq_len})...")
@@ -557,6 +573,7 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
         "n_ctx": n_ctx,
         "vocab_size": tc['vocab_size'],
         "layer_types": tc['layer_types'],
+        "quantization": quant,
     }
     save_package(output_path, g_prefill, g_decode, weights_dir, metadata,
                  tokenizer_path=str(model_dir / "tokenizer.json"),
@@ -571,10 +588,11 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
 if __name__ == '__main__':
     import sys
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_path = sys.argv[2]
     num_layers = int(sys.argv[3]) if len(sys.argv) > 3 else 24
     prefill_seq_len = int(sys.argv[4]) if len(sys.argv) > 4 else 256
-    convert_qwen35(model_dir, output_path, num_layers, prefill_seq_len)
+    quant = sys.argv[5] if len(sys.argv) > 5 else "none"
+    convert_qwen35(model_dir, output_path, num_layers, prefill_seq_len, quant=quant)

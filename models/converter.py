@@ -2,7 +2,7 @@
 """mollm model converter — auto-detect model type from config.json and dispatch.
 
 Usage:
-    python3 models/converter.py <model_dir> <output.mollm> [num_layers] [prefill_seq_len]
+    python3 models/converter.py <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant]
 
 The converter reads <model_dir>/config.json to determine the model type:
     - model_type "qwen3_5"  → Qwen3.5 converter (qwen35.py)
@@ -47,6 +47,7 @@ def main():
     output_path = sys.argv[2]
     num_layers_arg = int(sys.argv[3]) if len(sys.argv) > 3 else None
     prefill_seq_len = int(sys.argv[4]) if len(sys.argv) > 4 else 256
+    quant = sys.argv[5] if len(sys.argv) > 5 else "none"
 
     # Detect model type
     model_type = detect_model_type(model_dir)
@@ -64,12 +65,13 @@ def main():
     print(f"  output:          {output_path}")
     print(f"  num_layers:      {num_layers}")
     print(f"  prefill_seq_len: {prefill_seq_len}")
+    print(f"  quant:           {quant}")
     print()
 
     # Import and dispatch
     module = __import__(mod_name)
     convert_fn = getattr(module, func_name)
-    convert_fn(model_dir, output_path, num_layers, prefill_seq_len)
+    convert_fn(model_dir, output_path, num_layers, prefill_seq_len, quant=quant)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,8 @@ public:
 
     size_t data_size()   const { return header_.data_size; }
     size_t scales_size() const { return header_.scales_size; }
+    uint32_t group_size() const { return header_.group_size; }
+    uint32_t num_groups() const { return header_.num_groups; }
 
     // --- madvise hints ---
 

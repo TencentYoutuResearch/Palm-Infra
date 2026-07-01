@@ -27,7 +27,17 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from transpile import GraphBuilder, OpType, Precision, Activation, _write_weight_file, save_package
+from transpile import GraphBuilder, OpType, Precision, Activation, _write_weight_file, quantize_weight_w8_group, save_package
+
+
+def _quant_group_size(quant: str, k: int) -> int | None:
+    if quant == "none":
+        return None
+    if quant == "w8pc":
+        return k
+    if quant.startswith("w8g"):
+        return int(quant[3:])
+    raise ValueError(f"unsupported quant mode: {quant}")
 
 
 def load_safetensors(path: str) -> dict[str, np.ndarray]:
@@ -62,15 +72,20 @@ def load_safetensors(path: str) -> dict[str, np.ndarray]:
     return tensors
 
 
-def export_weights(weights: dict, weights_dir: str):
+def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
     """Export all weights to a shared directory. Called once."""
     os.makedirs(weights_dir, exist_ok=True)
 
-    def save(name: str, data: np.ndarray):
+    def save(name: str, data: np.ndarray, quantizable: bool = False):
         wpath = os.path.join(weights_dir, f"{name}.weights")
-        _write_weight_file(wpath, data)
+        group_size = _quant_group_size(quant, data.shape[1]) if quantizable and data.ndim == 2 else None
+        if group_size is not None:
+            q, scales, gs, ng = quantize_weight_w8_group(data, group_size)
+            _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng)
+        else:
+            _write_weight_file(wpath, data)
 
-    # All projection weights (non-norm) — keep as FP16.
+    # All projection weights (non-norm) — optionally W8 quantized.
     for wname, wdata in weights.items():
         if 'layernorm' in wname.lower() or 'norm' in wname.lower():
             continue
@@ -81,7 +96,7 @@ def export_weights(weights: dict, weights_dir: str):
             continue
         # Convert to float16 for FP16 storage.
         d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
-        save(wname.replace('.', '_'), d)
+        save(wname.replace('.', '_'), d, quantizable=True)
 
     # Merge mlp.gate_proj + mlp.up_proj per layer into a single weight
     # (one matmul + slice at inference, halves A-pack overhead).
@@ -103,7 +118,7 @@ def export_weights(weights: dict, weights_dir: str):
         merged = np.concatenate([gate_w, up_w], axis=0)
         if merged.dtype != np.float16:
             merged = merged.astype(np.float16)
-        save(f"model_layers_{layer_idx}_mlp_gate_up_proj_weight", merged)
+        save(f"model_layers_{layer_idx}_mlp_gate_up_proj_weight", merged, quantizable=True)
 
     # embed_tokens — FP16, packed at load time (tied with lm_head)
     embed_w = weights['model.embed_tokens.weight']
@@ -331,7 +346,8 @@ def cfg_intermediate_size(cfg: dict) -> int:
 
 
 def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
-                prefill_seq_len: int = 128, n_ctx: int = 4096):
+                prefill_seq_len: int = 128, n_ctx: int = 4096,
+                quant: str = "none"):
     """Main entry point: export weights + build graphs → single .mollm file."""
     model_dir = Path(model_dir)
     import tempfile
@@ -346,7 +362,7 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
 
     # ---- Step 1: Export shared weights to temp dir ----
     print("Exporting weights...")
-    export_weights(weights, str(weights_dir))
+    export_weights(weights, str(weights_dir), quant=quant)
 
     # ---- Step 2: Build prefill graph ----
     print(f"\nBuilding prefill graph (seq_len={prefill_seq_len})...")
@@ -370,6 +386,7 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
         "prefill_seq_len": prefill_seq_len,
         "n_ctx": n_ctx,
         "vocab_size": cfg['vocab_size'],
+        "quantization": quant,
     }
     save_package(output_path, g_prefill, g_decode, weights_dir, metadata,
                  tokenizer_path=str(model_dir / "tokenizer.json"),
@@ -383,10 +400,11 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_path = sys.argv[2]
     num_layers = int(sys.argv[3]) if len(sys.argv) > 3 else 32
     prefill_seq_len = int(sys.argv[4]) if len(sys.argv) > 4 else 128
-    convert_mla(model_dir, output_path, num_layers, prefill_seq_len)
+    quant = sys.argv[5] if len(sys.argv) > 5 else "none"
+    convert_mla(model_dir, output_path, num_layers, prefill_seq_len, quant=quant)

@@ -241,8 +241,10 @@ ownership/liveness 模型：
 
 ### MappedFile（`graph/mmap_file.h`）
 
-权重文件 mmap（88 字节 header：magic, ndim, prec, shape, data_offset, data_size, scales）
+权重文件 mmap（88 字节 header：magic, ndim, prec, shape, data_offset, data_size,
+scales_offset, scales_size, group_size, num_groups）
 - `data()` 返回 header 之后的权重数据
+- `scales()` 返回 W8 per-channel/per-group FP32 scales（非量化权重为 `nullptr`）
 - `prefetch()`（MADV_WILLNEED）/ `release_pages()`（MADV_DONTNEED）
 
 ### .mollm Package（`models/transpile.py`）

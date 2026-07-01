@@ -128,6 +128,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_engine        tests/test_engine.cpp)
     add_mollm_test(test_tokenizer     tests/test_tokenizer.cpp)
     add_mollm_test(test_e2e           tests/test_e2e.cpp)
+    add_mollm_test(test_quantized_e2e tests/test_quantized_e2e.cpp)
     add_mollm_test(test_thread_pool_stress tests/test_thread_pool_stress.cpp)
 endif()
 

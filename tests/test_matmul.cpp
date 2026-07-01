@@ -296,6 +296,51 @@ int main() {
         g_matmul_config.use_interleave_pack = true;
     }
 
+    // ---- INT8 weight path: per-channel and per-group scales ----
+    {
+        int M = 2, K = 4, N = 3;
+        float a_data[8] = {
+            1.0f, -2.0f, 0.5f, 3.0f,
+            -1.0f, 4.0f, 2.0f, -0.5f,
+        };
+        int8_t q_data[12] = {
+            1, 2, -3, 4,
+            -2, 1, 5, -1,
+            3, -4, 2, 1,
+        };
+        float c_data[6];
+        float ref_c[6];
+
+        auto run_int8_case = [&](const float* scales, uint32_t group_size,
+                                 uint32_t groups_per_row, const char* label) {
+            float deq[12];
+            for (int n = 0; n < N; n++) {
+                for (int k = 0; k < K; k++) {
+                    deq[n * K + k] = (float)q_data[n * K + k]
+                        * scales[n * groups_per_row + k / (int)group_size];
+                }
+            }
+
+            Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
+            Tensor B = Tensor::create(Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1, q_data);
+            Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, c_data);
+            B.scales = scales;
+            B.group_size = group_size;
+            B.groups_per_row = groups_per_row;
+            B.num_groups = (uint32_t)(N * groups_per_row);
+
+            kernel_matmul_fp32(A, B, C);
+            ref_matmul(a_data, deq, ref_c, M, N, K);
+            CHECK(check_approx(c_data, ref_c, M * N, 1e-5f), label);
+        };
+
+        float pc_scales[3] = {0.5f, 0.25f, 0.125f};
+        run_int8_case(pc_scales, 4, 1, "INT8 per-channel matmul");
+
+        float pg_scales[6] = {0.5f, 0.25f, 0.125f, 0.75f, 1.0f, 0.0625f};
+        run_int8_case(pg_scales, 2, 2, "INT8 per-group matmul");
+    }
+
     if (failures == 0) {
         printf("\nAll matmul tests passed!\n");
     } else {

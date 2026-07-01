@@ -819,10 +819,51 @@ def _numpy_to_precision(dt: np.dtype) -> Precision:
     raise ValueError(f"unsupported dtype: {dt}")
 
 
-def _write_weight_file(path: str, data: np.ndarray):
+def quantize_weight_w8_group(data: np.ndarray, group_size: int) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Symmetric int8 quantization over K-dim groups for [N, K] weights."""
+    if data.ndim != 2:
+        raise ValueError(f"W8 quant expects 2-D [N,K] weight, got {data.shape}")
+    if group_size <= 0:
+        raise ValueError(f"group_size must be > 0, got {group_size}")
+
+    w = data.astype(np.float32, copy=False)
+    n, k = w.shape
+    groups_per_row = (k + group_size - 1) // group_size
+    q = np.empty((n, k), dtype=np.int8)
+    scales = np.empty((n, groups_per_row), dtype=np.float32)
+
+    for row in range(n):
+        for g in range(groups_per_row):
+            begin = g * group_size
+            end = min(begin + group_size, k)
+            block = w[row, begin:end]
+            max_abs = float(np.max(np.abs(block))) if block.size else 0.0
+            scale = max_abs / 127.0 if max_abs > 0.0 else 1.0
+            scales[row, g] = scale
+            q[row, begin:end] = np.clip(np.rint(block / scale), -127, 127).astype(np.int8)
+
+    return q, scales.reshape(-1), group_size, n * groups_per_row
+
+
+def _write_weight_file(path: str, data: np.ndarray,
+                       scales: np.ndarray | None = None,
+                       group_size: int = 0,
+                       num_groups: int = 0):
     """Write a .weights file with self-contained header."""
     ndim = data.ndim
     shape = list(data.shape) + [1] * (4 - ndim)
+    scales_bytes = b""
+    scales_offset = 0
+    scales_size = 0
+    if scales is not None:
+        scales = np.asarray(scales, dtype=np.float32).reshape(-1)
+        scales_bytes = scales.tobytes()
+        scales_offset = 88 + data.nbytes
+        scales_size = len(scales_bytes)
+        if group_size <= 0 or num_groups <= 0:
+            raise ValueError("quantized weights require group_size and num_groups")
+        if num_groups != scales.size:
+            raise ValueError(f"num_groups={num_groups} does not match scales={scales.size}")
 
     header = struct.pack('<II', WEIGHT_MAGIC, 0)      # magic, flags
     header += struct.pack('<II', ndim, _numpy_to_precision(data.dtype))
@@ -830,14 +871,17 @@ def _write_weight_file(path: str, data: np.ndarray):
     data_offset = 88  # sizeof(Header)
     data_size = data.nbytes
     header += struct.pack('<QQ', data_offset, data_size)  # data offset, size
-    header += struct.pack('<QQ', 0, 0)                    # no scales
-    header += struct.pack('<II', 0, 0)                    # group_size, num_groups
+    header += struct.pack('<QQ', scales_offset, scales_size)
+    header += struct.pack('<II', group_size, num_groups)
     assert len(header) == 88
 
     with open(path, 'wb') as f:
         f.write(header)
         f.write(data.tobytes())
-    print(f"  Wrote {path} ({data.shape}, {data.dtype})")
+        if scales_bytes:
+            f.write(scales_bytes)
+    qinfo = f", group={group_size}, groups={num_groups}" if scales is not None else ""
+    print(f"  Wrote {path} ({data.shape}, {data.dtype}{qinfo})")
 
 
 # ---------------------------------------------------------------------------

@@ -314,9 +314,40 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
 
         auto& t = g.runtime.tensors[node.id];
 
+        auto setup_quant_metadata = [&](const void* scales, uint32_t group_size, uint32_t num_groups,
+                                        size_t scales_size, const char* label) -> bool {
+            t.scales = nullptr;
+            t.group_size = 0;
+            t.num_groups = 0;
+            t.groups_per_row = 0;
+
+            if (t.prec != Precision::INT8) return true;
+            int64_t N = t.shape[0];
+            int64_t K = t.shape[1];
+            if (!scales || group_size == 0 || N <= 0 || K <= 0) {
+                fprintf(stderr, "Engine: INT8 weight %s missing quant scales/group metadata\n", label);
+                return false;
+            }
+            uint32_t groups_per_row = (uint32_t)((K + group_size - 1) / group_size);
+            uint64_t expected_groups = (uint64_t)N * groups_per_row;
+            if (num_groups != expected_groups ||
+                scales_size != expected_groups * sizeof(float)) {
+                fprintf(stderr,
+                        "Engine: INT8 weight %s bad quant metadata (N=%lld K=%lld group=%u groups=%u expected=%llu scales=%zu)\n",
+                        label, (long long)N, (long long)K, group_size, num_groups,
+                        (unsigned long long)expected_groups, scales_size);
+                return false;
+            }
+            t.scales = static_cast<const float*>(scales);
+            t.group_size = group_size;
+            t.num_groups = num_groups;
+            t.groups_per_row = groups_per_row;
+            return true;
+        };
+
         // Helper: set up weight tensor.
-        auto setup_weight = [&](void* data) {
-            t.prec = node.out_prec;
+        auto setup_weight = [&](void* data, Precision file_prec) {
+            t.prec = file_prec;
             int64_t dim0 = node.out_shape[0];  // N
             int64_t dim1 = node.out_shape[1];  // K
             t.shape[0] = dim0;
@@ -337,10 +368,23 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             if (pit != package_weight_map_.end()) {
                 const uint8_t* hdr = package_weights_base_ + pit->second.first;
                 // Read data_offset from weight header (byte 48, 8 bytes)
+                uint32_t file_prec_u32 = 0;
                 uint64_t data_off;
+                std::memcpy(&file_prec_u32, hdr + 12, sizeof(file_prec_u32));
                 std::memcpy(&data_off, hdr + 48, sizeof(data_off));
+                uint64_t scales_off = 0, scales_size = 0;
+                uint32_t group_size = 0, num_groups = 0;
+                std::memcpy(&scales_off, hdr + 64, sizeof(scales_off));
+                std::memcpy(&scales_size, hdr + 72, sizeof(scales_size));
+                std::memcpy(&group_size, hdr + 80, sizeof(group_size));
+                std::memcpy(&num_groups, hdr + 84, sizeof(num_groups));
                 void* data = const_cast<uint8_t*>(hdr + data_off);
-                setup_weight(data);
+                setup_weight(data, static_cast<Precision>(file_prec_u32));
+                const void* scales = scales_size ? (hdr + scales_off) : nullptr;
+                if (!setup_quant_metadata(scales, group_size, num_groups,
+                                          (size_t)scales_size, wref.c_str())) {
+                    return false;
+                }
 
                 // Interleaved packing (same as file path)
                 if (t.prec == Precision::FP16 && g_matmul_config.use_interleave_pack) {
@@ -370,7 +414,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         auto it = weight_map_.find(wpath);
         if (it != weight_map_.end()) {
             // Reuse existing mmap
-            setup_weight(const_cast<void*>(shared_weights_[it->second].data()));
+            setup_weight(const_cast<void*>(shared_weights_[it->second].data()),
+                         static_cast<Precision>(shared_weights_[it->second].header().precision));
         } else {
             // Load new mmap
             MappedFile mf;
@@ -383,7 +428,21 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             weight_map_[wpath] = idx;
             shared_weights_.push_back(std::move(mf));
 
-            setup_weight(const_cast<void*>(shared_weights_[idx].data()));
+            setup_weight(const_cast<void*>(shared_weights_[idx].data()),
+                         static_cast<Precision>(shared_weights_[idx].header().precision));
+            const auto& mapped = shared_weights_[idx];
+            if (!setup_quant_metadata(mapped.scales(), mapped.group_size(), mapped.num_groups(),
+                                      mapped.scales_size(), wpath.c_str())) {
+                return false;
+            }
+        }
+
+        if (it != weight_map_.end()) {
+            const auto& mapped = shared_weights_[it->second];
+            if (!setup_quant_metadata(mapped.scales(), mapped.group_size(), mapped.num_groups(),
+                                      mapped.scales_size(), wpath.c_str())) {
+                return false;
+            }
         }
 
         // Load-time B interleaved packing for FP16 weights (skip embed_tokens)

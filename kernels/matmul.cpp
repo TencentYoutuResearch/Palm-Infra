@@ -132,6 +132,31 @@ static void matmul_fp32_scalar_range(const float* A, const float* B, float* C,
     }
 }
 
+static void matmul_int8_scalar_range(const float* A, const int8_t* B, const float* scales,
+                                     int group_size, int groups_per_row,
+                                     float* C, int M, int N, int K,
+                                     int lda, int K_weight, int ldc,
+                                     int m_begin, int m_end,
+                                     int n_begin, int n_end) {
+    (void)M;
+    if (group_size <= 0) group_size = K;
+    if (groups_per_row <= 0) groups_per_row = 1;
+
+    for (int m = m_begin; m < m_end; m++) {
+        float* c_row = C + m * ldc;
+        for (int n = n_begin; n < n_end; n++) {
+            const int8_t* b_row = B + n * K_weight;
+            const float* s_row = scales + n * groups_per_row;
+            float sum = 0.f;
+            for (int k = 0; k < K; k++) {
+                int g = k / group_size;
+                sum += A[k + m * lda] * ((float)b_row[k] * s_row[g]);
+            }
+            c_row[n] = sum;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NEON matmul — TILE_M=8, TILE_N=8, FP16 storage + FP32 accumulate
 //
@@ -1001,16 +1026,60 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     const float* a_ptr = A.ptr<float>();
     float* c_ptr = C.ptr<float>();
 
-    // Detect FP16 weight: B.prec == FP16.
+    // Detect quantized/FP16 weight.
+    bool is_int8 = (B.prec == Precision::INT8);
     bool is_fp16 = (B.prec == Precision::FP16);
+    const int8_t* b_int8 = is_int8 ? reinterpret_cast<const int8_t*>(B.data) : nullptr;
     const __fp16* b_fp16 = is_fp16 ? reinterpret_cast<const __fp16*>(B.data) : nullptr;
-    const float* b_fp32 = is_fp16 ? nullptr : B.ptr<float>();
+    const float* b_fp32 = (is_fp16 || is_int8) ? nullptr : B.ptr<float>();
 
     // K_weight is the stride between consecutive k rows in the repacked layout.
     // For repacked [K, N]: K_weight = original N.
     // For non-repacked [N, K]: K_weight = original K (the inner dim of B).
     // We determine this by comparing K_weight with K: if they differ, it's repacked.
     bool is_repacked = (K_weight != K);
+
+    if (is_int8) {
+        const float* scales = B.scales;
+        int group_size = (int)B.group_size;
+        int groups_per_row = (int)B.groups_per_row;
+        if (!scales || group_size <= 0 || groups_per_row <= 0) {
+            return;
+        }
+
+        constexpr int tile_m = HAS_NEON ? 8 : 1;
+        int n_threads = thread_pool ? thread_pool->num_threads() : 1;
+        bool shard_by_n = (N > M * 8 && M == 1);
+        int chunk_size = (M == 1 || N == 1) ? g_matmul_config.gemv_chunk_size : tile_m;
+        int total_dim = shard_by_n ? N : M;
+        int n_chunks = (total_dim + chunk_size - 1) / chunk_size;
+        bool use_parallel = n_threads > 1 && n_chunks > 1;
+
+        if (!use_parallel) {
+            matmul_int8_scalar_range(a_ptr, b_int8, scales, group_size, groups_per_row,
+                                     c_ptr, M, N, K, lda, K_weight, ldc, 0, M, 0, N);
+        } else if (shard_by_n) {
+            thread_pool->parallel_for(0, N, chunk_size,
+                                      [&](int, int n_begin, int n_end) {
+                                          matmul_int8_scalar_range(a_ptr, b_int8, scales,
+                                                                   group_size, groups_per_row,
+                                                                   c_ptr, M, N, K, lda, K_weight, ldc,
+                                                                   0, M, n_begin, n_end);
+                                      });
+        } else {
+            thread_pool->parallel_for(0, M, chunk_size,
+                                      [&](int, int m_begin, int m_end) {
+                                          matmul_int8_scalar_range(a_ptr, b_int8, scales,
+                                                                   group_size, groups_per_row,
+                                                                   c_ptr, M, N, K, lda, K_weight, ldc,
+                                                                   m_begin, m_end, 0, N);
+                                      });
+        }
+        if (act != Activation::NONE && act_n_len != 0) {
+            apply_activation_to_range(c_ptr, M, N, ldc, 0, M, act, act_n_begin, act_n_len);
+        }
+        return;
+    }
 
     // ---- Interleaved packing path (FP16 + NEON) ----
     // B is pre-packed at load time (engine) or by the caller (bench/test).

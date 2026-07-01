@@ -182,6 +182,33 @@ Dynamic shape 模式启用后，短 prompt 不再 padding 到 256：
 2. **C++ 执行器**（`graph/execute.cpp`）：顺序节点 dispatch + BufferPool 内存管理 + Backend 抽象
 3. **NEON kernels**（`kernels/`）：matmul, attention, gdn, norm, rope
 
+### Quantization（W8 correctness baseline）
+
+2026-07-01 已加入 correctness-first W8 weight-only 量化：
+
+- converter 支持 `quant=none|w8pc|w8gN`（如 `w8g128`）
+- `.weights` header 已使用 `scales_offset/scales_size/group_size/num_groups`
+  表达 per-channel/per-group scale metadata
+- runtime 从 weight header 读取真实 precision；INT8 CONSTANT 会校验 scale metadata，
+  并跳过 FP16 interleaved packing
+- `kernel_matmul_fp32()` 已有 INT8 scalar path，按 `scales[n * groups_per_row + k / group_size]`
+  on-the-fly dequant 到 FP32 output
+- Qwen3.5 / Youtu converter 仅量化 projection/linear 2-D weights；embedding/lm_head storage、
+  norm、conv、`A_log`、`dt_bias` 等保持原精度
+
+当前重点是正确性，INT8 kernel 还没有 NEON 优化，不应解读 W8 推理速度。
+
+Qwen3.5-0.8B quick validation：
+
+| Package | Size | Short CE/PPL | CE delta vs FP16 | Greedy smoke |
+|---|---:|---:|---:|---|
+| FP16 `qwen35_0.8b.mollm` | 1518.9 MB | 3.0911 / 22.00 | - | - |
+| W8PC `qwen35_0.8b_w8pc.mollm` | 1022.9 MB | 3.0969 / 22.13 | +0.0058 | pass |
+| W8G128 `qwen35_0.8b_w8g128.mollm` | 1036.8 MB | 3.0926 / 22.03 | +0.0015 | pass |
+
+新增 `test_quantized_e2e` 覆盖 W8 package load、finite logits、short CE drift、
+workspace presence 和短 decode。详细设计见 `docs/QUANTIZATION.md`。
+
 ### Dynamic shape（尝试 13）
 
 - `DimExpr`（CONST/SEQ/MUL/ADD/BATCH）每维一个表达式，transpile 时 `propagate_dim_exprs()` 从 INPUT 传播
@@ -219,7 +246,7 @@ mollm/
 ├── engine/          LLMEngine、tokenizer、generation loop、backend.h
 ├── models/          Python 转译器 + graph builder（converter.py, qwen35.py, mla.py, transpile.py）
 ├── examples/        mollm_chat (CLI), mollm_bench (benchmark)
-├── tests/           19 个测试（unit + e2e + shape_propagation.py）
+├── tests/           unit + e2e + quantization smoke + shape_propagation.py
 └── docs/            优化日志、架构文档
 ```
 
@@ -243,6 +270,7 @@ python3 models/converter.py /path/to/Qwen3.5-4B model.mollm
 
 # 测试
 ./build/test_e2e qwen35_0.8b.mollm [youtu-llm-2b.mollm]  # PPL + chunked prefill
+./build/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w8pc.mollm
 ./build/test_gdn      # GDN kernel 正确性
 ./build/test_norm     # RMSNorm（含 strided）
 ./build/test_rope     # RoPE（含 strided）
@@ -254,6 +282,7 @@ python3 tests/test_shape_propagation.py  # DimExpr symbolic propagation
 | 测试 | 内容 |
 |------|------|
 | test_e2e | 端到端 PPL（Qwen3.5-0.8B，HF ref 8.50）+ Test 5 chunked prefill |
+| test_quantized_e2e | W8 package load、短 CE drift、finite logits、短 decode |
 | test_shape_propagation.py | DimExpr symbolic propagation（13 个用例，含 MUL 复合维） |
 | test_gdn | fused GDN kernel（prefill/decode/state continuity） |
 | test_norm | RMSNorm（含 strided 用例） |
@@ -278,7 +307,7 @@ python3 tests/test_shape_propagation.py  # DimExpr symbolic propagation
   - 256 单 chunk: PPL 8.4893 ✓
   - 100+100+56 / 56×4+32 / 57×4+28 / 40×6+16 / 33×7+25: PPL 全过（tolerance 0.1）
 - **Youtu-LLM-2B MLA DYNAMIC 模式**：256 prefill PPL=10.26 vs HF 10.20 ✓（tolerance 2.0）
-- **17/17 unit test 全过**（14 C++ + 1 Python + e2e）
+- **15/15 quick ctest 全过**（排除 heavy `test_e2e`/bench），新增 W8PC/W8G128 量化 smoke 全过
 
 ### 已知 Bug
 
@@ -326,9 +355,9 @@ graph fusion、continuous batching、多 backend 前，建议先收敛成显式
 
 ## 下一步
 
-1. **Weight quantization (W4)** — 4B prefill 唯一大幅杠杆。MATMUL 87% at 988 GF/s，W4 砍权重带宽 2x，预期 4B prefill 115 → ~160+（超 llama.cpp 143）
-2. **内存模型整理** — 按 `docs/MEMORY_MODEL.md` 继续落地：下一步把 `(owner_id, storage_id)` 扩展成 explicit `TensorStorage` / storage registry
-3. **Graph fusion** — 融合相邻 matmul+activation+norm，减少 cache 抢占（e2e matmul 利用率 40% vs microbench 86%）
-4. **Continuous batching** — 多序列共享 prefill
-5. **Vision encoder** — Qwen3.5 是多模态
-6. **Qualcomm Oryon 支持** — 非 Apple ARM 验证
+1. **W8 NEON kernels** — 当前 W8 只保证正确性；下一步实现 ARM NEON GEMV/GEMM，再按严格协议测 2B/4B
+2. **W8 quality audit** — 对 W8PC/W8G128 跑完整 256-token PPL，确认 group-size 质量/大小 tradeoff
+3. **W4 quantization** — 复用 W8 metadata/runtime 结构扩展到 W4，目标仍是 4B prefill 主要杠杆
+4. **内存模型整理** — 按 `docs/MEMORY_MODEL.md` 继续落地：下一步把 `(owner_id, storage_id)` 扩展成 explicit `TensorStorage` / storage registry
+5. **Graph fusion** — 融合相邻 matmul+activation+norm，减少 cache 抢占（e2e matmul 利用率 40% vs microbench 86%）
+6. **Continuous batching / Vision encoder / Qualcomm Oryon 支持**
