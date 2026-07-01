@@ -51,6 +51,8 @@ public:
     // --- metrics ---
     size_t active_bytes() const { return active_; }
     size_t peak_bytes()   const { return peak_; }
+    size_t acquire_count() const { return acquire_count_; }
+    size_t release_count() const { return release_count_; }
 
     /// Total bytes held in the freelist (not currently in use).
     size_t pool_bytes() const;
@@ -64,4 +66,6 @@ private:
 
     size_t active_ = 0;   // bytes currently handed out via acquire()
     size_t peak_   = 0;   // high-water mark of active_
+    size_t acquire_count_ = 0;
+    size_t release_count_ = 0;
 };

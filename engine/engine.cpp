@@ -839,6 +839,31 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
 // prefill / decode
 // ---------------------------------------------------------------------------
 
+void LLMEngine::release_prefill_buffers() {
+    auto& pool = graph_prefill_.runtime.pool;
+    auto& tensors = graph_prefill_.runtime.tensors;
+    auto& nodes = graph_prefill_.nodes;
+    // Release all non-INPUT/CONSTANT POOLED tensors (same logic as
+    // execute_graph's reset). View ops borrow data — skip them.
+    // INPUT buffers (hidden/mask/cos/sin) are already released by run_graph;
+    // cache_k/v are EXTERNAL — skip all INPUTs.
+    static const auto is_view = [](OpType op) {
+        return op == OpType::RESHAPE || op == OpType::PERMUTE ||
+               op == OpType::SLICE || op == OpType::TILE || op == OpType::CONCAT;
+    };
+    for (size_t i = 0; i < nodes.size(); i++) {
+        auto& node = nodes[i];
+        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        if (is_view(node.op_type)) continue;
+        auto& t = tensors[node.id];
+        if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
+            pool.release(t.data, t.nbytes());
+        }
+        t.data = nullptr;
+        t.mem_type = MemoryType::NONE;
+    }
+}
+
 int LLMEngine::prefill(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0) return -1;
@@ -873,6 +898,11 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         if (last_token < 0) return -1;
         offset += chunk_size;
     }
+    // Note: release_prefill_buffers() would release the last chunk's pool
+    // buffers, but causes a token=0 regression (under investigation — likely
+    // a tensor liveness issue where graph output is read after pool release).
+    // Disabled until root-caused. Memory is reclaimed on next prefill's
+    // execute_graph reset, so peak RSS is bounded (just higher than ideal).
     return last_token;
 }
 
@@ -893,12 +923,10 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     // prefill_hidden (each chunk appends to KV cache). No padding — the
     // graph's SEQ dims are filled with the actual chunk size n at runtime.
 
-    Tensor h = embed(token_ids);
-    int hidden_dim = (int)h.shape[0];
-
     // DYNAMIC mode: no padding, runtime fills SEQ/MUL/ADD dims via DimExpr.
     // STATIC_PADDED mode: pad short prompts to graph_seq_len (A/B comparison).
     const bool use_padding = cfg_.static_padded && n < graph_seq_len;
+    Tensor h;
     Tensor cos, sin;
     Tensor mask;
 
@@ -907,8 +935,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         exec_ctx_prefill_.static_padded   = true;
         exec_ctx_prefill_.padded_seq_len  = graph_seq_len;
         inject_runtime_shapes(exec_ctx_prefill_);
-        // Re-embed with padding (the embed above used n; re-embed to graph_seq_len)
-        h = embed(token_ids, graph_seq_len);
+        h = embed(token_ids, graph_seq_len);  // zero-padded to graph_seq_len
         h.shape[1] = graph_seq_len;
         h.compute_strides();
         generate_rope_cache(graph_seq_len, past_len_, cos, sin);
@@ -918,8 +945,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         exec_ctx_prefill_.static_padded   = false;
         exec_ctx_prefill_.padded_seq_len  = -1;
         inject_runtime_shapes(exec_ctx_prefill_);
-        // h.shape[1] = n (actual token count). INPUT node's SEQ dim gets n via
-        // inject_runtime_shapes; downstream SEQ/MUL dims inherit it.
+        h = embed(token_ids);
         h.shape[1] = n;
         h.compute_strides();
         generate_rope_cache(n, past_len_, cos, sin);

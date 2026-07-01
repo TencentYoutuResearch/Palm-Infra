@@ -50,6 +50,7 @@ size_t BufferPool::round_up(size_t bytes) {
 
 void* BufferPool::acquire(size_t bytes) {
     size_t bucket = round_up(bytes);
+    acquire_count_++;
 
     auto it = free_.find(bucket);
     if (it != free_.end() && !it->second.empty()) {
@@ -78,6 +79,7 @@ void BufferPool::release(void* ptr, size_t bytes) {
     if (!ptr) return;
 
     size_t bucket = round_up(bytes);
+    release_count_++;
     active_ -= bucket;
     free_[bucket].push_back(ptr);
 }

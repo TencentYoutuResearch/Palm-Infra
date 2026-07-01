@@ -14,6 +14,23 @@ void mollm_reset_pack_counters();
 #include <string>
 #include <vector>
 
+// Peak RSS reporting (portable: getrusage works on macOS + Linux).
+// Reports peak resident set size in bytes across the whole process lifetime,
+// including mmap'd weights and all BufferPool allocations.
+#include <sys/resource.h>
+
+static double peak_rss_mb() {
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+#if defined(__APPLE__)
+    // macOS: ru_maxrss is in bytes
+    return ru.ru_maxrss / (1024.0 * 1024.0);
+#else
+    // Linux: ru_maxrss is in kilobytes
+    return ru.ru_maxrss / 1024.0;
+#endif
+}
+
 namespace {
 
 struct AggregatedProfileRow {
@@ -156,6 +173,15 @@ int main(int argc, char** argv) {
     std::printf("prefill_ms=%.2f\n", result.prefill_ms);
     std::printf("decode_ms=%.2f\n", result.decode_ms);
     std::printf("total_ms=%.2f\n", metrics.total_ms);
+    std::printf("peak_rss_mb=%.1f\n", peak_rss_mb());
+    {
+        auto ps = engine.prefill_pool_stats();
+        std::printf("pool_active_mb=%.1f pool_peak_mb=%.1f pool_freelist_mb=%.1f pool_acquires=%zu pool_releases=%zu\n",
+                    ps.active / (1024.0 * 1024.0),
+                    ps.peak / (1024.0 * 1024.0),
+                    ps.freelist / (1024.0 * 1024.0),
+                    ps.acquires, ps.releases);
+    }
     std::printf("hit_eos=%s\n", result.hit_eos ? "true" : "false");
     // Only show generated_text for real prompts (dummy-token mode produces garbage)
     if (opts.prompt_tokens <= 0) {

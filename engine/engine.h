@@ -125,6 +125,23 @@ public:
     const ExecContext& prefill_exec_ctx() const { return exec_ctx_prefill_; }
     const ExecContext& decode_exec_ctx() const { return exec_ctx_decode_; }
 
+    /// BufferPool memory stats (for leak detection in benchmarks).
+    /// Returns {active_bytes, peak_bytes, acquire_count, release_count} from the prefill graph's pool.
+    struct PoolStats { size_t active, peak, acquires, releases, freelist; };
+    PoolStats prefill_pool_stats() const {
+        return {graph_prefill_.runtime.pool.active_bytes(),
+                graph_prefill_.runtime.pool.peak_bytes(),
+                graph_prefill_.runtime.pool.acquire_count(),
+                graph_prefill_.runtime.pool.release_count(),
+                graph_prefill_.runtime.pool.pool_bytes()};
+    }
+
+    /// Release all non-INPUT/CONSTANT POOLED tensors from the prefill graph's
+    /// pool. Called after prefill() completes to release the last chunk's
+    /// intermediate buffers (which won't be reset by a subsequent
+    /// execute_graph call since there's no next chunk).
+    void release_prefill_buffers();
+
     // Dump ADD node outputs (last token) from prefill graph to dir.
     // Each layer has 2 ADD nodes: attention residual + MLP residual.
     void dump_prefill_add_outputs(const char* dir);
