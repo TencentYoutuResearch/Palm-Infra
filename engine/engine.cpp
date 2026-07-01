@@ -459,25 +459,30 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     cfg_.num_threads = std::max(cfg_.num_threads, 1);
     thread_pool_.resize(cfg_.num_threads);
     exec_ctx_prefill_.thread_pool = &thread_pool_;
-    exec_ctx_decode_.thread_pool = &thread_pool_;
+    exec_ctx_decode_.thread_pool  = &thread_pool_;
+    exec_ctx_prefill_.backend     = &cpu_backend_;
+    exec_ctx_decode_.backend      = &cpu_backend_;
 
-    // If a .mollm package is specified, load it first (sets up weights mmap,
-    // extracts graphs to temp files, parses metadata for weight offset map)
-    std::string pf_path = cfg.prefill_graph_path;
-    std::string dc_path = cfg.decode_graph_path;
-    if (!cfg.package_path.empty()) {
+    // Load the .mollm package (sets up weights mmap, extracts graphs to temp
+    // files, parses metadata for weight offset map).
+    if (cfg.package_path.empty()) {
+        fprintf(stderr, "Engine: package_path is required (use .mollm package)\n");
+        return false;
+    }
+    std::string pf_path, dc_path;
+    {
         std::string tok_tmp, jin_tmp;
         if (!load_package(cfg.package_path, pf_path, dc_path, tok_tmp, jin_tmp)) {
             return false;
         }
-        // If tokenizer was extracted, use it
         if (!tok_tmp.empty()) {
             cfg_.tokenizer_path = tok_tmp;
         }
     }
 
     // Load prefill graph first (establishes shared weights)
-    if (!load_graph(graph_prefill_, exec_ctx_prefill_, pf_path.c_str())) {
+    const std::string& pf_path_load = cfg.use_decode_as_prefill ? dc_path : pf_path;
+    if (!load_graph(graph_prefill_, exec_ctx_prefill_, pf_path_load.c_str())) {
         return false;
     }
 
@@ -861,43 +866,29 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         }
     }
 
-    if (n > graph_seq_len) {
-        fprintf(stderr, "prefill_hidden: n=%d > graph_seq_len=%d, chunked mode not supported\n",
-                n, graph_seq_len);
-        return Tensor();
-    }
+    // Dynamic shape mode: chunked prefill is supported via repeated calls to
+    // prefill_hidden (each chunk appends to KV cache). No padding — the
+    // graph's SEQ dims are filled with the actual chunk size n at runtime.
 
     Tensor h = embed(token_ids);
     int hidden_dim = (int)h.shape[0];
 
-    // Pad to graph seq_len
-    if (n < graph_seq_len) {
-        size_t padded_bytes = (size_t)hidden_dim * graph_seq_len * sizeof(float);
-        void* padded_buf = graph_prefill_.runtime.pool.acquire(padded_bytes);
-        std::memset(padded_buf, 0, padded_bytes);
-        std::memcpy(padded_buf, h.data, (size_t)hidden_dim * n * sizeof(float));
-        h = Tensor::create(Precision::FP32, MemoryType::POOLED,
-                           hidden_dim, graph_seq_len, 1, 1, padded_buf);
-    }
-    h.shape[1] = graph_seq_len;
+    // DYNAMIC mode: no padding, runtime fills SEQ/MUL/ADD dims via DimExpr.
+    exec_ctx_prefill_.runtime_seq_len = n;
+    exec_ctx_prefill_.static_padded   = false;
+    exec_ctx_prefill_.padded_seq_len  = -1;
+    inject_runtime_shapes(exec_ctx_prefill_);
+
+    // h.shape[1] = n (actual token count). INPUT node's SEQ dim gets n via
+    // inject_runtime_shapes; downstream SEQ/MUL dims inherit it.
+    h.shape[1] = n;
     h.compute_strides();
 
     Tensor cos, sin;
-    generate_rope_cache(graph_seq_len, past_len_, cos, sin);
-    Tensor mask = build_causal_mask(graph_seq_len, past_len_);
+    generate_rope_cache(n, past_len_, cos, sin);
+    Tensor mask = build_causal_mask(n, past_len_);
 
-    // Inject n_real_tokens (same as prefill_chunk)
-    if (n < graph_seq_len) {
-        for (auto& node : graph_prefill_.nodes) {
-            if (node.op_type == OpType::GATED_DELTANET_PREFILL) {
-                if (node.params.i32.size() <= 6) node.params.i32.resize(7, 0);
-                node.params.i32[6] = n;
-            } else if (node.op_type == OpType::SHORTCONV) {
-                if (node.params.i32.size() <= 1) node.params.i32.resize(2, 0);
-                node.params.i32[1] = n;
-            }
-        }
-    }
+    // n_real_tokens injection is done by inject_runtime_shapes() above.
 
     // Set cache metadata
     for (auto& cp : caches_) {
@@ -940,42 +931,24 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
         return -1;
     }
 
+    // DYNAMIC mode: no padding. runtime fills SEQ/MUL/ADD dims via DimExpr
+    // evaluation against runtime_seq_len. Symbolic reshape handles N*seq.
+    exec_ctx_prefill_.runtime_seq_len = n;
+    exec_ctx_prefill_.static_padded   = false;
+    exec_ctx_prefill_.padded_seq_len  = -1;
+    inject_runtime_shapes(exec_ctx_prefill_);
+
     Tensor h = embed(token_ids);
-    // Pad hidden to the graph's seq_len if needed
-    if (n < graph_seq_len) {
-        int hidden_dim = (int)h.shape[0];
-        size_t padded_bytes = (size_t)hidden_dim * graph_seq_len * sizeof(float);
-        void* padded_buf = graph_prefill_.runtime.pool.acquire(padded_bytes);
-        std::memset(padded_buf, 0, padded_bytes);
-        std::memcpy(padded_buf, h.data, (size_t)hidden_dim * n * sizeof(float));
-        h = Tensor::create(Precision::FP32, MemoryType::POOLED,
-                           hidden_dim, graph_seq_len, 1, 1, padded_buf);
-    }
-    h.shape[1] = graph_seq_len;
+    // h.shape[1] = n (actual token count, no padding).
+    h.shape[1] = n;
     h.compute_strides();
 
     Tensor cos, sin;
-    generate_rope_cache(graph_seq_len, past, cos, sin);
+    generate_rope_cache(n, past, cos, sin);
 
-    Tensor mask = build_causal_mask(graph_seq_len, past);
+    Tensor mask = build_causal_mask(n, past);
 
-    // Inject n_real_tokens into SHORTCONV and GATED_DELTANET_PREFILL params
-    // so kernels can skip padding positions (stateful ops).
-    if (n < graph_seq_len) {
-        for (auto& node : graph_prefill_.nodes) {
-            if (node.op_type == OpType::GATED_DELTANET_PREFILL) {
-                if (node.params.i32.size() <= 6) {
-                    node.params.i32.resize(7, 0);
-                }
-                node.params.i32[6] = n;
-            } else if (node.op_type == OpType::SHORTCONV) {
-                if (node.params.i32.size() <= 1) {
-                    node.params.i32.resize(2, 0);
-                }
-                node.params.i32[1] = n;
-            }
-        }
-    }
+    // n_real_tokens injection is now done by inject_runtime_shapes() above.
 
     // Set cache metadata so SDPA knows the existing context length.
     for (auto& cp : caches_) {
@@ -1026,6 +999,11 @@ Tensor LLMEngine::decode_hidden(int token_id) {
     Tensor h = embed({token_id});
     h.shape[1] = 1;
     h.compute_strides();
+
+    // Decode graph is all-STATIC (seq=1); no dynamic shape injection needed.
+    exec_ctx_decode_.runtime_seq_len = -1;
+    exec_ctx_decode_.static_padded   = false;
+    exec_ctx_decode_.padded_seq_len  = -1;
 
     Tensor cos, sin;
     generate_rope_cache(1, past_len_, cos, sin);

@@ -998,7 +998,6 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     int lda = (int)(A.stride[1] / sizeof(float));
     int ldc = (int)(C.stride[1] / sizeof(float));
     int K_weight = (int)B.shape[1];
-
     const float* a_ptr = A.ptr<float>();
     float* c_ptr = C.ptr<float>();
 

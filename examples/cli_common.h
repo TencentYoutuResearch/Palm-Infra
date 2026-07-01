@@ -8,9 +8,7 @@
 #include <vector>
 
 struct CliCommonOptions {
-    std::string tokenizer_path;
-    std::string artifacts_dir;
-    std::string package_path;   // .mollm single-file package (alternative to --artifacts/--tokenizer)
+    std::string package_path;   // .mollm single-file package (required)
     std::string prompt;
     std::string prompt_file;  // read prompt text from file (--prompt-file)
     int prompt_tokens = 0;   // >0: use N dummy tokens instead of --prompt text
@@ -52,8 +50,6 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                        std::string& error);
 void print_common_usage(const char* program_name, const char* extra_usage = nullptr);
 EngineConfig make_engine_config(const CliCommonOptions& opts);
-bool inspect_prefill_seq_len(const std::string& graph_path, int& seq_len,
-                             std::string& error);
 bool load_runtime(const CliCommonOptions& opts, Tokenizer& tokenizer,
                   LLMEngine& engine, int& prefill_seq_len, std::string& error);
 std::string decode_piece(const Tokenizer& tokenizer, int token_id);

@@ -26,7 +26,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 GRAPH_MAGIC   = 0x4D4C4C47  # "GLLM"
-GRAPH_VERSION = 2  # v2: added metadata in header
+GRAPH_VERSION = 3  # v3: added per-node dynamic[4] (DynamicKind)
 
 WEIGHT_MAGIC  = 0x50414D58  # "XMAP"
 
@@ -65,6 +65,106 @@ class Precision(IntEnum):
 
 
 # ---------------------------------------------------------------------------
+# Symbolic dim expressions (must match `struct DimExpr` in graph.h)
+# ---------------------------------------------------------------------------
+# Each dim of a tensor's output shape can be a symbolic expression:
+#   CONST: value = out_shape[i] (static)
+#   SEQ:   value = runtime_seq_len
+#   MUL:   value = coeff * runtime_seq_len   (covers N * SEQ)
+#   ADD:   value = coeff + runtime_seq_len   (covers N + SEQ, rare)
+#   BATCH: value = runtime_batch_size         (reserved)
+#
+# Transpile-time symbolic propagation flows these from INPUT nodes through
+# every op. The C++ runtime evaluates them via eval_dim().
+
+class DimKind(IntEnum):
+    CONST = 0
+    SEQ   = 1
+    MUL   = 2
+    ADD   = 3
+    BATCH = 4
+
+
+@dataclass
+class DimExpr:
+    """Symbolic expression for a single tensor dimension."""
+    kind: int = DimKind.CONST
+    coeff: int = 0   # multiplier (MUL) or constant term (ADD)
+
+    @staticmethod
+    def const():
+        return DimExpr(DimKind.CONST, 0)
+
+    @staticmethod
+    def seq():
+        return DimExpr(DimKind.SEQ, 0)
+
+    @staticmethod
+    def mul(coeff):
+        return DimExpr(DimKind.MUL, coeff)
+
+    @staticmethod
+    def add(coeff):
+        return DimExpr(DimKind.ADD, coeff)
+
+
+# Module-level SEQ symbol for use in reshape() target shapes.
+# Usage: g.reshape(x, (head_dim, num_heads * SEQ))  # dim 1 = MUL(num_heads, seq)
+#
+# In build_graph(), callers should bind SEQ to the actual seq_len via
+# SEQ.bind(seq_len) so that transpile-time shape values are correct.
+# The unbound SEQ (build-time value 0) is only used for element-count
+# inference; runtime evaluation uses runtime_seq_len.
+class _SeqSymbol:
+    """Symbol representing runtime seq_len in reshape() target shapes.
+
+    Supports arithmetic: SEQ, N * SEQ, N + SEQ. Detected by reshape()
+    to construct the appropriate DimExpr.
+
+    The build-time value (default 0) is used for shape serialization;
+    runtime evaluation uses runtime_seq_len via DimExpr.
+    """
+    def __init__(self, build_value=0):
+        self._build_value = build_value
+
+    def bind(self, seq_len):
+        """Return a new _SeqSymbol bound to a specific build-time seq_len."""
+        return _SeqSymbol(seq_len)
+
+    @property
+    def build_value(self):
+        return self._build_value
+
+    def __mul__(self, other):
+        if isinstance(other, int):
+            return _DimExprSymbol(DimExpr(DimKind.MUL, other), self._build_value * other)
+        return NotImplemented
+    def __rmul__(self, other):
+        if isinstance(other, int):
+            return _DimExprSymbol(DimExpr(DimKind.MUL, other), self._build_value * other)
+        return NotImplemented
+    def __add__(self, other):
+        if isinstance(other, int):
+            return _DimExprSymbol(DimExpr(DimKind.ADD, other), self._build_value + other)
+        return NotImplemented
+    def __radd__(self, other):
+        if isinstance(other, int):
+            return _DimExprSymbol(DimExpr(DimKind.ADD, other), self._build_value + other)
+        return NotImplemented
+
+
+@dataclass
+class _DimExprSymbol:
+    """Result of arithmetic on _SeqSymbol (e.g. 8 * SEQ).
+    Carries both the DimExpr and the build-time value for shape serialization."""
+    expr: DimExpr
+    build_value: int
+
+
+SEQ = _SeqSymbol()  # unbound; build_graph binds it to actual seq_len
+
+
+# ---------------------------------------------------------------------------
 # Activation functions (fused into MATMUL at writeback time).
 # Values must match `enum class Activation` in kernels/activations.h.
 # ---------------------------------------------------------------------------
@@ -85,12 +185,109 @@ class _Node:
     op_type: OpType
     inputs: list[int] = field(default_factory=list)
     out_shape: tuple[int, ...] = (0, 1, 1, 1)
+    # Per-dim symbolic expression.  CONST by default (out_shape is literal).
+    # When SEQ/MUL/ADD, runtime evaluates against runtime_seq_len.
+    # Transpile-time symbolic propagation fills this in (see propagate_dim_exprs).
+    dim_expr: tuple = field(default_factory=lambda: (DimExpr.const(),) * 4)
     out_prec: Precision = Precision.FP32
     params_i32: list[int] = field(default_factory=list)
     params_f32: list[float] = field(default_factory=list)
     params_str: list[str] = field(default_factory=list)
     weight_path: Optional[str] = None   # for weight nodes
     weight_data: Optional[np.ndarray] = None  # for inline constants
+
+
+# ---------------------------------------------------------------------------
+# Symbolic shape propagation — ONNX-style dynamic dim flow
+# ---------------------------------------------------------------------------
+#
+# After the graph is built, this pass walks nodes in topological order and
+# fills each node's `dim_expr[4]` field based on the dim_expr[] of its inputs.
+# Runtime (C++) then reads dim_expr[] to know which dims need runtime seq_len
+# evaluation; it does NOT re-derive these rules.
+#
+# Core invariant: a node's output dim is dynamic iff some input dim that flows
+# to it is dynamic. Most ops propagate input[0]'s dim_expr directly; a few
+# (MATMUL, SDPA, RESHAPE, GATED_DELTANET_PREFILL) have specialized rules.
+
+_CONST = DimExpr.const()
+_CONST4 = (_CONST, _CONST, _CONST, _CONST)
+
+
+def _propagate_op(node: _Node, nodes: list) -> tuple:
+    """Compute this node's dim_expr[4] from its inputs' dim_expr fields."""
+    op = node.op_type
+    def inp(i):
+        return nodes[node.inputs[i]]
+
+    n_in = len(node.inputs)
+
+    if op == OpType.CONSTANT:
+        return _CONST4
+
+    if op in (OpType.RMS_NORM, OpType.LAYER_NORM,
+              OpType.SILU, OpType.GELU, OpType.SIGMOID, OpType.EXP, OpType.SOFTPLUS,
+              OpType.ROTARY_EMBED,
+              OpType.TILE, OpType.CONTIGUOUS,
+              OpType.QUANTIZE_KV, OpType.DEQUANTIZE_KV,
+              OpType.SHORTCONV):
+        return inp(0).dim_expr if n_in >= 1 else _CONST4
+
+    if op in (OpType.ADD, OpType.MUL):
+        return inp(0).dim_expr if n_in >= 1 else _CONST4
+
+    if op == OpType.MATMUL:
+        a = inp(0).dim_expr if n_in >= 1 else _CONST4
+        return (_CONST, a[1], _CONST, _CONST)
+
+    if op in (OpType.SDPA, OpType.SDPA_MLA):
+        q = inp(0).dim_expr if n_in >= 1 else _CONST4
+        return (_CONST, q[1], _CONST, _CONST)
+
+    if op == OpType.PERMUTE:
+        order = node.params_i32[:4]
+        in_de = inp(0).dim_expr if n_in >= 1 else _CONST4
+        if len(order) < 4:
+            return _CONST4
+        return tuple(in_de[order[i]] for i in range(4))
+
+    if op == OpType.SLICE:
+        in_de = inp(0).dim_expr if n_in >= 1 else _CONST4
+        return in_de  # preserve all dims' exprs
+
+    if op == OpType.CONCAT:
+        in_de = inp(0).dim_expr if n_in >= 1 else _CONST4
+        return in_de
+
+    if op == OpType.RESHAPE:
+        # Reshape's dim_expr is set at construction time via SEQ symbol
+        # detection (see GraphBuilder.reshape). Don't recompute from inputs.
+        return node.dim_expr
+
+    if op == OpType.GATED_DELTANET_PREFILL:
+        return (_CONST, DimExpr.seq(), _CONST, _CONST)
+
+    if op == OpType.GATED_DELTANET_DECODE:
+        return _CONST4
+
+    # Default: don't propagate (conservative).
+    return _CONST4
+
+
+def propagate_dim_exprs(nodes: list):
+    """Fill dim_expr[] on every non-INPUT node based on inputs' dim_expr[].
+
+    INPUT nodes must already have their dim_expr[] set (via builder.input()).
+    Safe to call multiple times; idempotent.
+    """
+    for node in nodes:
+        if node.op_type == OpType.INPUT:
+            continue  # caller-set
+        node.dim_expr = _propagate_op(node, nodes)
+
+
+# Backward-compat alias (older code called propagate_dynamic_shapes)
+propagate_dynamic_shapes = propagate_dim_exprs
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +347,26 @@ class GraphBuilder:
     # ---- inputs / constants ----
 
     def input(self, name: str, shape: tuple,
-              prec: Precision = Precision.FP32) -> int:
-        return self._add(OpType.INPUT, [], shape, prec, s=[name])
+              prec: Precision = Precision.FP32,
+              dynamic: Optional[tuple] = None) -> int:
+        """Declare a graph INPUT node.
+
+        Args:
+            name: input name (matched by engine at runtime).
+            shape: 4-D shape (will be normalized to 4 elements).
+            prec: tensor precision.
+            dynamic: optional 4-tuple of DimExpr values; if given, marks
+                which dims are runtime-dynamic. Default = all CONST.
+                Transpile-time propagation fills downstream nodes' dim_expr
+                fields automatically; callers only need to mark INPUT.
+        """
+        nid = self._add(OpType.INPUT, [], shape, prec, s=[name])
+        if dynamic is not None:
+            dyn = list(dynamic)
+            while len(dyn) < 4:
+                dyn.append(DimExpr.const())
+            self._nodes[nid].dim_expr = tuple(dyn[:4])
+        return nid
 
     def weight(self, path: str, shape: tuple,
                prec: Precision = Precision.FP16) -> int:
@@ -266,6 +481,18 @@ class GraphBuilder:
     # ---- shape ops (zero-copy views) ----
 
     def reshape(self, x: int, shape: tuple) -> int:
+        """Reshape input to target shape.
+
+        Args:
+            x: input node id.
+            shape: target shape (4-D, will be normalized). Use -1 to infer
+                   one dim from total element count. Use the module-level
+                   SEQ symbol to mark runtime-dynamic dims:
+                     g.reshape(x, (head_dim, num_heads, SEQ))      # dim 2 = SEQ
+                     g.reshape(x, (head_dim, num_heads * SEQ))     # dim 1 = MUL
+                   The C++ runtime evaluates these DimExprs against
+                   runtime_seq_len via eval_dim().
+        """
         sx = self._nodes[x].out_shape
         n_elems = 1
         for d in sx: n_elems *= d
@@ -274,22 +501,60 @@ class GraphBuilder:
         if -1 in resolved:
             known = 1
             for d in resolved:
-                if d != -1: known *= d
+                if d != -1 and not isinstance(d, (_SeqSymbol, DimExpr)):
+                    known *= d
             idx = resolved.index(-1)
             resolved[idx] = n_elems // known
+        # separate static dims from symbolic ones
+        static_dims = []
+        dim_exprs = [DimExpr.const()] * 4
+        for d, val in enumerate(resolved):
+            if isinstance(val, _SeqSymbol):
+                static_dims.append(val.build_value)  # build-time value (for serialization)
+                dim_exprs[d] = DimExpr.seq()
+            elif isinstance(val, _DimExprSymbol):
+                static_dims.append(val.build_value)
+                dim_exprs[d] = val.expr
+            elif isinstance(val, DimExpr):
+                static_dims.append(0)  # no build-value available
+                dim_exprs[d] = val
+            else:
+                static_dims.append(int(val))
         s_elems = 1
-        for d in resolved: s_elems *= d
-        assert n_elems == s_elems, f"reshape element mismatch: {sx} vs {shape}"
-        # Mark the dynamic dimension: the one that was -1 (inferred) is the
-        # seq_len dimension that will change between prefill and decode.
-        # Store the dim index in params_i32[4] so the C++ executor can use it.
-        resolved_4d = list(self._normalize_shape(tuple(resolved)))
+        for d in static_dims:
+            if d > 0: s_elems *= d
+        # For element count check, treat dynamic dims as their build-time
+        # values (we don't have runtime values at transpile time).
+        # Skip the strict element-mismatch assert when shape has SEQ symbols.
+        has_symbolic = any(isinstance(v, (_SeqSymbol, DimExpr)) for v in resolved)
+        if not has_symbolic:
+            assert n_elems == s_elems, f"reshape element mismatch: {sx} vs {shape}"
+        resolved_4d = list(self._normalize_shape(tuple(static_dims)))
         dynamic_dim = idx if -1 in list(shape) else -1
         i32_params = list(resolved_4d)
         i32_params.append(dynamic_dim)  # params_i32[4] = dynamic dim index
-        return self._add(OpType.RESHAPE, [x], tuple(resolved_4d),
-                         prec=self._nodes[x].out_prec,
-                         i32=i32_params)
+        nid = self._add(OpType.RESHAPE, [x], tuple(resolved_4d),
+                        prec=self._nodes[x].out_prec,
+                        i32=i32_params)
+
+        # Apply symbolic dim_exprs. If caller used SEQ symbol, those are set
+        # above. Otherwise check -1 path: if source has SEQ, mark inferred dim.
+        node = self._nodes[nid]
+        out_de = list(node.dim_expr)
+        for d in range(4):
+            if dim_exprs[d].kind != DimKind.CONST:
+                out_de[d] = dim_exprs[d]
+        # -1 path: only auto-mark if no explicit SEQ was given AND source has SEQ
+        if dynamic_dim >= 0 and dynamic_dim < 4 and not has_symbolic:
+            src_de = self._nodes[x].dim_expr
+            if any(e.kind != DimKind.CONST for e in src_de):
+                # inherit the first non-CONST expr from source
+                for e in src_de:
+                    if e.kind != DimKind.CONST:
+                        out_de[dynamic_dim] = e
+                        break
+        node.dim_expr = tuple(out_de)
+        return nid
 
     def permute(self, x: int, order: tuple) -> int:
         sx = self._nodes[x].out_shape
@@ -441,6 +706,9 @@ class GraphBuilder:
         if path_prefix.endswith('.graph'):
             path_prefix = path_prefix[:-6]
 
+        # Symbolic shape propagation: fill dynamic[] on all non-INPUT nodes.
+        propagate_dynamic_shapes(self._nodes)
+
         # compute liveness
         use_count = [0] * len(self._nodes)
         for node in self._nodes:
@@ -505,6 +773,13 @@ class GraphBuilder:
                 shape = self._normalize_shape(node.out_shape)
                 for d in shape:
                     f.write(struct.pack('<q', d))
+                # dim_expr[4] (4 × 8 bytes: kind + 3 pad + coeff int32) — v3+
+                de = list(node.dim_expr)
+                while len(de) < 4:
+                    de.append(DimExpr.const())
+                for d in range(4):
+                    e = de[d]
+                    f.write(struct.pack('<bxxx i', int(e.kind), int(e.coeff)))
                 f.write(struct.pack('<I', int(node.out_prec)))
                 # i32 params
                 f.write(struct.pack('<I', len(node.params_i32)))

@@ -1,4 +1,5 @@
 #include "graph/execute.h"
+#include "engine/backend.h"
 #include <cstdio>
 #include <cstring>
 
@@ -10,6 +11,7 @@ static int failures = 0;
 } while(0)
 
 int main() {
+    CPUBackend cpu_backend;  // shared across all ExecContexts below
     // ---- build a simple chain: INPUT → RESHAPE → (end) ----
     Graph g;
 
@@ -49,6 +51,7 @@ int main() {
     ExecContext ctx;
     ctx.graph = &g;
     ctx.pool  = &pool;
+    ctx.backend = &cpu_backend;
 
     // ---- prepare ----
     prepare_execution(ctx);
@@ -103,6 +106,7 @@ int main() {
     ExecContext ctx2;
     ctx2.graph = &g2;
     ctx2.pool  = &pool2;
+    ctx2.backend = &cpu_backend;
 
     prepare_execution(ctx2);
     execute_graph(ctx2);
@@ -165,6 +169,7 @@ int main() {
     ExecContext ctx3;
     ctx3.graph = &g3;
     ctx3.pool = &pool3;
+    ctx3.backend = &cpu_backend;
 
     prepare_execution(ctx3);
     execute_graph(ctx3);
@@ -214,6 +219,7 @@ int main() {
         ctxp.graph = &gp;
         ctxp.pool = &poolp;
         ctxp.profile_enabled = true;
+        ctxp.backend = &cpu_backend;
 
         prepare_execution(ctxp);
         execute_graph(ctxp);
@@ -267,6 +273,7 @@ int main() {
     ExecContext ctx4;
     ctx4.graph = &g4;
     ctx4.pool = &pool4;
+    ctx4.backend = &cpu_backend;
 
     prepare_execution(ctx4);
     execute_graph(ctx4);

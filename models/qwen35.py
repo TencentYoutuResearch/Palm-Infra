@@ -114,8 +114,13 @@ def export_weights(weights: dict, weights_dir: str):
 
 
 def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
-                n_ctx: int = 4096) -> GraphBuilder:
-    """Build prefill or decode graph for Qwen3.5 text model."""
+                n_ctx: int = 4096, is_prefill: bool = False) -> GraphBuilder:
+    """Build prefill or decode graph for Qwen3.5 text model.
+
+    When is_prefill=True, the hidden INPUT's seq dim is marked DynamicKind.SEQ
+    so the C++ runtime can inject actual seq_len (dynamic shape mode).
+    Decode graphs (seq=1) stay all-STATIC.
+    """
     g = GraphBuilder()
     tc = cfg['text_config'] if 'text_config' in cfg else cfg
 
@@ -162,10 +167,22 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     g.weight(embed_path, embed_shape, Precision.FP16)
 
     # ---- graph inputs ----
-    hidden = g.input('hidden', (hidden_size, seq_len))
-    mask = g.input('mask', (1, seq_len))
-    cos = g.input('cos', (rope_dim // 2, seq_len))
-    sin = g.input('sin', (rope_dim // 2, seq_len))
+    # In prefill graphs, mark seq dim (shape[1]) as SEQ so the C++ runtime
+    # can substitute actual seq_len. Decode graphs stay all-CONST.
+    if is_prefill:
+        from transpile import DimExpr
+        SEQ_DIM = DimExpr.seq()
+        CONST   = DimExpr.const()
+        hidden_dyn = (CONST, SEQ_DIM, CONST, CONST)
+        mask_dyn   = (CONST, SEQ_DIM, CONST, CONST)
+        cos_dyn    = (CONST, SEQ_DIM, CONST, CONST)
+        sin_dyn    = (CONST, SEQ_DIM, CONST, CONST)
+    else:
+        hidden_dyn = mask_dyn = cos_dyn = sin_dyn = None
+    hidden = g.input('hidden', (hidden_size, seq_len), dynamic=hidden_dyn)
+    mask = g.input('mask', (1, seq_len), dynamic=mask_dyn)
+    cos = g.input('cos', (rope_dim // 2, seq_len), dynamic=cos_dyn)
+    sin = g.input('sin', (rope_dim // 2, seq_len), dynamic=sin_dyn)
 
     # ---- persistent state inputs (KV cache for full attn, GDN state for linear attn) ----
     cache_inputs = []
@@ -196,7 +213,8 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                         num_heads, num_kv_heads, head_dim,
                         linear_num_heads, linear_k_dim, linear_v_dim,
                         linear_num_v_heads,
-                        conv_kernel, intermediate, hidden_size, lt)
+                        conv_kernel, intermediate, hidden_size, lt,
+                        is_prefill=is_prefill)
 
     # ---- final norm ----
     w_norm = g.weight(os.path.join(weights_dir, "final_norm.weights"),
@@ -213,7 +231,8 @@ def _build_layer(g, x, layer_idx, weights_dir, cfg, tc,
                  num_heads, num_kv_heads, head_dim,
                  linear_num_heads, linear_k_dim, linear_v_dim,
                  linear_num_v_heads,
-                 conv_kernel, intermediate, hidden_size, layer_type):
+                 conv_kernel, intermediate, hidden_size, layer_type,
+                 is_prefill=False):
     """Build one layer (linear_attention or full_attention)."""
 
     pfx_lm = f'model_language_model_layers_{layer_idx}'
@@ -234,7 +253,7 @@ def _build_layer(g, x, layer_idx, weights_dir, cfg, tc,
                                            cos, sin, mask, ck_in, cv_in,
                                            eps, seq_len, rope_dim,
                                            num_heads, num_kv_heads, head_dim,
-                                           hidden_size)
+                                           hidden_size, is_prefill=is_prefill)
 
     # ---- Residual ----
     x = g.add(x, attn_out)
@@ -333,8 +352,13 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
 def _build_full_attn_layer(g, x, layer_idx, weights_dir,
                             cos, sin, mask, ck_in, cv_in,
                             eps, seq_len, rope_dim,
-                            num_heads, num_kv_heads, head_dim, hidden_size):
+                            num_heads, num_kv_heads, head_dim, hidden_size,
+                            is_prefill=False):
     """Build a full attention (GQA + QK norm + output gate) layer."""
+    # In prefill graphs, use SEQ symbol for seq dims (runtime substitutes
+    # actual seq_len). In decode graphs, use seq_len literal (=1, static).
+    from transpile import SEQ
+    _S = SEQ.bind(seq_len) if is_prefill else seq_len
     pfx = f'model_language_model_layers_{layer_idx}_self_attn'
 
     # ---- q_proj: [4096, 1024] → 8 × (256 query + 256 gate) ----
@@ -359,10 +383,10 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     # No contiguous() needed: reshape + slice both use stride-aware accessors,
     # and the matmul output's [seq, NH*HD*2] row-major layout already matches
     # the [HD*2, NH, seq] view (same element ordering, see comment above).
-    qg = g.reshape(qg, (head_dim * 2, num_heads, seq_len))        # [512, 8, 4]
-    query, gate = g.slice(qg, [head_dim, head_dim], dim=0)         # [256, 8, 4] each
-    query = g.reshape(query, (num_heads * head_dim, seq_len))      # [2048, 4]
-    gate = g.reshape(gate, (num_heads * head_dim, seq_len))        # [2048, 4]
+    qg = g.reshape(qg, (head_dim * 2, num_heads, _S))        # [512, 8, seq]
+    query, gate = g.slice(qg, [head_dim, head_dim], dim=0)         # [256, 8, seq] each
+    query = g.reshape(query, (num_heads * head_dim, _S))      # [2048, seq]
+    gate = g.reshape(gate, (num_heads * head_dim, _S))        # [2048, seq]
 
     # ---- k_proj, v_proj ----
     w_k = g.weight(os.path.join(weights_dir, f"{pfx}_k_proj_weight.weights"),
@@ -405,21 +429,21 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     # No contiguous() before reshape/permute: reshape inherits stride,
     # permute is zero-copy. The downstream rms_norm kernel reads via
     # stride[1] (ldx), so it handles the strided permuted view directly.
-    query = g.reshape(query, (head_dim, num_heads, seq_len))  # [HD, NH, seq]
+    query = g.reshape(query, (head_dim, num_heads, _S))  # [HD, NH, seq]
     query = g.permute(query, (0, 2, 1, 3))                   # [HD, seq, NH]
     # No contiguous() before rms_norm: kernel_rms_norm uses ldx=stride[1].
-    query = g.reshape(query, (head_dim, num_heads * seq_len)) # [HD, NH*seq], cols s-major
+    query = g.reshape(query, (head_dim, num_heads * _S)) # [HD, NH*seq], cols s-major
     query = g.rms_norm(query, w_qn, eps=eps)
-    query = g.reshape(query, (head_dim, seq_len, num_heads))  # [HD, seq, NH]
+    query = g.reshape(query, (head_dim, _S, num_heads))  # [HD, seq, NH]
     query = g.contiguous(query)                                # for RoPE/SDPA
 
     # --- Key ---
     # No contiguous() before reshape/permute/rms_norm: same rationale as Query.
-    k = g.reshape(k, (head_dim, num_kv_heads, seq_len))       # [HD, NKV, seq]
+    k = g.reshape(k, (head_dim, num_kv_heads, _S))       # [HD, NKV, seq]
     k = g.permute(k, (0, 2, 1, 3))                            # [HD, seq, NKV]
-    k = g.reshape(k, (head_dim, num_kv_heads * seq_len))      # [HD, NKV*seq], cols s-major
+    k = g.reshape(k, (head_dim, num_kv_heads * _S))      # [HD, NKV*seq], cols s-major
     k = g.rms_norm(k, w_kn, eps=eps)
-    k = g.reshape(k, (head_dim, seq_len, num_kv_heads))       # [HD, seq, NKV]
+    k = g.reshape(k, (head_dim, _S, num_kv_heads))       # [HD, seq, NKV]
     k = g.contiguous(k)                                         # for RoPE/SDPA
     # v is matmul output: declared shape [nkv*hd, seq], data [seq, nkv*hd] row-major.
     # Step 1: reshape (hd, nkv, seq) — zero-copy, d0=hd innermost.
@@ -429,7 +453,7 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     # No contiguous() before reshape/permute: reshape+permute are zero-copy
     # stride-aware; the single contiguous() before SDPA materializes the
     # layout SDPA requires (stride[1] == hd*es).
-    v = g.reshape(v, (head_dim, num_kv_heads, seq_len))
+    v = g.reshape(v, (head_dim, num_kv_heads, _S))
     v = g.permute(v, (0, 2, 1, 3))
     v = g.contiguous(v)
 
@@ -458,7 +482,7 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     #   flat[s*2048 + h*256 + d] = SDPA(s, h, d). ✓
     attn = g.permute(attn, (0, 2, 1, 3))     # [HD, NH, seq]
     attn = g.contiguous(attn)                  # materialize
-    attn = g.reshape(attn, (num_heads * head_dim, seq_len))  # [NH*HD, seq]
+    attn = g.reshape(attn, (num_heads * head_dim, _S))  # [NH*HD, seq]
 
     # ---- Output gate: attn * sigmoid(gate) ----
     # gate is matmul output (qg_proj second half): [NH*HD, seq], data [seq, NH*HD].
@@ -511,7 +535,8 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
 
     # ---- Step 2: Build prefill graph ----
     print(f"\nBuilding prefill graph (seq_len={prefill_seq_len})...")
-    g_prefill = build_graph(weights_rel, cfg, seq_len=prefill_seq_len, n_ctx=n_ctx)
+    g_prefill = build_graph(weights_rel, cfg, seq_len=prefill_seq_len,
+                            n_ctx=n_ctx, is_prefill=True)
 
     # ---- Step 3: Build decode graph ----
     print(f"\nBuilding decode graph (seq_len=1)...")

@@ -1,4 +1,5 @@
 #include "graph/execute.h"
+#include "engine/backend.h"
 #include "kernels/matmul.h"
 #include "kernels/norm.h"
 #include "kernels/rope.h"
@@ -19,7 +20,23 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// Materialize a strided tensor into a contiguous row-major buffer.
+// DimExpr evaluation — substitute runtime seq_len into a symbolic dim expr.
+// ---------------------------------------------------------------------------
+
+static inline int64_t eval_dim(const DimExpr& e, int64_t out_shape_val,
+                                int64_t seq_val, int64_t batch_val) {
+    switch (e.kind) {
+        case DIM_SEQ:   return seq_val;
+        case DIM_MUL:   return (int64_t)e.coeff * seq_val;
+        case DIM_ADD:   return (int64_t)e.coeff + seq_val;
+        case DIM_BATCH: return batch_val;
+        case DIM_CONST:
+        default:        return out_shape_val;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// materialize_strided
 //
 // Used by RESHAPE (non-contiguous input) and CONTIGUOUS ops. The generic
 // 4-loop elementwise memcpy is slow when dim0 is contiguous (stride[0]==es):
@@ -256,13 +273,82 @@ void prepare_execution(ExecContext& ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// kernel dispatcher
+// inject_runtime_shapes
+//
+// Fills INPUT tensors' actual shapes (substituting runtime_seq_len for any
+// dim tagged DynamicKind::SEQ) and patches stateful op params (n_real_tokens
+// for GATED_DELTANET_PREFILL.params.i32[6] and SHORTCONV.params.i32[1]).
+//
+// Called once before execute_graph() by the engine. After this call:
+//   - INPUT tensors have their runtime shape filled in
+//   - Downstream tensors are filled during execute_graph() dispatch
+//   - stateful op params are set so kernels can skip padding positions
+//
+// In DYNAMIC mode (static_padded=false): runtime_seq_len is the actual token
+// count and the graph executes with that seq_len — no padding.
+// In STATIC_PADDED mode (static_padded=true): the graph executes with
+// padded_seq_len, but stateful ops still need to know runtime_seq_len (the
+// real token count) to skip padding positions.
 // ---------------------------------------------------------------------------
 
-static void dispatch_kernel(OpType op, const OpParams& params,
-                            const std::vector<const Tensor*>& inputs,
-                            Tensor* output,
-                            ThreadPool* thread_pool) {
+void inject_runtime_shapes(ExecContext& ctx) {
+    auto& nodes  = ctx.graph->nodes;
+    auto& tensors = ctx.graph->runtime.tensors;
+    const int seq_val = ctx.static_padded ? ctx.padded_seq_len : ctx.runtime_seq_len;
+    const int n_real  = ctx.runtime_seq_len;  // always the real token count
+
+    // Phase 1: INPUT tensors' actual shape.
+    // Engine fills INPUT tensor data + shape before calling execute_graph;
+    // for dynamic dims we override the shape[dim] with the evaluated DimExpr.
+    for (auto& n : nodes) {
+        if (n.op_type != OpType::INPUT) continue;
+        auto& t = tensors[n.id];
+        for (int d = 0; d < 4; d++) {
+            if (n.dim_expr[d].is_dynamic()) {
+                t.shape[d] = eval_dim(n.dim_expr[d], n.out_shape[d], seq_val, n_real);
+            }
+        }
+        t.compute_strides();
+    }
+
+    // Phase 2: patch stateful op n_real_tokens + seq_len.
+    // In STATIC_PADDED mode (current): graph runs at graph_seq_len (build-time
+    // seq_len = 256). Stateful kernels read seq_len from params.i32[3] (GDN)
+    // and need it to stay at build-time value so they iterate the full padded
+    // range, but skip padding positions via n_real_tokens (params.i32[6]).
+    // In DYNAMIC mode (future): runtime_seq_len replaces both seq_len and
+    // n_real_tokens in params, kernels iterate only the real tokens.
+    if (n_real <= 0) return;
+    const bool patch_seq_len = !ctx.static_padded;  // DYNAMIC mode only
+    for (auto& n : nodes) {
+        if (n.op_type == OpType::GATED_DELTANET_PREFILL) {
+            if (n.params.i32.size() <= 6) n.params.i32.resize(7, 0);
+            n.params.i32[6] = n_real;  // n_real_tokens (skip padding positions)
+            if (patch_seq_len && n.params.i32.size() > 3) {
+                n.params.i32[3] = n_real;  // seq_len = n_real in DYNAMIC mode
+            }
+        } else if (n.op_type == OpType::SHORTCONV) {
+            if (n.params.i32.size() <= 1) n.params.i32.resize(2, 0);
+            n.params.i32[1] = n_real;
+            // SHORTCONV reads seq_len from input tensor shape (x.shape[1]),
+            // which is set by the engine to graph_seq_len (padding mode) or
+            // n_real (dynamic mode).
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CPUBackend::dispatch — kernel dispatcher for CPU (ARM NEON) backend.
+//
+// Routes OpType to the appropriate kernel. This is the only dispatch
+// entry point for CPU; future NPU backend will have its own dispatch().
+// ---------------------------------------------------------------------------
+
+void CPUBackend::dispatch(const GraphNode& node,
+                          const std::vector<const Tensor*>& inputs,
+                          Tensor* output, ThreadPool* thread_pool) {
+    const OpType op = node.op_type;
+    const OpParams& params = node.params;
     switch (op) {
     case OpType::INPUT:
     case OpType::CONSTANT:
@@ -273,14 +359,22 @@ static void dispatch_kernel(OpType op, const OpParams& params,
         // Reshape preserves logical element order. For contiguous inputs this is
         // a zero-copy metadata change; for non-contiguous views we materialize a
         // contiguous output.
+        //
+        // Output shape priority for each dim d:
+        //   - if node.dim_expr[d].is_dynamic(): use output->shape[d] (already
+        //     filled by execute_graph main loop via eval_dim)
+        //   - else: use params.i32[d] (build-time literal)
         if (!inputs.empty() && inputs[0] && output) {
             const Tensor& src = *inputs[0];
-            int64_t new_shape[4] = { output->shape[0], output->shape[1], output->shape[2], output->shape[3] };
+            int64_t new_shape[4] = { output->shape[0], output->shape[1],
+                                     output->shape[2], output->shape[3] };
             if (params.i32.size() >= 4) {
-                new_shape[0] = params.i32[0];
-                new_shape[1] = params.i32[1];
-                new_shape[2] = params.i32[2];
-                new_shape[3] = params.i32[3];
+                for (int d = 0; d < 4; d++) {
+                    if (!node.dim_expr[d].is_dynamic()) {
+                        new_shape[d] = params.i32[d];
+                    }
+                    // dynamic dims: preserve output->shape[d] (runtime-filled)
+                }
             }
 
             if (src.is_contiguous()) {
@@ -918,6 +1012,27 @@ void execute_graph(ExecContext& ctx) {
     auto& tensors = ctx.graph->runtime.tensors;
     auto* pool   = ctx.pool;
 
+    // Compute seq_val once for dynamic shape injection.
+    // In DYNAMIC mode this = runtime_seq_len; in STATIC_PADDED mode = padded_seq_len.
+    const int seq_val = ctx.static_padded ? ctx.padded_seq_len : ctx.runtime_seq_len;
+    const bool has_dynamic = (seq_val > 0);
+
+    // Reset non-INPUT/CONSTANT tensor state before execution.
+    // Zero-copy view ops (RESHAPE/PERMUTE/SLICE/TILE/CONCAT) inherit data
+    // pointers from their inputs at dispatch time, but their tensor.data is
+    // NOT cleared by the release pass (see "view ops: continue" below).
+    // Without this reset, a second execute_graph() call would see stale
+    // out.data from the previous call, skipping both shape init and buffer
+    // allocation — leading to use of freed/reused memory.
+    // INPUT/CONSTANT tensors keep their data (set by engine / load-time).
+    for (size_t i = 0; i < nodes.size(); i++) {
+        auto& node = nodes[i];
+        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        auto& t = tensors[node.id];
+        t.data = nullptr;
+        t.mem_type = MemoryType::NONE;
+    }
+
     for (size_t i = 0; i < nodes.size(); i++) {
         auto& node = nodes[i];
 
@@ -932,19 +1047,48 @@ void execute_graph(ExecContext& ctx) {
             start_time = std::chrono::steady_clock::now();
         }
 
-        // initialise output shape from node definition (static!)
-        // For zero-copy ops that already have data (from input sharing),
-        // skip shape init to preserve contiguity info.
+        // initialise output shape from node definition.
+        // Dynamic dims evaluated against runtime seq_val via DimExpr.
+        //
+        // For zero-copy ops (RESHAPE/PERMUTE/SLICE) we must NOT skip this step
+        // entirely in DYNAMIC mode: the dispatch reads output->shape[d] for the
+        // dynamic dims, and skipping would leave stale values from the previous
+        // execute_graph() call. Only skip when the graph is fully STATIC
+        // (has_dynamic == false) — then shapes are constants and reuse is safe.
+        //
+        // When out.data is already set (zero-copy view inheriting from input),
+        // we still must update shape[d] for dynamic dims, but we must NOT call
+        // compute_strides() unconditionally — the dispatch path will handle
+        // strides itself (see RESHAPE dispatch).
         bool skip_init = (node.op_type == OpType::RESHAPE ||
                           node.op_type == OpType::PERMUTE ||
-                          node.op_type == OpType::SLICE) && out.data != nullptr;
+                          node.op_type == OpType::SLICE)
+                         && out.data != nullptr
+                         && !has_dynamic;
         if (!skip_init) {
-            out.shape[0] = node.out_shape[0];
-            out.shape[1] = node.out_shape[1];
-            out.shape[2] = node.out_shape[2];
-            out.shape[3] = node.out_shape[3];
+            // Always update dynamic dims via eval_dim, even for zero-copy views.
+            // For static dims, fall back to build-time literal.
+            bool any_dynamic = false;
+            for (int d = 0; d < 4; d++) {
+                if (has_dynamic && node.dim_expr[d].is_dynamic()) {
+                    out.shape[d] = eval_dim(node.dim_expr[d], node.out_shape[d],
+                                            seq_val, ctx.runtime_batch);
+                    any_dynamic = true;
+                } else {
+                    out.shape[d] = node.out_shape[d];
+                }
+            }
             out.prec     = node.out_prec;
-            out.compute_strides();
+            // For zero-copy views with dynamic dims, defer stride computation
+            // to dispatch (which knows whether to inherit from src or
+            // materialise). Computing strides here with the new (correct)
+            // shape would overwrite the inherited contiguous layout.
+            if (!(any_dynamic && out.data != nullptr &&
+                  (node.op_type == OpType::RESHAPE ||
+                   node.op_type == OpType::PERMUTE ||
+                   node.op_type == OpType::SLICE))) {
+                out.compute_strides();
+            }
         }
 
         // allocate output if needed
@@ -969,8 +1113,8 @@ void execute_graph(ExecContext& ctx) {
             inputs.push_back(&tensors[inp_id]);
         }
 
-        // dispatch
-        dispatch_kernel(node.op_type, node.params, inputs, &out, ctx.thread_pool);
+        // dispatch via backend
+        ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
 
         // release completed tensors
         for (uint32_t rel_id : ctx.release_queue[i]) {

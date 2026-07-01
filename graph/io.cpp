@@ -10,7 +10,10 @@
 //   Offset  Size   Field
 //   ------  ----   -----
 //   0       4      magic: 0x4D4C4C47 ("GLLM")
-//   4       4      version (current = 1)
+//   4       4      version (current = 3)
+//                      v1: initial
+//                      v2: added metadata in header
+//                      v3: added per-node dim_expr[4] (DimExpr)
 //   8       4      node_count
 //   12      4      input_count
 //   16      4*N    graph_inputs[node_id...]
@@ -22,6 +25,7 @@
 //   *       4      input_count
 //   *       4*N    input_ids[]
 //   *       4*4    out_shape[4] (int64)
+//   *       8*4    dim_expr[4] (8 bytes each: kind + 3 pad + coeff int32)  [v3+]
 //   *       4      out_prec (uint32)
 //   *       4      param_i32_count
 //   *       4*N    param_i32[] (int32)
@@ -32,12 +36,15 @@
 //
 // All integers are stored in native byte order (little-endian on all
 // supported platforms).
+//
+// Not forward-compatible with v2. Old .mollm/.graph files must be re-
+// transpiled.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 static constexpr uint32_t GRAPH_MAGIC   = 0x4D4C4C47;  // "GLLM"
-static constexpr uint32_t GRAPH_VERSION = 2;  // v2: added metadata in header
+static constexpr uint32_t GRAPH_VERSION = 3;  // v3: added per-node dynamic[4]
 
 // ---- low-level I/O helpers ----
 
@@ -137,6 +144,17 @@ bool graph_load(Graph& g, const char* path) {
             if (!read_i64(f, &n.out_shape[d])) { fclose(f); return false; }
         }
 
+        // dim_expr[4] (4 × 8 bytes: kind + coeff + pad) — v3+
+        // Format per dim: 1 byte kind, 3 bytes padding, 4 bytes coeff (int32)
+        for (int d = 0; d < 4; d++) {
+            uint8_t buf[8];
+            if (fread(buf, 1, 8, f) != 8) { fclose(f); return false; }
+            n.dim_expr[d].kind  = static_cast<int8_t>(buf[0]);
+            int32_t coeff;
+            std::memcpy(&coeff, buf + 4, 4);
+            n.dim_expr[d].coeff = coeff;
+        }
+
         // output precision
         uint32_t prec = 0;
         if (!read_u32(f, &prec))       { fclose(f); return false; }
@@ -218,6 +236,14 @@ bool graph_save(const Graph& g, const char* path) {
 
         // output shape (4 int64s)
         for (int d = 0; d < 4; d++) write_i64(f, n.out_shape[d]);
+
+        // dim_expr[4] (4 × 8 bytes: kind + 3 pad + coeff int32) — v3+
+        for (int d = 0; d < 4; d++) {
+            uint8_t buf[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            buf[0] = static_cast<uint8_t>(n.dim_expr[d].kind);
+            std::memcpy(buf + 4, &n.dim_expr[d].coeff, 4);
+            fwrite(buf, 1, 8, f);
+        }
 
         write_u32(f, static_cast<uint32_t>(n.out_prec));
 

@@ -123,10 +123,14 @@ def export_weights(weights: dict, weights_dir: str):
 
 
 def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
-                n_ctx: int = 4096) -> GraphBuilder:
+                n_ctx: int = 4096, is_prefill: bool = False) -> GraphBuilder:
     """
     Build a computation graph with the given seq_len.
     seq_len=1 for decode, seq_len=128 for prefill chunk.
+
+    When is_prefill=True, the hidden INPUT's seq dim is marked DynamicKind.SEQ
+    so the C++ runtime can inject actual seq_len (dynamic shape mode).
+    Decode graphs (seq=1) stay all-STATIC.
     """
     g = GraphBuilder()
     n_layers = cfg.get('num_hidden_layers', 32)
@@ -161,10 +165,22 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     embed_node = g.weight(embed_path, embed_shape, Precision.FP16)
 
     # ---- graph inputs ----
-    hidden = g.input('hidden', (hidden_size, seq_len))
-    mask   = g.input('mask', (1, seq_len))
-    cos    = g.input('cos', (qk_rope_dim // 2, seq_len))
-    sin    = g.input('sin', (qk_rope_dim // 2, seq_len))
+    # In prefill graphs, mark seq dim (shape[1]) as SEQ so the C++ runtime
+    # can substitute actual seq_len. Decode graphs stay all-CONST.
+    if is_prefill:
+        from transpile import DimExpr
+        SEQ_DIM = DimExpr.seq()
+        CONST   = DimExpr.const()
+        hidden_dyn = (CONST, SEQ_DIM, CONST, CONST)
+        mask_dyn   = (CONST, SEQ_DIM, CONST, CONST)
+        cos_dyn    = (CONST, SEQ_DIM, CONST, CONST)
+        sin_dyn    = (CONST, SEQ_DIM, CONST, CONST)
+    else:
+        hidden_dyn = mask_dyn = cos_dyn = sin_dyn = None
+    hidden = g.input('hidden', (hidden_size, seq_len), dynamic=hidden_dyn)
+    mask   = g.input('mask',   (1, seq_len),           dynamic=mask_dyn)
+    cos    = g.input('cos',    (qk_rope_dim // 2, seq_len), dynamic=cos_dyn)
+    sin    = g.input('sin',    (qk_rope_dim // 2, seq_len), dynamic=sin_dyn)
 
     # KV cache inputs (preallocated, metadata in header)
     # FP16 storage: halves cache memory, enables FP16FML SDPA without per-call
@@ -184,7 +200,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
             cos, sin, mask, ck_in, cv_in,
             num_heads, kv_lora_rank, q_lora_rank,
             qk_nope_dim, qk_rope_dim, qk_head_dim, v_head_dim,
-            hidden_size, eps, scale, seq_len)
+            hidden_size, eps, scale, seq_len, is_prefill=is_prefill)
         cache_inputs[i] = (ck_out, cv_out)
 
     # ---- final norm ----
@@ -203,8 +219,13 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
                      num_heads: int, kv_lora_rank: int, q_lora_rank: int,
                      qk_nope_dim: int, qk_rope_dim: int, qk_head_dim: int,
                      v_head_dim: int, hidden_size: int,
-                     eps: float, scale: float, seq_len: int
+                     eps: float, scale: float, seq_len: int,
+                     is_prefill: bool = False
                      ) -> tuple[int, int, int]:
+    # In prefill graphs, use SEQ symbol for seq dims (runtime substitutes
+    # actual seq_len). In decode graphs, use seq_len literal (=1, static).
+    from transpile import SEQ
+    _S = SEQ.bind(seq_len) if is_prefill else seq_len
     pfx = f'model.layers.{layer_idx}.self_attn'
 
     # ---- Input RMSNorm ----
@@ -226,8 +247,8 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     q = g.matmul(q_comp, w_q_b)
 
     # reshape + permute: (num_heads*qk_head_dim, seq) → [hd, seq, heads]
-    q = g.reshape(q, (num_heads * qk_head_dim, seq_len))
-    q = g.reshape(q, (qk_head_dim, num_heads, seq_len))
+    q = g.reshape(q, (num_heads * qk_head_dim, _S))
+    q = g.reshape(q, (qk_head_dim, num_heads, _S))
     q = g.permute(q, (0, 2, 1, 3))  # [hd, seq, heads]
     q_nope, q_rope = g.slice(q, [qk_nope_dim, qk_rope_dim], dim=0)
 
@@ -244,14 +265,14 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
     w_kv_b = g.weight(os.path.join(weights_dir, f"{pfx.replace('.', '_')}_kv_b_proj_weight.weights"),
                       (num_heads * (qk_nope_dim + v_head_dim), kv_lora_rank), Precision.FP16)
     kv_expanded = g.matmul(kv_normed, w_kv_b)
-    kv_expanded = g.reshape(kv_expanded, (num_heads * (qk_nope_dim + v_head_dim), seq_len))
-    kv_expanded = g.reshape(kv_expanded, (qk_nope_dim + v_head_dim, num_heads, seq_len))
+    kv_expanded = g.reshape(kv_expanded, (num_heads * (qk_nope_dim + v_head_dim), _S))
+    kv_expanded = g.reshape(kv_expanded, (qk_nope_dim + v_head_dim, num_heads, _S))
     kv_expanded = g.permute(kv_expanded, (0, 2, 1, 3))  # [qk_nope+v, seq, heads]
     k_nope, v = g.slice(kv_expanded, [qk_nope_dim, v_head_dim], dim=0)
 
     # ---- RoPE ----
     q_rope = g.rope(q_rope, cos, sin, rope_dim=qk_rope_dim)
-    k_rope_raw = g.reshape(k_rope_raw, (qk_rope_dim, seq_len, 1))
+    k_rope_raw = g.reshape(k_rope_raw, (qk_rope_dim, _S, 1))
     k_rope = g.rope(k_rope_raw, cos, sin, rope_dim=qk_rope_dim)
     k_rope = g.tile(k_rope, (1, 1, num_heads))  # broadcast to all heads along dim=2
 
@@ -268,7 +289,7 @@ def _build_mla_layer(g: GraphBuilder, x: int, layer_idx: int,
 
     # ---- output projection ----
     attn_out = g.permute(attn_out, (0, 2, 1, 3))  # [v, heads, seq]
-    attn_out = g.reshape(attn_out, (num_heads * v_head_dim, seq_len))
+    attn_out = g.reshape(attn_out, (num_heads * v_head_dim, _S))
     w_o = g.weight(os.path.join(weights_dir, f"{pfx.replace('.', '_')}_o_proj_weight.weights"),
                    (hidden_size, num_heads * v_head_dim), Precision.FP16)
     out = g.matmul(attn_out, w_o)
@@ -329,7 +350,8 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
 
     # ---- Step 2: Build prefill graph ----
     print(f"\nBuilding prefill graph (seq_len={prefill_seq_len})...")
-    g_prefill = build_graph(weights_rel, cfg, seq_len=prefill_seq_len, n_ctx=n_ctx)
+    g_prefill = build_graph(weights_rel, cfg, seq_len=prefill_seq_len,
+                            n_ctx=n_ctx, is_prefill=True)
 
     # ---- Step 3: Build decode graph ----
     print(f"\nBuilding decode graph (seq_len=1)...")

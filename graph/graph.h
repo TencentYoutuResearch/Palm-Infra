@@ -15,7 +15,45 @@
 // A Graph is a linear (topologically-sorted) list of nodes.  Execution walks
 // the list once, dispatching each node to its kernel.  All graph construction
 // and optimisation happens in Python; the C++ side only loads and executes.
+//
+// Dynamic shape support
+// ---------------------
+// Each GraphNode carries a `dim_expr[4]` array of DimExpr structs, one per
+// output dimension.  When a dim depends on runtime seq_len, its size is
+// expressed as a symbolic expression (SEQ, N*SEQ, N+SEQ) evaluated at runtime.
+// STATIC dims use out_shape[i] verbatim.  The transpiler does full symbolic
+// shape propagation (ONNX style): expr information flows from INPUT nodes
+// through every op, so every tensor's dim_expr[] is baked into the graph.
+// Runtime does NO shape inference — it just reads dim_expr[] and evaluates.
+//
+// BATCH is reserved for future batch dim support; not used currently.
 // ---------------------------------------------------------------------------
+
+// Per-dimension symbolic expression.
+//   CONST: value = out_shape[i] (no runtime dependence)
+//   SEQ:   value = runtime_seq_len
+//   MUL:   value = coeff * runtime_seq_len    (covers N * SEQ)
+//   ADD:   value = coeff + runtime_seq_len    (covers N + SEQ, rare)
+//   BATCH: value = runtime_batch_size          (reserved)
+//
+// Serialized as 8 bytes (kind + coeff + padding). The coeff field is only
+// used by MUL and ADD; CONST/SEQ/BATCH ignore it.
+struct DimExpr {
+    int8_t  kind  = 0;   // 0=CONST, 1=SEQ, 2=MUL, 3=ADD, 4=BATCH
+    int32_t coeff = 0;   // multiplier (MUL) or constant term (ADD)
+
+    bool is_static() const { return kind == 0; }
+    bool is_dynamic() const { return kind != 0; }
+};
+
+// DimExpr kinds (matching the int8_t values above)
+enum : int8_t {
+    DIM_CONST = 0,
+    DIM_SEQ   = 1,
+    DIM_MUL   = 2,
+    DIM_ADD   = 3,
+    DIM_BATCH = 4,
+};
 
 // ---- op types ----
 enum class OpType : uint32_t {
@@ -125,6 +163,9 @@ struct GraphNode {
 
     // output shape as a flat list of 4 int64s (always 4 elements)
     int64_t    out_shape[4] = {0, 1, 1, 1};
+    // per-dim symbolic expression.  Default CONST (out_shape[i] is the size).
+    // When SEQ/MUL/ADD, runtime evaluates against runtime_seq_len.
+    DimExpr    dim_expr[4] = {};
     Precision  out_prec     = Precision::FP32;
 };
 

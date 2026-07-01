@@ -2,6 +2,7 @@
 
 #include "graph/graph.h"
 #include "graph/execute.h"
+#include "engine/backend.h"
 #include "kernels/tensor.h"
 #include "kernels/threading.h"
 
@@ -61,10 +62,7 @@ inline const void* cache_data(const void* data) {
 // ---------------------------------------------------------------------------
 
 struct EngineConfig {
-    std::string prefill_graph_path;   // .graph file for prefill
-    std::string decode_graph_path;    // .graph file for decode
-    std::string package_path;         // .mollm single-file package (alternative to above)
-    std::string tokenizer_path;       // tokenizer.json path (may be set by package load)
+    std::string package_path;         // .mollm single-file package (required)
     int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;
@@ -75,6 +73,15 @@ struct EngineConfig {
     int top_k = 50;                   // 0 = disabled
     float top_p = 0.9f;              // 0 = disabled
     unsigned int seed = 42;          // random seed for sampling
+
+    // Output-only: set by load() when package contains a tokenizer.
+    // Callers (e.g. CLI) read this to load the Tokenizer after engine.load().
+    std::string tokenizer_path;
+
+    // Test-only: when true, load the decode graph as the prefill graph too
+    // (so prefill() runs the seq=1 decode graph). Used by test_e2e to verify
+    // the decode path's PPL independently from the prefill path.
+    bool use_decode_as_prefill = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -135,6 +142,7 @@ private:
     ExecContext exec_ctx_prefill_;
     ExecContext exec_ctx_decode_;
     ThreadPool thread_pool_;
+    CPUBackend cpu_backend_;     // owned by engine; assigned to ExecContexts
     int past_len_ = 0;
 
     // Shared mmap'd weight files (path → MappedFile)

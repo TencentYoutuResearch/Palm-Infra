@@ -281,3 +281,47 @@ mollm/
 ├── tests/                  18 个测试
 └── third_party/nlohmann/   JSON 库
 ```
+
+## 10. Dynamic Shape & Backend Abstraction（v3 graph format）
+
+### Dynamic shape schema
+
+每个 `GraphNode` 携带 `dynamic[4]` 字段（每维一个 `DynamicKind`）：
+
+```cpp
+enum class DynamicKind : int8_t {
+    STATIC  = 0,   // out_shape[i] 的值就是该维大小
+    SEQ     = 1,   // 此维 = runtime 注入的 seq_len
+    BATCH   = 2,   // reserved for future batch dim
+};
+```
+
+- **transpile 时**：`propagate_dynamic_shapes()` pass 从 INPUT 节点（hidden/mask/cos/sin 标 SEQ dim 1）按 op 规则传播到下游所有 tensor
+- **runtime 不做 shape inference**：只读 `node.dynamic[]`，是 SEQ 的位置在 `inject_runtime_shapes()` 里填实际 seq_len
+- **graph format v3**：`dynamic[4]` 紧跟 `out_shape[4]` 序列化（4 字节包）。不向前兼容 v2
+
+### Backend 抽象
+
+```cpp
+class Backend {
+public:
+    virtual ShapeMode shape_mode() const = 0;  // DYNAMIC (CPU) | STATIC_PADDED (NPU future)
+    virtual int padded_seq_len() const { return -1; }
+    virtual void dispatch(OpType, const OpParams&,
+                         const std::vector<const Tensor*>&,
+                         Tensor* output, ThreadPool*) = 0;
+};
+
+class CPUBackend : public Backend { /* routes to NEON kernels */ };
+// 未来: class NPUBackend : public Backend { ... };
+```
+
+- **`.mollm` 后端中立**：transpile 不做任何后端特定优化、不写 PAD 节点、不假设 shape mode
+- **engine load 时选 backend**：CPUBackend 是当前唯一实现，未来 NPUBackend 由 runtime 选择
+- **Shape mode 由 backend 决定**：CPU=DYNAMIC（无 padding），NPU=STATIC_PADDED（pad 到编译时 seq_len）
+
+### 当前状态
+
+- **STATIC_PADDED 模式启用**：graph 按 build-time seq_len (256) 跑，stateful ops 通过 `n_real_tokens` 跳过 padding 位置
+- **DYNAMIC 模式 reserved**：机制就位（ExecContext.runtime_seq_len + inject_runtime_shapes），但 reshape() 节点的 SEQ 标记不完整（head_dim=256 与 seq_len=256 数值碰撞），暂未启用
+- **chunked prefill 已验证**：Test 5 跑 256 token 拆 (128,128) 和 (100,100,56) PPL 一致（8.4893 vs HF 8.50）

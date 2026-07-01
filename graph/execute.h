@@ -4,6 +4,7 @@
 #include <vector>
 
 class ThreadPool;
+class Backend;
 
 // ---------------------------------------------------------------------------
 // mollm — Execution context
@@ -23,7 +24,21 @@ struct ExecContext {
     Graph*        graph   = nullptr;
     BufferPool*   pool    = nullptr;
     ThreadPool*   thread_pool = nullptr;
+    Backend*      backend = nullptr;   // op dispatcher (CPU/NPU/...)
     bool          profile_enabled = false;
+
+    // ---- Dynamic shape injection ----
+    // When the graph contains dynamic DimExpr dims (SEQ/MUL/ADD), runtime
+    // injects the actual seq_len here before execution. inject_runtime_shapes()
+    // reads this and fills tensor shapes accordingly.
+    //   static_padded=false (DYNAMIC mode): runtime_seq_len = actual token count
+    //   static_padded=true  (STATIC_PADDED mode): runtime_seq_len = actual token
+    //     count (for n_real_tokens in stateful ops), padded_seq_len = graph's
+    //     fixed seq_len (for shape + buffer allocation).
+    int  runtime_seq_len = -1;     // actual token count (must be set if graph has SEQ)
+    int  runtime_batch   = -1;     // reserved for future BATCH dim support
+    bool static_padded   = false;  // STATIC_PADDED mode (NPU backend future)
+    int  padded_seq_len  = -1;     // padded_seq_len for STATIC_PADDED mode
 
     // liveness: release_queue[i] = nodes that can be freed after node i
     std::vector<std::vector<uint32_t>> release_queue;
@@ -35,6 +50,11 @@ void reset_profile_stats(ExecContext& ctx);
 /// Compute use_count + last_use + release_queue from the graph topology.
 /// Must be called once after graph_load().
 void prepare_execution(ExecContext& ctx);
+
+/// Inject runtime seq_len into the graph's INPUT tensors and patch stateful
+/// op params (GDN_PREFILL / SHORTCONV n_real_tokens). Must be called before
+/// execute_graph() when the graph contains dynamic DimExpr dims.
+void inject_runtime_shapes(ExecContext& ctx);
 
 /// Execute the graph once.  Input tensors must already have data set.
 /// Allocates intermediate tensors from the BufferPool.
