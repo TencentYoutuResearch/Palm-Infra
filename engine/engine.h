@@ -82,6 +82,12 @@ struct EngineConfig {
     // (so prefill() runs the seq=1 decode graph). Used by test_e2e to verify
     // the decode path's PPL independently from the prefill path.
     bool use_decode_as_prefill = false;
+
+    // When true, prefill pads short prompts to graph_seq_len (build-time
+    // seq_len, typically 256) instead of running with the actual token count.
+    // Stateful ops still receive n_real_tokens to skip padding positions.
+    // For A/B benchmark comparison against DYNAMIC mode.
+    bool static_padded = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -191,7 +197,7 @@ private:
     std::vector<CachePair> caches_;
 
     /// Embed tokens.
-    Tensor embed(const std::vector<int>& token_ids);
+    Tensor embed(const std::vector<int>& token_ids, int pad_to = 0);
 
     /// Run lm_head on the last hidden state.
     int run_lmhead(const Tensor& hidden, int n_tokens = 1);

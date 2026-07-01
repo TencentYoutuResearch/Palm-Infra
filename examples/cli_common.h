@@ -19,6 +19,7 @@ struct CliCommonOptions {
     int num_threads = 4;
     bool profile = false;
     int warmup = 1;
+    bool static_padded = false;  // pad short prompts to graph_seq_len (A/B vs DYNAMIC)
 
     // Sampling
     float temperature = 0.6f;

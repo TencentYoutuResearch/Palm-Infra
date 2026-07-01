@@ -571,8 +571,9 @@ void LLMEngine::reset() {
 // embed
 // ---------------------------------------------------------------------------
 
-Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
-    int seq_len = (int)token_ids.size();
+Tensor LLMEngine::embed(const std::vector<int>& token_ids, int pad_to) {
+    int n = (int)token_ids.size();
+    int seq_len = (pad_to > n) ? pad_to : n;
 
     if (embed_weight_ && embed_weight_->data) {
         int vocab_size = (int)embed_weight_->shape[0];
@@ -585,11 +586,13 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
         void* buf = graph_prefill_.runtime.pool.acquire(nbytes);
         Tensor t = Tensor::create(Precision::FP32, MemoryType::POOLED,
                                   hidden_dim, seq_len, 1, 1, buf);
+        // Zero-init so padding positions (if any) are well-defined zeros.
+        std::memset(t.data, 0, nbytes);
 
         if (embed_weight_->prec == Precision::FP16) {
             // Row-major FP16 — simple direct access
             const __fp16* embed_data = reinterpret_cast<const __fp16*>(embed_weight_->data);
-            for (int s = 0; s < seq_len; s++) {
+            for (int s = 0; s < n; s++) {
                 int tid = token_ids[s];
                 if (tid < 0 || tid >= vocab_size) tid = 0;
                 float* dst = t.ptr<float>() + s * hidden_dim;
@@ -600,7 +603,7 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids) {
         } else {
             // Row-major FP32
             const float* embed_data = embed_weight_->ptr<float>();
-            for (int s = 0; s < seq_len; s++) {
+            for (int s = 0; s < n; s++) {
                 int tid = token_ids[s];
                 if (tid < 0 || tid >= vocab_size) tid = 0;
                 float* dst = t.ptr<float>() + s * hidden_dim;
@@ -803,9 +806,29 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
 
     execute_graph(exec_ctx);
 
+    // Release INPUT buffers (hidden/mask/cos/sin) back to the pool.
+    // These are acquired by run_graph above and are NOT borrowed (unlike
+    // view ops' borrowed data). cache_k/cache_v are load-time allocated
+    // and must persist — skip INPUT nodes whose data is EXTERNAL/OWNED.
     if (!graph.graph_outputs.empty()) {
         uint32_t out_id = graph.graph_outputs.back();
-        return tensors[out_id];
+        Tensor result = tensors[out_id];
+
+        for (auto& node : graph.nodes) {
+            if (node.op_type != OpType::INPUT) continue;
+            if (node.params.str.empty()) continue;
+            const std::string& name = node.params.str[0];
+            if (name == "hidden" || name == "mask" || name == "cos" || name == "sin") {
+                Tensor& t = tensors[node.id];
+                if (t.data && t.mem_type == MemoryType::POOLED) {
+                    graph.runtime.pool.release(t.data, t.nbytes());
+                    t.data = nullptr;
+                    t.mem_type = MemoryType::NONE;
+                }
+            }
+        }
+
+        return result;
     }
 
     fprintf(stderr, "Engine: no graph output found\n");
@@ -874,19 +897,34 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     int hidden_dim = (int)h.shape[0];
 
     // DYNAMIC mode: no padding, runtime fills SEQ/MUL/ADD dims via DimExpr.
-    exec_ctx_prefill_.runtime_seq_len = n;
-    exec_ctx_prefill_.static_padded   = false;
-    exec_ctx_prefill_.padded_seq_len  = -1;
-    inject_runtime_shapes(exec_ctx_prefill_);
-
-    // h.shape[1] = n (actual token count). INPUT node's SEQ dim gets n via
-    // inject_runtime_shapes; downstream SEQ/MUL dims inherit it.
-    h.shape[1] = n;
-    h.compute_strides();
-
+    // STATIC_PADDED mode: pad short prompts to graph_seq_len (A/B comparison).
+    const bool use_padding = cfg_.static_padded && n < graph_seq_len;
     Tensor cos, sin;
-    generate_rope_cache(n, past_len_, cos, sin);
-    Tensor mask = build_causal_mask(n, past_len_);
+    Tensor mask;
+
+    if (use_padding) {
+        exec_ctx_prefill_.runtime_seq_len = n;
+        exec_ctx_prefill_.static_padded   = true;
+        exec_ctx_prefill_.padded_seq_len  = graph_seq_len;
+        inject_runtime_shapes(exec_ctx_prefill_);
+        // Re-embed with padding (the embed above used n; re-embed to graph_seq_len)
+        h = embed(token_ids, graph_seq_len);
+        h.shape[1] = graph_seq_len;
+        h.compute_strides();
+        generate_rope_cache(graph_seq_len, past_len_, cos, sin);
+        mask = build_causal_mask(graph_seq_len, past_len_);
+    } else {
+        exec_ctx_prefill_.runtime_seq_len = n;
+        exec_ctx_prefill_.static_padded   = false;
+        exec_ctx_prefill_.padded_seq_len  = -1;
+        inject_runtime_shapes(exec_ctx_prefill_);
+        // h.shape[1] = n (actual token count). INPUT node's SEQ dim gets n via
+        // inject_runtime_shapes; downstream SEQ/MUL dims inherit it.
+        h.shape[1] = n;
+        h.compute_strides();
+        generate_rope_cache(n, past_len_, cos, sin);
+        mask = build_causal_mask(n, past_len_);
+    }
 
     // n_real_tokens injection is done by inject_runtime_shapes() above.
 
@@ -933,20 +971,36 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
 
     // DYNAMIC mode: no padding. runtime fills SEQ/MUL/ADD dims via DimExpr
     // evaluation against runtime_seq_len. Symbolic reshape handles N*seq.
-    exec_ctx_prefill_.runtime_seq_len = n;
-    exec_ctx_prefill_.static_padded   = false;
-    exec_ctx_prefill_.padded_seq_len  = -1;
-    inject_runtime_shapes(exec_ctx_prefill_);
-
-    Tensor h = embed(token_ids);
-    // h.shape[1] = n (actual token count, no padding).
-    h.shape[1] = n;
-    h.compute_strides();
-
+    //
+    // STATIC_PADDED mode: pad short chunks (n < graph_seq_len) to graph_seq_len.
+    // Stateful ops (GDN/SHORTCONV) receive n_real via params to skip padding
+    // positions. Full chunks (n == graph_seq_len) skip padding (identical work).
+    const bool use_padding = cfg_.static_padded && n < graph_seq_len;
+    Tensor h;
     Tensor cos, sin;
-    generate_rope_cache(n, past, cos, sin);
+    Tensor mask;
 
-    Tensor mask = build_causal_mask(n, past);
+    if (use_padding) {
+        exec_ctx_prefill_.runtime_seq_len = n;          // real token count
+        exec_ctx_prefill_.static_padded   = true;
+        exec_ctx_prefill_.padded_seq_len  = graph_seq_len;
+        inject_runtime_shapes(exec_ctx_prefill_);
+        h = embed(token_ids, graph_seq_len);             // zero-padded to graph_seq_len
+        h.shape[1] = graph_seq_len;
+        h.compute_strides();
+        generate_rope_cache(graph_seq_len, past, cos, sin);
+        mask = build_causal_mask(graph_seq_len, past);
+    } else {
+        exec_ctx_prefill_.runtime_seq_len = n;
+        exec_ctx_prefill_.static_padded   = false;
+        exec_ctx_prefill_.padded_seq_len  = -1;
+        inject_runtime_shapes(exec_ctx_prefill_);
+        h = embed(token_ids);
+        h.shape[1] = n;
+        h.compute_strides();
+        generate_rope_cache(n, past, cos, sin);
+        mask = build_causal_mask(n, past);
+    }
 
     // n_real_tokens injection is now done by inject_runtime_shapes() above.
 

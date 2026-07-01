@@ -1024,9 +1024,36 @@ void execute_graph(ExecContext& ctx) {
     // Without this reset, a second execute_graph() call would see stale
     // out.data from the previous call, skipping both shape init and buffer
     // allocation — leading to use of freed/reused memory.
-    // INPUT/CONSTANT tensors keep their data (set by engine / load-time).
+    //
+    // IMPORTANT: only release buffers owned by non-view ops. View ops
+    // (RESHAPE/PERMUTE/SLICE/TILE/CONCAT) borrow data from their inputs;
+    // releasing their borrowed pointer would double-free (the underlying
+    // owner also releases it). Without this exclusion, view-op buffers
+    // leaked across execute_graph() calls — causing the pool to grow
+    // unboundedly on chunked prefill (n=2048 peaked at 37GB).
+    // INPUT/CONSTANT tensors keep their data (set by engine / load-time,
+    // e.g. cache_k/cache_v which are mmap'd or load-time allocated).
+    auto is_view_op = [](OpType op) {
+        return op == OpType::RESHAPE || op == OpType::PERMUTE ||
+               op == OpType::SLICE || op == OpType::TILE ||
+               op == OpType::CONCAT;
+    };
     for (size_t i = 0; i < nodes.size(); i++) {
         auto& node = nodes[i];
+        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        if (is_view_op(node.op_type)) continue;  // borrowed data, don't release
+        auto& t = tensors[node.id];
+        if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
+            pool->release(t.data, t.nbytes());
+        }
+        t.data = nullptr;
+        t.mem_type = MemoryType::NONE;
+    }
+    // View ops: just null the pointer (their data is borrowed, will be
+    // re-inherited from inputs at dispatch time).
+    for (size_t i = 0; i < nodes.size(); i++) {
+        auto& node = nodes[i];
+        if (!is_view_op(node.op_type)) continue;
         if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
         auto& t = tensors[node.id];
         t.data = nullptr;

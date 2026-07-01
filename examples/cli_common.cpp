@@ -96,6 +96,8 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             }
         } else if (arg == "--profile") {
             opts.profile = true;
+        } else if (arg == "--static-padded") {
+            opts.static_padded = true;
         } else if (arg == "--warmup") {
             if (!require_value(argc, argv, i, "--warmup", value, error)) return false;
             if (!parse_int(value, opts.warmup) || opts.warmup < 0) {
@@ -147,6 +149,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --rope-theta <float>      Default: 1600000\n");
     std::printf("  --threads <int>          Default: 4\n");
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
+    std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
     std::printf("  --warmup <int>            Default: 1 (used by benchmark)\n");
     std::printf("  --temperature <float>     Default: 0.6 (0 = greedy)\n");
     std::printf("  --top-k <int>             Default: 50 (0 = disabled)\n");
@@ -169,6 +172,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.top_k = opts.top_k;
     cfg.top_p = opts.top_p;
     cfg.seed = (unsigned int)opts.seed;
+    cfg.static_padded = opts.static_padded;
     return cfg;
 }
 

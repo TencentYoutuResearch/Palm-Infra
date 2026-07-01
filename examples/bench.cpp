@@ -111,12 +111,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "bench: prompt is empty after tokenization\n");
         return 1;
     }
-    if ((int)prompt_ids.size() > prefill_seq_len) {
-        std::fprintf(stderr,
-                     "bench: prompt too long (%zu tokens > prefill seq_len %d)\n",
-                     prompt_ids.size(), prefill_seq_len);
-        return 1;
-    }
+    // Long prompts are handled by chunked prefill (prefill() splits into
+    // graph_seq_len-sized chunks). No upper bound check here — only the
+    // per-chunk size matters, and that's enforced inside the engine.
 
     for (int i = 0; i < opts.warmup; i++) {
         GenerationResult warmup_result;
