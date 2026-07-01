@@ -1,5 +1,8 @@
 #include "graph/buffer_pool.h"
 #include <algorithm>
+#include <cassert>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 // ---------------------------------------------------------------------------
@@ -7,6 +10,21 @@
 // ---------------------------------------------------------------------------
 
 namespace {
+
+std::atomic<uint32_t> g_next_pool_id{1};
+#ifndef MOLLM_DISABLE_STORAGE_DEBUG
+std::atomic<uint64_t> g_next_storage_id{1};
+#endif
+
+uint32_t next_pool_id() {
+    return g_next_pool_id.fetch_add(1, std::memory_order_relaxed);
+}
+
+#ifndef MOLLM_DISABLE_STORAGE_DEBUG
+uint64_t next_storage_id() {
+    return g_next_storage_id.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
 
 void* aligned_alloc_bytes(size_t size, size_t alignment) {
 #if defined(_WIN32)
@@ -27,6 +45,8 @@ void aligned_free(void* ptr) {
 }
 
 } // anonymous namespace
+
+BufferPool::BufferPool() : id_(next_pool_id()) {}
 
 // ---------------------------------------------------------------------------
 // round_up
@@ -58,16 +78,25 @@ void* BufferPool::acquire(size_t bytes) {
         auto& list = it->second;
         void* ptr = list.back();
         list.pop_back();
-        active_ += bucket;
-        if (active_ > peak_) peak_ = active_;
+#ifndef MOLLM_DISABLE_ACTIVE_TRACKING
+        active_allocs_[ptr] = bucket;
+#endif
+        active_bytes_ += bucket;
+        if (active_bytes_ > peak_) peak_ = active_bytes_;
         return ptr;
     }
 
     // allocate fresh — must be aligned
     void* buf = aligned_alloc_bytes(bucket, ALIGNMENT);
     if (!buf) return nullptr;
-    active_ += bucket;
-    if (active_ > peak_) peak_ = active_;
+#ifndef MOLLM_DISABLE_ACTIVE_TRACKING
+    active_allocs_[buf] = bucket;
+#endif
+#ifndef MOLLM_DISABLE_STORAGE_DEBUG
+    storage_ids_[buf] = next_storage_id();
+#endif
+    active_bytes_ += bucket;
+    if (active_bytes_ > peak_) peak_ = active_bytes_;
     return buf;
 }
 
@@ -79,8 +108,27 @@ void BufferPool::release(void* ptr, size_t bytes) {
     if (!ptr) return;
 
     size_t bucket = round_up(bytes);
+#ifndef MOLLM_DISABLE_ACTIVE_TRACKING
+    auto it = active_allocs_.find(ptr);
+    if (it == active_allocs_.end()) {
+        std::fprintf(stderr, "BufferPool::release: foreign or double-released pointer %p\n", ptr);
+        assert(false && "BufferPool::release foreign/double pointer");
+        return;
+    }
+    if (it->second != bucket) {
+        std::fprintf(stderr,
+                     "BufferPool::release: bucket mismatch for %p (got %zu, expected %zu)\n",
+                     ptr, bucket, it->second);
+        assert(false && "BufferPool::release size/bucket mismatch");
+        return;
+    }
+
     release_count_++;
-    active_ -= bucket;
+    active_allocs_.erase(it);
+#else
+    release_count_++;
+#endif
+    active_bytes_ -= bucket;
     free_[bucket].push_back(ptr);
 }
 
@@ -89,28 +137,34 @@ void BufferPool::release(void* ptr, size_t bytes) {
 // ---------------------------------------------------------------------------
 
 void BufferPool::clear() {
+#ifndef MOLLM_DISABLE_ACTIVE_TRACKING
+    for (auto& [ptr, bucket] : active_allocs_) {
+        (void)bucket;
+        if (ptr) aligned_free(ptr);
+    }
+    active_allocs_.clear();
+#endif
+
     for (auto& [size, list] : free_) {
+        (void)size;
         for (void* ptr : list) {
             // Safety: check pointer is not null
             if (ptr) aligned_free(ptr);
         }
     }
     free_.clear();
-    active_ = 0;
+#ifndef MOLLM_DISABLE_STORAGE_DEBUG
+    storage_ids_.clear();
+#endif
+    active_bytes_ = 0;
     // peak_ intentionally preserved — it's a high-water mark for the session
 }
 
 // ---------------------------------------------------------------------------
-// reset (return all active to freelist without freeing — caller must track
-//         its own active allocations and call reset() between prefill/decode)
+// reset
 // ---------------------------------------------------------------------------
 
 void BufferPool::reset() {
-    // reset() is designed to be called after the caller has manually
-    // released all active buffers.  We just clear the freelist here
-    // to match the semantics: after reset, everything is available again.
-    //
-    // The actual "return to freelist" happens per-buffer via release().
     clear();
 }
 
@@ -124,4 +178,14 @@ size_t BufferPool::pool_bytes() const {
         total += size * list.size();
     }
     return total;
+}
+
+uint64_t BufferPool::storage_id(void* ptr) const {
+#ifdef MOLLM_DISABLE_STORAGE_DEBUG
+    (void)ptr;
+    return 0;
+#else
+    auto it = storage_ids_.find(ptr);
+    return it == storage_ids_.end() ? 0 : it->second;
+#endif
 }

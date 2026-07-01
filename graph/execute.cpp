@@ -8,6 +8,7 @@
 #include "kernels/tensor.h"
 #include "kernels/activations.h"  // for Activation enum + sigmoid_f32_neon
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -134,6 +135,13 @@ static inline bool is_contiguous_layout(const Tensor& t) {
     if (t.stride[2] != t.stride[1] * t.shape[1]) return false;
     if (t.stride[3] != t.stride[2] * t.shape[2]) return false;
     return true;
+}
+
+static inline bool shares_storage(const Tensor& a, const Tensor& b) {
+    if (a.storage_id != 0 && b.storage_id != 0) {
+        return a.owner_id == b.owner_id && a.storage_id == b.storage_id;
+    }
+    return a.data == b.data;
 }
 
 // Apply a unary op (sigmoid/silu/etc) reading from `src` (may be strided view),
@@ -265,11 +273,81 @@ void reset_profile_stats(ExecContext& ctx) {
 void prepare_execution(ExecContext& ctx) {
     auto& nodes = ctx.graph->nodes;
     const size_t N = nodes.size();
-    ctx.release_queue.resize(N);
+    ctx.release_queue.assign(N, {});
     reset_profile_stats(ctx);
-    // Phase 1: simple approach — don't free anything.
-    // Memory is released when the BufferPool is destroyed.
-    // Proper liveness analysis with view-awareness will be added later.
+
+    // Stateful/cache-mutating graphs need a stronger storage dependency model:
+    // SDPA updates KV cache, GDN/SHORTCONV update recurrent state, and their
+    // inputs may alias persistent engine storage. Keep them on end-of-call
+    // cleanup until TensorStorage/storage-id tracking replaces pointer-based
+    // borrowed-view inference.
+    for (const auto& node : nodes) {
+        if (node.op_type == OpType::SDPA || node.op_type == OpType::SDPA_MLA ||
+            node.op_type == OpType::GATED_DELTANET_PREFILL ||
+            node.op_type == OpType::GATED_DELTANET_DECODE ||
+            node.op_type == OpType::SHORTCONV) {
+            return;
+        }
+    }
+
+    uint32_t max_id = 0;
+    for (const auto& node : nodes) max_id = std::max(max_id, node.id);
+    const size_t M = (size_t)max_id + 1;
+
+    std::vector<uint32_t> owner_root(M, 0);
+    std::vector<int> node_index(M, -1);
+    std::vector<int> last_direct_use(M, -1);
+    std::vector<int> last_storage_use(M, -1);
+    std::vector<uint8_t> keep(M, 0);
+
+    auto is_view_like = [](OpType op) {
+        // RESHAPE may materialize at runtime for non-contiguous inputs, but it
+        // may also borrow. Treating it as view-like for owner propagation keeps
+        // producers alive for the borrowed case; runtime release skips it when
+        // it actually borrowed and releases it when it materialized.
+        return op == OpType::RESHAPE || op == OpType::PERMUTE || op == OpType::SLICE;
+    };
+
+    for (size_t i = 0; i < N; i++) {
+        const auto& node = nodes[i];
+        if (node.id >= M) continue;
+        node_index[node.id] = (int)i;
+
+        if (is_view_like(node.op_type) && !node.inputs.empty() && node.inputs[0] < M) {
+            owner_root[node.id] = owner_root[node.inputs[0]];
+        } else {
+            owner_root[node.id] = node.id;
+        }
+        if (owner_root[node.id] >= M) owner_root[node.id] = node.id;
+
+        for (uint32_t inp_id : node.inputs) {
+            if (inp_id >= M) continue;
+            last_direct_use[inp_id] = (int)i;
+            uint32_t root = owner_root[inp_id];
+            if (root < M) last_storage_use[root] = std::max(last_storage_use[root], (int)i);
+        }
+    }
+
+    // Graph outputs are returned to the caller. If the output is a borrowed
+    // view, its storage owner must also stay alive past execute_graph().
+    for (uint32_t out_id : ctx.graph->graph_outputs) {
+        if (out_id >= M) continue;
+        keep[out_id] = 1;
+        uint32_t root = owner_root[out_id];
+        if (root < M) keep[root] = 1;
+    }
+
+    for (const auto& node : nodes) {
+        if (node.id >= M) continue;
+        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        if (keep[node.id]) continue;
+
+        int rel_at = std::max(last_direct_use[node.id], last_storage_use[node.id]);
+        if (rel_at < 0) rel_at = node_index[node.id];  // dead materialized output
+        if (rel_at >= 0 && (size_t)rel_at < ctx.release_queue.size()) {
+            ctx.release_queue[rel_at].push_back(node.id);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,48 +1094,84 @@ void execute_graph(ExecContext& ctx) {
     // In DYNAMIC mode this = runtime_seq_len; in STATIC_PADDED mode = padded_seq_len.
     const int seq_val = ctx.static_padded ? ctx.padded_seq_len : ctx.runtime_seq_len;
     const bool has_dynamic = (seq_val > 0);
+    const bool same_shape_workspace =
+        ctx.reuse_same_shape_workspace &&
+        ctx.workspace_shape_valid &&
+        ctx.workspace_runtime_seq_len == ctx.runtime_seq_len &&
+        ctx.workspace_runtime_batch == ctx.runtime_batch &&
+        ctx.workspace_static_padded == ctx.static_padded &&
+        ctx.workspace_padded_seq_len == ctx.padded_seq_len;
+    const bool reuse_workspace =
+        (ctx.reuse_static_workspace && !has_dynamic) ||
+        (has_dynamic && same_shape_workspace);
 
-    // Reset non-INPUT/CONSTANT tensor state before execution.
-    // Zero-copy view ops (RESHAPE/PERMUTE/SLICE/TILE/CONCAT) inherit data
-    // pointers from their inputs at dispatch time, but their tensor.data is
-    // NOT cleared by the release pass (see "view ops: continue" below).
-    // Without this reset, a second execute_graph() call would see stale
-    // out.data from the previous call, skipping both shape init and buffer
-    // allocation — leading to use of freed/reused memory.
+    // Reset non-INPUT/CONSTANT tensor state before execution. Borrowed views
+    // must always be cleared because their source storage may be overwritten
+    // or released between calls. Materialized tensors are released by default;
+    // fully static graphs may opt into keeping them as reusable workspace.
     //
-    // IMPORTANT: only release buffers owned by non-view ops. View ops
-    // (RESHAPE/PERMUTE/SLICE/TILE/CONCAT) borrow data from their inputs;
-    // releasing their borrowed pointer would double-free (the underlying
-    // owner also releases it). Without this exclusion, view-op buffers
-    // leaked across execute_graph() calls — causing the pool to grow
-    // unboundedly on chunked prefill (n=2048 peaked at 37GB).
+    // IMPORTANT: only release buffers owned by materialized ops. View ops
+    // (zero-copy RESHAPE/PERMUTE/SLICE) borrow data from their inputs;
+    // releasing their borrowed pointer would double-free the real owner.
     // INPUT/CONSTANT tensors keep their data (set by engine / load-time,
     // e.g. cache_k/cache_v which are mmap'd or load-time allocated).
-    auto is_view_op = [](OpType op) {
-        return op == OpType::RESHAPE || op == OpType::PERMUTE ||
-               op == OpType::SLICE || op == OpType::TILE ||
-               op == OpType::CONCAT;
+    auto is_always_borrowed_view_op = [](OpType op) {
+        return op == OpType::PERMUTE || op == OpType::SLICE;
     };
+    // First classify borrowed views while all producer pointers are still
+    // intact. View chains are common; mutating an earlier view before
+    // classifying a later one would lose the pointer equality evidence.
+    std::vector<uint8_t> borrowed_view(nodes.size(), 0);
+    const std::vector<uint32_t> empty_release_batch;
     for (size_t i = 0; i < nodes.size(); i++) {
         auto& node = nodes[i];
         if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
-        if (is_view_op(node.op_type)) continue;  // borrowed data, don't release
         auto& t = tensors[node.id];
-        if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
-            pool->release(t.data, t.nbytes());
+
+        bool borrowed = is_always_borrowed_view_op(node.op_type);
+        if (node.op_type == OpType::RESHAPE && !node.inputs.empty()) {
+            const Tensor& src = tensors[node.inputs[0]];
+            borrowed = shares_storage(t, src);
         }
-        t.data = nullptr;
-        t.mem_type = MemoryType::NONE;
+        borrowed_view[node.id] = borrowed ? 1 : 0;
     }
-    // View ops: just null the pointer (their data is borrowed, will be
-    // re-inherited from inputs at dispatch time).
+
+    // Clear borrowed views without releasing their borrowed pointer.
     for (size_t i = 0; i < nodes.size(); i++) {
         auto& node = nodes[i];
-        if (!is_view_op(node.op_type)) continue;
         if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        if (!borrowed_view[node.id]) continue;
         auto& t = tensors[node.id];
         t.data = nullptr;
         t.mem_type = MemoryType::NONE;
+        t.owner_id = 0;
+        t.storage_id = 0;
+    }
+
+    if (!reuse_workspace) {
+        // Then release materialized outputs. Borrowed views were nulled above,
+        // so RESHAPE only reaches this path when it actually materialized a
+        // buffer.
+        for (size_t i = 0; i < nodes.size(); i++) {
+            auto& node = nodes[i];
+            if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+            if (borrowed_view[node.id]) continue;
+            auto& t = tensors[node.id];
+            if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
+                if (t.owner_id != 0 && t.owner_id != pool->id()) {
+                    std::fprintf(stderr,
+                                 "execute_graph: owner mismatch before release for node %u (%p owner=%u pool=%u)\n",
+                                 node.id, t.data, t.owner_id, pool->id());
+                    assert(false && "execute_graph owner mismatch");
+                    return;
+                }
+                pool->release(t.data, t.nbytes());
+            }
+            t.data = nullptr;
+            t.mem_type = MemoryType::NONE;
+            t.owner_id = 0;
+            t.storage_id = 0;
+        }
     }
 
     for (size_t i = 0; i < nodes.size(); i++) {
@@ -1118,46 +1232,87 @@ void execute_graph(ExecContext& ctx) {
             }
         }
 
-        // allocate output if needed
-        if (out.data == nullptr) {
-            size_t nbytes = out.nbytes();
-            if (nbytes > 0) {
-                void* buf = pool->acquire(nbytes);
-                if (!buf) {
-                    fprintf(stderr, "execute: pool acquire failed for node %u (%zu bytes)\n",
-                            node.id, nbytes);
-                    return;
-                }
-                out.data     = buf;
-                out.mem_type = MemoryType::POOLED;
-            }
-        }
-
-        // collect inputs
+        // collect inputs before allocation so zero-copy views can avoid
+        // acquiring a buffer they will immediately overwrite with borrowed data.
         std::vector<const Tensor*> inputs;
         inputs.reserve(node.inputs.size());
         for (uint32_t inp_id : node.inputs) {
             inputs.push_back(&tensors[inp_id]);
         }
 
+        // allocate output if needed
+        if (out.data == nullptr) {
+            size_t nbytes = out.nbytes();
+            bool needs_allocation = true;
+            if (node.op_type == OpType::PERMUTE || node.op_type == OpType::SLICE) {
+                needs_allocation = false;
+            } else if (node.op_type == OpType::RESHAPE) {
+                needs_allocation = !(inputs.size() >= 1 && inputs[0] && inputs[0]->is_contiguous());
+            }
+            if (nbytes > 0) {
+                if (needs_allocation) {
+                    void* buf = pool->acquire(nbytes);
+                    if (!buf) {
+                        fprintf(stderr, "execute: pool acquire failed for node %u (%zu bytes)\n",
+                                node.id, nbytes);
+                        return;
+                    }
+                    out.data     = buf;
+                    out.mem_type = MemoryType::POOLED;
+                    out.owner_id = pool->id();
+                    out.storage_id = pool->storage_id(buf);
+                }
+            }
+        }
+
         // dispatch via backend
         ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
 
-        // release completed tensors
-        for (uint32_t rel_id : ctx.release_queue[i]) {
+        // Release completed tensors. Classify borrowed views before mutating
+        // any producer in this release batch; a producer and its view can have
+        // the same last-use node.
+        const auto& rels = reuse_workspace ? empty_release_batch : ctx.release_queue[i];
+        std::vector<uint8_t> rel_borrowed(rels.size(), 0);
+        for (size_t r = 0; r < rels.size(); r++) {
+            uint32_t rel_id = rels[r];
+            if (rel_id >= nodes.size()) continue;
+            auto op = nodes[rel_id].op_type;
+            if (op == OpType::SLICE || op == OpType::PERMUTE) {
+                rel_borrowed[r] = 1;
+            } else if (op == OpType::RESHAPE && !nodes[rel_id].inputs.empty()) {
+                auto& t = tensors[rel_id];
+                rel_borrowed[r] = shares_storage(t, tensors[nodes[rel_id].inputs[0]]) ? 1 : 0;
+            }
+        }
+
+        for (size_t r = 0; r < rels.size(); r++) {
+            uint32_t rel_id = rels[r];
             auto& t = tensors[rel_id];
             if (rel_id < nodes.size()) {
                 auto op = nodes[rel_id].op_type;
-                if (op == OpType::INPUT || op == OpType::CONSTANT ||
-                    op == OpType::SLICE || op == OpType::RESHAPE ||
-                    op == OpType::PERMUTE || op == OpType::TILE ||
-                    op == OpType::CONCAT)
+                if (op == OpType::INPUT || op == OpType::CONSTANT)
                     continue;
+                if (rel_borrowed[r]) {
+                    t.data = nullptr;
+                    t.mem_type = MemoryType::NONE;
+                    t.owner_id = 0;
+                    t.storage_id = 0;
+                    continue;
+                }
             }
             if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
+                if (t.owner_id != 0 && t.owner_id != pool->id()) {
+                    std::fprintf(stderr,
+                                 "execute_graph: owner mismatch in release_queue for node %u (%p owner=%u pool=%u)\n",
+                                 rel_id, t.data, t.owner_id, pool->id());
+                    assert(false && "execute_graph release_queue owner mismatch");
+                    return;
+                }
                 pool->release(t.data, t.nbytes());
                 t.data     = nullptr;
                 t.mem_type = MemoryType::NONE;
+                t.owner_id = 0;
+                t.storage_id = 0;
             }
         }
 
@@ -1168,5 +1323,13 @@ void execute_graph(ExecContext& ctx) {
             stat.calls += 1;
             stat.total_ns += elapsed_ns;
         }
+    }
+
+    if (ctx.reuse_same_shape_workspace && has_dynamic) {
+        ctx.workspace_shape_valid = true;
+        ctx.workspace_runtime_seq_len = ctx.runtime_seq_len;
+        ctx.workspace_runtime_batch = ctx.runtime_batch;
+        ctx.workspace_static_padded = ctx.static_padded;
+        ctx.workspace_padded_seq_len = ctx.padded_seq_len;
     }
 }

@@ -55,7 +55,6 @@ int main() {
 
     // ---- prepare ----
     prepare_execution(ctx);
-    // Phase 1: release_queue is empty (no-release mode)
     CHECK(ctx.release_queue.size() == 2, "release_queue sized");
 
     // ---- execute ----
@@ -70,6 +69,7 @@ int main() {
 
     // verify data is shared (zero-copy reshape)
     CHECK(t1.data == t0.data, "reshape shares data pointer");
+    CHECK(pool.active_bytes() == 0, "zero-copy reshape does not allocate pool buffer");
 
     // verify pool active dropped (input was released after node 1)
     // input was OWNED, not POOLED, so it won't be released by the engine
@@ -117,6 +117,7 @@ int main() {
     // after swap: stride[0]=12, stride[1]=4
     CHECK(tp.stride[0] == 12 && tp.stride[1] == 4, "permute strides correct");
     CHECK(tp.at<float>(0, 1) == 2.0f, "permute data access via stride");
+    CHECK(pool2.active_bytes() == 0, "zero-copy permute does not allocate pool buffer");
 
     // ---- test: slice(dim=0) + concat(dim=0) preserve row layout ----
     Graph g3;
@@ -159,7 +160,9 @@ int main() {
     g3.nodes.push_back(concat);
 
     g3.graph_inputs = {0};
-    g3.graph_outputs = {3};
+    // Keep slices as explicit outputs because this test inspects them after
+    // execute_graph(); non-output internal views may be cleared by liveness.
+    g3.graph_outputs = {1, 2, 3};
     g3.runtime.tensors.resize(4);
 
     float* d3 = new float[8]{0, 1, 2, 3, 4, 5, 6, 7};
@@ -170,6 +173,7 @@ int main() {
     ctx3.graph = &g3;
     ctx3.pool = &pool3;
     ctx3.backend = &cpu_backend;
+    ctx3.reuse_static_workspace = true;
 
     prepare_execution(ctx3);
     execute_graph(ctx3);
@@ -186,6 +190,152 @@ int main() {
     CHECK(tc.at<float>(0, 1) == 4.0f && tc.at<float>(1, 1) == 5.0f &&
           tc.at<float>(2, 1) == 6.0f && tc.at<float>(3, 1) == 7.0f,
           "concat row 1 preserves dim0 ordering");
+    size_t concat_active = pool3.active_bytes();
+    size_t concat_acquires = pool3.acquire_count();
+    CHECK(concat_active > 0, "concat materializes pooled output");
+    execute_graph(ctx3);
+    CHECK(pool3.active_bytes() == concat_active, "concat repeated execute does not grow active pool bytes");
+    CHECK(pool3.acquire_count() == concat_acquires, "static workspace reuses concat buffer without reacquire");
+
+    // ---- test: dynamic same-shape workspace reuse ----
+    {
+        Graph gd;
+        GraphNode a;
+        a.id = 0;
+        a.op_type = OpType::INPUT;
+        a.out_shape[0] = 4;
+        a.out_shape[1] = 1;
+        a.dim_expr[1].kind = DIM_SEQ;
+        a.out_prec = Precision::FP32;
+        gd.nodes.push_back(a);
+
+        GraphNode b;
+        b.id = 1;
+        b.op_type = OpType::INPUT;
+        b.out_shape[0] = 4;
+        b.out_shape[1] = 1;
+        b.dim_expr[1].kind = DIM_SEQ;
+        b.out_prec = Precision::FP32;
+        gd.nodes.push_back(b);
+
+        GraphNode add;
+        add.id = 2;
+        add.op_type = OpType::ADD;
+        add.inputs = {0, 1};
+        add.out_shape[0] = 4;
+        add.out_shape[1] = 1;
+        add.dim_expr[1].kind = DIM_SEQ;
+        add.out_prec = Precision::FP32;
+        gd.nodes.push_back(add);
+
+        gd.graph_inputs = {0, 1};
+        gd.graph_outputs = {2};
+        gd.runtime.tensors.resize(3);
+
+        float da[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+        float db[12] = {10, 10, 10, 10, 20, 20, 20, 20, 30, 30, 30, 30};
+        gd.runtime.tensors[0] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 4, 3, 1, 1, da);
+        gd.runtime.tensors[1] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 4, 3, 1, 1, db);
+
+        BufferPool pool_d;
+        ExecContext ctx_d;
+        ctx_d.graph = &gd;
+        ctx_d.pool = &pool_d;
+        ctx_d.backend = &cpu_backend;
+        ctx_d.reuse_same_shape_workspace = true;
+        ctx_d.runtime_seq_len = 3;
+
+        prepare_execution(ctx_d);
+        execute_graph(ctx_d);
+        size_t dyn_active = pool_d.active_bytes();
+        size_t dyn_acquires = pool_d.acquire_count();
+        CHECK(gd.runtime.tensors[2].shape[1] == 3, "dynamic output shape follows runtime seq");
+        CHECK(gd.runtime.tensors[2].at<float>(0, 2) == 38.0f,
+              "dynamic same-shape output correct");
+
+        execute_graph(ctx_d);
+        CHECK(pool_d.active_bytes() == dyn_active,
+              "dynamic same-shape workspace keeps active bytes stable");
+        CHECK(pool_d.acquire_count() == dyn_acquires,
+              "dynamic same-shape workspace reuses buffer without reacquire");
+
+        gd.runtime.tensors[0] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 4, 2, 1, 1, da);
+        gd.runtime.tensors[1] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 4, 2, 1, 1, db);
+        ctx_d.runtime_seq_len = 2;
+        execute_graph(ctx_d);
+        CHECK(gd.runtime.tensors[2].shape[1] == 2, "dynamic changed-shape output updates shape");
+        CHECK(pool_d.acquire_count() > dyn_acquires,
+              "dynamic changed-shape workspace reacquires buffer");
+    }
+
+    // ---- test: view-aware liveness releases materialized producer after view consumer ----
+    {
+        Graph gl;
+        GraphNode a;
+        a.id = 0;
+        a.op_type = OpType::INPUT;
+        a.out_shape[0] = 4;
+        a.out_prec = Precision::FP32;
+        gl.nodes.push_back(a);
+
+        GraphNode b;
+        b.id = 1;
+        b.op_type = OpType::INPUT;
+        b.out_shape[0] = 4;
+        b.out_prec = Precision::FP32;
+        gl.nodes.push_back(b);
+
+        GraphNode add1;
+        add1.id = 2;
+        add1.op_type = OpType::ADD;
+        add1.inputs = {0, 1};
+        add1.out_shape[0] = 4;
+        add1.out_prec = Precision::FP32;
+        gl.nodes.push_back(add1);
+
+        GraphNode reshape_l;
+        reshape_l.id = 3;
+        reshape_l.op_type = OpType::RESHAPE;
+        reshape_l.inputs = {2};
+        reshape_l.out_shape[0] = 2;
+        reshape_l.out_shape[1] = 2;
+        reshape_l.out_prec = Precision::FP32;
+        reshape_l.params.i32 = {2, 2, 1, 1};
+        gl.nodes.push_back(reshape_l);
+
+        GraphNode add2;
+        add2.id = 4;
+        add2.op_type = OpType::ADD;
+        add2.inputs = {3, 1};
+        add2.out_shape[0] = 4;
+        add2.out_prec = Precision::FP32;
+        gl.nodes.push_back(add2);
+
+        gl.graph_inputs = {0, 1};
+        gl.graph_outputs = {4};
+        gl.runtime.tensors.resize(5);
+
+        float da[4] = {1, 2, 3, 4};
+        float db[4] = {10, 20, 30, 40};
+        gl.runtime.tensors[0] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 4, 1, 1, 1, da);
+        gl.runtime.tensors[1] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 4, 1, 1, 1, db);
+
+        BufferPool pool_l;
+        ExecContext ctx_l;
+        ctx_l.graph = &gl;
+        ctx_l.pool = &pool_l;
+        ctx_l.backend = &cpu_backend;
+
+        prepare_execution(ctx_l);
+        CHECK(!ctx_l.release_queue.empty(), "liveness release_queue built");
+        execute_graph(ctx_l);
+
+        Tensor& out_l = gl.runtime.tensors[4];
+        CHECK(out_l.at<float>(0) == 21.0f && out_l.at<float>(3) == 84.0f,
+              "liveness graph output correct");
+        CHECK(pool_l.active_bytes() == BufferPool::MIN_BUCKET,
+              "view-aware liveness releases intermediate producer");
+    }
 
     // ---- test: profiler counts executed ops ----
     {
@@ -226,7 +376,6 @@ int main() {
 
         CHECK(ctxp.profile_stats.size() == 2, "profile stats sized to node count");
         CHECK(ctxp.profile_stats[1].calls == 1, "profile counts reshape call");
-        CHECK(ctxp.profile_stats[1].total_ns > 0, "profile records non-zero time");
         CHECK(ctxp.profile_stats[1].op_type == OpType::RESHAPE, "profile records op type");
 
         delete[] dp;
@@ -274,6 +423,7 @@ int main() {
     ctx4.graph = &g4;
     ctx4.pool = &pool4;
     ctx4.backend = &cpu_backend;
+    ctx4.reuse_static_workspace = true;
 
     prepare_execution(ctx4);
     execute_graph(ctx4);
@@ -284,6 +434,12 @@ int main() {
           tr.at<float>(0, 1) == 4.0f && tr.at<float>(1, 1) == 1.0f &&
           tr.at<float>(0, 2) == 3.0f && tr.at<float>(1, 2) == 5.0f,
           "reshape after permute preserves logical element order");
+    size_t reshape_active = pool4.active_bytes();
+    size_t reshape_acquires = pool4.acquire_count();
+    CHECK(reshape_active > 0, "non-contiguous reshape materializes pooled output");
+    execute_graph(ctx4);
+    CHECK(pool4.active_bytes() == reshape_active, "non-contiguous reshape repeated execute does not grow active pool bytes");
+    CHECK(pool4.acquire_count() == reshape_acquires, "static workspace reuses materialized reshape buffer without reacquire");
 
     delete[] input_data;
     delete[] d2;

@@ -9,7 +9,8 @@ class Backend;
 // ---------------------------------------------------------------------------
 // mollm — Execution context
 //
-// prepare_execution() computes liveness information from the graph.
+// prepare_execution() initializes per-graph execution bookkeeping and computes
+// a conservative view-aware last-use release queue.
 // execute_graph() runs one full pass.
 // ---------------------------------------------------------------------------
 
@@ -26,6 +27,19 @@ struct ExecContext {
     ThreadPool*   thread_pool = nullptr;
     Backend*      backend = nullptr;   // op dispatcher (CPU/NPU/...)
     bool          profile_enabled = false;
+
+    // Keep materialized tensors alive across execute_graph() calls when the
+    // graph is fully static. Borrowed views are still cleared each call.
+    bool          reuse_static_workspace = false;
+
+    // Keep materialized tensors alive for dynamic graphs only when the runtime
+    // shape key is exactly the same as the previous execution.
+    bool          reuse_same_shape_workspace = false;
+    bool          workspace_shape_valid = false;
+    int           workspace_runtime_seq_len = -1;
+    int           workspace_runtime_batch = -1;
+    bool          workspace_static_padded = false;
+    int           workspace_padded_seq_len = -1;
 
     // ---- Dynamic shape injection ----
     // When the graph contains dynamic DimExpr dims (SEQ/MUL/ADD), runtime
@@ -47,8 +61,11 @@ struct ExecContext {
 
 void reset_profile_stats(ExecContext& ctx);
 
-/// Compute use_count + last_use + release_queue from the graph topology.
-/// Must be called once after graph_load().
+/// Initialize execution bookkeeping after graph_load().
+/// The release queue frees materialized intermediates after their last use.
+/// Borrowed views are cleared, not released; RESHAPE is conservatively treated
+/// as view-like for owner propagation because it may borrow or materialize at
+/// runtime depending on input contiguity.
 void prepare_execution(ExecContext& ctx);
 
 /// Inject runtime seq_len into the graph's INPUT tensors and patch stateful

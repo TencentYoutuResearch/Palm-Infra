@@ -10,21 +10,30 @@ static int failures = 0;
 
 int main() {
     BufferPool pool;
+    BufferPool other_pool;
+    CHECK(pool.id() != 0, "pool id is non-zero");
+    CHECK(other_pool.id() != 0, "second pool id is non-zero");
+    CHECK(pool.id() != other_pool.id(), "pool ids are unique");
 
     // ---- basic acquire / release ----
     void* p1 = pool.acquire(100);   // → 1024 bucket
     CHECK(p1 != nullptr, "acquire 100 bytes");
     CHECK(pool.active_bytes() >= 1024, "active >= 1024");
+    uint64_t p1_sid = pool.storage_id(p1);
+    CHECK(p1_sid != 0, "acquired buffer has storage id");
 
     void* p2 = pool.acquire(2000);  // → 2048 bucket
     CHECK(p2 != nullptr, "acquire 2000 bytes");
     CHECK(pool.active_bytes() >= 3072, "active >= 1024+2048");
+    CHECK(pool.storage_id(p2) != 0 && pool.storage_id(p2) != p1_sid,
+          "different buffers have different storage ids");
 
     // ---- release + reuse ----
     pool.release(p1, 100);
     CHECK(pool.active_bytes() < 3072, "active dropped after release");
     void* p1b = pool.acquire(50);   // should reuse the 1024 bucket
     CHECK(p1b == p1, "reused same pointer from freelist");
+    CHECK(pool.storage_id(p1b) == p1_sid, "reused buffer keeps storage id");
 
     pool.release(p1b, 50);
     pool.release(p2, 2000);
@@ -33,7 +42,17 @@ int main() {
     size_t peak_before = pool.peak_bytes();
     pool.clear();
     CHECK(pool.active_bytes() == 0, "clear → active=0");
+    CHECK(pool.pool_bytes() == 0, "clear → freelist=0");
     CHECK(pool.peak_bytes() == peak_before, "peak preserved after clear");
+
+    // ---- clear active allocations ----
+    void* p_active1 = pool.acquire(333);
+    void* p_active2 = pool.acquire(4097);
+    CHECK(p_active1 != nullptr && p_active2 != nullptr, "active allocations acquired");
+    CHECK(pool.active_bytes() >= BufferPool::MIN_BUCKET + 8192, "active includes unreleased allocations");
+    pool.clear();
+    CHECK(pool.active_bytes() == 0, "clear releases active allocations");
+    CHECK(pool.pool_bytes() == 0, "clear active leaves no freelist");
 
     // ---- round-up edge cases ----
     BufferPool pool2;

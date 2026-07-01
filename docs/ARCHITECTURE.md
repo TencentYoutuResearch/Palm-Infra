@@ -1,6 +1,6 @@
 # mollm Architecture
 
-*Last updated: 2026-06-29*
+*Last updated: 2026-07-01*
 
 ## 1. 概述
 
@@ -194,7 +194,50 @@ Power-of-2 bucketed freelist allocator：
 - MIN_BUCKET=1KB，ALIGNMENT=64（cache line）
 - `acquire(bytes)` → 从 freelist 复用或 `aligned_alloc`
 - `release(ptr, bytes)` → 返回 freelist（不 free）
-- `reset()` → 把所有 active buffer 移回 freelist（prefill → decode 切换）
+- `reset()` → `clear()` 的兼容别名；会释放 active + freelist
+
+### 当前内存生命周期
+
+内存管理当前是工程上可工作的 BufferPool/reset 模式，但还不是严格的
+ownership/liveness 模型：
+
+- CONSTANT 权重指向 `.mollm` mmap 或文件 mmap，`MemoryType::EXTERNAL`
+- KV cache、GDN state、GDN conv state 在 load 时从 `LLMEngine` 的 persistent
+  pool 分配，prefill/decode graph INPUT tensor 共享物理指针
+- 每次 `execute_graph()` 入口都会先清空上一轮 borrowed view metadata；默认会释放
+  materialized temporaries。静态 decode graph 可通过 `reuse_static_workspace` 保留
+  materialized POOLED tensor 跨 token 复用；dynamic prefill 可通过
+  `reuse_same_shape_workspace` 在 runtime shape key 完全相同时复用 materialized workspace
+- zero-copy RESHAPE/PERMUTE/SLICE 只借用输入指针，入口先清空 borrowed view；
+  CONCAT/TILE/CONTIGUOUS 和 non-contiguous RESHAPE 会 materialize output
+- `BufferPool` 记录 active allocations；`clear()`/析构释放 active + freelist，
+  `release()` 校验 foreign pointer、double release 和 bucket mismatch
+- pooled tensor 带 `owner_id` / `storage_id`，主要 release 路径会校验 tensor
+  owner 是否匹配目标 pool，borrowed view 判断优先使用 storage id
+- `run_graph()` 直接借用 `embed()` / RoPE / mask helper tensor 作为 graph INPUT；
+  helper 在 output 已消费或 copy out 后由调用方释放
+- `prefill()` / `prefill_hidden()` 在 output 消费或 copy 后清空 borrowed views，并保留
+  bounded same-shape workspace；`release_prefill_buffers()` 显式释放
+- `decode()` / `decode_hidden()` 消费或 copy output 后保留静态 decode workspace；`reset()`
+  会释放该 workspace
+- `prefill_hidden()` 返回 engine-owned contiguous copy，不暴露 graph pool 内部 output
+- `prepare_execution()` 有实验性 view-aware last-use release queue；当前仅对无
+  stateful/cache-mutating op 的图启用，真实模型图仍使用 end-of-call cleanup
+
+这个策略解决了 DYNAMIC/chunked prefill 中暴露的 stale view pointer 和 pool
+增长问题，并恢复了 decode 以及同 shape prefill 的主要 buffer 复用。注意：
+`release()` 只把 buffer 移到 BufferPool freelist，不降低 RSS；workspace 复用主要把同一批
+内存从 freelist 变为 active，避免下一次同 shape 执行的 release/reacquire 开销。仍有明显
+技术债：
+
+- view ownership 仍依赖 op 类型 + 指针比较，缺少类型层面的 owner/borrowed 区分
+- `MemoryType::POOLED` 仍没有携带 owner id，persistent pool 与 graph pool 的区分
+  依赖调用协议和 INPUT cleanup 规则
+- `Tensor` 本身没有析构释放语义，所有释放依赖 engine/executor 的外部协议
+
+后续如果继续做 graph fusion、continuous batching 或多 backend，建议先把内存模型
+收敛成显式的 `TensorStorage`/borrowed view/liveness release 三层，否则正确性会越
+来越依赖约定。详细设计草案见 `docs/MEMORY_MODEL.md`。
 
 ### MappedFile（`graph/mmap_file.h`）
 
@@ -265,12 +308,13 @@ HF tokenizer.json 格式 → vocab + merges + added_tokens
 ```
 mollm/
 ├── CMakeLists.txt          项目配置（C++17, NEON, nlohmann/json）
-├── CODEBUDDY.md            Agent 指引
+├── AGENTS.md               Agent 指引
 ├── README.md               项目概览 + roadmap
 ├── ARCHITECTURE.md         本文档
 ├── docs/
 │   ├── CURRENT_STATE.md    当前状态（性能 + profiling + next steps）
-│   ├── OPTIMIZATION_LOG_QWEN35.md  Qwen3.5 优化日志（12 attempts）
+│   ├── MEMORY_MODEL.md     内存 ownership/lifetime 设计草案
+│   ├── OPTIMIZATION_LOG_QWEN35.md  Qwen3.5 优化日志（13 attempts）
 │   ├── OPTIMIZATION_LOG.md         Youtu-LLM 优化日志（17 attempts）
 │   └── DEBUG_QWEN35.md     调试笔记
 ├── engine/                 LLMEngine + tokenizer + generation
@@ -278,7 +322,7 @@ mollm/
 ├── kernels/                NEON kernels（matmul, attention, gdn, norm, rope）
 ├── models/                 Python 转译器（converter.py, qwen35.py, mla.py, transpile.py）
 ├── examples/               mollm_chat + mollm_bench
-├── tests/                  18 个测试
+├── tests/                  19 个测试（unit + e2e + shape_propagation.py）
 └── third_party/nlohmann/   JSON 库
 ```
 
@@ -286,19 +330,25 @@ mollm/
 
 ### Dynamic shape schema
 
-每个 `GraphNode` 携带 `dynamic[4]` 字段（每维一个 `DynamicKind`）：
+每个 `GraphNode` 携带 `dim_expr[4]` 字段（每维一个 `DimExpr`）：
 
 ```cpp
-enum class DynamicKind : int8_t {
-    STATIC  = 0,   // out_shape[i] 的值就是该维大小
-    SEQ     = 1,   // 此维 = runtime 注入的 seq_len
-    BATCH   = 2,   // reserved for future batch dim
+struct DimExpr {
+    int8_t  kind  = 0;  // CONST/SEQ/MUL/ADD/BATCH
+    int32_t coeff = 0;  // MUL multiplier or ADD constant term
 };
+
+// CONST: value = out_shape[i]
+// SEQ:   value = runtime_seq_len
+// MUL:   value = coeff * runtime_seq_len
+// ADD:   value = coeff + runtime_seq_len
+// BATCH: reserved for future batch dim
 ```
 
-- **transpile 时**：`propagate_dynamic_shapes()` pass 从 INPUT 节点（hidden/mask/cos/sin 标 SEQ dim 1）按 op 规则传播到下游所有 tensor
-- **runtime 不做 shape inference**：只读 `node.dynamic[]`，是 SEQ 的位置在 `inject_runtime_shapes()` 里填实际 seq_len
-- **graph format v3**：`dynamic[4]` 紧跟 `out_shape[4]` 序列化（4 字节包）。不向前兼容 v2
+- **transpile 时**：`propagate_dim_exprs()` 从 INPUT 节点传播 symbolic shape 到下游所有 tensor
+- **runtime 不做 shape inference**：只读 `node.dim_expr[]`，在 `inject_runtime_shapes()` 和 `execute_graph()` 中用 `eval_dim()` 替换运行时 seq_len
+- **graph format v3**：`dim_expr[4]` 紧跟 `out_shape[4]` 序列化（8 字节/dim）。不向前兼容 v2
+- **复合维支持**：reshape 可以显式标记 `SEQ`，`num_heads * SEQ` 会表达成 `MUL(coeff=num_heads)`，避免 `head_dim=256` 与 `seq_len=256` 这种数值碰撞
 
 ### Backend 抽象
 
@@ -307,9 +357,9 @@ class Backend {
 public:
     virtual ShapeMode shape_mode() const = 0;  // DYNAMIC (CPU) | STATIC_PADDED (NPU future)
     virtual int padded_seq_len() const { return -1; }
-    virtual void dispatch(OpType, const OpParams&,
-                         const std::vector<const Tensor*>&,
-                         Tensor* output, ThreadPool*) = 0;
+    virtual void dispatch(const GraphNode& node,
+                          const std::vector<const Tensor*>& inputs,
+                          Tensor* output, ThreadPool* thread_pool) = 0;
 };
 
 class CPUBackend : public Backend { /* routes to NEON kernels */ };
@@ -322,6 +372,7 @@ class CPUBackend : public Backend { /* routes to NEON kernels */ };
 
 ### 当前状态
 
-- **STATIC_PADDED 模式启用**：graph 按 build-time seq_len (256) 跑，stateful ops 通过 `n_real_tokens` 跳过 padding 位置
-- **DYNAMIC 模式 reserved**：机制就位（ExecContext.runtime_seq_len + inject_runtime_shapes），但 reshape() 节点的 SEQ 标记不完整（head_dim=256 与 seq_len=256 数值碰撞），暂未启用
-- **chunked prefill 已验证**：Test 5 跑 256 token 拆 (128,128) 和 (100,100,56) PPL 一致（8.4893 vs HF 8.50）
+- **DYNAMIC 模式已启用**：CPUBackend 默认无 padding，短 prompt 按实际 token 数执行
+- **STATIC_PADDED 仍保留**：`--static-padded` 用于 A/B 对比和未来 NPU fixed-shape 路径
+- **chunked prefill 已验证**：Test 5 跑 256 token 拆成多种 chunk 组合，PPL 一致（8.4893 vs HF 8.50）
+- **已修复 DYNAMIC shape bug**：stale view shape、view op borrowed pointer 和跨 `execute_graph()` stale data 指针问题已在 executor 入口清理逻辑中处理

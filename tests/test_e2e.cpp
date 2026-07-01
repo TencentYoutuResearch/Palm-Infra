@@ -23,6 +23,8 @@ static const float PPL_TOLERANCE = 0.1f;
 static float compute_ppl(LLMEngine& eng, const std::vector<int>& token_ids) {
     Tensor hidden_out = eng.prefill_hidden(token_ids);
     if (!hidden_out.data) return -1.f;
+    CHECK(eng.prefill_pool_stats().active > 0,
+          "prefill_hidden keeps reusable prefill workspace after output copy");
 
     int n_tokens = (int)token_ids.size();
     int n_targets = n_tokens - 1;
@@ -90,6 +92,8 @@ int main(int argc, char** argv) {
 
     bool ok = eng.load(cfg);
     CHECK(ok, "engine load qwen35 package");
+    if (ok) CHECK(eng.prefill_pool_stats().active == 0,
+                  "load keeps persistent cache out of prefill graph pool");
 
     if (ok) {
         // Run single-token "prefill" (simulates decode)
@@ -97,10 +101,26 @@ int main(int argc, char** argv) {
         printf("Prefill returned token: %d\n", token);
         CHECK(token >= 0, "single-token prefill completed");
 
+        size_t decode_workspace = 0;
+        bool decode_workspace_stable = true;
         for (int step = 0; step < 3 && token >= 0; step++) {
             token = eng.decode(token);
             printf("Decode step %d returned token: %d\n", step, token);
+            size_t active = eng.decode_pool_stats().active;
+            if (step == 0) decode_workspace = active;
+            else decode_workspace_stable = decode_workspace_stable && (active == decode_workspace);
         }
+        size_t prefill_workspace = eng.prefill_pool_stats().active;
+        CHECK(prefill_workspace > 0 && decode_workspace_stable,
+              "sampling prefill/decode keep bounded reusable workspaces");
+        eng.reset();
+        CHECK(eng.decode_pool_stats().active == 0,
+              "reset releases reusable decode workspace");
+        CHECK(eng.prefill_pool_stats().active == prefill_workspace,
+              "reset preserves reusable prefill workspace");
+        eng.release_prefill_buffers();
+        CHECK(eng.prefill_pool_stats().active == 0,
+              "release_prefill_buffers releases reusable prefill workspace");
     }
     // ---- Test 2: Prefill graph (T=4) + decode ----
     printf("\n=== Test 2: Prefill graph (T=4) + decode ===\n");
@@ -114,19 +134,28 @@ int main(int argc, char** argv) {
 
     ok = eng2.load(cfg2);
     CHECK(ok, "engine load qwen35 package (for prefill+decode)");
+    if (ok) CHECK(eng2.prefill_pool_stats().active == 0,
+                  "load keeps persistent cache out of prefill graph pool (prefill+decode)");
 
     if (ok) {
         int token = eng2.prefill(ids);
         printf("Prefill (4 tokens) returned token: %d (HF ref: %d)\n", token, REF_DECODE_SEQ[0]);
         CHECK(token == REF_DECODE_SEQ[0], "prefill argmax matches HF reference");
 
+        size_t decode_workspace = 0;
+        bool decode_workspace_stable = true;
         for (int step = 0; step < REF_DECODE_LEN - 1; step++) {
             token = eng2.decode(token);
             printf("Decode step %d: token=%d (HF ref: %d)\n",
                    step + 1, token, REF_DECODE_SEQ[step + 1]);
             CHECK(token == REF_DECODE_SEQ[step + 1],
                   "decode argmax matches HF reference");
+            size_t active = eng2.decode_pool_stats().active;
+            if (step == 0) decode_workspace = active;
+            else decode_workspace_stable = decode_workspace_stable && (active == decode_workspace);
         }
+        CHECK(eng2.prefill_pool_stats().active > 0 && decode_workspace_stable,
+              "prefill+decode sampling path keeps bounded reusable workspaces");
     }
     // ---- Test 3: PPL — prefill vs decode consistency + HF reference ----
     // 256 tokens from calibration_data_v5_rc.txt. HF reference PPL=8.50.
@@ -147,6 +176,8 @@ int main(int argc, char** argv) {
 
             ok = eng.load(cfg);
             CHECK(ok, "prefill engine load");
+            if (ok) CHECK(eng.prefill_pool_stats().active == 0,
+                          "prefill engine load has no active graph-pool cache");
 
             if (ok) {
                 prefill_ppl = compute_ppl(eng, ppl_ids);
@@ -170,13 +201,19 @@ int main(int argc, char** argv) {
 
             ok = eng.load(cfg);
             CHECK(ok, "decode engine load");
+            if (ok) CHECK(eng.prefill_pool_stats().active == 0,
+                          "decode engine load has no active graph-pool cache");
 
             if (ok) {
                 // Step 0: prefill token[0]
                 Tensor hidden = eng.prefill_hidden({ppl_ids[0]});
+                size_t prefill_workspace = eng.prefill_pool_stats().active;
 
                 float total_ce = 0.f;
                 int n_steps = PPL_REF_N - 1;  // 255 steps
+                bool decode_pool_ok = true;
+                bool have_decode_workspace = false;
+                size_t decode_workspace = 0;
 
                 for (int step = 0; step < n_steps; step++) {
                     int target = ppl_ids[step + 1];
@@ -203,10 +240,19 @@ int main(int argc, char** argv) {
 
                     // Next token
                     hidden = eng.decode_hidden(target);
+                    size_t active = eng.decode_pool_stats().active;
+                    if (!have_decode_workspace) {
+                        decode_workspace = active;
+                        have_decode_workspace = true;
+                    }
+                    decode_pool_ok = decode_pool_ok
+                        && eng.prefill_pool_stats().active == prefill_workspace
+                        && active == decode_workspace;
 
                     if ((step + 1) % 64 == 0)
                         printf("  decode %d/%d\n", step + 1, n_steps);
                 }
+                CHECK(decode_pool_ok, "decode_hidden keeps bounded reusable workspaces");
 
                 decode_ppl = std::exp(total_ce / n_steps);
                 printf("  Decode PPL:  %.4f (HF ref: %.2f)\n", decode_ppl, REF_PPL);
@@ -236,6 +282,8 @@ int main(int argc, char** argv) {
 
         ok = youtu_eng.load(youtu_cfg);
         CHECK(ok, "Youtu engine load (package mode)");
+        if (ok) CHECK(youtu_eng.prefill_pool_stats().active == 0,
+                      "Youtu load keeps persistent cache out of prefill graph pool");
         if (ok) {
             // Load tokenizer from extracted path (engine sets it)
             Tokenizer youtu_tok;
@@ -251,17 +299,28 @@ int main(int argc, char** argv) {
                 std::vector<int> youtu_ids = youtu_tok.encode("Hello, world!");
                 int token = youtu_eng.prefill(youtu_ids);
                 printf("  Prefill token: %d\n", token);
+                size_t decode_workspace = 0;
+                bool decode_workspace_stable = true;
                 for (int step = 0; step < 4 && token >= 0; step++) {
                     token = youtu_eng.decode(token);
                     printf("  Decode step %d: token=%d\n", step + 1, token);
+                    size_t active = youtu_eng.decode_pool_stats().active;
+                    if (step == 0) decode_workspace = active;
+                    else decode_workspace_stable = decode_workspace_stable && (active == decode_workspace);
                 }
+                CHECK(youtu_eng.prefill_pool_stats().active > 0 && decode_workspace_stable,
+                      "Youtu sampling path keeps bounded reusable workspaces");
             }
 
             // Hidden state dump for layer comparison
             {
-                youtu_eng.reset();  // Clear cache from greedy decode test
+                youtu_eng.reset();  // Clear cache and reusable decode workspace from greedy decode test
+                CHECK(youtu_eng.decode_pool_stats().active == 0,
+                      "Youtu reset releases reusable decode workspace");
                 std::vector<int> ppl_ids(YOUTU_PPL_TOKENS, YOUTU_PPL_TOKENS + YOUTU_PPL_N);
                 Tensor hidden = youtu_eng.prefill_hidden(ppl_ids);
+                CHECK(youtu_eng.prefill_pool_stats().active > 0,
+                      "Youtu prefill_hidden keeps reusable prefill workspace after output copy");
                 if (hidden.data) {
                     int hidden_size = (int)hidden.shape[0];  // 2048
                     int n_tokens = (int)hidden.shape[1];      // 256
@@ -283,6 +342,8 @@ int main(int argc, char** argv) {
                 youtu_eng.reset();
                 std::vector<int> ppl_ids(YOUTU_PPL_TOKENS, YOUTU_PPL_TOKENS + YOUTU_PPL_N);
                 Tensor hidden = youtu_eng.prefill_hidden(ppl_ids);
+                CHECK(youtu_eng.prefill_pool_stats().active > 0,
+                      "Youtu PPL prefill_hidden keeps reusable prefill workspace");
                 bool ppl_ok = false;
                 if (hidden.data) {
                     std::vector<float> logits = youtu_eng.run_lmhead_raw(
@@ -373,6 +434,8 @@ int main(int argc, char** argv) {
                 CHECK(false, label);
                 continue;
             }
+            CHECK(eng.prefill_pool_stats().active == 0,
+                  "chunked engine load has no active graph-pool cache");
 
             // Prefill chunk by chunk, accumulate logits for all positions.
             std::vector<float> all_logits;
@@ -383,6 +446,8 @@ int main(int argc, char** argv) {
                 std::vector<int> chunk_ids(ppl_ids.begin() + offset,
                                            ppl_ids.begin() + offset + chunk);
                 Tensor hidden = eng.prefill_hidden(chunk_ids);
+                CHECK(eng.prefill_pool_stats().active > 0,
+                      "chunked prefill_hidden keeps bounded reusable prefill workspace");
                 if (!hidden.data) {
                     printf("  %s: prefill_hidden failed at offset %d\n",
                            spec.name, offset);

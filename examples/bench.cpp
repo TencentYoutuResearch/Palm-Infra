@@ -175,12 +175,28 @@ int main(int argc, char** argv) {
     std::printf("total_ms=%.2f\n", metrics.total_ms);
     std::printf("peak_rss_mb=%.1f\n", peak_rss_mb());
     {
-        auto ps = engine.prefill_pool_stats();
+        auto pre = engine.prefill_pool_stats();
+        auto dec = engine.decode_pool_stats();
+        size_t active = pre.active + dec.active;
+        size_t peak = pre.peak + dec.peak;
+        size_t freelist = pre.freelist + dec.freelist;
+        size_t acquires = pre.acquires + dec.acquires;
+        size_t releases = pre.releases + dec.releases;
         std::printf("pool_active_mb=%.1f pool_peak_mb=%.1f pool_freelist_mb=%.1f pool_acquires=%zu pool_releases=%zu\n",
-                    ps.active / (1024.0 * 1024.0),
-                    ps.peak / (1024.0 * 1024.0),
-                    ps.freelist / (1024.0 * 1024.0),
-                    ps.acquires, ps.releases);
+                    active / (1024.0 * 1024.0),
+                    peak / (1024.0 * 1024.0),
+                    freelist / (1024.0 * 1024.0),
+                    acquires, releases);
+        std::printf("prefill_pool_active_mb=%.1f prefill_pool_peak_mb=%.1f prefill_pool_freelist_mb=%.1f prefill_pool_acquires=%zu prefill_pool_releases=%zu\n",
+                    pre.active / (1024.0 * 1024.0),
+                    pre.peak / (1024.0 * 1024.0),
+                    pre.freelist / (1024.0 * 1024.0),
+                    pre.acquires, pre.releases);
+        std::printf("decode_pool_active_mb=%.1f decode_pool_peak_mb=%.1f decode_pool_freelist_mb=%.1f decode_pool_acquires=%zu decode_pool_releases=%zu\n",
+                    dec.active / (1024.0 * 1024.0),
+                    dec.peak / (1024.0 * 1024.0),
+                    dec.freelist / (1024.0 * 1024.0),
+                    dec.acquires, dec.releases);
     }
     std::printf("hit_eos=%s\n", result.hit_eos ? "true" : "false");
     // Only show generated_text for real prompts (dummy-token mode produces garbage)

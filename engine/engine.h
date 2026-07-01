@@ -135,6 +135,13 @@ public:
                 graph_prefill_.runtime.pool.release_count(),
                 graph_prefill_.runtime.pool.pool_bytes()};
     }
+    PoolStats decode_pool_stats() const {
+        return {graph_decode_.runtime.pool.active_bytes(),
+                graph_decode_.runtime.pool.peak_bytes(),
+                graph_decode_.runtime.pool.acquire_count(),
+                graph_decode_.runtime.pool.release_count(),
+                graph_decode_.runtime.pool.pool_bytes()};
+    }
 
     /// Release all non-INPUT/CONSTANT POOLED tensors from the prefill graph's
     /// pool. Called after prefill() completes to release the last chunk's
@@ -189,6 +196,14 @@ private:
 
     // Packed copy of embed_tokens for lm_head matmul (row-major original stays for embed lookup)
     std::vector<uint8_t> embed_packed_;
+
+    // Engine-owned contiguous copy returned by prefill_hidden/decode_hidden.
+    // Valid until the next hidden-output call on this engine.
+    std::vector<uint8_t> hidden_output_copy_;
+
+    // Engine-lifetime storage for KV cache and recurrent state. Graph pools
+    // are reserved for per-execution temporaries.
+    BufferPool persistent_pool_;
 
     // KV cache tensor pointers (per layer)
     struct CachePair {

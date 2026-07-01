@@ -2,6 +2,7 @@
 #include "kernels/matmul.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -125,11 +126,153 @@ int sample_token(float* logits, int vocab_size,
     return sample_multinomial(logits, vocab_size, r);
 }
 
+void release_pool_tensor(BufferPool& pool, Tensor& t) {
+    if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
+        if (t.owner_id != 0 && t.owner_id != pool.id()) {
+            std::fprintf(stderr,
+                         "release_pool_tensor: owner mismatch for %p (tensor owner=%u, pool=%u)\n",
+                         t.data, t.owner_id, pool.id());
+            assert(false && "release_pool_tensor owner mismatch");
+            return;
+        }
+        pool.release(t.data, t.nbytes());
+    }
+    t.data = nullptr;
+    t.mem_type = MemoryType::NONE;
+    t.owner_id = 0;
+    t.storage_id = 0;
+}
+
+bool is_view_op(OpType op) {
+    return op == OpType::PERMUTE || op == OpType::SLICE;
+}
+
+bool shares_storage(const Tensor& a, const Tensor& b) {
+    if (a.storage_id != 0 && b.storage_id != 0) {
+        return a.owner_id == b.owner_id && a.storage_id == b.storage_id;
+    }
+    return a.data == b.data;
+}
+
+void release_graph_temporaries(Graph& graph) {
+#ifdef MOLLM_SKIP_GRAPH_TEMP_CLEANUP
+    (void)graph;
+    return;
+#endif
+    auto& pool = graph.runtime.pool;
+    auto& tensors = graph.runtime.tensors;
+    std::vector<uint8_t> borrowed_view(graph.nodes.size(), 0);
+
+    for (auto& node : graph.nodes) {
+        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        Tensor& t = tensors[node.id];
+        bool borrowed = is_view_op(node.op_type);
+        if (node.op_type == OpType::RESHAPE && !node.inputs.empty()) {
+            borrowed = shares_storage(t, tensors[node.inputs[0]]);
+        }
+        borrowed_view[node.id] = borrowed ? 1 : 0;
+    }
+
+    for (auto& node : graph.nodes) {
+        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        if (!borrowed_view[node.id]) continue;
+        Tensor& t = tensors[node.id];
+        t.data = nullptr;
+        t.mem_type = MemoryType::NONE;
+        t.owner_id = 0;
+        t.storage_id = 0;
+    }
+
+    for (auto& node : graph.nodes) {
+        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        if (borrowed_view[node.id]) continue;
+        Tensor& t = tensors[node.id];
+        release_pool_tensor(pool, t);
+    }
+}
+
+void clear_graph_borrowed_views(Graph& graph) {
+    auto& tensors = graph.runtime.tensors;
+    std::vector<uint8_t> borrowed_view(graph.nodes.size(), 0);
+
+    for (auto& node : graph.nodes) {
+        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        Tensor& t = tensors[node.id];
+        bool borrowed = is_view_op(node.op_type);
+        if (node.op_type == OpType::RESHAPE && !node.inputs.empty()) {
+            borrowed = shares_storage(t, tensors[node.inputs[0]]);
+        }
+        borrowed_view[node.id] = borrowed ? 1 : 0;
+    }
+
+    for (auto& node : graph.nodes) {
+        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
+        if (!borrowed_view[node.id]) continue;
+        Tensor& t = tensors[node.id];
+        t.data = nullptr;
+        t.mem_type = MemoryType::NONE;
+        t.owner_id = 0;
+        t.storage_id = 0;
+    }
+}
+
+void invalidate_workspace_key(ExecContext& ctx) {
+    ctx.workspace_shape_valid = false;
+    ctx.workspace_runtime_seq_len = -1;
+    ctx.workspace_runtime_batch = -1;
+    ctx.workspace_static_padded = false;
+    ctx.workspace_padded_seq_len = -1;
+}
+
+void finish_graph_temporaries(Graph& graph, ExecContext& ctx) {
+    if (ctx.reuse_static_workspace || ctx.reuse_same_shape_workspace) {
+        clear_graph_borrowed_views(graph);
+    } else {
+        release_graph_temporaries(graph);
+        invalidate_workspace_key(ctx);
+    }
+}
+
+Tensor copy_tensor_contiguous(const Tensor& src, std::vector<uint8_t>& storage) {
+    size_t es = src.element_size();
+    size_t bytes = (size_t)src.nelements() * es;
+    storage.resize(bytes);
+
+    Tensor dst = Tensor::create(src.prec, MemoryType::EXTERNAL,
+                                src.shape[0], src.shape[1],
+                                src.shape[2], src.shape[3],
+                                storage.data());
+
+    if (!src.data || bytes == 0) return dst;
+
+    if (src.is_contiguous()) {
+        std::memcpy(dst.data, src.data, bytes);
+        return dst;
+    }
+
+    char* dp = static_cast<char*>(dst.data);
+    const char* sp_base = static_cast<const char*>(src.data);
+    size_t flat = 0;
+    for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
+        for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
+            for (int64_t i1 = 0; i1 < src.shape[1]; i1++) {
+                const char* sp = sp_base
+                    + i1 * src.stride[1]
+                    + i2 * src.stride[2]
+                    + i3 * src.stride[3];
+                std::memcpy(dp + flat * es, sp, (size_t)src.shape[0] * es);
+                flat += (size_t)src.shape[0];
+            }
+        }
+    }
+    return dst;
+}
+
 } // namespace
 
 LLMEngine::~LLMEngine() {
-    // Tensor data owned by BufferPool or EXTERNAL — no explicit free needed
-    // MappedFiles in shared_weights_ auto-close on destruction
+    // Tensor data owned by BufferPool or EXTERNAL — no explicit free needed.
+    // MappedFiles in shared_weights_ auto-close on destruction.
 
     // Release .mollm package mmap (can be many GB — qwen35_4b is 8.4 GB).
     if (package_mmap_) {
@@ -363,7 +506,8 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         }
     }
 
-    // Allocate cache data buffers (once, at load time).
+    // Allocate cache/state data buffers from engine-owned persistent storage
+    // (once, at load time). Graph runtime pools are execution-temporary only.
     for (auto& cp : caches_) {
         // Standard KV cache
         if (cp.k) {
@@ -373,7 +517,7 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             size_t data_bytes = (size_t)hd * n_ctx * nkv * es;
             size_t total = CacheMetadata::SIZE + data_bytes;
 
-            void* buf = g.runtime.pool.acquire(total);
+            void* buf = persistent_pool_.acquire(total);
             std::memset(buf, 0, CacheMetadata::SIZE);
 
             auto* meta = cache_meta(buf);
@@ -384,6 +528,8 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
 
             cp.k->data     = buf;
             cp.k->mem_type = MemoryType::POOLED;
+            cp.k->owner_id = persistent_pool_.id();
+            cp.k->storage_id = persistent_pool_.storage_id(buf);
             cp.k->shape[0] = (int64_t)total / (int64_t)es;
             cp.k->compute_strides();
         }
@@ -394,7 +540,7 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             size_t data_bytes = (size_t)vd * n_ctx * nkv * es;
             size_t total = CacheMetadata::SIZE + data_bytes;
 
-            void* buf = g.runtime.pool.acquire(total);
+            void* buf = persistent_pool_.acquire(total);
             std::memset(buf, 0, CacheMetadata::SIZE);
 
             auto* meta = cache_meta(buf);
@@ -405,6 +551,8 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
 
             cp.v->data     = buf;
             cp.v->mem_type = MemoryType::POOLED;
+            cp.v->owner_id = persistent_pool_.id();
+            cp.v->storage_id = persistent_pool_.storage_id(buf);
             cp.v->shape[0] = (int64_t)total / (int64_t)es;
             cp.v->compute_strides();
         }
@@ -413,10 +561,12 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         // No CacheMetadata header — GDN state is a plain FP32 buffer.
         if (cp.gdn_state) {
             size_t data_bytes = (size_t)cp.gdn_v_dim * cp.gdn_k_dim * cp.gdn_num_heads * sizeof(float);
-            void* buf = g.runtime.pool.acquire(data_bytes);
+            void* buf = persistent_pool_.acquire(data_bytes);
             std::memset(buf, 0, data_bytes);
             cp.gdn_state->data     = buf;
             cp.gdn_state->mem_type = MemoryType::POOLED;
+            cp.gdn_state->owner_id = persistent_pool_.id();
+            cp.gdn_state->storage_id = persistent_pool_.storage_id(buf);
             cp.gdn_state->shape[0] = (int64_t)cp.gdn_v_dim;
             cp.gdn_state->shape[1] = (int64_t)cp.gdn_k_dim;
             cp.gdn_state->shape[2] = (int64_t)cp.gdn_num_heads;
@@ -427,10 +577,12 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         if (cp.gdn_conv) {
             int kernel_m1 = cp.gdn_conv_kernel - 1;
             size_t data_bytes = (size_t)cp.gdn_conv_groups * kernel_m1 * sizeof(float);
-            void* buf = g.runtime.pool.acquire(data_bytes);
+            void* buf = persistent_pool_.acquire(data_bytes);
             std::memset(buf, 0, data_bytes);
             cp.gdn_conv->data     = buf;
             cp.gdn_conv->mem_type = MemoryType::POOLED;
+            cp.gdn_conv->owner_id = persistent_pool_.id();
+            cp.gdn_conv->storage_id = persistent_pool_.storage_id(buf);
             cp.gdn_conv->shape[0] = (int64_t)cp.gdn_conv_groups;
             cp.gdn_conv->shape[1] = (int64_t)kernel_m1;
             cp.gdn_conv->shape[2] = 1;
@@ -457,11 +609,17 @@ void LLMEngine::reset_profiles() {
 bool LLMEngine::load(const EngineConfig& cfg) {
     cfg_ = cfg;
     cfg_.num_threads = std::max(cfg_.num_threads, 1);
+    caches_.clear();
+    persistent_pool_.clear();
     thread_pool_.resize(cfg_.num_threads);
     exec_ctx_prefill_.thread_pool = &thread_pool_;
     exec_ctx_decode_.thread_pool  = &thread_pool_;
     exec_ctx_prefill_.backend     = &cpu_backend_;
     exec_ctx_decode_.backend      = &cpu_backend_;
+    exec_ctx_prefill_.reuse_static_workspace = false;
+    exec_ctx_prefill_.reuse_same_shape_workspace = true;
+    exec_ctx_decode_.reuse_static_workspace  = true;
+    exec_ctx_decode_.reuse_same_shape_workspace = false;
 
     // Load the .mollm package (sets up weights mmap, extracts graphs to temp
     // files, parses metadata for weight offset map).
@@ -548,6 +706,9 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 // ---------------------------------------------------------------------------
 
 void LLMEngine::reset() {
+    release_graph_temporaries(graph_decode_);
+    invalidate_workspace_key(exec_ctx_decode_);
+    clear_graph_borrowed_views(graph_prefill_);
     past_len_ = 0;
     // KV cache: only clear metadata header (current_seq_len = 0).
     // GDN state: zero the entire recurrent state buffer (it's small, ~256KB
@@ -586,6 +747,8 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids, int pad_to) {
         void* buf = graph_prefill_.runtime.pool.acquire(nbytes);
         Tensor t = Tensor::create(Precision::FP32, MemoryType::POOLED,
                                   hidden_dim, seq_len, 1, 1, buf);
+        t.owner_id = graph_prefill_.runtime.pool.id();
+        t.storage_id = graph_prefill_.runtime.pool.storage_id(buf);
         // Zero-init so padding positions (if any) are well-defined zeros.
         std::memset(t.data, 0, nbytes);
 
@@ -618,6 +781,8 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids, int pad_to) {
     int hidden_dim = 2048;
     void* buf = graph_prefill_.runtime.pool.acquire(hidden_dim * seq_len * sizeof(float));
     Tensor t = Tensor::create(Precision::FP32, MemoryType::POOLED, hidden_dim, seq_len, 1, 1, buf);
+    t.owner_id = graph_prefill_.runtime.pool.id();
+    t.storage_id = graph_prefill_.runtime.pool.storage_id(buf);
     std::memset(t.data, 0, t.nbytes());
     return t;
 }
@@ -650,6 +815,8 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
     // Output: [vocab_size, 1]
     void* c_buf = graph_prefill_.runtime.pool.acquire(vocab_size * sizeof(float));
     Tensor C = Tensor::create(Precision::FP32, MemoryType::POOLED, vocab_size, 1, 1, 1, c_buf);
+    C.owner_id = graph_prefill_.runtime.pool.id();
+    C.storage_id = graph_prefill_.runtime.pool.storage_id(c_buf);
 
     // Use packed embed copy for fast lm_head matmul (if available)
     if (!embed_packed_.empty()) {
@@ -666,8 +833,7 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
                               cfg_.temperature, cfg_.top_k, cfg_.top_p,
                               &cfg_.seed);
 
-    // Release lm_head output buffer back to pool
-    graph_prefill_.runtime.pool.release(c_buf, vocab_size * sizeof(float));
+    release_pool_tensor(graph_prefill_.runtime.pool, C);
 
     return token;
 }
@@ -715,6 +881,8 @@ Tensor LLMEngine::build_causal_mask(int seq_len, int past_len) {
     int total = past_len + seq_len;
     void* buf = graph_prefill_.runtime.pool.acquire(total * seq_len * sizeof(float));
     Tensor mask = Tensor::create(Precision::FP32, MemoryType::POOLED, total, seq_len, 1, 1, buf);
+    mask.owner_id = graph_prefill_.runtime.pool.id();
+    mask.storage_id = graph_prefill_.runtime.pool.storage_id(buf);
     float* d = mask.ptr<float>();
     for (int i = 0; i < seq_len; i++) {
         for (int j = 0; j < total; j++) {
@@ -732,6 +900,10 @@ void LLMEngine::generate_rope_cache(int seq_len, int start_pos,
     void* sb = graph_prefill_.runtime.pool.acquire(half * seq_len * sizeof(float));
     cos = Tensor::create(Precision::FP32, MemoryType::POOLED, half, seq_len, 1, 1, cb);
     sin = Tensor::create(Precision::FP32, MemoryType::POOLED, half, seq_len, 1, 1, sb);
+    cos.owner_id = graph_prefill_.runtime.pool.id();
+    sin.owner_id = graph_prefill_.runtime.pool.id();
+    cos.storage_id = graph_prefill_.runtime.pool.storage_id(cb);
+    sin.storage_id = graph_prefill_.runtime.pool.storage_id(sb);
 
     for (int n = 0; n < seq_len; n++) {
         int pos = start_pos + n;
@@ -753,7 +925,9 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
                              const Tensor& cos, const Tensor& sin) {
     auto& tensors = graph.runtime.tensors;
 
-    // Feed graph inputs
+    // Feed graph inputs by borrowing the caller-owned/helper tensors directly.
+    // hidden/mask/cos/sin lifetime is managed by the caller; cache/state INPUTs
+    // point at engine persistent storage and are set up at load time.
     for (auto& node : graph.nodes) {
         if (node.op_type != OpType::INPUT) continue;
         if (node.params.str.empty()) continue;
@@ -762,73 +936,22 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
         Tensor* t = &tensors[node.id];
 
         if (name == "hidden") {
-            // hidden is OWNED by caller, copy data into graph's pool
-            size_t nbytes = hidden.nbytes();
-            void* buf = graph.runtime.pool.acquire(nbytes);
-            if (!buf) {
-                fprintf(stderr, "FATAL: pool acquire failed for hidden (%zu bytes)\n", nbytes);
-                return Tensor();
-            }
-            std::memcpy(buf, hidden.data, nbytes);
-            *t = Tensor::create(hidden.prec, MemoryType::POOLED,
-                                hidden.shape[0], hidden.shape[1],
-                                hidden.shape[2], hidden.shape[3], buf);
+            *t = hidden;
         } else if (name == "mask") {
-            size_t nbytes = mask.nbytes();
-            void* buf = graph.runtime.pool.acquire(nbytes);
-            if (buf) {
-                std::memcpy(buf, mask.data, nbytes);
-                *t = Tensor::create(mask.prec, MemoryType::POOLED,
-                                    mask.shape[0], mask.shape[1],
-                                    mask.shape[2], mask.shape[3], buf);
-            }
+            *t = mask;
         } else if (name == "cos") {
-            size_t nbytes = cos.nbytes();
-            void* buf = graph.runtime.pool.acquire(nbytes);
-            if (buf) {
-                std::memcpy(buf, cos.data, nbytes);
-                *t = Tensor::create(cos.prec, MemoryType::POOLED,
-                                    cos.shape[0], cos.shape[1],
-                                    cos.shape[2], cos.shape[3], buf);
-            }
+            *t = cos;
         } else if (name == "sin") {
-            size_t nbytes = sin.nbytes();
-            void* buf = graph.runtime.pool.acquire(nbytes);
-            if (buf) {
-                std::memcpy(buf, sin.data, nbytes);
-                *t = Tensor::create(sin.prec, MemoryType::POOLED,
-                                    sin.shape[0], sin.shape[1],
-                                    sin.shape[2], sin.shape[3], buf);
-            }
+            *t = sin;
         }
-        // cache_k/cache_v are set in reset() and updated by SDPA
+        // cache_k/cache_v/gdn state are persistent INPUT tensors.
     }
 
     execute_graph(exec_ctx);
 
-    // Release INPUT buffers (hidden/mask/cos/sin) back to the pool.
-    // These are acquired by run_graph above and are NOT borrowed (unlike
-    // view ops' borrowed data). cache_k/cache_v are load-time allocated
-    // and must persist — skip INPUT nodes whose data is EXTERNAL/OWNED.
     if (!graph.graph_outputs.empty()) {
         uint32_t out_id = graph.graph_outputs.back();
-        Tensor result = tensors[out_id];
-
-        for (auto& node : graph.nodes) {
-            if (node.op_type != OpType::INPUT) continue;
-            if (node.params.str.empty()) continue;
-            const std::string& name = node.params.str[0];
-            if (name == "hidden" || name == "mask" || name == "cos" || name == "sin") {
-                Tensor& t = tensors[node.id];
-                if (t.data && t.mem_type == MemoryType::POOLED) {
-                    graph.runtime.pool.release(t.data, t.nbytes());
-                    t.data = nullptr;
-                    t.mem_type = MemoryType::NONE;
-                }
-            }
-        }
-
-        return result;
+        return tensors[out_id];
     }
 
     fprintf(stderr, "Engine: no graph output found\n");
@@ -840,28 +963,8 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
 // ---------------------------------------------------------------------------
 
 void LLMEngine::release_prefill_buffers() {
-    auto& pool = graph_prefill_.runtime.pool;
-    auto& tensors = graph_prefill_.runtime.tensors;
-    auto& nodes = graph_prefill_.nodes;
-    // Release all non-INPUT/CONSTANT POOLED tensors (same logic as
-    // execute_graph's reset). View ops borrow data — skip them.
-    // INPUT buffers (hidden/mask/cos/sin) are already released by run_graph;
-    // cache_k/v are EXTERNAL — skip all INPUTs.
-    static const auto is_view = [](OpType op) {
-        return op == OpType::RESHAPE || op == OpType::PERMUTE ||
-               op == OpType::SLICE || op == OpType::TILE || op == OpType::CONCAT;
-    };
-    for (size_t i = 0; i < nodes.size(); i++) {
-        auto& node = nodes[i];
-        if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
-        if (is_view(node.op_type)) continue;
-        auto& t = tensors[node.id];
-        if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
-            pool.release(t.data, t.nbytes());
-        }
-        t.data = nullptr;
-        t.mem_type = MemoryType::NONE;
-    }
+    release_graph_temporaries(graph_prefill_);
+    invalidate_workspace_key(exec_ctx_prefill_);
 }
 
 int LLMEngine::prefill(const std::vector<int>& token_ids) {
@@ -898,11 +1001,6 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         if (last_token < 0) return -1;
         offset += chunk_size;
     }
-    // Note: release_prefill_buffers() would release the last chunk's pool
-    // buffers, but causes a token=0 regression (under investigation — likely
-    // a tensor liveness issue where graph output is read after pool release).
-    // Disabled until root-caused. Memory is reclaimed on next prefill's
-    // execute_graph reset, so peak RSS is bounded (just higher than ideal).
     return last_token;
 }
 
@@ -961,6 +1059,11 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     }
 
     Tensor out = run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
+    Tensor copied = copy_tensor_contiguous(out, hidden_output_copy_);
+    release_pool_tensor(graph_prefill_.runtime.pool, h);
+    release_pool_tensor(graph_prefill_.runtime.pool, mask);
+    release_pool_tensor(graph_prefill_.runtime.pool, cos);
+    release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
     past_len_ += n;
 
@@ -969,7 +1072,8 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
     }
 
-    return out;
+    finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
+    return copied;
 }
 
 int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
@@ -1049,7 +1153,13 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     // Cache migration (prefill→decode graph) is done once at load time.
     // Both graphs share the same physical cache buffers.
 
-    return run_lmhead(out, n);
+    int token = run_lmhead(out, n);
+    release_pool_tensor(graph_prefill_.runtime.pool, h);
+    release_pool_tensor(graph_prefill_.runtime.pool, mask);
+    release_pool_tensor(graph_prefill_.runtime.pool, cos);
+    release_pool_tensor(graph_prefill_.runtime.pool, sin);
+    finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
+    return token;
 }
 
 int LLMEngine::decode(int token_id) {
@@ -1072,7 +1182,13 @@ int LLMEngine::decode(int token_id) {
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
     }
 
-    return run_lmhead(out);
+    int token = run_lmhead(out);
+    release_pool_tensor(graph_prefill_.runtime.pool, h);
+    release_pool_tensor(graph_prefill_.runtime.pool, mask);
+    release_pool_tensor(graph_prefill_.runtime.pool, cos);
+    release_pool_tensor(graph_prefill_.runtime.pool, sin);
+    finish_graph_temporaries(graph_decode_, exec_ctx_decode_);
+    return token;
 }
 
 Tensor LLMEngine::decode_hidden(int token_id) {
@@ -1091,6 +1207,11 @@ Tensor LLMEngine::decode_hidden(int token_id) {
     Tensor mask = build_causal_mask(1, past_len_);
 
     Tensor out = run_graph(graph_decode_, exec_ctx_decode_, h, mask, cos, sin);
+    Tensor copied = copy_tensor_contiguous(out, hidden_output_copy_);
+    release_pool_tensor(graph_prefill_.runtime.pool, h);
+    release_pool_tensor(graph_prefill_.runtime.pool, mask);
+    release_pool_tensor(graph_prefill_.runtime.pool, cos);
+    release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
     past_len_++;
 
@@ -1099,7 +1220,8 @@ Tensor LLMEngine::decode_hidden(int token_id) {
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
     }
 
-    return out;
+    finish_graph_temporaries(graph_decode_, exec_ctx_decode_);
+    return copied;
 }
 
 // ---------------------------------------------------------------------------

@@ -52,6 +52,8 @@ struct Tensor {
     int64_t     shape[4] = {0, 1, 1, 1};
     size_t      stride[4] = {0, 0, 0, 0};  // stride in bytes
     void*       data     = nullptr;
+    uint32_t    owner_id = 0;  // debug owner for pooled storage; 0 = unknown/non-pooled
+    uint64_t    storage_id = 0; // debug allocation identity; copied by borrowed views
 
     // -----------------------------------------------------------------------
     // factory

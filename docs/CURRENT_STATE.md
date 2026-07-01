@@ -21,6 +21,100 @@ Python 转译前端 → `.mollm` 单文件打包 → C++ 执行器 + NEON FP16FM
 | Qwen3.5-0.8B | 601 / 104 | 749 / 100 | 1.25x | **0.96x (faster)** |
 | Youtu-LLM-2B | 235 / 54 | 264 / 41 | 1.12x | **0.76x (faster)** |
 
+### 2026-07-01 内存管理分支 benchmark 审计
+
+协议：pp256 + tg64, warmup=3, 4 threads, 5 runs median。结论：当前内存管理改动
+没有相对 clean HEAD 造成可见性能回退。最新实现保留静态 decode graph 的
+materialized workspace 跨 token 复用，也允许 dynamic prefill 在 runtime shape key
+完全相同（`runtime_seq_len/static_padded/padded_seq_len/batch` 相同）时复用
+materialized workspace。`reset()` 释放 decode workspace，但保留 prefill workspace；
+`release_prefill_buffers()` 可显式释放 prefill workspace。当前机器状态下 4B 绝对值
+低于历史 fan-max baseline，因此本节只用于同一时段 A/B，不替换上表 baseline。
+
+| Model / package | Commit | pp/tg median | pool 状态 |
+|---|---|---:|---|
+| Qwen3.5-4B (`qwen35_4b_current_reconv.mollm`) | current + prefill/decode workspace reuse | 108.4 / 25.4 | prefill workspace ~3837.5 MB; decode workspace ~14.9 MB |
+| Qwen3.5-4B (`qwen35_4b_current_reconv.mollm`) | current + decode workspace reuse | 109.7 / 25.0 | prefill active 0 MB; decode workspace ~14.9 MB |
+| Qwen3.5-4B (`qwen35_4b_current_reconv.mollm`) | current before decode reuse | 106.4 / 23.8 | active 0 MB, acquire=release |
+| Qwen3.5-4B (same package) | `5ecf403` clean HEAD | 104.5 / 23.8 | active ~7071 MB |
+| Qwen3.5-4B (`qwen35_4b_cee9357.mollm`, old graph) | `cee9357` pre-dynamic | 108.0 / 24.5 | old bench has no pool stats |
+| Qwen3.5-0.8B (`qwen35_0.8b.mollm`) | current memory branch | 612.7 / 100.2 | active 0 MB, acquire=release |
+| Qwen3.5-0.8B (same package) | `5ecf403` clean HEAD | 610.8 / 99.1 | active ~2267 MB |
+| Qwen3.5-0.8B (`qwen35_0.8b_cee9357.mollm`, old graph) | `cee9357` pre-dynamic | 618.2 / 98.1 | old bench has no pool stats |
+| Youtu-LLM-2B (`youtu-llm-2b.mollm`) | current + prefill/decode workspace reuse | 236.7 / 52.0 | prefill workspace ~2038.0 MB; decode workspace ~7.7 MB |
+| Youtu-LLM-2B (`youtu-llm-2b.mollm`) | current + decode workspace reuse | 235.6 / 51.9 | prefill active 0 MB; decode workspace ~7.7 MB |
+| Youtu-LLM-2B (`youtu-llm-2b.mollm`) | current before decode reuse | 229.0 / 50.2 | active 0 MB, acquire=release |
+| Youtu-LLM-2B (same package) | `5ecf403` clean HEAD | 211.4 / 47.0 | active ~23792 MB |
+| Youtu-LLM-2B (same package) | `29afe99` dynamic initial | 209.0 / 46.3 | old bench has no pool stats |
+| Youtu-LLM-2B (`youtu-llm-2b_cee9357.mollm`, old graph) | `cee9357` pre-dynamic | 225.3 / 48.4 | old bench has no pool stats |
+
+Notes:
+- Existing `qwen35_4b.mollm` from 2026-06-30 failed graph load; 4B was reconverted to
+  `qwen35_4b_current_reconv.mollm` before measurement.
+- pre-dynamic rows use old-format packages generated inside the `cee9357` worktree, so they
+  include converter/graph format/runtime differences and are not isolated memory-management A/B.
+
+### 2026-07-01 Dynamic shape 前后 benchmark 审计
+
+协议：pp256 + tg64, warmup=3, 4 threads, 5 runs median。只测 2B/4B，跳过
+0.8B（噪声较大）。`cee9357` 是 dynamic shape 前一提交；`29afe99` 是 dynamic
+shape / Backend / graph v3 初版。每个提交使用该提交自己的 converter 重新生成
+`.mollm` 包。
+
+结论：**dynamic 初版提交确实有性能回退信号**。pp256 下 prefill dynamic 理论上不应减少
+计算量（seq_len 仍为 256）；decode graph 仍是 seq=1 static，不做 runtime shape
+injection。因此这不是“decode graph 做 dynamic”导致，而是该提交同时引入的通用
+executor/Backend/graph-v3 生命周期路径带来的开销。
+
+| Model | pre-dynamic `cee9357` | dynamic initial `29afe99` | delta |
+|---|---:|---:|---:|
+| Youtu-LLM-2B | 235.5 / 48.0 | 215.0 / 45.1 | pp -8.7%, tg -6.1% |
+| Qwen3.5-4B | 107.7 / 24.3 | 103.0 / 22.0 | pp -4.3%, tg -9.5% |
+
+Likely suspects in `29afe99`:
+- `execute_graph()` treats `runtime_seq_len > 0` as dynamic and disables zero-copy view
+  `skip_init`, causing every node to refresh shapes through the dynamic path.
+- `inject_runtime_shapes()` patches INPUT shapes and stateful op params before every prefill.
+- Backend dispatch adds an indirect call per node; small alone, but all nodes now run through it.
+- Converter emits symbolic `SEQ/MUL` reshape dims in prefill graphs, expanding graph metadata and
+  changing runtime shape handling while compute kernels are otherwise unchanged.
+
+Root-cause analysis update:
+- Main cause is **executor lifetime/reset semantics**, not `eval_dim()` arithmetic itself.
+- `29afe99` added an execute-entry reset that clears every non INPUT/CONSTANT tensor's `data`.
+  Because allocation still happened before dispatch, RESHAPE/PERMUTE/SLICE zero-copy view ops
+  were repeatedly preallocated, then dispatch overwrote the tensor with a borrowed view. That
+  created wasted pool allocations and destroyed warmup-time reuse.
+- The same reset also forced non-contiguous RESHAPE materializations to be reallocated/rebuilt
+  every execute call, which particularly hurts decode because decode calls the graph once per
+  generated token.
+- Experimental patch on `29afe99`:
+  1. skip preallocation for PERMUTE/SLICE and contiguous RESHAPE,
+  2. then disable the reset pass entirely as an unsafe upper-bound test.
+
+| Model | dynamic initial | skip zero-copy prealloc | no-reset upper bound | pre-dynamic |
+|---|---:|---:|---:|---:|
+| Youtu-LLM-2B | 215.0 / 45.1 | 222.3 / 46.4 | 229.5 / 51.1 | 235.5 / 48.0 |
+| Qwen3.5-4B | 103.0 / 22.0 | 104.8 / 23.5 | 109.9 / 24.3 | 107.7 / 24.3 |
+
+Interpretation:
+- Zero-copy prealloc waste explains a meaningful part of the regression.
+- The rest is mostly lost reuse of materialized intermediate buffers after the reset pass.
+- Decode graph itself remains static (`runtime_seq_len=-1`, no `inject_runtime_shapes()`), but it
+  still goes through the same execute-entry reset and pre-dispatch allocation path, so the same
+  buffer-reuse regression shows up in decode.
+- Current memory-management branch fixes the unsafe zero-copy allocation behavior. Static decode
+  graph now opts into explicit workspace reuse: borrowed views are cleared each execute, materialized
+  pooled tensors are kept only when the graph has no runtime dynamic dims. Dynamic prefill uses a
+  stricter same-shape policy: it keeps materialized pooled tensors only if the runtime shape key
+  exactly matches the previous execution; otherwise the next execute entry releases the old
+  workspace before allocating the new shape.
+- Memory accounting note: repeated `release()` moves prefill buffers from `active` to BufferPool
+  `freelist`; it does not return pages to the OS, so RSS/peak is roughly unchanged. With workspace
+  reuse, 4B reports ~3837.5 MB prefill active and ~5.3 MB prefill freelist. With release-each-call,
+  the same memory would appear as ~0 MB prefill active and ~3842.8 MB prefill freelist. Only
+  `clear()` / engine teardown releases both active and freelist allocations to the system.
+
 ### DYNAMIC 模式短 prompt prefill 性能（Qwen3.5-0.8B, 4 threads）
 
 Dynamic shape 模式启用后，短 prompt 不再 padding 到 256：
@@ -190,6 +284,30 @@ python3 tests/test_shape_propagation.py  # DimExpr symbolic propagation
 
 无（两个 DYNAMIC shape bug 已修复，见下）。
 
+### 已知技术债：内存管理
+
+当前内存管理是可工作的 BufferPool/reset 协议，但结构偏脆：
+
+- `execute_graph()` 入口先清空上一轮 borrowed view metadata；默认释放 materialized temporaries。
+  静态 decode graph 会保留 materialized workspace 跨 token 复用；dynamic prefill 在
+  runtime shape key 完全相同时保留 materialized workspace
+- zero-copy RESHAPE/PERMUTE/SLICE 借用输入指针；CONCAT/TILE/non-contiguous RESHAPE 会 materialize
+- KV/GDN cache/state 已从 engine-owned persistent pool 分配，再由 prefill/decode graph INPUT tensor 共享引用
+- `run_graph()` 已直接借用 `embed()` / mask / RoPE helper tensor 作为 graph INPUT，不再做 input staging copy
+- `prepare_execution()` 已有实验性 view-aware last-use release queue；目前仅对无 stateful/cache-mutating op 的图启用，真实模型图仍使用 end-of-call cleanup
+- `Tensor` 本身仍没有完整 owner/borrowed 类型语义，`RESHAPE` borrowed/materialized 仍依赖运行时指针判断
+- `Tensor::owner_id` / `storage_id` 已记录 pooled tensor 来自哪个 `BufferPool` 以及具体 allocation；主要 release 路径会校验 owner mismatch，borrowed 判断优先用 storage id
+- `BufferPool` 已记录 active allocation，析构/`clear()` 可释放 active + freelist；helper tensor 已在 output 消费或 copy 后释放
+- `prefill()` / `prefill_hidden()` 在 output 消费或 copy 后清空 borrowed views，并保留
+  bounded same-shape workspace；`release_prefill_buffers()` 显式释放。`decode()` /
+  `decode_hidden()` 保留 bounded static workspace，`reset()` 会释放 decode workspace；
+  hidden API 已返回 engine-owned copied output
+
+这套协议已经修掉 chunked prefill 的 stale shape/data 和 pool 增长问题，但后续做
+graph fusion、continuous batching、多 backend 前，建议先收敛成显式
+`TensorStorage` / borrowed view / liveness release 模型。设计草案见
+`docs/MEMORY_MODEL.md`。
+
 ### 已修复的 DYNAMIC shape bug
 
 1. **chunked prefill past_len != 128 时出错**（Qwen3.5-0.8B DYNAMIC 模式）— **已修复**
@@ -209,7 +327,8 @@ python3 tests/test_shape_propagation.py  # DimExpr symbolic propagation
 ## 下一步
 
 1. **Weight quantization (W4)** — 4B prefill 唯一大幅杠杆。MATMUL 87% at 988 GF/s，W4 砍权重带宽 2x，预期 4B prefill 115 → ~160+（超 llama.cpp 143）
-2. **Graph fusion** — 融合相邻 matmul+activation+norm，减少 cache 抢占（e2e matmul 利用率 40% vs microbench 86%）
-3. **Continuous batching** — 多序列共享 prefill
-4. **Vision encoder** — Qwen3.5 是多模态
-5. **Qualcomm Oryon 支持** — 非 Apple ARM 验证
+2. **内存模型整理** — 按 `docs/MEMORY_MODEL.md` 继续落地：下一步把 `(owner_id, storage_id)` 扩展成 explicit `TensorStorage` / storage registry
+3. **Graph fusion** — 融合相邻 matmul+activation+norm，减少 cache 抢占（e2e matmul 利用率 40% vs microbench 86%）
+4. **Continuous batching** — 多序列共享 prefill
+5. **Vision encoder** — Qwen3.5 是多模态
+6. **Qualcomm Oryon 支持** — 非 Apple ARM 验证
