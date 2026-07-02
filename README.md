@@ -24,7 +24,8 @@ Benchmarks vs llama.cpp (Apple M5 Pro, 4 threads, pp256 + tg64, warmup=3):
 | Youtu-LLM-2B | 235 / **54** | 264 / 41 | 1.12x | **0.76x (faster)** |
 
 Decode beats llama.cpp on all three models. Prefill gaps are MATMUL-bound
-and await weight quantization.
+(weight bandwidth on 4B/2B); W8 quantization helps but FP16FML still has
+higher throughput on hardware without i8mm.
 
 ## Architecture
 
@@ -38,12 +39,10 @@ and await weight quantization.
 mollm/
 ├── kernels/         NEON kernels (matmul, attention, gdn, norm, rope)
 ├── graph/           Executor, graph format, BufferPool, mmap
-├── engine/          LLMEngine, tokenizer, generation loop
-├── models/          Python transpilers (qwen35.py, mla.py)
-├── models/               Python transpilers + graph builder (qwen35.py, mla.py, transpile.py)
+├── engine/          LLMEngine, tokenizer, generation loop, backend abstraction
+├── models/          Python transpilers + graph builder (qwen35.py, mla.py, transpile.py)
 ├── examples/        mollm_chat (CLI), mollm_bench (benchmark)
-├── tests/           Unit + e2e tests
-└── docs/            Optimization logs, architecture notes
+└── tests/           Unit + e2e tests
 ```
 
 ### Package format (`.mollm`)
@@ -107,9 +106,29 @@ The converter auto-detects the model type from `config.json` and dispatches to t
 
 Produces a single `.mollm` file containing graphs + weights + tokenizer + chat template.
 
-W8 quantization is currently correctness-first. The package format and runtime
-support per-channel/per-group scales, but INT8 matmul is still scalar; benchmark
-after the NEON W8 kernels land. See `docs/QUANTIZATION.md`.
+W8 weight-only quantization is implemented with NEON INT8 kernels. The default
+runtime uses a llama.cpp-style Q8 activation dot-product path for both decode
+(GEMV) and prefill (GEMM), with a repacked INT8 weight layout optimized for
+ARM dot-product access patterns. On Apple Silicon (no i8mm), W8 repacked
+GEMM reaches ~421 GF/s microbench (vs FP16FML's 988 GF/s).
+
+W8 status by phase (Qwen3.5-0.8B, 4 threads, warmup=3):
+
+| Package | pp256 t/s | tg64 t/s | peak RSS |
+|---------|-----------|----------|----------|
+| FP16 baseline | 623 | 98 | 3.99 GB |
+| W8PC (default q8dot GEMV + native GEMM) | 221 | 102 | 3.04 GB |
+| W8PC (repacked q8dot GEMM) | 388 | 103 | 3.52 GB |
+
+Decode reaches parity with FP16 (the bandwidth win from W8 offsets the
+int8→fp32 dequant overhead at GEMV sizes). Prefill is still behind FP16 because
+FP16FML's fused accumulate has higher throughput than the int8 dot path on
+hardware without `__ARM_FEATURE_MATMUL_INT8`. On i8mm-capable hardware
+(`-DMOLLM_ARM_I8MM=ON`), the `vmmlaq_s32` kernel should close more of the gap.
+
+`MOLLM_ARM_I8MM=ON` build flag exposes the i8mm instruction set while
+preserving the FP16FML kernels. `MOLLM_ARM_NATIVE=ON` passes `-mcpu=native`
+for local benchmarking.
 
 ## Run
 
@@ -122,22 +141,12 @@ after the NEON W8 kernels land. See `docs/QUANTIZATION.md`.
     --prompt-tokens 256 --max-new-tokens 64 --warmup 3 --threads 4 --profile
 ```
 
-## Optimization highlights
-
-See `docs/OPTIMIZATION_LOG_QWEN35.md` for the full Qwen3.5 optimization journey (attempts 1-12, prefill 71→115 t/s, +62%):
-
-- **GDN recurrence kernel fusion**: 5-pass state access → 2-pass (state memory traffic -60%)
-- **GDN decode multi-threading**: 21.8% → 7.2% of decode time
-- **full_attn contiguous cleanup**: verified rms_norm/rope kernels handle strided inputs via unit tests, removed 5 redundant `contiguous()` calls
-- **RESHAPE/CONTIGUOUS materialize**: row-level memcpy fast path (-94%, 85ms→5ms)
-- **FP16FML matmul**: 988 GF/s microbench (86% of FP16FML peak), lane-FMA + 2-way K-unroll GEMM, 8-way K-unroll GEMV
-
 ## Roadmap
 
 ### Near-term
-- **`.mollm` package format**: single-file model artifact (graph + weights + metadata), replacing the current directory layout
-- **W8/W4 weight quantization**: W8 weight-only format/runtime is in place as a correctness baseline; optimized W8 NEON kernels and then W4 are the next prefill levers
+- **W4 weight quantization**: W8 (per-channel + per-group) is implemented with Q8-dot NEON kernels; W4 is the next bandwidth lever for prefill
 - **Graph fusion**: fuse adjacent matmul + activation + norm to reduce cache thrash between ops (end-to-end matmul utilization is 40% vs 86% microbench, the 2.5x gap is cache/DRAM traffic between matmuls)
+- **Liveness analysis for BufferPool**: current reset releases previous chunk's buffers; proper liveness tracking would release tensors at last-use, cutting peak RSS significantly on long prompts
 
 ### Mid-term
 - **Continuous batching / multi-user**: serve multiple sequences with shared prefill
