@@ -312,7 +312,8 @@ int main() {
         float ref_c[6];
 
         auto run_int8_case = [&](const float* scales, uint32_t group_size,
-                                 uint32_t groups_per_row, const char* label) {
+                                 uint32_t groups_per_row, const char* label,
+                                 bool interleaved = false) {
             float deq[12];
             for (int n = 0; n < N; n++) {
                 for (int k = 0; k < K; k++) {
@@ -321,24 +322,144 @@ int main() {
                 }
             }
 
+            int8_t* packed = interleaved ? pack_b_interleaved_int8_full(q_data, N, K, K) : nullptr;
             Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-            Tensor B = Tensor::create(Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1, q_data);
+            Tensor B = Tensor::create(Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1,
+                                      interleaved ? (void*)packed : (void*)q_data);
             Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, c_data);
             B.scales = scales;
             B.group_size = group_size;
             B.groups_per_row = groups_per_row;
             B.num_groups = (uint32_t)(N * groups_per_row);
+            B.is_interleaved = interleaved;
 
             kernel_matmul_fp32(A, B, C);
             ref_matmul(a_data, deq, ref_c, M, N, K);
-            CHECK(check_approx(c_data, ref_c, M * N, 1e-5f), label);
+            CHECK(check_approx(c_data, ref_c, M * N, interleaved ? 8e-2f : 1e-5f), label);
+            if (packed) delete[] packed;
         };
 
         float pc_scales[3] = {0.5f, 0.25f, 0.125f};
         run_int8_case(pc_scales, 4, 1, "INT8 per-channel matmul");
+        run_int8_case(pc_scales, 4, 1, "INT8 per-channel matmul interleaved", true);
 
         float pg_scales[6] = {0.5f, 0.25f, 0.125f, 0.75f, 1.0f, 0.0625f};
         run_int8_case(pg_scales, 2, 2, "INT8 per-group matmul");
+        run_int8_case(pg_scales, 2, 2, "INT8 per-group matmul interleaved", true);
+    }
+
+    {
+        int M = 1, K = 4, N = 3;
+        float a_data[4] = {1.0f, -2.0f, 0.5f, 3.0f};
+        int8_t q_data[12] = {
+            1, 2, -3, 4,
+            -2, 1, 5, -1,
+            3, -4, 2, 1,
+        };
+        float scales[3] = {0.5f, 0.25f, 0.125f};
+        float deq[12];
+        for (int n = 0; n < N; n++) {
+            for (int k = 0; k < K; k++) {
+                deq[n * K + k] = (float)q_data[n * K + k] * scales[n];
+            }
+        }
+
+        int8_t* packed = pack_b_interleaved_int8_full(q_data, N, K, K);
+        float c_data[3];
+        float ref_c[3];
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
+        Tensor B = Tensor::create(Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1, packed);
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, c_data);
+        B.scales = scales;
+        B.group_size = K;
+        B.groups_per_row = 1;
+        B.num_groups = N;
+        B.is_interleaved = true;
+
+        kernel_matmul_fp32(A, B, C);
+        ref_matmul(a_data, deq, ref_c, M, N, K);
+        CHECK(check_approx(c_data, ref_c, M * N, 8e-2f), "INT8 Q8-dot GEMV interleaved");
+        delete[] packed;
+    }
+
+    {
+        int M = 1, K = 32, N = 8;
+        std::vector<float> a_data(M * K);
+        std::vector<int8_t> q_data(N * K);
+        std::vector<float> scales(N);
+        std::vector<float> deq(N * K);
+        std::vector<float> c_data(M * N);
+        std::vector<float> ref_c(M * N);
+
+        for (int k = 0; k < K; k++) {
+            a_data[k] = ((k % 13) - 6) * 0.03125f;
+        }
+        for (int n = 0; n < N; n++) {
+            scales[n] = 0.01f + 0.001f * (float)(n % 3);
+            for (int k = 0; k < K; k++) {
+                q_data[n * K + k] = (int8_t)(((n * 11 + k * 5) % 63) - 31);
+                deq[n * K + k] = (float)q_data[n * K + k] * scales[n];
+            }
+        }
+
+        int8_t* packed = pack_b_interleaved_int8_full(q_data.data(), N, K, K);
+        int8_t* q8_repack = pack_b_q8dot_int8_full(q_data.data(), N, K, K);
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data.data());
+        Tensor B = Tensor::create(Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1, packed);
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, c_data.data());
+        B.scales = scales.data();
+        B.group_size = K;
+        B.groups_per_row = 1;
+        B.num_groups = N;
+        B.is_interleaved = true;
+        B.q8_repack_data = q8_repack;
+
+        kernel_matmul_fp32(A, B, C);
+        ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
+        CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 8e-2f),
+              "INT8 Q8-dot GEMV repackable interleaved");
+        delete[] packed;
+        delete[] q8_repack;
+    }
+
+    {
+        int M = 4, K = 32, N = 8;
+        std::vector<float> a_data(M * K);
+        std::vector<int8_t> q_data(N * K);
+        std::vector<float> scales(N);
+        std::vector<float> deq(N * K);
+        std::vector<float> c_data(M * N);
+        std::vector<float> ref_c(M * N);
+
+        for (int i = 0; i < M * K; i++) {
+            a_data[i] = ((i % 17) - 8) * 0.03125f;
+        }
+        for (int n = 0; n < N; n++) {
+            scales[n] = 0.01f + 0.001f * (float)(n % 3);
+            for (int k = 0; k < K; k++) {
+                q_data[n * K + k] = (int8_t)(((n * 13 + k * 7) % 63) - 31);
+                deq[n * K + k] = (float)q_data[n * K + k] * scales[n];
+            }
+        }
+
+        int8_t* packed = pack_b_interleaved_int8_full(q_data.data(), N, K, K);
+        int8_t* q8_repack = pack_b_q8dot_int8_full(q_data.data(), N, K, K);
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data.data());
+        Tensor B = Tensor::create(Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1, packed);
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, c_data.data());
+        B.scales = scales.data();
+        B.group_size = K;
+        B.groups_per_row = 1;
+        B.num_groups = N;
+        B.is_interleaved = true;
+        B.q8_repack_data = q8_repack;
+
+        kernel_matmul_fp32(A, B, C);
+        ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
+        CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 8e-2f),
+              "INT8 Q8-dot GEMM repackable interleaved");
+        delete[] packed;
+        delete[] q8_repack;
     }
 
     if (failures == 0) {

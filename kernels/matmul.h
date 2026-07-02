@@ -16,6 +16,13 @@ struct MatmulConfig {
 extern MatmulConfig g_matmul_config;
 extern bool g_mollm_force_fp32_acc;  // debug: force FP32 accumulation
 
+extern "C" {
+int mollm_matmul_shape_profile_enabled();
+void mollm_set_matmul_profile_phase(const char* phase);
+void mollm_reset_matmul_shape_profile();
+void mollm_print_matmul_shape_profile(const char* title, int top_n);
+}
+
 // ---------------------------------------------------------------------------
 // mollm — Matmul kernels
 //
@@ -48,6 +55,14 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
 // K_weight is the stride between consecutive k rows in B_original
 // (typically == K for row-major).
 __fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K, int K_weight);
+
+// Pack full int8 B [N, K] row-major -> interleaved [N/8, K, 8] layout.
+// Same layout as FP16 B packing, but with int8 elements. Padding rows are zero.
+int8_t* pack_b_interleaved_int8_full(const int8_t* B_original, int N, int K, int K_weight);
+
+// Pack full int8 B [N, K] row-major -> Q8-dot layout [N/8, K/32, 8, 32].
+// Padding output rows and K tail are zero.
+int8_t* pack_b_q8dot_int8_full(const int8_t* B_original, int N, int K, int K_weight);
 
 // Pack A [K, M] column-major FP32 → interleaved [M/8, K, 8] FP16.
 // For each M-tile of 8 rows, 8 M values at the same k are stored consecutively.

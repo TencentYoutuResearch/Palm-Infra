@@ -20,6 +20,114 @@
 
 namespace {
 
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && std::strcmp(value, "0") != 0;
+}
+
+bool int8_q8dot_repack_supported(const Tensor& t) {
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    return t.prec == Precision::INT8 && t.group_size > 0 && (t.group_size % 32) == 0;
+#else
+    (void)t;
+    return false;
+#endif
+}
+
+struct Int8PackingPlan {
+    bool build_interleaved = false;
+    bool build_q8dot = false;
+};
+
+using PackedWeightMap = std::unordered_map<std::string, std::vector<uint8_t>>;
+
+Int8PackingPlan plan_int8_packing(const Tensor& t) {
+    Int8PackingPlan plan;
+    if (t.prec != Precision::INT8 || !g_matmul_config.use_interleave_pack) {
+        return plan;
+    }
+
+    bool q8dot_disabled = env_flag_enabled("MOLLM_W8_NO_Q8_DOT");
+    bool q8dot_repack_disabled =
+        env_flag_enabled("MOLLM_W8_NO_Q8_DOT_REPACK") ||
+        env_flag_enabled("MOLLM_W8_NO_Q8_REPACK");
+    bool q8dot_gemm_disabled = env_flag_enabled("MOLLM_W8_NO_Q8_DOT_GEMM");
+    bool onfly_fp16 = env_flag_enabled("MOLLM_W8_ONFLY_FP16");
+    bool keep_interleaved = env_flag_enabled("MOLLM_W8_KEEP_INT8_INTERLEAVED");
+    bool can_q8dot = int8_q8dot_repack_supported(t);
+
+    plan.build_q8dot = can_q8dot && !q8dot_disabled && !q8dot_repack_disabled;
+    plan.build_interleaved = keep_interleaved || onfly_fp16 || q8dot_disabled ||
+                             q8dot_repack_disabled || q8dot_gemm_disabled ||
+                             !plan.build_q8dot;
+    return plan;
+}
+
+void maybe_pack_fp16_weight(Tensor& t, const std::string& key,
+                            const void* rowmajor_data,
+                            PackedWeightMap& packed_weights) {
+    if (t.prec != Precision::FP16 || !g_matmul_config.use_interleave_pack) return;
+
+    auto it = packed_weights.find(key);
+    if (it == packed_weights.end()) {
+        int N = (int)t.shape[0];
+        int K = (int)t.shape[1];
+        const __fp16* b_orig = reinterpret_cast<const __fp16*>(rowmajor_data);
+        __fp16* b_packed = pack_b_interleaved_full(b_orig, N, K, K);
+        size_t buf_size = (size_t)((N + 7) / 8) * 8 * K * sizeof(__fp16);
+        std::vector<uint8_t> buf((uint8_t*)b_packed, (uint8_t*)b_packed + buf_size);
+        delete[] b_packed;
+        it = packed_weights.emplace(key, std::move(buf)).first;
+    }
+    t.data = it->second.data();
+}
+
+void maybe_pack_int8_weight(Tensor& t, const std::string& key,
+                            const void* rowmajor_data,
+                            PackedWeightMap& packed_weights) {
+#if HAS_NEON
+    Int8PackingPlan plan = plan_int8_packing(t);
+    if (!plan.build_interleaved && !plan.build_q8dot) return;
+
+    int N = (int)t.shape[0];
+    int K = (int)t.shape[1];
+    const int8_t* b_orig = reinterpret_cast<const int8_t*>(rowmajor_data);
+
+    if (plan.build_interleaved) {
+        std::string pack_key = key + "#int8_interleaved";
+        auto it = packed_weights.find(pack_key);
+        if (it == packed_weights.end()) {
+            int8_t* b_packed = pack_b_interleaved_int8_full(b_orig, N, K, K);
+            size_t buf_size = (size_t)((N + 7) / 8) * 8 * K * sizeof(int8_t);
+            std::vector<uint8_t> buf((uint8_t*)b_packed, (uint8_t*)b_packed + buf_size);
+            delete[] b_packed;
+            it = packed_weights.emplace(pack_key, std::move(buf)).first;
+        }
+        t.data = it->second.data();
+        t.is_interleaved = true;
+    }
+
+    if (plan.build_q8dot) {
+        std::string q8_key = key + "#int8_q8dot";
+        auto it = packed_weights.find(q8_key);
+        if (it == packed_weights.end()) {
+            int K_blocks = (K + 31) / 32;
+            int8_t* b_q8 = pack_b_q8dot_int8_full(b_orig, N, K, K);
+            size_t buf_size = (size_t)((N + 7) / 8) * 8 * K_blocks * 32 * sizeof(int8_t);
+            std::vector<uint8_t> buf((uint8_t*)b_q8, (uint8_t*)b_q8 + buf_size);
+            delete[] b_q8;
+            it = packed_weights.emplace(q8_key, std::move(buf)).first;
+        }
+        t.q8_repack_data = it->second.data();
+    }
+#else
+    (void)t;
+    (void)key;
+    (void)rowmajor_data;
+    (void)packed_weights;
+#endif
+}
+
 /// Temperature scaling + softmax in-place.
 /// Returns the softmax sum (should be ~1.0).
 float softmax_inplace(float* logits, int n, float temperature) {
@@ -357,6 +465,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.compute_strides();
             t.data = data;
             t.mem_type = MemoryType::EXTERNAL;
+            t.is_interleaved = false;
+            t.q8_repack_data = nullptr;
         };
 
         // Package mode: resolve weight from package mmap via offset map.
@@ -386,25 +496,10 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     return false;
                 }
 
-                // Interleaved packing (same as file path)
-                if (t.prec == Precision::FP16 && g_matmul_config.use_interleave_pack) {
-                    bool is_embed = (wref.find("embed_tokens") != std::string::npos);
-                    if (!is_embed) {
-                        std::string pack_key = wref;
-                        auto pack_it = packed_weights_.find(pack_key);
-                        if (pack_it == packed_weights_.end()) {
-                            int N = (int)t.shape[0];
-                            int K = (int)t.shape[1];
-                            const __fp16* b_orig = reinterpret_cast<const __fp16*>(data);
-                            __fp16* b_packed = pack_b_interleaved_full(b_orig, N, K, K);
-                            size_t buf_size = (size_t)((N + 7) / 8) * 8 * K * sizeof(__fp16);
-                            packed_weights_[pack_key] = std::vector<uint8_t>(
-                                (uint8_t*)b_packed, (uint8_t*)b_packed + buf_size);
-                            delete[] b_packed;
-                        }
-                        t.data = packed_weights_[pack_key].data();
-                    }
+                if (wref.find("embed_tokens") == std::string::npos) {
+                    maybe_pack_fp16_weight(t, wref, data, packed_weights_);
                 }
+                maybe_pack_int8_weight(t, wref, data, packed_weights_);
                 continue;
             }
         }
@@ -445,28 +540,11 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             }
         }
 
-        // Load-time B interleaved packing for FP16 weights (skip embed_tokens)
-        // embed_tokens stays row-major FP16 for simple embed() lookup.
-        // A packed copy is created separately for lm_head matmul.
-        if (t.prec == Precision::FP16 && g_matmul_config.use_interleave_pack) {
-            bool is_embed = (node.params.str[0].find("embed_tokens") != std::string::npos);
-            if (!is_embed) {
-                auto pack_it = packed_weights_.find(wpath);
-                if (pack_it == packed_weights_.end()) {
-                int N = (int)t.shape[0];
-                int K = (int)t.shape[1];
-                int K_weight = K;
-                const __fp16* b_orig = reinterpret_cast<const __fp16*>(t.data);
-                __fp16* b_packed = pack_b_interleaved_full(b_orig, N, K, K_weight);
-                size_t buf_size = (size_t)N * K * sizeof(__fp16);
-                std::vector<uint8_t> buf((uint8_t*)b_packed,
-                                         (uint8_t*)b_packed + buf_size);
-                delete[] b_packed;
-                packed_weights_[wpath] = std::move(buf);
-                }
-                t.data = packed_weights_[wpath].data();
-            }
+        // embed_tokens stays row-major for lookup; lm_head gets its own packed copy below.
+        if (node.params.str[0].find("embed_tokens") == std::string::npos) {
+            maybe_pack_fp16_weight(t, wpath, t.data, packed_weights_);
         }
+        maybe_pack_int8_weight(t, wpath, t.data, packed_weights_);
     }
 
     // Find embed_tokens weight and create packed copy for lm_head
@@ -1117,7 +1195,9 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
     }
 
+    mollm_set_matmul_profile_phase("prefill_graph");
     Tensor out = run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
+    mollm_set_matmul_profile_phase("unscoped");
     Tensor copied = copy_tensor_contiguous(out, hidden_output_copy_);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
@@ -1199,6 +1279,7 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past;
     }
 
+    mollm_set_matmul_profile_phase("prefill_graph");
     Tensor out = run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
 
     past_len_ = past + n;
@@ -1212,7 +1293,9 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     // Cache migration (prefill→decode graph) is done once at load time.
     // Both graphs share the same physical cache buffers.
 
+    mollm_set_matmul_profile_phase("prefill_lmhead");
     int token = run_lmhead(out, n);
+    mollm_set_matmul_profile_phase("unscoped");
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
@@ -1231,6 +1314,7 @@ int LLMEngine::decode(int token_id) {
 
     Tensor mask = build_causal_mask(1, past_len_);
 
+    mollm_set_matmul_profile_phase("decode_graph");
     Tensor out = run_graph(graph_decode_, exec_ctx_decode_, h, mask, cos, sin);
 
     past_len_++;
@@ -1241,7 +1325,9 @@ int LLMEngine::decode(int token_id) {
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
     }
 
+    mollm_set_matmul_profile_phase("decode_lmhead");
     int token = run_lmhead(out);
+    mollm_set_matmul_profile_phase("unscoped");
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
@@ -1265,7 +1351,9 @@ Tensor LLMEngine::decode_hidden(int token_id) {
 
     Tensor mask = build_causal_mask(1, past_len_);
 
+    mollm_set_matmul_profile_phase("decode_graph");
     Tensor out = run_graph(graph_decode_, exec_ctx_decode_, h, mask, cos, sin);
+    mollm_set_matmul_profile_phase("unscoped");
     Tensor copied = copy_tensor_contiguous(out, hidden_output_copy_);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);

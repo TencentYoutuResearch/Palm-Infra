@@ -1,6 +1,6 @@
 # Current State
 
-*Last updated: 2026-07-01*
+*Last updated: 2026-07-02*
 
 ## 项目概述
 
@@ -182,7 +182,7 @@ Dynamic shape 模式启用后，短 prompt 不再 padding 到 256：
 2. **C++ 执行器**（`graph/execute.cpp`）：顺序节点 dispatch + BufferPool 内存管理 + Backend 抽象
 3. **NEON kernels**（`kernels/`）：matmul, attention, gdn, norm, rope
 
-### Quantization（W8 correctness baseline）
+### Quantization（W8 + Q8 activation dot decode path）
 
 2026-07-01 已加入 correctness-first W8 weight-only 量化：
 
@@ -191,12 +191,20 @@ Dynamic shape 模式启用后，短 prompt 不再 padding 到 256：
   表达 per-channel/per-group scale metadata
 - runtime 从 weight header 读取真实 precision；INT8 CONSTANT 会校验 scale metadata，
   并跳过 FP16 interleaved packing
-- `kernel_matmul_fp32()` 已有 INT8 scalar path，按 `scales[n * groups_per_row + k / group_size]`
-  on-the-fly dequant 到 FP32 output
+- `kernel_matmul_fp32()` 已有 INT8 scalar fallback、native W8 NEON dequant kernel，
+  以及 decode/GEMV 默认 Q8 activation dot path
 - Qwen3.5 / Youtu converter 仅量化 projection/linear 2-D weights；embedding/lm_head storage、
   norm、conv、`A_log`、`dt_bias` 等保持原精度
 
-当前重点是正确性，INT8 kernel 还没有 NEON 优化，不应解读 W8 推理速度。
+W8 默认路径已按 llama.cpp/ggml 的方向改成：
+
+```text
+FP32 activation -> temporary Q8 blocks -> INT8 weight x Q8 activation dot -> FP32 output
+```
+
+decode/GEMV 和 prefill/GEMM 默认都使用 q8dot repacked layout
+`[N/8, K/32, 8, 32]` + `vdotq_s32`。旧 `[N/8, K, 8]` INT8 interleaved copy
+不再默认常驻；仅在 fallback/diagnostic 模式或 q8dot unsupported shape 下创建。
 
 Qwen3.5-0.8B quick validation：
 
@@ -206,8 +214,117 @@ Qwen3.5-0.8B quick validation：
 | W8PC `qwen35_0.8b_w8pc.mollm` | 1022.9 MB | 3.0969 / 22.13 | +0.0058 | pass |
 | W8G128 `qwen35_0.8b_w8g128.mollm` | 1036.8 MB | 3.0926 / 22.03 | +0.0015 | pass |
 
+256-token PPL audit on the same reference tokens:
+
+| Package | 256-token CE/PPL | CE delta vs FP16 |
+|---|---:|---:|
+| FP16 `qwen35_0.8b.mollm` | 2.1388 / 8.49 | - |
+| W8PC `qwen35_0.8b_w8pc.mollm` | 2.1473 / 8.56 | +0.0085 |
+| W8G128 `qwen35_0.8b_w8g128.mollm` | 2.1413 / 8.51 | +0.0025 |
+
 新增 `test_quantized_e2e` 覆盖 W8 package load、finite logits、short CE drift、
 workspace presence 和短 decode。详细设计见 `docs/QUANTIZATION.md`。
+
+2026-07-01 后续已开始 W8 kernel 优化，详见 `docs/OPTIMIZATION_LOG_QUANT.md`：
+
+- 加入 INT8 B interleaved packing、W8 NEON GEMV、W8 NEON 4x8 GEMM
+- decode/GEMV 和 prefill/GEMM 默认启用 repacked Q8 activation dot；
+  `MOLLM_W8_NO_Q8_DOT_REPACK=1` 可回退旧 interleaved layout，
+  `MOLLM_W8_NO_Q8_DOT=1` 可回退 native W8 dequant 路径
+- microbench 中 GEMV 从 ~9 GF/s 提升到 ~70 GF/s；GEMM 从 ~10 GF/s 提升到
+  ~210-230 GF/s
+- Q8-dot GEMV microbench 进一步到 ~158 GF/s；旧 W8 GEMV 同形状约 ~65 GF/s
+- repacked Q8-dot GEMV opt-in path 使用 `[N/8, K/32, 8, 32]` layout +
+  `vdotq_s32`，microbench `M=1 K=2048 N=6144` 从 0.15ms 降到 0.10ms
+- repacked Q8-dot GEMM 现在是 W8 默认 prefill 路径；当前单次 0.8B bench 中
+  W8PC 默认约 376 / 127 pp/tg
+- ARM i8mm (`vmmlaq_s32`) q8dot GEMM 已实现；`-DMOLLM_ARM_I8MM=ON` build
+  下 2B/4B dominant prefill microbench 约 1.5x，整包单次 fresh run prefill
+  提升约 61-64%，decode 基本不变
+- q8dot GEMV 已去掉 per-column `vaddvq_s32` 标量化；W8 scale mode 明确拆成
+  per-channel / true per-block(32) / per-group。`-DMOLLM_ARM_I8MM=ON` 单次
+  fresh run 中 2B/4B decode 已基本追上或超过 llama.cpp Q8_0 参考
+- 0.8B package W8PC decode 从旧路径 44.7 tok/s 提升到当前约 102 tok/s；
+  repacked GEMV opt-in 可到约 133 tok/s；W8G128 当前约 103 tok/s，
+  repacked GEMV opt-in 约 115 tok/s
+- 但 FP16FML prefill 仍明显更快（FP16 0.8B package 约 623.5 / 97.6 pp/tg）；
+  当前 W8PC 默认约 376 / 127
+- W8 0.8B peak RSS 默认约 3.05 GB；q8dot repack 已替换旧 INT8 interleaved
+  copy，不再像早期 full repack 一样升到约 3.52 GB
+
+W8PC 多模型 package bench（pp256 + tg64, warmup=3, 4 threads, greedy decode，
+单次 fresh run；2026-07-02 默认 W8 已切到 q8dot full repack，并去掉旧 INT8
+interleaved 常驻 copy）：
+
+| Model | Runtime | pp/tg | peak RSS |
+|---|---|---:|---:|
+| Qwen3.5-0.8B W8PC | default q8dot full repack | 376.1 / 126.8 | 3045 MB |
+| Youtu-LLM-2B W8PC | default q8dot full repack | 118.4 / 57.3 | 6200 MB |
+| Qwen3.5-4B W8PC | default q8dot full repack | 54.5 / 27.7 | 12176 MB |
+
+Interpretation:
+- q8dot full repack is now the default W8 path and keeps roughly the old default
+  RSS by replacing, not adding to, the INT8 interleaved layout
+- decode improves substantially versus the earlier default W8PC path, but still
+  trails llama.cpp Q8_0 on all tested models
+- prefill is much better than native W8 dequant, but still trails llama.cpp Q8_0
+  prefill by a large margin on 2B/4B
+
+llama.cpp Q8_0 CPU 参考基线（`../llama.cpp` build `5c7c22c3e` / 9803，
+`llama-bench -ngl 0 -p 256 -n 64 -t 4 -r 5 -o md`）：
+
+| GGUF | Size | pp256 | tg64 |
+|---|---:|---:|---:|
+| Qwen3.5-0.8B Q8_0 | 784.52 MiB | 809.11 +/- 0.97 | 167.23 +/- 0.88 |
+| Youtu-LLM-2B Q8_0 | 1.94 GiB | 257.31 +/- 20.32 | 85.84 +/- 1.65 |
+| Qwen3.5-4B Q8_0 | 4.28 GiB | 137.45 +/- 4.96 | 38.25 +/- 1.82 |
+
+当前判断：native W8 NEON 已修复 scalar bottleneck；llama.cpp-style Q8 activation
+dot 对 decode 有明确收益，q8dot repack 继续缩小了和 llama.cpp Q8_0 的差距
+（0.8B decode 约 127-135 vs 167 tok/s），但还没有追平。整包 load-time
+dequant-to-FP16 曾作为 upper-bound 原型测试过，但已移除；它需要常驻 FP16 packed
+weight copy，会放弃太多 W8 runtime-memory 收益，不是目标路径。
+
+当前保留的实验路径是 `MOLLM_W8_ONFLY_FP16=1`：权重仍按 INT8 interleaved
+保存，只在 kernel 加载 B tile 时现场 dequant 成 FP16 并走 FP16 accumulate 结构。
+microbench 结果显示它没有改善 prefill GEMM，且 GEMV 明显变慢。下一步重点是
+继续打磨默认 q8dot repack layout 的 kernel 效率：scale handling、tile layout、
+runtime memory traffic，以及 per-group 量化路径。
+
+2026-07-02 新增 `MOLLM_MATMUL_SHAPE_PROFILE=1`，`mollm_bench --profile`
+会额外打印按 `phase/path/M/N/K/group` 聚合的 matmul shape profile。短 profiling
+（pp256 + tg16, warmup=1）显示 2B/4B 的 W8 瓶颈集中在少数通用 shape class：
+
+| Model | Dominant prefill q8dot GEMM | GMAC/s | Dominant decode q8dot GEMV | GMAC/s |
+|---|---|---:|---|---:|
+| Youtu-LLM-2B W8PC | M=256,N=12288,K=2048 | ~240 | M=1,N=12288,K=2048 | ~130 |
+| Qwen3.5-4B W8PC | M=256,N=9216,K=2560 | ~225 | M=1,N=9216,K=2560 | ~127 |
+
+这说明下一步不应该按模型/层硬编码具体矩阵尺寸，而应像 llama.cpp/ggml 一样按
+quant type、GEMV/GEMM、tile（如 4x8/8x8）和 CPU feature 选择通用 kernel。
+2026-07-02 已加入 ARM i8mm/`vmmlaq_s32` 的 q8dot GEMM kernel。当前 CMake
+默认仍保持可移植 ARM64 target，本机默认 clang 只定义 `__ARM_FEATURE_DOTPROD`，
+不会定义 `__ARM_FEATURE_MATMUL_INT8`；本地 benchmark 需要
+`-DMOLLM_ARM_NATIVE=ON` 或 `-DMOLLM_ARM_I8MM=ON`。
+
+i8mm 单次 fresh run（pp256 + tg64, warmup=3, 4 threads；非 5-run median）：
+
+| Model | Default DOTPROD W8PC | i8mm GEMM W8PC | effect |
+|---|---:|---:|---:|
+| Youtu-LLM-2B | 126.8 / 57.2 | 203.7 / 57.4 | pp +60.7%, tg flat |
+| Qwen3.5-4B | 53.3 / 27.1 | 87.3 / 26.6 | pp +63.6%, tg flat |
+
+随后 q8dot GEMV 改成 vector reduction，并区分 per-channel / per-block32 /
+per-group scale mode。i8mm build 单次 fresh run：
+
+| Model | Attempt 9 W8PC | llama.cpp Q8_0 reference |
+|---|---:|---:|
+| Youtu-LLM-2B | 230.4 / 87.1 | 257.3 / 85.8 |
+| Qwen3.5-4B | 106.7 / 42.4 | 137.5 / 38.3 |
+
+结论：decode gap 基本消失；剩余主要是 prefill，尤其 4B。下一步应把 GEMM
+layout 进一步向 ggml `block_q8_0x4` 靠拢：A packing/layout、scale placement、
+store/reorder 开销，以及 q8 activation quantization（当前约 4-6% matmul time）。
 
 ### Dynamic shape（尝试 13）
 
@@ -355,8 +472,8 @@ graph fusion、continuous batching、多 backend 前，建议先收敛成显式
 
 ## 下一步
 
-1. **W8 NEON kernels** — 当前 W8 只保证正确性；下一步实现 ARM NEON GEMV/GEMM，再按严格协议测 2B/4B
-2. **W8 quality audit** — 对 W8PC/W8G128 跑完整 256-token PPL，确认 group-size 质量/大小 tradeoff
+1. **W8 kernel next step** — q8dot full repack 已是默认 W8 路径，decode 已基本追上 Q8_0 参考；下一步集中优化 prefill GEMM layout（A packing、scale placement、store/reorder、q8 activation quantization）和 per-group 路径
+2. **W8 quality audit** — 256-token PPL 已通过；后续扩大到更多 calibration samples，确认 group-size 质量/大小 tradeoff
 3. **W4 quantization** — 复用 W8 metadata/runtime 结构扩展到 W4，目标仍是 4B prefill 主要杠杆
 4. **内存模型整理** — 按 `docs/MEMORY_MODEL.md` 继续落地：下一步把 `(owner_id, storage_id)` 扩展成 explicit `TensorStorage` / storage registry
 5. **Graph fusion** — 融合相邻 matmul+activation+norm，减少 cache 抢占（e2e matmul 利用率 40% vs microbench 86%）

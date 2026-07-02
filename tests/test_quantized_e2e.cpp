@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -21,7 +22,7 @@ struct CeResult {
     bool finite = false;
 };
 
-static CeResult compute_short_ce(LLMEngine& eng, const std::vector<int>& token_ids) {
+static CeResult compute_ce(LLMEngine& eng, const std::vector<int>& token_ids) {
     CeResult result;
     Tensor hidden = eng.prefill_hidden(token_ids);
     if (!hidden.data) return result;
@@ -66,7 +67,13 @@ int main(int argc, char** argv) {
     const char* quant_package = argc > 2 ? argv[2] :
         "/Users/molly/workspace-youtulm-ncnn/mollm/qwen35_0.8b_w8pc.mollm";
 
-    std::vector<int> ppl_ids(PPL_REF_TOKENS, PPL_REF_TOKENS + 32);
+    int n_ppl_tokens = 32;
+    if (argc > 3) {
+        n_ppl_tokens = std::atoi(argv[3]);
+        if (n_ppl_tokens < 2) n_ppl_tokens = 2;
+        if (n_ppl_tokens > PPL_REF_N) n_ppl_tokens = PPL_REF_N;
+    }
+    std::vector<int> ppl_ids(PPL_REF_TOKENS, PPL_REF_TOKENS + n_ppl_tokens);
 
     LLMEngine fp16;
     EngineConfig fp16_cfg;
@@ -93,14 +100,14 @@ int main(int argc, char** argv) {
     }
 
     if (fp16_ok && quant_ok) {
-        CeResult fp16_ce = compute_short_ce(fp16, ppl_ids);
-        CeResult quant_ce = compute_short_ce(quant, ppl_ids);
-        std::printf("  short CE/PPL: fp16=%.4f/%.2f w8=%.4f/%.2f\n",
-                    fp16_ce.ce, fp16_ce.ppl, quant_ce.ce, quant_ce.ppl);
-        std::printf("  short CE delta: %.4f\n", quant_ce.ce - fp16_ce.ce);
+        CeResult fp16_ce = compute_ce(fp16, ppl_ids);
+        CeResult quant_ce = compute_ce(quant, ppl_ids);
+        std::printf("  CE/PPL (%d tokens): fp16=%.4f/%.2f w8=%.4f/%.2f\n",
+                    n_ppl_tokens, fp16_ce.ce, fp16_ce.ppl, quant_ce.ce, quant_ce.ppl);
+        std::printf("  CE delta: %.4f\n", quant_ce.ce - fp16_ce.ce);
 
-        CHECK(fp16_ce.finite, "FP16 short logits finite");
-        CHECK(quant_ce.finite, "W8 short logits finite");
+        CHECK(fp16_ce.finite, "FP16 logits finite");
+        CHECK(quant_ce.finite, "W8 logits finite");
         CHECK(fp16_ce.vocab > 0 && fp16_ce.vocab == quant_ce.vocab,
               "W8 vocab/logit shape matches FP16");
         CHECK(quant.prefill_pool_stats().active > 0,
@@ -110,7 +117,7 @@ int main(int argc, char** argv) {
         // expected to drift from FP16, but a very large CE jump usually means
         // bad scale indexing, missing metadata, or transposed quantization.
         CHECK(quant_ce.ce < fp16_ce.ce + 1.0f,
-              "W8 short CE stays near FP16 baseline");
+              "W8 CE stays near FP16 baseline");
 
         Tokenizer tok;
         bool tok_ok = tok.load(fp16.config().tokenizer_path);

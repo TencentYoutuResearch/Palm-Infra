@@ -11,6 +11,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(MOLLM_BUILD_TESTS "Build tests" ON)
 option(MOLLM_BUILD_EXAMPLE "Build example CLI" ON)
+option(MOLLM_ARM_NATIVE "Build ARM64 kernels with -mcpu=native for local benchmarking" OFF)
+option(MOLLM_ARM_I8MM "Build ARM64 kernels with -march=armv8.6-a+i8mm+fp16+fp16fml" OFF)
 
 # ---------------------------------------------------------------------------
 # library sources
@@ -64,6 +66,13 @@ target_link_libraries(mollm_lib PUBLIC)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     message(STATUS "Target: ARM64 (NEON enabled)")
     target_compile_definitions(mollm_lib PRIVATE __ARM_NEON=1)
+    if(MOLLM_ARM_NATIVE)
+        message(STATUS "ARM64 native target enabled (-mcpu=native)")
+        target_compile_options(mollm_lib PRIVATE -mcpu=native)
+    elseif(MOLLM_ARM_I8MM)
+        message(STATUS "ARM64 i8mm target enabled (-march=armv8.6-a+i8mm+fp16+fp16fml)")
+        target_compile_options(mollm_lib PRIVATE -march=armv8.6-a+i8mm+fp16+fp16fml)
+    endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     message(STATUS "Target: ARM32")
     target_compile_definitions(mollm_lib PRIVATE __ARM_NEON=1)

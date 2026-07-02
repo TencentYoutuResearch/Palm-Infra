@@ -58,6 +58,8 @@ struct Tensor {
     uint32_t    group_size = 0;    // K-dim quant group size; K means per-channel
     uint32_t    num_groups = 0;    // total groups = N * groups_per_row
     uint32_t    groups_per_row = 0;
+    bool        is_interleaved = false; // weight data is packed as [N/8, K, 8]
+    const void* q8_repack_data = nullptr; // optional [N/8, K/32, 8, 32] INT8 dot layout
 
     // -----------------------------------------------------------------------
     // factory

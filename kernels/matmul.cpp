@@ -3,7 +3,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -78,27 +83,164 @@ static void apply_activation_to_range_gemv(float* C, int N,
 // std::atomic<double> has no fetch_add, use mutex-protected doubles.
 static double g_pack_a_ms = 0;
 static double g_matmul_ms = 0;
+static double g_q8_quant_a_ms = 0;
 static long long g_pack_a_calls = 0;
+static long long g_q8_quant_a_calls = 0;
 static std::mutex g_prof_mtx;
+
+static bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && std::strcmp(value, "0") != 0;
+}
+
+static bool matmul_shape_profile_enabled() {
+    static bool enabled = env_flag_enabled("MOLLM_MATMUL_SHAPE_PROFILE");
+    return enabled;
+}
+
+struct MatmulShapeProfileRow {
+    const char* phase = "unscoped";
+    const char* path = "unknown";
+    int M = 0;
+    int N = 0;
+    int K = 0;
+    int group_size = 0;
+    int groups_per_row = 0;
+    int threads = 1;
+    bool has_q8_repack = false;
+    bool b_interleaved = false;
+    long long calls = 0;
+    double total_ms = 0.0;
+};
+
+static const char* g_matmul_profile_phase = "unscoped";
+static std::vector<MatmulShapeProfileRow> g_matmul_shape_profile;
+
+static bool same_shape_profile_key(const MatmulShapeProfileRow& row,
+                                   const MatmulShapeProfileRow& key) {
+    return std::strcmp(row.phase, key.phase) == 0 &&
+           std::strcmp(row.path, key.path) == 0 &&
+           row.M == key.M && row.N == key.N && row.K == key.K &&
+           row.group_size == key.group_size &&
+           row.groups_per_row == key.groups_per_row &&
+           row.threads == key.threads &&
+           row.has_q8_repack == key.has_q8_repack &&
+           row.b_interleaved == key.b_interleaved;
+}
+
+static void record_matmul_shape_profile_locked(const MatmulShapeProfileRow& key,
+                                               double elapsed_ms) {
+    for (auto& row : g_matmul_shape_profile) {
+        if (same_shape_profile_key(row, key)) {
+            row.calls += 1;
+            row.total_ms += elapsed_ms;
+            return;
+        }
+    }
+    MatmulShapeProfileRow row = key;
+    row.calls = 1;
+    row.total_ms = elapsed_ms;
+    g_matmul_shape_profile.push_back(row);
+}
 
 extern "C" double mollm_pack_a_total_ms() { return g_pack_a_ms; }
 extern "C" long long mollm_pack_a_calls() { return g_pack_a_calls; }
 extern "C" double mollm_matmul_total_ms() { return g_matmul_ms; }
+extern "C" double mollm_q8_quant_a_total_ms() { return g_q8_quant_a_ms; }
+extern "C" long long mollm_q8_quant_a_calls() { return g_q8_quant_a_calls; }
+extern "C" int mollm_matmul_shape_profile_enabled() {
+    return matmul_shape_profile_enabled() ? 1 : 0;
+}
+extern "C" void mollm_set_matmul_profile_phase(const char* phase) {
+    if (!matmul_shape_profile_enabled()) return;
+    std::lock_guard<std::mutex> lk(g_prof_mtx);
+    g_matmul_profile_phase = (phase && phase[0]) ? phase : "unscoped";
+}
+extern "C" void mollm_reset_matmul_shape_profile() {
+    std::lock_guard<std::mutex> lk(g_prof_mtx);
+    g_matmul_shape_profile.clear();
+    g_matmul_profile_phase = "unscoped";
+}
+extern "C" void mollm_print_matmul_shape_profile(const char* title, int top_n) {
+    if (!matmul_shape_profile_enabled()) return;
+
+    std::vector<MatmulShapeProfileRow> rows;
+    {
+        std::lock_guard<std::mutex> lk(g_prof_mtx);
+        rows = g_matmul_shape_profile;
+    }
+    if (rows.empty()) return;
+
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        return a.total_ms > b.total_ms;
+    });
+
+    double total_ms = 0.0;
+    for (const auto& row : rows) total_ms += row.total_ms;
+    if (top_n <= 0 || top_n > (int)rows.size()) top_n = (int)rows.size();
+
+    std::printf("\n[%s]\n", title && title[0] ? title : "matmul_shape_profile");
+    std::printf("  %-16s %-28s %5s %7s %6s %7s %7s %4s %3s %3s %8s %10s %9s %7s %9s\n",
+                "phase", "path", "M", "N", "K", "group", "groups", "thr",
+                "q8r", "int", "calls", "total_ms", "avg_ms", "pct", "GMAC/s");
+    std::printf("  %-16s %-28s %5s %7s %6s %7s %7s %4s %3s %3s %8s %10s %9s %7s %9s\n",
+                "---", "---", "---", "---", "---", "---", "---", "---",
+                "---", "---", "---", "---", "---", "---", "---");
+    for (int i = 0; i < top_n; i++) {
+        const auto& row = rows[i];
+        double avg_ms = row.calls > 0 ? row.total_ms / row.calls : 0.0;
+        double pct = total_ms > 0.0 ? row.total_ms * 100.0 / total_ms : 0.0;
+        double gmac = (double)row.calls * (double)row.M * (double)row.N * (double)row.K / 1e9;
+        double gmac_s = row.total_ms > 0.0 ? gmac / (row.total_ms / 1000.0) : 0.0;
+        std::printf("  %-16s %-28s %5d %7d %6d %7d %7d %4d %3d %3d %8lld %10.2f %9.3f %6.1f%% %9.2f\n",
+                    row.phase, row.path, row.M, row.N, row.K,
+                    row.group_size, row.groups_per_row, row.threads,
+                    row.has_q8_repack ? 1 : 0,
+                    row.b_interleaved ? 1 : 0,
+                    row.calls, row.total_ms, avg_ms, pct, gmac_s);
+    }
+}
 extern "C" void mollm_reset_pack_counters() {
     std::lock_guard<std::mutex> lk(g_prof_mtx);
     g_pack_a_ms = 0;
     g_pack_a_calls = 0;
+    g_q8_quant_a_ms = 0;
+    g_q8_quant_a_calls = 0;
     g_matmul_ms = 0;
 }
 
 // RAII timer for kernel_matmul_fp32 — captures all return paths.
 struct MatmulTimer {
     std::chrono::steady_clock::time_point t0;
+    MatmulShapeProfileRow shape;
+    bool shape_valid = false;
+
     MatmulTimer() : t0(std::chrono::steady_clock::now()) {}
+    void set_shape(const char* path, int M, int N, int K,
+                   int group_size = 0, int groups_per_row = 0,
+                   bool has_q8_repack = false, bool b_interleaved = false,
+                   int threads = 1) {
+        if (!matmul_shape_profile_enabled()) return;
+        shape.path = path ? path : "unknown";
+        shape.M = M;
+        shape.N = N;
+        shape.K = K;
+        shape.group_size = group_size;
+        shape.groups_per_row = groups_per_row;
+        shape.has_q8_repack = has_q8_repack;
+        shape.b_interleaved = b_interleaved;
+        shape.threads = threads;
+        shape_valid = true;
+    }
     ~MatmulTimer() {
         auto t1 = std::chrono::steady_clock::now();
+        double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::lock_guard<std::mutex> lk(g_prof_mtx);
-        g_matmul_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        g_matmul_ms += elapsed_ms;
+        if (shape_valid && matmul_shape_profile_enabled()) {
+            shape.phase = g_matmul_profile_phase;
+            record_matmul_shape_profile_locked(shape, elapsed_ms);
+        }
     }
 };
 
@@ -106,6 +248,57 @@ MatmulConfig g_matmul_config;
 
 // Debug override: force FP32 accumulation (for precision comparison)
 bool g_mollm_force_fp32_acc = false;
+
+static constexpr int W8_Q8_BLOCK = 32;
+
+enum class W8ScaleMode {
+    PerChannel,
+    PerBlock32,
+    PerGroup,
+};
+
+static inline W8ScaleMode w8_scale_mode(int group_size, int groups_per_row) {
+    if (groups_per_row == 1) return W8ScaleMode::PerChannel;
+    if (group_size == W8_Q8_BLOCK) return W8ScaleMode::PerBlock32;
+    return W8ScaleMode::PerGroup;
+}
+
+static inline int w8_scale_group(W8ScaleMode mode, int qb, int group_size) {
+    switch (mode) {
+        case W8ScaleMode::PerChannel:
+            return 0;
+        case W8ScaleMode::PerBlock32:
+            return qb;
+        case W8ScaleMode::PerGroup:
+            return (qb * W8_Q8_BLOCK) / group_size;
+    }
+    return 0;
+}
+
+#if HAS_NEON
+static inline void load_w8_b_scales8(const float* scales, int n, int c_valid,
+                                     int groups_per_row, int group,
+                                     float32x4_t& lo, float32x4_t& hi) {
+    float tmp[8];
+    for (int c = 0; c < 8; c++) {
+        tmp[c] = (c < c_valid) ? scales[(n + c) * groups_per_row + group] : 0.f;
+    }
+    lo = vld1q_f32(tmp);
+    hi = vld1q_f32(tmp + 4);
+}
+#endif
+
+static void debug_w8_path_once(const char* path, int M, int N, int K,
+                               int group_size, bool has_q8_repack) {
+    static bool enabled = env_flag_enabled("MOLLM_W8_DEBUG_PATHS");
+    if (!enabled) return;
+    static std::mutex mu;
+    static int count = 0;
+    std::lock_guard<std::mutex> lock(mu);
+    if (count++ >= 80) return;
+    std::fprintf(stderr, "W8_PATH path=%s M=%d N=%d K=%d group=%d q8_repack=%d\n",
+                 path, M, N, K, group_size, has_q8_repack ? 1 : 0);
+}
 
 // ---------------------------------------------------------------------------
 // scalar matmul (fallback)
@@ -132,12 +325,57 @@ static void matmul_fp32_scalar_range(const float* A, const float* B, float* C,
     }
 }
 
+int8_t* pack_b_interleaved_int8_full(const int8_t* B_original, int N, int K, int K_weight) {
+    int N_padded = ((N + 7) / 8) * 8;
+    int8_t* dst = new int8_t[(size_t)N_padded * K];
+    for (int n_tile = 0; n_tile < N_padded; n_tile += 8) {
+        int tile_valid = std::min(8, N - n_tile);
+        if (tile_valid < 0) tile_valid = 0;
+        for (int k = 0; k < K; k++) {
+            for (int j = 0; j < tile_valid; j++) {
+                dst[n_tile * K + k * 8 + j] = B_original[(n_tile + j) * K_weight + k];
+            }
+            for (int j = tile_valid; j < 8; j++) {
+                dst[n_tile * K + k * 8 + j] = 0;
+            }
+        }
+    }
+    return dst;
+}
+
+int8_t* pack_b_q8dot_int8_full(const int8_t* B_original, int N, int K, int K_weight) {
+    int N_padded = ((N + 7) / 8) * 8;
+    int blocks_per_row = (K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK;
+    int8_t* dst = new int8_t[(size_t)(N_padded / 8) * blocks_per_row * 8 * W8_Q8_BLOCK];
+    std::memset(dst, 0, (size_t)(N_padded / 8) * blocks_per_row * 8 * W8_Q8_BLOCK);
+
+    for (int n_tile = 0; n_tile < N_padded; n_tile += 8) {
+        int tile_valid = std::min(8, N - n_tile);
+        if (tile_valid < 0) tile_valid = 0;
+        int8_t* tile = dst + (size_t)(n_tile / 8) * blocks_per_row * 8 * W8_Q8_BLOCK;
+        for (int qb = 0; qb < blocks_per_row; qb++) {
+            int k_begin = qb * W8_Q8_BLOCK;
+            int k_end = std::min(k_begin + W8_Q8_BLOCK, K);
+            int8_t* block = tile + (size_t)qb * 8 * W8_Q8_BLOCK;
+            for (int j = 0; j < tile_valid; j++) {
+                int8_t* col = block + j * W8_Q8_BLOCK;
+                const int8_t* src = B_original + (size_t)(n_tile + j) * K_weight;
+                for (int k = k_begin; k < k_end; k++) {
+                    col[k - k_begin] = src[k];
+                }
+            }
+        }
+    }
+    return dst;
+}
+
 static void matmul_int8_scalar_range(const float* A, const int8_t* B, const float* scales,
                                      int group_size, int groups_per_row,
                                      float* C, int M, int N, int K,
                                      int lda, int K_weight, int ldc,
                                      int m_begin, int m_end,
-                                     int n_begin, int n_end) {
+                                     int n_begin, int n_end,
+                                     bool b_interleaved = false) {
     (void)M;
     if (group_size <= 0) group_size = K;
     if (groups_per_row <= 0) groups_per_row = 1;
@@ -150,7 +388,97 @@ static void matmul_int8_scalar_range(const float* A, const int8_t* B, const floa
             float sum = 0.f;
             for (int k = 0; k < K; k++) {
                 int g = k / group_size;
-                sum += A[k + m * lda] * ((float)b_row[k] * s_row[g]);
+                int8_t q = b_interleaved
+                    ? B[(n & ~7) * K_weight + k * 8 + (n & 7)]
+                    : b_row[k];
+                sum += A[k + m * lda] * ((float)q * s_row[g]);
+            }
+            c_row[n] = sum;
+        }
+    }
+}
+
+static void quantize_a_q8_blocks(const float* A, int M, int K, int lda,
+                                 int K_storage,
+                                 std::vector<int8_t>& qA,
+                                 std::vector<float>& a_scales) {
+    auto t0 = std::chrono::steady_clock::now();
+    if (K_storage < K) K_storage = K;
+    int blocks_per_row = (K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK;
+    if (K_storage == K) {
+        qA.resize((size_t)M * K_storage);
+    } else {
+        qA.assign((size_t)M * K_storage, 0);
+    }
+    a_scales.resize((size_t)M * blocks_per_row);
+
+    for (int m = 0; m < M; m++) {
+        const float* a_row = A + m * lda;
+        int8_t* qa_row = qA.data() + (size_t)m * K_storage;
+        float* s_row = a_scales.data() + (size_t)m * blocks_per_row;
+        for (int qb = 0; qb < blocks_per_row; qb++) {
+            int k_begin = qb * W8_Q8_BLOCK;
+            int k_end = std::min(k_begin + W8_Q8_BLOCK, K);
+            float amax = 0.f;
+            for (int k = k_begin; k < k_end; k++) {
+                amax = std::max(amax, std::fabs(a_row[k]));
+            }
+            float scale = (amax > 0.f) ? (amax / 127.f) : 1.f;
+            float inv_scale = (amax > 0.f) ? (127.f / amax) : 0.f;
+            s_row[qb] = scale;
+            for (int k = k_begin; k < k_end; k++) {
+                int q = (int)std::nearbyint(a_row[k] * inv_scale);
+                q = std::max(-127, std::min(127, q));
+                qa_row[k] = (int8_t)q;
+            }
+        }
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::lock_guard<std::mutex> lk(g_prof_mtx);
+    g_q8_quant_a_ms += ms;
+    g_q8_quant_a_calls++;
+}
+
+static inline int8_t load_b_int8_value(const int8_t* B, int n, int k,
+                                       int K_weight, bool b_interleaved) {
+    return b_interleaved
+        ? B[(n & ~7) * K_weight + k * 8 + (n & 7)]
+        : B[n * K_weight + k];
+}
+
+static void matmul_int8_q8dot_scalar_range(
+    const int8_t* qA, const float* a_scales,
+    const int8_t* B, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int M, int N, int K,
+    int K_weight, int ldc,
+    int m_begin, int m_end,
+    int n_begin, int n_end,
+    bool b_interleaved)
+{
+    (void)M;
+    int blocks_per_row = (K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK;
+    for (int m = m_begin; m < m_end; m++) {
+        const int8_t* qa_row = qA + (size_t)m * K;
+        const float* as_row = a_scales + (size_t)m * blocks_per_row;
+        float* c_row = C + m * ldc;
+        for (int n = n_begin; n < n_end; n++) {
+            const float* bs_row = scales + n * groups_per_row;
+            float sum = 0.f;
+            int k0 = 0;
+            while (k0 < K) {
+                int q_block = k0 / W8_Q8_BLOCK;
+                int group = k0 / group_size;
+                int k_end = std::min({K, (q_block + 1) * W8_Q8_BLOCK,
+                                      (group + 1) * group_size});
+                int32_t dot = 0;
+                for (int k = k0; k < k_end; k++) {
+                    dot += (int32_t)qa_row[k] *
+                           (int32_t)load_b_int8_value(B, n, k, K_weight, b_interleaved);
+                }
+                sum += (float)dot * as_row[q_block] * bs_row[group];
+                k0 = k_end;
             }
             c_row[n] = sum;
         }
@@ -599,6 +927,837 @@ static void matmul_fp16_neon_gemv_range_fp16acc(
     }
 }
 
+static void matmul_int8_neon_gemv_range(
+    const float* A, const int8_t* B_packed, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int K, int n_begin, int n_end)
+{
+    if (group_size <= 0) group_size = K;
+    for (int n = n_begin; n < n_end; n += 8) {
+        int n_tile_end = std::min(n + 8, n_end);
+        const int8_t* b_tile = &B_packed[(n & ~7) * K];
+
+        float32x4_t acc0 = vdupq_n_f32(0.f);
+        float32x4_t acc1 = vdupq_n_f32(0.f);
+
+        for (int g = 0; g < groups_per_row; g++) {
+            int k_begin = g * group_size;
+            int k_end = std::min(k_begin + group_size, K);
+
+            float scale_tmp[8];
+            for (int j = 0; j < 8; j++) {
+                scale_tmp[j] = (n + j < n_tile_end)
+                    ? scales[(n + j) * groups_per_row + g]
+                    : 0.f;
+            }
+            float32x4_t scale0 = vld1q_f32(scale_tmp);
+            float32x4_t scale1 = vld1q_f32(scale_tmp + 4);
+
+            for (int k = k_begin; k < k_end; k++) {
+                int8x8_t b8 = vld1_s8(b_tile + k * 8);
+                int16x8_t b16 = vmovl_s8(b8);
+                float32x4_t b0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(b16)));
+                float32x4_t b1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(b16)));
+                float a = A[k];
+                acc0 = vfmaq_f32(acc0, b0, vmulq_n_f32(scale0, a));
+                acc1 = vfmaq_f32(acc1, b1, vmulq_n_f32(scale1, a));
+            }
+        }
+
+        float tmp[4];
+        vst1q_f32(tmp, acc0);
+        for (int j = 0; j < 4 && n + j < n_tile_end; j++) C[n + j] = tmp[j];
+        vst1q_f32(tmp, acc1);
+        for (int j = 0; j < 4 && n + 4 + j < n_tile_end; j++) C[n + 4 + j] = tmp[j];
+    }
+}
+
+static void matmul_int8_neon_4x8_range(
+    const float* A, const int8_t* B_packed, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int M, int N, int K,
+    int lda, int ldc, int m_begin, int m_end)
+{
+    if (group_size <= 0) group_size = K;
+
+    for (int m = m_begin; m < m_end; m += 4) {
+        int m_tile_end = std::min(m + 4, m_end);
+
+        for (int n = 0; n < N; n += 8) {
+            int n_tile_end = std::min(n + 8, N);
+            const int8_t* b_tile = &B_packed[(n & ~7) * K];
+
+            float32x4_t c0_lo = vdupq_n_f32(0.f);
+            float32x4_t c0_hi = vdupq_n_f32(0.f);
+            float32x4_t c1_lo = vdupq_n_f32(0.f);
+            float32x4_t c1_hi = vdupq_n_f32(0.f);
+            float32x4_t c2_lo = vdupq_n_f32(0.f);
+            float32x4_t c2_hi = vdupq_n_f32(0.f);
+            float32x4_t c3_lo = vdupq_n_f32(0.f);
+            float32x4_t c3_hi = vdupq_n_f32(0.f);
+
+            for (int g = 0; g < groups_per_row; g++) {
+                int k_begin = g * group_size;
+                int k_end = std::min(k_begin + group_size, K);
+
+                float scale_tmp[8];
+                for (int j = 0; j < 8; j++) {
+                    scale_tmp[j] = (n + j < n_tile_end)
+                        ? scales[(n + j) * groups_per_row + g]
+                        : 0.f;
+                }
+                float32x4_t scale0 = vld1q_f32(scale_tmp);
+                float32x4_t scale1 = vld1q_f32(scale_tmp + 4);
+
+                for (int k = k_begin; k < k_end; k++) {
+                    int8x8_t b8 = vld1_s8(b_tile + k * 8);
+                    int16x8_t b16 = vmovl_s8(b8);
+                    float32x4_t b0 = vmulq_f32(
+                        vcvtq_f32_s32(vmovl_s16(vget_low_s16(b16))), scale0);
+                    float32x4_t b1 = vmulq_f32(
+                        vcvtq_f32_s32(vmovl_s16(vget_high_s16(b16))), scale1);
+
+                    float a0 = A[k + (m + 0) * lda];
+                    c0_lo = vfmaq_n_f32(c0_lo, b0, a0);
+                    c0_hi = vfmaq_n_f32(c0_hi, b1, a0);
+                    if (m + 1 < m_tile_end) {
+                        float a1 = A[k + (m + 1) * lda];
+                        c1_lo = vfmaq_n_f32(c1_lo, b0, a1);
+                        c1_hi = vfmaq_n_f32(c1_hi, b1, a1);
+                    }
+                    if (m + 2 < m_tile_end) {
+                        float a2 = A[k + (m + 2) * lda];
+                        c2_lo = vfmaq_n_f32(c2_lo, b0, a2);
+                        c2_hi = vfmaq_n_f32(c2_hi, b1, a2);
+                    }
+                    if (m + 3 < m_tile_end) {
+                        float a3 = A[k + (m + 3) * lda];
+                        c3_lo = vfmaq_n_f32(c3_lo, b0, a3);
+                        c3_hi = vfmaq_n_f32(c3_hi, b1, a3);
+                    }
+                }
+            }
+
+            auto store_row = [&](int row, float32x4_t lo, float32x4_t hi) {
+                if (row >= m_tile_end) return;
+                float* c_row = C + row * ldc;
+                float tmp[4];
+                vst1q_f32(tmp, lo);
+                for (int j = 0; j < 4 && n + j < n_tile_end; j++) c_row[n + j] = tmp[j];
+                vst1q_f32(tmp, hi);
+                for (int j = 0; j < 4 && n + 4 + j < n_tile_end; j++) c_row[n + 4 + j] = tmp[j];
+            };
+            store_row(m + 0, c0_lo, c0_hi);
+            store_row(m + 1, c1_lo, c1_hi);
+            store_row(m + 2, c2_lo, c2_hi);
+            store_row(m + 3, c3_lo, c3_hi);
+        }
+    }
+}
+
+static void matmul_int8_q8dot_neon_gemv_range(
+    const int8_t* qA, const float* a_scales,
+    const int8_t* B_packed, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int K, int n_begin, int n_end)
+{
+    if (group_size <= 0) group_size = K;
+
+    for (int n = n_begin; n < n_end; n += 8) {
+        int n_tile_end = std::min(n + 8, n_end);
+        const int8_t* b_tile = &B_packed[(n & ~7) * K];
+        float32x4_t acc0 = vdupq_n_f32(0.f);
+        float32x4_t acc1 = vdupq_n_f32(0.f);
+
+        int k0 = 0;
+        while (k0 < K) {
+            int q_block = k0 / W8_Q8_BLOCK;
+            int group = k0 / group_size;
+            int k_end = std::min({K, (q_block + 1) * W8_Q8_BLOCK,
+                                  (group + 1) * group_size});
+            int32x4_t dot0 = vdupq_n_s32(0);
+            int32x4_t dot1 = vdupq_n_s32(0);
+
+            for (int k = k0; k < k_end; k++) {
+                int16x8_t b16 = vmovl_s8(vld1_s8(b_tile + k * 8));
+                int16x8_t prod = vmulq_n_s16(b16, (int16_t)qA[k]);
+                dot0 = vaddw_s16(dot0, vget_low_s16(prod));
+                dot1 = vaddw_s16(dot1, vget_high_s16(prod));
+            }
+
+            float scale_tmp[8];
+            float a_scale = a_scales[q_block];
+            for (int j = 0; j < 8; j++) {
+                scale_tmp[j] = (n + j < n_tile_end)
+                    ? a_scale * scales[(n + j) * groups_per_row + group]
+                    : 0.f;
+            }
+            acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(dot0), vld1q_f32(scale_tmp));
+            acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(dot1), vld1q_f32(scale_tmp + 4));
+            k0 = k_end;
+        }
+
+        float tmp[4];
+        vst1q_f32(tmp, acc0);
+        for (int j = 0; j < 4 && n + j < n_tile_end; j++) C[n + j] = tmp[j];
+        vst1q_f32(tmp, acc1);
+        for (int j = 0; j < 4 && n + 4 + j < n_tile_end; j++) C[n + 4 + j] = tmp[j];
+    }
+}
+
+static void matmul_int8_q8dot_neon_4x8_range(
+    const int8_t* qA, const float* a_scales,
+    const int8_t* B_packed, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int M, int N, int K,
+    int ldc, int m_begin, int m_end)
+{
+    if (group_size <= 0) group_size = K;
+    int blocks_per_row = (K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK;
+
+    for (int m = m_begin; m < m_end; m += 4) {
+        int m_tile_end = std::min(m + 4, m_end);
+
+        for (int n = 0; n < N; n += 8) {
+            int n_tile_end = std::min(n + 8, N);
+            const int8_t* b_tile = &B_packed[(n & ~7) * K];
+
+            float32x4_t c0_lo = vdupq_n_f32(0.f);
+            float32x4_t c0_hi = vdupq_n_f32(0.f);
+            float32x4_t c1_lo = vdupq_n_f32(0.f);
+            float32x4_t c1_hi = vdupq_n_f32(0.f);
+            float32x4_t c2_lo = vdupq_n_f32(0.f);
+            float32x4_t c2_hi = vdupq_n_f32(0.f);
+            float32x4_t c3_lo = vdupq_n_f32(0.f);
+            float32x4_t c3_hi = vdupq_n_f32(0.f);
+
+            int k0 = 0;
+            while (k0 < K) {
+                int q_block = k0 / W8_Q8_BLOCK;
+                int group = k0 / group_size;
+                int k_end = std::min({K, (q_block + 1) * W8_Q8_BLOCK,
+                                      (group + 1) * group_size});
+
+                int32x4_t d0_lo = vdupq_n_s32(0);
+                int32x4_t d0_hi = vdupq_n_s32(0);
+                int32x4_t d1_lo = vdupq_n_s32(0);
+                int32x4_t d1_hi = vdupq_n_s32(0);
+                int32x4_t d2_lo = vdupq_n_s32(0);
+                int32x4_t d2_hi = vdupq_n_s32(0);
+                int32x4_t d3_lo = vdupq_n_s32(0);
+                int32x4_t d3_hi = vdupq_n_s32(0);
+
+                const int8_t* qa0 = qA + (size_t)(m + 0) * K;
+                const int8_t* qa1 = (m + 1 < m_tile_end) ? qA + (size_t)(m + 1) * K : qa0;
+                const int8_t* qa2 = (m + 2 < m_tile_end) ? qA + (size_t)(m + 2) * K : qa0;
+                const int8_t* qa3 = (m + 3 < m_tile_end) ? qA + (size_t)(m + 3) * K : qa0;
+
+                for (int k = k0; k < k_end; k++) {
+                    int16x8_t b16 = vmovl_s8(vld1_s8(b_tile + k * 8));
+                    int16x4_t b_lo = vget_low_s16(b16);
+                    int16x4_t b_hi = vget_high_s16(b16);
+
+                    int16x8_t p0 = vmulq_n_s16(b16, (int16_t)qa0[k]);
+                    d0_lo = vaddw_s16(d0_lo, vget_low_s16(p0));
+                    d0_hi = vaddw_s16(d0_hi, vget_high_s16(p0));
+                    if (m + 1 < m_tile_end) {
+                        d1_lo = vaddw_s16(d1_lo, vmul_n_s16(b_lo, (int16_t)qa1[k]));
+                        d1_hi = vaddw_s16(d1_hi, vmul_n_s16(b_hi, (int16_t)qa1[k]));
+                    }
+                    if (m + 2 < m_tile_end) {
+                        d2_lo = vaddw_s16(d2_lo, vmul_n_s16(b_lo, (int16_t)qa2[k]));
+                        d2_hi = vaddw_s16(d2_hi, vmul_n_s16(b_hi, (int16_t)qa2[k]));
+                    }
+                    if (m + 3 < m_tile_end) {
+                        d3_lo = vaddw_s16(d3_lo, vmul_n_s16(b_lo, (int16_t)qa3[k]));
+                        d3_hi = vaddw_s16(d3_hi, vmul_n_s16(b_hi, (int16_t)qa3[k]));
+                    }
+                }
+
+                float b_scale_tmp[8];
+                for (int j = 0; j < 8; j++) {
+                    b_scale_tmp[j] = (n + j < n_tile_end)
+                        ? scales[(n + j) * groups_per_row + group]
+                        : 0.f;
+                }
+                float32x4_t bs0 = vld1q_f32(b_scale_tmp);
+                float32x4_t bs1 = vld1q_f32(b_scale_tmp + 4);
+
+                auto add_row = [&](int row, int32x4_t lo, int32x4_t hi,
+                                   float32x4_t& c_lo, float32x4_t& c_hi) {
+                    float a_scale = a_scales[(size_t)row * blocks_per_row + q_block];
+                    c_lo = vfmaq_f32(c_lo, vcvtq_f32_s32(lo), vmulq_n_f32(bs0, a_scale));
+                    c_hi = vfmaq_f32(c_hi, vcvtq_f32_s32(hi), vmulq_n_f32(bs1, a_scale));
+                };
+                add_row(m + 0, d0_lo, d0_hi, c0_lo, c0_hi);
+                if (m + 1 < m_tile_end) add_row(m + 1, d1_lo, d1_hi, c1_lo, c1_hi);
+                if (m + 2 < m_tile_end) add_row(m + 2, d2_lo, d2_hi, c2_lo, c2_hi);
+                if (m + 3 < m_tile_end) add_row(m + 3, d3_lo, d3_hi, c3_lo, c3_hi);
+
+                k0 = k_end;
+            }
+
+            auto store_row = [&](int row, float32x4_t lo, float32x4_t hi) {
+                if (row >= m_tile_end) return;
+                float* c_row = C + row * ldc;
+                float tmp[4];
+                vst1q_f32(tmp, lo);
+                for (int j = 0; j < 4 && n + j < n_tile_end; j++) c_row[n + j] = tmp[j];
+                vst1q_f32(tmp, hi);
+                for (int j = 0; j < 4 && n + 4 + j < n_tile_end; j++) c_row[n + 4 + j] = tmp[j];
+            };
+            store_row(m + 0, c0_lo, c0_hi);
+            store_row(m + 1, c1_lo, c1_hi);
+            store_row(m + 2, c2_lo, c2_hi);
+            store_row(m + 3, c3_lo, c3_hi);
+        }
+    }
+}
+
+#if defined(__ARM_FEATURE_DOTPROD)
+static void matmul_int8_q8dot_neon_gemv_repacked_range(
+    const int8_t* qA, const float* a_scales,
+    const int8_t* B_repack, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int K, int K_padded, int n_begin, int n_end)
+{
+    (void)K_padded;
+    if (group_size <= 0) group_size = K;
+    int blocks_per_row = (K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK;
+    W8ScaleMode scale_mode = w8_scale_mode(group_size, groups_per_row);
+    bool scale_per_channel = scale_mode == W8ScaleMode::PerChannel;
+
+    for (int n = n_begin; n < n_end; n += 8) {
+        int n_tile_end = std::min(n + 8, n_end);
+        int c_valid = n_tile_end - n;
+        const int8_t* b_tile = B_repack + (size_t)(n / 8) * blocks_per_row * 8 * W8_Q8_BLOCK;
+        float32x4_t bscale_lo_pc = vdupq_n_f32(0.f);
+        float32x4_t bscale_hi_pc = vdupq_n_f32(0.f);
+        if (scale_per_channel) {
+            load_w8_b_scales8(scales, n, c_valid, groups_per_row, 0,
+                              bscale_lo_pc, bscale_hi_pc);
+        }
+
+        float32x4_t acc_lo = vdupq_n_f32(0.f);
+        float32x4_t acc_hi = vdupq_n_f32(0.f);
+
+        for (int qb = 0; qb < blocks_per_row; qb++) {
+            int group = w8_scale_group(scale_mode, qb, group_size);
+            const int8_t* b_block = b_tile + (size_t)qb * 8 * W8_Q8_BLOCK;
+            int32x4_t d0 = vdupq_n_s32(0);
+            int32x4_t d1 = vdupq_n_s32(0);
+            int32x4_t d2 = vdupq_n_s32(0);
+            int32x4_t d3 = vdupq_n_s32(0);
+            int32x4_t d4 = vdupq_n_s32(0);
+            int32x4_t d5 = vdupq_n_s32(0);
+            int32x4_t d6 = vdupq_n_s32(0);
+            int32x4_t d7 = vdupq_n_s32(0);
+
+            for (int half = 0; half < W8_Q8_BLOCK; half += 16) {
+                const int8_t* qa = qA + (size_t)qb * W8_Q8_BLOCK + half;
+                int8x16_t a_vec = vld1q_s8(qa);
+                d0 = vdotq_s32(d0, vld1q_s8(b_block + 0 * W8_Q8_BLOCK + half), a_vec);
+                d1 = vdotq_s32(d1, vld1q_s8(b_block + 1 * W8_Q8_BLOCK + half), a_vec);
+                d2 = vdotq_s32(d2, vld1q_s8(b_block + 2 * W8_Q8_BLOCK + half), a_vec);
+                d3 = vdotq_s32(d3, vld1q_s8(b_block + 3 * W8_Q8_BLOCK + half), a_vec);
+                d4 = vdotq_s32(d4, vld1q_s8(b_block + 4 * W8_Q8_BLOCK + half), a_vec);
+                d5 = vdotq_s32(d5, vld1q_s8(b_block + 5 * W8_Q8_BLOCK + half), a_vec);
+                d6 = vdotq_s32(d6, vld1q_s8(b_block + 6 * W8_Q8_BLOCK + half), a_vec);
+                d7 = vdotq_s32(d7, vld1q_s8(b_block + 7 * W8_Q8_BLOCK + half), a_vec);
+            }
+
+            int32x4_t p01 = vpaddq_s32(d0, d1);
+            int32x4_t p23 = vpaddq_s32(d2, d3);
+            int32x4_t p45 = vpaddq_s32(d4, d5);
+            int32x4_t p67 = vpaddq_s32(d6, d7);
+            int32x4_t dots_lo = vpaddq_s32(p01, p23);
+            int32x4_t dots_hi = vpaddq_s32(p45, p67);
+
+            float a_scale = a_scales[qb];
+            float32x4_t bscale_lo = bscale_lo_pc;
+            float32x4_t bscale_hi = bscale_hi_pc;
+            if (!scale_per_channel) {
+                load_w8_b_scales8(scales, n, c_valid, groups_per_row, group,
+                                  bscale_lo, bscale_hi);
+            }
+            float32x4_t scale_lo = vmulq_n_f32(bscale_lo, a_scale);
+            float32x4_t scale_hi = vmulq_n_f32(bscale_hi, a_scale);
+
+            acc_lo = vfmaq_f32(acc_lo, vcvtq_f32_s32(dots_lo), scale_lo);
+            acc_hi = vfmaq_f32(acc_hi, vcvtq_f32_s32(dots_hi), scale_hi);
+        }
+
+        float tmp[4];
+        vst1q_f32(tmp, acc_lo);
+        for (int c = 0; c < 4 && c < c_valid; c++) C[n + c] = tmp[c];
+        vst1q_f32(tmp, acc_hi);
+        for (int c = 0; c < 4 && c + 4 < c_valid; c++) C[n + 4 + c] = tmp[c];
+    }
+}
+
+static void matmul_int8_q8dot_neon_4x8_repacked_range(
+    const int8_t* qA, const float* a_scales,
+    const int8_t* B_repack, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int M, int N, int K,
+    int K_padded, int ldc, int m_begin, int m_end)
+{
+    if (group_size <= 0) group_size = K;
+    int blocks_per_row = (K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK;
+    W8ScaleMode scale_mode = w8_scale_mode(group_size, groups_per_row);
+    bool scale_per_channel = scale_mode == W8ScaleMode::PerChannel;
+
+    for (int m = m_begin; m < m_end; m += 4) {
+        int m_tile_end = std::min(m + 4, m_end);
+        int r_valid = m_tile_end - m;
+
+        for (int n = 0; n < N; n += 8) {
+            int n_tile_end = std::min(n + 8, N);
+            int c_valid = n_tile_end - n;
+            const int8_t* b_tile = B_repack + (size_t)(n / 8) * blocks_per_row * 8 * W8_Q8_BLOCK;
+            float32x4_t bscale_lo_pc = vdupq_n_f32(0.f);
+            float32x4_t bscale_hi_pc = vdupq_n_f32(0.f);
+            if (scale_per_channel) {
+                load_w8_b_scales8(scales, n, c_valid, groups_per_row, 0,
+                                  bscale_lo_pc, bscale_hi_pc);
+            }
+
+            float acc[4][8] = {};
+
+            for (int qb = 0; qb < blocks_per_row; qb++) {
+                int group = w8_scale_group(scale_mode, qb, group_size);
+                const int8_t* b_block = b_tile + (size_t)qb * 8 * W8_Q8_BLOCK;
+                int32_t dots[4][8] = {};
+
+                for (int half = 0; half < W8_Q8_BLOCK; half += 16) {
+                    int8x16_t b_vec[8];
+                    for (int c = 0; c < 8; c++) {
+                        b_vec[c] = vld1q_s8(b_block + c * W8_Q8_BLOCK + half);
+                    }
+                    for (int r = 0; r < r_valid; r++) {
+                        const int8_t* qa = qA + (size_t)(m + r) * K_padded + qb * W8_Q8_BLOCK + half;
+                        int8x16_t a_vec = vld1q_s8(qa);
+                        for (int c = 0; c < 8; c++) {
+                            int32x4_t dot = vdotq_s32(vdupq_n_s32(0), b_vec[c], a_vec);
+                            dots[r][c] += vaddvq_s32(dot);
+                        }
+                    }
+                }
+
+                float32x4_t bscale_lo = bscale_lo_pc;
+                float32x4_t bscale_hi = bscale_hi_pc;
+                if (!scale_per_channel) {
+                    load_w8_b_scales8(scales, n, c_valid, groups_per_row, group,
+                                      bscale_lo, bscale_hi);
+                }
+
+                for (int r = 0; r < r_valid; r++) {
+                    float a_scale = a_scales[(size_t)(m + r) * blocks_per_row + qb];
+                    float32x4_t acc_lo = vld1q_f32(acc[r]);
+                    float32x4_t acc_hi = vld1q_f32(acc[r] + 4);
+                    acc_lo = vfmaq_f32(acc_lo, vcvtq_f32_s32(vld1q_s32(dots[r])),
+                                       vmulq_n_f32(bscale_lo, a_scale));
+                    acc_hi = vfmaq_f32(acc_hi, vcvtq_f32_s32(vld1q_s32(dots[r] + 4)),
+                                       vmulq_n_f32(bscale_hi, a_scale));
+                    vst1q_f32(acc[r], acc_lo);
+                    vst1q_f32(acc[r] + 4, acc_hi);
+                }
+            }
+
+            for (int r = 0; r < r_valid; r++) {
+                float* c_row = C + (m + r) * ldc;
+                for (int c = 0; c < c_valid; c++) {
+                    c_row[n + c] = acc[r][c];
+                }
+            }
+        }
+    }
+}
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+static void matmul_int8_q8dot_neon_4x8_repacked_i8mm_range(
+    const int8_t* qA, const float* a_scales,
+    const int8_t* B_repack, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int M, int N, int K,
+    int K_padded, int ldc, int m_begin, int m_end)
+{
+    (void)M;
+    if (group_size <= 0) group_size = K;
+    int blocks_per_row = (K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK;
+    W8ScaleMode scale_mode = w8_scale_mode(group_size, groups_per_row);
+    bool scale_per_channel = scale_mode == W8ScaleMode::PerChannel;
+
+    for (int m = m_begin; m < m_end; m += 4) {
+        int m_tile_end = std::min(m + 4, m_end);
+
+        for (int n = 0; n < N; n += 8) {
+            int n_tile_end = std::min(n + 8, N);
+            int c_valid = n_tile_end - n;
+            const int8_t* b_tile = B_repack + (size_t)(n / 8) * blocks_per_row * 8 * W8_Q8_BLOCK;
+            float32x4_t bscale_lo_pc = vdupq_n_f32(0.f);
+            float32x4_t bscale_hi_pc = vdupq_n_f32(0.f);
+            if (scale_per_channel) {
+                load_w8_b_scales8(scales, n, c_valid, groups_per_row, 0,
+                                  bscale_lo_pc, bscale_hi_pc);
+            }
+
+            float32x4_t c0_lo = vdupq_n_f32(0.f);
+            float32x4_t c0_hi = vdupq_n_f32(0.f);
+            float32x4_t c1_lo = vdupq_n_f32(0.f);
+            float32x4_t c1_hi = vdupq_n_f32(0.f);
+            float32x4_t c2_lo = vdupq_n_f32(0.f);
+            float32x4_t c2_hi = vdupq_n_f32(0.f);
+            float32x4_t c3_lo = vdupq_n_f32(0.f);
+            float32x4_t c3_hi = vdupq_n_f32(0.f);
+
+            for (int qb = 0; qb < blocks_per_row; qb++) {
+                int group = w8_scale_group(scale_mode, qb, group_size);
+                const int8_t* b_block = b_tile + (size_t)qb * 8 * W8_Q8_BLOCK;
+
+                int32x4_t acc01_01 = vdupq_n_s32(0);
+                int32x4_t acc01_23 = vdupq_n_s32(0);
+                int32x4_t acc23_01 = vdupq_n_s32(0);
+                int32x4_t acc23_23 = vdupq_n_s32(0);
+                int32x4_t acc01_45 = vdupq_n_s32(0);
+                int32x4_t acc01_67 = vdupq_n_s32(0);
+                int32x4_t acc23_45 = vdupq_n_s32(0);
+                int32x4_t acc23_67 = vdupq_n_s32(0);
+
+                const int8_t* qa0 = qA + (size_t)(m + 0) * K_padded + qb * W8_Q8_BLOCK;
+                const int8_t* qa1 = (m + 1 < m_tile_end)
+                    ? qA + (size_t)(m + 1) * K_padded + qb * W8_Q8_BLOCK
+                    : qa0;
+                const int8_t* qa2 = (m + 2 < m_tile_end)
+                    ? qA + (size_t)(m + 2) * K_padded + qb * W8_Q8_BLOCK
+                    : qa0;
+                const int8_t* qa3 = (m + 3 < m_tile_end)
+                    ? qA + (size_t)(m + 3) * K_padded + qb * W8_Q8_BLOCK
+                    : qa0;
+
+                for (int off = 0; off < W8_Q8_BLOCK; off += 8) {
+                    int8x16_t a01 = vcombine_s8(vld1_s8(qa0 + off), vld1_s8(qa1 + off));
+                    int8x16_t a23 = vcombine_s8(vld1_s8(qa2 + off), vld1_s8(qa3 + off));
+
+                    int8x16_t b01 = vcombine_s8(vld1_s8(b_block + 0 * W8_Q8_BLOCK + off),
+                                                 vld1_s8(b_block + 1 * W8_Q8_BLOCK + off));
+                    int8x16_t b23 = vcombine_s8(vld1_s8(b_block + 2 * W8_Q8_BLOCK + off),
+                                                 vld1_s8(b_block + 3 * W8_Q8_BLOCK + off));
+                    int8x16_t b45 = vcombine_s8(vld1_s8(b_block + 4 * W8_Q8_BLOCK + off),
+                                                 vld1_s8(b_block + 5 * W8_Q8_BLOCK + off));
+                    int8x16_t b67 = vcombine_s8(vld1_s8(b_block + 6 * W8_Q8_BLOCK + off),
+                                                 vld1_s8(b_block + 7 * W8_Q8_BLOCK + off));
+
+                    acc01_01 = vmmlaq_s32(acc01_01, a01, b01);
+                    acc01_23 = vmmlaq_s32(acc01_23, a01, b23);
+                    acc23_01 = vmmlaq_s32(acc23_01, a23, b01);
+                    acc23_23 = vmmlaq_s32(acc23_23, a23, b23);
+                    acc01_45 = vmmlaq_s32(acc01_45, a01, b45);
+                    acc01_67 = vmmlaq_s32(acc01_67, a01, b67);
+                    acc23_45 = vmmlaq_s32(acc23_45, a23, b45);
+                    acc23_67 = vmmlaq_s32(acc23_67, a23, b67);
+                }
+
+                int32x4_t row0_lo = vcombine_s32(vget_low_s32(acc01_01), vget_low_s32(acc01_23));
+                int32x4_t row0_hi = vcombine_s32(vget_low_s32(acc01_45), vget_low_s32(acc01_67));
+                int32x4_t row1_lo = vcombine_s32(vget_high_s32(acc01_01), vget_high_s32(acc01_23));
+                int32x4_t row1_hi = vcombine_s32(vget_high_s32(acc01_45), vget_high_s32(acc01_67));
+                int32x4_t row2_lo = vcombine_s32(vget_low_s32(acc23_01), vget_low_s32(acc23_23));
+                int32x4_t row2_hi = vcombine_s32(vget_low_s32(acc23_45), vget_low_s32(acc23_67));
+                int32x4_t row3_lo = vcombine_s32(vget_high_s32(acc23_01), vget_high_s32(acc23_23));
+                int32x4_t row3_hi = vcombine_s32(vget_high_s32(acc23_45), vget_high_s32(acc23_67));
+
+                float32x4_t bs0 = bscale_lo_pc;
+                float32x4_t bs1 = bscale_hi_pc;
+                if (!scale_per_channel) {
+                    load_w8_b_scales8(scales, n, c_valid, groups_per_row, group, bs0, bs1);
+                }
+
+                auto add_row = [&](int row, int32x4_t lo, int32x4_t hi,
+                                   float32x4_t& dst_lo, float32x4_t& dst_hi) {
+                    if (row >= m_tile_end) return;
+                    float a_scale = a_scales[(size_t)row * blocks_per_row + qb];
+                    dst_lo = vfmaq_f32(dst_lo, vcvtq_f32_s32(lo), vmulq_n_f32(bs0, a_scale));
+                    dst_hi = vfmaq_f32(dst_hi, vcvtq_f32_s32(hi), vmulq_n_f32(bs1, a_scale));
+                };
+                add_row(m + 0, row0_lo, row0_hi, c0_lo, c0_hi);
+                add_row(m + 1, row1_lo, row1_hi, c1_lo, c1_hi);
+                add_row(m + 2, row2_lo, row2_hi, c2_lo, c2_hi);
+                add_row(m + 3, row3_lo, row3_hi, c3_lo, c3_hi);
+            }
+
+            auto store_row = [&](int row, float32x4_t lo, float32x4_t hi) {
+                if (row >= m_tile_end) return;
+                float* c_row = C + row * ldc;
+                float tmp[4];
+                vst1q_f32(tmp, lo);
+                for (int c = 0; c < 4 && n + c < n_tile_end; c++) c_row[n + c] = tmp[c];
+                vst1q_f32(tmp, hi);
+                for (int c = 0; c < 4 && n + 4 + c < n_tile_end; c++) c_row[n + 4 + c] = tmp[c];
+            };
+            store_row(m + 0, c0_lo, c0_hi);
+            store_row(m + 1, c1_lo, c1_hi);
+            store_row(m + 2, c2_lo, c2_hi);
+            store_row(m + 3, c3_lo, c3_hi);
+        }
+    }
+}
+#endif
+#endif
+
+static inline float16x8_t dequant_int8x8_to_fp16(
+    const int8_t* q, const float* scales, int n, int n_tile_end,
+    int groups_per_row, int group)
+{
+    int8x8_t b8 = vld1_s8(q);
+    int16x8_t b16 = vmovl_s8(b8);
+    float32x4_t b0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(b16)));
+    float32x4_t b1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(b16)));
+
+    float scale_tmp[8];
+    for (int j = 0; j < 8; j++) {
+        scale_tmp[j] = (n + j < n_tile_end)
+            ? scales[(n + j) * groups_per_row + group]
+            : 0.f;
+    }
+    b0 = vmulq_f32(b0, vld1q_f32(scale_tmp));
+    b1 = vmulq_f32(b1, vld1q_f32(scale_tmp + 4));
+    return vcombine_f16(vcvt_f16_f32(b0), vcvt_f16_f32(b1));
+}
+
+static void matmul_int8_neon_gemv_range_fp16acc(
+    const float* A, const int8_t* B_packed, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int K, int n_begin, int n_end,
+    Activation act = Activation::NONE,
+    int act_n_begin = 0, int act_n_len = -1)
+{
+    if (group_size <= 0) group_size = K;
+    if (groups_per_row <= 0) groups_per_row = 1;
+    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
+    const int K_BLOCK_FP16 = K_BLOCK * 2;
+
+    for (int n = n_begin; n < n_end; n += 8) {
+        int n_tile_end = std::min(n + 8, n_end);
+        const int8_t* b_tile = &B_packed[(n & ~7) * K];
+
+        float16x8_t acc[8];
+        for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK_FP16) {
+            int k_end = std::min(k_outer + K_BLOCK_FP16, K);
+            if (k_outer == 0) {
+                for (int i = 0; i < 8; i++) acc[i] = vdupq_n_f16((__fp16)0.f);
+            } else {
+                float tmp[8];
+                for (int j = 0; j < 8; j++) tmp[j] = (n + j < n_tile_end) ? C[n + j] : 0.f;
+                acc[0] = vcombine_f16(
+                    vcvt_f16_f32(vld1q_f32(tmp)),
+                    vcvt_f16_f32(vld1q_f32(tmp + 4)));
+                for (int i = 1; i < 8; i++) acc[i] = vdupq_n_f16((__fp16)0.f);
+            }
+
+            int k = k_outer;
+            int k_unrolled_end = k_outer + ((k_end - k_outer) & ~7);
+            for (; k < k_unrolled_end; k += 8) {
+                __fp16 a0 = (__fp16)A[k + 0];
+                __fp16 a1 = (__fp16)A[k + 1];
+                __fp16 a2 = (__fp16)A[k + 2];
+                __fp16 a3 = (__fp16)A[k + 3];
+                __fp16 a4 = (__fp16)A[k + 4];
+                __fp16 a5 = (__fp16)A[k + 5];
+                __fp16 a6 = (__fp16)A[k + 6];
+                __fp16 a7 = (__fp16)A[k + 7];
+                float16x8_t b0 = dequant_int8x8_to_fp16(b_tile + (k + 0) * 8, scales, n, n_tile_end, groups_per_row, (k + 0) / group_size);
+                float16x8_t b1 = dequant_int8x8_to_fp16(b_tile + (k + 1) * 8, scales, n, n_tile_end, groups_per_row, (k + 1) / group_size);
+                float16x8_t b2 = dequant_int8x8_to_fp16(b_tile + (k + 2) * 8, scales, n, n_tile_end, groups_per_row, (k + 2) / group_size);
+                float16x8_t b3 = dequant_int8x8_to_fp16(b_tile + (k + 3) * 8, scales, n, n_tile_end, groups_per_row, (k + 3) / group_size);
+                float16x8_t b4 = dequant_int8x8_to_fp16(b_tile + (k + 4) * 8, scales, n, n_tile_end, groups_per_row, (k + 4) / group_size);
+                float16x8_t b5 = dequant_int8x8_to_fp16(b_tile + (k + 5) * 8, scales, n, n_tile_end, groups_per_row, (k + 5) / group_size);
+                float16x8_t b6 = dequant_int8x8_to_fp16(b_tile + (k + 6) * 8, scales, n, n_tile_end, groups_per_row, (k + 6) / group_size);
+                float16x8_t b7 = dequant_int8x8_to_fp16(b_tile + (k + 7) * 8, scales, n, n_tile_end, groups_per_row, (k + 7) / group_size);
+                acc[0] = vfmaq_n_f16(acc[0], b0, a0);
+                acc[1] = vfmaq_n_f16(acc[1], b1, a1);
+                acc[2] = vfmaq_n_f16(acc[2], b2, a2);
+                acc[3] = vfmaq_n_f16(acc[3], b3, a3);
+                acc[4] = vfmaq_n_f16(acc[4], b4, a4);
+                acc[5] = vfmaq_n_f16(acc[5], b5, a5);
+                acc[6] = vfmaq_n_f16(acc[6], b6, a6);
+                acc[7] = vfmaq_n_f16(acc[7], b7, a7);
+            }
+            for (; k < k_end; k++) {
+                int idx = (k - k_outer) & 7;
+                __fp16 a0 = (__fp16)A[k];
+                float16x8_t b0 = dequant_int8x8_to_fp16(
+                    b_tile + k * 8, scales, n, n_tile_end,
+                    groups_per_row, k / group_size);
+                acc[idx] = vfmaq_n_f16(acc[idx], b0, a0);
+            }
+
+            acc[0] = vaddq_f16(acc[0], acc[1]);
+            acc[2] = vaddq_f16(acc[2], acc[3]);
+            acc[4] = vaddq_f16(acc[4], acc[5]);
+            acc[6] = vaddq_f16(acc[6], acc[7]);
+            acc[0] = vaddq_f16(acc[0], acc[2]);
+            acc[4] = vaddq_f16(acc[4], acc[6]);
+            acc[0] = vaddq_f16(acc[0], acc[4]);
+
+            bool is_last_block = (k_outer + K_BLOCK_FP16 >= K);
+            float32x4_t lo = vcvt_f32_f16(vget_low_f16(acc[0]));
+            float32x4_t hi = vcvt_f32_f16(vget_high_f16(acc[0]));
+            if (is_last_block && act != Activation::NONE && act_n_len != 0) {
+                bool lo_active = (act_n_len < 0) ||
+                                 (activation_applies_at(n + 0, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 1, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 2, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 3, act_n_begin, act_n_len));
+                if (lo_active) lo = apply_activation_f32_neon(lo, act);
+                bool hi_active = (act_n_len < 0) ||
+                                 (activation_applies_at(n + 4, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 5, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 6, act_n_begin, act_n_len) &&
+                                  activation_applies_at(n + 7, act_n_begin, act_n_len));
+                if (hi_active) hi = apply_activation_f32_neon(hi, act);
+            }
+
+            float tmp[4];
+            vst1q_f32(tmp, lo);
+            for (int j = 0; j < 4 && n + j < n_tile_end; j++) C[n + j] = tmp[j];
+            vst1q_f32(tmp, hi);
+            for (int j = 0; j < 4 && n + 4 + j < n_tile_end; j++) C[n + 4 + j] = tmp[j];
+        }
+    }
+}
+
+static void matmul_int8_neon_8x8_range_packed_a_fp16acc(
+    const __fp16* A_packed, const int8_t* B_packed, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int M, int N, int K,
+    int ldc, int m_begin, int m_end,
+    Activation act = Activation::NONE,
+    int act_n_begin = 0, int act_n_len = -1)
+{
+    if (group_size <= 0) group_size = K;
+    if (groups_per_row <= 0) groups_per_row = 1;
+    const int K_BLOCK = g_matmul_config.k_block > 0 ? g_matmul_config.k_block : K;
+    const int K_BLOCK_FP16 = K_BLOCK * 2;
+    bool act_enabled = (act != Activation::NONE) && (act_n_len != 0);
+    bool act_full_N = act_enabled && (act_n_len < 0 ||
+                                      (act_n_begin == 0 && act_n_len >= N));
+
+    for (int k_outer = 0; k_outer < K; k_outer += K_BLOCK_FP16) {
+        int k_end = std::min(k_outer + K_BLOCK_FP16, K);
+        bool first_block = (k_outer == 0);
+        bool last_block = (k_outer + K_BLOCK_FP16 >= K);
+
+        for (int m = m_begin; m < m_end; m += 8) {
+            int m_tile_end = std::min(m + 8, m_end);
+            int m_global_end = std::min(m + 8, M);
+
+            for (int n = 0; n < N; n += 8) {
+                int n_end = std::min(n + 8, N);
+                const int8_t* b_tile = &B_packed[(n & ~7) * K];
+
+                float16x8_t c[8];
+                if (first_block) {
+                    for (int j = 0; j < 8; j++) c[j] = vdupq_n_f16((__fp16)0.f);
+                } else {
+                    for (int j = 0; j < 8; j++) {
+                        if (n + j < n_end) {
+                            float tmp[8];
+                            for (int r = 0; r < 8; r++) {
+                                int row = m + r;
+                                tmp[r] = (row < m_tile_end && row < m_global_end)
+                                       ? C[row * ldc + n + j] : 0.f;
+                            }
+                            c[j] = vcombine_f16(
+                                vcvt_f16_f32(vld1q_f32(tmp)),
+                                vcvt_f16_f32(vld1q_f32(tmp + 4)));
+                        } else {
+                            c[j] = vdupq_n_f16((__fp16)0.f);
+                        }
+                    }
+                }
+
+                float16x8_t c1[8];
+                for (int j = 0; j < 8; j++) c1[j] = vdupq_n_f16((__fp16)0.f);
+
+                int k = k_outer;
+                for (; k + 1 < k_end; k += 2) {
+                    float16x8_t a0 = vld1q_f16(&A_packed[(m & ~7) * K + k * 8]);
+                    float16x8_t a1 = vld1q_f16(&A_packed[(m & ~7) * K + (k + 1) * 8]);
+                    float16x8_t b0 = dequant_int8x8_to_fp16(
+                        b_tile + k * 8, scales, n, n_end,
+                        groups_per_row, k / group_size);
+                    float16x8_t b1 = dequant_int8x8_to_fp16(
+                        b_tile + (k + 1) * 8, scales, n, n_end,
+                        groups_per_row, (k + 1) / group_size);
+                    float16x4_t b0_low = vget_low_f16(b0), b0_high = vget_high_f16(b0);
+                    float16x4_t b1_low = vget_low_f16(b1), b1_high = vget_high_f16(b1);
+
+                    c[0] = vfmaq_lane_f16(c[0], a0, b0_low, 0);
+                    c[1] = vfmaq_lane_f16(c[1], a0, b0_low, 1);
+                    c[2] = vfmaq_lane_f16(c[2], a0, b0_low, 2);
+                    c[3] = vfmaq_lane_f16(c[3], a0, b0_low, 3);
+                    c[4] = vfmaq_lane_f16(c[4], a0, b0_high, 0);
+                    c[5] = vfmaq_lane_f16(c[5], a0, b0_high, 1);
+                    c[6] = vfmaq_lane_f16(c[6], a0, b0_high, 2);
+                    c[7] = vfmaq_lane_f16(c[7], a0, b0_high, 3);
+
+                    c1[0] = vfmaq_lane_f16(c1[0], a1, b1_low, 0);
+                    c1[1] = vfmaq_lane_f16(c1[1], a1, b1_low, 1);
+                    c1[2] = vfmaq_lane_f16(c1[2], a1, b1_low, 2);
+                    c1[3] = vfmaq_lane_f16(c1[3], a1, b1_low, 3);
+                    c1[4] = vfmaq_lane_f16(c1[4], a1, b1_high, 0);
+                    c1[5] = vfmaq_lane_f16(c1[5], a1, b1_high, 1);
+                    c1[6] = vfmaq_lane_f16(c1[6], a1, b1_high, 2);
+                    c1[7] = vfmaq_lane_f16(c1[7], a1, b1_high, 3);
+                }
+                if (k < k_end) {
+                    float16x8_t a0 = vld1q_f16(&A_packed[(m & ~7) * K + k * 8]);
+                    float16x8_t b0 = dequant_int8x8_to_fp16(
+                        b_tile + k * 8, scales, n, n_end,
+                        groups_per_row, k / group_size);
+                    float16x4_t b0_low = vget_low_f16(b0), b0_high = vget_high_f16(b0);
+                    c[0] = vfmaq_lane_f16(c[0], a0, b0_low, 0);
+                    c[1] = vfmaq_lane_f16(c[1], a0, b0_low, 1);
+                    c[2] = vfmaq_lane_f16(c[2], a0, b0_low, 2);
+                    c[3] = vfmaq_lane_f16(c[3], a0, b0_low, 3);
+                    c[4] = vfmaq_lane_f16(c[4], a0, b0_high, 0);
+                    c[5] = vfmaq_lane_f16(c[5], a0, b0_high, 1);
+                    c[6] = vfmaq_lane_f16(c[6], a0, b0_high, 2);
+                    c[7] = vfmaq_lane_f16(c[7], a0, b0_high, 3);
+                }
+                for (int j = 0; j < 8; j++) c[j] = vaddq_f16(c[j], c1[j]);
+
+                bool tile_active = act_enabled && last_block &&
+                                   (act_full_N ||
+                                    (activation_applies_at(n + 0, act_n_begin, act_n_len) &&
+                                     activation_applies_at(n + 7, act_n_begin, act_n_len)));
+                for (int j = 0; j < 8 && n + j < n_end; j++) {
+                    float32x4_t lo = vcvt_f32_f16(vget_low_f16(c[j]));
+                    float32x4_t hi = vcvt_f32_f16(vget_high_f16(c[j]));
+                    if (tile_active) {
+                        lo = apply_activation_f32_neon(lo, act);
+                        hi = apply_activation_f32_neon(hi, act);
+                    } else if (act_enabled && last_block &&
+                               activation_applies_at(n + j, act_n_begin, act_n_len)) {
+                        lo = apply_activation_f32_neon(lo, act);
+                        hi = apply_activation_f32_neon(hi, act);
+                    }
+                    float tmp[8];
+                    vst1q_f32(tmp, lo);
+                    vst1q_f32(tmp + 4, hi);
+                    for (int r = 0; r < 8; r++) {
+                        int row = m + r;
+                        if (row < m_tile_end && row < m_global_end) {
+                            C[row * ldc + n + j] = tmp[r];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---- FP16 lane-FMA kernel (A + B both pre-packed interleaved) ----
 //
 // A_packed: [M/8, K, 8] FP16 — 8 M values at same k are contiguous.
@@ -1043,7 +2202,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         const float* scales = B.scales;
         int group_size = (int)B.group_size;
         int groups_per_row = (int)B.groups_per_row;
+        bool b_interleaved = B.is_interleaved;
+        const int8_t* b_q8_repack = reinterpret_cast<const int8_t*>(B.q8_repack_data);
         if (!scales || group_size <= 0 || groups_per_row <= 0) {
+            _timer.set_shape("int8_invalid_scales", M, N, K, group_size, groups_per_row,
+                             b_q8_repack != nullptr, b_interleaved,
+                             thread_pool ? thread_pool->num_threads() : 1);
             return;
         }
 
@@ -1055,16 +2219,308 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         int n_chunks = (total_dim + chunk_size - 1) / chunk_size;
         bool use_parallel = n_threads > 1 && n_chunks > 1;
 
+#if HAS_NEON
+        static const bool w8_onfly_fp16_enabled = env_flag_enabled("MOLLM_W8_ONFLY_FP16");
+        static const bool w8_q8_dot_enabled = !env_flag_enabled("MOLLM_W8_NO_Q8_DOT");
+        static const bool w8_q8_dot_gemm_disabled = env_flag_enabled("MOLLM_W8_NO_Q8_DOT_GEMM");
+        static const bool w8_q8_dot_gemm_legacy_enabled = env_flag_enabled("MOLLM_W8_Q8_DOT_GEMM");
+        static const bool w8_q8_dot_repack_enabled =
+            !env_flag_enabled("MOLLM_W8_NO_Q8_DOT_REPACK") &&
+            !env_flag_enabled("MOLLM_W8_NO_Q8_REPACK");
+        bool use_onfly_fp16 = b_interleaved && w8_onfly_fp16_enabled;
+#if defined(__ARM_FEATURE_DOTPROD)
+        bool can_use_q8_repack = w8_q8_dot_repack_enabled &&
+                                 b_q8_repack && (group_size % W8_Q8_BLOCK == 0);
+#else
+        bool can_use_q8_repack = false;
+#endif
+        bool use_q8_dot_gemv = w8_q8_dot_enabled && (can_use_q8_repack || b_interleaved);
+        bool use_q8_dot_gemm = w8_q8_dot_enabled && !w8_q8_dot_gemm_disabled &&
+                               (can_use_q8_repack ||
+                                (b_interleaved && w8_q8_dot_gemm_legacy_enabled));
+        bool use_q8_dot_gemv_repack = use_q8_dot_gemv && can_use_q8_repack;
+        bool use_q8_dot_gemm_repack = use_q8_dot_gemm && can_use_q8_repack;
+        if (M == 1 && use_onfly_fp16) {
+            _timer.set_shape("onfly_fp16_gemv", M, N, K, group_size, groups_per_row,
+                             b_q8_repack != nullptr, b_interleaved, n_threads);
+            debug_w8_path_once("onfly_fp16_gemv", M, N, K, group_size, b_q8_repack != nullptr);
+            if (!use_parallel) {
+                matmul_int8_neon_gemv_range_fp16acc(
+                    a_ptr, b_int8, scales, group_size, groups_per_row,
+                    c_ptr, K, 0, N);
+            } else {
+                int n_chunk = std::max(N / (n_threads * 8), 64);
+                n_chunk = ((n_chunk + 7) / 8) * 8;
+                thread_pool->parallel_for(0, N, n_chunk,
+                    [&](int, int n_begin, int n_end) {
+                        matmul_int8_neon_gemv_range_fp16acc(
+                            a_ptr, b_int8, scales, group_size, groups_per_row,
+                            c_ptr, K, n_begin, n_end);
+                    });
+            }
+            if (act != Activation::NONE && act_n_len != 0) {
+                apply_activation_to_range_gemv(c_ptr, N, act, act_n_begin, act_n_len);
+            }
+            return;
+        }
+        if (use_onfly_fp16) {
+            _timer.set_shape("onfly_fp16_gemm", M, N, K, group_size, groups_per_row,
+                             b_q8_repack != nullptr, b_interleaved, n_threads);
+            debug_w8_path_once("onfly_fp16_gemm", M, N, K, group_size, b_q8_repack != nullptr);
+            if (!use_parallel) {
+                __fp16* a_packed = pack_a_interleaved_full(a_ptr, M, K, lda);
+                matmul_int8_neon_8x8_range_packed_a_fp16acc(
+                    a_packed, b_int8, scales, group_size, groups_per_row,
+                    c_ptr, M, N, K, ldc, 0, M);
+                delete[] a_packed;
+            } else {
+                int m_tiles = (M + tile_m - 1) / tile_m;
+                std::vector<__fp16*> a_packed_tiles(m_tiles, nullptr);
+                for (int i = 0; i < m_tiles; i++) {
+                    int m_begin = i * tile_m;
+                    int m_len = std::min(tile_m, M - m_begin);
+                    a_packed_tiles[i] = pack_a_interleaved_full(
+                        a_ptr + m_begin * lda, m_len, K, lda);
+                }
+                thread_pool->parallel_for(0, M, tile_m,
+                    [&](int, int m_begin, int m_end) {
+                        int tile_idx = m_begin / tile_m;
+                        int m_len = m_end - m_begin;
+                        matmul_int8_neon_8x8_range_packed_a_fp16acc(
+                            a_packed_tiles[tile_idx], b_int8, scales,
+                            group_size, groups_per_row,
+                            c_ptr + m_begin * ldc, m_len, N, K, ldc, 0, m_len);
+                    });
+                for (int i = 0; i < m_tiles; i++) delete[] a_packed_tiles[i];
+            }
+            if (act != Activation::NONE && act_n_len != 0) {
+                apply_activation_to_range(c_ptr, M, N, ldc, 0, M, act, act_n_begin, act_n_len);
+            }
+            return;
+        }
+        if (M == 1 && use_q8_dot_gemv) {
+            const char* path = use_q8_dot_gemv_repack ? "q8dot_gemv_repack" : "q8dot_gemv";
+            _timer.set_shape(path, M, N, K, group_size, groups_per_row,
+                             b_q8_repack != nullptr, b_interleaved, n_threads);
+            debug_w8_path_once(path,
+                               M, N, K, group_size, b_q8_repack != nullptr);
+            std::vector<int8_t> qA;
+            std::vector<float> a_scales;
+            int K_padded = ((K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK) * W8_Q8_BLOCK;
+            quantize_a_q8_blocks(a_ptr, M, K, lda,
+                                 use_q8_dot_gemv_repack ? K_padded : K,
+                                 qA, a_scales);
+            if (!use_parallel) {
+#if defined(__ARM_FEATURE_DOTPROD)
+                if (use_q8_dot_gemv_repack) {
+                    matmul_int8_q8dot_neon_gemv_repacked_range(
+                        qA.data(), a_scales.data(), b_q8_repack, scales,
+                        group_size, groups_per_row, c_ptr, K, K_padded, 0, N);
+                } else
+#endif
+                {
+                    matmul_int8_q8dot_neon_gemv_range(
+                        qA.data(), a_scales.data(), b_int8, scales,
+                        group_size, groups_per_row, c_ptr, K, 0, N);
+                }
+            } else {
+                int n_chunk = std::max(N / (n_threads * 8), 64);
+                n_chunk = ((n_chunk + 7) / 8) * 8;
+                thread_pool->parallel_for(0, N, n_chunk,
+                    [&](int, int n_begin, int n_end) {
+#if defined(__ARM_FEATURE_DOTPROD)
+                        if (use_q8_dot_gemv_repack) {
+                            matmul_int8_q8dot_neon_gemv_repacked_range(
+                                qA.data(), a_scales.data(), b_q8_repack, scales,
+                                group_size, groups_per_row, c_ptr, K, K_padded, n_begin, n_end);
+                        } else
+#endif
+                        {
+                            matmul_int8_q8dot_neon_gemv_range(
+                                qA.data(), a_scales.data(), b_int8, scales,
+                                group_size, groups_per_row, c_ptr, K, n_begin, n_end);
+                        }
+                    });
+            }
+            if (act != Activation::NONE && act_n_len != 0) {
+                apply_activation_to_range_gemv(c_ptr, N, act, act_n_begin, act_n_len);
+            }
+            return;
+        }
+        if (use_q8_dot_gemm) {
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+            static const bool w8_i8mm_disabled = env_flag_enabled("MOLLM_W8_NO_I8MM");
+            bool use_q8_dot_gemm_i8mm = use_q8_dot_gemm_repack && !w8_i8mm_disabled;
+#else
+            bool use_q8_dot_gemm_i8mm = false;
+#endif
+            const char* path = use_q8_dot_gemm_i8mm
+                ? "q8dot_gemm_repack_i8mm"
+                : (use_q8_dot_gemm_repack ? "q8dot_gemm_repack" : "q8dot_gemm");
+            _timer.set_shape(path, M, N, K, group_size, groups_per_row,
+                             b_q8_repack != nullptr, b_interleaved, n_threads);
+            debug_w8_path_once(path,
+                               M, N, K, group_size, b_q8_repack != nullptr);
+            std::vector<int8_t> qA;
+            std::vector<float> a_scales;
+            int K_padded = ((K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK) * W8_Q8_BLOCK;
+            quantize_a_q8_blocks(a_ptr, M, K, lda,
+                                 use_q8_dot_gemm_repack ? K_padded : K,
+                                 qA, a_scales);
+            if (!use_parallel) {
+#if defined(__ARM_FEATURE_DOTPROD)
+                if (use_q8_dot_gemm_repack) {
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                    if (use_q8_dot_gemm_i8mm) {
+                        matmul_int8_q8dot_neon_4x8_repacked_i8mm_range(
+                            qA.data(), a_scales.data(), b_q8_repack, scales,
+                            group_size, groups_per_row, c_ptr, M, N, K, K_padded, ldc, 0, M);
+                    } else
+#endif
+                    {
+                        matmul_int8_q8dot_neon_4x8_repacked_range(
+                            qA.data(), a_scales.data(), b_q8_repack, scales,
+                            group_size, groups_per_row, c_ptr, M, N, K, K_padded, ldc, 0, M);
+                    }
+                } else
+#endif
+                {
+                    matmul_int8_q8dot_neon_4x8_range(
+                        qA.data(), a_scales.data(), b_int8, scales,
+                        group_size, groups_per_row, c_ptr, M, N, K, ldc, 0, M);
+                }
+            } else {
+                thread_pool->parallel_for(0, M, tile_m,
+                    [&](int, int m_begin, int m_end) {
+#if defined(__ARM_FEATURE_DOTPROD)
+                        if (use_q8_dot_gemm_repack) {
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                            if (use_q8_dot_gemm_i8mm) {
+                                matmul_int8_q8dot_neon_4x8_repacked_i8mm_range(
+                                    qA.data(), a_scales.data(), b_q8_repack, scales,
+                                    group_size, groups_per_row, c_ptr, M, N, K, K_padded, ldc,
+                                    m_begin, m_end);
+                            } else
+#endif
+                            {
+                                matmul_int8_q8dot_neon_4x8_repacked_range(
+                                    qA.data(), a_scales.data(), b_q8_repack, scales,
+                                    group_size, groups_per_row, c_ptr, M, N, K, K_padded, ldc,
+                                    m_begin, m_end);
+                            }
+                        } else
+#endif
+                        {
+                            matmul_int8_q8dot_neon_4x8_range(
+                                qA.data(), a_scales.data(), b_int8, scales,
+                                group_size, groups_per_row, c_ptr, M, N, K, ldc,
+                                m_begin, m_end);
+                        }
+                    });
+            }
+            if (act != Activation::NONE && act_n_len != 0) {
+                apply_activation_to_range(c_ptr, M, N, ldc, 0, M, act, act_n_begin, act_n_len);
+            }
+            return;
+        }
+        if (M == 1 && b_interleaved) {
+            _timer.set_shape("native_w8_gemv", M, N, K, group_size, groups_per_row,
+                             b_q8_repack != nullptr, b_interleaved, n_threads);
+            debug_w8_path_once("native_w8_gemv", M, N, K, group_size, b_q8_repack != nullptr);
+            if (!use_parallel) {
+                matmul_int8_neon_gemv_range(a_ptr, b_int8, scales, group_size, groups_per_row,
+                                             c_ptr, K, 0, N);
+            } else {
+                int n_chunk = std::max(N / (n_threads * 8), 64);
+                n_chunk = ((n_chunk + 7) / 8) * 8;
+                thread_pool->parallel_for(0, N, n_chunk,
+                    [&](int, int n_begin, int n_end) {
+                        matmul_int8_neon_gemv_range(a_ptr, b_int8, scales,
+                                                     group_size, groups_per_row,
+                                                     c_ptr, K, n_begin, n_end);
+                    });
+            }
+            if (act != Activation::NONE && act_n_len != 0) {
+                apply_activation_to_range_gemv(c_ptr, N, act, act_n_begin, act_n_len);
+            }
+            return;
+        }
+        if (b_interleaved) {
+            _timer.set_shape("native_w8_gemm", M, N, K, group_size, groups_per_row,
+                             b_q8_repack != nullptr, b_interleaved, n_threads);
+            debug_w8_path_once("native_w8_gemm", M, N, K, group_size, b_q8_repack != nullptr);
+            if (!use_parallel) {
+                matmul_int8_neon_4x8_range(a_ptr, b_int8, scales, group_size, groups_per_row,
+                                            c_ptr, M, N, K, lda, ldc, 0, M);
+            } else {
+                thread_pool->parallel_for(0, M, tile_m,
+                    [&](int, int m_begin, int m_end) {
+                        matmul_int8_neon_4x8_range(a_ptr, b_int8, scales,
+                                                    group_size, groups_per_row,
+                                                    c_ptr, M, N, K, lda, ldc,
+                                                    m_begin, m_end);
+                    });
+            }
+            if (act != Activation::NONE && act_n_len != 0) {
+                apply_activation_to_range(c_ptr, M, N, ldc, 0, M, act, act_n_begin, act_n_len);
+            }
+            return;
+        }
+#endif
+
+        static const bool w8_q8_dot_enabled_scalar = !env_flag_enabled("MOLLM_W8_NO_Q8_DOT");
+        static const bool w8_q8_dot_gemm_enabled_scalar = env_flag_enabled("MOLLM_W8_Q8_DOT_GEMM");
+        if (b_interleaved && w8_q8_dot_enabled_scalar &&
+            (M == 1 || w8_q8_dot_gemm_enabled_scalar)) {
+            _timer.set_shape("q8dot_scalar", M, N, K, group_size, groups_per_row,
+                             b_q8_repack != nullptr, b_interleaved, n_threads);
+            debug_w8_path_once("q8dot_scalar", M, N, K, group_size, b_q8_repack != nullptr);
+            std::vector<int8_t> qA;
+            std::vector<float> a_scales;
+            quantize_a_q8_blocks(a_ptr, M, K, lda, K, qA, a_scales);
+            if (!use_parallel) {
+                matmul_int8_q8dot_scalar_range(
+                    qA.data(), a_scales.data(), b_int8, scales,
+                    group_size, groups_per_row, c_ptr, M, N, K,
+                    K_weight, ldc, 0, M, 0, N, b_interleaved);
+            } else if (shard_by_n) {
+                thread_pool->parallel_for(0, N, chunk_size,
+                    [&](int, int n_begin, int n_end) {
+                        matmul_int8_q8dot_scalar_range(
+                            qA.data(), a_scales.data(), b_int8, scales,
+                            group_size, groups_per_row, c_ptr, M, N, K,
+                            K_weight, ldc, 0, M, n_begin, n_end, b_interleaved);
+                    });
+            } else {
+                thread_pool->parallel_for(0, M, chunk_size,
+                    [&](int, int m_begin, int m_end) {
+                        matmul_int8_q8dot_scalar_range(
+                            qA.data(), a_scales.data(), b_int8, scales,
+                            group_size, groups_per_row, c_ptr, M, N, K,
+                            K_weight, ldc, m_begin, m_end, 0, N, b_interleaved);
+                    });
+            }
+            if (act != Activation::NONE && act_n_len != 0) {
+                apply_activation_to_range(c_ptr, M, N, ldc, 0, M, act, act_n_begin, act_n_len);
+            }
+            return;
+        }
+
+        _timer.set_shape("int8_scalar", M, N, K, group_size, groups_per_row,
+                         b_q8_repack != nullptr, b_interleaved, n_threads);
         if (!use_parallel) {
+            debug_w8_path_once("scalar", M, N, K, group_size, b_q8_repack != nullptr);
             matmul_int8_scalar_range(a_ptr, b_int8, scales, group_size, groups_per_row,
-                                     c_ptr, M, N, K, lda, K_weight, ldc, 0, M, 0, N);
+                                     c_ptr, M, N, K, lda, K_weight, ldc, 0, M, 0, N,
+                                     b_interleaved);
         } else if (shard_by_n) {
             thread_pool->parallel_for(0, N, chunk_size,
                                       [&](int, int n_begin, int n_end) {
                                           matmul_int8_scalar_range(a_ptr, b_int8, scales,
                                                                    group_size, groups_per_row,
                                                                    c_ptr, M, N, K, lda, K_weight, ldc,
-                                                                   0, M, n_begin, n_end);
+                                                                   0, M, n_begin, n_end,
+                                                                   b_interleaved);
                                       });
         } else {
             thread_pool->parallel_for(0, M, chunk_size,
@@ -1072,7 +2528,8 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                                           matmul_int8_scalar_range(a_ptr, b_int8, scales,
                                                                    group_size, groups_per_row,
                                                                    c_ptr, M, N, K, lda, K_weight, ldc,
-                                                                   m_begin, m_end, 0, N);
+                                                                   m_begin, m_end, 0, N,
+                                                                   b_interleaved);
                                       });
         }
         if (act != Activation::NONE && act_n_len != 0) {
@@ -1136,6 +2593,9 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
 
         // ---- GEMV path: M == 1, dedicated kernel ----
         if (M == 1) {
+            _timer.set_shape(use_fp16_acc ? "fp16_gemv_interleaved_fp16acc"
+                                          : "fp16_gemv_interleaved_fp32acc",
+                             M, N, K, 0, 0, false, false, n_threads);
             if (use_fp16_acc) {
                 if (!use_parallel) {
                     matmul_fp16_neon_gemv_range_fp16acc(a_ptr, b_packed, c_ptr, K, 0, N,
@@ -1195,6 +2655,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
             }
             return;
         }
+
+        _timer.set_shape(use_lane_fma
+                             ? (use_fp16_acc ? "fp16_gemm_interleaved_fp16acc"
+                                             : "fp16_gemm_interleaved_fp32acc")
+                             : "fp16_gemm_interleaved_scalar_a",
+                         M, N, K, 0, 0, false, false, n_threads);
 
         __fp16* a_packed = nullptr;
         if (use_lane_fma && !use_parallel) {
@@ -1318,6 +2784,10 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     int total_dim = shard_by_n ? N : M;
     int n_chunks = (total_dim + chunk_size - 1) / chunk_size;
     bool use_parallel = n_threads > 1 && n_chunks > 1;
+
+    _timer.set_shape(is_fp16 ? (is_repacked ? "fp16_standard_repacked" : "fp16_standard")
+                             : "fp32_standard",
+                     M, N, K, 0, 0, false, false, n_threads);
 
     if (!use_parallel) {
         if (is_fp16) {

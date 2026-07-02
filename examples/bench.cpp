@@ -9,7 +9,12 @@ extern "C" {
 double mollm_pack_a_total_ms();
 long long mollm_pack_a_calls();
 double mollm_matmul_total_ms();
+double mollm_q8_quant_a_total_ms();
+long long mollm_q8_quant_a_calls();
 void mollm_reset_pack_counters();
+int mollm_matmul_shape_profile_enabled();
+void mollm_reset_matmul_shape_profile();
+void mollm_print_matmul_shape_profile(const char* title, int top_n);
 }
 #include <string>
 #include <vector>
@@ -143,6 +148,7 @@ int main(int argc, char** argv) {
     }
 
     mollm_reset_pack_counters();
+    mollm_reset_matmul_shape_profile();
 
     if (opts.profile) {
         engine.reset_profiles();
@@ -207,14 +213,21 @@ int main(int argc, char** argv) {
     // Pack-A profiling: show how much of the run is spent packing A.
     double pack_ms = mollm_pack_a_total_ms();
     long long pack_calls = mollm_pack_a_calls();
+    double q8_quant_a_ms = mollm_q8_quant_a_total_ms();
+    long long q8_quant_a_calls = mollm_q8_quant_a_calls();
     double mm_ms = mollm_matmul_total_ms();
-    std::printf("pack_a_ms=%.2f pack_a_calls=%lld matmul_ms=%.2f pack_pct=%.1f%%\n",
-                pack_ms, pack_calls, mm_ms,
-                mm_ms > 0 ? (pack_ms / mm_ms * 100.0) : 0.0);
+    std::printf("pack_a_ms=%.2f pack_a_calls=%lld q8_quant_a_ms=%.2f q8_quant_a_calls=%lld matmul_ms=%.2f pack_pct=%.1f%% q8_quant_a_pct=%.1f%%\n",
+                pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls,
+                mm_ms,
+                mm_ms > 0 ? (pack_ms / mm_ms * 100.0) : 0.0,
+                mm_ms > 0 ? (q8_quant_a_ms / mm_ms * 100.0) : 0.0);
 
     if (opts.profile) {
         print_profile_section("prefill_profile", engine.prefill_exec_ctx());
         print_profile_section("decode_profile", engine.decode_exec_ctx());
+        if (mollm_matmul_shape_profile_enabled()) {
+            mollm_print_matmul_shape_profile("matmul_shape_profile", 24);
+        }
     }
 
     return 0;
