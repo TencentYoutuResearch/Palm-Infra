@@ -151,10 +151,10 @@ for local benchmarking.
 ### Mid-term
 - **Continuous batching / multi-user**: serve multiple sequences with shared prefill
 - **Speculative decoding**: draft model + verify
-- **Qualcomm Oryon support**: validate NEON kernels on non-Apple ARM
 - **Vision encoder**: Qwen3.5 is multimodal — wire up the ViT side
 
 ### Longer-term
+- **MoE support**: Mixture-of-Experts routing + sparse expert matmul (DeepSeek, Qwen3-MoE, Mixtral)
 - **GPU/Vulkan backend**: roadmap item, CPU-first for now
 - **W4 KV cache**: reduce decode memory for long contexts
 - **More models**: Llama, Mistral, DeepSeek families
