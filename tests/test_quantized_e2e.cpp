@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     quant_cfg.rope_theta = 1600000.f;
     quant_cfg.temperature = 0.0f;
     bool quant_ok = quant.load(quant_cfg);
-    CHECK(quant_ok, "W8 engine load");
+    CHECK(quant_ok, "quantized engine load");
 
     if (fp16_ok && fp16.config().tokenizer_path.empty()) {
         CHECK(false, "FP16 package exposes tokenizer");
@@ -102,22 +102,22 @@ int main(int argc, char** argv) {
     if (fp16_ok && quant_ok) {
         CeResult fp16_ce = compute_ce(fp16, ppl_ids);
         CeResult quant_ce = compute_ce(quant, ppl_ids);
-        std::printf("  CE/PPL (%d tokens): fp16=%.4f/%.2f w8=%.4f/%.2f\n",
+        std::printf("  CE/PPL (%d tokens): fp16=%.4f/%.2f quant=%.4f/%.2f\n",
                     n_ppl_tokens, fp16_ce.ce, fp16_ce.ppl, quant_ce.ce, quant_ce.ppl);
         std::printf("  CE delta: %.4f\n", quant_ce.ce - fp16_ce.ce);
 
         CHECK(fp16_ce.finite, "FP16 logits finite");
-        CHECK(quant_ce.finite, "W8 logits finite");
+        CHECK(quant_ce.finite, "quantized logits finite");
         CHECK(fp16_ce.vocab > 0 && fp16_ce.vocab == quant_ce.vocab,
-              "W8 vocab/logit shape matches FP16");
+              "quantized vocab/logit shape matches FP16");
         CHECK(quant.prefill_pool_stats().active > 0,
-              "W8 prefill keeps reusable workspace");
+              "quantized prefill keeps reusable workspace");
 
-        // This is a correctness smoke bound, not a quality target. W8PC is
+        // This is a correctness smoke bound, not a quality target. Quantized packages are
         // expected to drift from FP16, but a very large CE jump usually means
         // bad scale indexing, missing metadata, or transposed quantization.
         CHECK(quant_ce.ce < fp16_ce.ce + 1.0f,
-              "W8 CE stays near FP16 baseline");
+              "quantized CE stays near FP16 baseline");
 
         Tokenizer tok;
         bool tok_ok = tok.load(fp16.config().tokenizer_path);
@@ -127,20 +127,20 @@ int main(int argc, char** argv) {
         if (!ids.empty() && quant_ce.vocab > 0) {
             quant.reset();
             int token = quant.prefill(ids);
-            std::printf("  W8 greedy prefill token: %d\n", token);
-            CHECK(token >= 0 && token < quant_ce.vocab, "W8 prefill returns valid token");
+            std::printf("  quantized greedy prefill token: %d\n", token);
+            CHECK(token >= 0 && token < quant_ce.vocab, "quantized prefill returns valid token");
 
             size_t decode_workspace = 0;
             bool stable = true;
             for (int step = 0; step < 2 && token >= 0; step++) {
                 token = quant.decode(token);
-                std::printf("  W8 decode step %d token: %d\n", step + 1, token);
+                std::printf("  quantized decode step %d token: %d\n", step + 1, token);
                 size_t active = quant.decode_pool_stats().active;
                 if (step == 0) decode_workspace = active;
                 else stable = stable && active == decode_workspace;
-                CHECK(token >= 0 && token < quant_ce.vocab, "W8 decode returns valid token");
+                CHECK(token >= 0 && token < quant_ce.vocab, "quantized decode returns valid token");
             }
-            CHECK(stable && decode_workspace > 0, "W8 decode workspace is stable");
+            CHECK(stable && decode_workspace > 0, "quantized decode workspace is stable");
         }
     }
 

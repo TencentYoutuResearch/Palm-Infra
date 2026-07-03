@@ -369,6 +369,35 @@ int8_t* pack_b_q8dot_int8_full(const int8_t* B_original, int N, int K, int K_wei
     return dst;
 }
 
+uint8_t* pack_b_q4dot_int4_full(const uint8_t* B_original, int N, int K, int K_weight) {
+    int N_padded = ((N + 7) / 8) * 8;
+    int blocks_per_row = (K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK;
+    int src_row_stride = (K_weight + 1) / 2;
+    constexpr int bytes_per_block = W8_Q8_BLOCK / 2;
+    size_t total_bytes = (size_t)(N_padded / 8) * blocks_per_row * 8 * bytes_per_block;
+    uint8_t* dst = new uint8_t[total_bytes];
+    std::memset(dst, 0, total_bytes);
+
+    for (int n_tile = 0; n_tile < N_padded; n_tile += 8) {
+        int tile_valid = std::min(8, N - n_tile);
+        if (tile_valid < 0) tile_valid = 0;
+        uint8_t* tile = dst + (size_t)(n_tile / 8) * blocks_per_row * 8 * bytes_per_block;
+        for (int qb = 0; qb < blocks_per_row; qb++) {
+            int k_begin = qb * W8_Q8_BLOCK;
+            int k_end = std::min(k_begin + W8_Q8_BLOCK, K);
+            int nbytes = (k_end - k_begin + 1) / 2;
+            uint8_t* block = tile + (size_t)qb * 8 * bytes_per_block;
+            for (int j = 0; j < tile_valid; j++) {
+                const uint8_t* src = B_original + (size_t)(n_tile + j) * src_row_stride;
+                std::memcpy(block + (size_t)j * bytes_per_block,
+                            src + k_begin / 2,
+                            (size_t)nbytes);
+            }
+        }
+    }
+    return dst;
+}
+
 static void matmul_int8_scalar_range(const float* A, const int8_t* B, const float* scales,
                                      int group_size, int groups_per_row,
                                      float* C, int M, int N, int K,
@@ -391,6 +420,277 @@ static void matmul_int8_scalar_range(const float* A, const int8_t* B, const floa
                 int8_t q = b_interleaved
                     ? B[(n & ~7) * K_weight + k * 8 + (n & 7)]
                     : b_row[k];
+                sum += A[k + m * lda] * ((float)q * s_row[g]);
+            }
+            c_row[n] = sum;
+        }
+    }
+}
+
+static inline int8_t unpack_int4_signed(uint8_t byte, bool high_nibble) {
+    int v = high_nibble ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+    if (v >= 8) v -= 16;
+    return (int8_t)v;
+}
+
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+static inline int8x16_t sign_extend_int4_nibbles(uint8x16_t nibbles) {
+    // Move the 4-bit sign bit into bit 7, then arithmetic shift it back.
+    return vshrq_n_s8(vreinterpretq_s8_u8(vshlq_n_u8(nibbles, 4)), 4);
+}
+
+static inline void unpack_int4x32_signed(const uint8_t* src,
+                                         int8x16_t& even,
+                                         int8x16_t& odd) {
+    uint8x16_t packed = vld1q_u8(src);
+    uint8x16_t lo = vandq_u8(packed, vdupq_n_u8(0x0F));
+    uint8x16_t hi = vshrq_n_u8(packed, 4);
+    even = sign_extend_int4_nibbles(lo);
+    odd = sign_extend_int4_nibbles(hi);
+}
+
+static inline int32x4_t q4_q8_dot32(int8x16_t q4_even, int8x16_t q4_odd,
+                                    int8x16_t qa_even, int8x16_t qa_odd) {
+    int32x4_t d = vdupq_n_s32(0);
+    d = vdotq_s32(d, q4_even, qa_even);
+    d = vdotq_s32(d, q4_odd, qa_odd);
+    return d;
+}
+
+static void matmul_int4_q8dot_neon_gemv_range(
+    const int8_t* qA, const int8_t* qA_even_pre, const int8_t* qA_odd_pre,
+    const float* a_scales,
+    const uint8_t* B, const uint8_t* B_repack, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int K, int K_weight,
+    int n_begin, int n_end)
+{
+    if (group_size <= 0) group_size = K;
+    int row_stride = (K_weight + 1) / 2;
+    int blocks_per_row = K / W8_Q8_BLOCK;
+    constexpr int bytes_per_block = W8_Q8_BLOCK / 2;
+    W8ScaleMode scale_mode = w8_scale_mode(group_size, groups_per_row);
+    bool scale_per_channel = scale_mode == W8ScaleMode::PerChannel;
+
+    for (int n = n_begin; n < n_end; n += 8) {
+        int n_tile_end = std::min(n + 8, n_end);
+        int c_valid = n_tile_end - n;
+        float32x4_t bscale_lo_pc = vdupq_n_f32(0.f);
+        float32x4_t bscale_hi_pc = vdupq_n_f32(0.f);
+        if (scale_per_channel) {
+            load_w8_b_scales8(scales, n, c_valid, groups_per_row, 0,
+                              bscale_lo_pc, bscale_hi_pc);
+        }
+
+        float32x4_t acc_lo = vdupq_n_f32(0.f);
+        float32x4_t acc_hi = vdupq_n_f32(0.f);
+
+        auto run_qblock = [&](int qb, float32x4_t bscale_lo, float32x4_t bscale_hi) {
+            int byte_off = qb * (W8_Q8_BLOCK / 2);
+            const uint8_t* b_repack_block = B_repack
+                ? B_repack + ((size_t)(n / 8) * blocks_per_row + qb) * 8 * bytes_per_block
+                : nullptr;
+
+            int8x16_t qa_even;
+            int8x16_t qa_odd;
+            if (qA_even_pre && qA_odd_pre) {
+                qa_even = vld1q_s8(qA_even_pre + (size_t)qb * 16);
+                qa_odd = vld1q_s8(qA_odd_pre + (size_t)qb * 16);
+            } else {
+                int8x16_t qa0 = vld1q_s8(qA + (size_t)qb * W8_Q8_BLOCK);
+                int8x16_t qa1 = vld1q_s8(qA + (size_t)qb * W8_Q8_BLOCK + 16);
+                qa_even = vuzp1q_s8(qa0, qa1);
+                qa_odd = vuzp2q_s8(qa0, qa1);
+            }
+
+            int32x4_t d0 = vdupq_n_s32(0);
+            int32x4_t d1 = vdupq_n_s32(0);
+            int32x4_t d2 = vdupq_n_s32(0);
+            int32x4_t d3 = vdupq_n_s32(0);
+            int32x4_t d4 = vdupq_n_s32(0);
+            int32x4_t d5 = vdupq_n_s32(0);
+            int32x4_t d6 = vdupq_n_s32(0);
+            int32x4_t d7 = vdupq_n_s32(0);
+
+            auto dot_col = [&](int c, int32x4_t& d) {
+                int8x16_t q4_even, q4_odd;
+                const uint8_t* src = b_repack_block
+                    ? b_repack_block + (size_t)c * bytes_per_block
+                    : B + (size_t)(n + c) * row_stride + byte_off;
+                unpack_int4x32_signed(src,
+                                      q4_even, q4_odd);
+                d = q4_q8_dot32(q4_even, q4_odd, qa_even, qa_odd);
+            };
+            if (c_valid > 0) dot_col(0, d0);
+            if (c_valid > 1) dot_col(1, d1);
+            if (c_valid > 2) dot_col(2, d2);
+            if (c_valid > 3) dot_col(3, d3);
+            if (c_valid > 4) dot_col(4, d4);
+            if (c_valid > 5) dot_col(5, d5);
+            if (c_valid > 6) dot_col(6, d6);
+            if (c_valid > 7) dot_col(7, d7);
+
+            int32x4_t p01 = vpaddq_s32(d0, d1);
+            int32x4_t p23 = vpaddq_s32(d2, d3);
+            int32x4_t p45 = vpaddq_s32(d4, d5);
+            int32x4_t p67 = vpaddq_s32(d6, d7);
+            int32x4_t dots_lo = vpaddq_s32(p01, p23);
+            int32x4_t dots_hi = vpaddq_s32(p45, p67);
+
+            float a_scale = a_scales[qb];
+            acc_lo = vfmaq_f32(acc_lo, vcvtq_f32_s32(dots_lo), vmulq_n_f32(bscale_lo, a_scale));
+            acc_hi = vfmaq_f32(acc_hi, vcvtq_f32_s32(dots_hi), vmulq_n_f32(bscale_hi, a_scale));
+        };
+
+        if (scale_per_channel) {
+            for (int qb = 0; qb < blocks_per_row; qb++) {
+                run_qblock(qb, bscale_lo_pc, bscale_hi_pc);
+            }
+        } else if (scale_mode == W8ScaleMode::PerGroup) {
+            int qblocks_per_group = std::max(1, group_size / W8_Q8_BLOCK);
+            for (int group = 0; group < groups_per_row; group++) {
+                float32x4_t bscale_lo;
+                float32x4_t bscale_hi;
+                load_w8_b_scales8(scales, n, c_valid, groups_per_row, group,
+                                  bscale_lo, bscale_hi);
+                int qb_begin = group * qblocks_per_group;
+                int qb_end = std::min(qb_begin + qblocks_per_group, blocks_per_row);
+                for (int qb = qb_begin; qb < qb_end; qb++) {
+                    run_qblock(qb, bscale_lo, bscale_hi);
+                }
+            }
+        } else {
+            for (int qb = 0; qb < blocks_per_row; qb++) {
+                float32x4_t bscale_lo;
+                float32x4_t bscale_hi;
+                load_w8_b_scales8(scales, n, c_valid, groups_per_row, qb,
+                                  bscale_lo, bscale_hi);
+                run_qblock(qb, bscale_lo, bscale_hi);
+            }
+        }
+
+        float tmp[4];
+        vst1q_f32(tmp, acc_lo);
+        for (int c = 0; c < 4 && c < c_valid; c++) C[n + c] = tmp[c];
+        vst1q_f32(tmp, acc_hi);
+        for (int c = 0; c < 4 && c + 4 < c_valid; c++) C[n + 4 + c] = tmp[c];
+    }
+}
+
+static void matmul_int4_q8dot_neon_4x8_range(
+    const int8_t* qA, const float* a_scales,
+    const uint8_t* B, const uint8_t* B_repack, const float* scales,
+    int group_size, int groups_per_row,
+    float* C, int M, int N, int K,
+    int K_padded, int K_weight, int ldc,
+    int m_begin, int m_end)
+{
+    (void)M;
+    if (group_size <= 0) group_size = K;
+    int row_stride = (K_weight + 1) / 2;
+    int blocks_per_row = K / W8_Q8_BLOCK;
+    constexpr int bytes_per_block = W8_Q8_BLOCK / 2;
+    W8ScaleMode scale_mode = w8_scale_mode(group_size, groups_per_row);
+    bool scale_per_channel = scale_mode == W8ScaleMode::PerChannel;
+
+    for (int m = m_begin; m < m_end; m += 4) {
+        int m_tile_end = std::min(m + 4, m_end);
+        int r_valid = m_tile_end - m;
+
+        for (int n = 0; n < N; n += 8) {
+            int n_tile_end = std::min(n + 8, N);
+            int c_valid = n_tile_end - n;
+            float32x4_t bscale_lo_pc = vdupq_n_f32(0.f);
+            float32x4_t bscale_hi_pc = vdupq_n_f32(0.f);
+            if (scale_per_channel) {
+                load_w8_b_scales8(scales, n, c_valid, groups_per_row, 0,
+                                  bscale_lo_pc, bscale_hi_pc);
+            }
+
+            float acc[4][8] = {};
+
+            for (int qb = 0; qb < blocks_per_row; qb++) {
+                int group = w8_scale_group(scale_mode, qb, group_size);
+                int byte_off = qb * (W8_Q8_BLOCK / 2);
+                const uint8_t* b_repack_block = B_repack
+                    ? B_repack + ((size_t)(n / 8) * blocks_per_row + qb) * 8 * bytes_per_block
+                    : nullptr;
+
+                int8x16_t q4_even[8];
+                int8x16_t q4_odd[8];
+                for (int c = 0; c < c_valid; c++) {
+                    const uint8_t* src = b_repack_block
+                        ? b_repack_block + (size_t)c * bytes_per_block
+                        : B + (size_t)(n + c) * row_stride + byte_off;
+                    unpack_int4x32_signed(src,
+                                          q4_even[c], q4_odd[c]);
+                }
+
+                int32_t dots[4][8] = {};
+                for (int r = 0; r < r_valid; r++) {
+                    const int8_t* qa = qA + (size_t)(m + r) * K_padded + qb * W8_Q8_BLOCK;
+                    int8x16_t qa0 = vld1q_s8(qa);
+                    int8x16_t qa1 = vld1q_s8(qa + 16);
+                    int8x16_t qa_even = vuzp1q_s8(qa0, qa1);
+                    int8x16_t qa_odd = vuzp2q_s8(qa0, qa1);
+                    for (int c = 0; c < c_valid; c++) {
+                        int32x4_t d = q4_q8_dot32(q4_even[c], q4_odd[c], qa_even, qa_odd);
+                        dots[r][c] = vaddvq_s32(d);
+                    }
+                }
+
+                float32x4_t bscale_lo = bscale_lo_pc;
+                float32x4_t bscale_hi = bscale_hi_pc;
+                if (!scale_per_channel) {
+                    load_w8_b_scales8(scales, n, c_valid, groups_per_row, group,
+                                      bscale_lo, bscale_hi);
+                }
+
+                for (int r = 0; r < r_valid; r++) {
+                    float a_scale = a_scales[(size_t)(m + r) * blocks_per_row + qb];
+                    float32x4_t acc_lo = vld1q_f32(acc[r]);
+                    float32x4_t acc_hi = vld1q_f32(acc[r] + 4);
+                    acc_lo = vfmaq_f32(acc_lo, vcvtq_f32_s32(vld1q_s32(dots[r])),
+                                       vmulq_n_f32(bscale_lo, a_scale));
+                    acc_hi = vfmaq_f32(acc_hi, vcvtq_f32_s32(vld1q_s32(dots[r] + 4)),
+                                       vmulq_n_f32(bscale_hi, a_scale));
+                    vst1q_f32(acc[r], acc_lo);
+                    vst1q_f32(acc[r] + 4, acc_hi);
+                }
+            }
+
+            for (int r = 0; r < r_valid; r++) {
+                float* c_row = C + (m + r) * ldc;
+                for (int c = 0; c < c_valid; c++) {
+                    c_row[n + c] = acc[r][c];
+                }
+            }
+        }
+    }
+}
+#endif
+
+static void matmul_int4_scalar_range(const float* A, const uint8_t* B, const float* scales,
+                                     int group_size, int groups_per_row,
+                                     float* C, int M, int N, int K,
+                                     int lda, int K_weight, int ldc,
+                                     int m_begin, int m_end,
+                                     int n_begin, int n_end) {
+    (void)M;
+    if (group_size <= 0) group_size = K;
+    if (groups_per_row <= 0) groups_per_row = 1;
+    int row_stride = (K_weight + 1) / 2;
+
+    for (int m = m_begin; m < m_end; m++) {
+        float* c_row = C + m * ldc;
+        for (int n = n_begin; n < n_end; n++) {
+            const uint8_t* b_row = B + (size_t)n * row_stride;
+            const float* s_row = scales + n * groups_per_row;
+            float sum = 0.f;
+            for (int k = 0; k < K; k++) {
+                uint8_t byte = b_row[k >> 1];
+                int8_t q = unpack_int4_signed(byte, (k & 1) != 0);
+                int g = k / group_size;
                 sum += A[k + m * lda] * ((float)q * s_row[g]);
             }
             c_row[n] = sum;
@@ -433,6 +733,48 @@ static void quantize_a_q8_blocks(const float* A, int M, int K, int lda,
             }
         }
     }
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::lock_guard<std::mutex> lk(g_prof_mtx);
+    g_q8_quant_a_ms += ms;
+    g_q8_quant_a_calls++;
+}
+
+static void quantize_a_q8_blocks_even_odd(const float* A, int K,
+                                          std::vector<int8_t>& qA_even,
+                                          std::vector<int8_t>& qA_odd,
+                                          std::vector<float>& a_scales) {
+    auto t0 = std::chrono::steady_clock::now();
+    int blocks_per_row = (K + W8_Q8_BLOCK - 1) / W8_Q8_BLOCK;
+    qA_even.resize((size_t)blocks_per_row * 16);
+    qA_odd.resize((size_t)blocks_per_row * 16);
+    a_scales.resize((size_t)blocks_per_row);
+
+    for (int qb = 0; qb < blocks_per_row; qb++) {
+        int k_begin = qb * W8_Q8_BLOCK;
+        int k_end = std::min(k_begin + W8_Q8_BLOCK, K);
+        float amax = 0.f;
+        for (int k = k_begin; k < k_end; k++) {
+            amax = std::max(amax, std::fabs(A[k]));
+        }
+        float scale = (amax > 0.f) ? (amax / 127.f) : 1.f;
+        float inv_scale = (amax > 0.f) ? (127.f / amax) : 0.f;
+        a_scales[qb] = scale;
+
+        int8_t* even = qA_even.data() + (size_t)qb * 16;
+        int8_t* odd = qA_odd.data() + (size_t)qb * 16;
+        for (int i = 0; i < 16; i++) {
+            int k0 = k_begin + i * 2;
+            int k1 = k0 + 1;
+            int q0 = (k0 < k_end) ? (int)std::nearbyint(A[k0] * inv_scale) : 0;
+            int q1 = (k1 < k_end) ? (int)std::nearbyint(A[k1] * inv_scale) : 0;
+            q0 = std::max(-127, std::min(127, q0));
+            q1 = std::max(-127, std::min(127, q1));
+            even[i] = (int8_t)q0;
+            odd[i] = (int8_t)q1;
+        }
+    }
+
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     std::lock_guard<std::mutex> lk(g_prof_mtx);
@@ -2187,16 +2529,135 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
 
     // Detect quantized/FP16 weight.
     bool is_int8 = (B.prec == Precision::INT8);
+    bool is_int4 = (B.prec == Precision::INT4);
     bool is_fp16 = (B.prec == Precision::FP16);
     const int8_t* b_int8 = is_int8 ? reinterpret_cast<const int8_t*>(B.data) : nullptr;
+    const uint8_t* b_int4 = is_int4 ? reinterpret_cast<const uint8_t*>(B.data) : nullptr;
     const __fp16* b_fp16 = is_fp16 ? reinterpret_cast<const __fp16*>(B.data) : nullptr;
-    const float* b_fp32 = (is_fp16 || is_int8) ? nullptr : B.ptr<float>();
+    const float* b_fp32 = (is_fp16 || is_int8 || is_int4) ? nullptr : B.ptr<float>();
 
     // K_weight is the stride between consecutive k rows in the repacked layout.
     // For repacked [K, N]: K_weight = original N.
     // For non-repacked [N, K]: K_weight = original K (the inner dim of B).
     // We determine this by comparing K_weight with K: if they differ, it's repacked.
     bool is_repacked = (K_weight != K);
+
+    if (is_int4) {
+        const float* scales = B.scales;
+        int group_size = (int)B.group_size;
+        int groups_per_row = (int)B.groups_per_row;
+        const uint8_t* b_q4_repack = reinterpret_cast<const uint8_t*>(B.q4_repack_data);
+        int n_threads = thread_pool ? thread_pool->num_threads() : 1;
+        if (!scales || group_size <= 0 || groups_per_row <= 0) {
+            _timer.set_shape("int4_invalid_scales", M, N, K, group_size, groups_per_row,
+                             false, false, n_threads);
+            return;
+        }
+
+        constexpr int tile_m = HAS_NEON ? 8 : 1;
+        bool shard_by_n = (N > M * 8 && M == 1);
+        int chunk_size = (M == 1 || N == 1) ? g_matmul_config.gemv_chunk_size : tile_m;
+        int total_dim = shard_by_n ? N : M;
+        int n_chunks = (total_dim + chunk_size - 1) / chunk_size;
+        bool use_parallel = n_threads > 1 && n_chunks > 1;
+
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+        static const bool w4_q8_dot_enabled = !env_flag_enabled("MOLLM_W4_NO_Q8_DOT");
+        static const bool w4_q8_dot_gemm_disabled = env_flag_enabled("MOLLM_W4_NO_Q8_DOT_GEMM");
+        static const bool w4_q4_repack_enabled =
+            !env_flag_enabled("MOLLM_W4_NO_Q4_REPACK") &&
+            !env_flag_enabled("MOLLM_W4_NO_Q8_REPACK");
+        bool can_use_q4_dot = (B.is_q4_repacked || w4_q8_dot_enabled) &&
+                              (K % W8_Q8_BLOCK == 0) &&
+                              (group_size % W8_Q8_BLOCK == 0);
+        bool use_q4_repack = can_use_q4_dot && b_q4_repack &&
+                              (B.is_q4_repacked || w4_q4_repack_enabled);
+        if (M == 1 && can_use_q4_dot) {
+            const char* path = use_q4_repack ? "q4dot_gemv_repack" : "q4dot_gemv";
+            _timer.set_shape(path, M, N, K, group_size, groups_per_row,
+                             use_q4_repack, false, n_threads);
+            std::vector<int8_t> qA_even;
+            std::vector<int8_t> qA_odd;
+            std::vector<float> a_scales;
+            quantize_a_q8_blocks_even_odd(a_ptr, K, qA_even, qA_odd, a_scales);
+            if (!use_parallel) {
+                matmul_int4_q8dot_neon_gemv_range(
+                    nullptr, qA_even.data(), qA_odd.data(), a_scales.data(), b_int4,
+                    use_q4_repack ? b_q4_repack : nullptr, scales,
+                    group_size, groups_per_row, c_ptr, K, K_weight, 0, N);
+            } else {
+                int n_chunk = std::max(N / (n_threads * 8), 64);
+                n_chunk = ((n_chunk + 7) / 8) * 8;
+                thread_pool->parallel_for(0, N, n_chunk,
+                    [&](int, int n_begin, int n_end) {
+                        matmul_int4_q8dot_neon_gemv_range(
+                            nullptr, qA_even.data(), qA_odd.data(), a_scales.data(), b_int4,
+                            use_q4_repack ? b_q4_repack : nullptr, scales,
+                            group_size, groups_per_row, c_ptr, K, K_weight,
+                            n_begin, n_end);
+                    });
+            }
+            if (act != Activation::NONE && act_n_len != 0) {
+                apply_activation_to_range_gemv(c_ptr, N, act, act_n_begin, act_n_len);
+            }
+            return;
+        }
+        if (can_use_q4_dot && !w4_q8_dot_gemm_disabled) {
+            const char* path = use_q4_repack ? "q4dot_gemm_repack" : "q4dot_gemm";
+            _timer.set_shape(path, M, N, K, group_size, groups_per_row,
+                             use_q4_repack, false, n_threads);
+            std::vector<int8_t> qA;
+            std::vector<float> a_scales;
+            quantize_a_q8_blocks(a_ptr, M, K, lda, K, qA, a_scales);
+            if (!use_parallel) {
+                matmul_int4_q8dot_neon_4x8_range(
+                    qA.data(), a_scales.data(), b_int4,
+                    use_q4_repack ? b_q4_repack : nullptr, scales,
+                    group_size, groups_per_row, c_ptr, M, N, K, K, K_weight, ldc, 0, M);
+            } else {
+                thread_pool->parallel_for(0, M, tile_m,
+                    [&](int, int m_begin, int m_end) {
+                        matmul_int4_q8dot_neon_4x8_range(
+                            qA.data(), a_scales.data(), b_int4,
+                            use_q4_repack ? b_q4_repack : nullptr, scales,
+                            group_size, groups_per_row, c_ptr, M, N, K, K, K_weight, ldc,
+                            m_begin, m_end);
+                    });
+            }
+            if (act != Activation::NONE && act_n_len != 0) {
+                apply_activation_to_range(c_ptr, M, N, ldc, 0, M, act, act_n_begin, act_n_len);
+            }
+            return;
+        }
+#endif
+
+        _timer.set_shape("int4_scalar", M, N, K, group_size, groups_per_row,
+                         false, false, n_threads);
+        if (!use_parallel) {
+            matmul_int4_scalar_range(a_ptr, b_int4, scales, group_size, groups_per_row,
+                                     c_ptr, M, N, K, lda, K_weight, ldc, 0, M, 0, N);
+        } else if (shard_by_n) {
+            thread_pool->parallel_for(0, N, chunk_size,
+                                      [&](int, int n_begin, int n_end) {
+                                          matmul_int4_scalar_range(a_ptr, b_int4, scales,
+                                                                   group_size, groups_per_row,
+                                                                   c_ptr, M, N, K, lda, K_weight, ldc,
+                                                                   0, M, n_begin, n_end);
+                                      });
+        } else {
+            thread_pool->parallel_for(0, M, chunk_size,
+                                      [&](int, int m_begin, int m_end) {
+                                          matmul_int4_scalar_range(a_ptr, b_int4, scales,
+                                                                   group_size, groups_per_row,
+                                                                   c_ptr, M, N, K, lda, K_weight, ldc,
+                                                                   m_begin, m_end, 0, N);
+                                      });
+        }
+        if (act != Activation::NONE && act_n_len != 0) {
+            apply_activation_to_range(c_ptr, M, N, ldc, 0, M, act, act_n_begin, act_n_len);
+        }
+        return;
+    }
 
     if (is_int8) {
         const float* scales = B.scales;

@@ -33,10 +33,11 @@ struct BenchConfig {
     bool disable_k_block = false;
     bool use_fp16 = false; // FP16 weight storage
     bool use_int8 = false; // INT8 weight storage
+    bool use_int4 = false; // INT4 packed weight storage
     bool use_fp32 = false; // explicitly FP32 (default)
     bool interleave_pack = true;   // B interleaved packing (FP16/INT8)
     bool no_interleave_pack = false;
-    int group_size = 0;     // INT8 quant group size; 0 = per-channel
+    int group_size = 0;     // quant group size; 0 = per-channel
 };
 
 struct BenchResult {
@@ -118,6 +119,8 @@ static BenchConfig parse_args(int argc, char** argv) {
             cfg.use_fp16 = true;
         } else if (arg == "--int8") {
             cfg.use_int8 = true;
+        } else if (arg == "--int4") {
+            cfg.use_int4 = true;
         } else if (arg == "--fp32") {
             cfg.use_fp32 = true;
         } else if (arg == "--group-size") {
@@ -164,6 +167,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
 
     bool is_fp16 = cfg.use_fp16;
     bool is_int8 = cfg.use_int8;
+    bool is_int4 = cfg.use_int4;
 
     float* a_data = new float[M * K];
     float* c_data = new float[M * N];
@@ -176,6 +180,8 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     int8_t* b_int8_data = nullptr;
     int8_t* b_int8_packed_data = nullptr;
     int8_t* b_int8_q8dot_data = nullptr;
+    uint8_t* b_int4_data = nullptr;
+    uint8_t* b_int4_q4dot_data = nullptr;
     float* scales_data = nullptr;
     int group_size = cfg.group_size > 0 ? cfg.group_size : K;
     int groups_per_row = (K + group_size - 1) / group_size;
@@ -198,6 +204,27 @@ static BenchResult run_bench(const BenchConfig& cfg) {
         } else {
             b_raw = b_int8_data;
         }
+    } else if (is_int4) {
+        int row_stride = (K + 1) / 2;
+        b_int4_data = new uint8_t[(size_t)N * row_stride];
+        std::memset(b_int4_data, 0, (size_t)N * row_stride);
+        scales_data = new float[N * groups_per_row];
+        for (int n = 0; n < N; n++) {
+            for (int g = 0; g < groups_per_row; g++) {
+                scales_data[n * groups_per_row + g] = 0.01f + 0.0001f * (float)((n + g) & 7);
+            }
+            for (int k = 0; k < K; k++) {
+                int q = (std::rand() % 15) - 7;
+                uint8_t nibble = (uint8_t)q & 0x0F;
+                uint8_t* byte = b_int4_data + (size_t)n * row_stride + (k >> 1);
+                if (k & 1) *byte |= (uint8_t)(nibble << 4);
+                else *byte |= nibble;
+            }
+        }
+        b_raw = b_int4_data;
+        if (g_matmul_config.use_interleave_pack && (K % 32) == 0 && (group_size % 32) == 0) {
+            b_int4_q4dot_data = pack_b_q4dot_int4_full(b_int4_data, N, K, K);
+        }
     } else if (is_fp16) {
         b_fp16_data = new __fp16[N * K];
         float* tmp = new float[N * K];
@@ -219,15 +246,19 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     }
 
     Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-    Tensor B = Tensor::create(is_int8 ? Precision::INT8 : is_fp16 ? Precision::FP16 : Precision::FP32,
+    Tensor B = Tensor::create(is_int4 ? Precision::INT4 : is_int8 ? Precision::INT8 : is_fp16 ? Precision::FP16 : Precision::FP32,
                               MemoryType::EXTERNAL, N, K, 1, 1, b_raw);
-    if (is_int8) {
+    if (is_int8 || is_int4) {
         B.scales = scales_data;
         B.group_size = (uint32_t)group_size;
         B.groups_per_row = (uint32_t)groups_per_row;
         B.num_groups = (uint32_t)(N * groups_per_row);
-        B.is_interleaved = g_matmul_config.use_interleave_pack;
-        B.q8_repack_data = b_int8_q8dot_data;
+        if (is_int8) {
+            B.is_interleaved = g_matmul_config.use_interleave_pack;
+            B.q8_repack_data = b_int8_q8dot_data;
+        } else {
+            B.q4_repack_data = b_int4_q4dot_data;
+        }
     }
     Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
@@ -270,8 +301,12 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     if (is_fp16) delete[] b_fp16_data;
     if (b_int8_packed_data) delete[] b_int8_packed_data;
     if (b_int8_q8dot_data) delete[] b_int8_q8dot_data;
+    if (b_int4_q4dot_data) delete[] b_int4_q4dot_data;
     if (is_int8) {
         delete[] b_int8_data;
+        delete[] scales_data;
+    } else if (is_int4) {
+        delete[] b_int4_data;
         delete[] scales_data;
     } else if (!is_fp16) {
         delete[] b_fp32_data;
@@ -285,7 +320,7 @@ int main(int argc, char** argv) {
     BenchResult result = run_bench(cfg);
 
     std::printf("M=%d K=%d N=%d threads=%d prec=%s\n", cfg.M, cfg.K, cfg.N, cfg.num_threads,
-                cfg.use_int8 ? "INT8" : cfg.use_fp16 ? "FP16" : "FP32");
+                cfg.use_int4 ? "INT4" : cfg.use_int8 ? "INT8" : cfg.use_fp16 ? "FP16" : "FP32");
     std::printf("  warmup=%d repeat=%d\n", cfg.warmup, cfg.repeat);
     std::printf("  avg=%.2fms min=%.2fms max=%.2fms p50=%.2fms\n",
                 result.avg_ms, result.min_ms, result.max_ms, result.p50_ms);

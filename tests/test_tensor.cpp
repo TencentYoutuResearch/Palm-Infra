@@ -63,6 +63,7 @@ int main() {
     CHECK(precision_size(Precision::FP32) == 4, "FP32=4 bytes");
     CHECK(precision_size(Precision::FP16) == 2, "FP16=2 bytes");
     CHECK(precision_size(Precision::INT8) == 1, "INT8=1 byte");
+    CHECK(precision_size(Precision::INT4) == 1, "INT4 packed storage byte");
 
     // ---- is_contiguous after permute ----
     CHECK(!p.is_contiguous(), "permuted tensor not contiguous");

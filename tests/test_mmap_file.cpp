@@ -81,6 +81,7 @@ int main() {
         float scales[2] = {0.5f, 2.0f};
         MappedFile::Header hdr = {};
         hdr.magic       = MappedFile::MAGIC;
+        hdr.flags       = MappedFile::FLAG_INT4_Q4DOT;
         hdr.precision   = (uint32_t)Precision::FP16;
         hdr.ndim        = 1;
         hdr.shape[0]    = 4;
@@ -99,6 +100,7 @@ int main() {
         CHECK(mf.data_size() == sizeof(data), "data_size with scales");
         CHECK(mf.scales_size() == sizeof(scales), "scales_size");
         CHECK(mf.scales() != nullptr, "scales not null");
+        CHECK(mf.header().flags == MappedFile::FLAG_INT4_Q4DOT, "flags");
         CHECK(mf.header().group_size == 32, "group_size");
         CHECK(mf.header().num_groups == 1, "num_groups");
 

@@ -3,35 +3,52 @@
 A from-scratch LLM inference engine for ARM-based devices.
 Currently developed and benchmarked on Apple Silicon; targeting mobile/edge
 ARM (Qualcomm Oryon, MediaTek) on the roadmap.
-Pure C++ runtime with a Python transpilation frontend. FP16 with FP16FML NEON kernels.
+Pure C++ runtime with a Python transpilation frontend. FP16 uses FP16FML NEON
+kernels; W8/W4 weight-only quantization uses ARM dot-product kernels.
 
 ## Status
 
-Supports three model families:
+Supports three model families. Benchmark protocol is Apple M5 Pro, 4 threads,
+pp256 + tg64, warmup=3, 5-run median unless noted.
 
-| Model | Architecture | pp256 t/s | tg64 t/s |
-|-------|-------------|-----------|----------|
-| Qwen3.5-4B | Hybrid linear/full attention (Gated DeltaNet + GQA) | 115 | 25 |
-| Qwen3.5-0.8B | Same | 601 | 104 |
-| Youtu-LLM-2B | MLA | 235 | 54 |
+FP16:
 
-Benchmarks vs llama.cpp (Apple M5 Pro, 4 threads, pp256 + tg64, warmup=3):
+| Model | Architecture | mollm pp/tg | llama.cpp pp/tg |
+|-------|--------------|------------:|----------------:|
+| Qwen3.5-0.8B | Hybrid linear/full attention (Gated DeltaNet + GQA) | 625.36 / 101.74 | 675.69 / 99.24 |
+| Youtu-LLM-2B | MLA | 241.59 / 51.27 | 266.66 / 46.89 |
+| Qwen3.5-4B | Hybrid linear/full attention (Gated DeltaNet + GQA) | 110.66 / 24.44 | 143.22 / 22.02 |
 
-| Model | mollm pp/tg | llama.cpp pp/tg | prefill gap | decode gap |
-|-------|------------|-----------------|-------------|------------|
-| Qwen3.5-4B | 115 / **25** | 143 / 23 | 1.25x | **0.92x (faster)** |
-| Qwen3.5-0.8B | 601 / **104** | 749 / 100 | 1.25x | **0.96x (faster)** |
-| Youtu-LLM-2B | 235 / **54** | 264 / 41 | 1.12x | **0.76x (faster)** |
+W8PC / Q8_0:
 
-Decode beats llama.cpp on all three models. Prefill gaps are MATMUL-bound
-(weight bandwidth on 4B/2B); W8 quantization helps but FP16FML still has
-higher throughput on hardware without i8mm.
+| Model | mollm W8PC pp/tg | llama.cpp Q8_0 pp/tg |
+|-------|-----------------:|---------------------:|
+| Qwen3.5-0.8B | 396.78 / 157.34 | 813.58 / 171.10 |
+| Youtu-LLM-2B | 139.50 / 89.64 | 271.58 / 86.47 |
+| Qwen3.5-4B | 64.02 / 43.66 | 138.22 / 40.71 |
+
+Youtu-LLM-2B W4G128 direct q4pkg after the latest W4 GEMV cleanup:
+
+| Runtime | pp256 | tg64 |
+|---------|------:|-----:|
+| mollm W4G128 | 118.39 | 89.61 |
+| llama.cpp Q4_0 | 255.28 | 90.35 |
+| llama.cpp Q4_K_M | 187.96 | 82.53 |
+| llama.cpp Q8_0 | 259.58 | 85.09 |
+
+Current summary: decode is competitive with llama.cpp on 2B/4B for FP16, W8,
+and 2B W4. Quantized prefill is still the main gap, especially W4/W8 GEMM
+versus llama.cpp's BLAS-backed CPU path.
 
 ## Architecture
 
-- **Python transpile → binary graph**: PyTorch weights + model definition → serialized `.graph` + `.weights` files. No runtime JIT, all op fusion done at transpile time.
-- **C++ executor**: Sequential node dispatch, BufferPool memory management, mmap'd weights.
-- **NEON kernels**: FP16FML lane-FMA GEMM, dedicated GEMV with 8-way K-unroll, fused Gated DeltaNet recurrence, SDPA with register-tiled PV.
+- **Python transpile → `.mollm` package**: PyTorch weights + model definition
+  become a single mmap-friendly package with metadata, tokenizer, prefill graph,
+  decode graph, and weights.
+- **C++ executor**: Sequential node dispatch, BufferPool memory management,
+  graph workspace reuse, mmap'd weights, and a CPU backend abstraction.
+- **NEON kernels**: FP16FML lane-FMA GEMM/GEMV, W8 q8dot, W4 q4dot, fused
+  Gated DeltaNet recurrence, SDPA with register-tiled PV.
 
 ### Directory layout
 
@@ -47,27 +64,29 @@ mollm/
 
 ### Package format (`.mollm`)
 
-A single-file container bundling graph + weights + metadata, so models ship as one
-artifact instead of a directory of loose files. Planned format:
+A single-file container bundling graphs + weights + tokenizer + metadata, so
+models ship as one artifact instead of a directory of loose files. Format:
 
 ```
-[Header]
+[Header 128B]
   magic "MOLM"
-  version
-  metadata_offset, metadata_len      # JSON: model name, architecture, config,
-                                     #   tokenizer ref, prefill_seq_len, n_ctx
-  prefill_graph_offset, graph_len    # binary graph (existing format)
+  metadata_offset, metadata_len      # JSON: config + weight offset map
+  tokenizer_offset, tokenizer_len
+  chat_template_offset, template_len
+  prefill_graph_offset, graph_len
   decode_graph_offset, graph_len
-  weights_offset, weights_len        # concatenated .weights blobs
+  weights_offset, weights_len
 [metadata JSON]
+[tokenizer.json]
+[chat_template.jinja]
 [prefill graph bytes]
 [decode graph bytes]
-[weights bytes]                      # mmap'd at runtime, offset within file
+[weights bytes]                      # mmap'd at runtime
 ```
 
-Runtime opens the `.mollm` file once, mmaps the weights region, and reads the two
-graphs. No directory sprawl, no path juggling. The transpile step can emit either
-the current directory layout or a single `.mollm` file.
+Runtime opens the `.mollm` file once, mmaps the weights region, and reads the
+two graphs. Packages must contain explicit `lm_head.weights`; old packages from
+before that boundary need reconversion.
 
 ## Build
 
@@ -85,6 +104,9 @@ cd mollm
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b.mollm
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w8pc.mollm 32 256 w8pc
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w8g128.mollm 32 256 w8g128
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm 32 256 w4g128
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm 32 256 w4mixg128
+python3 models/converter.py /path/to/Youtu-LLM-2B youtu-llm-2b_w4g128.mollm 32 256 w4g128
 ```
 
 The converter auto-detects the model type from `config.json` and dispatches to the appropriate converter. Supported types:
@@ -102,29 +124,36 @@ The converter auto-detects the model type from `config.json` and dispatches to t
 | 2 | `output_path` | yes | Output `.mollm` file path |
 | 3 | `num_layers` | no | Override number of hidden layers (auto-detected if omitted) |
 | 4 | `prefill_seq_len` | no | Prefill chunk size (default 256) |
-| 5 | `quant` | no | `none`, `w8pc`, or `w8gN` such as `w8g128` |
+| 5 | `quant` | no | `none`, `w8pc`, `w8gN`, `w4gN`, or Qwen3.5-only `w4mixgN` |
 
 Produces a single `.mollm` file containing graphs + weights + tokenizer + chat template.
 
-W8 weight-only quantization is implemented with NEON INT8 kernels. The default
-runtime uses a llama.cpp-style Q8 activation dot-product path for both decode
-(GEMV) and prefill (GEMM), with a repacked INT8 weight layout optimized for
-ARM dot-product access patterns. On Apple Silicon (no i8mm), W8 repacked
-GEMM reaches ~421 GF/s microbench (vs FP16FML's 988 GF/s).
+Quantization status:
 
-W8 status by phase (Qwen3.5-0.8B, 4 threads, warmup=3):
+- W8 uses weight-only int8 with Q8 activation dot-product kernels. Runtime uses
+  q8dot repacked layout `[N/8, K/32, 8, 32]` by default for GEMV and GEMM.
+- W4 uses signed int4 weights with Q8 activation dot-product kernels. Current
+  packages store W4 directly in q4dot physical layout
+  `[ceil(N/8), K/32, 8, 16B]`, so runtime does not keep a second W4 repack copy.
+- `w4mixgN` is currently Qwen3.5-only and promotes quality-sensitive tensors
+  such as `lm_head.weights` and selected attention/FFN projections to W8.
+- `embed_tokens.weights` stays FP16 row-major for lookup; `lm_head.weights` is
+  explicit in the package and follows the same quantization policy as a normal
+  linear weight.
+
+Quantized package examples:
 
 | Package | pp256 t/s | tg64 t/s | peak RSS |
-|---------|-----------|----------|----------|
-| FP16 baseline | 623 | 98 | 3.99 GB |
-| W8PC (default q8dot GEMV + native GEMM) | 221 | 102 | 3.04 GB |
-| W8PC (repacked q8dot GEMM) | 388 | 103 | 3.52 GB |
+|---------|----------:|---------:|---------:|
+| Qwen3.5-0.8B W8PC | 396.78 | 157.34 | 2561.9 MB |
+| Qwen3.5-0.8B W4G128 direct q4pkg | 385.88 | 154.88 | 1500.7 MB |
+| Qwen3.5-0.8B W4MIXG128 direct q4pkg | 370.07 | 143.38 | 2232.8 MB |
+| Youtu-LLM-2B W4G128 direct q4pkg | 118.39 | 89.61 | 2893.6 MB |
 
-Decode reaches parity with FP16 (the bandwidth win from W8 offsets the
-int8→fp32 dequant overhead at GEMV sizes). Prefill is still behind FP16 because
-FP16FML's fused accumulate has higher throughput than the int8 dot path on
-hardware without `__ARM_FEATURE_MATMUL_INT8`. On i8mm-capable hardware
-(`-DMOLLM_ARM_I8MM=ON`), the `vmmlaq_s32` kernel should close more of the gap.
+Pure W4 quality is model-dependent. On the current 256-token reference sample,
+Youtu-LLM-2B W4G128 has small drift from FP16 (`CE delta +0.0440`), while
+Qwen3.5-0.8B pure W4 drifts much more; Qwen3.5 `w4mixg128` keeps quality near
+W8 by selectively promoting important tensors.
 
 `MOLLM_ARM_I8MM=ON` build flag exposes the i8mm instruction set while
 preserving the FP16FML kernels. `MOLLM_ARM_NATIVE=ON` passes `-mcpu=native`
@@ -144,9 +173,13 @@ for local benchmarking.
 ## Roadmap
 
 ### Near-term
-- **W4 weight quantization**: W8 (per-channel + per-group) is implemented with Q8-dot NEON kernels; W4 is the next bandwidth lever for prefill
+- **W4 prefill GEMM**: 2B W4 decode is now llama.cpp Q4/Q8-class; prefill still
+  trails llama.cpp by about 2x and needs a better GEMM tile/layout.
+- **W4 quality policy**: Youtu pure W4 looks acceptable on the current sample,
+  while Qwen3.5 needs mixed precision policy work.
 - **Graph fusion**: fuse adjacent matmul + activation + norm to reduce cache thrash between ops (end-to-end matmul utilization is 40% vs 86% microbench, the 2.5x gap is cache/DRAM traffic between matmuls)
-- **Liveness analysis for BufferPool**: current reset releases previous chunk's buffers; proper liveness tracking would release tensors at last-use, cutting peak RSS significantly on long prompts
+- **Memory planning**: current workspace reuse fixes repeated allocation churn;
+  next step is last-use liveness planning to reduce peak RSS on long prompts.
 
 ### Mid-term
 - **Continuous batching / multi-user**: serve multiple sequences with shared prefill

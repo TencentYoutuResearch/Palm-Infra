@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 static int failures = 0;
 
@@ -346,6 +347,183 @@ int main() {
         float pg_scales[6] = {0.5f, 0.25f, 0.125f, 0.75f, 1.0f, 0.0625f};
         run_int8_case(pg_scales, 2, 2, "INT8 per-group matmul");
         run_int8_case(pg_scales, 2, 2, "INT8 per-group matmul interleaved", true);
+    }
+
+    // ---- INT4 packed weight path: per-group scales, odd K tail ----
+    {
+        int M = 2, K = 5, N = 3;
+        uint32_t group_size = 2;
+        uint32_t groups_per_row = 3;
+        float a_data[10] = {
+            1.0f, -2.0f, 0.5f, 3.0f, -1.5f,
+            -1.0f, 4.0f, 2.0f, -0.5f, 0.25f,
+        };
+        int8_t q_data[15] = {
+            1, 2, -3, 4, -7,
+            -2, 1, 5, -1, 6,
+            3, -4, 2, 1, -5,
+        };
+        uint8_t packed[9] = {};
+        for (int n = 0; n < N; n++) {
+            for (int k = 0; k < K; k++) {
+                uint8_t nibble = (uint8_t)q_data[n * K + k] & 0x0F;
+                int byte_idx = n * ((K + 1) / 2) + (k >> 1);
+                if (k & 1) packed[byte_idx] |= (uint8_t)(nibble << 4);
+                else packed[byte_idx] |= nibble;
+            }
+        }
+        float scales[9] = {
+            0.5f, 0.25f, 0.125f,
+            0.75f, 1.0f, 0.0625f,
+            0.2f, 0.4f, 0.8f,
+        };
+        float deq[15];
+        for (int n = 0; n < N; n++) {
+            for (int k = 0; k < K; k++) {
+                deq[n * K + k] = (float)q_data[n * K + k]
+                    * scales[n * groups_per_row + k / (int)group_size];
+            }
+        }
+
+        float c_data[6];
+        float ref_c[6];
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
+        Tensor B = Tensor::create(Precision::INT4, MemoryType::EXTERNAL, N, K, 1, 1, packed);
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, c_data);
+        B.scales = scales;
+        B.group_size = group_size;
+        B.groups_per_row = groups_per_row;
+        B.num_groups = (uint32_t)(N * groups_per_row);
+
+        kernel_matmul_fp32(A, B, C);
+        ref_matmul(a_data, deq, ref_c, M, N, K);
+        CHECK(check_approx(c_data, ref_c, M * N, 1e-5f), "INT4 per-group packed matmul");
+    }
+
+    {
+        int M = 1, K = 32, N = 9;
+        uint32_t group_size = 32;
+        uint32_t groups_per_row = 1;
+        std::vector<float> a_data(M * K);
+        std::vector<int8_t> q_data(N * K);
+        std::vector<uint8_t> packed((size_t)N * ((K + 1) / 2), 0);
+        std::vector<float> scales(N * groups_per_row);
+        std::vector<float> deq(N * K);
+        std::vector<float> c_data(M * N);
+        std::vector<float> ref_c(M * N);
+
+        for (int k = 0; k < K; k++) {
+            a_data[k] = ((k % 17) - 8) * 0.03125f;
+        }
+        int row_stride = (K + 1) / 2;
+        for (int n = 0; n < N; n++) {
+            scales[n] = 0.01f + 0.001f * (float)(n % 5);
+            for (int k = 0; k < K; k++) {
+                int8_t q = (int8_t)(((n * 7 + k * 3) % 15) - 7);
+                q_data[n * K + k] = q;
+                deq[n * K + k] = (float)q * scales[n];
+                uint8_t nibble = (uint8_t)q & 0x0F;
+                uint8_t& byte = packed[(size_t)n * row_stride + (k >> 1)];
+                if (k & 1) byte |= (uint8_t)(nibble << 4);
+                else byte |= nibble;
+            }
+        }
+
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data.data());
+        Tensor B = Tensor::create(Precision::INT4, MemoryType::EXTERNAL, N, K, 1, 1, packed.data());
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, c_data.data());
+        B.scales = scales.data();
+        B.group_size = group_size;
+        B.groups_per_row = groups_per_row;
+        B.num_groups = (uint32_t)(N * groups_per_row);
+
+        kernel_matmul_fp32(A, B, C);
+        ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
+        CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
+              "INT4 Q8-dot GEMV packed matmul");
+
+        uint8_t* q4_repack = pack_b_q4dot_int4_full(packed.data(), N, K, K);
+        B.q4_repack_data = q4_repack;
+        kernel_matmul_fp32(A, B, C);
+        CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
+              "INT4 Q8-dot GEMV repacked matmul");
+
+        Tensor B_direct = Tensor::create(Precision::INT4, MemoryType::EXTERNAL,
+                                         N, K, 1, 1, q4_repack);
+        B_direct.scales = scales.data();
+        B_direct.group_size = group_size;
+        B_direct.groups_per_row = groups_per_row;
+        B_direct.num_groups = (uint32_t)(N * groups_per_row);
+        B_direct.is_q4_repacked = true;
+        B_direct.q4_repack_data = q4_repack;
+        kernel_matmul_fp32(A, B_direct, C);
+        CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
+              "INT4 Q8-dot GEMV direct q4 layout matmul");
+        delete[] q4_repack;
+    }
+
+    {
+        int M = 4, K = 64, N = 9;
+        uint32_t group_size = 32;
+        uint32_t groups_per_row = 2;
+        std::vector<float> a_data(M * K);
+        std::vector<int8_t> q_data(N * K);
+        std::vector<uint8_t> packed((size_t)N * ((K + 1) / 2), 0);
+        std::vector<float> scales(N * groups_per_row);
+        std::vector<float> deq(N * K);
+        std::vector<float> c_data(M * N);
+        std::vector<float> ref_c(M * N);
+
+        for (int i = 0; i < M * K; i++) {
+            a_data[i] = ((i % 19) - 9) * 0.03125f;
+        }
+        int row_stride = (K + 1) / 2;
+        for (int n = 0; n < N; n++) {
+            for (uint32_t g = 0; g < groups_per_row; g++) {
+                scales[n * groups_per_row + g] = 0.01f + 0.001f * (float)((n + g) % 5);
+            }
+            for (int k = 0; k < K; k++) {
+                int8_t q = (int8_t)(((n * 11 + k * 5) % 15) - 7);
+                q_data[n * K + k] = q;
+                deq[n * K + k] = (float)q * scales[n * groups_per_row + k / (int)group_size];
+                uint8_t nibble = (uint8_t)q & 0x0F;
+                uint8_t& byte = packed[(size_t)n * row_stride + (k >> 1)];
+                if (k & 1) byte |= (uint8_t)(nibble << 4);
+                else byte |= nibble;
+            }
+        }
+
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data.data());
+        Tensor B = Tensor::create(Precision::INT4, MemoryType::EXTERNAL, N, K, 1, 1, packed.data());
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, c_data.data());
+        B.scales = scales.data();
+        B.group_size = group_size;
+        B.groups_per_row = groups_per_row;
+        B.num_groups = (uint32_t)(N * groups_per_row);
+
+        kernel_matmul_fp32(A, B, C);
+        ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
+        CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
+              "INT4 Q8-dot GEMM packed matmul");
+
+        uint8_t* q4_repack = pack_b_q4dot_int4_full(packed.data(), N, K, K);
+        B.q4_repack_data = q4_repack;
+        kernel_matmul_fp32(A, B, C);
+        CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
+              "INT4 Q8-dot GEMM repacked matmul");
+
+        Tensor B_direct = Tensor::create(Precision::INT4, MemoryType::EXTERNAL,
+                                         N, K, 1, 1, q4_repack);
+        B_direct.scales = scales.data();
+        B_direct.group_size = group_size;
+        B_direct.groups_per_row = groups_per_row;
+        B_direct.num_groups = (uint32_t)(N * groups_per_row);
+        B_direct.is_q4_repacked = true;
+        B_direct.q4_repack_data = q4_repack;
+        kernel_matmul_fp32(A, B_direct, C);
+        CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
+              "INT4 Q8-dot GEMM direct q4 layout matmul");
+        delete[] q4_repack;
     }
 
     {

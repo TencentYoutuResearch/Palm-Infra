@@ -23,6 +23,7 @@ enum class Precision : uint8_t {
     FP32 = 0,
     FP16 = 1,
     INT8 = 2,
+    INT4 = 3,
 };
 
 enum class MemoryType : uint8_t {
@@ -54,12 +55,14 @@ struct Tensor {
     void*       data     = nullptr;
     uint32_t    owner_id = 0;  // debug owner for pooled storage; 0 = unknown/non-pooled
     uint64_t    storage_id = 0; // debug allocation identity; copied by borrowed views
-    const float* scales = nullptr; // quant scales for INT8 weights; borrowed from weight file
+    const float* scales = nullptr; // quant scales for INT8/INT4 weights; borrowed from weight file
     uint32_t    group_size = 0;    // K-dim quant group size; K means per-channel
     uint32_t    num_groups = 0;    // total groups = N * groups_per_row
     uint32_t    groups_per_row = 0;
     bool        is_interleaved = false; // weight data is packed as [N/8, K, 8]
+    bool        is_q4_repacked = false; // INT4 data itself is [N/8, K/32, 8, 16B]
     const void* q8_repack_data = nullptr; // optional [N/8, K/32, 8, 32] INT8 dot layout
+    const void* q4_repack_data = nullptr; // optional [N/8, K/32, 8, 16B] INT4 dot layout
 
     // -----------------------------------------------------------------------
     // factory
@@ -101,6 +104,7 @@ struct Tensor {
         case Precision::FP32: return 4;
         case Precision::FP16: return 2;
         case Precision::INT8: return 1;
+        case Precision::INT4: return 1; // packed storage byte; logical element is a nibble
         }
         return 0;
     }
@@ -294,6 +298,7 @@ inline size_t precision_size(Precision p) {
     case Precision::FP32: return 4;
     case Precision::FP16: return 2;
     case Precision::INT8: return 1;
+    case Precision::INT4: return 1; // packed storage byte
     }
     return 0;
 }

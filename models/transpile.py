@@ -29,6 +29,7 @@ GRAPH_MAGIC   = 0x4D4C4C47  # "GLLM"
 GRAPH_VERSION = 3  # v3: added per-node dynamic[4] (DynamicKind)
 
 WEIGHT_MAGIC  = 0x50414D58  # "XMAP"
+WEIGHT_FLAG_INT4_Q4DOT = 1 << 0
 
 class OpType(IntEnum):
     INPUT          = 0
@@ -62,6 +63,7 @@ class Precision(IntEnum):
     FP32 = 0
     FP16 = 1
     INT8 = 2
+    INT4 = 3
 
 
 # ---------------------------------------------------------------------------
@@ -845,13 +847,89 @@ def quantize_weight_w8_group(data: np.ndarray, group_size: int) -> tuple[np.ndar
     return q, scales.reshape(-1), group_size, n * groups_per_row
 
 
+def quantize_weight_w4_group(
+    data: np.ndarray, group_size: int
+) -> tuple[np.ndarray, np.ndarray, int, int, tuple[int, int]]:
+    """Symmetric signed int4 quantization over K-dim groups for [N, K] weights.
+
+    Values are clipped to [-7, 7] and packed as two two's-complement nibbles per
+    byte, low nibble first. The returned packed array has physical shape
+    [N, ceil(K/2)], while the .weights header must keep logical shape [N, K].
+    """
+    if data.ndim != 2:
+        raise ValueError(f"W4 quant expects 2-D [N,K] weight, got {data.shape}")
+    if group_size <= 0:
+        raise ValueError(f"group_size must be > 0, got {group_size}")
+
+    w = data.astype(np.float32, copy=False)
+    n, k = w.shape
+    groups_per_row = (k + group_size - 1) // group_size
+    q = np.empty((n, k), dtype=np.int8)
+    scales = np.empty((n, groups_per_row), dtype=np.float32)
+
+    for row in range(n):
+        for g in range(groups_per_row):
+            begin = g * group_size
+            end = min(begin + group_size, k)
+            block = w[row, begin:end]
+            max_abs = float(np.max(np.abs(block))) if block.size else 0.0
+            scale = max_abs / 7.0 if max_abs > 0.0 else 1.0
+            scales[row, g] = scale
+            q[row, begin:end] = np.clip(np.rint(block / scale), -7, 7).astype(np.int8)
+
+    packed = np.zeros((n, (k + 1) // 2), dtype=np.uint8)
+    for row in range(n):
+        for col in range(k):
+            nibble = int(q[row, col]) & 0x0F
+            if col & 1:
+                packed[row, col >> 1] |= np.uint8(nibble << 4)
+            else:
+                packed[row, col >> 1] |= np.uint8(nibble)
+
+    return packed, scales.reshape(-1), group_size, n * groups_per_row, (n, k)
+
+
+def pack_weight_w4_q4dot(packed: np.ndarray, logical_shape: tuple[int, int]) -> np.ndarray:
+    """Pack row-major W4 [N, ceil(K/2)] to [N/8, K/32, 8, 16B]."""
+    if packed.ndim != 2:
+        raise ValueError(f"W4 q4dot pack expects 2-D packed data, got {packed.shape}")
+    n, k = logical_shape
+    if k % 32 != 0:
+        raise ValueError(f"W4 q4dot pack requires K multiple of 32, got {k}")
+    expected = (n, (k + 1) // 2)
+    if packed.shape != expected:
+        raise ValueError(
+            f"W4 packed physical shape {packed.shape} does not match logical {logical_shape}"
+        )
+
+    n_padded = ((n + 7) // 8) * 8
+    k_blocks = k // 32
+    out = np.zeros((n_padded // 8, k_blocks, 8, 16), dtype=np.uint8)
+    for n0 in range(0, n_padded, 8):
+        valid = min(8, n - n0)
+        if valid <= 0:
+            continue
+        for qb in range(k_blocks):
+            src_begin = qb * 16
+            src_end = src_begin + 16
+            out[n0 // 8, qb, :valid, :] = packed[n0:n0 + valid, src_begin:src_end]
+    return out
+
+
 def _write_weight_file(path: str, data: np.ndarray,
                        scales: np.ndarray | None = None,
                        group_size: int = 0,
-                       num_groups: int = 0):
+                       num_groups: int = 0,
+                       precision: Precision | None = None,
+                       logical_shape: tuple[int, ...] | None = None,
+                       flags: int = 0):
     """Write a .weights file with self-contained header."""
-    ndim = data.ndim
-    shape = list(data.shape) + [1] * (4 - ndim)
+    precision = _numpy_to_precision(data.dtype) if precision is None else precision
+    logical_shape = tuple(data.shape) if logical_shape is None else tuple(logical_shape)
+    ndim = len(logical_shape)
+    if ndim <= 0 or ndim > 4:
+        raise ValueError(f"weights require 1-4 logical dims, got {logical_shape}")
+    shape = list(logical_shape) + [1] * (4 - ndim)
     scales_bytes = b""
     scales_offset = 0
     scales_size = 0
@@ -865,8 +943,8 @@ def _write_weight_file(path: str, data: np.ndarray,
         if num_groups != scales.size:
             raise ValueError(f"num_groups={num_groups} does not match scales={scales.size}")
 
-    header = struct.pack('<II', WEIGHT_MAGIC, 0)      # magic, flags
-    header += struct.pack('<II', ndim, _numpy_to_precision(data.dtype))
+    header = struct.pack('<II', WEIGHT_MAGIC, flags)  # magic, flags
+    header += struct.pack('<II', ndim, int(precision))
     header += struct.pack('<qqqq', *shape)
     data_offset = 88  # sizeof(Header)
     data_size = data.nbytes
@@ -881,7 +959,9 @@ def _write_weight_file(path: str, data: np.ndarray,
         if scales_bytes:
             f.write(scales_bytes)
     qinfo = f", group={group_size}, groups={num_groups}" if scales is not None else ""
-    print(f"  Wrote {path} ({data.shape}, {data.dtype}{qinfo})")
+    finfo = f", flags=0x{flags:x}" if flags else ""
+    sinfo = f", logical={logical_shape}" if tuple(data.shape) != logical_shape else ""
+    print(f"  Wrote {path} ({data.shape}, {data.dtype}, prec={precision.name}{sinfo}{qinfo}{finfo})")
 
 
 # ---------------------------------------------------------------------------

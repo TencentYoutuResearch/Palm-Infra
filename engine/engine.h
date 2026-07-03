@@ -120,6 +120,7 @@ public:
     const EngineConfig& config() const { return cfg_; }
     int past_len() const { return past_len_; }
     Tensor* embed_weight() { return embed_weight_; }
+    Tensor* lm_head_weight() { return lm_head_weight_; }
     void set_profile_enabled(bool enabled);
     void reset_profiles();
     const ExecContext& prefill_exec_ctx() const { return exec_ctx_prefill_; }
@@ -194,9 +195,6 @@ private:
     // Load-time interleaved-packed FP16 weights (path → packed buffer)
     std::unordered_map<std::string, std::vector<uint8_t>> packed_weights_;
 
-    // Packed copy of embed_tokens for lm_head matmul (row-major original stays for embed lookup)
-    std::vector<uint8_t> embed_packed_;
-
     // Engine-owned contiguous copy returned by prefill_hidden/decode_hidden.
     // Valid until the next hidden-output call on this engine.
     std::vector<uint8_t> hidden_output_copy_;
@@ -253,5 +251,6 @@ private:
     int prefill_chunk(const std::vector<int>& token_ids, int past);
 
     // weight tensors
-    Tensor* embed_weight_ = nullptr;  // [vocab_size, hidden_dim]
+    Tensor* embed_weight_ = nullptr;   // [vocab_size, hidden_dim], row-major FP16/FP32 for lookup
+    Tensor* lm_head_weight_ = nullptr; // [vocab_size, hidden_dim], regular matmul weight
 };

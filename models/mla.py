@@ -27,16 +27,22 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from transpile import GraphBuilder, OpType, Precision, Activation, _write_weight_file, quantize_weight_w8_group, save_package
+from transpile import (
+    GraphBuilder, OpType, Precision, Activation, _write_weight_file,
+    WEIGHT_FLAG_INT4_Q4DOT, pack_weight_w4_q4dot,
+    quantize_weight_w4_group, quantize_weight_w8_group, save_package,
+)
 
 
-def _quant_group_size(quant: str, k: int) -> int | None:
+def _quant_spec(quant: str, k: int) -> tuple[str, int] | None:
     if quant == "none":
         return None
     if quant == "w8pc":
-        return k
+        return ("w8", k)
     if quant.startswith("w8g"):
-        return int(quant[3:])
+        return ("w8", int(quant[3:]))
+    if quant.startswith("w4g"):
+        return ("w4", int(quant[3:]))
     raise ValueError(f"unsupported quant mode: {quant}")
 
 
@@ -75,13 +81,29 @@ def load_safetensors(path: str) -> dict[str, np.ndarray]:
 def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
     """Export all weights to a shared directory. Called once."""
     os.makedirs(weights_dir, exist_ok=True)
+    lm_head_source = weights.get('lm_head.weight')
+    if lm_head_source is None:
+        lm_head_source = weights.get('model.lm_head.weight')
 
     def save(name: str, data: np.ndarray, quantizable: bool = False):
         wpath = os.path.join(weights_dir, f"{name}.weights")
-        group_size = _quant_group_size(quant, data.shape[1]) if quantizable and data.ndim == 2 else None
-        if group_size is not None:
-            q, scales, gs, ng = quantize_weight_w8_group(data, group_size)
-            _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng)
+        quant_spec = _quant_spec(quant, data.shape[1]) if quantizable and data.ndim == 2 else None
+        if quant_spec is not None:
+            quant_kind, group_size = quant_spec
+            if quant_kind == "w8":
+                q, scales, gs, ng = quantize_weight_w8_group(data, group_size)
+                _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng)
+            elif quant_kind == "w4":
+                q, scales, gs, ng, logical_shape = quantize_weight_w4_group(data, group_size)
+                flags = 0
+                if logical_shape[1] % 32 == 0 and gs % 32 == 0:
+                    q = pack_weight_w4_q4dot(q, logical_shape)
+                    flags = WEIGHT_FLAG_INT4_Q4DOT
+                _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng,
+                                   precision=Precision.INT4, logical_shape=logical_shape,
+                                   flags=flags)
+            else:
+                raise ValueError(f"unsupported quant kind: {quant_kind}")
         else:
             _write_weight_file(wpath, data)
 
@@ -90,6 +112,8 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
         if 'layernorm' in wname.lower() or 'norm' in wname.lower():
             continue
         if 'embed_tokens' in wname:
+            continue
+        if wname.endswith('lm_head.weight'):
             continue
         # Skip mlp.gate_proj / mlp.up_proj — they will be merged below.
         if '.mlp.gate_proj.' in wname or '.mlp.up_proj.' in wname:
@@ -120,10 +144,17 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
             merged = merged.astype(np.float16)
         save(f"model_layers_{layer_idx}_mlp_gate_up_proj_weight", merged, quantizable=True)
 
-    # embed_tokens — FP16, packed at load time (tied with lm_head)
+    # embed_tokens — FP16 row-major for lookup.
     embed_w = weights['model.embed_tokens.weight']
     d = embed_w.astype(np.float16) if embed_w.dtype != np.float16 else embed_w
     save('embed_tokens', d)
+
+    # lm_head is stored explicitly even when the source model ties it to
+    # embeddings. Treat it as a normal linear weight for quantization/runtime.
+    if lm_head_source is None:
+        lm_head_source = embed_w
+    d = lm_head_source.astype(np.float16) if lm_head_source.dtype != np.float16 else lm_head_source
+    save('lm_head', d, quantizable=True)
 
     # norm weights (FP32)
     for wname, wdata in weights.items():
@@ -178,6 +209,10 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     embed_path = os.path.join(weights_dir, "embed_tokens.weights")
     embed_shape = (cfg['vocab_size'], hidden_size)
     embed_node = g.weight(embed_path, embed_shape, Precision.FP16)
+
+    # ---- lm_head weight node ----
+    lm_head_path = os.path.join(weights_dir, "lm_head.weights")
+    g.weight(lm_head_path, embed_shape, Precision.FP16)
 
     # ---- graph inputs ----
     # In prefill graphs, mark seq dim (shape[1]) as SEQ so the C++ runtime
@@ -400,7 +435,7 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128|w4g128]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_path = sys.argv[2]

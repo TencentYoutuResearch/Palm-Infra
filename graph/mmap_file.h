@@ -13,7 +13,8 @@
 //   Offset  Size   Field
 //   ------  ----   -----
 //   0       4      magic   — 0x50414D58 ("XMAP")
-//   4       4      flags   — reserved (0)
+//   4       4      flags
+//                      bit 0: INT4 data is q4dot layout [N/8,K/32,8,16B]
 //   8       4      ndim    — number of dimensions (1-4)
 //   12      4      precision — Precision enum value
 //   16      8      shape[0]
@@ -36,6 +37,7 @@
 class MappedFile {
 public:
     static constexpr uint32_t MAGIC = 0x50414D58; // "XMAP"
+    static constexpr uint32_t FLAG_INT4_Q4DOT = 1u << 0;
 
     struct Header {
         uint32_t magic;

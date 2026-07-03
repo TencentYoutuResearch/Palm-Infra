@@ -13,21 +13,68 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import struct
 from pathlib import Path
 
 import numpy as np
 
-from transpile import GraphBuilder, Precision, _write_weight_file, quantize_weight_w8_group, save_package
+from transpile import (
+    GraphBuilder, Precision, _write_weight_file,
+    WEIGHT_FLAG_INT4_Q4DOT, pack_weight_w4_q4dot,
+    quantize_weight_w4_group, quantize_weight_w8_group, save_package,
+)
 
 
-def _quant_group_size(quant: str, k: int) -> int | None:
+def _layer_index(wname: str) -> int | None:
+    match = re.search(r"\.layers\.(\d+)\.", wname)
+    return int(match.group(1)) if match else None
+
+
+def _w4mix_promote_to_w8(wname: str) -> bool:
+    """Qwen3.5-specific mixed W4 policy inspired by llama.cpp Q4_K_M."""
+    if wname == "lm_head.weight" or wname.endswith(".lm_head.weight"):
+        return True
+
+    layer_idx = _layer_index(wname)
+    if layer_idx is None:
+        return False
+
+    # Fused linear-attention QKV is V-like/sensitive.
+    if ".linear_attn.in_proj_qkv.weight" in wname:
+        return True
+
+    # Full-attention V projection is the split equivalent of attn_v.weight.
+    if ".self_attn.v_proj.weight" in wname:
+        return True
+
+    # Our current W4 format is a symmetric per-group baseline, not Q4_K. Be
+    # more quality-biased than llama.cpp's Q4_K_M for output-like projections.
+    if ".linear_attn.out_proj.weight" in wname or ".self_attn.o_proj.weight" in wname:
+        return True
+
+    # llama.cpp's Q4_K_M gives selected FFN down projections more bits. With
+    # the simpler W4 format, promote all FFN down projections for now.
+    if ".mlp.down_proj.weight" in wname:
+        return True
+
+    return False
+
+
+def _quant_spec(quant: str, k: int, wname: str = "") -> tuple[str, int] | None:
     if quant == "none":
         return None
     if quant == "w8pc":
-        return k
+        return ("w8", k)
     if quant.startswith("w8g"):
-        return int(quant[3:])
+        return ("w8", int(quant[3:]))
+    if quant.startswith("w4mixg"):
+        group_size = int(quant[6:])
+        if _w4mix_promote_to_w8(wname):
+            return ("w8", group_size)
+        return ("w4", group_size)
+    if quant.startswith("w4g"):
+        return ("w4", int(quant[3:]))
     raise ValueError(f"unsupported quant mode: {quant}")
 
 
@@ -65,13 +112,41 @@ def load_safetensors(path: str) -> dict[str, np.ndarray]:
 def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
     """Export text model weights. Skip vision encoder."""
     os.makedirs(weights_dir, exist_ok=True)
+    quant_counts = {"w4": 0, "w8": 0}
+    lm_head_source = None
 
-    def save(name: str, data: np.ndarray, quantizable: bool = False):
+    for wname, wdata in weights.items():
+        if 'visual' in wname or 'vision' in wname:
+            continue
+        if 'language_model' not in wname:
+            continue
+        if wname.endswith('lm_head.weight'):
+            lm_head_source = wdata
+            break
+
+    def save(name: str, data: np.ndarray, quantizable: bool = False, raw_name: str = ""):
         wpath = os.path.join(weights_dir, f"{name}.weights")
-        group_size = _quant_group_size(quant, data.shape[1]) if quantizable and data.ndim == 2 else None
-        if group_size is not None:
-            q, scales, gs, ng = quantize_weight_w8_group(data, group_size)
-            _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng)
+        quant_spec = (
+            _quant_spec(quant, data.shape[1], raw_name)
+            if quantizable and data.ndim == 2 else None
+        )
+        if quant_spec is not None:
+            quant_kind, group_size = quant_spec
+            if quant_kind == "w8":
+                q, scales, gs, ng = quantize_weight_w8_group(data, group_size)
+                _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng)
+            elif quant_kind == "w4":
+                q, scales, gs, ng, logical_shape = quantize_weight_w4_group(data, group_size)
+                flags = 0
+                if logical_shape[1] % 32 == 0 and gs % 32 == 0:
+                    q = pack_weight_w4_q4dot(q, logical_shape)
+                    flags = WEIGHT_FLAG_INT4_Q4DOT
+                _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng,
+                                   precision=Precision.INT4, logical_shape=logical_shape,
+                                   flags=flags)
+            else:
+                raise ValueError(f"unsupported quant kind: {quant_kind}")
+            quant_counts[quant_kind] += 1
         else:
             _write_weight_file(wpath, data)
 
@@ -80,6 +155,8 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
         if 'visual' in wname or 'vision' in wname:
             continue
         if 'language_model' not in wname:
+            continue
+        if wname.endswith('lm_head.weight'):
             continue
 
         # Final norm (check before generic norm)
@@ -112,6 +189,8 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
 
         # Embed tokens → FP16
         if 'embed_tokens' in wname:
+            if lm_head_source is None:
+                lm_head_source = wdata
             d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
             save('embed_tokens', d)
             continue
@@ -125,7 +204,15 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
 
         # Projection weights are FP16 by default, optionally W8 quantized.
         d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
-        save(wname.replace('.', '_'), d, quantizable=True)
+        save(wname.replace('.', '_'), d, quantizable=True, raw_name=wname)
+
+    if lm_head_source is None:
+        raise KeyError("No lm_head.weight or embed_tokens.weight found for lm_head export")
+    d = lm_head_source.astype(np.float16) if lm_head_source.dtype != np.float16 else lm_head_source
+    save('lm_head', d, quantizable=True, raw_name="lm_head.weight")
+
+    if quant != "none":
+        print(f"  Quantized tensors: W4={quant_counts['w4']} W8={quant_counts['w8']}")
 
 
 def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
@@ -180,6 +267,10 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     embed_path = os.path.join(weights_dir, "embed_tokens.weights")
     embed_shape = (tc['vocab_size'], hidden_size)
     g.weight(embed_path, embed_shape, Precision.FP16)
+
+    # ---- lm_head ----
+    lm_head_path = os.path.join(weights_dir, "lm_head.weights")
+    g.weight(lm_head_path, embed_shape, Precision.FP16)
 
     # ---- graph inputs ----
     # In prefill graphs, mark seq dim (shape[1]) as SEQ so the C++ runtime
@@ -588,7 +679,7 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
 if __name__ == '__main__':
     import sys
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128|w4g128|w4mixg128]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_path = sys.argv[2]

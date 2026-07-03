@@ -34,6 +34,24 @@ bool int8_q8dot_repack_supported(const Tensor& t) {
 #endif
 }
 
+bool int4_q4dot_repack_supported(const Tensor& t) {
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    return t.prec == Precision::INT4 && t.group_size > 0 &&
+           (t.group_size % 32) == 0 && t.shape[1] > 0 && (t.shape[1] % 32) == 0;
+#else
+    (void)t;
+    return false;
+#endif
+}
+
+bool int4_q4dot_kernel_available() {
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    return true;
+#else
+    return false;
+#endif
+}
+
 struct Int8PackingPlan {
     bool build_interleaved = false;
     bool build_q8dot = false;
@@ -124,6 +142,44 @@ void maybe_pack_int8_weight(Tensor& t, const std::string& key,
     (void)t;
     (void)key;
     (void)rowmajor_data;
+    (void)packed_weights;
+#endif
+}
+
+void maybe_pack_int4_weight(Tensor& t, const std::string& key,
+                            const void* weight_data,
+                            PackedWeightMap& packed_weights) {
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    if (t.is_q4_repacked) {
+        t.q4_repack_data = weight_data;
+        return;
+    }
+    if (!g_matmul_config.use_interleave_pack || !int4_q4dot_repack_supported(t)) return;
+    if (env_flag_enabled("MOLLM_W4_NO_Q8_DOT") ||
+        env_flag_enabled("MOLLM_W4_NO_Q4_REPACK") ||
+        env_flag_enabled("MOLLM_W4_NO_Q8_REPACK")) {
+        return;
+    }
+
+    int N = (int)t.shape[0];
+    int K = (int)t.shape[1];
+    const uint8_t* b_orig = reinterpret_cast<const uint8_t*>(weight_data);
+
+    std::string q4_key = key + "#int4_q4dot";
+    auto it = packed_weights.find(q4_key);
+    if (it == packed_weights.end()) {
+        int K_blocks = (K + 31) / 32;
+        uint8_t* b_q4 = pack_b_q4dot_int4_full(b_orig, N, K, K);
+        size_t buf_size = (size_t)((N + 7) / 8) * 8 * K_blocks * 16;
+        std::vector<uint8_t> buf(b_q4, b_q4 + buf_size);
+        delete[] b_q4;
+        it = packed_weights.emplace(q4_key, std::move(buf)).first;
+    }
+    t.q4_repack_data = it->second.data();
+#else
+    (void)t;
+    (void)key;
+    (void)weight_data;
     (void)packed_weights;
 #endif
 }
@@ -423,33 +479,73 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         auto& t = g.runtime.tensors[node.id];
 
         auto setup_quant_metadata = [&](const void* scales, uint32_t group_size, uint32_t num_groups,
-                                        size_t scales_size, const char* label) -> bool {
+                                        size_t scales_size, size_t data_size, uint32_t flags,
+                                        const char* label) -> bool {
             t.scales = nullptr;
             t.group_size = 0;
             t.num_groups = 0;
             t.groups_per_row = 0;
+            t.is_q4_repacked = false;
 
-            if (t.prec != Precision::INT8) return true;
+            bool is_quantized = (t.prec == Precision::INT8 || t.prec == Precision::INT4);
+            if (!is_quantized) return true;
             int64_t N = t.shape[0];
             int64_t K = t.shape[1];
             if (!scales || group_size == 0 || N <= 0 || K <= 0) {
-                fprintf(stderr, "Engine: INT8 weight %s missing quant scales/group metadata\n", label);
+                fprintf(stderr, "Engine: quantized weight %s missing scales/group metadata\n", label);
                 return false;
             }
             uint32_t groups_per_row = (uint32_t)((K + group_size - 1) / group_size);
             uint64_t expected_groups = (uint64_t)N * groups_per_row;
-            if (num_groups != expected_groups ||
-                scales_size != expected_groups * sizeof(float)) {
+            bool int4_q4dot_layout =
+                t.prec == Precision::INT4 && (flags & MappedFile::FLAG_INT4_Q4DOT);
+            if (flags & ~MappedFile::FLAG_INT4_Q4DOT) {
+                fprintf(stderr, "Engine: quantized weight %s has unsupported flags 0x%x\n",
+                        label, flags);
+                return false;
+            }
+            if ((flags & MappedFile::FLAG_INT4_Q4DOT) && t.prec != Precision::INT4) {
+                fprintf(stderr, "Engine: weight %s has INT4 q4dot flag but precision is not INT4\n",
+                        label);
+                return false;
+            }
+            if (int4_q4dot_layout && (K % 32 != 0 || group_size % 32 != 0)) {
                 fprintf(stderr,
-                        "Engine: INT8 weight %s bad quant metadata (N=%lld K=%lld group=%u groups=%u expected=%llu scales=%zu)\n",
+                        "Engine: INT4 q4dot weight %s requires K/group multiple of 32 (K=%lld group=%u)\n",
+                        label, (long long)K, group_size);
+                return false;
+            }
+            if (int4_q4dot_layout && !int4_q4dot_kernel_available()) {
+                fprintf(stderr,
+                        "Engine: INT4 q4dot weight %s requires an ARM DOTPROD build\n",
+                        label);
+                return false;
+            }
+            uint64_t expected_data_size = (uint64_t)N * (uint64_t)K;
+            if (t.prec == Precision::INT4) {
+                if (int4_q4dot_layout) {
+                    uint64_t n_padded = (uint64_t)(((N + 7) / 8) * 8);
+                    uint64_t k_blocks = (uint64_t)((K + 31) / 32);
+                    expected_data_size = n_padded * k_blocks * 16;
+                } else {
+                    expected_data_size = (uint64_t)N * (uint64_t)((K + 1) / 2);
+                }
+            }
+            if (num_groups != expected_groups ||
+                scales_size != expected_groups * sizeof(float) ||
+                data_size != expected_data_size) {
+                fprintf(stderr,
+                        "Engine: quantized weight %s bad metadata (N=%lld K=%lld group=%u groups=%u expected=%llu scales=%zu data=%zu expected_data=%llu)\n",
                         label, (long long)N, (long long)K, group_size, num_groups,
-                        (unsigned long long)expected_groups, scales_size);
+                        (unsigned long long)expected_groups, scales_size, data_size,
+                        (unsigned long long)expected_data_size);
                 return false;
             }
             t.scales = static_cast<const float*>(scales);
             t.group_size = group_size;
             t.num_groups = num_groups;
             t.groups_per_row = groups_per_row;
+            t.is_q4_repacked = int4_q4dot_layout;
             return true;
         };
 
@@ -466,7 +562,9 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.data = data;
             t.mem_type = MemoryType::EXTERNAL;
             t.is_interleaved = false;
+            t.is_q4_repacked = false;
             t.q8_repack_data = nullptr;
+            t.q4_repack_data = nullptr;
         };
 
         // Package mode: resolve weight from package mmap via offset map.
@@ -478,8 +576,10 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             if (pit != package_weight_map_.end()) {
                 const uint8_t* hdr = package_weights_base_ + pit->second.first;
                 // Read data_offset from weight header (byte 48, 8 bytes)
+                uint32_t flags = 0;
                 uint32_t file_prec_u32 = 0;
                 uint64_t data_off;
+                std::memcpy(&flags, hdr + 4, sizeof(flags));
                 std::memcpy(&file_prec_u32, hdr + 12, sizeof(file_prec_u32));
                 std::memcpy(&data_off, hdr + 48, sizeof(data_off));
                 uint64_t scales_off = 0, scales_size = 0;
@@ -489,10 +589,13 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                 std::memcpy(&group_size, hdr + 80, sizeof(group_size));
                 std::memcpy(&num_groups, hdr + 84, sizeof(num_groups));
                 void* data = const_cast<uint8_t*>(hdr + data_off);
+                uint64_t data_size = 0;
+                std::memcpy(&data_size, hdr + 56, sizeof(data_size));
                 setup_weight(data, static_cast<Precision>(file_prec_u32));
                 const void* scales = scales_size ? (hdr + scales_off) : nullptr;
                 if (!setup_quant_metadata(scales, group_size, num_groups,
-                                          (size_t)scales_size, wref.c_str())) {
+                                          (size_t)scales_size, (size_t)data_size, flags,
+                                          wref.c_str())) {
                     return false;
                 }
 
@@ -500,6 +603,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     maybe_pack_fp16_weight(t, wref, data, packed_weights_);
                 }
                 maybe_pack_int8_weight(t, wref, data, packed_weights_);
+                maybe_pack_int4_weight(t, wref, data, packed_weights_);
                 continue;
             }
         }
@@ -527,7 +631,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                          static_cast<Precision>(shared_weights_[idx].header().precision));
             const auto& mapped = shared_weights_[idx];
             if (!setup_quant_metadata(mapped.scales(), mapped.group_size(), mapped.num_groups(),
-                                      mapped.scales_size(), wpath.c_str())) {
+                                      mapped.scales_size(), mapped.data_size(),
+                                      mapped.header().flags, wpath.c_str())) {
                 return false;
             }
         }
@@ -535,34 +640,30 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         if (it != weight_map_.end()) {
             const auto& mapped = shared_weights_[it->second];
             if (!setup_quant_metadata(mapped.scales(), mapped.group_size(), mapped.num_groups(),
-                                      mapped.scales_size(), wpath.c_str())) {
+                                      mapped.scales_size(), mapped.data_size(),
+                                      mapped.header().flags, wpath.c_str())) {
                 return false;
             }
         }
 
-        // embed_tokens stays row-major for lookup; lm_head gets its own packed copy below.
+        // embed_tokens stays row-major for lookup; all other linear weights,
+        // including lm_head, are regular load-time packed weights.
         if (node.params.str[0].find("embed_tokens") == std::string::npos) {
             maybe_pack_fp16_weight(t, wpath, t.data, packed_weights_);
         }
         maybe_pack_int8_weight(t, wpath, t.data, packed_weights_);
+        maybe_pack_int4_weight(t, wpath, t.data, packed_weights_);
     }
 
-    // Find embed_tokens weight and create packed copy for lm_head
+    // Find special externally-driven weights. lm_head is stored explicitly in
+    // the package and is treated as a normal matmul weight.
     for (auto& node : g.nodes) {
         if (node.op_type == OpType::CONSTANT && !node.params.str.empty()) {
-            if (node.params.str[0].find("embed_tokens") != std::string::npos) {
+            const std::string& wref = node.params.str[0];
+            if (wref.find("embed_tokens") != std::string::npos) {
                 embed_weight_ = &g.runtime.tensors[node.id];
-                // Create packed copy for lm_head matmul (one-time cost)
-                if (embed_weight_->prec == Precision::FP16 && g_matmul_config.use_interleave_pack
-                    && embed_packed_.empty()) {
-                    int N = (int)embed_weight_->shape[0];
-                    int K = (int)embed_weight_->shape[1];
-                    const __fp16* orig = reinterpret_cast<const __fp16*>(embed_weight_->data);
-                    __fp16* packed = pack_b_interleaved_full(orig, N, K, K);
-                    size_t buf_size = (size_t)N * K * sizeof(__fp16);
-                    embed_packed_.assign((uint8_t*)packed, (uint8_t*)packed + buf_size);
-                    delete[] packed;
-                }
+            } else if (wref.find("lm_head") != std::string::npos) {
+                lm_head_weight_ = &g.runtime.tensors[node.id];
             }
         }
     }
@@ -747,6 +848,8 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     cfg_ = cfg;
     cfg_.num_threads = std::max(cfg_.num_threads, 1);
     caches_.clear();
+    embed_weight_ = nullptr;
+    lm_head_weight_ = nullptr;
     persistent_pool_.clear();
     thread_pool_.resize(cfg_.num_threads);
     exec_ctx_prefill_.thread_pool = &thread_pool_;
@@ -801,6 +904,15 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 
     // Load decode graph (reuses shared weights via weight_map_)
     if (!load_graph(graph_decode_, exec_ctx_decode_, dc_path.c_str())) {
+        return false;
+    }
+
+    if (!embed_weight_ || !embed_weight_->data) {
+        fprintf(stderr, "Engine: package missing explicit embed_tokens weight\n");
+        return false;
+    }
+    if (!lm_head_weight_ || !lm_head_weight_->data) {
+        fprintf(stderr, "Engine: package missing explicit lm_head weight; reconvert with current converter\n");
         return false;
     }
 
@@ -929,10 +1041,10 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids, int pad_to) {
 // ---------------------------------------------------------------------------
 
 int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
-    if (!embed_weight_ || !embed_weight_->data) return 0;
+    if (!lm_head_weight_ || !lm_head_weight_->data) return 0;
 
-    int vocab_size = (int)embed_weight_->shape[0];
-    int hidden_dim = (int)embed_weight_->shape[1];
+    int vocab_size = (int)lm_head_weight_->shape[0];
+    int hidden_dim = (int)lm_head_weight_->shape[1];
     int seq_len = (int)hidden.shape[1];
 
     // Read the last real token, not necessarily the last position
@@ -940,7 +1052,7 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
     int last_pos = (n_tokens > 0 && n_tokens <= seq_len) ? n_tokens - 1 : seq_len - 1;
 
     // hidden is [hidden_dim, seq_len], we want [hidden_dim, 1] for matmul
-    // embed_weight is [vocab_size, hidden_dim] — we use it as weight B
+    // lm_head_weight is [vocab_size, hidden_dim] — we use it as weight B
     // output will be [vocab_size, 1] — we take argmax
 
     // Create a view of the last hidden row as A: [hidden_dim, 1]
@@ -955,15 +1067,7 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
     C.owner_id = graph_prefill_.runtime.pool.id();
     C.storage_id = graph_prefill_.runtime.pool.storage_id(c_buf);
 
-    // Use packed embed copy for fast lm_head matmul (if available)
-    if (!embed_packed_.empty()) {
-        Tensor B_packed = Tensor::create(Precision::FP16, MemoryType::EXTERNAL,
-                                         vocab_size, hidden_dim, 1, 1,
-                                         embed_packed_.data());
-        kernel_matmul_fp32(A, B_packed, C, exec_ctx_decode_.thread_pool);
-    } else {
-        kernel_matmul_fp32(A, *embed_weight_, C, exec_ctx_decode_.thread_pool);
-    }
+    kernel_matmul_fp32(A, *lm_head_weight_, C, exec_ctx_decode_.thread_pool);
 
     float* scores = C.ptr<float>();
     int token = sample_token(scores, vocab_size,
@@ -977,10 +1081,10 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
 
 std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
                                                bool all_positions) {
-    if (!embed_weight_ || !embed_weight_->data) return {};
+    if (!lm_head_weight_ || !lm_head_weight_->data) return {};
 
-    int vocab_size = (int)embed_weight_->shape[0];
-    int hidden_dim = (int)embed_weight_->shape[1];
+    int vocab_size = (int)lm_head_weight_->shape[0];
+    int hidden_dim = (int)lm_head_weight_->shape[1];
     int seq_len = (int)hidden.shape[1];
 
     int n_pos = all_positions ? n_tokens : 1;
@@ -997,14 +1101,7 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
         Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
                                   vocab_size, 1, 1, 1, logits.data() + p * vocab_size);
 
-        if (!embed_packed_.empty()) {
-            Tensor B_packed = Tensor::create(Precision::FP16, MemoryType::EXTERNAL,
-                                             vocab_size, hidden_dim, 1, 1,
-                                             embed_packed_.data());
-            kernel_matmul_fp32(A, B_packed, C, exec_ctx_decode_.thread_pool);
-        } else {
-            kernel_matmul_fp32(A, *embed_weight_, C, exec_ctx_decode_.thread_pool);
-        }
+        kernel_matmul_fp32(A, *lm_head_weight_, C, exec_ctx_decode_.thread_pool);
     }
 
     return logits;
