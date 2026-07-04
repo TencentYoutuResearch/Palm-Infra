@@ -37,7 +37,7 @@ def detect_model_type(model_dir: str) -> str:
 def main():
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant]")
-        print("Quant modes: none, w8pc, w8gN, w4gN, w4mixgN (Qwen3.5)")
+        print("Quant modes: none, w8pc, w8gN, w4gN, w4mixgN")
         print()
         print("Supported model types:")
         for mt, (mod, func, default_layers) in SUPPORTED_MODELS.items():

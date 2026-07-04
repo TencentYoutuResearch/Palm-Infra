@@ -21,8 +21,8 @@ import numpy as np
 
 from transpile import (
     GraphBuilder, Precision, _write_weight_file,
-    WEIGHT_FLAG_INT4_Q4DOT, pack_weight_w4_q4dot,
-    quantize_weight_w4_group, quantize_weight_w8_group, save_package,
+    quantize_weight_w8_group, save_package,
+    write_quantized_weight_file_cpp,
 )
 
 
@@ -132,18 +132,14 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
         )
         if quant_spec is not None:
             quant_kind, group_size = quant_spec
+            if write_quantized_weight_file_cpp(
+                wpath, data, quant_kind, group_size, required=(quant_kind == "w4")
+            ):
+                quant_counts[quant_kind] += 1
+                return
             if quant_kind == "w8":
                 q, scales, gs, ng = quantize_weight_w8_group(data, group_size)
                 _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng)
-            elif quant_kind == "w4":
-                q, scales, gs, ng, logical_shape = quantize_weight_w4_group(data, group_size)
-                flags = 0
-                if logical_shape[1] % 32 == 0 and gs % 32 == 0:
-                    q = pack_weight_w4_q4dot(q, logical_shape)
-                    flags = WEIGHT_FLAG_INT4_Q4DOT
-                _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng,
-                                   precision=Precision.INT4, logical_shape=logical_shape,
-                                   flags=flags)
             else:
                 raise ValueError(f"unsupported quant kind: {quant_kind}")
             quant_counts[quant_kind] += 1

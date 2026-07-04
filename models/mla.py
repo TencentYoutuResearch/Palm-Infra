@@ -29,18 +29,41 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from transpile import (
     GraphBuilder, OpType, Precision, Activation, _write_weight_file,
-    WEIGHT_FLAG_INT4_Q4DOT, pack_weight_w4_q4dot,
-    quantize_weight_w4_group, quantize_weight_w8_group, save_package,
+    quantize_weight_w8_group, save_package,
+    write_quantized_weight_file_cpp,
 )
 
 
-def _quant_spec(quant: str, k: int) -> tuple[str, int] | None:
+def _w4mix_promote_to_w8(wname: str) -> bool:
+    """Youtu MLA mixed W4 policy.
+
+    Keep output/expansion-heavy tensors in W8 and leave compression/gate-up
+    tensors in W4. This is deliberately conservative enough to protect quality
+    without turning the package into mostly-W8.
+    """
+    if wname == "lm_head.weight" or wname.endswith(".lm_head.weight"):
+        return True
+    if ".self_attn.kv_b_proj.weight" in wname:
+        return True
+    if ".self_attn.o_proj.weight" in wname:
+        return True
+    if ".mlp.down_proj.weight" in wname:
+        return True
+    return False
+
+
+def _quant_spec(quant: str, k: int, wname: str = "") -> tuple[str, int] | None:
     if quant == "none":
         return None
     if quant == "w8pc":
         return ("w8", k)
     if quant.startswith("w8g"):
         return ("w8", int(quant[3:]))
+    if quant.startswith("w4mixg"):
+        group_size = int(quant[6:])
+        if _w4mix_promote_to_w8(wname):
+            return ("w8", group_size)
+        return ("w4", group_size)
     if quant.startswith("w4g"):
         return ("w4", int(quant[3:]))
     raise ValueError(f"unsupported quant mode: {quant}")
@@ -81,29 +104,30 @@ def load_safetensors(path: str) -> dict[str, np.ndarray]:
 def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
     """Export all weights to a shared directory. Called once."""
     os.makedirs(weights_dir, exist_ok=True)
+    quant_counts = {"w4": 0, "w8": 0}
     lm_head_source = weights.get('lm_head.weight')
     if lm_head_source is None:
         lm_head_source = weights.get('model.lm_head.weight')
 
-    def save(name: str, data: np.ndarray, quantizable: bool = False):
+    def save(name: str, data: np.ndarray, quantizable: bool = False, raw_name: str = ""):
         wpath = os.path.join(weights_dir, f"{name}.weights")
-        quant_spec = _quant_spec(quant, data.shape[1]) if quantizable and data.ndim == 2 else None
+        quant_spec = (
+            _quant_spec(quant, data.shape[1], raw_name or name)
+            if quantizable and data.ndim == 2 else None
+        )
         if quant_spec is not None:
             quant_kind, group_size = quant_spec
+            if write_quantized_weight_file_cpp(
+                wpath, data, quant_kind, group_size, required=(quant_kind == "w4")
+            ):
+                quant_counts[quant_kind] += 1
+                return
             if quant_kind == "w8":
                 q, scales, gs, ng = quantize_weight_w8_group(data, group_size)
                 _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng)
-            elif quant_kind == "w4":
-                q, scales, gs, ng, logical_shape = quantize_weight_w4_group(data, group_size)
-                flags = 0
-                if logical_shape[1] % 32 == 0 and gs % 32 == 0:
-                    q = pack_weight_w4_q4dot(q, logical_shape)
-                    flags = WEIGHT_FLAG_INT4_Q4DOT
-                _write_weight_file(wpath, q, scales=scales, group_size=gs, num_groups=ng,
-                                   precision=Precision.INT4, logical_shape=logical_shape,
-                                   flags=flags)
             else:
                 raise ValueError(f"unsupported quant kind: {quant_kind}")
+            quant_counts[quant_kind] += 1
         else:
             _write_weight_file(wpath, data)
 
@@ -120,7 +144,7 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
             continue
         # Convert to float16 for FP16 storage.
         d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
-        save(wname.replace('.', '_'), d, quantizable=True)
+        save(wname.replace('.', '_'), d, quantizable=True, raw_name=wname)
 
     # Merge mlp.gate_proj + mlp.up_proj per layer into a single weight
     # (one matmul + slice at inference, halves A-pack overhead).
@@ -142,7 +166,12 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
         merged = np.concatenate([gate_w, up_w], axis=0)
         if merged.dtype != np.float16:
             merged = merged.astype(np.float16)
-        save(f"model_layers_{layer_idx}_mlp_gate_up_proj_weight", merged, quantizable=True)
+        save(
+            f"model_layers_{layer_idx}_mlp_gate_up_proj_weight",
+            merged,
+            quantizable=True,
+            raw_name=f"model.layers.{layer_idx}.mlp.gate_up_proj.weight",
+        )
 
     # embed_tokens — FP16 row-major for lookup.
     embed_w = weights['model.embed_tokens.weight']
@@ -154,7 +183,7 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
     if lm_head_source is None:
         lm_head_source = embed_w
     d = lm_head_source.astype(np.float16) if lm_head_source.dtype != np.float16 else lm_head_source
-    save('lm_head', d, quantizable=True)
+    save('lm_head', d, quantizable=True, raw_name="lm_head.weight")
 
     # norm weights (FP32)
     for wname, wdata in weights.items():
@@ -166,6 +195,9 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
     final_norm_w = weights['model.norm.weight']
     d = final_norm_w.astype(np.float32) if final_norm_w.dtype != np.float32 else final_norm_w
     save('final_norm', d)
+
+    if quant != "none":
+        print(f"  Quantized tensors: W4={quant_counts['w4']} W8={quant_counts['w8']}")
 
 
 def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
@@ -435,7 +467,7 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128|w4g128]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128|w4g128|w4mixg128]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_path = sys.argv[2]

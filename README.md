@@ -23,22 +23,24 @@ W8PC / Q8_0:
 
 | Model | mollm W8PC pp/tg | llama.cpp Q8_0 pp/tg |
 |-------|-----------------:|---------------------:|
-| Qwen3.5-0.8B | 396.78 / 157.34 | 813.58 / 171.10 |
-| Youtu-LLM-2B | 139.50 / 89.64 | 271.58 / 86.47 |
-| Qwen3.5-4B | 64.02 / 43.66 | 138.22 / 40.71 |
+| Qwen3.5-0.8B | 604.11 / 151.23 | 813.58 / 171.10 |
+| Youtu-LLM-2B | 239.59 / 87.89 | 275.90 / 83.99 |
+| Qwen3.5-4B | 114.36 / 43.02 | 142.88 / 39.77 |
 
-Youtu-LLM-2B W4G128 direct q4pkg after the latest W4 GEMV cleanup:
+Youtu-LLM-2B W4G128 direct q4pkg after the latest W4 GEMM cleanup:
 
 | Runtime | pp256 | tg64 |
 |---------|------:|-----:|
-| mollm W4G128 | 118.39 | 89.61 |
-| llama.cpp Q4_0 | 255.28 | 90.35 |
-| llama.cpp Q4_K_M | 187.96 | 82.53 |
-| llama.cpp Q8_0 | 259.58 | 85.09 |
+| mollm W4G128 | 227.31 | 91.28 |
+| llama.cpp Q4_0 | 281.04 | 99.82 |
+| llama.cpp Q4_K_M | 216.35 | 88.72 |
+| llama.cpp Q8_0 | 275.90 | 83.99 |
 
 Current summary: decode is competitive with llama.cpp on 2B/4B for FP16, W8,
-and 2B W4. Quantized prefill is still the main gap, especially W4/W8 GEMM
-versus llama.cpp's BLAS-backed CPU path.
+and 2B W4. AUTO i8mm plus full-tile cleanup makes W8 prefill much closer to
+llama.cpp; W4 prefill has recovered substantially with q4dot DOTPROD
+vector-reduce, scaled-nibble, and full-tile GEMM cleanup. Remaining gap is
+mostly 4B prefill.
 
 ## Architecture
 
@@ -99,6 +101,13 @@ Requires Apple Clang (for `__ARM_FEATURE_FP16FML`), Python 3 with `safetensors`.
 
 ## Convert a model
 
+For W4 conversion, build the C++ tensor quantizer first. The Python converter
+can still do FP16 and W8 without it, but W4 intentionally requires the helper:
+
+```bash
+cmake --build build --target mollm-quantize
+```
+
 ```bash
 cd mollm
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b.mollm
@@ -107,6 +116,7 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w8g128.mollm 32 256 w8
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm 32 256 w4g128
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm 32 256 w4mixg128
 python3 models/converter.py /path/to/Youtu-LLM-2B youtu-llm-2b_w4g128.mollm 32 256 w4g128
+python3 models/converter.py /path/to/Youtu-LLM-2B youtu-llm-2b_w4mixg128.mollm 32 256 w4mixg128
 ```
 
 The converter auto-detects the model type from `config.json` and dispatches to the appropriate converter. Supported types:
@@ -124,19 +134,24 @@ The converter auto-detects the model type from `config.json` and dispatches to t
 | 2 | `output_path` | yes | Output `.mollm` file path |
 | 3 | `num_layers` | no | Override number of hidden layers (auto-detected if omitted) |
 | 4 | `prefill_seq_len` | no | Prefill chunk size (default 256) |
-| 5 | `quant` | no | `none`, `w8pc`, `w8gN`, `w4gN`, or Qwen3.5-only `w4mixgN` |
+| 5 | `quant` | no | `none`, `w8pc`, `w8gN`, `w4gN`, or `w4mixgN` |
 
 Produces a single `.mollm` file containing graphs + weights + tokenizer + chat template.
 
 Quantization status:
 
+- `models/converter.py` auto-detects `build/mollm-quantize` for W8/W4 tensor
+  quantization and q4dot packing. `MOLLM_QUANT_HELPER=/path/to/helper`
+  overrides the path; `MOLLM_DISABLE_CPP_QUANT=1` forces Python fallback only
+  for W8. W4 has no Python fallback.
 - W8 uses weight-only int8 with Q8 activation dot-product kernels. Runtime uses
   q8dot repacked layout `[N/8, K/32, 8, 32]` by default for GEMV and GEMM.
 - W4 uses signed int4 weights with Q8 activation dot-product kernels. Current
   packages store W4 directly in q4dot physical layout
   `[ceil(N/8), K/32, 8, 16B]`, so runtime does not keep a second W4 repack copy.
-- `w4mixgN` is currently Qwen3.5-only and promotes quality-sensitive tensors
-  such as `lm_head.weights` and selected attention/FFN projections to W8.
+- `w4mixgN` promotes quality-sensitive tensors such as `lm_head.weights` and
+  selected attention/FFN projections to W8. Qwen3.5 and Youtu have separate
+  model-specific policies.
 - `embed_tokens.weights` stays FP16 row-major for lookup; `lm_head.weights` is
   explicit in the package and follows the same quantization policy as a normal
   linear weight.
@@ -145,19 +160,27 @@ Quantized package examples:
 
 | Package | pp256 t/s | tg64 t/s | peak RSS |
 |---------|----------:|---------:|---------:|
-| Qwen3.5-0.8B W8PC | 396.78 | 157.34 | 2561.9 MB |
-| Qwen3.5-0.8B W4G128 direct q4pkg | 385.88 | 154.88 | 1500.7 MB |
-| Qwen3.5-0.8B W4MIXG128 direct q4pkg | 370.07 | 143.38 | 2232.8 MB |
-| Youtu-LLM-2B W4G128 direct q4pkg | 118.39 | 89.61 | 2893.6 MB |
+| Qwen3.5-0.8B W8PC | 604.11 | 151.23 | 2560.6 MB |
+| Qwen3.5-0.8B W4G128 direct q4pkg | 624.17 | 163.37 | 1501.2 MB |
+| Youtu-LLM-2B W8PC | 239.59 | 87.89 | 5948.9 MB |
+| Youtu-LLM-2B W4G128 direct q4pkg | 227.31 | 91.28 | 2894.3 MB |
+| Qwen3.5-4B W8PC | 114.36 | 43.02 | 10964.4 MB |
+| Qwen3.5-4B W4G128 direct q4pkg | 102.42 | 43.34 | 4984.3 MB |
 
 Pure W4 quality is model-dependent. On the current 256-token reference sample,
-Youtu-LLM-2B W4G128 has small drift from FP16 (`CE delta +0.0440`), while
-Qwen3.5-0.8B pure W4 drifts much more; Qwen3.5 `w4mixg128` keeps quality near
-W8 by selectively promoting important tensors.
+Youtu-LLM-2B W4G128 has small drift from FP16 (`CE delta +0.0440`), and
+Youtu `w4mixg128` improves it slightly to `+0.0372`. Qwen3.5-0.8B pure W4
+drifts much more; Qwen3.5 `w4mixg128` keeps quality near W8 by selectively
+promoting important tensors.
 
-`MOLLM_ARM_I8MM=ON` build flag exposes the i8mm instruction set while
-preserving the FP16FML kernels. `MOLLM_ARM_NATIVE=ON` passes `-mcpu=native`
-for local benchmarking.
+`MOLLM_ARM_I8MM` defaults to `AUTO`: on ARM64, CMake probes
+`-march=armv8.6-a+i8mm+fp16+fp16fml` and enables the i8mm W8 GEMM kernel when
+the compiler defines `__ARM_FEATURE_MATMUL_INT8` and accepts `vmmlaq_s32`.
+Use `-DMOLLM_ARM_I8MM=OFF` to force the portable DOTPROD/NEON path, or
+`-DMOLLM_ARM_I8MM=ON` to require i8mm support. `MOLLM_ARM_NATIVE=ON` passes
+`-mcpu=native` for local benchmarking. W4 currently defaults to the q4dot
+DOTPROD vector-reduce GEMM; `MOLLM_W4_I8MM=1` enables an experimental W4 i8mm
+prototype, but it is slower on current shapes.
 
 ## Run
 
@@ -173,10 +196,12 @@ for local benchmarking.
 ## Roadmap
 
 ### Near-term
-- **W4 prefill GEMM**: 2B W4 decode is now llama.cpp Q4/Q8-class; prefill still
-  trails llama.cpp by about 2x and needs a better GEMM tile/layout.
-- **W4 quality policy**: Youtu pure W4 looks acceptable on the current sample,
-  while Qwen3.5 needs mixed precision policy work.
+- **W4 prefill/decode kernels**: 2B W4 decode is now llama.cpp Q4/Q8-class and
+  prefill has improved with q4dot DOTPROD vector-reduce; next work is
+  activation Q8 quantization, scale handling, and a true W4 micro-panel layout
+  if i8mm is revisited.
+- **W4 quality policy**: Qwen3.5 and Youtu both have first mixed policies;
+  next step is targeted ablation to reduce W8 coverage without losing PPL.
 - **Graph fusion**: fuse adjacent matmul + activation + norm to reduce cache thrash between ops (end-to-end matmul utilization is 40% vs 86% microbench, the 2.5x gap is cache/DRAM traffic between matmuls)
 - **Memory planning**: current workspace reuse fixes repeated allocation churn;
   next step is last-use liveness planning to reduce peak RSS on long prompts.

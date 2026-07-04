@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(CheckCXXSourceCompiles)
+include(CheckCXXSourceRuns)
+
+find_package(Threads REQUIRED)
+
 # ---------------------------------------------------------------------------
 # options
 # ---------------------------------------------------------------------------
@@ -12,7 +17,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(MOLLM_BUILD_TESTS "Build tests" ON)
 option(MOLLM_BUILD_EXAMPLE "Build example CLI" ON)
 option(MOLLM_ARM_NATIVE "Build ARM64 kernels with -mcpu=native for local benchmarking" OFF)
-option(MOLLM_ARM_I8MM "Build ARM64 kernels with -march=armv8.6-a+i8mm+fp16+fp16fml" OFF)
+set(MOLLM_ARM_I8MM "AUTO" CACHE STRING
+    "ARM64 i8mm kernel target mode: AUTO, ON, or OFF")
+set_property(CACHE MOLLM_ARM_I8MM PROPERTY STRINGS AUTO ON OFF)
+string(TOUPPER "${MOLLM_ARM_I8MM}" MOLLM_ARM_I8MM_MODE)
+if(NOT MOLLM_ARM_I8MM_MODE MATCHES "^(AUTO|ON|OFF)$")
+    message(FATAL_ERROR "MOLLM_ARM_I8MM must be AUTO, ON, or OFF (got '${MOLLM_ARM_I8MM}')")
+endif()
 
 # ---------------------------------------------------------------------------
 # library sources
@@ -69,9 +80,46 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     if(MOLLM_ARM_NATIVE)
         message(STATUS "ARM64 native target enabled (-mcpu=native)")
         target_compile_options(mollm_lib PRIVATE -mcpu=native)
-    elseif(MOLLM_ARM_I8MM)
-        message(STATUS "ARM64 i8mm target enabled (-march=armv8.6-a+i8mm+fp16+fp16fml)")
-        target_compile_options(mollm_lib PRIVATE -march=armv8.6-a+i8mm+fp16+fp16fml)
+    elseif(NOT MOLLM_ARM_I8MM_MODE STREQUAL "OFF")
+        set(MOLLM_ARM_I8MM_FLAGS "-march=armv8.6-a+i8mm+fp16+fp16fml")
+        set(_mollm_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+        set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${MOLLM_ARM_I8MM_FLAGS}")
+        set(_mollm_i8mm_probe_source "
+            #include <arm_neon.h>
+            #ifndef __ARM_FEATURE_MATMUL_INT8
+            #error __ARM_FEATURE_MATMUL_INT8 is not defined
+            #endif
+            int main() {
+                int32x4_t acc = vdupq_n_s32(0);
+                int8x16_t a = vdupq_n_s8(1);
+                int8x16_t b = vdupq_n_s8(1);
+                acc = vmmlaq_s32(acc, a, b);
+                return vaddvq_s32(acc) == 0;
+            }
+        ")
+        check_cxx_source_compiles("${_mollm_i8mm_probe_source}" MOLLM_ARM_I8MM_COMPILES)
+        if(MOLLM_ARM_I8MM_COMPILES AND NOT CMAKE_CROSSCOMPILING)
+            check_cxx_source_runs("${_mollm_i8mm_probe_source}" MOLLM_ARM_I8MM_RUNS)
+        elseif(MOLLM_ARM_I8MM_COMPILES AND CMAKE_CROSSCOMPILING)
+            set(MOLLM_ARM_I8MM_RUNS TRUE)
+            message(STATUS "ARM64 i8mm runtime probe skipped while cross-compiling")
+        else()
+            set(MOLLM_ARM_I8MM_RUNS FALSE)
+        endif()
+        set(CMAKE_REQUIRED_FLAGS "${_mollm_saved_required_flags}")
+
+        if(MOLLM_ARM_I8MM_COMPILES AND MOLLM_ARM_I8MM_RUNS)
+            message(STATUS "ARM64 i8mm target enabled (${MOLLM_ARM_I8MM_FLAGS})")
+            target_compile_options(mollm_lib PRIVATE ${MOLLM_ARM_I8MM_FLAGS})
+        elseif(MOLLM_ARM_I8MM_MODE STREQUAL "ON")
+            message(FATAL_ERROR
+                "MOLLM_ARM_I8MM=ON requested, but compiler/target does not support "
+                "${MOLLM_ARM_I8MM_FLAGS} with __ARM_FEATURE_MATMUL_INT8")
+        else()
+            message(STATUS "ARM64 i8mm target not available; using DOTPROD/NEON kernels")
+        endif()
+    else()
+        message(STATUS "ARM64 i8mm target disabled by MOLLM_ARM_I8MM=OFF")
     endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     message(STATUS "Target: ARM32")
@@ -107,6 +155,13 @@ if(MOLLM_BUILD_EXAMPLE)
     )
     target_link_libraries(mollm_bench PRIVATE mollm_lib)
 endif()
+
+add_executable(mollm-quantize tools/quantize_weight.cpp)
+target_link_libraries(mollm-quantize PRIVATE Threads::Threads)
+
+# Backwards-compatible build target name used in older docs/scripts. The
+# produced binary is build/mollm-quantize.
+add_custom_target(mollm_quantize_weight DEPENDS mollm-quantize)
 
 # ---------------------------------------------------------------------------
 # tests

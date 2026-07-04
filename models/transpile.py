@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import struct
 import os
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from enum import IntEnum
+from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
@@ -29,7 +32,9 @@ GRAPH_MAGIC   = 0x4D4C4C47  # "GLLM"
 GRAPH_VERSION = 3  # v3: added per-node dynamic[4] (DynamicKind)
 
 WEIGHT_MAGIC  = 0x50414D58  # "XMAP"
-WEIGHT_FLAG_INT4_Q4DOT = 1 << 0
+_CPP_QUANT_HELPER: str | None | bool = None
+_CPP_QUANT_HELPER_ANNOUNCED = False
+_CPP_QUANT_HELPER_MISSING_ANNOUNCED = False
 
 class OpType(IntEnum):
     INPUT          = 0
@@ -847,73 +852,107 @@ def quantize_weight_w8_group(data: np.ndarray, group_size: int) -> tuple[np.ndar
     return q, scales.reshape(-1), group_size, n * groups_per_row
 
 
-def quantize_weight_w4_group(
-    data: np.ndarray, group_size: int
-) -> tuple[np.ndarray, np.ndarray, int, int, tuple[int, int]]:
-    """Symmetric signed int4 quantization over K-dim groups for [N, K] weights.
+def _find_cpp_quant_helper() -> str | None:
+    """Find optional C++ tensor quantizer built by CMake."""
+    global _CPP_QUANT_HELPER
+    if _CPP_QUANT_HELPER is not None:
+        return _CPP_QUANT_HELPER if isinstance(_CPP_QUANT_HELPER, str) else None
+    if os.environ.get("MOLLM_DISABLE_CPP_QUANT") == "1":
+        _CPP_QUANT_HELPER = False
+        return None
 
-    Values are clipped to [-7, 7] and packed as two two's-complement nibbles per
-    byte, low nibble first. The returned packed array has physical shape
-    [N, ceil(K/2)], while the .weights header must keep logical shape [N, K].
+    candidates = []
+    env = os.environ.get("MOLLM_QUANT_HELPER")
+    if env:
+        candidates.append(Path(env))
+    root = Path(__file__).resolve().parent.parent
+    exe = "mollm-quantize"
+    old_exe = "mollm_quantize_weight"
+    candidates.extend([
+        root / "build" / exe,
+        root / "build" / "Release" / exe,
+        Path.cwd() / "build" / exe,
+        Path.cwd() / exe,
+        root / "build" / old_exe,
+        root / "build" / "Release" / old_exe,
+        Path.cwd() / "build" / old_exe,
+        Path.cwd() / old_exe,
+    ])
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            _CPP_QUANT_HELPER = str(path)
+            return str(path)
+    _CPP_QUANT_HELPER = False
+    return None
+
+
+def write_quantized_weight_file_cpp(path: str, data: np.ndarray,
+                                    quant_kind: str, group_size: int,
+                                    required: bool = False) -> bool:
+    """Write one quantized 2-D weight file using the optional C++ helper.
+
+    Returns False when the helper is unavailable and a Python fallback is
+    acceptable. W4 callers should set required=True; Python W4 quantization is
+    intentionally not supported because it is too slow for real models.
     """
+    global _CPP_QUANT_HELPER_ANNOUNCED, _CPP_QUANT_HELPER_MISSING_ANNOUNCED
+    helper = _find_cpp_quant_helper()
+    if helper is None:
+        if required or quant_kind == "w4":
+            raise RuntimeError(
+                "W4 quantization requires the C++ quantizer. "
+                "Build it with: cmake --build build --target mollm-quantize"
+            )
+        if not _CPP_QUANT_HELPER_MISSING_ANNOUNCED:
+            print("  C++ quantizer not found; falling back to Python W8 quantization")
+            print("  Build it with: cmake --build build --target mollm-quantize")
+            _CPP_QUANT_HELPER_MISSING_ANNOUNCED = True
+        return False
     if data.ndim != 2:
-        raise ValueError(f"W4 quant expects 2-D [N,K] weight, got {data.shape}")
-    if group_size <= 0:
-        raise ValueError(f"group_size must be > 0, got {group_size}")
+        return False
+    if quant_kind not in ("w8", "w4"):
+        raise ValueError(f"unsupported C++ quant kind: {quant_kind}")
 
-    w = data.astype(np.float32, copy=False)
-    n, k = w.shape
-    groups_per_row = (k + group_size - 1) // group_size
-    q = np.empty((n, k), dtype=np.int8)
-    scales = np.empty((n, groups_per_row), dtype=np.float32)
+    arr = np.ascontiguousarray(data)
+    if arr.dtype == np.float16:
+        dtype = "f16"
+    elif arr.dtype == np.float32:
+        dtype = "f32"
+    else:
+        arr = arr.astype(np.float16)
+        dtype = "f16"
 
-    for row in range(n):
-        for g in range(groups_per_row):
-            begin = g * group_size
-            end = min(begin + group_size, k)
-            block = w[row, begin:end]
-            max_abs = float(np.max(np.abs(block))) if block.size else 0.0
-            scale = max_abs / 7.0 if max_abs > 0.0 else 1.0
-            scales[row, g] = scale
-            q[row, begin:end] = np.clip(np.rint(block / scale), -7, 7).astype(np.int8)
+    out_dir = os.path.dirname(path) or "."
+    tmp = tempfile.NamedTemporaryFile(prefix="mollm_quant_", suffix=".raw",
+                                      dir=out_dir, delete=False)
+    tmp_path = tmp.name
+    try:
+        arr.tofile(tmp)
+        tmp.close()
+        cmd = [
+            helper, tmp_path, path, dtype,
+            str(arr.shape[0]), str(arr.shape[1]), quant_kind, str(group_size),
+        ]
+        result = subprocess.run(cmd, text=True, capture_output=True)
+        if result.returncode != 0:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"C++ quantizer failed for {path}: {detail}")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
 
-    packed = np.zeros((n, (k + 1) // 2), dtype=np.uint8)
-    for row in range(n):
-        for col in range(k):
-            nibble = int(q[row, col]) & 0x0F
-            if col & 1:
-                packed[row, col >> 1] |= np.uint8(nibble << 4)
-            else:
-                packed[row, col >> 1] |= np.uint8(nibble)
-
-    return packed, scales.reshape(-1), group_size, n * groups_per_row, (n, k)
-
-
-def pack_weight_w4_q4dot(packed: np.ndarray, logical_shape: tuple[int, int]) -> np.ndarray:
-    """Pack row-major W4 [N, ceil(K/2)] to [N/8, K/32, 8, 16B]."""
-    if packed.ndim != 2:
-        raise ValueError(f"W4 q4dot pack expects 2-D packed data, got {packed.shape}")
-    n, k = logical_shape
-    if k % 32 != 0:
-        raise ValueError(f"W4 q4dot pack requires K multiple of 32, got {k}")
-    expected = (n, (k + 1) // 2)
-    if packed.shape != expected:
-        raise ValueError(
-            f"W4 packed physical shape {packed.shape} does not match logical {logical_shape}"
-        )
-
-    n_padded = ((n + 7) // 8) * 8
-    k_blocks = k // 32
-    out = np.zeros((n_padded // 8, k_blocks, 8, 16), dtype=np.uint8)
-    for n0 in range(0, n_padded, 8):
-        valid = min(8, n - n0)
-        if valid <= 0:
-            continue
-        for qb in range(k_blocks):
-            src_begin = qb * 16
-            src_end = src_begin + 16
-            out[n0 // 8, qb, :valid, :] = packed[n0:n0 + valid, src_begin:src_end]
-    return out
+    if not _CPP_QUANT_HELPER_ANNOUNCED:
+        print(f"  Using C++ quantizer: {helper}")
+        _CPP_QUANT_HELPER_ANNOUNCED = True
+    prec = "INT8" if quant_kind == "w8" else "INT4"
+    print(f"  Wrote {path} ({arr.shape}, {arr.dtype}, prec={prec}, group={group_size}, via=C++)")
+    return True
 
 
 def _write_weight_file(path: str, data: np.ndarray,
