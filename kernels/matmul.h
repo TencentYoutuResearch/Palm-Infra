@@ -68,6 +68,12 @@ int8_t* pack_b_q8dot_int8_full(const int8_t* B_original, int N, int K, int K_wei
 // [N/8, K/32, 8, 16 packed bytes]. Padding output rows and K tail are zero.
 uint8_t* pack_b_q4dot_int4_full(const uint8_t* B_original, int N, int K, int K_weight);
 
+// Pack Q4-dot B plus W4G128 scales -> [N/8, K/128] blocks.
+// Each block stores float scales[8] then q4dot q[4][8][16].
+size_t pack_b_q4dot_g128_bytes(int N, int K);
+uint8_t* pack_b_q4dot_g128_full(const uint8_t* B_q4dot, const float* scales,
+                                int N, int K, int groups_per_row);
+
 // Pack A [K, M] column-major FP32 → interleaved [M/8, K, 8] FP16.
 // For each M-tile of 8 rows, 8 M values at the same k are stored consecutively.
 // Enables vld1q_f16 contiguous load + vfmlalq_laneq_f16 lane-broadcast FMA.

@@ -30,22 +30,22 @@ FP16 / F16:
 
 W8PC / Q8_0:
 
-W8PC rows are refreshed with the 2026-07-04 current AUTO-i8mm build after the
-W8 i8mm 8-row GEMM switch; llama.cpp Q8_0 references are the latest recorded
-CPU-only no-BLAS baselines in this repo.
+W8PC rows are refreshed with the 2026-07-05 fan-on validation rerun using the
+current AUTO-i8mm build; llama.cpp Q8_0 references are CPU-only no-BLAS medians
+from the same rerun.
 
 | Model | mollm W8PC pp/tg | llama.cpp Q8_0 pp/tg | prefill gap | decode gap |
 |-------|-----------------:|---------------------:|------------:|-----------:|
-| Qwen3.5-0.8B | 622.17 / 148.88 | 813.58 / 171.10 | 1.31x slower | 1.15x slower |
-| Youtu-LLM-2B | 253.76 / 87.37 | 275.90 / 83.99 | 1.09x slower | 1.04x faster |
-| Qwen3.5-4B | 117.46 / 42.39 | 142.88 / 39.77 | 1.22x slower | 1.07x faster |
+| Qwen3.5-0.8B | 635.51 / 211.96 | 811.70 / 160.70 | 1.28x slower | 1.32x faster |
+| Youtu-LLM-2B | 250.81 / 94.34 | 274.46 / 84.61 | 1.09x slower | 1.11x faster |
+| Qwen3.5-4B | 117.21 / 45.50 | 139.66 / 39.71 | 1.19x slower | 1.15x faster |
 
 Interpretation:
 - FP16 decode remains slightly faster than llama.cpp F16 on 2B/4B; prefill remains slower.
-- Current W8PC decode is competitive with llama.cpp Q8_0 on 2B/4B. AUTO i8mm
-  plus the 8-row GEMM kernel narrowed W8PC prefill substantially, but 0.8B/4B
-  still trail llama.cpp Q8_0. 0.8B remains noisy and is not the primary
-  benchmark target.
+- Current W8PC decode is faster than llama.cpp Q8_0 in this fan-on rerun. AUTO
+  i8mm plus the 8-row GEMM kernel narrowed W8PC prefill substantially, but all
+  three models still trail llama.cpp Q8_0 on prefill. 0.8B remains noisy and is
+  not the primary benchmark target.
 - Explicit `lm_head.weights` increases tied-embedding FP16 package/RSS: current 4B FP16 package is
   ~9.0 GiB on disk and peaks around 19.1 GB RSS. W8PC 4B is ~5.1 GiB on disk and peaks around
   11.0 GB RSS.
@@ -215,22 +215,25 @@ Dynamic shape 模式启用后，短 prompt 不再 padding 到 256：
 
 2026-07-01 已加入 correctness-first W8 weight-only 量化；2026-07-02 已加入
 W4 per-group correctness baseline；2026-07-03 已把 W4 q4dot layout 下沉到
-`.mollm` package，避免 runtime 常驻第二份 W4 repack 权重：
+`.mollm` package，避免 runtime 常驻第二份 W4 repack 权重；2026-07-05
+W4G128 进一步默认写入 direct BG128 package layout，让 prefill/decode 都能使用
+grouped B-side layout 而不再复制 q4 权重：
 
 - converter 支持 `quant=none|w8pc|w8gN|w4gN|w4mixgN`
   （如 `w8g128` / `w4g128` / `w4mixg128`）
 - 当 CMake build 里存在 `mollm-quantize` 时，converter 会自动用 C++
   helper 生成 W8/W4 `.weights`。W8 仍保留 Python fallback；W4 不再保留
   Python fallback，缺少 helper 会直接报错。该 helper 直接
-  输出当前 `.weights` header、W8 row-major data 和 W4 q4dot physical layout，
-  不改变 runtime 格式。
+  输出当前 `.weights` header、W8 row-major data、W4 q4dot 或 W4G128 BG128
+  physical layout，不改变 runtime 格式。
   因此普通 FP16/W8 转换不强制先编译 C++，但 W4 转换必须先 build helper：
   `cmake --build build --target mollm-quantize`。
 - `.weights` header 已使用 `scales_offset/scales_size/group_size/num_groups`
   表达 per-channel/per-group scale metadata
 - runtime 从 weight header 读取真实 precision；INT8/INT4 CONSTANT 会校验 scale
-  metadata，INT4 data size 允许旧 row-major `N * ceil(K/2)`，或带
-  `FLAG_INT4_Q4DOT` 的 q4dot physical layout
+  metadata，INT4 data size 允许旧 row-major `N * ceil(K/2)`、带
+  `FLAG_INT4_Q4DOT` 的 q4dot physical layout，或带 `FLAG_INT4_BG128` 的
+  direct BG128 physical layout
 - `kernel_matmul_fp32()` 已有 INT8 scalar fallback、native W8 NEON dequant kernel、
   decode/GEMV 默认 Q8 activation dot path，以及 W4 scalar fallback
 - Qwen3.5 / Youtu converter 保留 `embed_tokens.weights` 为 FP16 row-major
@@ -252,12 +255,15 @@ decode/GEMV 和 prefill/GEMM 默认都使用 q8dot repacked layout
 不再默认常驻；仅在 fallback/diagnostic 模式或 q8dot unsupported shape 下创建。
 
 W4G 权重仍是 signed int4 nibble packed，header 保留逻辑 shape `[N,K]`。
-当前 converter 对 K/group 都 32 对齐的 W4 tensor 直接把物理 data 写成
-q4dot layout `[ceil(N/8), K/32, 8, 16B]`，并设置 header flag bit0
-`FLAG_INT4_Q4DOT`。Runtime 看到该 flag 后直接把 mmap data 作为 q4dot weight
-使用，不再创建 runtime repack copy；旧 row-major W4 包（flag=0）仍可在
-load time 创建 q4dot repack 作为兼容路径。Direct q4dot 包需要 ARM DOTPROD
-build，不能通过 `MOLLM_W4_NO_Q4_REPACK=1` 强制回到 row-major/scalar。
+当前 converter 对 `w4g128` tensor 直接把物理 data 写成 BG128 layout
+`[ceil(N/8), K/128]` blocks（`float scales[8] + q4dot q[4][8][16B]`），
+并设置 header flag bit1 `FLAG_INT4_BG128`。Runtime 看到该 flag 后直接把
+mmap data 作为 `q4_g128_data`，prefill/GEMM 和 decode/GEMV 都默认走 BG128
+kernel，不再创建 runtime sidecar copy。非 BG128 但 K/group 都 32 对齐的 W4
+tensor 仍可写成 q4dot layout `[ceil(N/8), K/32, 8, 16B]` 并设置
+`FLAG_INT4_Q4DOT`。旧 row-major W4 包（flag=0）仍可在 load time 创建 q4dot
+repack 作为兼容路径。Direct q4dot/BG128 包需要 ARM DOTPROD build，不能通过
+`MOLLM_W4_NO_Q4_REPACK=1` 强制回到 row-major/scalar。
 
 默认 W4 matmul 使用 Q8 activation dot path：FP32 activation 先按 32-K block
 量化为 Q8，W4 nibble 在 kernel 内 sign-extend 成 int8，再用 `vdotq_s32`
@@ -508,6 +514,39 @@ The next meaningful direction is a new packed quantized-matmul pipeline
 (`q4g128x8`/`q8_0x4`-style A/B layouts plus i8mm kernel and tile-aware
 scheduling), while keeping the current DOTPROD W4G128 path as the fallback.
 
+2026-07-05 packed-A4 activation experiment: `MOLLM_W4_PACKED_A4=1` routes W4
+prefill GEMM through a packed 4-row Q8 activation layout (pre-split even/odd
+streams, `float` scales). This gives about +3.4% on two serial synthetic 4B W4
+GEMM shapes, but only +0.5% 4B W4 endpoint prefill in 5-run same-session median
+(`112.67` -> `113.22` pp/s). It is kept as an opt-in diagnostic/foundation for
+a fuller packed A+B layout, not as a default path. `MOLLM_W4_I8MM=1` plus A4
+improves the existing i8mm prototype by ~5% synthetic, but it remains slower
+than DOTPROD+A4, so current i8mm still needs a true B-side packed layout. See
+`docs/OPTIMIZATION_LOG_QUANT.md` Attempt 33.
+
+2026-07-05 packed-BG128 update: runtime sidecar `MOLLM_W4_PACKED_BG128=1`
+proved the layout, then converter/runtime were updated so new `w4g128` packages
+store BG128 directly with `FLAG_INT4_BG128`. 4B direct BG128 package
+`qwen35_4b_w4g128_bg128.mollm` is 3653.6 MB vs old q4dot package 3522.2 MB,
+but peak RSS is back to ~4987 MB instead of sidecar ~7166 MB. Latest 4B direct
+BG128 fan-on validation rerun is `110.78 / 55.75`; earlier direct BG128+A4 was
+`117.21 / 56.86` in the same machine session. 0.8B direct BG128 keeps 128-token CE/PPL
+`2.6224 / 13.77` and defaults to `q4dot_gemm_bg128` / `q4dot_gemv_bg128`
+without env flags. See `docs/OPTIMIZATION_LOG_QUANT.md` Attempts 34-35.
+
+Fan-on all-model direct BG128 W4G128 rerun (`pp256 + tg64`, warmup=3, 4 threads,
+5 independent process median):
+
+| Model | mollm W4G128 direct BG128 pp/tg | llama.cpp Q4_0 pp/tg | prefill gap | decode gap |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B | 687.32 / 252.91 | 800.05 / 188.72 | 1.16x slower | 1.34x faster |
+| Youtu-LLM-2B | 241.99 / 114.03 | 269.87 / 97.39 | 1.12x slower | 1.17x faster |
+| Qwen3.5-4B | 110.78 / 55.75 | 143.46 / 44.32 | 1.29x slower | 1.26x faster |
+
+Interpretation: direct BG128 makes W4 decode clearly faster than llama.cpp
+Q4_0 on all three local models and brings 2B W4 prefill near llama.cpp Q4_0.
+4B W4 prefill still has the largest remaining gap.
+
 llama.cpp same-session CPU baseline（`../llama.cpp` `5c7c22c3e` / build 9803,
 `llama-bench -ngl 0 -p 256 -n 64 -t 4 -r 5`，llama-bench reported summary）：
 
@@ -623,20 +662,20 @@ pp256/tg64 smoke 为 `117.94 / 81.18`、RSS `4384.1 MB`；这不是 strict
 5-run baseline，只用于确认 mixed 包正常运行并记录初始代价。
 
 W8PC 多模型 package bench（pp256 + tg64, warmup=3, 4 threads, 5-run median；
-2026-07-04 AUTO-i8mm build，均包含显式 `lm_head.weights`，默认 W8 为
+2026-07-05 fan-on AUTO-i8mm build，均包含显式 `lm_head.weights`，默认 W8 为
 q8dot full repack + i8mm 8-row GEMM）：
 
 | Model | Runtime | pp/tg | peak RSS |
 |---|---|---:|---:|
-| Qwen3.5-0.8B W8PC | explicit W8 lmhead + q8dot full repack + i8mm 8-row GEMM | 622.17 / 148.88 | 2561.5 MB |
-| Youtu-LLM-2B W8PC | explicit W8 lmhead + q8dot full repack + i8mm 8-row GEMM | 253.76 / 87.37 | 5949.2 MB |
-| Qwen3.5-4B W8PC | explicit W8 lmhead + q8dot full repack + i8mm 8-row GEMM | 117.46 / 42.39 | 10964.5 MB |
+| Qwen3.5-0.8B W8PC | explicit W8 lmhead + q8dot full repack + i8mm 8-row GEMM | 635.51 / 211.96 | 2560.7 MB |
+| Youtu-LLM-2B W8PC | explicit W8 lmhead + q8dot full repack + i8mm 8-row GEMM | 250.81 / 94.34 | 5947.6 MB |
+| Qwen3.5-4B W8PC | explicit W8 lmhead + q8dot full repack + i8mm 8-row GEMM | 117.21 / 45.50 | 10964.0 MB |
 
 Interpretation:
 - q8dot full repack is now the default W8 path and keeps roughly the old default
   RSS by replacing, not adding to, the INT8 interleaved layout
-- W8PC decode is competitive with llama.cpp Q8_0 on 2B/4B; 0.8B remains noisy
-  and below llama.cpp Q8_0 in strict runs
+- W8PC decode is faster than llama.cpp Q8_0 in this fan-on rerun; 0.8B remains
+  noisy and is not the primary benchmark target
 - AUTO i8mm plus 8-row GEMM narrows W8PC prefill substantially; 2B is now much
   closer to llama.cpp Q8_0, while 0.8B/4B still trail
 
@@ -645,9 +684,9 @@ llama.cpp Q8_0 CPU 参考基线（`../llama.cpp` build `5c7c22c3e` / 9803，
 
 | GGUF | Size | pp256 | tg64 |
 |---|---:|---:|---:|
-| Qwen3.5-0.8B Q8_0 | 784.52 MiB | 813.58 | 171.10 |
-| Youtu-LLM-2B Q8_0 | 1.94 GiB | 271.58 | 86.47 |
-| Qwen3.5-4B Q8_0 | 4.28 GiB | 138.22 | 40.71 |
+| Qwen3.5-0.8B Q8_0 | 784.52 MiB | 811.70 | 160.70 |
+| Youtu-LLM-2B Q8_0 | 1.94 GiB | 274.46 | 84.61 |
+| Qwen3.5-4B Q8_0 | 4.28 GiB | 139.66 | 39.71 |
 
 当前判断：native W8 NEON 已修复 scalar bottleneck；llama.cpp-style Q8 activation
 dot 对 decode 有明确收益，q8dot repack 在 2B/4B decode 上已基本追平或略超

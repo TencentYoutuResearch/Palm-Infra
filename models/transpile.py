@@ -870,12 +870,18 @@ def _find_cpp_quant_helper() -> str | None:
     old_exe = "mollm_quantize_weight"
     candidates.extend([
         root / "build" / exe,
+        root / "build_i8mm" / exe,
         root / "build" / "Release" / exe,
+        root / "build_i8mm" / "Release" / exe,
         Path.cwd() / "build" / exe,
+        Path.cwd() / "build_i8mm" / exe,
         Path.cwd() / exe,
         root / "build" / old_exe,
+        root / "build_i8mm" / old_exe,
         root / "build" / "Release" / old_exe,
+        root / "build_i8mm" / "Release" / old_exe,
         Path.cwd() / "build" / old_exe,
+        Path.cwd() / "build_i8mm" / old_exe,
         Path.cwd() / old_exe,
     ])
     for path in candidates:

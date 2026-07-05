@@ -61,8 +61,10 @@ struct Tensor {
     uint32_t    groups_per_row = 0;
     bool        is_interleaved = false; // weight data is packed as [N/8, K, 8]
     bool        is_q4_repacked = false; // INT4 data itself is [N/8, K/32, 8, 16B]
+    bool        is_q4_g128_packed = false; // INT4 data itself is [N/8, K/128] G128 blocks
     const void* q8_repack_data = nullptr; // optional [N/8, K/32, 8, 32] INT8 dot layout
     const void* q4_repack_data = nullptr; // optional [N/8, K/32, 8, 16B] INT4 dot layout
+    const void* q4_g128_data = nullptr; // optional [N/8, K/128] G128 packed INT4+scales
 
     // -----------------------------------------------------------------------
     // factory

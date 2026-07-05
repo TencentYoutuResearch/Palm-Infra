@@ -182,6 +182,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     int8_t* b_int8_q8dot_data = nullptr;
     uint8_t* b_int4_data = nullptr;
     uint8_t* b_int4_q4dot_data = nullptr;
+    uint8_t* b_int4_q4g128_data = nullptr;
     float* scales_data = nullptr;
     int group_size = cfg.group_size > 0 ? cfg.group_size : K;
     int groups_per_row = (K + group_size - 1) / group_size;
@@ -224,6 +225,10 @@ static BenchResult run_bench(const BenchConfig& cfg) {
         b_raw = b_int4_data;
         if (g_matmul_config.use_interleave_pack && (K % 32) == 0 && (group_size % 32) == 0) {
             b_int4_q4dot_data = pack_b_q4dot_int4_full(b_int4_data, N, K, K);
+            if (group_size == 128 && (K % 128) == 0) {
+                b_int4_q4g128_data = pack_b_q4dot_g128_full(
+                    b_int4_q4dot_data, scales_data, N, K, groups_per_row);
+            }
         }
     } else if (is_fp16) {
         b_fp16_data = new __fp16[N * K];
@@ -258,6 +263,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
             B.q8_repack_data = b_int8_q8dot_data;
         } else {
             B.q4_repack_data = b_int4_q4dot_data;
+            B.q4_g128_data = b_int4_q4g128_data;
         }
     }
     Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
@@ -302,6 +308,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     if (b_int8_packed_data) delete[] b_int8_packed_data;
     if (b_int8_q8dot_data) delete[] b_int8_q8dot_data;
     if (b_int4_q4dot_data) delete[] b_int4_q4dot_data;
+    if (b_int4_q4g128_data) delete[] b_int4_q4g128_data;
     if (is_int8) {
         delete[] b_int8_data;
         delete[] scales_data;

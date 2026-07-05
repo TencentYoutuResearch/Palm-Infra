@@ -3173,3 +3173,338 @@ than mutating the existing `q4dot [N/8,K/32,8,16B] + side scales` path:
 
 This is larger than an incremental cleanup, but it matches the part of
 llama.cpp that still looks materially ahead of mollm.
+
+## Attempt 33: W4 Packed-A4 Activation Layout (Opt-In)
+
+### Scope
+
+As a small test of the packed-matmul direction from Attempt 32, add an opt-in
+W4 GEMM activation layout:
+
+- env flag: `MOLLM_W4_PACKED_A4=1`
+- affected path: default W4 DOTPROD GEMM only (`M > 1`)
+- not affected: W4 GEMV/decode, W4 i8mm diagnostic path, 4x8 diagnostic path
+- layout: four activation rows per qblock, pre-split into q4dot even/odd Q8
+  streams with `float` scales
+
+The 8x8 W4 DOTPROD kernel is templated as `<PackedA4>` so the default path does
+not carry a runtime branch in the hot loop. The A4 packer writes qblocks in the
+same tile/qblock order that the GEMM consumes them; a row-major packer variant
+was tested and was worse in same-session synthetic runs, likely because it left
+the packed activation buffer colder for the immediately following GEMM.
+
+### Microbench
+
+Serial synthetic W4 GEMM, 4 threads, `warmup=10`, `repeat=30`. Earlier parallel
+microbench runs were discarded because concurrent benches interfered with each
+other.
+
+| Shape `(M,K,N)` | default p50 | `MOLLM_W4_PACKED_A4=1` p50 | delta |
+|---|---:|---:|---:|
+| `256,2560,9216` | 11.82 ms | 11.43 ms | +3.4% |
+| `256,9216,2560` | 12.00 ms | 11.61 ms | +3.4% |
+
+Follow-up diagnostic: the existing W4 i8mm prototype was templated to consume
+the same A4 activation layout when both `MOLLM_W4_I8MM=1` and
+`MOLLM_W4_PACKED_A4=1` are set. This removes the per-qblock A-side `vuzp`
+inside the i8mm path, but the path remains slower than DOTPROD+A4:
+
+| Shape `(M,K,N)` | i8mm p50 | i8mm+A4 p50 | DOTPROD+A4 p50 |
+|---|---:|---:|---:|
+| `256,2560,9216` | 14.08 ms | 13.33 ms | 11.34 ms |
+| `256,9216,2560` | 14.33 ms | 13.55 ms | 11.49 ms |
+
+So A-side packing helps i8mm by about 5%, but does not make the current
+runtime-unpack i8mm design competitive. The remaining i8mm gap is likely on the
+B layout / instruction-organization side, reinforcing that a true packed A+B
+layout is needed.
+
+### Endpoint A/B
+
+Qwen3.5-4B W4G128, `pp256 + tg64`, warmup=3, 4 threads, 5 independent
+processes. Same-session medians:
+
+| Path | pp/tg median | prefill ms median | decode ms median |
+|---|---:|---:|---:|
+| default W4 DOTPROD | 112.67 / 52.68 | 2272.03 | 1195.82 |
+| `MOLLM_W4_PACKED_A4=1` | 113.22 / 51.53 | 2261.11 | 1222.61 |
+
+Interpretation:
+
+- The synthetic GEMM gain is real enough to justify keeping the experiment.
+- Endpoint prefill only improved about +0.5%, so this is not a default policy
+  change.
+- Decode is not affected by this code path; the lower decode median is treated
+  as run-order/thermal noise.
+- The result supports the broader Attempt 32 conclusion: simply pre-packing A
+  helps a little, but the larger gap still needs a coherent packed A+B layout,
+  embedded/near scales, and a matching i8mm/asm kernel.
+
+### Validation
+
+```bash
+cmake --build build_i8mm --target test_matmul test_quantized_e2e bench_matmul mollm_bench mollm_chat -j 10
+./build_i8mm/test_matmul
+MOLLM_W4_PACKED_A4=1 ./build_i8mm/test_matmul
+./build_i8mm/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_cppq.mollm 128
+MOLLM_W4_PACKED_A4=1 ./build_i8mm/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_cppq.mollm 128
+```
+
+All passed. 0.8B W4 128-token CE/PPL stayed identical in the default and A4
+paths: `2.6224 / 13.77`, CE delta `+0.3031` vs FP16.
+
+### Not Kept
+
+A thread-local scratch reuse experiment for W4/W8 q8dot activation buffers was
+tested and removed. Synthetic W4 GEMM changed negligibly, while directly
+referencing a `thread_local` scratch object inside `ThreadPool` lambdas is
+unsafe: worker threads resolve the name to their own empty scratch instance
+unless raw pointers are captured after quantization. Given the tiny observed
+benefit, the code stays with ordinary local vectors for GEMM activation
+quantization.
+
+## Attempt 34: W4G128 Packed-B Group Layout (Opt-In)
+
+### Scope
+
+Attempt 33 showed that packing A alone helps but does not close the W4 prefill
+gap. This attempt tests a B-side layout for the dominant W4G128 path without
+changing the `.mollm` package format:
+
+- env flag: `MOLLM_W4_PACKED_BG128=1`
+- intended prefill use: combine with `MOLLM_W4_PACKED_A4=1`
+- layout: one block per `(N/8, K/128)` group:
+  - `float scales[8]`
+  - four q4dot qblocks: `q[4][8][16]`
+- dispatch path: `q4dot_gemm_bg128` / `q4dot_gemm_bg128_a4` for prefill,
+  `q4dot_gemv_bg128` for decode/lmhead
+
+This keeps one scale vector per W4G128 group instead of repeating scales per
+32-wide qblock. It also removes the per-qblock scale cache branch from the hot
+loop because the kernel iterates by 128-wide groups directly.
+
+For now the layout is built at engine load time when the env flag is set. That
+means it duplicates the q4dot bytes in memory; it is a performance experiment,
+not a memory-acceptable default.
+
+### Microbench
+
+Serial synthetic W4 GEMM, 4 threads, `warmup=10`, `repeat=30`:
+
+| Shape `(M,K,N)` | default p50 | A4 p50 | BG128 p50 | BG128+A4 p50 |
+|---|---:|---:|---:|---:|
+| `256,2560,9216` | 11.74 ms | 11.25 ms | 11.65 ms | 10.96 ms |
+| `256,9216,2560` | 11.96 ms | 11.47 ms | 11.91 ms | 11.15 ms |
+
+Interpretation:
+
+- BG128 alone is only a small win.
+- BG128+A4 is the useful combination: about +6.6% and +7.3% over default in
+  these two dominant synthetic shapes.
+- This confirms the shape of the next real package layout: A and B layouts need
+  to be designed together.
+
+### Endpoint A/B
+
+Initial prefill-only endpoint A/B, Qwen3.5-4B W4G128, `pp256 + tg64`,
+warmup=3, 4 threads, 5 independent processes. Same-session medians:
+
+| Path | pp/tg median | prefill ms median | decode ms median | peak RSS median |
+|---|---:|---:|---:|---:|
+| default W4 DOTPROD | 111.90 / 52.54 | 2287.76 | 1199.15 | 4983.9 MB |
+| `MOLLM_W4_PACKED_BG128=1 MOLLM_W4_PACKED_A4=1` | 119.49 / 51.30 | 2142.40 | 1227.96 | 7165.6 MB |
+
+After extending the same BG128 layout to GEMV/decode, the 4B same-session
+5-run median is:
+
+| Path | pp/tg median | prefill ms median | decode ms median | peak RSS median |
+|---|---:|---:|---:|---:|
+| default W4 DOTPROD | 114.10 / 52.04 | 2243.57 | 1210.69 | 4983.6 MB |
+| `MOLLM_W4_PACKED_BG128=1` | 113.02 / 57.12 | 2265.05 | 1102.85 | 7165.8 MB |
+| `MOLLM_W4_PACKED_BG128=1 MOLLM_W4_PACKED_A4=1` | 118.29 / 57.74 | 2164.19 | 1091.14 | 7166.4 MB |
+
+Result:
+
+- Prefill improved by about +6.8% in endpoint median.
+- BG128-only prefill is roughly neutral, but decode improves by about +10% from
+  using the same grouped B-side layout in GEMV. This exceeds the "must at least
+  hold decode" requirement.
+- BG128+A4 is still the useful prefill combination in this experiment.
+- Runtime RSS cost is about +2.18 GB on 4B because the experiment duplicates
+  q4dot weights into the BG128 sidecar.
+
+### Takeaway
+
+Keep BG128 as an opt-in experiment. It is the first packed-layout attempt that
+produces a meaningful endpoint prefill gain and it also improves decode once
+GEMV consumes the layout. The current implementation is still not acceptable as
+a default because it keeps both the original q4dot package bytes and the packed
+BG128 copy resident. The next step should be a package format/converter update
+that stores BG128 directly for W4G128 weights, so the runtime does not duplicate
+q4 data.
+
+### Validation
+
+```bash
+cmake --build build_i8mm --target test_matmul test_quantized_e2e bench_matmul mollm_bench -j 10
+./build_i8mm/test_matmul
+MOLLM_W4_PACKED_BG128=1 MOLLM_W4_PACKED_A4=1 ./build_i8mm/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_cppq.mollm 128
+```
+
+`test_matmul` now includes deterministic BG128 GEMV and GEMM checks comparing
+the BG128 sidecar path against the existing q4dot repack path, plus a reference
+sanity check. All validation passed.
+
+## Attempt 35: Direct W4G128 BG128 Package Layout
+
+### Scope
+
+Attempt 34 showed that BG128 helps decode and can improve prefill when combined
+with A4, but the runtime sidecar duplicated q4 weights. This attempt moves the
+BG128 layout into the `.weights` file for `w4g128` tensors:
+
+- new `.weights` flag: `FLAG_INT4_BG128 = 1 << 1`
+- logical shape remains `[N, K]`
+- physical data is `[ceil(N/8), K/128]` blocks, each:
+  - `float scales[8]`
+  - `uint8_t q[4][8][16]`
+- side scales are still stored in the header's scale region for metadata and
+  compatibility; the q4 payload itself is no longer duplicated at runtime
+- direct BG128 packages default to `q4dot_gemm_bg128` / `q4dot_gemv_bg128`
+  without requiring `MOLLM_W4_PACKED_BG128=1`
+
+Old q4dot packages remain compatible. For those packages,
+`MOLLM_W4_PACKED_BG128=1` can still build the sidecar for A/B, but new
+`w4g128` conversions no longer need it.
+
+### Package / RSS
+
+New packages generated with:
+
+```bash
+MOLLM_QUANT_HELPER=./build_i8mm/mollm-quantize \
+  python3 models/converter.py ../Qwen3.5-0.8B qwen35_0.8b_w4g128_bg128.mollm 24 256 w4g128
+
+MOLLM_QUANT_HELPER=./build_i8mm/mollm-quantize \
+  python3 models/converter.py ../Qwen3.5-4B qwen35_4b_w4g128_bg128.mollm 32 256 w4g128
+```
+
+Package size impact:
+
+| Package | Old q4dot | Direct BG128 | Delta |
+|---|---:|---:|---:|
+| Qwen3.5-0.8B W4G128 | 923.1 MB | 946.6 MB | +23.5 MB |
+| Qwen3.5-4B W4G128 | 3522.2 MB | 3653.6 MB | +131.4 MB |
+
+The size increase is the embedded per-8-row group scales inside BG128 blocks.
+It replaces the previous runtime sidecar, so peak RSS drops back to the old
+q4dot class:
+
+| 4B path | pp/tg median | prefill ms median | decode ms median | peak RSS median |
+|---|---:|---:|---:|---:|
+| old q4dot default | 114.10 / 52.04 | 2243.57 | 1210.69 | 4983.6 MB |
+| old q4dot + runtime BG128 sidecar | 113.02 / 57.12 | 2265.05 | 1102.85 | 7165.8 MB |
+| direct BG128 package | 117.96 / 56.77 | 2170.24 | 1109.78 | 4987.3 MB |
+| direct BG128 package + A4 | 117.21 / 56.86 | 2184.16 | 1107.98 | 4987.8 MB |
+
+The direct BG128 rows were measured with Qwen3.5-4B W4G128, `pp256 + tg64`,
+warmup=3, 4 threads, 5 independent processes. In this machine session A4 did
+not show a stable extra prefill gain, but it also does not change RSS.
+
+Fresh all-model direct BG128 W4G128 rerun under the same protocol:
+
+| Model / package | pp/tg median | prefill ms median | decode ms median | peak RSS median |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B `qwen35_0.8b_w4g128_bg128.mollm` | 706.30 / 254.79 | 362.45 | 247.27 | 1502.4 MB |
+| Youtu-LLM-2B `youtu-llm-2b_w4g128_bg128.mollm` | 254.30 / 114.99 | 1006.68 | 547.89 | 2896.3 MB |
+| Qwen3.5-4B `qwen35_4b_w4g128_bg128.mollm` | 117.96 / 56.77 | 2170.24 | 1109.78 | 4987.3 MB |
+
+Against the latest recorded local llama.cpp CPU Q4_0 baseline, direct BG128 is
+still slower on prefill (`1.15x`, `1.11x`, `1.26x` for 0.8B/2B/4B) but faster
+on decode (`1.34x`, `1.15x`, `1.22x` respectively).
+
+2026-07-05 validation rerun with the same strict protocol confirmed the result
+within normal frequency noise:
+
+| Model / package | pp/tg median | prefill ms median | decode ms median | peak RSS median |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B `qwen35_0.8b_w4g128_bg128.mollm` | 702.79 / 259.15 | 364.26 | 243.10 | 1502.1 MB |
+| Youtu-LLM-2B `youtu-llm-2b_w4g128_bg128.mollm` | 250.77 / 115.20 | 1020.85 | 546.89 | 2896.2 MB |
+| Qwen3.5-4B `qwen35_4b_w4g128_bg128.mollm` | 116.53 / 57.28 | 2196.89 | 1099.90 | 4987.4 MB |
+
+Text-generation smoke also passed for Qwen3.5-0.8B and Qwen3.5-4B. Youtu-LLM-2B
+shows greedy repetition on a short Chinese prompt, but the same repetition appears
+in the FP16 and W8 packages, so it is not a BG128/W4-specific decode corruption.
+Additional quantized e2e checks passed:
+
+```text
+Qwen3.5-0.8B: fp16=2.3193/10.17 quant=2.6224/13.77 CE delta=0.3031
+Youtu-LLM-2B: fp16=4.0394/56.79 quant=4.1239/61.80 CE delta=0.0846
+Qwen3.5-4B:   fp16=2.0253/7.58  quant=2.0914/8.10  CE delta=0.0660
+```
+
+Same-session llama.cpp CPU-only Q4_0 rerun used
+`../llama.cpp/build-cpu-noblas/bin/llama-bench -ngl 0 -p 256 -n 64 -t 4 -r 1`
+for 5 independent process runs. Median results:
+
+| Model / GGUF | llama.cpp Q4_0 pp/tg median | mollm direct BG128 pp/tg | prefill gap | decode gap |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B `Qwen3.5-0.8B-Q4_0.gguf` | 809.91 / 188.96 | 702.79 / 259.15 | 1.15x slower | 1.37x faster |
+| Youtu-LLM-2B `Youtu-LLM-2B-Q4_0.gguf` | 281.48 / 98.90 | 250.77 / 115.20 | 1.12x slower | 1.16x faster |
+| Qwen3.5-4B `Qwen3.5-4B-Q4_0.gguf` | 149.63 / 45.90 | 116.53 / 57.28 | 1.28x slower | 1.25x faster |
+
+Raw Q4_0 samples:
+
+```text
+Qwen3.5-0.8B pp: 812.25, 760.13, 809.59, 811.90, 809.91
+Qwen3.5-0.8B tg: 190.00, 187.85, 188.96, 189.20, 188.73
+Youtu-LLM-2B pp: 282.52, 280.34, 281.48, 282.72, 280.24
+Youtu-LLM-2B tg: 98.60, 99.04, 98.64, 98.93, 98.90
+Qwen3.5-4B pp:   150.66, 150.95, 149.11, 148.01, 149.63
+Qwen3.5-4B tg:   45.67, 46.04, 45.90, 45.91, 45.86
+```
+
+Follow-up fan-on README validation reran quantized mollm and llama.cpp
+CPU-only baselines with the same strict protocol. For W4, a second independent
+mollm W4-only rerun was used because the first long mixed run showed lower
+prefill after many consecutive packages:
+
+| Model | mollm W8PC | llama.cpp Q8_0 | mollm W4G128 BG128 | llama.cpp Q4_0 |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B | 635.51 / 211.96 | 811.70 / 160.70 | 687.32 / 252.91 | 800.05 / 188.72 |
+| Youtu-LLM-2B | 250.81 / 94.34 | 274.46 / 84.61 | 241.99 / 114.03 | 269.87 / 97.39 |
+| Qwen3.5-4B | 117.21 / 45.50 | 139.66 / 39.71 | 110.78 / 55.75 | 143.46 / 44.32 |
+
+Interpretation: fan-on retest keeps the same structural conclusion. Quantized
+prefill still trails llama.cpp, while W8 and W4 decode are faster than the
+matching llama.cpp CPU-only quantized baselines in this run. 0.8B prefill remains
+noisy and should not drive kernel decisions.
+
+### Correctness / Path Check
+
+0.8B direct BG128 e2e:
+
+```text
+CE/PPL (128 tokens): fp16=2.3193/10.17 quant=2.6224/13.77
+CE delta: 0.3031
+```
+
+Short profile without any BG128 env flag confirms direct package dispatch:
+
+```text
+prefill_graph  q4dot_gemm_bg128
+decode_graph   q4dot_gemv_bg128
+decode_lmhead  q4dot_gemv_bg128
+```
+
+### Validation
+
+```bash
+cmake --build build_i8mm --target mollm-quantize test_matmul test_quantized_e2e bench_matmul mollm_bench mollm_chat -j 10
+./build_i8mm/test_matmul
+./build_i8mm/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_bg128.mollm 128
+./build_i8mm/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_cppq.mollm 128
+```
+
+All passed. A tiny manual `mollm-quantize` W4G128 file also checked header
+`flags=2` and BG128 `data_size = ceil(N/8) * (K/128) * 544`.

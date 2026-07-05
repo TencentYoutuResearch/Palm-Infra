@@ -146,12 +146,50 @@ void maybe_pack_int8_weight(Tensor& t, const std::string& key,
 #endif
 }
 
+void maybe_pack_int4_g128_weight(Tensor& t, const std::string& key,
+                                 const void* q4dot_data,
+                                 PackedWeightMap& packed_weights) {
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    if (!env_flag_enabled("MOLLM_W4_PACKED_BG128")) return;
+    if (t.prec != Precision::INT4 || !q4dot_data || !t.scales ||
+        t.group_size != 128 || t.shape[1] <= 0 || (t.shape[1] % 128) != 0) {
+        return;
+    }
+
+    int N = (int)t.shape[0];
+    int K = (int)t.shape[1];
+    std::string g128_key = key + "#int4_q4g128";
+    auto it = packed_weights.find(g128_key);
+    if (it == packed_weights.end()) {
+        uint8_t* b_g128 = pack_b_q4dot_g128_full(
+            reinterpret_cast<const uint8_t*>(q4dot_data),
+            t.scales, N, K, (int)t.groups_per_row);
+        if (!b_g128) return;
+        size_t buf_size = pack_b_q4dot_g128_bytes(N, K);
+        std::vector<uint8_t> buf(b_g128, b_g128 + buf_size);
+        delete[] b_g128;
+        it = packed_weights.emplace(g128_key, std::move(buf)).first;
+    }
+    t.q4_g128_data = it->second.data();
+#else
+    (void)t;
+    (void)key;
+    (void)q4dot_data;
+    (void)packed_weights;
+#endif
+}
+
 void maybe_pack_int4_weight(Tensor& t, const std::string& key,
                             const void* weight_data,
                             PackedWeightMap& packed_weights) {
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    if (t.is_q4_g128_packed) {
+        t.q4_g128_data = weight_data;
+        return;
+    }
     if (t.is_q4_repacked) {
         t.q4_repack_data = weight_data;
+        maybe_pack_int4_g128_weight(t, key, weight_data, packed_weights);
         return;
     }
     if (!g_matmul_config.use_interleave_pack || !int4_q4dot_repack_supported(t)) return;
@@ -176,6 +214,7 @@ void maybe_pack_int4_weight(Tensor& t, const std::string& key,
         it = packed_weights.emplace(q4_key, std::move(buf)).first;
     }
     t.q4_repack_data = it->second.data();
+    maybe_pack_int4_g128_weight(t, key, t.q4_repack_data, packed_weights);
 #else
     (void)t;
     (void)key;
@@ -486,6 +525,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.num_groups = 0;
             t.groups_per_row = 0;
             t.is_q4_repacked = false;
+            t.is_q4_g128_packed = false;
 
             bool is_quantized = (t.prec == Precision::INT8 || t.prec == Precision::INT4);
             if (!is_quantized) return true;
@@ -499,13 +539,22 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             uint64_t expected_groups = (uint64_t)N * groups_per_row;
             bool int4_q4dot_layout =
                 t.prec == Precision::INT4 && (flags & MappedFile::FLAG_INT4_Q4DOT);
-            if (flags & ~MappedFile::FLAG_INT4_Q4DOT) {
+            bool int4_bg128_layout =
+                t.prec == Precision::INT4 && (flags & MappedFile::FLAG_INT4_BG128);
+            constexpr uint32_t supported_flags =
+                MappedFile::FLAG_INT4_Q4DOT | MappedFile::FLAG_INT4_BG128;
+            if (flags & ~supported_flags) {
                 fprintf(stderr, "Engine: quantized weight %s has unsupported flags 0x%x\n",
                         label, flags);
                 return false;
             }
-            if ((flags & MappedFile::FLAG_INT4_Q4DOT) && t.prec != Precision::INT4) {
-                fprintf(stderr, "Engine: weight %s has INT4 q4dot flag but precision is not INT4\n",
+            if ((flags & supported_flags) && t.prec != Precision::INT4) {
+                fprintf(stderr, "Engine: weight %s has INT4 layout flag but precision is not INT4\n",
+                        label);
+                return false;
+            }
+            if (int4_q4dot_layout && int4_bg128_layout) {
+                fprintf(stderr, "Engine: weight %s has mutually exclusive INT4 layout flags\n",
                         label);
                 return false;
             }
@@ -515,9 +564,15 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                         label, (long long)K, group_size);
                 return false;
             }
-            if (int4_q4dot_layout && !int4_q4dot_kernel_available()) {
+            if (int4_bg128_layout && (K % 128 != 0 || group_size != 128)) {
                 fprintf(stderr,
-                        "Engine: INT4 q4dot weight %s requires an ARM DOTPROD build\n",
+                        "Engine: INT4 BG128 weight %s requires K multiple of 128 and group=128 (K=%lld group=%u)\n",
+                        label, (long long)K, group_size);
+                return false;
+            }
+            if ((int4_q4dot_layout || int4_bg128_layout) && !int4_q4dot_kernel_available()) {
+                fprintf(stderr,
+                        "Engine: INT4 packed weight %s requires an ARM DOTPROD build\n",
                         label);
                 return false;
             }
@@ -527,6 +582,9 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     uint64_t n_padded = (uint64_t)(((N + 7) / 8) * 8);
                     uint64_t k_blocks = (uint64_t)((K + 31) / 32);
                     expected_data_size = n_padded * k_blocks * 16;
+                } else if (int4_bg128_layout) {
+                    expected_data_size =
+                        (uint64_t)pack_b_q4dot_g128_bytes((int)N, (int)K);
                 } else {
                     expected_data_size = (uint64_t)N * (uint64_t)((K + 1) / 2);
                 }
@@ -546,6 +604,10 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.num_groups = num_groups;
             t.groups_per_row = groups_per_row;
             t.is_q4_repacked = int4_q4dot_layout;
+            t.is_q4_g128_packed = int4_bg128_layout;
+            if (int4_bg128_layout) {
+                t.q4_g128_data = t.data;
+            }
             return true;
         };
 
@@ -563,8 +625,10 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.mem_type = MemoryType::EXTERNAL;
             t.is_interleaved = false;
             t.is_q4_repacked = false;
+            t.is_q4_g128_packed = false;
             t.q8_repack_data = nullptr;
             t.q4_repack_data = nullptr;
+            t.q4_g128_data = nullptr;
         };
 
         // Package mode: resolve weight from package mmap via offset map.
