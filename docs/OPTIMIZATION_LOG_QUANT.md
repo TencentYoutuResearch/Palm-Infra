@@ -2560,3 +2560,616 @@ between W8/W4/FP16 matmul families. The next larger W8 step is likely an 8-row
 i8mm tile or a llama.cpp-style packed micro-panel that reuses B loads across
 more rows, but that needs a careful register-pressure A/B rather than another
 tail-path cleanup.
+
+## Attempt 26: W8 i8mm 8-Row GEMM
+
+### Diagnosis
+
+Attempt 25 removed tail checks from the common full 4x8 W8 i8mm tile, but the
+dispatcher already shards prefill by 8 rows. That meant each `M=8` work item
+still ran the internal 4x8 kernel twice and loaded the same B micro-panel twice
+for rows 0-3 and 4-7.
+
+The obvious 8x8 i8mm kernel is register-heavy: a full 8-row by 8-column i8mm
+tile would need many int32 accumulators plus FP32 output accumulators. This
+attempt uses a conservative split-half design: process 8 rows by 4 columns at
+a time, so each B 4-column micro-panel is loaded once for all 8 rows. This
+halves the hot B micro-panel loads compared with two 4x8 passes while keeping
+register pressure lower. It reloads A for the high 4 columns, which is a better
+tradeoff on the current large-N prefill shapes.
+
+The older 4-row kernel remains available through `MOLLM_W8_I8MM_4X8=1`.
+
+### Microbench
+
+AUTO-i8mm build, W8PC/per-channel, 4 threads, `warmup=10`, `repeat=20`.
+The old column is the previous default 4x8 i8mm path; the new column is the
+8-row path before making it default.
+
+| Shape `(M,K,N)` | old 4x8 i8mm p50 | new 8-row i8mm p50 |
+|---|---:|---:|
+| `256,2560,9216` | 11.21 ms / 1075.8 GF/s | 10.93 ms / 1090.6 GF/s |
+| `256,9216,2560` | 12.00 ms / 1005.9 GF/s | 11.47 ms / 1053.5 GF/s |
+| `256,2048,12288` | 11.88 ms / 1076.6 GF/s | 11.49 ms / 1113.3 GF/s |
+| `256,6144,2048` | 6.46 ms / 984.8 GF/s | 6.23 ms / 1019.5 GF/s |
+
+After switching the default, a serial sanity A/B on `256,9216,2560` measured
+default 8-row `11.46 ms` vs forced 4x8 `11.85 ms`. A parallel sanity run was
+discarded because the two benchmarks contended for CPU.
+
+### Endpoint
+
+Strict protocol: pp256 + tg64, warmup=3, 4 threads, 5 independent process
+median. For 2B/4B, old and new were measured in the same machine session.
+
+| Model / package | old 4x8 i8mm | new 8-row i8mm | prefill delta |
+|---|---:|---:|---:|
+| Qwen3.5-0.8B W8PC | 622.02 / 151.23 | 622.17 / 148.88 | neutral/noisy |
+| Youtu-LLM-2B W8PC | 240.25 / 87.90 | 253.76 / 87.37 | +5.6% |
+| Qwen3.5-4B W8PC | 112.51 / 42.37 | 117.46 / 42.39 | +4.4% |
+
+Median latency details:
+
+| Model / mode | prefill ms | decode ms | peak RSS |
+|---|---:|---:|---:|
+| Youtu-LLM-2B old 4x8 | 1065.55 | 716.70 | 5949.9 MB |
+| Youtu-LLM-2B new 8-row | 1008.83 | 721.04 | 5948.7 MB |
+| Qwen3.5-4B old 4x8 | 2275.39 | 1486.92 | 10964.5 MB |
+| Qwen3.5-4B new 8-row | 2179.56 | 1486.14 | 10964.5 MB |
+
+0.8B is noisy under the strict protocol and is not the primary benchmark target.
+The new kernel only changes prefill GEMM; M=1 decode continues through the GEMV
+path, so 0.8B decode movement is treated as measurement noise.
+
+### Validation
+
+```bash
+cmake --build build --target test_matmul bench_matmul mollm_bench test_quantized_e2e -j 10
+./build/test_matmul
+MOLLM_W8_I8MM_4X8=1 ./build/test_matmul
+./build/test_quantized_e2e youtu-llm-2b.mollm youtu-llm-2b_w8pc.mollm 256
+```
+
+All passed. Youtu-LLM-2B W8PC 256-token CE/PPL remains `3.1094 / 22.41`
+with CE delta `-0.0045` vs FP16.
+
+### Takeaway
+
+Keep the 8-row i8mm path as the default W8 GEMM kernel. It gives a stable
+prefill win on the 2B/4B target models, does not change package layout or
+quantization math, and keeps a clean 4x8 fallback for A/B. The remaining W8
+prefill gap to llama.cpp is no longer a tail-path issue; the next likely area
+is a more deeply packed/scheduled micro-panel design or reducing matmul-to-
+matmul memory traffic at the graph level.
+
+## Attempt 27: W4 GEMV Full-Tile Cleanup
+
+### Diagnosis
+
+W4 decode still lagged llama.cpp Q4_0 more than expected even after the W4
+GEMM prefill work. Short Youtu-LLM-2B W4G128 profile showed decode remained
+MATMUL-bound:
+
+| Metric | Before |
+|---|---:|
+| decode t/s (`pp256 + tg16`, warmup=1) | 94.74 |
+| decode MATMUL total | 115.71 ms |
+| `M=1,N=12288,K=2048` | 0.105 ms / 238.60 GMAC/s |
+| `M=1,N=2048,K=6144` | 0.058 ms / 218.17 GMAC/s |
+| `decode_lmhead M=1,N=128256,K=2048` | 1.016 ms / 258.58 GMAC/s |
+
+The W4 GEMV path processes 8 output columns per tile. All hot model shapes are
+8-column aligned, but the kernel still carried per-column `c_valid` checks and
+tail-safe scalar stores in the common path.
+
+### Implementation
+
+Specialize the full 8-column tile case in `matmul_int4_q8dot_neon_gemv_range`:
+
+- compute all 8 output columns unconditionally when `c_valid == 8`;
+- store the two FP32 output vectors directly with `vst1q_f32`;
+- keep the old guarded path for odd/tail `N`.
+
+This is a GEMV-only cleanup and does not change package layout, quantization
+math, or W4 GEMM prefill.
+
+### Profile
+
+Same short profile command as above after the change:
+
+| Metric | After | Delta |
+|---|---:|---:|
+| decode t/s (`pp256 + tg16`, warmup=1) | 97.86 | +3.3% |
+| decode MATMUL total | 110.97 ms | -4.1% |
+| `M=1,N=12288,K=2048` | 0.101 ms / 250.16 GMAC/s | +4.8% GMAC/s |
+| `M=1,N=2048,K=6144` | 0.056 ms / 225.81 GMAC/s | +3.5% GMAC/s |
+| `decode_lmhead M=1,N=128256,K=2048` | 0.990 ms / 265.24 GMAC/s | +2.6% GMAC/s |
+
+Thread/chunk-size A/B on synthetic decode shapes did not show a better default:
+4 threads remained faster than 1 thread, and `--chunk-size` changes were noisy
+or neutral. The retained change is only the full-tile kernel cleanup.
+
+### Endpoint
+
+Strict protocol: pp256 + tg64, warmup=3, 4 threads, 5 independent process
+median.
+
+| Model / package | Before | After | llama.cpp reference |
+|---|---:|---:|---:|
+| Qwen3.5-0.8B W4G128 | 624.17 / 163.37 | 611.13 / 165.53 | Q4_0 809.47 / 189.80 |
+| Youtu-LLM-2B W4G128 | 227.31 / 91.28 | 232.76 / 97.65 | Q4_0 281.04 / 99.82 |
+| Qwen3.5-4B W4G128 | 102.42 / 43.34 | 104.19 / 46.16 | Q4_0 148.67 / 46.43 |
+
+Median latency details:
+
+| Model | prefill ms | decode ms | load ms | peak RSS |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B W4G128 | 418.90 | 380.60 | 201.03 | 1501.3 MB |
+| Youtu-LLM-2B W4G128 | 1099.84 | 645.13 | 105.70 | 2892.8 MB |
+| Qwen3.5-4B W4G128 | 2457.11 | 1364.82 | 209.54 | 4984.5 MB |
+
+### Validation
+
+```bash
+cmake --build build --target test_matmul bench_matmul mollm_bench test_quantized_e2e -j 10
+./build/test_matmul
+./build/test_quantized_e2e youtu-llm-2b.mollm youtu-llm-2b_w4g128_q4pkg.mollm 256
+```
+
+Both passed. Youtu-LLM-2B W4G128 256-token CE/PPL remains `3.1578 / 23.52`
+with CE delta `+0.0440` vs FP16.
+
+### Takeaway
+
+This fixes the obvious W4 decode fast-path miss. After this change, 2B W4
+decode is within about 2% of llama.cpp Q4_0 and 4B W4 decode is essentially at
+llama.cpp Q4_0 speed. The remaining quantized gap is now mainly W4 prefill,
+not W4 decode. 0.8B remains below llama.cpp Q4_0 decode, but it is also the
+noisiest target and not the primary benchmark model.
+
+## Attempt 28: W4 GEMV NEON Activation Quantization
+
+### Diagnosis
+
+After Attempt 27, W4 decode was close to llama.cpp Q4_0 on 2B/4B, but the
+GEMV path still quantized the single activation row with scalar code:
+
+- scan 32 FP32 values for `amax`;
+- compute scale;
+- scalar `nearbyint` and clamp;
+- write pre-split even/odd Q8 buffers for q4dot.
+
+The existing profiling counter showed Q8 activation quantization was still
+around 5% of total matmul time in the Youtu W4 short profile. A previous
+activation-side experiment had been reverted because it did not help real
+package decode and hurt prefill-shaped work. This attempt is narrower: only
+the `M==1` W4 GEMV even/odd quantizer gets a full-32-block NEON path. Prefill
+GEMM continues to use the existing row-major activation quantizer.
+
+### Implementation
+
+For full 32-element K blocks in `quantize_a_q8_blocks_even_odd`:
+
+- load 32 FP32 activation values with NEON;
+- compute `amax` with vector abs/max and horizontal max;
+- quantize with `vcvtnq_s32_f32`, clamp to `[-127, 127]`, narrow to int8;
+- split the 32 quantized values into q4dot even/odd streams with `vuzp1/vuzp2`.
+
+Tail blocks keep the scalar path. `MOLLM_W4_GEMV_SCALAR_QA=1` forces the old
+scalar quantizer for A/B.
+
+### Microbench
+
+Synthetic W4 GEMV, 4 threads, `warmup=30`, `repeat=80`. These include both
+activation quantization and GEMV compute.
+
+| Shape `(M,K,N)` | NEON QA p50 | scalar QA p50 |
+|---|---:|---:|
+| `1,2048,12288` | 0.08 ms | 0.08 ms |
+| `1,6144,2048` | 0.04 ms | 0.05 ms |
+| `1,2048,128256` | 0.99 ms | 1.00 ms |
+| `1,2560,9216` | 0.07 ms | 0.08 ms |
+| `1,9216,2560` | 0.08 ms | 0.09 ms |
+
+### Profile
+
+Youtu-LLM-2B W4G128 short profile (`pp256 + tg16`, warmup=1, 4 threads):
+
+| Metric | Attempt 27 | Attempt 28 |
+|---|---:|---:|
+| decode t/s | 97.86 | 102.24 |
+| decode MATMUL total | 110.97 ms | 104.64 ms |
+| q8 activation quant total | 54.56 ms | 50.17 ms |
+| `M=1,N=12288,K=2048` | 0.101 ms / 250.16 GMAC/s | 0.099 ms / 255.41 GMAC/s |
+| `M=1,N=2048,K=6144` | 0.056 ms / 225.81 GMAC/s | 0.051 ms / 248.30 GMAC/s |
+| `decode_lmhead M=1,N=128256,K=2048` | 0.990 ms / 265.24 GMAC/s | 0.983 ms / 267.34 GMAC/s |
+
+### Endpoint
+
+Youtu-LLM-2B W4G128 strict 5-run in the current machine state measured median
+`219.25 / 98.71`. Decode improved slightly over Attempt 27 (`97.65`) and is
+now within about 1.1% of the recorded llama.cpp Q4_0 decode baseline (`99.82`).
+Prefill in this run was lower than the Attempt 27 baseline because the machine
+state was worse, so this row is not used to replace the main W4 prefill table.
+
+Qwen3.5-4B strict rerun in the same machine state was also globally slower
+than Attempt 27, so it is not used as a reliable endpoint comparison. Synthetic
+4B decode shapes still show NEON QA is not slower than scalar QA.
+
+### Validation
+
+```bash
+cmake --build build --target bench_matmul test_matmul mollm_bench test_quantized_e2e -j 10
+./build/test_matmul
+MOLLM_W4_GEMV_SCALAR_QA=1 ./build/test_matmul
+./build/test_quantized_e2e youtu-llm-2b.mollm youtu-llm-2b_w4g128_q4pkg.mollm 256
+```
+
+All passed. Youtu-LLM-2B W4G128 256-token CE/PPL remains `3.1578 / 23.52`
+with CE delta `+0.0440` vs FP16.
+
+### Takeaway
+
+Keep this as a small decode cleanup with an A/B escape hatch. It does not change
+the larger conclusion: W4 decode on 2B/4B is now basically in the llama.cpp
+Q4_0 range, while W4 prefill remains the main open performance gap.
+
+## Attempt 29: GEMM Activation Q8 Quantization NEON Path
+
+### Diagnosis
+
+After the W8 8-row i8mm and W4 q4dot cleanup work, prefill was still slower
+than llama.cpp, especially on 4B. Short Qwen3.5-4B profiles showed the remaining
+quantized prefill cost was split between:
+
+- dominant GEMM dot kernels;
+- about 80-120 ms of temporary activation Q8 quantization per pp256 run;
+- about 250-320 ms of non-matmul work such as GDN/SHORTCONV/norm/activation.
+
+Two scheduling/kernel experiments were checked before keeping this change:
+
+- W8 GEMM 2D N-block scheduling gave only about +0.7% endpoint prefill median
+  and was removed.
+- A W4 runtime-unpack i8mm 8-row prototype was only about +0.6% endpoint median
+  and was removed; the existing `MOLLM_W4_I8MM=1` opt-in 4x8 prototype remains
+  for diagnostics.
+
+The useful low-risk target was the shared GEMM activation quantizer:
+`quantize_a_q8_blocks()` was still scalar, while W4 GEMV had already gained a
+full-block NEON quantizer in Attempt 28.
+
+### Implementation
+
+For full 32-element K blocks in `quantize_a_q8_blocks()`:
+
+- load 32 FP32 activation values with NEON;
+- compute `amax` with vector abs/max and horizontal max;
+- quantize with `vcvtnq_s32_f32`, clamp to `[-127, 127]`, narrow to int8;
+- store the contiguous Q8 row block.
+
+Tail blocks still use the scalar path. `MOLLM_Q8_GEMM_SCALAR_QA=1` forces the
+old scalar GEMM activation quantizer for A/B. This path is used by both W8 and
+W4 prefill GEMM.
+
+The W4 i8mm diagnostic path was also adjusted to consume scaled signed nibbles
+(`q4 * 16`) and divide the dot result by 16, matching the default q4dot math.
+It remains opt-in because it is still slower than DOTPROD on current shapes.
+
+### Microbench
+
+Synthetic matmul, 4 threads, `warmup=10`, `repeat=20`; includes activation
+quantization and dot kernel time.
+
+| Shape / precision | NEON QA avg | scalar QA avg | delta |
+|---|---:|---:|---:|
+| `256,2560,9216` W8 | 10.71 ms | 10.92 ms | +2.0% |
+| `256,2560,9216` W4 | 12.35 ms | 12.43 ms | +0.6% |
+
+The microbench gain is small because the dot kernel dominates each large GEMM,
+but endpoint profiles show the quantization counter itself drops substantially.
+
+### Profile
+
+Qwen3.5-4B short profile (`pp256 + tg4`, warmup=1, 4 threads):
+
+| Package | Before q8 QA | After q8 QA | MATMUL profile effect |
+|---|---:|---:|---:|
+| W8PC | ~82 ms | 34.46 ms | prefill MATMUL ~1744 ms -> 1712 ms |
+| W4G128 | ~119 ms | 34.43 ms | prefill MATMUL ~2038 ms -> 1902 ms |
+
+After this change, `q8_quant_a_pct` is about 1.5-2% of total matmul time in
+the strict pp256+tg64 runs, down from roughly 4-6%.
+
+### Endpoint
+
+Strict protocol: pp256 + tg64, warmup=3, 4 threads, 5 independent process
+median. These runs were taken in the same post-change session; W4 had a visible
+downward thermal trend, so the W4 number is conservative.
+
+| Model / package | Previous recorded | After NEON GEMM QA | prefill delta |
+|---|---:|---:|---:|
+| Qwen3.5-4B W8PC | 117.46 / 42.39 | 124.06 / 42.69 | +5.6% |
+| Qwen3.5-4B W4G128 | 104.19 / 46.16 | 108.28 / 47.38 | +3.9% |
+| Youtu-LLM-2B W8PC | 253.76 / 87.37 | 251.69 / 81.46 | prefill neutral; decode noisy |
+
+Median latency details for the new 4B rows:
+
+| Package | prefill ms | decode ms | q8 activation quant |
+|---|---:|---:|---:|
+| Qwen3.5-4B W8PC | 2063.56 | 1475.68 | 49.37 ms |
+| Qwen3.5-4B W4G128 | 2364.25 | 1329.72 | 45.60 ms |
+
+### Validation
+
+```bash
+cmake --build build --target test_matmul bench_matmul mollm_bench -j 10
+./build/test_matmul
+MOLLM_Q8_GEMM_SCALAR_QA=1 ./build/test_matmul
+MOLLM_W4_I8MM=1 ./build/test_matmul
+./build/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w8pc.mollm 256
+./build/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_cppq.mollm 256
+```
+
+All passed. 0.8B 256-token CE/PPL:
+
+| Package | CE/PPL | CE delta vs FP16 |
+|---|---:|---:|
+| W8PC | 2.1475 / 8.56 | +0.0086 |
+| W4G128 | 2.4239 / 11.29 | +0.2851 |
+
+### Takeaway
+
+Keep the NEON GEMM activation quantizer. It is correctness-preserving, applies
+to W8 and W4 prefill, and removes activation quantization as a major remaining
+cost bucket. It does not solve the overall prefill gap: Qwen3.5-4B W8 is still
+about 1.15x slower than the recorded llama.cpp Q8_0 prefill baseline, and W4 is
+still about 1.37x slower than llama.cpp Q4_0. The next meaningful work is no
+longer scalar A-quantization; it is GEMM layout/micro-panel design, scale
+placement, store/reorder overhead, and possibly a true package-level W4 i8mm
+layout that avoids hot-loop runtime unpacking.
+
+## Attempt 30: W4 Per-Group Scale Cache and GDN Repeat Q/K Reuse
+
+### Diagnosis
+
+After Attempt 29, activation Q8 quantization was no longer the main prefill
+bucket. Qwen3.5-4B profiles still showed two smaller opportunities:
+
+- Gated DeltaNet prefill spends about 145-155 ms per pp256 run. In the 4B
+  linear-attention blocks, `num_v_heads > num_heads`, so repeated value heads
+  share the same q/k projection for a key head.
+- W4G128 prefill remains matmul-bound. The default `q4dot_gemm_repack` 8x8
+  kernel used group-size 128, but reloaded the same B scale every 32-wide Q8
+  activation block. For G128, four Q8 blocks share one B scale.
+
+Two other ideas were checked and removed:
+
+- Reusing Q8 GEMM/GEMV activation scratch via `static thread_local std::vector`
+  passed `test_matmul`, but the Qwen3.5-4B package profile segfaulted
+  (`exit 139`). The change was reverted.
+- Replacing SHORTCONV prefill scratch zero-initialization with uninitialized
+  storage passed `test_execute`, but did not reduce the SHORTCONV profile time
+  (still about 50 ms). The change was reverted.
+
+### Implementation
+
+Kept changes:
+
+- GDN prefill now has a repeat-value-head path that groups by key head. It
+  loads and L2-normalizes q/k once per `(key_head, token)`, then runs the
+  recurrence for all repeated value heads under that key head.
+- `tests/test_gdn.cpp` now covers `num_v_heads != num_heads`, matching the
+  Qwen3.5-4B style repeat-value-head layout.
+- W4 default 8x8 GEMM caches `load_w8_b_scales8()` results for per-group scale
+  mode. For W4G128 this reduces B scale loads from once per 32-wide qblock to
+  once per 128-wide group. Per-channel and per-block32 behavior is unchanged.
+
+### Profile
+
+Qwen3.5-4B W4G128 short profile, `pp256 + tg16`, warmup=1, 4 threads. These
+were same-turn directional runs, not strict medians.
+
+| Metric | Before scale cache | After scale cache |
+|---|---:|---:|
+| prefill t/s | 112.21 | 118.30 |
+| prefill ms | 2281.50 | 2163.91 |
+| prefill MATMUL | 1993.08 ms | 1876.92 ms |
+| GDN prefill | 147.50 ms | 142.99 ms |
+
+Dominant W4 prefill shape throughput:
+
+| Shape `(M,N,K)` | Before | After |
+|---|---:|---:|
+| `256,9216,2560` | 462.95 GMAC/s | 490.74 GMAC/s |
+| `256,2560,9216` | 455.39 GMAC/s | 483.02 GMAC/s |
+| `256,8192,2560` | 462.10 GMAC/s | 490.38 GMAC/s |
+| `256,2560,4096` | 455.51 GMAC/s | 487.40 GMAC/s |
+| `256,4096,2560` | 456.28 GMAC/s | 486.62 GMAC/s |
+
+### Endpoint
+
+Strict protocol: Qwen3.5-4B W4G128, pp256 + tg64, warmup=3, 4 threads,
+5 independent process median. Both rows were measured in the same machine
+session; the run still shows a gradual thermal downward trend, so use this as
+same-session A/B rather than a full-table replacement.
+
+| Build | pp/tg median | prefill ms | decode ms | load ms | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| before W4 scale cache | 104.82 / 47.08 | 2442.29 | 1338.22 | 211.36 | 4984.4 MB |
+| after W4 scale cache | 109.02 / 48.00 | 2348.10 | 1312.59 | 205.24 | 4984.5 MB |
+
+The scale cache gives about +4.0% W4 prefill in this same-session median. The
+GDN q/k reuse is a smaller local cleanup; profile runs moved GDN prefill by a
+few milliseconds, but endpoint performance is still dominated by W4 matmul.
+
+### Validation
+
+```bash
+cmake --build build --target test_gdn test_e2e test_matmul test_quantized_e2e bench_matmul mollm_bench -j 10
+./build/test_gdn
+./build/test_e2e
+./build/test_matmul
+./build/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_cppq.mollm 256
+```
+
+All passed in targeted validation. The W4 0.8B CE/PPL remained
+`2.4239 / 11.29`, CE delta `+0.2851` vs FP16.
+
+### Takeaway
+
+Keep the W4 per-group scale cache: it is a low-risk hot-loop simplification and
+shows a measurable same-session endpoint gain. Keep the GDN repeat q/k reuse
+mostly as correctness-covered cleanup for the 4B repeat-value-head path. The
+remaining W4 prefill gap is still matmul-kernel structure, not scale-load
+bookkeeping alone.
+
+## Attempt 31: W4 GEMM Per-Group Loop Cleanup (Not Kept)
+
+### Diagnosis
+
+Attempt 30 cached W4G128 B scales inside the qblock loop, but the hot loop still
+computed/checks the current group for every 32-wide activation block. For
+group-size 128, four qblocks share one B scale, so the cleaner structure is the
+same as the GEMV path: dispatch by scale mode and make `PerGroup` loop over
+groups outside qblocks.
+
+Two alternatives were tested and removed:
+
+- `MOLLM_W4_GEMM_SHARD_N=1` diagnostic N-sharding was correctness-clean, but
+  microbench was neutral/slower on the dominant 4B prefill shapes. The code was
+  removed instead of keeping another dispatch mode.
+- Moving `d0..d7` zero-initialization into the non-full-tile branch did not
+  improve microbench and slowed the main shape in one run. The change was
+  reverted.
+
+### Experiment
+
+`matmul_int4_q8dot_neon_8x8_range()` was changed to use a local `run_qblock()`
+helper and separate scale-mode loops:
+
+- `PerChannel`: load B scales once for the tile and run all qblocks.
+- `PerGroup`: load B scales once per group, then run that group's qblocks
+  (`4` qblocks for W4G128).
+- `PerBlock32`: load B scales per qblock, preserving the old behavior.
+
+The intent was to keep the Attempt 30 scale-load reduction while removing the
+per-qblock group division and branch from the W4G128 path.
+
+### Microbench
+
+Current machine state was thermally noisy, so only same-session synthetic
+microbench direction is used here. Dominant Qwen3.5-4B W4 prefill shapes,
+4 threads, `warmup=10`, `repeat=30`:
+
+| Shape `(M,K,N)` | Attempt 30 cache p50 | per-group loop p50 |
+|---|---:|---:|
+| `256,2560,9216` | 12.06 ms | 11.92 ms |
+| `256,9216,2560` | 12.40 ms | 12.14 ms |
+| `256,2560,8192` | 10.92 ms | 10.82 ms |
+
+The first endpoint 5-run attempted after this was invalidated by a clear thermal
+downward trend (`109.09` pp/s on run 1 falling to `96.02` pp/s on run 5).
+
+After turning the fan up, a same-session A/B still did not support keeping the
+change:
+
+| W4G128 4B build | pp/tg median | prefill ms | decode ms |
+|---|---:|---:|---:|
+| per-group loop experiment | 106.90 / 46.76 | 2394.66 | 1347.26 |
+| Attempt 30 cache+branch | 107.19 / 47.13 | 2388.38 | 1336.62 |
+
+Both groups still had mild thermal drift, but the cache+branch version was
+slightly better in the same session.
+
+### Validation
+
+```bash
+cmake --build build --target test_matmul test_quantized_e2e test_gdn mollm_bench -j 10
+./build/test_matmul
+./build/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_cppq.mollm 256
+./build/test_gdn
+```
+
+All passed. W4 0.8B CE/PPL remains `2.4239 / 11.29`, CE delta `+0.2851` vs
+FP16.
+
+### Takeaway
+
+Do not keep the per-group loop cleanup. The microbench-only gain did not survive
+endpoint A/B, so the code was reverted to the Attempt 30 cache+branch structure.
+The next meaningful W4 prefill step is still a stronger q4 GEMM microkernel or
+a package-level layout designed for i8mm/asm.
+
+## Attempt 32: llama.cpp Gap Survey (Analysis Only)
+
+### Scope
+
+Local reference: `../llama.cpp` at `5c7c22c3e`. The goal was to identify
+structural differences beyond the current mollm q8dot/q4dot kernels that could
+explain the remaining quantized prefill gap.
+
+### Findings
+
+llama.cpp has a full CPU repack subsystem, not just a different inner loop:
+
+- `GGML_CPU_REPACK` is enabled by default and provides a `CPU_REPACK` buffer
+  type. Repacked tensors carry a tensor trait, and `MUL_MAT` dispatch is
+  delegated to that trait's `forward_mul_mat()`.
+- Q4/Q8 data layouts are block structs with fp16 scales embedded next to
+  interleaved quants: `block_q4_0x4`, `block_q4_0x8`, `block_q4_0x16`,
+  `block_q8_0x4`, etc. Our W4G128 package stores q4 bytes in a q4dot physical
+  layout, but B scales remain in a side array and activation scales remain a
+  separate `float` array.
+- llama.cpp quantizes activation rows into packed `block_q8_0x4` planes, so a
+  GEMM kernel consumes four activation rows with their fp16 scales in the same
+  layout. mollm currently quantizes A into row-major int8 bytes plus separate
+  fp32 scales, then each kernel reshapes or indexes that representation.
+- The ARM path selects among repack traits by CPU feature. On NEON+i8mm it uses
+  the `q4_0_4x8_q8_0` / `q8_0_4x8_q8_0` style kernels; on NEON dotprod it falls
+  back to `4x4`; SVE+i8mm has an `8x8` path. The fast Q4 i8mm path is designed
+  around the packed q4/q8 layouts. Our experimental W4 i8mm path had to
+  rearrange unpacked nibbles at runtime, which likely explains why it lost to
+  the DOTPROD path.
+- The repack `forward_mul_mat()` owns activation quantization and scheduling.
+  It quantizes source rows in 4-row chunks, aligns output chunks to `NB_COLS`,
+  and uses atomic work stealing over chunked work. mollm W8/W4 prefill still
+  uses the generic matmul entry and primarily shards by `M`.
+- llama.cpp also has more fallback/specialized backend options: llamafile/BLAS
+  routes for suitable unquantized GEMM, KleidiAI kernels on supported ARM, and
+  many more quant formats (`Q4_K`, `IQ4`, `MXFP4`, etc.). The no-BLAS CPU
+  baseline is already faster than mollm prefill, so these are not required to
+  explain the current Apple CPU gap, but they are relevant for mobile ARM.
+- Quantization policy is model/tensor-aware. The quantizer categorizes
+  embeddings, output, attn_v/qkv, attn_output, and ffn_down; `Q4_K_M` promotes
+  selected sensitive tensors to higher-bit formats, uses layer-position rules,
+  and can use imatrix guidance. mollm's mixed policy covers the obvious
+  sensitive tensors, but does not yet have imatrix or llama.cpp's layer-aware
+  rules.
+
+### Implications
+
+The next high-value performance direction is not another small branch removal
+inside the current W4 DOTPROD loop. The bigger gap is that llama.cpp's prefill
+path is a coherent packed-block GEMM pipeline:
+
+1. package/runtime B layout matches the microkernel,
+2. activation Q8 layout matches the same microkernel,
+3. scales are embedded or laid out for vector loads,
+4. scheduling is aware of kernel tile constraints.
+
+For mollm, a realistic next step is a new packed quantized-matmul path rather
+than mutating the existing `q4dot [N/8,K/32,8,16B] + side scales` path:
+
+- define a `q4g128x8` or `q4_0x8`-like package layout that stores per-block or
+  per-group scales in the same stream as the 8 output rows;
+- add an activation pack equivalent to `block_q8_0x4`, preferably with fp16
+  scales to reduce bandwidth and match the kernel's load pattern;
+- implement one ARM i8mm kernel against that layout, starting with the dominant
+  prefill shape class;
+- route W4/W8 prefill through 2D tile-aware scheduling instead of only
+  sharding by `M`;
+- keep the existing W4G128 DOTPROD path as the correctness/reference fallback
+  until the packed path proves both PPL and endpoint speed.
+
+This is larger than an incremental cleanup, but it matches the part of
+llama.cpp that still looks materially ahead of mollm.

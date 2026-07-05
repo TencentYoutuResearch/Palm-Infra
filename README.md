@@ -23,24 +23,24 @@ W8PC / Q8_0:
 
 | Model | mollm W8PC pp/tg | llama.cpp Q8_0 pp/tg |
 |-------|-----------------:|---------------------:|
-| Qwen3.5-0.8B | 604.11 / 151.23 | 813.58 / 171.10 |
-| Youtu-LLM-2B | 239.59 / 87.89 | 275.90 / 83.99 |
-| Qwen3.5-4B | 114.36 / 43.02 | 142.88 / 39.77 |
+| Qwen3.5-0.8B | 622.17 / 148.88 | 813.58 / 171.10 |
+| Youtu-LLM-2B | 253.76 / 87.37 | 275.90 / 83.99 |
+| Qwen3.5-4B | 117.46 / 42.39 | 142.88 / 39.77 |
 
-Youtu-LLM-2B W4G128 direct q4pkg after the latest W4 GEMM cleanup:
+Youtu-LLM-2B W4G128 direct q4pkg after the latest W4 GEMV/GEMM cleanup:
 
 | Runtime | pp256 | tg64 |
 |---------|------:|-----:|
-| mollm W4G128 | 227.31 | 91.28 |
+| mollm W4G128 | 232.76 | 97.65 |
 | llama.cpp Q4_0 | 281.04 | 99.82 |
 | llama.cpp Q4_K_M | 216.35 | 88.72 |
 | llama.cpp Q8_0 | 275.90 | 83.99 |
 
 Current summary: decode is competitive with llama.cpp on 2B/4B for FP16, W8,
-and 2B W4. AUTO i8mm plus full-tile cleanup makes W8 prefill much closer to
-llama.cpp; W4 prefill has recovered substantially with q4dot DOTPROD
-vector-reduce, scaled-nibble, and full-tile GEMM cleanup. Remaining gap is
-mostly 4B prefill.
+and 2B W4. AUTO i8mm plus the W8 8-row GEMM kernel makes W8 prefill much
+closer to llama.cpp; W4 prefill has recovered substantially with q4dot DOTPROD
+vector-reduce, scaled-nibble, full-tile GEMM cleanup, and per-group scale-load
+caching. Remaining gap is mostly 4B prefill.
 
 ## Architecture
 
@@ -160,12 +160,12 @@ Quantized package examples:
 
 | Package | pp256 t/s | tg64 t/s | peak RSS |
 |---------|----------:|---------:|---------:|
-| Qwen3.5-0.8B W8PC | 604.11 | 151.23 | 2560.6 MB |
-| Qwen3.5-0.8B W4G128 direct q4pkg | 624.17 | 163.37 | 1501.2 MB |
-| Youtu-LLM-2B W8PC | 239.59 | 87.89 | 5948.9 MB |
-| Youtu-LLM-2B W4G128 direct q4pkg | 227.31 | 91.28 | 2894.3 MB |
-| Qwen3.5-4B W8PC | 114.36 | 43.02 | 10964.4 MB |
-| Qwen3.5-4B W4G128 direct q4pkg | 102.42 | 43.34 | 4984.3 MB |
+| Qwen3.5-0.8B W8PC | 622.17 | 148.88 | 2561.5 MB |
+| Qwen3.5-0.8B W4G128 direct q4pkg | 611.13 | 165.53 | 1501.3 MB |
+| Youtu-LLM-2B W8PC | 253.76 | 87.37 | 5949.2 MB |
+| Youtu-LLM-2B W4G128 direct q4pkg | 232.76 | 97.65 | 2892.8 MB |
+| Qwen3.5-4B W8PC | 117.46 | 42.39 | 10964.5 MB |
+| Qwen3.5-4B W4G128 direct q4pkg | 104.19 | 46.16 | 4984.5 MB |
 
 Pure W4 quality is model-dependent. On the current 256-token reference sample,
 Youtu-LLM-2B W4G128 has small drift from FP16 (`CE delta +0.0440`), and
@@ -178,9 +178,13 @@ promoting important tensors.
 the compiler defines `__ARM_FEATURE_MATMUL_INT8` and accepts `vmmlaq_s32`.
 Use `-DMOLLM_ARM_I8MM=OFF` to force the portable DOTPROD/NEON path, or
 `-DMOLLM_ARM_I8MM=ON` to require i8mm support. `MOLLM_ARM_NATIVE=ON` passes
-`-mcpu=native` for local benchmarking. W4 currently defaults to the q4dot
-DOTPROD vector-reduce GEMM; `MOLLM_W4_I8MM=1` enables an experimental W4 i8mm
-prototype, but it is slower on current shapes.
+`-mcpu=native` for local benchmarking. W8 i8mm GEMM defaults to the 8-row
+kernel; `MOLLM_W8_I8MM_4X8=1` forces the older 4-row kernel for A/B. W4
+currently defaults to the q4dot DOTPROD vector-reduce GEMM; `MOLLM_W4_I8MM=1`
+enables an experimental W4 i8mm prototype, but it is slower on current shapes.
+`MOLLM_W4_GEMV_SCALAR_QA=1` forces the older scalar W4 GEMV activation
+quantizer for A/B. `MOLLM_Q8_GEMM_SCALAR_QA=1` forces the older scalar GEMM
+activation quantizer for W8/W4 prefill A/B.
 
 ## Run
 
@@ -198,8 +202,8 @@ prototype, but it is slower on current shapes.
 ### Near-term
 - **W4 prefill/decode kernels**: 2B W4 decode is now llama.cpp Q4/Q8-class and
   prefill has improved with q4dot DOTPROD vector-reduce; next work is
-  activation Q8 quantization, scale handling, and a true W4 micro-panel layout
-  if i8mm is revisited.
+  scale handling, store/reorder cleanup, and a true W4 micro-panel layout if
+  i8mm is revisited.
 - **W4 quality policy**: Qwen3.5 and Youtu both have first mixed policies;
   next step is targeted ablation to reduce W8 coverage without losing PPL.
 - **Graph fusion**: fuse adjacent matmul + activation + norm to reduce cache thrash between ops (end-to-end matmul utilization is 40% vs 86% microbench, the 2.5x gap is cache/DRAM traffic between matmuls)

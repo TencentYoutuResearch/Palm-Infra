@@ -7,6 +7,7 @@
 #include "kernels/threading.h"
 
 #if HAS_NEON
+#include <algorithm>
 #include <cstring>
 
 void kernel_gdn_prefill_neon(const OpParams& params,
@@ -54,9 +55,9 @@ void kernel_gdn_prefill_neon(const OpParams& params,
         neg_exp_A_vec[h] = -std::exp(A_log_data[h]);
     const float* neg_exp_A = neg_exp_A_vec.data();
 
-    // Process heads in parallel. Each head's tokens are sequential (stateful).
-    // Heads are independent when repeat=1; when repeat>1, heads sharing a key_head
-    // must be serialised. We group by key_head for correctness.
+    // Process heads in parallel. Each value head's tokens are sequential
+    // because state is recurrent. When repeat>1, grouping by key head lets
+    // repeated value heads reuse the same normalized q/k vectors.
     // parallel_for signature: fn(int thread_id, int begin, int end)
     auto process_head = [&](int /*tid*/, int vh_start, int vh_end) {
         for (int vh = vh_start; vh < vh_end; vh++) {
@@ -96,20 +97,62 @@ void kernel_gdn_prefill_neon(const OpParams& params,
         }
     };
 
+    auto process_key_head = [&](int /*tid*/, int kh_start, int kh_end) {
+        for (int kh = kh_start; kh < kh_end; kh++) {
+            int q_base = kh * k_head_dim;
+            int k_base = qkv_dim + kh * k_head_dim;
+
+            for (int t = 0; t < process_len; t++) {
+                alignas(16) float q[128], k_buf[128], v_buf[128];
+                for (int d = 0; d < k_head_dim; d++) {
+                    q[d]     = qkv_data[(q_base + d) * seq_len + t];
+                    k_buf[d] = qkv_data[(k_base + d) * seq_len + t];
+                }
+
+                gdn_l2norm_neon(q, k_head_dim, l2_eps);
+                gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
+
+                int vh_begin = kh * repeat;
+                int vh_end = std::min(vh_begin + repeat, num_v_heads);
+                for (int vh = vh_begin; vh < vh_end; vh++) {
+                    int v_base = 2 * qkv_dim + vh * v_head_dim;
+                    for (int d = 0; d < v_head_dim; d++)
+                        v_buf[d] = qkv_data[(v_base + d) * seq_len + t];
+
+                    float a_h = a_data[t * num_v_heads + vh];
+                    float b_h = b_data[t * num_v_heads + vh];
+                    float sp = gdn_softplusf(a_h + dtb_data[vh]);
+                    float g_t = neg_exp_A[vh] * sp;
+                    float g_t_exp = std::exp(g_t);
+                    float beta_t = gdn_sigmoidf(b_h);
+
+                    float* state_h = state_data + vh * state_sz;
+                    const float* z_row = z_data + t * z_dim + vh * v_head_dim;
+                    float* out_head = out_data + t * z_dim + vh * v_head_dim;
+
+                    gdn_recurrence_neon(q, k_buf, v_buf,
+                                        g_t_exp, beta_t, state_h,
+                                        norm_data, z_row, out_head,
+                                        k_head_dim, v_head_dim, scale, rms_eps);
+                }
+            }
+        }
+    };
+
     // Parallelize over heads when safe (repeat=1: independent state per head)
     if (thread_pool && repeat == 1 && num_v_heads >= 4) {
         int chunk = (num_v_heads + thread_pool->num_threads() - 1) / thread_pool->num_threads();
         if (chunk < 1) chunk = 1;
         thread_pool->parallel_for(0, num_v_heads, chunk, process_head);
     } else if (thread_pool && repeat > 1 && num_v_heads >= 8) {
-        // Group by key_head to avoid state sharing
+        // Group by key_head so repeated value heads reuse q/k work.
         int num_kh = num_v_heads / repeat;
         int chunk = (num_kh + thread_pool->num_threads() - 1) / thread_pool->num_threads();
         if (chunk < 1) chunk = 1;
-        auto process_kh = [&](int tid, int kh_start, int kh_end) {
-            process_head(tid, kh_start * repeat, kh_end * repeat);
-        };
-        thread_pool->parallel_for(0, num_kh, chunk, process_kh);
+        thread_pool->parallel_for(0, num_kh, chunk, process_key_head);
+    } else if (repeat > 1) {
+        int num_kh = num_v_heads / repeat;
+        process_key_head(0, 0, num_kh);
     } else {
         process_head(0, 0, num_v_heads);
     }

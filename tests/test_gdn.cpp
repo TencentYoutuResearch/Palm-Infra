@@ -45,15 +45,18 @@ static void ref_fused_gdn(
     const float* A_log, const float* dt_bias, const float* norm_w,
     float* state, float* out,
     int num_heads, int k_dim, int v_dim, int seq_len,
-    bool use_l2norm, float rms_eps, float l2norm_eps, float scale)
+    bool use_l2norm, float rms_eps, float l2norm_eps, float scale,
+    int num_v_heads = -1)
 {
+    if (num_v_heads < 0) num_v_heads = num_heads;
     int qkv_dim   = num_heads * k_dim;
-    int qkv_total = qkv_dim * 3;
-    int z_dim     = num_heads * v_dim;
+    int qkv_total = qkv_dim * 2 + num_v_heads * v_dim;
+    int z_dim     = num_v_heads * v_dim;
     int state_size = k_dim * v_dim;
+    int repeat = num_v_heads / num_heads;
 
-    std::vector<float> neg_exp_A(num_heads), dt_bias_h(num_heads);
-    for (int h = 0; h < num_heads; h++) {
+    std::vector<float> neg_exp_A(num_v_heads), dt_bias_h(num_v_heads);
+    for (int h = 0; h < num_v_heads; h++) {
         neg_exp_A[h] = -std::exp(A_log[h]);
         dt_bias_h[h] = dt_bias[h];
     }
@@ -62,22 +65,23 @@ static void ref_fused_gdn(
     std::vector<float> q_n(k_dim), k_n(k_dim);
     std::vector<float> kv_mem(v_dim), delta(v_dim), attn_out(v_dim);
 
-    for (int h = 0; h < num_heads; h++) {
-        float* state_h = state + h * state_size;
-        float nea = neg_exp_A[h];
-        float dtb = dt_bias_h[h];
+    for (int vh = 0; vh < num_v_heads; vh++) {
+        int kh = vh / repeat;
+        float* state_h = state + vh * state_size;
+        float nea = neg_exp_A[vh];
+        float dtb = dt_bias_h[vh];
 
         for (int t = 0; t < seq_len; t++) {
             // qkv layout: [qkv_total, seq] row-major → qkv[qkv_idx * seq_len + t]
             for (int d = 0; d < k_dim; d++) {
-                q_pre[d] = qkv[(h * k_dim + d) * seq_len + t];
-                k_pre[d] = qkv[(qkv_dim + h * k_dim + d) * seq_len + t];
+                q_pre[d] = qkv[(kh * k_dim + d) * seq_len + t];
+                k_pre[d] = qkv[(qkv_dim + kh * k_dim + d) * seq_len + t];
             }
             for (int d = 0; d < v_dim; d++)
-                v_t[d] = qkv[(2 * qkv_dim + h * v_dim + d) * seq_len + t];
+                v_t[d] = qkv[(2 * qkv_dim + vh * v_dim + d) * seq_len + t];
 
-            float a_ht   = a[t * num_heads + h];
-            float b_ht   = b[t * num_heads + h];
+            float a_ht   = a[t * num_v_heads + vh];
+            float b_ht   = b[t * num_v_heads + vh];
             float sp     = ref_softplusf(a_ht + dtb);
             float g_t    = nea * sp;
             float beta_t = ref_sigmoidf(b_ht);
@@ -117,14 +121,14 @@ static void ref_fused_gdn(
 
             // RMSNormGated
             // Output layout: [z_dim, seq_len] row-major → out[(h*v_dim+d) + t * z_dim]
-            const float* z_row = z + t * z_dim + h * v_dim;
+            const float* z_row = z + t * z_dim + vh * v_dim;
             float sum_sq = 0.f;
             for (int d = 0; d < v_dim; d++) sum_sq += attn_out[d] * attn_out[d];
             float rms = 1.f / std::sqrt(sum_sq / (float)v_dim + rms_eps);
             for (int d = 0; d < v_dim; d++) {
                 float normed = attn_out[d] * rms * norm_w[d];
                 float silu_z = z_row[d] * ref_sigmoidf(z_row[d]);
-                int global_dim = h * v_dim + d;
+                int global_dim = vh * v_dim + d;
                 out[global_dim + t * z_dim] = normed * silu_z;
             }
         }
@@ -137,9 +141,11 @@ static bool run_kernel(bool prefill,
                        int num_heads, int k_dim, int v_dim, int seq_len,
                        const float* qkv, const float* a, const float* b, const float* z,
                        const float* A_log, const float* dt_bias, const float* norm_w,
-                       float* state, float* out_buf) {
-    int qkv_total = num_heads * k_dim * 3;
-    int z_dim     = num_heads * v_dim;
+                       float* state, float* out_buf,
+                       int num_v_heads = -1) {
+    if (num_v_heads < 0) num_v_heads = num_heads;
+    int qkv_total = num_heads * k_dim * 2 + num_v_heads * v_dim;
+    int z_dim     = num_v_heads * v_dim;
 
     // Input shapes use the [dim, seq] declared convention (kernel ignores them
     // and indexes by data layout [seq, dim]); we set strides to match the data.
@@ -150,17 +156,18 @@ static bool run_kernel(bool prefill,
     };
 
     Tensor qkv_t   = make_2d(Precision::FP32, qkv_total, seq_len,   qkv);
-    Tensor a_t     = make_2d(Precision::FP32, num_heads,  seq_len,  a);
-    Tensor b_t     = make_2d(Precision::FP32, num_heads,  seq_len,  b);
+    Tensor a_t     = make_2d(Precision::FP32, num_v_heads, seq_len, a);
+    Tensor b_t     = make_2d(Precision::FP32, num_v_heads, seq_len, b);
     Tensor z_t     = make_2d(Precision::FP32, z_dim,      seq_len,  z);
-    Tensor A_log_t = make_2d(Precision::FP32, num_heads,  1,        A_log);
-    Tensor dtb_t   = make_2d(Precision::FP32, num_heads,  1,        dt_bias);
+    Tensor A_log_t = make_2d(Precision::FP32, num_v_heads, 1,       A_log);
+    Tensor dtb_t   = make_2d(Precision::FP32, num_v_heads, 1,       dt_bias);
     Tensor norm_t  = make_2d(Precision::FP32, v_dim,      1,        norm_w);
-    Tensor state_t = make_2d(Precision::FP32, v_dim * k_dim * num_heads, 1, state);
+    Tensor state_t = make_2d(Precision::FP32, v_dim * k_dim * num_v_heads, 1, state);
     Tensor out_t   = make_2d(Precision::FP32, z_dim,      seq_len,  out_buf);
 
     OpParams params;
-    params.i32 = {num_heads, k_dim, v_dim, seq_len, 1 /*use_l2norm*/, 4 /*conv_kernel*/};
+    params.i32 = {num_heads, k_dim, v_dim, seq_len, 1 /*use_l2norm*/,
+                  4 /*conv_kernel*/, seq_len /*n_real*/, num_v_heads};
     params.f32 = {1e-6f /*rms_eps*/, 1e-6f /*l2norm_eps*/, 1.f / std::sqrt((float)k_dim)};
 
     std::vector<const Tensor*> inputs = {&qkv_t, &a_t, &b_t, &z_t,
@@ -231,7 +238,47 @@ static bool test_prefill_basic() {
     return ok;
 }
 
-// ---- Test 2: decode (seq_len=1), compare against scalar reference ----
+// ---- Test 2: prefill with repeated value heads (Qwen3.5-4B style) ----
+static bool test_prefill_repeated_value_heads() {
+    const int num_heads = 2, num_v_heads = 4, k_dim = 8, v_dim = 8, seq_len = 5;
+    const int qkv_dim = num_heads * k_dim;
+    const int qkv_total = qkv_dim * 2 + num_v_heads * v_dim;
+    const int z_dim = num_v_heads * v_dim;
+    const int state_size = num_v_heads * k_dim * v_dim;
+    unsigned int seed = 123;
+
+    std::vector<float> qkv(seq_len * qkv_total), a(seq_len * num_v_heads),
+                       b(seq_len * num_v_heads), z(seq_len * z_dim),
+                       A_log(num_v_heads), dt_bias(num_v_heads), norm_w(v_dim);
+    fill_rand(qkv.data(), qkv.size(), &seed);
+    fill_rand(a.data(), a.size(), &seed);
+    fill_rand(b.data(), b.size(), &seed);
+    fill_rand(z.data(), z.size(), &seed);
+    fill_rand(A_log.data(), A_log.size(), &seed);
+    fill_rand(dt_bias.data(), dt_bias.size(), &seed);
+    fill_rand(norm_w.data(), norm_w.size(), &seed);
+
+    std::vector<float> state_k(state_size, 0), state_r(state_size, 0);
+    std::vector<float> out_k(seq_len * z_dim, 0), out_r(seq_len * z_dim, 0);
+
+    float scale = 1.f / std::sqrt((float)k_dim);
+    ref_fused_gdn(qkv.data(), a.data(), b.data(), z.data(),
+                  A_log.data(), dt_bias.data(), norm_w.data(),
+                  state_r.data(), out_r.data(),
+                  num_heads, k_dim, v_dim, seq_len,
+                  true, 1e-6f, 1e-6f, scale, num_v_heads);
+
+    run_kernel(/*prefill=*/true, num_heads, k_dim, v_dim, seq_len,
+               qkv.data(), a.data(), b.data(), z.data(),
+               A_log.data(), dt_bias.data(), norm_w.data(),
+               state_k.data(), out_k.data(), num_v_heads);
+
+    bool ok = compare(out_r.data(), out_k.data(), seq_len * z_dim, "repeat prefill out");
+    ok &= compare(state_r.data(), state_k.data(), state_size, "repeat prefill state");
+    return ok;
+}
+
+// ---- Test 3: decode (seq_len=1), compare against scalar reference ----
 static bool test_decode_basic() {
     const int num_heads = 2, k_dim = 8, v_dim = 8;
     const int qkv_dim = num_heads * k_dim;
@@ -274,7 +321,7 @@ static bool test_decode_basic() {
     return ok;
 }
 
-// ---- Test 3: prefill then decode — state continuity ----
+// ---- Test 4: prefill then decode — state continuity ----
 static bool test_prefill_then_decode() {
     const int num_heads = 4, k_dim = 16, v_dim = 16, seq_len = 8;
     const int qkv_dim = num_heads * k_dim;
@@ -338,9 +385,10 @@ static bool test_prefill_then_decode() {
 }
 
 int main() {
-    CHECK(test_prefill_basic(),       "GDN prefill matches reference");
-    CHECK(test_decode_basic(),        "GDN decode matches reference");
-    CHECK(test_prefill_then_decode(), "GDN prefill→decode state continuity");
+    CHECK(test_prefill_basic(),                "GDN prefill matches reference");
+    CHECK(test_prefill_repeated_value_heads(), "GDN repeat-value-head prefill matches reference");
+    CHECK(test_decode_basic(),                 "GDN decode matches reference");
+    CHECK(test_prefill_then_decode(),          "GDN prefill→decode state continuity");
     printf(failures ? "\n%d FAILED\n" : "\nAll GDN tests passed!\n", failures);
     return failures;
 }
