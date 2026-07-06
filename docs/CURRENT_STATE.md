@@ -1,6 +1,6 @@
 # Current State
 
-*Last updated: 2026-07-05*
+*Last updated: 2026-07-06*
 
 ## 项目概述
 
@@ -15,40 +15,58 @@ Python 转译前端 → `.mollm` 单文件打包 → C++ 执行器 + NEON FP16FM
 
 ## 性能（Apple M5 Pro, 4 threads, pp256 + tg64, warmup=3）
 
-2026-07-02 严格复测：mollm 和 llama.cpp 都用 5 个独立进程取 median，
+2026-07-06 严格复测：mollm 和 llama.cpp 都用 5 个独立进程取 median，
 `mollm_bench --prompt-tokens 256 --max-new-tokens 64 --warmup 3 --threads 4`；
-`llama-bench -ngl 0 -p 256 -n 64 -t 4 -r 1` 跑 5 次取 median。4B/2B 包已重转为
+`llama-bench -ngl 0 -p 256 -n 64 -t 4 -r 1 -o json` 跑 5 次取 median。
+llama.cpp 行统一使用 `../llama.cpp/build-cpu/bin/llama-bench`
+（`GGML_BLAS=ON`, `GGML_METAL=OFF`, `GGML_CPU_REPACK=ON`）。4B/2B 包已重转为
 当前显式 `lm_head.weights` 格式。
 
 FP16 / F16:
 
 | Model | mollm pp/tg | llama.cpp pp/tg | prefill gap | decode gap |
 |-------|------------:|----------------:|------------:|-----------:|
-| Qwen3.5-0.8B | 625.36 / 101.74 | 675.69 / 99.24 | 1.08x slower | 1.03x faster |
-| Youtu-LLM-2B | 241.59 / 51.27 | 266.66 / 46.89 | 1.10x slower | 1.09x faster |
-| Qwen3.5-4B | 110.66 / 24.44 | 143.22 / 22.02 | 1.29x slower | 1.11x faster |
+| Qwen3.5-0.8B | 601.38 / 123.68 | 664.54 / 97.87 | 1.11x slower | 1.26x faster |
+| Youtu-LLM-2B | 218.67 / 52.12 | 257.93 / 45.12 | 1.18x slower | 1.16x faster |
+| Qwen3.5-4B | 102.48 / 25.00 | 142.44 / 22.33 | 1.39x slower | 1.12x faster |
 
 W8PC / Q8_0:
 
-W8PC rows are refreshed with the 2026-07-05 fan-on validation rerun using the
-current AUTO-i8mm build; llama.cpp Q8_0 references are CPU-only no-BLAS medians
-from the same rerun.
+W8PC rows are refreshed with the 2026-07-06 validation rerun using the current
+AUTO-i8mm build with W8 GEMM 2D N-block scheduling; llama.cpp Q8_0 references
+use the same BLAS-on, Metal-off build as the FP16 rows.
 
 | Model | mollm W8PC pp/tg | llama.cpp Q8_0 pp/tg | prefill gap | decode gap |
 |-------|-----------------:|---------------------:|------------:|-----------:|
-| Qwen3.5-0.8B | 635.51 / 211.96 | 811.70 / 160.70 | 1.28x slower | 1.32x faster |
-| Youtu-LLM-2B | 250.81 / 94.34 | 274.46 / 84.61 | 1.09x slower | 1.11x faster |
-| Qwen3.5-4B | 117.21 / 45.50 | 139.66 / 39.71 | 1.19x slower | 1.15x faster |
+| Qwen3.5-0.8B | 671.73 / 217.69 | 782.16 / 167.63 | 1.16x slower | 1.30x faster |
+| Youtu-LLM-2B | 253.05 / 89.53 | 263.95 / 86.58 | 1.04x slower | 1.03x faster |
+| Qwen3.5-4B | 118.55 / 46.64 | 135.58 / 40.50 | 1.14x slower | 1.15x faster |
+
+W4G128 direct BG128 / Q4_0:
+
+| Model | mollm W4G128 pp/tg | llama.cpp Q4_0 pp/tg | prefill gap | decode gap |
+|-------|-------------------:|---------------------:|------------:|-----------:|
+| Qwen3.5-0.8B | 678.41 / 259.43 | 775.95 / 190.89 | 1.14x slower | 1.36x faster |
+| Youtu-LLM-2B | 248.08 / 115.64 | 265.58 / 97.15 | 1.07x slower | 1.19x faster |
+| Qwen3.5-4B | 115.37 / 55.94 | 140.51 / 44.25 | 1.22x slower | 1.26x faster |
 
 Interpretation:
-- FP16 decode remains slightly faster than llama.cpp F16 on 2B/4B; prefill remains slower.
-- Current W8PC decode is faster than llama.cpp Q8_0 in this fan-on rerun. AUTO
-  i8mm plus the 8-row GEMM kernel narrowed W8PC prefill substantially, but all
-  three models still trail llama.cpp Q8_0 on prefill. 0.8B remains noisy and is
-  not the primary benchmark target.
+- FP16 decode remains faster than llama.cpp F16 on all three models in this
+  rerun; prefill remains slower.
+- Current W8PC decode is faster than llama.cpp Q8_0. AUTO i8mm plus W8 GEMM
+  2D N-block scheduling narrowed W8PC prefill further: 2B is about
+  1.04x slower than llama.cpp Q8_0, while 4B remains about 1.14x slower.
+  0.8B remains noisy and is not the primary benchmark target.
+- W4G128 direct BG128 now defaults to A4-packed activation quantization in GEMM.
+  On the primary 2B/4B models this gives about 6-7% W4 prefill uplift versus
+  the old non-A4 path. Prefill still trails llama.cpp Q4_0, while decode remains
+  faster. W4 GEMM 2D N-block scheduling was tested after A4 but is kept opt-in
+  (`MOLLM_W4_GEMM_2D=1`) because strict endpoint results did not show a stable
+  default win. The 0.8B rows remain noisy and should not drive kernel decisions.
 - Explicit `lm_head.weights` increases tied-embedding FP16 package/RSS: current 4B FP16 package is
-  ~9.0 GiB on disk and peaks around 19.1 GB RSS. W8PC 4B is ~5.1 GiB on disk and peaks around
-  11.0 GB RSS.
+  ~9.0 GiB on disk and peaks around 16.8 GB RSS in the latest full rerun. W8PC
+  4B is ~5.1 GiB on disk and peaks around 11.0 GB RSS; W4G128 direct BG128 4B
+  peaks around 5.0 GB RSS.
 
 ### 2026-07-01 内存管理分支 benchmark 审计
 
@@ -504,6 +522,26 @@ its CPU repack/i8mm kernels are materially stronger. Current mollm decode is
 competitive on 2B/4B, but prefill still trails, especially 4B (`W4 104.19` vs
 `Q4_0 148.67`, `W8 117.46` vs `Q8_0 142.88`).
 
+2026-07-06 llama.cpp BLAS vs no-BLAS A/B used two Metal-off builds:
+`build-cpu` (`GGML_BLAS=ON`, `GGML_METAL=OFF`, `GGML_CPU_REPACK=ON`) and
+`build-cpu-noblas` (`GGML_BLAS=OFF`, `GGML_METAL=OFF`,
+`GGML_CPU_REPACK=ON`). Protocol was pp256 + tg64, 4 threads, 5 independent
+process medians. Result: BLAS is crucial for F16 prefill, but Q8_0/Q4_0 are
+essentially unchanged because the quantized CPU repack kernels do not depend on
+BLAS for these shapes.
+
+| Model | Quant | BLAS pp/tg | no-BLAS pp/tg | effect |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B | F16 | 725.24 / 98.78 | 290.76 / 98.75 | BLAS pp 2.49x |
+| Qwen3.5-0.8B | Q8_0 | 805.81 / 168.97 | 800.41 / 169.06 | neutral |
+| Qwen3.5-0.8B | Q4_0 | 802.66 / 186.09 | 804.59 / 188.18 | neutral |
+| Youtu-LLM-2B | F16 | 257.42 / 46.49 | 92.30 / 46.43 | BLAS pp 2.79x |
+| Youtu-LLM-2B | Q8_0 | 270.41 / 85.26 | 268.18 / 85.72 | neutral |
+| Youtu-LLM-2B | Q4_0 | 269.76 / 98.32 | 268.89 / 98.44 | neutral |
+| Qwen3.5-4B | F16 | 141.95 / 22.09 | 42.83 / 21.87 | BLAS pp 3.31x |
+| Qwen3.5-4B | Q8_0 | 136.32 / 39.04 | 134.91 / 39.55 | neutral |
+| Qwen3.5-4B | Q4_0 | 143.89 / 44.23 | 143.64 / 44.72 | neutral |
+
 2026-07-05 llama.cpp gap survey: the main remaining quantized-prefill gap looks
 structural. llama.cpp's CPU repack path uses packed B formats with embedded
 fp16 scales (`block_q4_0x8`, `block_q8_0x4`), packs activation rows into
@@ -514,15 +552,15 @@ The next meaningful direction is a new packed quantized-matmul pipeline
 (`q4g128x8`/`q8_0x4`-style A/B layouts plus i8mm kernel and tile-aware
 scheduling), while keeping the current DOTPROD W4G128 path as the fallback.
 
-2026-07-05 packed-A4 activation experiment: `MOLLM_W4_PACKED_A4=1` routes W4
-prefill GEMM through a packed 4-row Q8 activation layout (pre-split even/odd
-streams, `float` scales). This gives about +3.4% on two serial synthetic 4B W4
-GEMM shapes, but only +0.5% 4B W4 endpoint prefill in 5-run same-session median
-(`112.67` -> `113.22` pp/s). It is kept as an opt-in diagnostic/foundation for
-a fuller packed A+B layout, not as a default path. `MOLLM_W4_I8MM=1` plus A4
-improves the existing i8mm prototype by ~5% synthetic, but it remains slower
-than DOTPROD+A4, so current i8mm still needs a true B-side packed layout. See
-`docs/OPTIMIZATION_LOG_QUANT.md` Attempt 33.
+2026-07-05 packed-A4 activation experiment: `MOLLM_W4_PACKED_A4=1` initially
+routed W4 prefill GEMM through a packed 4-row Q8 activation layout (pre-split
+even/odd streams, `float` scales). That early opt-in result was noisy, but the
+2026-07-06 direct-BG128 rerun showed stable 6-7% prefill gain on 2B/4B, so A4
+is now the default W4 GEMM path and `MOLLM_W4_NO_PACKED_A4=1` is the rollback
+switch. `MOLLM_W4_I8MM=1` plus A4 improves the existing i8mm prototype by ~5%
+synthetic, but it remains slower than DOTPROD+A4, so current i8mm still needs a
+true B-side packed layout. See `docs/OPTIMIZATION_LOG_QUANT.md` Attempts 33 and
+38.
 
 2026-07-05 packed-BG128 update: runtime sidecar `MOLLM_W4_PACKED_BG128=1`
 proved the layout, then converter/runtime were updated so new `w4g128` packages
@@ -678,6 +716,16 @@ Interpretation:
   noisy and is not the primary benchmark target
 - AUTO i8mm plus 8-row GEMM narrows W8PC prefill substantially; 2B is now much
   closer to llama.cpp Q8_0, while 0.8B/4B still trail
+
+2026-07-06 follow-up changed W8 q8dot GEMM multithread scheduling from pure
+M-sharding to 2D atomic-steal over M tiles and N blocks. This does not change
+the q8dot B layout: GEMV/decode and GEMM/prefill still share the same
+`[N/8, K/32, 8, 32]` `q8_repack_data`, so RSS is unchanged. The old path is
+available with `MOLLM_W8_GEMM_1D=1`; `MOLLM_W8_GEMM_N_BLOCK` overrides the
+default W8 GEMM N block size of 1024 for A/B. Alternating 3-run same-session
+A/B gave Qwen3.5-4B W8PC `121.75 / 44.96` vs old 1D `117.83 / 45.60`, and
+Youtu-LLM-2B W8PC `252.70 / 93.57` vs old 1D `246.81 / 91.74`. Treat these as
+directional 3-run A/B, not a replacement for the fan-on 5-run baseline table.
 
 llama.cpp Q8_0 CPU 参考基线（`../llama.cpp` build `5c7c22c3e` / 9803，
 `llama-bench -ngl 0 -p 256 -n 64 -t 4 -r 5 -o md`）：
@@ -886,7 +934,7 @@ graph fusion、continuous batching、多 backend 前，建议先收敛成显式
 
 1. **W4 quality sweep** — 显式 lmhead 后，纯 W4G128 的 0.8B 256-token CE delta 为 +0.2851；Qwen3.5 `w4mixg128` 通过 73 个 W8 tensor（包含 `lm_head.weights`）恢复到 +0.0296。下一步比较 `w4mixg64` / `w4mixg32`、更细的 tensor ablation，或实现 Q4_K-like asymmetric block 格式
 2. **W4 kernel next step** — W4 q4dot + package-level layout 已落地，runtime 不再需要常驻第二份 W4 repack copy；DOTPROD vector-reduce 和 GEMM/GEMV activation quantization 已显著恢复性能。下一步针对 2B/4B prefill shape 继续优化 q4dot kernel，或设计真正适合 i8mm 的 W4 micro-panel layout（避免 hot loop 临时展开）
-3. **W8 kernel next step** — q8dot full repack 已是默认 W8 路径，decode 已基本追上 Q8_0 参考；GEMM activation quantization 已不是主瓶颈。下一步集中优化 prefill GEMM layout（A packing、scale placement、store/reorder）和 per-group 路径
+3. **W8 kernel next step** — q8dot full repack 已是默认 W8 路径，decode 已基本追上 Q8_0 参考；W8 GEMM 已加入 2D N-block 调度且不改变 GEMV 复用的 B layout。剩余 prefill gap 仍主要需要更深的 packed GEMM layout/kernel 工作（A/B micro-panel、scale placement、store/reorder）和 per-group 路径
 4. **W8 quality audit** — 256-token PPL 已通过；后续扩大到更多 calibration samples，确认 group-size 质量/大小 tradeoff
 5. **内存模型整理** — 按 `docs/MEMORY_MODEL.md` 继续落地：下一步把 `(owner_id, storage_id)` 扩展成 explicit `TensorStorage` / storage registry
 6. **Graph fusion** — 融合相邻 matmul+activation+norm，减少 cache 抢占（e2e matmul 利用率 40% vs microbench 86%）

@@ -10,31 +10,32 @@ kernels; W8/W4 weight-only quantization uses ARM dot-product kernels.
 
 Supports three model families. Benchmark protocol is Apple M5 Pro, 4 threads,
 pp256 + tg64, warmup=3, 5-run median unless noted. Higher throughput numbers
-are bolded.
+are bolded. Current tables were refreshed on 2026-07-06; quantized llama.cpp
+rows use `GGML_BLAS=ON`, `GGML_METAL=OFF`, and `GGML_CPU_REPACK=ON`.
 
 FP16:
 
 | Model | Architecture | mollm pp/tg | llama.cpp pp/tg | pp winner | tg winner |
 |-------|--------------|------------:|----------------:|-----------|-----------|
-| Qwen3.5-0.8B | Hybrid linear/full attention | 625.36 / **101.74** | **675.69** / 99.24 | llama.cpp 1.08x | mollm 1.03x |
-| Youtu-LLM-2B | MLA | 241.59 / **51.27** | **266.66** / 46.89 | llama.cpp 1.10x | mollm 1.09x |
-| Qwen3.5-4B | Hybrid linear/full attention | 110.66 / **24.44** | **143.22** / 22.02 | llama.cpp 1.29x | mollm 1.11x |
+| Qwen3.5-0.8B | Hybrid linear/full attention | 601.38 / **123.68** | **664.54** / 97.87 | llama.cpp 1.11x | mollm 1.26x |
+| Youtu-LLM-2B | MLA | 218.67 / **52.12** | **257.93** / 45.12 | llama.cpp 1.18x | mollm 1.16x |
+| Qwen3.5-4B | Hybrid linear/full attention | 102.48 / **25.00** | **142.44** / 22.33 | llama.cpp 1.39x | mollm 1.12x |
 
 W8PC / Q8_0 (current AUTO-i8mm build):
 
 | Model | mollm W8PC pp/tg | llama.cpp Q8_0 pp/tg | pp winner | tg winner |
 |-------|-----------------:|---------------------:|-----------|-----------|
-| Qwen3.5-0.8B | 635.51 / **211.96** | **811.70** / 160.70 | llama.cpp 1.28x | mollm 1.32x |
-| Youtu-LLM-2B | 250.81 / **94.34** | **274.46** / 84.61 | llama.cpp 1.09x | mollm 1.11x |
-| Qwen3.5-4B | 117.21 / **45.50** | **139.66** / 39.71 | llama.cpp 1.19x | mollm 1.15x |
+| Qwen3.5-0.8B | 671.73 / **217.69** | **782.16** / 167.63 | llama.cpp 1.16x | mollm 1.30x |
+| Youtu-LLM-2B | 253.05 / **89.53** | **263.95** / 86.58 | llama.cpp 1.04x | mollm 1.03x |
+| Qwen3.5-4B | 118.55 / **46.64** | **135.58** / 40.50 | llama.cpp 1.14x | mollm 1.15x |
 
 W4G128 direct BG128 / Q4_0:
 
 | Model | mollm W4G128 pp/tg | llama.cpp Q4_0 pp/tg | pp winner | tg winner |
 |-------|--------------------:|---------------------:|-----------|-----------|
-| Qwen3.5-0.8B | 687.32 / **252.91** | **800.05** / 188.72 | llama.cpp 1.16x | mollm 1.34x |
-| Youtu-LLM-2B | 241.99 / **114.03** | **269.87** / 97.39 | llama.cpp 1.12x | mollm 1.17x |
-| Qwen3.5-4B | 110.78 / **55.75** | **143.46** / 44.32 | llama.cpp 1.29x | mollm 1.26x |
+| Qwen3.5-0.8B | 678.41 / **259.43** | **775.95** / 190.89 | llama.cpp 1.14x | mollm 1.36x |
+| Youtu-LLM-2B | 248.08 / **115.64** | **265.58** / 97.15 | llama.cpp 1.07x | mollm 1.19x |
+| Qwen3.5-4B | 115.37 / **55.94** | **140.51** / 44.25 | llama.cpp 1.22x | mollm 1.26x |
 
 
 ## Architecture
@@ -151,8 +152,8 @@ exit. If your local optimized build directory is `build_i8mm`, replace
 ## Roadmap
 
 ### Near-term
-- **W4 prefill**: W4 decode is now faster than local llama.cpp Q4_0 on all
-  three benchmarked models; next work is closing the remaining prefill gap.
+- **W4 prefill**: W4 decode is faster than local llama.cpp Q4_0 on the
+  primary 2B/4B models; next work is closing the remaining prefill gap.
 - **W4 quality policy**: Qwen3.5 and Youtu both have first mixed policies;
   next step is targeted ablation to reduce W8 coverage without losing PPL.
 - **Graph fusion**: fuse adjacent matmul + activation + norm to reduce cache thrash between ops (end-to-end matmul utilization is 40% vs 86% microbench, the 2.5x gap is cache/DRAM traffic between matmuls)

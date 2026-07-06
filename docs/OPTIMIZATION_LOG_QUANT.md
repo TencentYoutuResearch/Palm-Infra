@@ -1,6 +1,6 @@
 # Quantization Optimization Log
 
-*Last updated: 2026-07-03*
+*Last updated: 2026-07-06*
 
 This log tracks quantized-kernel optimization separately from the Qwen3.5 FP16
 optimization log. `docs/QUANTIZATION.md` describes the format and correctness
@@ -188,6 +188,46 @@ MOLLM_W8_ONFLY_FP16=1 ./build/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w
 ```
 
 Both passed.
+
+## Attempt 37: llama.cpp BLAS vs no-BLAS Check (Analysis Only)
+
+### Goal
+
+Clarify whether llama.cpp's quantized prefill advantage comes from Apple BLAS or
+from its CPU repack quantized kernels.
+
+### Setup
+
+Both builds have Metal disabled:
+
+- BLAS build: `../llama.cpp/build-cpu/bin/llama-bench`,
+  `GGML_BLAS=ON`, `GGML_METAL=OFF`, `GGML_CPU_REPACK=ON`
+- no-BLAS build: `../llama.cpp/build-cpu-noblas/bin/llama-bench`,
+  `GGML_BLAS=OFF`, `GGML_METAL=OFF`, `GGML_CPU_REPACK=ON`
+
+Protocol: pp256 + tg64, 4 threads, 5 independent process medians, `-ngl 0`.
+
+### Results
+
+| Model | Quant | BLAS pp/tg | no-BLAS pp/tg | effect |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B | F16 | 725.24 / 98.78 | 290.76 / 98.75 | BLAS pp 2.49x |
+| Qwen3.5-0.8B | Q8_0 | 805.81 / 168.97 | 800.41 / 169.06 | neutral |
+| Qwen3.5-0.8B | Q4_0 | 802.66 / 186.09 | 804.59 / 188.18 | neutral |
+| Youtu-LLM-2B | F16 | 257.42 / 46.49 | 92.30 / 46.43 | BLAS pp 2.79x |
+| Youtu-LLM-2B | Q8_0 | 270.41 / 85.26 | 268.18 / 85.72 | neutral |
+| Youtu-LLM-2B | Q4_0 | 269.76 / 98.32 | 268.89 / 98.44 | neutral |
+| Qwen3.5-4B | F16 | 141.95 / 22.09 | 42.83 / 21.87 | BLAS pp 3.31x |
+| Qwen3.5-4B | Q8_0 | 136.32 / 39.04 | 134.91 / 39.55 | neutral |
+| Qwen3.5-4B | Q4_0 | 143.89 / 44.23 | 143.64 / 44.72 | neutral |
+
+### Interpretation
+
+BLAS explains llama.cpp's F16 prefill speed, but not Q8_0/Q4_0. The quantized
+prefill gap remains a CPU quantized-kernel/layout gap, not an Apple BLAS
+artifact. Decode is also essentially unchanged by BLAS. Official mollm vs
+llama.cpp tables still use the BLAS-on, Metal-off llama.cpp build for all
+precisions, so the comparison uses one consistent llama.cpp build.
 
 Short CE/PPL:
 
@@ -3508,3 +3548,231 @@ cmake --build build_i8mm --target mollm-quantize test_matmul test_quantized_e2e 
 
 All passed. A tiny manual `mollm-quantize` W4G128 file also checked header
 `flags=2` and BG128 `data_size = ceil(N/8) * (K/128) * 544`.
+
+## Attempt 36: W8 GEMM 2D N-Block Scheduling
+
+### Goal
+
+Try the first low-risk W8 prefill optimization after the packed-layout gap
+survey: improve GEMM scheduling without changing the W8 B layout. The existing
+q8dot B layout `[N/8, K/32, 8, 32]` is still shared by GEMV/decode and
+GEMM/prefill, so this does not add a second resident weight copy and does not
+break decode reuse.
+
+### Implementation
+
+- Extended the W8 repacked GEMM range kernels with `[n_begin, n_end)` so they
+  can work on a column block.
+- Changed the default multithreaded W8 q8dot GEMM path to use
+  `ThreadPool::parallel_for_2d(M, 8, N, N_BLOCK)` instead of only sharding M.
+- Default `N_BLOCK` is 1024 for W8 GEMM; `MOLLM_W8_GEMM_N_BLOCK=N` overrides
+  it for A/B. `MOLLM_W8_GEMM_1D=1` forces the previous M-sharded path.
+- M==1 GEMV/decode is unchanged and still uses the same `q8_repack_data`.
+- Added `test_matmul` coverage for repacked INT8 q8dot GEMM with
+  `M=16, K=64, N=19, threads=4`, covering 2D scheduling and odd-N tail stores.
+
+### Microbench
+
+4 threads, `warmup=10`, `repeat=40`, AUTO-i8mm build:
+
+| Shape `(M,K,N)` | 2D default p50 | old 1D p50 | effect |
+|---|---:|---:|---:|
+| `256,2560,9216` | 12.42 ms | 12.97 ms | +4.4% |
+| `256,9216,2560` | 13.85 ms | 14.52 ms | +4.8% |
+| `256,2048,12288` | 14.31 ms | 15.29 ms | +6.9% |
+
+N-block sweep on `256,2048,12288` showed 1024 slightly ahead of 256/512 in the
+same noisy session:
+
+| N block | p50 |
+|---:|---:|
+| 256 | 14.46 ms |
+| 512 | 14.44 ms |
+| 1024 | 14.31 ms |
+
+### Endpoint A/B
+
+Alternating 3 independent process runs, pp256 + tg64, warmup=3, 4 threads:
+
+| Model / package | default 2D median | old 1D median | effect |
+|---|---:|---:|---:|
+| Qwen3.5-4B W8PC | 121.75 / 44.96 | 117.83 / 45.60 | pp +3.3%, tg neutral |
+| Youtu-LLM-2B W8PC | 252.70 / 93.57 | 246.81 / 91.74 | pp +2.4%, tg neutral/noisy |
+
+Short 4B profile (`max-new-tokens=1`, warmup=1) moved MATMUL from
+`1769.98 ms` to `1742.68 ms` in the same session. Dominant shape examples:
+
+| Shape `(M,N,K)` | 2D GMAC/s | old 1D GMAC/s |
+|---|---:|---:|
+| `256,9216,2560` | 532.83 | 519.19 |
+| `256,8192,2560` | 530.62 | 524.22 |
+| `256,4096,2560` | 534.61 | 511.84 |
+
+### Interpretation
+
+This is a small but real prefill win, and it respects the B-layout constraint:
+GEMV/decode keeps using the same q8dot repack buffer. The improvement is much
+smaller than the remaining llama.cpp prefill gap, so the larger structural work
+is still a packed quantized-matmul pipeline with better A/B micro-panel layout,
+scale placement, and possibly lower-level kernel work.
+
+### Validation
+
+```bash
+cmake --build build_i8mm --target test_matmul test_quantized_e2e mollm_bench -j 10
+./build_i8mm/test_matmul
+./build_i8mm/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w8pc.mollm
+```
+
+Both passed.
+
+## Attempt 38: Default W4 GEMM A4 Activation Packing
+
+### Goal
+
+Continue closing the W4 prefill gap without changing the resident W4 B/package
+layout. The direct BG128 package layout is still shared by GEMM and GEMV, so
+this attempt only changes the prefill A-side quantized activation layout.
+
+### Implementation
+
+- Enabled the existing W4 GEMM A4 activation packing path by default.
+- Added `MOLLM_W4_NO_PACKED_A4=1` as the rollback switch.
+- M==1 GEMV/decode is unchanged; A4 is only used by W4 GEMM.
+- A rejected W8 microkernel experiment fused the two 8x4 i8mm halves into a
+  single 8x8 helper to reduce repeated A loads. It was not kept because the
+  two primary W8 microbench shapes were neutral (`5.73 -> 5.74 ms` for
+  `256,2048,6144`; `10.64 -> 10.63 ms` for `256,2560,9216`), likely because
+  extra register pressure canceled the saved loads.
+
+### Microbench
+
+4 threads, AUTO-i8mm build, direct-BG128 path forced in `bench_matmul` with
+`MOLLM_W4_PACKED_BG128=1`, `warmup=8`, `repeat=30`:
+
+| Shape `(M,K,N)` | default A4 p50 | `MOLLM_W4_NO_PACKED_A4=1` p50 | effect |
+|---|---:|---:|---:|
+| `256,2048,6144` | 5.80 ms | 6.18 ms | +6.6% |
+| `256,2560,9216` | 10.83 ms | 11.56 ms | +6.7% |
+
+Shorter dynamic-prefill-like shapes also favored A4 in the same session:
+`64,2048,6144` moved `1.56 -> 1.47 ms`, and `32,2048,6144` moved
+`0.78 -> 0.73 ms`.
+
+### Endpoint A/B
+
+Strict 5 independent process median, pp256 + tg64, warmup=3, 4 threads:
+
+| Model / package | default A4 pp/tg | no-A4 pp/tg | effect |
+|---|---:|---:|---:|
+| Youtu-LLM-2B W4G128 direct BG128 | 261.21 / 108.48 | 247.10 / 108.55 | pp +5.7%, tg neutral |
+| Qwen3.5-4B W4G128 direct BG128 | 118.59 / 52.36 | 110.94 / 52.17 | pp +6.9%, tg neutral |
+
+0.8B same-session default A4 measured `703.79 / 183.92`. A quick 3-run no-A4
+check measured `699.19 / 183.23`, so the lower 0.8B decode number versus older
+tables is not caused by A4. As before, 0.8B remains too noisy to drive kernel
+decisions.
+
+Against the current BLAS-on, Metal-off llama.cpp Q4_0 reference rows, the W4
+headline comparison becomes:
+
+| Model | mollm W4G128 direct BG128 | llama.cpp Q4_0 | prefill gap | decode gap |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B | 703.79 / 183.92 | 802.66 / 186.09 | 1.14x slower | 1.01x slower |
+| Youtu-LLM-2B | 261.21 / 108.48 | 269.76 / 98.32 | 1.03x slower | 1.10x faster |
+| Qwen3.5-4B | 118.59 / 52.36 | 143.89 / 44.23 | 1.21x slower | 1.18x faster |
+
+### Interpretation
+
+A4 is a worthwhile default because it gives a clean 6-7% W4 prefill uplift on
+the primary 2B/4B models, without changing decode, RSS, package format, or B
+layout reuse. It narrows 2B W4 prefill to near parity with llama.cpp Q4_0, but
+4B still has a large prefill gap; remaining work likely needs deeper packed
+W4 micro-panel/layout changes rather than only activation-side packing.
+
+### Validation
+
+```bash
+cmake --build build_i8mm --target test_matmul bench_matmul mollm_bench -j 10
+./build_i8mm/test_matmul
+./build_i8mm/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_bg128.mollm 128
+./build_i8mm/test_quantized_e2e youtu-llm-2b.mollm youtu-llm-2b_w4g128_bg128.mollm 128
+```
+
+All passed. The e2e CE/PPL rows stayed at the existing W4 values:
+Qwen3.5-0.8B `2.6224 / 13.77`, Youtu-LLM-2B `4.1239 / 61.80`.
+
+## Attempt 39: W4 GEMM 2D Scheduling Check and Full Rerun
+
+### Goal
+
+Test whether W4 prefill can get the same scheduling benefit as W8 GEMM 2D
+N-block scheduling, while preserving the direct-BG128 B layout used by GEMV.
+
+### Implementation
+
+- Extended the W4 q4dot 8x8 GEMM range kernels with `[n_begin, n_end)` so a
+  worker can own a subrange of output columns.
+- Added `MOLLM_W4_GEMM_2D=1` as an opt-in switch for 2D M/N scheduling.
+- Added `MOLLM_W4_GEMM_N_BLOCK=N` for N-block A/B tuning.
+- Kept default W4 GEMM on the previous M-sharded scheduling path. A4 activation
+  packing remains default; M==1 GEMV/decode is unchanged.
+- Added `test_matmul` coverage for BG128 W4 GEMM with odd `N=19`, `threads=4`,
+  and `MOLLM_W4_GEMM_2D=1`.
+
+### Result
+
+Synthetic W4 dominant shapes showed only a tiny or noisy gain:
+
+| Shape `(M,K,N)` | 2D p50 | old 1D p50 | effect |
+|---|---:|---:|---:|
+| `256,2048,6144` | 5.83 ms | 5.88 ms | +0.9% |
+| `256,2560,9216` | 10.95 ms | 10.98 ms | +0.3% |
+
+Strict endpoint results did not justify enabling it by default. A full run with
+experimental W4 2D default measured Youtu-LLM-2B W4 at `248.57 / 113.51` and
+Qwen3.5-4B W4 at `114.67 / 55.90`; a same-session old-1D supplement measured
+Youtu-LLM-2B W4 at `258.36 / 109.00` and Qwen3.5-4B W4 at `116.38 / 51.72`.
+The prefill deltas are smaller than run-to-run variance and not consistently
+positive, so W4 2D scheduling stays as a diagnostic switch.
+
+### Full Current-Default Rerun
+
+Protocol: pp256 + tg64, warmup=3, 4 threads, 5 independent process medians.
+llama.cpp uses the BLAS-on, Metal-off build (`GGML_BLAS=ON`,
+`GGML_METAL=OFF`, `GGML_CPU_REPACK=ON`). Report with raw samples:
+`/tmp/mollm_llama_full_current_default_20260706.md`.
+
+| Model | Case | mollm pp/tg | llama.cpp pp/tg | pp winner | tg winner | mollm RSS |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3.5-0.8B | FP16 / F16 | 601.38 / 123.68 | 664.54 / 97.87 | llama.cpp 1.11x | mollm 1.26x | 3993.1 MB |
+| Qwen3.5-0.8B | W8PC / Q8_0 | 671.73 / 217.69 | 782.16 / 167.63 | llama.cpp 1.16x | mollm 1.30x | 2561.1 MB |
+| Qwen3.5-0.8B | W4G128 BG128 / Q4_0 | 678.41 / 259.43 | 775.95 / 190.89 | llama.cpp 1.14x | mollm 1.36x | 1502.5 MB |
+| Youtu-LLM-2B | FP16 / F16 | 218.67 / 52.12 | 257.93 / 45.12 | llama.cpp 1.18x | mollm 1.16x | 9490.5 MB |
+| Youtu-LLM-2B | W8PC / Q8_0 | 253.05 / 89.53 | 263.95 / 86.58 | llama.cpp 1.04x | mollm 1.03x | 5947.8 MB |
+| Youtu-LLM-2B | W4G128 BG128 / Q4_0 | 248.08 / 115.64 | 265.58 / 97.15 | llama.cpp 1.07x | mollm 1.19x | 2895.4 MB |
+| Qwen3.5-4B | FP16 / F16 | 102.48 / 25.00 | 142.44 / 22.33 | llama.cpp 1.39x | mollm 1.12x | 16783.6 MB |
+| Qwen3.5-4B | W8PC / Q8_0 | 118.55 / 46.64 | 135.58 / 40.50 | llama.cpp 1.14x | mollm 1.15x | 10964.3 MB |
+| Qwen3.5-4B | W4G128 BG128 / Q4_0 | 115.37 / 55.94 | 140.51 / 44.25 | llama.cpp 1.22x | mollm 1.26x | 4987.6 MB |
+
+### Interpretation
+
+The current default state is stable enough to document: W8 and W4 decode are
+faster than the corresponding llama.cpp quantized baselines on this machine,
+but prefill remains slower across all precisions. W8 prefill is closest on
+Youtu-LLM-2B (`1.04x` slower); W4 prefill still needs kernel/layout work,
+especially on Qwen3.5-4B (`1.22x` slower).
+
+### Validation
+
+```bash
+cmake --build build_i8mm --target test_matmul bench_matmul mollm_bench test_quantized_e2e -j 10
+./build_i8mm/test_matmul
+./build_i8mm/test_quantized_e2e qwen35_0.8b.mollm qwen35_0.8b_w4g128_bg128.mollm 128
+./build_i8mm/test_quantized_e2e youtu-llm-2b.mollm youtu-llm-2b_w4g128_bg128.mollm 128
+python3 /Users/molly/.codex/skills/mollm-benchmark/scripts/run_mollm_llama_bench.py \
+  --repo /Users/molly/workspace-youtulm-ncnn/mollm --suite full --runs 5 \
+  --output /tmp/mollm_llama_full_current_default_20260706.md
+```
+
+All passed.
