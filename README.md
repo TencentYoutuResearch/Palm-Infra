@@ -8,10 +8,12 @@ kernels; W8/W4 weight-only quantization uses ARM dot-product kernels.
 
 ## Status
 
-Supports three model families. Benchmark protocol is Apple M5 Pro, 4 threads,
-pp256 + tg64, warmup=3, 5-run median unless noted. Higher throughput numbers
-are bolded. Current tables were refreshed on 2026-07-06; quantized llama.cpp
-rows use `GGML_BLAS=ON`, `GGML_METAL=OFF`, and `GGML_CPU_REPACK=ON`.
+Supports Qwen3.5 dense, Youtu, and experimental Qwen3.5/3.6 MoE text models.
+Benchmark protocol is Apple M5 Pro, 4 threads, pp256 + tg64, warmup=3,
+5-run median unless noted. Higher throughput numbers are bolded. Dense tables
+were refreshed on 2026-07-06; the MoE table was refreshed on 2026-07-07.
+Quantized llama.cpp rows use `GGML_BLAS=ON`, `GGML_METAL=OFF`, and
+`GGML_CPU_REPACK=ON`.
 
 FP16:
 
@@ -36,6 +38,12 @@ W4G128 direct BG128 / Q4_0:
 | Qwen3.5-0.8B | 678.41 / **259.43** | **775.95** / 190.89 | llama.cpp 1.14x | mollm 1.36x |
 | Youtu-LLM-2B | 248.08 / **115.64** | **265.58** / 97.15 | llama.cpp 1.07x | mollm 1.19x |
 | Qwen3.5-4B | 115.37 / **55.94** | **140.51** / 44.25 | llama.cpp 1.22x | mollm 1.26x |
+
+Experimental MoE W4 / Q4_0:
+
+| Model | mollm W4G128 pp/tg | llama.cpp Q4_0 pp/tg | pp winner | tg winner |
+|-------|--------------------:|---------------------:|-----------|-----------|
+| Qwen3.6-35B-A3B MoE | **131.80** / **60.31** | 116.93 / 43.73 | mollm 1.13x | mollm 1.38x |
 
 
 ## Architecture
@@ -90,6 +98,7 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm 32 256 w4
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm 32 256 w4mixg128
 python3 models/converter.py /path/to/Youtu-LLM-2B youtu-llm-2b_w4g128.mollm 32 256 w4g128
 python3 models/converter.py /path/to/Youtu-LLM-2B youtu-llm-2b_w4mixg128.mollm 32 256 w4mixg128
+python3 models/converter.py /path/to/Qwen3.6-35B-A3B qwen35_moe_40l_w4g128.mollm 40 256 w4g128
 ```
 
 The converter auto-detects the model type from `config.json` and dispatches to the appropriate converter. Supported types:
@@ -97,6 +106,7 @@ The converter auto-detects the model type from `config.json` and dispatches to t
 | `model_type` | Model | Default layers |
 |-------------|-------|-----------------|
 | `qwen3_5` | Qwen3.5-0.8B/4B | 24 (0.8B), 32 (4B) |
+| `qwen3_5_moe` | Qwen3.5/3.6-35B-A3B text-only MoE, FP16/W4 path | Config value; tested package uses 40 text layers |
 | `youtu` | Youtu-LLM-2B | 32 |
 
 **Arguments:**
@@ -120,6 +130,10 @@ Quantization summary:
   still run from Python alone.
 - `w4mixgN` keeps selected quality-sensitive tensors in W8 when pure W4 is too
   lossy for a model.
+- `qwen3_5_moe` supports full text-only W4 packages. Router
+  `mlp.gate.weight` and `shared_expert_gate.weight` stay high precision, while
+  expert `gate_proj`/`up_proj`/`down_proj` weights are flattened and quantized
+  for the runtime MoE scheduler.
 
 See [docs/QUANTIZATION.md](docs/QUANTIZATION.md) for tensor formats, quality
 audits, diagnostic env flags, and kernel notes.
@@ -139,9 +153,15 @@ audits, diagnostic env flags, and kernel notes.
 ./build/mollm_chat --package qwen35_0.8b_w4g128_bg128.mollm --threads 4
 ./build/mollm_chat --package youtu-llm-2b_w4g128_bg128.mollm --threads 4
 ./build/mollm_chat --package qwen35_4b_w8pc.mollm --threads 4
+./build/mollm_chat \
+    --package /path/to/Qwen3.6-35B-A3B/qwen35_moe_40l_w4g128.mollm \
+    --threads 4
 
 # Benchmark (pp256 + tg64, prints per-op profile)
 ./build/mollm_bench --package qwen35_4b_w4g128_bg128.mollm \
+    --prompt-tokens 256 --max-new-tokens 64 --warmup 3 --threads 4 --profile
+MOLLM_MOE_PROFILE=1 ./build/mollm_bench \
+    --package /path/to/Qwen3.6-35B-A3B/qwen35_moe_40l_w4g128.mollm \
     --prompt-tokens 256 --max-new-tokens 64 --warmup 3 --threads 4 --profile
 ```
 
@@ -154,6 +174,8 @@ exit. If your local optimized build directory is `build_i8mm`, replace
 ### Near-term
 - **W4 prefill**: W4 decode is faster than local llama.cpp Q4_0 on the
   primary 2B/4B models; next work is closing the remaining prefill gap.
+- **MoE prefill**: Qwen3.5/3.6 MoE now has a full W4 text path and matmul-backed
+  routed FFN scheduler; next work is improving small-bucket expert GEMM.
 - **W4 quality policy**: Qwen3.5 and Youtu both have first mixed policies;
   next step is targeted ablation to reduce W8 coverage without losing PPL.
 - **Graph fusion**: fuse adjacent matmul + activation + norm to reduce cache thrash between ops (end-to-end matmul utilization is 40% vs 86% microbench, the 2.5x gap is cache/DRAM traffic between matmuls)
@@ -166,7 +188,7 @@ exit. If your local optimized build directory is `build_i8mm`, replace
 - **Vision encoder**: Qwen3.5 is multimodal — wire up the ViT side
 
 ### Longer-term
-- **MoE support**: Mixture-of-Experts routing + sparse expert matmul (DeepSeek, Qwen3-MoE, Mixtral)
+- **MoE memory tiering**: expert-level lazy load, cache, and offload
 - **GPU/Vulkan backend**: roadmap item, CPU-first for now
 - **W4 KV cache**: reduce decode memory for long contexts
 - **More models**: Llama, Mistral, DeepSeek families

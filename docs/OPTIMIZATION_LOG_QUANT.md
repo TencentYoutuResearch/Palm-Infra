@@ -1,6 +1,6 @@
 # Quantization Optimization Log
 
-*Last updated: 2026-07-06*
+*Last updated: 2026-07-07*
 
 This log tracks quantized-kernel optimization separately from the Qwen3.5 FP16
 optimization log. `docs/QUANTIZATION.md` describes the format and correctness
@@ -59,6 +59,261 @@ ctest --test-dir build --output-on-failure -E 'test_e2e|bench_matmul|bench_sdpa'
 ```
 
 All passed.
+
+## Attempt 40: Qwen3.5-MoE W4 Bring-up and First Bottleneck Profile
+
+### Goal
+
+Build a full text-only Qwen3.5-35B-A3B MoE W4 package while keeping the expert
+router projection unquantized, then identify the dominant runtime bottleneck.
+
+### Implementation
+
+- Added MoE W4 export support in `models/qwen35_moe.py`.
+- Kept `model.language_model.layers.*.mlp.gate.weight` in FP16. This tensor is
+  the expert router projection (`hidden -> num_experts logits`) and is not the
+  SwiGLU gate.
+- Kept `mlp.shared_expert_gate.weight` in FP16 as a small control-path tensor.
+- Flattened expert tensors for package/runtime storage:
+  - `mlp.experts.gate_up_proj`: `[E, 2I, H] -> [E*2I, H]`
+  - `mlp.experts.down_proj`: `[E, H, I] -> [E*H, I]`
+- Extended the MoE kernel with scalar INT8/INT4 dequant reads for direct q4dot
+  and BG128 layouts.
+- Changed `save_package()` to stream weight files into the `.mollm` package
+  instead of accumulating one large Python `bytearray`; full MoE W4 packages
+  otherwise require tens of GB of temporary RAM during packing.
+- Added `MOLLM_MOE_PROFILE=1` profiling counters for MoE internal stages.
+
+### Result
+
+Generated:
+
+```bash
+python3 models/converter.py /Users/molly/Qwen3.5-35B-A3B \
+  /tmp/qwen35_moe_40l_w4g128.mollm 40 256 w4g128
+```
+
+Package: `/tmp/qwen35_moe_40l_w4g128.mollm`, size `19208697283` bytes
+(`18G` as reported by `ls -lh`). The package has 693 weights and 391 W4
+quantized tensors. Header spot-check:
+
+| Tensor | Precision | Notes |
+|---|---:|---|
+| `layers_0_mlp_gate_weight` | FP16 | router, intentionally not quantized |
+| `layers_0_mlp_shared_expert_gate_weight` | FP16 | small control-path gate |
+| `layers_0_mlp_experts_gate_up_proj` | INT4 | q4dot, group 128 |
+| `layers_0_mlp_experts_down_proj` | INT4 | q4dot, group 128 |
+| `lm_head` | INT4 | q4dot, group 128 |
+
+Smoke test:
+
+```bash
+./build_i8mm/mollm_chat --package /tmp/qwen35_moe_40l_w4g128.mollm \
+  --prompt "Hi" --max-new-tokens 2 --temperature 0 --threads 8
+```
+
+Output was coherent (`Hello!`) and the run completed without load or decode
+errors, but speed is poor: `ttft=2.97s`, `tpot=1450.5ms`, `decode=0.7 t/s`.
+
+### Profile
+
+Command:
+
+```bash
+MOLLM_MATMUL_SHAPE_PROFILE=1 MOLLM_MOE_PROFILE=1 \
+./build_i8mm/mollm_bench --package /tmp/qwen35_moe_40l_w4g128.mollm \
+  --prompt-tokens 32 --max-new-tokens 2 --warmup 0 --threads 8 \
+  --profile --temperature 0
+```
+
+Top-level op profile:
+
+| Phase | MOE | MATMUL | Other |
+|---|---:|---:|---:|
+| prefill | `6355.92 ms` / `96.7%` | `178.59 ms` / `2.7%` | `<1%` |
+| decode | `1487.96 ms` / `99.5%` | `5.01 ms` / `0.3%` | `<1%` |
+
+MoE internal profile (sums include parallel worker time, so use percentages):
+
+| Stage | Calls | Total ms | Avg ms | Share |
+|---|---:|---:|---:|---:|
+| `routed_gate_up` | 10560 | 30537.96 | 2.892 | 60.0% |
+| `routed_down` | 10560 | 13022.25 | 1.233 | 25.6% |
+| `shared_gate_up` | 1320 | 5113.57 | 3.874 | 10.1% |
+| `shared_down` | 1320 | 1760.43 | 1.334 | 3.5% |
+| `router_softmax_topk` | 1320 | 424.25 | 0.321 | 0.8% |
+
+Interpretation: the router/top-k path is not the problem. The bottleneck is
+the correctness-first MoE W4 scalar dequant dot implementation, especially
+selected-expert `gate_up` (`top_k * 2I x H`) and `down`
+(`top_k * H x I`).
+
+### Next Direction
+
+Use the existing optimized q4dot GEMV/GEMM kernels for selected expert blocks
+instead of scalar dequant loops:
+
+- For decode, each selected expert can be represented as a q4dot row-block
+  tensor view:
+  - `gate_up`: `[2I, H]` at row offset `expert * 2I`
+  - `down`: `[H, I]` at row offset `expert * H`
+- The row offsets are multiples of 8 (`2I=1024`, `H=2048`), so q4dot tiled
+  layout can be viewed without repacking.
+- Prefill can start with per-token selected-expert GEMV calls for correctness,
+  then group tokens by expert to use batched GEMM.
+
+### Validation
+
+```bash
+./build_i8mm/test_moe
+ctest --test-dir build_i8mm --output-on-failure \
+  -E 'bench_matmul|bench_sdpa|test_e2e|test_quantized_e2e'
+```
+
+Both passed. Full e2e was also run after W4 package bring-up before adding the
+MoE internal profiler, and passed 17/17.
+
+## Attempt 41: MoE Matmul-Backed Scheduler
+
+### Goal
+
+Replace the monolithic scalar MoE kernel with a scheduler that keeps MoE
+semantics in one graph op but reuses existing matmul kernels:
+
+- router: `hidden [T,H] @ gate [E,H] -> logits [T,E]`
+- fused top-k selector: top-k over logits, then normalized top-k weights
+- shared expert: batched gate/up/down matmuls
+- routed experts: bucket tokens by selected expert, create zero-copy expert
+  weight row views, run gate_up/down matmuls, then scatter weighted outputs
+
+### Implementation
+
+- `kernels/moe.cpp` now uses `kernel_matmul_fp32` for router, shared expert,
+  and selected expert FFNs.
+- Expert weights remain physically merged:
+  - `experts.gate_up_proj`: `[num_experts * 2I, H]`
+  - `experts.down_proj`: `[num_experts * H, I]`
+- Added expert row views for FP32/FP16/INT8/INT4, including q4dot and BG128
+  packed layouts. Qwen3.5-MoE expert row ranges are naturally 8-row aligned:
+  `2I=1024`, `H=2048`, so packed q4dot views do not copy weight data.
+- Removed the engine-side special case that skipped all MoE weight packing.
+  With matmul-backed MoE, FP16 router/shared weights use the same load-time
+  interleaved packing as ordinary linear weights. Direct q4dot/BG128 expert
+  packages still stay sliceable.
+- Relaxed the MoE FP16 unit-test tolerance to match the optimized FP16 matmul
+  path, which uses FP16 accumulation by default.
+
+### Result
+
+Full 40-layer W4 package smoke:
+
+```bash
+./build_i8mm/mollm_chat --package /tmp/qwen35_moe_40l_w4g128.mollm \
+  --prompt "你好" --max-new-tokens 8 --temperature 0 --threads 8
+```
+
+Output remained coherent:
+
+```text
+Assistant> 你好！有什么我可以帮你的吗？
+[ttft=3.20s tpot=84.8ms prefill=4.1 tps decode=11.8 tps tokens=8]
+```
+
+Profile with `prompt_tokens=32,max_new_tokens=2,threads=8`:
+
+| Metric | Before | After |
+|---|---:|---:|
+| prefill | `4.86 t/s` | `24.65 t/s` |
+| decode | `0.67 t/s` | `18.41 t/s` |
+| prefill MOE share | `96.7%` | `86.9%` |
+| decode MOE share | `99.5%` | `86.8%` |
+| peak RSS | not recorded in Attempt 40 table | `3214.0 MB` |
+
+The new MoE internal profile is now dominated by actual q4dot matmuls rather
+than scalar dequant:
+
+| Stage | Calls | Total | Share |
+|---|---:|---:|---:|
+| routed_gate_up | 1333 | `750.79 ms` | `64.5%` |
+| routed_down | 1333 | `386.06 ms` | `33.1%` |
+| shared_gate_up | 80 | `11.21 ms` | `1.0%` |
+| shared_down | 80 | `5.96 ms` | `0.5%` |
+| router_matmul | 80 | `5.15 ms` | `0.4%` |
+| topk_selector | 80 | `1.07 ms` | `0.1%` |
+
+### Interpretation
+
+The structural change fixed the catastrophic MoE decode bottleneck and made the
+implementation match the intended design: router/top-k are lightweight, while
+expert FFNs reuse normal q4dot GEMV/GEMM. Prefill is much better but still
+spends most time in many small expert matmuls; the next optimization area is
+reducing routed expert call overhead and improving grouped/bucketed prefill
+kernel efficiency.
+
+### Validation
+
+```bash
+cmake --build build_i8mm --target mollm_chat mollm_bench test_moe -j
+./build_i8mm/test_moe
+ctest --test-dir build_i8mm --output-on-failure -E 'bench_matmul|bench_sdpa'
+./build_i8mm/mollm_chat --package /tmp/qwen35_moe_40l_w4g128.mollm \
+  --prompt "你好" --max-new-tokens 8 --temperature 0 --threads 8
+MOLLM_MOE_PROFILE=1 MOLLM_MATMUL_SHAPE_PROFILE=1 \
+./build_i8mm/mollm_bench --package /tmp/qwen35_moe_40l_w4g128.mollm \
+  --prompt-tokens 32 --max-new-tokens 2 --warmup 0 --threads 8 \
+  --profile --temperature 0
+```
+
+All unit/e2e tests passed, and the full W4 chat smoke completed without crash.
+
+## Attempt 40: W4 q4_0 4x8 Shared-B Layout Prototype
+
+### Goal
+
+Check whether a llama.cpp-style `q4_0_4x8` packed B block can replace the
+current BG128 W4 layout while remaining usable by both GEMV and GEMM.
+
+### Implementation
+
+- Added an opt-in `Tensor::q4_0_4x8_data` side pointer and
+  `pack_b_q4_0_4x8_full()`.
+- The packer converts mollm's pair-packed signed int4 rows into q4_0 K32
+  semantics: low nibble stores K0..15 and high nibble stores K16..31. No
+  llama.cpp `xor 0x88` is needed because mollm already stores signed
+  two's-complement nibbles.
+- Added `MOLLM_W4_Q40_4X8=1` dispatch for W4 GEMV and GEMM. This is a
+  correctness-first DOTPROD implementation; it does not port llama.cpp's
+  q4_0_4x8 i8mm assembly GEMM.
+- `test_matmul` now compares q4_0_4x8 against the existing q4dot/BG128 paths.
+
+### Microbench Result
+
+Protocol: `build_i8mm/bench_matmul`, 4 threads, warmup=8, repeat=30,
+`--int4 --group-size 128`.
+
+| Shape `(M,K,N)` | BG128 avg | q4_0_4x8 avg | effect |
+|---|---:|---:|---:|
+| `1,2048,6144` | 0.05 ms | 0.06 ms | q4_0_4x8 0.82x |
+| `256,2048,6144` | 6.94 ms | 9.16 ms | q4_0_4x8 0.76x |
+| `1,2560,9216` | 0.09 ms | 0.10 ms | q4_0_4x8 0.84x |
+| `256,2560,9216` | 13.59 ms | 17.64 ms | q4_0_4x8 0.77x |
+
+### Interpretation
+
+The shared B block is correct but slower than BG128 in the current DOTPROD
+implementation. This suggests that simply adopting llama.cpp's packed block
+format is not enough. The remaining llama.cpp advantage is more likely from
+its q4_0_4x8 GEMM compute organization, especially the i8mm/SMMLA assembly and
+matching q8_0x4 A packing, rather than the B block format alone.
+
+### Validation
+
+```bash
+cmake --build build_i8mm --target test_matmul bench_matmul -j 10
+./build_i8mm/test_matmul
+env MOLLM_W4_PACKED_BG128=1 ./build_i8mm/bench_matmul 256 2048 6144 --int4 --group-size 128 --threads 4 --warmup 8 --repeat 30
+env MOLLM_W4_Q40_4X8=1 ./build_i8mm/bench_matmul 256 2048 6144 --int4 --group-size 128 --threads 4 --warmup 8 --repeat 30
+```
 
 `test_quantized_e2e` wall time dropped from about 9s to about 2.5s for explicit
 W8PC/W8G128 runs, and about 1.4s inside quick ctest after warm filesystem/cache

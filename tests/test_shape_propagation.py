@@ -145,6 +145,24 @@ def test_gated_deltanet_prefill_has_seq_dim1():
     check(is_seq(de[1]), "GATED_DELTANET_PREFILL has SEQ on dim 1")
 
 
+def test_moe_inherits_seq_dim1():
+    g = GraphBuilder()
+    h = g.input('hidden', (8, 256), dynamic=SEQ_DIM1)
+    router = g.weight('router', (4, 8))
+    gu = g.weight('gu', (4, 12, 8))
+    down = g.weight('down', (4, 8, 6))
+    sg = g.weight('sg', (5, 8))
+    su = g.weight('su', (5, 8))
+    sd = g.weight('sd', (8, 5))
+    seg = g.weight('seg', (1, 8))
+    moe = g.moe(h, router, gu, down, sg, su, sd, seg,
+                hidden_size=8, num_experts=4, top_k=2,
+                intermediate_size=6, shared_intermediate_size=5)
+    propagate_dim_exprs(g._nodes)
+    de = de_of(g, moe)
+    check(is_seq(de[1]), "MOE inherits SEQ on dim 1")
+
+
 def test_decode_graph_all_const():
     g = GraphBuilder()
     g.input('hidden', (1024, 1))  # no dynamic
@@ -206,6 +224,7 @@ def main():
         test_sdpa_seq_from_q,
         test_permute_reorders,
         test_gated_deltanet_prefill_has_seq_dim1,
+        test_moe_inherits_seq_dim1,
         test_decode_graph_all_const,
         test_reshape_with_seq_symbol,
         test_reshape_with_mul_symbol,

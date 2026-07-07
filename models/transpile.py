@@ -62,6 +62,7 @@ class OpType(IntEnum):
     DEQUANTIZE_KV  = 81
     GATED_DELTANET_DECODE  = 110
     GATED_DELTANET_PREFILL = 111
+    MOE            = 120
     SHORTCONV      = 140
 
 class Precision(IntEnum):
@@ -237,7 +238,8 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.ROTARY_EMBED,
               OpType.TILE, OpType.CONTIGUOUS,
               OpType.QUANTIZE_KV, OpType.DEQUANTIZE_KV,
-              OpType.SHORTCONV):
+              OpType.SHORTCONV,
+              OpType.MOE):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
     if op in (OpType.ADD, OpType.MUL):
@@ -706,6 +708,28 @@ class GraphBuilder:
                               1 if use_qk_l2norm else 0, 4, 0, num_v_heads],
                          f32=[rms_eps, 1e-6, scale])
 
+    def moe(self, hidden: int, router: int,
+            experts_gate_up: int, experts_down: int,
+            shared_gate: int, shared_up: int, shared_down: int,
+            shared_expert_gate: int,
+            hidden_size: int, num_experts: int, top_k: int,
+            intermediate_size: int, shared_intermediate_size: int) -> int:
+        """Fused Qwen3.5-MoE sparse MLP.
+
+        The expert tensors keep HF row-major layout:
+          experts_gate_up [num_experts, 2*intermediate, hidden]
+          experts_down    [num_experts, hidden, intermediate]
+        """
+        sx = self._nodes[hidden].out_shape
+        return self._add(OpType.MOE,
+                         [hidden, router, experts_gate_up, experts_down,
+                          shared_gate, shared_up, shared_down,
+                          shared_expert_gate],
+                         sx,
+                         prec=Precision.FP32,
+                         i32=[hidden_size, num_experts, top_k,
+                              intermediate_size, shared_intermediate_size])
+
     # ---- save ----
 
     def save(self, path_prefix: str):
@@ -1074,7 +1098,8 @@ def save_package(output_path: str,
 
         # Step 3: collect weight files referenced by both graphs
         weight_files = {}  # relative_name -> (offset, size)
-        weights_blob = bytearray()
+        weight_entries = []  # (path, size), in package order
+        weights_len = 0
 
         for g in [g_prefill, g_decode]:
             for node in g._nodes:
@@ -1091,10 +1116,11 @@ def save_package(output_path: str,
                     wpath = os.path.join(tmp_dir, ref)
                 if not os.path.exists(wpath):
                     raise FileNotFoundError(f"Weight file not found: {ref}")
-                blob = open(wpath, 'rb').read()
-                offset = len(weights_blob)
-                weights_blob.extend(blob)
-                weight_files[ref] = [offset, len(blob)]
+                size = os.path.getsize(wpath)
+                offset = weights_len
+                weights_len += size
+                weight_entries.append((wpath, size))
+                weight_files[ref] = [offset, size]
 
         # Step 4: build metadata
         meta = dict(metadata)
@@ -1127,18 +1153,26 @@ def save_package(output_path: str,
             f.write(struct.pack('<QQ', jin_off, len(jinja_bytes)))
             f.write(struct.pack('<QQ', pf_off, len(pf_bytes)))
             f.write(struct.pack('<QQ', dc_off, len(dc_bytes)))
-            f.write(struct.pack('<QQ', w_off, len(weights_blob)))
+            f.write(struct.pack('<QQ', w_off, weights_len))
             f.write(b'\x00' * (hs - 4 - 4 - 8 * 12))  # pad to 128
             f.write(meta_json)
             f.write(tok_bytes)
             f.write(jinja_bytes)
             f.write(pf_bytes)
             f.write(dc_bytes)
-            f.write(weights_blob)
+            buf = bytearray(8 * 1024 * 1024)
+            view = memoryview(buf)
+            for wpath, _ in weight_entries:
+                with open(wpath, 'rb') as wf:
+                    while True:
+                        n = wf.readinto(buf)
+                        if not n:
+                            break
+                        f.write(view[:n])
 
         total = (hs + len(meta_json) + len(tok_bytes) + len(jinja_bytes)
-                 + len(pf_bytes) + len(dc_bytes) + len(weights_blob))
-        print(f"Saved {output_path} ({len(weights_blob)} weights + {len(tok_bytes)} tokenizer + "
+                 + len(pf_bytes) + len(dc_bytes) + weights_len)
+        print(f"Saved {output_path} ({weights_len} weights + {len(tok_bytes)} tokenizer + "
               f"{len(jinja_bytes)} jinja + {len(pf_bytes)} prefill + {len(dc_bytes)} decode = {total} bytes)")
 
     finally:

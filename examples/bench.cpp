@@ -15,6 +15,9 @@ void mollm_reset_pack_counters();
 int mollm_matmul_shape_profile_enabled();
 void mollm_reset_matmul_shape_profile();
 void mollm_print_matmul_shape_profile(const char* title, int top_n);
+int mollm_moe_profile_enabled();
+void mollm_reset_moe_profile();
+void mollm_print_moe_profile(const char* title);
 }
 #include <string>
 #include <vector>
@@ -149,6 +152,7 @@ int main(int argc, char** argv) {
 
     mollm_reset_pack_counters();
     mollm_reset_matmul_shape_profile();
+    mollm_reset_moe_profile();
 
     if (opts.profile) {
         engine.reset_profiles();
@@ -227,6 +231,9 @@ int main(int argc, char** argv) {
         print_profile_section("decode_profile", engine.decode_exec_ctx());
         if (mollm_matmul_shape_profile_enabled()) {
             mollm_print_matmul_shape_profile("matmul_shape_profile", 24);
+        }
+        if (mollm_moe_profile_enabled()) {
+            mollm_print_moe_profile("moe_profile");
         }
     }
 

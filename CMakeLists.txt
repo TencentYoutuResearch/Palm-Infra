@@ -43,6 +43,7 @@ set(SOURCES
     kernels/gdn.cpp
     kernels/gdn_decode.cpp
     kernels/gdn_prefill.cpp
+    kernels/moe.cpp
     kernels/threading.cpp
     # engine
     engine/engine.cpp
@@ -55,6 +56,7 @@ set(HEADERS
     kernels/norm.h
     kernels/rope.h
     kernels/attention.h
+    kernels/moe.h
     kernels/threading.h
     graph/buffer_pool.h
     graph/mmap_file.h
@@ -183,6 +185,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_io            tests/test_io.cpp)
     add_mollm_test(test_execute       tests/test_execute.cpp)
     add_mollm_test(test_matmul        tests/test_matmul.cpp)
+    add_mollm_test(test_moe           tests/test_moe.cpp)
     add_mollm_test(bench_matmul       tests/bench_matmul.cpp)
     add_mollm_test(bench_sdpa         tests/bench_sdpa.cpp)
     add_mollm_test(test_norm          tests/test_norm.cpp)

@@ -25,9 +25,14 @@ bool env_flag_enabled(const char* name) {
     return value && std::strcmp(value, "0") != 0;
 }
 
+bool is_2d_linear_weight(const Tensor& t) {
+    return t.shape[2] == 1 && t.shape[3] == 1;
+}
+
 bool int8_q8dot_repack_supported(const Tensor& t) {
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
-    return t.prec == Precision::INT8 && t.group_size > 0 && (t.group_size % 32) == 0;
+    return is_2d_linear_weight(t) &&
+           t.prec == Precision::INT8 && t.group_size > 0 && (t.group_size % 32) == 0;
 #else
     (void)t;
     return false;
@@ -36,7 +41,8 @@ bool int8_q8dot_repack_supported(const Tensor& t) {
 
 bool int4_q4dot_repack_supported(const Tensor& t) {
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
-    return t.prec == Precision::INT4 && t.group_size > 0 &&
+    return is_2d_linear_weight(t) &&
+           t.prec == Precision::INT4 && t.group_size > 0 &&
            (t.group_size % 32) == 0 && t.shape[1] > 0 && (t.shape[1] % 32) == 0;
 #else
     (void)t;
@@ -61,7 +67,8 @@ using PackedWeightMap = std::unordered_map<std::string, std::vector<uint8_t>>;
 
 Int8PackingPlan plan_int8_packing(const Tensor& t) {
     Int8PackingPlan plan;
-    if (t.prec != Precision::INT8 || !g_matmul_config.use_interleave_pack) {
+    if (t.prec != Precision::INT8 || !g_matmul_config.use_interleave_pack ||
+        !is_2d_linear_weight(t)) {
         return plan;
     }
 
@@ -84,7 +91,10 @@ Int8PackingPlan plan_int8_packing(const Tensor& t) {
 void maybe_pack_fp16_weight(Tensor& t, const std::string& key,
                             const void* rowmajor_data,
                             PackedWeightMap& packed_weights) {
-    if (t.prec != Precision::FP16 || !g_matmul_config.use_interleave_pack) return;
+    if (t.prec != Precision::FP16 || !g_matmul_config.use_interleave_pack ||
+        !is_2d_linear_weight(t)) {
+        return;
+    }
 
     auto it = packed_weights.find(key);
     if (it == packed_weights.end()) {
@@ -150,6 +160,7 @@ void maybe_pack_int4_g128_weight(Tensor& t, const std::string& key,
                                  const void* q4dot_data,
                                  PackedWeightMap& packed_weights) {
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    if (!is_2d_linear_weight(t)) return;
     if (!env_flag_enabled("MOLLM_W4_PACKED_BG128")) return;
     if (t.prec != Precision::INT4 || !q4dot_data || !t.scales ||
         t.group_size != 128 || t.shape[1] <= 0 || (t.shape[1] % 128) != 0) {
@@ -183,6 +194,7 @@ void maybe_pack_int4_weight(Tensor& t, const std::string& key,
                             const void* weight_data,
                             PackedWeightMap& packed_weights) {
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    if (!is_2d_linear_weight(t)) return;
     if (t.is_q4_g128_packed) {
         t.q4_g128_data = weight_data;
         return;

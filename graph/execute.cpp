@@ -5,6 +5,7 @@
 #include "kernels/rope.h"
 #include "kernels/attention.h"
 #include "kernels/gdn.h"
+#include "kernels/moe.h"
 #include "kernels/tensor.h"
 #include "kernels/activations.h"  // for Activation enum + sigmoid_f32_neon
 #include <algorithm>
@@ -499,6 +500,19 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::GATED_DELTANET_DECODE: {
         std::vector<Tensor*> gdn_outs = { output };
         kernel_gdn_decode(params, inputs, gdn_outs, thread_pool);
+        break;
+    }
+    case OpType::MOE: {
+        int hidden_size = graph_params::get_i32(params, 0, output ? (int)output->shape[0] : 0);
+        int num_experts = graph_params::get_i32(params, 1, 0);
+        int top_k = graph_params::get_i32(params, 2, 0);
+        int intermediate_size = graph_params::get_i32(params, 3, 0);
+        int shared_intermediate_size = graph_params::get_i32(params, 4, intermediate_size);
+        if (output) {
+            kernel_qwen3_moe(inputs, *output, thread_pool,
+                             hidden_size, num_experts, top_k,
+                             intermediate_size, shared_intermediate_size);
+        }
         break;
     }
     case OpType::SHORTCONV: {

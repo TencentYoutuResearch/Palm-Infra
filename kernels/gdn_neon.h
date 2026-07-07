@@ -4,7 +4,6 @@
 #if HAS_NEON
 #include <arm_neon.h>
 #include <cmath>
-#include "kernels/activations.h"  // sigmoid_f32_neon
 
 static inline float gdn_sigmoidf(float x) {
     return 1.f / (1.f + std::exp(-x));
@@ -141,12 +140,13 @@ static inline void gdn_recurrence_neon(
             float32x4_t ao = vld1q_f32(attn_out + dv);
             float32x4_t nw = vld1q_f32(norm_w + dv);
             float32x4_t normed = vmulq_f32(vmulq_f32(ao, rms4), nw);
-            // Gated: out = normed * z * sigmoid(z) = normed * silu(z)
-            // Use NEON sigmoid_f32_neon (polynomial approx) instead of scalar
-            // expf loop. Avoids vst1q→scalar→vld1q round-trip.
-            float32x4_t zv = vld1q_f32(z_row + dv);
-            float32x4_t gate = vmulq_f32(zv, sigmoid_f32_neon(zv));
-            vst1q_f32(out_head + dv, vmulq_f32(normed, gate));
+            float normed_lane[4];
+            vst1q_f32(normed_lane, normed);
+            for (int j = 0; j < 4; j++) {
+                float z = z_row[dv + j];
+                float silu_z = z / (1.f + std::exp(-z));
+                out_head[dv + j] = normed_lane[j] * silu_z;
+            }
         }
     }
 }
