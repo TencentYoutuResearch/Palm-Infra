@@ -15,6 +15,7 @@ def check(actual, expected, msg):
 
 
 def main():
+    check(_quant_spec("fp16", 1024), None, "fp16 is unquantized")
     check(_quant_spec("none", 1024), None, "none is unquantized")
     check(_quant_spec("w8pc", 1024), ("w8", 1024), "w8pc uses K as group")
     check(_quant_spec("w8g128", 1024), ("w8", 128), "w8g128 parses")

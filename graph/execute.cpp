@@ -961,7 +961,7 @@ void CPUBackend::dispatch(const GraphNode& node,
                     // But for correctness, use: vlogq_f32 if available, else scalar fallback.
                     // NEON doesn't have vlogq_f32, so we do scalar for the log part.
                     // Fast path: if x > 10, return x (softplus ≈ x).
-                    float32x4_t mask_large = vcgtq_f32(x, vdupq_n_f32(10.f));
+                    uint32x4_t mask_large = vcgtq_f32(x, vdupq_n_f32(10.f));
                     float32x4_t result = x;  // fallback for large x
                     // For smaller values, compute log(1+exp) scalar.
                     float tmp[4];

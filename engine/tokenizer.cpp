@@ -131,34 +131,64 @@ static int utf8_codepoint(const char* s, int len_avail, int& len) {
     len = 1; return c;
 }
 
-static bool is_cjk_or_kana(int cp) {
+static bool is_common_unicode_punctuation(int cp) {
+    return cp == 0x00AB || cp == 0x00BB ||     // Guillemets
+           (cp >= 0x2000 && cp <= 0x206F) ||   // General punctuation
+           (cp >= 0x3000 && cp <= 0x303F) ||   // CJK symbols/punctuation
+           (cp >= 0xFE30 && cp <= 0xFE4F) ||   // CJK compatibility punctuation
+           (cp >= 0xFF00 && cp <= 0xFF0F) ||   // Fullwidth ASCII punctuation
+           (cp >= 0xFF1A && cp <= 0xFF20) ||
+           (cp >= 0xFF3B && cp <= 0xFF40) ||
+           (cp >= 0xFF5B && cp <= 0xFF65);
+}
+
+static bool is_unicode_mark(int cp) {
+    return (cp >= 0x0300 && cp <= 0x036F) ||
+           (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+           (cp >= 0x1DC0 && cp <= 0x1DFF) ||
+           (cp >= 0x20D0 && cp <= 0x20FF) ||
+           (cp >= 0xFE20 && cp <= 0xFE2F) ||
+           (cp >= 0x064B && cp <= 0x065F) ||
+           (cp >= 0x0900 && cp <= 0x0903) ||
+           cp == 0x093A || cp == 0x093C ||
+           (cp >= 0x093E && cp <= 0x094D) ||
+           (cp >= 0x0951 && cp <= 0x0957) ||
+           (cp >= 0x0962 && cp <= 0x0963) ||
+           (cp >= 0x0981 && cp <= 0x0983) ||
+           cp == 0x09BC ||
+           (cp >= 0x09BE && cp <= 0x09C4) ||
+           (cp >= 0x09C7 && cp <= 0x09C8) ||
+           (cp >= 0x09CB && cp <= 0x09CD) ||
+           cp == 0x09D7 ||
+           (cp >= 0x09E2 && cp <= 0x09E3) ||
+           cp == 0x0E31 ||
+           (cp >= 0x0E34 && cp <= 0x0E3A) ||
+           (cp >= 0x0E47 && cp <= 0x0E4E) ||
+           cp == 0xFE0F;
+}
+
+static bool is_cjk_or_kana_letter(int cp) {
     return (cp >= 0x4E00 && cp <= 0x9FFF) ||   // CJK Unified
            (cp >= 0x3400 && cp <= 0x4DBF) ||   // CJK Extension A
-           (cp >= 0x3040 && cp <= 0x309F) ||   // Hiragana
-           (cp >= 0x30A0 && cp <= 0x30FF) ||   // Katakana
+           (cp >= 0xF900 && cp <= 0xFAFF) ||   // CJK Compatibility Ideographs
+           (cp >= 0x3041 && cp <= 0x3096) ||   // Hiragana letters
+           (cp >= 0x30A1 && cp <= 0x30FA) ||   // Katakana letters
+           cp == 0x30FC ||                      // Katakana-Hiragana prolonged sound mark
+           (cp >= 0x1100 && cp <= 0x11FF) ||   // Hangul Jamo
+           (cp >= 0x3130 && cp <= 0x318F) ||   // Hangul Compatibility Jamo
            (cp >= 0xAC00 && cp <= 0xD7AF) ||   // Hangul
-           (cp >= 0x3000 && cp <= 0x303F) ||   // CJK Symbols
-           (cp >= 0xFF01 && cp <= 0xFF60) ||   // Fullwidth forms
-           (cp >= 0xFE30 && cp <= 0xFE4F) ||   // CJK Compatibility
            (cp >= 0x3105 && cp <= 0x312F);     // Bopomofo
 }
 
 static bool is_letter(int cp) {
     if (cp >= 'A' && cp <= 'Z') return true;
     if (cp >= 'a' && cp <= 'z') return true;
-    // Non-ASCII letters (not CJK/Hangul/Kana — those go through Stage 0)
-    if (cp > 0x7F && !is_cjk_or_kana(cp)) return true;
-    return false;
-}
-
-static bool is_upper(int cp) {
-    return (cp >= 'A' && cp <= 'Z');
-}
-
-static bool is_lower(int cp) {
-    if (cp >= 'a' && cp <= 'z') return true;
-    // Non-ASCII non-CJK are treated as Lo (Letter, other) = lowercase-like
-    if (cp > 0x7F && !is_cjk_or_kana(cp)) return true;
+    if (is_unicode_mark(cp)) return false;
+    if (is_cjk_or_kana_letter(cp)) return true;
+    // Approximate Unicode \p{L}/\p{M} for scripts outside the CJK ranges used
+    // by our fixtures. Keep common Unicode punctuation out so it can follow
+    // the punctuation branch instead of being folded into letter runs.
+    if (cp > 0x7F && !is_common_unicode_punctuation(cp)) return true;
     return false;
 }
 
@@ -176,19 +206,17 @@ static bool is_newline(int cp) {
 
 // --- Pre-tokenizer ----------------------------------------------------------
 //
-// Implements the 3-stage HuggingFace pre-tokenizer:
-//   Stage 0: CJK isolation — groups consecutive CJK/Hangul/Kana characters
-//   Stage 1: GPT-4 word splitting regex (simplified)
-//   Stage 2: Byte-level encoding (done in encode(), not here)
+// Implements the HuggingFace tokenizer.json Split regex followed by ByteLevel
+// encoding (the ByteLevel pass is done in encode(), not here).
 //
-// Stage 1 regex alternatives (tried in order):
-//   1. [^\r\n\p{L}\p{N}]?\p{Lu}*\p{Ll}+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-//   2. [^\r\n\p{L}\p{N}]?\p{Lu}+\p{Ll}*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
-//   3. \p{N}                          — single digit
-//   4.  ?[^\s\p{L}\p{N}]+[\r\n/]*    — punctuation with opt. space prefix
-//   5. \s*[\r\n]+                     — newlines
-//   6. \s+(?!\S)                      — trailing whitespace
-//   7. \s+                            — whitespace
+// Stage 1 regex alternatives from tokenizer.json (tried in order):
+//   1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+//   2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+//   3. \p{N}                           — single digit
+//   4.  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*  — punctuation with opt. space prefix
+//   5. \s*[\r\n]+                      — newlines
+//   6. \s+(?!\S)                       — trailing whitespace
+//   7. \s+                             — whitespace
 
 struct CharReader {
     const char* data;
@@ -207,41 +235,16 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
     std::vector<std::string> out;
     if (text.empty()) return out;
 
-    // Stage 0: Split CJK groups vs non-CJK segments
     struct Span { int start; int end; bool is_cjk; };
-    std::vector<Span> spans;
-    {
-        CharReader r{text.c_str(), (int)text.size()};
-        while (r.pos < r.size) {
-            int len;
-            int cp = r.peek_cp(len);
-            if (is_cjk_or_kana(cp)) {
-                int start = r.pos;
-                while (r.pos < r.size) {
-                    cp = r.peek_cp(len);
-                    if (!is_cjk_or_kana(cp)) break;
-                    r.advance(len);
-                }
-                spans.push_back({start, r.pos, true});
-            } else {
-                int start = r.pos;
-                while (r.pos < r.size) {
-                    cp = r.peek_cp(len);
-                    if (is_cjk_or_kana(cp)) break;
-                    r.advance(len);
-                }
-                spans.push_back({start, r.pos, false});
-            }
-        }
-    }
+    std::vector<Span> spans = {{0, (int)text.size(), false}};
 
-    // Stage 1: For each span, apply GPT-4-like word splitting
+    // Apply the tokenizer.json Split regex.
     //
     // The regex tries alternatives in order at each position:
-    //   1. [^\r\n\p{L}\p{N}]?\p{Lu}*\p{Ll}+(contraction)?
-    //   2. [^\r\n\p{L}\p{N}]?\p{Lu}+\p{Ll}*(contraction)?
+    //   1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    //   2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
     //   3. \p{N}
-    //   4.  ?[^\s\p{L}\p{N}]+[\r\n/]*
+    //   4.  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
     //   5. \s*[\r\n]+
     //   6. \s+(?!\S)  — whitespace NOT followed by non-whitespace (backtracks)
     //   7. \s+
@@ -251,19 +254,26 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
             out.push_back(text.substr(abs_start, abs_end - abs_start));
     };
 
-    // Try to match a contraction suffix ('s, 't, etc.) at current position.
+    // Try to match a contraction token ('s, 't, etc.) at current position.
     // Returns number of bytes consumed (0 if no match).
     auto try_contraction = [](const CharReader& r) -> int {
         if (r.pos >= r.size || r.data[r.pos] != '\'') return 0;
-        int save = r.pos + 1;
-        int end = save;
-        while (end < r.size && r.data[end] >= 'a' && r.data[end] <= 'z') end++;
-        int slen = end - save;
-        const char* s = r.data + save;
-        if ((slen == 1 && (*s == 's' || *s == 't' || *s == 'm' || *s == 'd')) ||
-            (slen == 2 && ((s[0] == 'r' && s[1] == 'e') || (s[0] == 'v' && s[1] == 'e') || (s[0] == 'l' && s[1] == 'l')))) {
-            return end - r.pos;
+        auto lower = [](char c) -> char {
+            return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+        };
+        char buf[3] = {0, 0, 0};
+        int n = 0;
+        for (int i = r.pos + 1; i < r.size && n < 2; i++, n++) {
+            char c = r.data[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) break;
+            buf[n] = lower(c);
         }
+        if (n >= 1 && (buf[0] == 's' || buf[0] == 't' || buf[0] == 'm' || buf[0] == 'd'))
+            return 2;
+        if (n >= 2 && ((buf[0] == 'r' && buf[1] == 'e') ||
+                       (buf[0] == 'v' && buf[1] == 'e') ||
+                       (buf[0] == 'l' && buf[1] == 'l')))
+            return 3;
         return 0;
     };
 
@@ -280,11 +290,23 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
             int len;
             int cp = r.peek_cp(len);
 
-            // --- Alt 1 & 2: optional prefix + letters + contraction ---
-            // The prefix is [^\r\n\p{L}\p{N}] — any char that isn't newline/letter/digit
+            // --- Alt 1: contraction ---
+            {
+                int ct = try_contraction(r);
+                if (ct > 0) {
+                    r.pos += ct;
+                    emit(span.start + start, span.start + r.pos);
+                    continue;
+                }
+            }
+
+            // --- Alt 2: optional prefix + contiguous letters/marks ---
+            // The prefix is [^\r\n\p{L}\p{N}] — any char that isn't newline/letter/digit.
+            // Unlike older GPT-4 regexes, this tokenizer does not split at
+            // uppercase/lowercase boundaries; e.g. "ViewController" is one
+            // pre-token so BPE can emit a single token.
             {
                 int save = r.pos;
-                bool has_prefix = false;
 
                 // Optional prefix: non-newline, non-letter, non-digit
                 if (!is_newline(cp) && !is_letter(cp) && !is_digit(cp) && cp != -1) {
@@ -293,7 +315,6 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
                         int l2;
                         int cp2 = utf8_codepoint(r.data + next_pos, r.size - next_pos, l2);
                         if (is_letter(cp2)) {
-                            has_prefix = true;
                             r.advance(len);
                         }
                     }
@@ -302,32 +323,11 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
                 int flen;
                 int fcp = r.peek_cp(flen);
                 if (is_letter(fcp)) {
-                    if (is_upper(fcp)) {
-                        // Consume uppercase run
-                        int upper_count = 0;
-                        while (r.pos < r.size) {
-                            int l; int c = r.peek_cp(l);
-                            if (!is_upper(c)) break;
-                            r.advance(l);
-                            upper_count++;
-                        }
-                        // Consume lowercase run
-                        while (r.pos < r.size) {
-                            int l; int c = r.peek_cp(l);
-                            if (!is_lower(c)) break;
-                            r.advance(l);
-                        }
-                    } else {
-                        // Lowercase start: consume all lowercase
-                        while (r.pos < r.size) {
-                            int l; int c = r.peek_cp(l);
-                            if (!is_lower(c)) break;
-                            r.advance(l);
-                        }
+                    while (r.pos < r.size) {
+                        int l; int c = r.peek_cp(l);
+                        if (!is_letter(c)) break;
+                        r.advance(l);
                     }
-                    // Try contraction
-                    int ct = try_contraction(r);
-                    r.pos += ct;
                     emit(span.start + start, span.start + r.pos);
                     continue;
                 }
@@ -346,29 +346,60 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
                 continue;
             }
 
-            // --- Alt 4: optional space + punctuation + trailing newlines ---
-            if (!is_whitespace(cp) && !is_letter(cp) && !is_digit(cp) && !is_newline(cp)) {
-                // Punctuation without space prefix
-                while (r.pos < r.size) {
-                    int l; int c = r.peek_cp(l);
-                    if (is_whitespace(c) || is_letter(c) || is_digit(c)) break;
-                    r.advance(l);
+            // --- Alt 4: optional ASCII space + punctuation + trailing newlines ---
+            // The tokenizer.json regex keeps a single leading space attached to
+            // a punctuation run. Without this, BPE cannot form tokens such as
+            // "Ġ=" or "Ġ((".
+            {
+                int save = r.pos;
+                if (cp == ' ') {
+                    int next_pos = r.pos + len;
+                    if (next_pos < r.size) {
+                        int l2;
+                        int cp2 = utf8_codepoint(r.data + next_pos, r.size - next_pos, l2);
+                        if (!is_whitespace(cp2) && !is_letter(cp2) && !is_digit(cp2) && !is_newline(cp2)) {
+                            r.advance(len);
+                            cp = cp2;
+                            len = l2;
+                        }
+                    }
                 }
-                while (r.pos < r.size && (r.data[r.pos] == '\r' || r.data[r.pos] == '\n'))
-                    r.advance(1);
-                emit(span.start + start, span.start + r.pos);
-                continue;
+                if (!(r.pos < r.size &&
+                      !is_whitespace(cp) && !is_letter(cp) && !is_digit(cp) && !is_newline(cp))) {
+                    r.pos = save;
+                } else {
+                    start = save;
+                    while (r.pos < r.size) {
+                        int l; int c = r.peek_cp(l);
+                        if (is_whitespace(c) || is_letter(c) || is_digit(c)) break;
+                        r.advance(l);
+                    }
+                    while (r.pos < r.size && (r.data[r.pos] == '\r' || r.data[r.pos] == '\n'))
+                        r.advance(1);
+                    emit(span.start + start, span.start + r.pos);
+                    continue;
+                }
             }
 
             // --- Alt 5: whitespace* + newlines ---
-            if (is_newline(cp)) {
+            if (is_whitespace(cp)) {
+                int save = r.pos;
                 while (r.pos < r.size) {
                     int l; int c = r.peek_cp(l);
-                    if (!is_newline(c)) break;
+                    if (!is_whitespace(c) || is_newline(c)) break;
                     r.advance(l);
                 }
-                emit(span.start + start, span.start + r.pos);
-                continue;
+                int l; int c = r.peek_cp(l);
+                if (is_newline(c)) {
+                    while (r.pos < r.size) {
+                        int nl; int nc = r.peek_cp(nl);
+                        if (!is_newline(nc)) break;
+                        r.advance(nl);
+                    }
+                    emit(span.start + start, span.start + r.pos);
+                    continue;
+                }
+                r.pos = save;
             }
 
             // --- Alt 6/7: whitespace handling ---
@@ -626,4 +657,3 @@ std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages)
 
     return encode(prompt);
 }
-

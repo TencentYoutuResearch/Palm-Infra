@@ -1,9 +1,10 @@
 """
-Text-only converter for Qwen3.5-MoE.
+Text-only converter for Qwen3.5/3.6-MoE.
 
-This first implementation is correctness-oriented and exports FP16/FP32
-weights only. Expert tensors are loaded selectively from sharded safetensors so
-1-2 layer packages can be built without materializing the full 35B-A3B model.
+The public converter builds full text-only packages by default and supports
+FP16/W4 weights. Expert tensors are streamed selectively from sharded
+safetensors so debug packages can still be built without materializing the full
+35B-A3B model in Python memory.
 """
 
 from __future__ import annotations
@@ -43,8 +44,16 @@ def _as_fp16(dtype_str: str, arr: np.ndarray) -> np.ndarray:
     return _as_fp32(dtype_str, arr).astype(np.float16)
 
 
+def _canonical_quant(quant: str) -> str:
+    q = quant.lower()
+    if q in ("none", "fp16", "f16"):
+        return "fp16"
+    return q
+
+
 def _quant_spec(quant: str, k: int) -> tuple[str, int] | None:
-    if quant == "none":
+    quant = _canonical_quant(quant)
+    if quant == "fp16":
         return None
     if quant == "w8pc":
         return ("w8", k)
@@ -158,8 +167,9 @@ def _required_weight_names(tc: dict, num_layers: int) -> set[str]:
 
 
 def export_weights(model_dir: Path, weights_dir: str, cfg: dict, num_layers: int,
-                   quant: str = "none"):
+                   quant: str = "fp16"):
     os.makedirs(weights_dir, exist_ok=True)
+    quant = _canonical_quant(quant)
     tc = cfg["text_config"]
     wanted = _required_weight_names(tc, num_layers)
     quant_counts = {"w4": 0, "w8": 0}
@@ -234,7 +244,7 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict, num_layers: int
         save(wname.replace(".", "_"), d,
              quantizable=quantizable, raw_name=wname)
 
-    if quant != "none":
+    if quant != "fp16":
         print(f"  Quantized tensors: W4={quant_counts['w4']} W8={quant_counts['w8']}")
 
 
@@ -406,17 +416,23 @@ def _build_layer(g, x, layer_idx, weights_dir, tc,
     return g.add(x, mlp_out)
 
 
-def convert_qwen35_moe(model_dir: str, output_path: str, num_layers: int = 1,
+def convert_qwen35_moe(model_dir: str, output_path: str, num_layers: int | None = None,
                        prefill_seq_len: int = 256, n_ctx: int = 4096,
-                       quant: str = "none"):
+                       quant: str = "fp16"):
     model_dir = Path(model_dir)
+    quant = _canonical_quant(quant)
     with open(model_dir / "config.json") as f:
         cfg = json.load(f)
 
     cfg = dict(cfg)
     tc = dict(cfg["text_config"])
+    config_num_layers = tc["num_hidden_layers"]
+    if num_layers is None:
+        num_layers = config_num_layers
     if num_layers <= 0 or num_layers > tc["num_hidden_layers"]:
         raise ValueError(f"num_layers must be in [1, {tc['num_hidden_layers']}], got {num_layers}")
+    if num_layers != config_num_layers:
+        print(f"Debug: truncating MoE text layers to {num_layers}/{config_num_layers}")
     tc["num_hidden_layers"] = num_layers
     tc["layer_types"] = list(tc["layer_types"][:num_layers])
     cfg["text_config"] = tc
@@ -464,11 +480,28 @@ def convert_qwen35_moe(model_dir: str, output_path: str, num_layers: int = 1,
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant]")
-        raise SystemExit(1)
-    nl = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-    ps = int(sys.argv[4]) if len(sys.argv) > 4 else 256
-    qt = sys.argv[5] if len(sys.argv) > 5 else "none"
-    convert_qwen35_moe(sys.argv[1], sys.argv[2], nl, ps, quant=qt)
+
+    if len(sys.argv) >= 6 and sys.argv[3].isdigit() and sys.argv[4].isdigit():
+        print("Warning: legacy positional layer/chunk/quant form is "
+              "deprecated; use --layers/--prefill-seq-len for debug packages.")
+        convert_qwen35_moe(sys.argv[1], sys.argv[2],
+                           num_layers=int(sys.argv[3]),
+                           prefill_seq_len=int(sys.argv[4]),
+                           quant=sys.argv[5])
+        raise SystemExit(0)
+
+    parser = argparse.ArgumentParser(description="Convert Qwen3.5/3.6-MoE to .mollm")
+    parser.add_argument("model_dir")
+    parser.add_argument("output")
+    parser.add_argument("quant", nargs="?", default="fp16")
+    parser.add_argument("--layers", type=int, default=None,
+                        help="debug-only layer truncation")
+    parser.add_argument("--prefill-seq-len", type=int, default=256,
+                        help="prefill graph chunk length")
+    args = parser.parse_args()
+    convert_qwen35_moe(args.model_dir, args.output,
+                       num_layers=args.layers,
+                       prefill_seq_len=args.prefill_seq_len,
+                       quant=args.quant)

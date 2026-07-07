@@ -5,6 +5,7 @@
 // Loads a HuggingFace tokenizer.json and performs encode / decode.
 // Based on the llm.ncnn tokenizer implementation.
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>

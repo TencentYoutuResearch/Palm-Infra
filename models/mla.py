@@ -52,8 +52,16 @@ def _w4mix_promote_to_w8(wname: str) -> bool:
     return False
 
 
+def _canonical_quant(quant: str) -> str:
+    q = quant.lower()
+    if q in ("none", "fp16", "f16"):
+        return "fp16"
+    return q
+
+
 def _quant_spec(quant: str, k: int, wname: str = "") -> tuple[str, int] | None:
-    if quant == "none":
+    quant = _canonical_quant(quant)
+    if quant == "fp16":
         return None
     if quant == "w8pc":
         return ("w8", k)
@@ -101,9 +109,10 @@ def load_safetensors(path: str) -> dict[str, np.ndarray]:
     return tensors
 
 
-def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
+def export_weights(weights: dict, weights_dir: str, quant: str = "fp16"):
     """Export all weights to a shared directory. Called once."""
     os.makedirs(weights_dir, exist_ok=True)
+    quant = _canonical_quant(quant)
     quant_counts = {"w4": 0, "w8": 0}
     lm_head_source = weights.get('lm_head.weight')
     if lm_head_source is None:
@@ -196,7 +205,7 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
     d = final_norm_w.astype(np.float32) if final_norm_w.dtype != np.float32 else final_norm_w
     save('final_norm', d)
 
-    if quant != "none":
+    if quant != "fp16":
         print(f"  Quantized tensors: W4={quant_counts['w4']} W8={quant_counts['w8']}")
 
 
@@ -412,11 +421,12 @@ def cfg_intermediate_size(cfg: dict) -> int:
     return cfg.get('intermediate_size', cfg['hidden_size'] * 3)
 
 
-def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
+def convert_mla(model_dir: str, output_path: str, num_layers: int | None = None,
                 prefill_seq_len: int = 128, n_ctx: int = 4096,
-                quant: str = "none"):
+                quant: str = "fp16"):
     """Main entry point: export weights + build graphs → single .mollm file."""
     model_dir = Path(model_dir)
+    quant = _canonical_quant(quant)
     import tempfile
     tmp_dir = tempfile.mkdtemp(prefix="mollm_weights_")
     weights_dir = tmp_dir
@@ -424,6 +434,11 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
 
     with open(model_dir / 'config.json') as f:
         cfg = json.load(f)
+    config_num_layers = cfg.get('num_hidden_layers', num_layers if num_layers is not None else 32)
+    if num_layers is not None and num_layers != config_num_layers:
+        print(f"Warning: ignoring deprecated num_layers={num_layers}; "
+              f"using config.json num_hidden_layers={config_num_layers}")
+    num_layers = config_num_layers
 
     weights = load_safetensors(str(model_dir / 'model.safetensors'))
 
@@ -467,11 +482,9 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int = 32,
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128|w4g128|w4mixg128]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant=fp16|w8pc|w4g128|w4mixg128]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_path = sys.argv[2]
-    num_layers = int(sys.argv[3]) if len(sys.argv) > 3 else 32
-    prefill_seq_len = int(sys.argv[4]) if len(sys.argv) > 4 else 128
-    quant = sys.argv[5] if len(sys.argv) > 5 else "none"
-    convert_mla(model_dir, output_path, num_layers, prefill_seq_len, quant=quant)
+    quant = sys.argv[3] if len(sys.argv) > 3 else "fp16"
+    convert_mla(model_dir, output_path, quant=quant)

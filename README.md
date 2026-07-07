@@ -10,9 +10,8 @@ kernels; W8/W4 weight-only quantization uses ARM dot-product kernels.
 
 Supports Qwen3.5 dense, Youtu, and experimental Qwen3.5/3.6 MoE text models.
 Benchmark protocol is Apple M5 Pro, 4 threads, pp256 + tg64, warmup=3,
-5-run median unless noted. Higher throughput numbers are bolded. Dense tables
-were refreshed on 2026-07-06; the MoE table was refreshed on 2026-07-07.
-Quantized llama.cpp rows use `GGML_BLAS=ON`, `GGML_METAL=OFF`, and
+5-run median unless noted. Higher throughput numbers are bolded. Quantized
+llama.cpp rows use `GGML_BLAS=ON`, `GGML_METAL=OFF`, and
 `GGML_CPU_REPACK=ON`.
 
 FP16:
@@ -92,22 +91,21 @@ cmake --build build --target mollm-quantize
 ```bash
 cd mollm
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b.mollm
-python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w8pc.mollm 32 256 w8pc
-python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w8g128.mollm 32 256 w8g128
-python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm 32 256 w4g128
-python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm 32 256 w4mixg128
-python3 models/converter.py /path/to/Youtu-LLM-2B youtu-llm-2b_w4g128.mollm 32 256 w4g128
-python3 models/converter.py /path/to/Youtu-LLM-2B youtu-llm-2b_w4mixg128.mollm 32 256 w4mixg128
-python3 models/converter.py /path/to/Qwen3.6-35B-A3B qwen35_moe_40l_w4g128.mollm 40 256 w4g128
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w8pc.mollm w8pc
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm w4mixg128
+python3 models/converter.py /path/to/Youtu-LLM-2B youtu-llm-2b_w4g128.mollm w4g128
+python3 models/converter.py /path/to/Youtu-LLM-2B youtu-llm-2b_w4mixg128.mollm w4mixg128
+python3 models/converter.py /path/to/Qwen3.6-35B-A3B qwen36_moe_40l_w4g128.mollm w4g128
 ```
 
 The converter auto-detects the model type from `config.json` and dispatches to the appropriate converter. Supported types:
 
-| `model_type` | Model | Default layers |
-|-------------|-------|-----------------|
-| `qwen3_5` | Qwen3.5-0.8B/4B | 24 (0.8B), 32 (4B) |
-| `qwen3_5_moe` | Qwen3.5/3.6-35B-A3B text-only MoE, FP16/W4 path | Config value; tested package uses 40 text layers |
-| `youtu` | Youtu-LLM-2B | 32 |
+| `model_type` | Model |
+|-------------|-------|
+| `qwen3_5` | Qwen3.5-0.8B/4B |
+| `qwen3_5_moe` | Qwen3.5/3.6-35B-A3B text-only MoE, FP16/W4 path |
+| `youtu` | Youtu-LLM-2B |
 
 **Arguments:**
 
@@ -115,20 +113,23 @@ The converter auto-detects the model type from `config.json` and dispatches to t
 |---|------|----------|-------------|
 | 1 | `model_dir` | yes | HF model directory (must contain `config.json` + `model.safetensors`) |
 | 2 | `output_path` | yes | Output `.mollm` file path |
-| 3 | `num_layers` | no | Override number of hidden layers (auto-detected if omitted) |
-| 4 | `prefill_seq_len` | no | Prefill chunk size (default 256) |
-| 5 | `quant` | no | `none`, `w8pc`, `w8gN`, `w4gN`, or `w4mixgN` |
+| 3 | `quant` | no | `fp16` (default), `w8pc`, `w4g128`, or `w4mixg128` |
 
 Produces a single `.mollm` file containing graphs + weights + tokenizer + chat template.
+Layer count is read from `config.json`. The prefill graph currently uses an
+internal 256-token chunk length; runtime prefill is dynamic for shorter chunks
+and splits longer prompts across chunks.
 
 Quantization summary:
 
-- Supported modes: `none`, `w8pc`, `w8gN`, `w4gN`, and `w4mixgN`.
+- Common modes: `fp16` by default, `w8pc` for the W8 baseline, `w4g128`
+  for the W4 performance baseline, and `w4mixg128` when pure W4 needs a
+  quality-biased fallback.
 - W8 is the conservative int8 path with small quality drift. W4G128 direct
   BG128 is the current lowest-RSS quantized path and fastest decode path.
 - W4 conversion requires the C++ quantizer helper; FP16 and W8 conversion can
   still run from Python alone.
-- `w4mixgN` keeps selected quality-sensitive tensors in W8 when pure W4 is too
+- `w4mixg128` keeps selected quality-sensitive tensors in W8 when pure W4 is too
   lossy for a model.
 - `qwen3_5_moe` supports full text-only W4 packages. Router
   `mlp.gate.weight` and `shared_expert_gate.weight` stay high precision, while
@@ -153,16 +154,18 @@ audits, diagnostic env flags, and kernel notes.
 ./build/mollm_chat --package qwen35_0.8b_w4g128_bg128.mollm --threads 4
 ./build/mollm_chat --package youtu-llm-2b_w4g128_bg128.mollm --threads 4
 ./build/mollm_chat --package qwen35_4b_w8pc.mollm --threads 4
-./build/mollm_chat \
-    --package /path/to/Qwen3.6-35B-A3B/qwen35_moe_40l_w4g128.mollm \
-    --threads 4
+./build/mollm_chat --package qwen36_moe_40l_w4g128.mollm --threads 4
 
 # Benchmark (pp256 + tg64, prints per-op profile)
 ./build/mollm_bench --package qwen35_4b_w4g128_bg128.mollm \
     --prompt-tokens 256 --max-new-tokens 64 --warmup 3 --threads 4 --profile
 MOLLM_MOE_PROFILE=1 ./build/mollm_bench \
-    --package /path/to/Qwen3.6-35B-A3B/qwen35_moe_40l_w4g128.mollm \
+    --package qwen36_moe_40l_w4g128.mollm \
     --prompt-tokens 256 --max-new-tokens 64 --warmup 3 --threads 4 --profile
+
+# Perplexity smoke / quantization quality checks on raw text
+./build/mollm_ppl --package qwen36_moe_40l_w4g128.mollm \
+    --text-file calibration.txt --max-tokens 256 --chunk-size 256 --threads 4
 ```
 
 In interactive mode, use `/reset` to clear the conversation and `/quit` to

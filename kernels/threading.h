@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>

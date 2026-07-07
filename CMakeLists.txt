@@ -156,6 +156,11 @@ if(MOLLM_BUILD_EXAMPLE)
         examples/cli_common.cpp
     )
     target_link_libraries(mollm_bench PRIVATE mollm_lib)
+
+    add_executable(mollm_ppl
+        examples/ppl.cpp
+    )
+    target_link_libraries(mollm_ppl PRIVATE mollm_lib)
 endif()
 
 add_executable(mollm-quantize tools/quantize_weight.cpp)

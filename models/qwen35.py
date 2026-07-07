@@ -61,8 +61,16 @@ def _w4mix_promote_to_w8(wname: str) -> bool:
     return False
 
 
+def _canonical_quant(quant: str) -> str:
+    q = quant.lower()
+    if q in ("none", "fp16", "f16"):
+        return "fp16"
+    return q
+
+
 def _quant_spec(quant: str, k: int, wname: str = "") -> tuple[str, int] | None:
-    if quant == "none":
+    quant = _canonical_quant(quant)
+    if quant == "fp16":
         return None
     if quant == "w8pc":
         return ("w8", k)
@@ -109,9 +117,10 @@ def load_safetensors(path: str) -> dict[str, np.ndarray]:
     return tensors
 
 
-def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
+def export_weights(weights: dict, weights_dir: str, quant: str = "fp16"):
     """Export text model weights. Skip vision encoder."""
     os.makedirs(weights_dir, exist_ok=True)
+    quant = _canonical_quant(quant)
     quant_counts = {"w4": 0, "w8": 0}
     lm_head_source = None
 
@@ -207,7 +216,7 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "none"):
     d = lm_head_source.astype(np.float16) if lm_head_source.dtype != np.float16 else lm_head_source
     save('lm_head', d, quantizable=True, raw_name="lm_head.weight")
 
-    if quant != "none":
+    if quant != "fp16":
         print(f"  Quantized tensors: W4={quant_counts['w4']} W8={quant_counts['w8']}")
 
 
@@ -599,19 +608,20 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     return out
 
 
-def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
+def convert_qwen35(model_dir: str, output_path: str, num_layers: int | None = None,
                     prefill_seq_len: int = 256, n_ctx: int = 4096,
-                    quant: str = "none"):
+                    quant: str = "fp16"):
     """Main entry point: export weights + build graphs → single .mollm file.
 
     Args:
         model_dir: path to HF model directory (with config.json + safetensors)
         output_path: output .mollm file path
-        num_layers: number of hidden layers
+        num_layers: deprecated; layer count is read from config.json
         prefill_seq_len: prefill sequence length
         n_ctx: max context length
     """
     model_dir = Path(model_dir)
+    quant = _canonical_quant(quant)
     import tempfile
     tmp_dir = tempfile.mkdtemp(prefix="mollm_weights_")
     weights_dir = tmp_dir
@@ -619,6 +629,12 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
 
     with open(model_dir / 'config.json') as f:
         cfg = json.load(f)
+    tc = cfg['text_config']
+    config_num_layers = tc['num_hidden_layers']
+    if num_layers is not None and num_layers != config_num_layers:
+        print(f"Warning: ignoring deprecated num_layers={num_layers}; "
+              f"using config.json num_hidden_layers={config_num_layers}")
+    num_layers = config_num_layers
 
     # Find safetensors files (may be sharded)
     st_files = sorted(model_dir.glob('model.safetensors-*.safetensors'))
@@ -647,7 +663,6 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
 
     # ---- Step 4: Pack into single .mollm file ----
     print(f"\nPacking {output_path}...")
-    tc = cfg['text_config']
     metadata = {
         "model_name": f"Qwen3.5-{num_layers}L",
         "architecture": "qwen3.5",
@@ -675,11 +690,9 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int = 24,
 if __name__ == '__main__':
     import sys
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [num_layers] [prefill_seq_len] [quant=none|w8pc|w8g128|w4g128|w4mixg128]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant=fp16|w8pc|w4g128|w4mixg128]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_path = sys.argv[2]
-    num_layers = int(sys.argv[3]) if len(sys.argv) > 3 else 24
-    prefill_seq_len = int(sys.argv[4]) if len(sys.argv) > 4 else 256
-    quant = sys.argv[5] if len(sys.argv) > 5 else "none"
-    convert_qwen35(model_dir, output_path, num_layers, prefill_seq_len, quant=quant)
+    quant = sys.argv[3] if len(sys.argv) > 3 else "fp16"
+    convert_qwen35(model_dir, output_path, quant=quant)
