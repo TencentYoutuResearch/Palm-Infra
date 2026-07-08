@@ -26,6 +26,10 @@ struct CliCommonOptions {
     int top_k = 50;
     float top_p = 0.9f;
     int seed = 42;
+
+    // bench output format: "kv" (default, machine-parseable) or "human"
+    // (aligned summary blocks). Ignored by chat.
+    std::string output_format = "kv";
 };
 
 struct GenerationResult {
