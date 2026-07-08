@@ -204,7 +204,7 @@ int main(int argc, char** argv) {
 
     std::string line;
     while (true) {
-        std::printf("\nUser> ");
+        std::printf("\n> ");
         std::fflush(stdout);
         if (!std::getline(std::cin, line)) break;
         if (line.empty()) continue;
