@@ -1,5 +1,13 @@
 # mollm — mobile-oriented LLM inference engine
 
+```
+                 _ _
+ _ __ ___   ___ | | |_ __ ___
+| '_ ` _ \ / _ \| | | '_ ` _ \
+| | | | | | (_) | | | | | | | |
+|_| |_| |_|\___/|_|_|_| |_| |_|
+```
+
 A from-scratch LLM inference engine for ARM-based devices.
 Currently developed and benchmarked on Apple Silicon; targeting mobile/edge
 ARM (Qualcomm Oryon, MediaTek) on the roadmap.
