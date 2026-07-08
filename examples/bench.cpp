@@ -95,6 +95,170 @@ void print_profile_section(const char* title, const ExecContext& ctx) {
     }
 }
 
+// 80-column light separator for human mode.
+static const char* const kSepLight =
+    "--------------------------------------------------------------------------------";
+
+// Print one aligned row " key<10> value<12> unit" in human mode.
+void human_row(const char* key, double value, const char* unit) {
+    std::printf(" %-14s %12.2f %s\n", key, value, unit);
+}
+void human_row_int(const char* key, long long value, const char* unit) {
+    std::printf(" %-14s %12lld %s\n", key, value, unit);
+}
+
+// Default machine-parseable output (byte-identical to pre-polish behavior).
+void print_kv_summary(double load_ms, const GenerationMetrics& m,
+                      const GenerationResult& result, double total_ms,
+                      const LLMEngine& engine, const CliCommonOptions& opts,
+                      double pack_ms, long long pack_calls,
+                      double q8_quant_a_ms, long long q8_quant_a_calls,
+                      double mm_ms) {
+    std::printf("load_ms=%.2f\n", load_ms);
+    std::printf("threads=%d\n", engine.config().num_threads);
+    std::printf("prompt_tokens=%d\n", m.prompt_tokens);
+    std::printf("generated_tokens=%d\n", m.generated_tokens);
+    std::printf("decode_tokens=%d\n", m.decode_tokens);
+    std::printf("ttft_ms=%.2f\n", m.ttft_ms);
+    std::printf("tpot_ms=%.2f\n", m.tpot_ms);
+    std::printf("prefill_tps=%.2f\n", m.prefill_tps);
+    std::printf("decode_tps=%.2f\n", m.decode_tps);
+    std::printf("prefill_ms=%.2f\n", result.prefill_ms);
+    std::printf("decode_ms=%.2f\n", result.decode_ms);
+    std::printf("total_ms=%.2f\n", total_ms);
+    std::printf("peak_rss_mb=%.1f\n", peak_rss_mb());
+    {
+        auto pre = engine.prefill_pool_stats();
+        auto dec = engine.decode_pool_stats();
+        size_t active = pre.active + dec.active;
+        size_t peak = pre.peak + dec.peak;
+        size_t freelist = pre.freelist + dec.freelist;
+        size_t acquires = pre.acquires + dec.acquires;
+        size_t releases = pre.releases + dec.releases;
+        std::printf("pool_active_mb=%.1f pool_peak_mb=%.1f pool_freelist_mb=%.1f pool_acquires=%zu pool_releases=%zu\n",
+                    active / (1024.0 * 1024.0),
+                    peak / (1024.0 * 1024.0),
+                    freelist / (1024.0 * 1024.0),
+                    acquires, releases);
+        std::printf("prefill_pool_active_mb=%.1f prefill_pool_peak_mb=%.1f prefill_pool_freelist_mb=%.1f prefill_pool_acquires=%zu prefill_pool_releases=%zu\n",
+                    pre.active / (1024.0 * 1024.0),
+                    pre.peak / (1024.0 * 1024.0),
+                    pre.freelist / (1024.0 * 1024.0),
+                    pre.acquires, pre.releases);
+        std::printf("decode_pool_active_mb=%.1f decode_pool_peak_mb=%.1f decode_pool_freelist_mb=%.1f decode_pool_acquires=%zu decode_pool_releases=%zu\n",
+                    dec.active / (1024.0 * 1024.0),
+                    dec.peak / (1024.0 * 1024.0),
+                    dec.freelist / (1024.0 * 1024.0),
+                    dec.acquires, dec.releases);
+    }
+    std::printf("hit_eos=%s\n", result.hit_eos ? "true" : "false");
+    // Only show generated_text for real prompts (dummy-token mode produces garbage)
+    if (opts.prompt_tokens <= 0) {
+        std::printf("generated_text=%s\n", result.text.c_str());
+    }
+    std::printf("pack_a_ms=%.2f pack_a_calls=%lld q8_quant_a_ms=%.2f q8_quant_a_calls=%lld matmul_ms=%.2f pack_pct=%.1f%% q8_quant_a_pct=%.1f%%\n",
+                pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls,
+                mm_ms,
+                mm_ms > 0 ? (pack_ms / mm_ms * 100.0) : 0.0,
+                mm_ms > 0 ? (q8_quant_a_ms / mm_ms * 100.0) : 0.0);
+}
+
+// Human-readable output: top summary line + grouped aligned sections.
+void print_human_summary(double load_ms, const GenerationMetrics& m,
+                         const GenerationResult& result, double total_ms,
+                         const LLMEngine& engine, const CliCommonOptions& opts,
+                         double pack_ms, long long pack_calls,
+                         double q8_quant_a_ms, long long q8_quant_a_calls,
+                         double mm_ms) {
+    // Top summary line — one-glance overview.
+    std::printf("=== mollm bench ===  pp=%.1f t/s  tg=%.1f t/s  peak_rss=%.1f MB  load=%.1f ms\n",
+                m.prefill_tps, m.decode_tps, peak_rss_mb(), load_ms);
+
+    // load section
+    std::printf("%s\n", kSepLight);
+    std::printf(" load\n");
+    std::printf("%s\n", kSepLight);
+    human_row("load_ms",     load_ms,                    "ms");
+    human_row_int("threads", engine.config().num_threads, "");
+
+    // prefill section
+    std::printf("%s\n", kSepLight);
+    std::printf(" prefill\n");
+    std::printf("%s\n", kSepLight);
+    human_row_int("prompt_tokens", m.prompt_tokens,    "");
+    human_row("prefill_ms",    result.prefill_ms,      "ms");
+    human_row("prefill_tps",   m.prefill_tps,          "t/s");
+
+    // decode section
+    std::printf("%s\n", kSepLight);
+    std::printf(" decode\n");
+    std::printf("%s\n", kSepLight);
+    human_row_int("generated_tokens", m.generated_tokens, "");
+    human_row_int("decode_tokens",    m.decode_tokens,    "");
+    human_row("decode_ms",     result.decode_ms,        "ms");
+    human_row("decode_tps",    m.decode_tps,            "t/s");
+    human_row("ttft_ms",       m.ttft_ms,               "ms");
+    human_row("tpot_ms",       m.tpot_ms,               "ms");
+    human_row("total_ms",      total_ms,                "ms");
+
+    // memory section
+    std::printf("%s\n", kSepLight);
+    std::printf(" memory\n");
+    std::printf("%s\n", kSepLight);
+    human_row("peak_rss_mb",   peak_rss_mb(),           "MB");
+    {
+        auto pre = engine.prefill_pool_stats();
+        auto dec = engine.decode_pool_stats();
+        size_t active = pre.active + dec.active;
+        size_t peak = pre.peak + dec.peak;
+        size_t freelist = pre.freelist + dec.freelist;
+        size_t acquires = pre.acquires + dec.acquires;
+        size_t releases = pre.releases + dec.releases;
+        human_row("pool_active_mb",   active   / (1024.0 * 1024.0), "MB");
+        human_row("pool_peak_mb",     peak     / (1024.0 * 1024.0), "MB");
+        human_row("pool_freelist_mb", freelist / (1024.0 * 1024.0), "MB");
+        human_row_int("pool_acquires",  (long long)acquires,  "");
+        human_row_int("pool_releases",  (long long)releases,  "");
+
+        // pool section (per-graph breakdown)
+        std::printf("%s\n", kSepLight);
+        std::printf(" pool (prefill / decode)\n");
+        std::printf("%s\n", kSepLight);
+        human_row("prefill_active_mb",   pre.active   / (1024.0 * 1024.0), "MB");
+        human_row("prefill_peak_mb",     pre.peak     / (1024.0 * 1024.0), "MB");
+        human_row("prefill_freelist_mb", pre.freelist / (1024.0 * 1024.0), "MB");
+        human_row_int("prefill_acquires",  (long long)pre.acquires, "");
+        human_row_int("prefill_releases",  (long long)pre.releases, "");
+        human_row("decode_active_mb",    dec.active   / (1024.0 * 1024.0), "MB");
+        human_row("decode_peak_mb",      dec.peak     / (1024.0 * 1024.0), "MB");
+        human_row("decode_freelist_mb",  dec.freelist / (1024.0 * 1024.0), "MB");
+        human_row_int("decode_acquires",   (long long)dec.acquires, "");
+        human_row_int("decode_releases",   (long long)dec.releases, "");
+    }
+
+    // pack section
+    std::printf("%s\n", kSepLight);
+    std::printf(" pack\n");
+    std::printf("%s\n", kSepLight);
+    human_row("pack_a_ms",       pack_ms,       "ms");
+    human_row_int("pack_a_calls",    pack_calls,    "");
+    human_row("q8_quant_a_ms",   q8_quant_a_ms, "ms");
+    human_row_int("q8_quant_a_calls", q8_quant_a_calls, "");
+    human_row("matmul_ms",       mm_ms,         "ms");
+    human_row("pack_pct",        mm_ms > 0 ? (pack_ms       / mm_ms * 100.0) : 0.0, "%");
+    human_row("q8_quant_a_pct",  mm_ms > 0 ? (q8_quant_a_ms / mm_ms * 100.0) : 0.0, "%");
+
+    // hit_eos + generated_text
+    std::printf("hit_eos=%s\n", result.hit_eos ? "true" : "false");
+    if (opts.prompt_tokens <= 0) {
+        std::printf("%s\n", kSepLight);
+        std::printf(" generated_text\n");
+        std::printf("%s\n", kSepLight);
+        std::printf(" %s\n", result.text.c_str());
+        std::printf("%s\n", kSepLight);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -104,7 +268,8 @@ int main(int argc, char** argv) {
         if (error != "help") std::fprintf(stderr, "bench: %s\n", error.c_str());
         print_common_usage(argv[0],
                            "Benchmark-specific notes:\n"
-                           "  --warmup <int>            Warmup iterations before timed run\n");
+                           "  --warmup <int>            Warmup iterations before timed run\n"
+                           "  --output <kv|human>       Output format (default: kv)\n");
         return error == "help" ? 0 : 1;
     }
 
@@ -171,60 +336,22 @@ int main(int argc, char** argv) {
     GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
     metrics.total_ms = total_ms;
 
-    std::printf("load_ms=%.2f\n", load_ms);
-    std::printf("threads=%d\n", engine.config().num_threads);
-    std::printf("prompt_tokens=%d\n", metrics.prompt_tokens);
-    std::printf("generated_tokens=%d\n", metrics.generated_tokens);
-    std::printf("decode_tokens=%d\n", metrics.decode_tokens);
-    std::printf("ttft_ms=%.2f\n", metrics.ttft_ms);
-    std::printf("tpot_ms=%.2f\n", metrics.tpot_ms);
-    std::printf("prefill_tps=%.2f\n", metrics.prefill_tps);
-    std::printf("decode_tps=%.2f\n", metrics.decode_tps);
-    std::printf("prefill_ms=%.2f\n", result.prefill_ms);
-    std::printf("decode_ms=%.2f\n", result.decode_ms);
-    std::printf("total_ms=%.2f\n", metrics.total_ms);
-    std::printf("peak_rss_mb=%.1f\n", peak_rss_mb());
-    {
-        auto pre = engine.prefill_pool_stats();
-        auto dec = engine.decode_pool_stats();
-        size_t active = pre.active + dec.active;
-        size_t peak = pre.peak + dec.peak;
-        size_t freelist = pre.freelist + dec.freelist;
-        size_t acquires = pre.acquires + dec.acquires;
-        size_t releases = pre.releases + dec.releases;
-        std::printf("pool_active_mb=%.1f pool_peak_mb=%.1f pool_freelist_mb=%.1f pool_acquires=%zu pool_releases=%zu\n",
-                    active / (1024.0 * 1024.0),
-                    peak / (1024.0 * 1024.0),
-                    freelist / (1024.0 * 1024.0),
-                    acquires, releases);
-        std::printf("prefill_pool_active_mb=%.1f prefill_pool_peak_mb=%.1f prefill_pool_freelist_mb=%.1f prefill_pool_acquires=%zu prefill_pool_releases=%zu\n",
-                    pre.active / (1024.0 * 1024.0),
-                    pre.peak / (1024.0 * 1024.0),
-                    pre.freelist / (1024.0 * 1024.0),
-                    pre.acquires, pre.releases);
-        std::printf("decode_pool_active_mb=%.1f decode_pool_peak_mb=%.1f decode_pool_freelist_mb=%.1f decode_pool_acquires=%zu decode_pool_releases=%zu\n",
-                    dec.active / (1024.0 * 1024.0),
-                    dec.peak / (1024.0 * 1024.0),
-                    dec.freelist / (1024.0 * 1024.0),
-                    dec.acquires, dec.releases);
-    }
-    std::printf("hit_eos=%s\n", result.hit_eos ? "true" : "false");
-    // Only show generated_text for real prompts (dummy-token mode produces garbage)
-    if (opts.prompt_tokens <= 0) {
-        std::printf("generated_text=%s\n", result.text.c_str());
-    }
-
-    // Pack-A profiling: show how much of the run is spent packing A.
+    // Pack-A profiling counters.
     double pack_ms = mollm_pack_a_total_ms();
     long long pack_calls = mollm_pack_a_calls();
     double q8_quant_a_ms = mollm_q8_quant_a_total_ms();
     long long q8_quant_a_calls = mollm_q8_quant_a_calls();
     double mm_ms = mollm_matmul_total_ms();
-    std::printf("pack_a_ms=%.2f pack_a_calls=%lld q8_quant_a_ms=%.2f q8_quant_a_calls=%lld matmul_ms=%.2f pack_pct=%.1f%% q8_quant_a_pct=%.1f%%\n",
-                pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls,
-                mm_ms,
-                mm_ms > 0 ? (pack_ms / mm_ms * 100.0) : 0.0,
-                mm_ms > 0 ? (q8_quant_a_ms / mm_ms * 100.0) : 0.0);
+
+    // Dispatch to the selected output format. "kv" (default) is byte-identical
+    // to pre-polish behavior so existing parsing scripts keep working.
+    if (opts.output_format == "human") {
+        print_human_summary(load_ms, metrics, result, total_ms, engine, opts,
+                            pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
+    } else {
+        print_kv_summary(load_ms, metrics, result, total_ms, engine, opts,
+                         pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
+    }
 
     if (opts.profile) {
         print_profile_section("prefill_profile", engine.prefill_exec_ctx());

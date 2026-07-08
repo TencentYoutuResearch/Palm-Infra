@@ -119,6 +119,12 @@ public:
 
     const EngineConfig& config() const { return cfg_; }
     int past_len() const { return past_len_; }
+    // Package-level metadata fields (model_name, architecture, quantization,
+    // num_layers, hidden_size, num_heads, n_ctx, vocab_size, prefill_seq_len).
+    // Empty for packages without a metadata JSON section.
+    const std::unordered_map<std::string, std::string>& package_metadata() const {
+        return package_metadata_;
+    }
     Tensor* embed_weight() { return embed_weight_; }
     Tensor* lm_head_weight() { return lm_head_weight_; }
     void set_profile_enabled(bool enabled);
@@ -188,6 +194,11 @@ private:
     std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> package_weight_map_;
     // prefill_seq_len from package metadata
     int package_prefill_seq_len_ = 256;
+    // Full package-level metadata JSON fields (model_name, architecture,
+    // quantization, num_layers, hidden_size, num_heads, n_ctx, vocab_size,
+    // prefill_seq_len, ...). Populated in load_package(); exposed via
+    // package_metadata() for CLI banner / display.
+    std::unordered_map<std::string, std::string> package_metadata_;
 
     // Temp files extracted from the package (cleaned up in destructor).
     std::vector<std::string> temp_files_;

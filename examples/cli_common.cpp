@@ -122,6 +122,13 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 error = "invalid value for --seed";
                 return false;
             }
+        } else if (arg == "--output") {
+            if (!require_value(argc, argv, i, "--output", value, error)) return false;
+            opts.output_format = value;
+            if (opts.output_format != "kv" && opts.output_format != "human") {
+                error = "invalid value for --output (expected: kv|human)";
+                return false;
+            }
         } else {
             error = std::string("unknown argument: ") + arg;
             return false;
@@ -155,6 +162,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --top-k <int>             Default: 50 (0 = disabled)\n");
     std::printf("  --top-p <float>           Default: 0.9 (0 = disabled)\n");
     std::printf("  --seed <int>              Default: 42\n");
+    std::printf("  --output <kv|human>       bench output format (default: kv)\n");
     if (extra_usage && *extra_usage) {
         std::printf("%s", extra_usage);
         if (extra_usage[std::strlen(extra_usage) - 1] != '\n') std::printf("\n");

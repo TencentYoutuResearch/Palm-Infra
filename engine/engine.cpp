@@ -1622,6 +1622,22 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 package_weight_map_[name] = {off, sz};
             }
         }
+        // Retain all top-level scalar fields for CLI banner / display.
+        // Skip "weights" (object) and any non-scalar. ints/bools are stringified.
+        for (auto it = meta.begin(); it != meta.end(); ++it) {
+            const std::string& key = it.key();
+            if (key == "weights") continue;
+            if (it->is_string()) {
+                package_metadata_[key] = it->get<std::string>();
+            } else if (it->is_number_integer()) {
+                package_metadata_[key] = std::to_string(it->get<int64_t>());
+            } else if (it->is_number_unsigned()) {
+                package_metadata_[key] = std::to_string(it->get<uint64_t>());
+            } else if (it->is_boolean()) {
+                package_metadata_[key] = it->get<bool>() ? "true" : "false";
+            }
+            // arrays / objects / layer_types list are skipped (not needed for banner)
+        }
     } catch (std::exception& e) {
         fprintf(stderr, "Engine: failed to parse package metadata: %s\n", e.what());
         return false;

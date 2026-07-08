@@ -5,23 +5,91 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
+
+// 80-column separator lines for visual grouping (plain ASCII, pipe-safe).
+static const char* const kSepHeavy =
+    "================================================================================";
+static const char* const kSepLight =
+    "--------------------------------------------------------------------------------";
+
+// Print one banner line " key      : value" only if value is non-empty.
+void banner_kv(const char* key, const std::string& value) {
+    if (value.empty()) return;
+    std::printf(" %-10s: %s\n", key, value.c_str());
+}
+
+// Lookup helper for package metadata.
+std::string meta_get(const std::unordered_map<std::string, std::string>& meta,
+                     const char* key) {
+    auto it = meta.find(key);
+    return it == meta.end() ? std::string() : it->second;
+}
+
+// Print the full REPL banner: heavy top, title, light divider, model/config
+// fields from package metadata + engine config, command hint, heavy bottom.
+void print_repl_banner(const LLMEngine& engine, int prefill_seq_len, int n_ctx) {
+    const auto& meta = engine.package_metadata();
+    std::printf("%s\n", kSepHeavy);
+    std::printf(" mollm chat\n");
+    std::printf("%s\n", kSepLight);
+    banner_kv("model",    meta_get(meta, "model_name"));
+    banner_kv("arch",     meta_get(meta, "architecture"));
+    banner_kv("layers",   meta_get(meta, "num_layers"));
+    banner_kv("hidden",   meta_get(meta, "hidden_size"));
+    banner_kv("quant",    meta_get(meta, "quantization"));
+    banner_kv("ctx",      std::to_string(n_ctx));
+    banner_kv("threads",  std::to_string(engine.config().num_threads));
+    banner_kv("prefill",  std::to_string(prefill_seq_len));
+    std::printf("%s\n", kSepLight);
+    std::printf(" /reset   clear context\n");
+    std::printf(" /quit    exit\n");
+    std::printf("%s\n", kSepHeavy);
+}
+
+// Compact one-liner header for single-shot mode.
+// Prints "--- mollm chat (model, quant) ---" or "--- mollm chat ---" fallback.
+void print_single_shot_header(const LLMEngine& engine) {
+    const auto& meta = engine.package_metadata();
+    std::string model = meta_get(meta, "model_name");
+    std::string quant = meta_get(meta, "quantization");
+    if (model.empty() && quant.empty()) {
+        std::printf("--- mollm chat ---\n");
+    } else if (quant.empty()) {
+        std::printf("--- mollm chat (%s) ---\n", model.c_str());
+    } else {
+        std::printf("--- mollm chat (%s, %s) ---\n", model.c_str(), quant.c_str());
+    }
+}
+
+// Print an aligned metric block (key 10-wide left, value 12-wide right).
+// Used at the end of each turn (single-shot and multi-turn).
+void print_metric_block(const GenerationMetrics& m, int ctx_len) {
+    std::printf("%s\n", kSepLight);
+    std::printf(" %-10s %12.2f s\n",   "ttft",    m.ttft_ms / 1000.0);
+    std::printf(" %-10s %12.1f ms\n",  "tpot",    m.tpot_ms);
+    std::printf(" %-10s %12.1f t/s\n", "prefill", m.prefill_tps);
+    std::printf(" %-10s %12.1f t/s\n", "decode",  m.decode_tps);
+    std::printf(" %-10s %12d\n",       "tokens",  m.generated_tokens);
+    std::printf(" %-10s %12d\n",       "ctx",     ctx_len);
+    std::printf("%s\n", kSepLight);
+}
 
 bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
                        const std::string& prompt, int /*prefill_seq_len*/,
                        int max_new_tokens) {
     std::vector<int> prompt_ids = tokenizer.apply_chat(prompt);
     if (prompt_ids.empty()) {
-        std::fprintf(stderr, "Chat: prompt is empty after tokenization\n");
+        std::fprintf(stderr, "[error] prompt is empty after tokenization\n");
         return false;
     }
     // No length check here — engine.prefill() handles chunked prefill for
     // prompts longer than graph_seq_len.
 
-    std::printf("Assistant> ");
-    std::fflush(stdout);
+    print_single_shot_header(engine);
 
     GenerationResult result;
     std::string error;
@@ -36,15 +104,13 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
         });
 
     if (!ok) {
-        std::fprintf(stderr, "\nChat: %s\n", error.c_str());
+        std::fprintf(stderr, "\n[error] %s\n", error.c_str());
         return false;
     }
 
     GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
-    std::printf("\n\n[ttft=%.2fs tpot=%.1fms prefill=%.1f tps decode=%.1f tps tokens=%d]\n",
-                metrics.ttft_ms / 1000.0, metrics.tpot_ms,
-                metrics.prefill_tps, metrics.decode_tps,
-                metrics.generated_tokens);
+    std::printf("\n");
+    print_metric_block(metrics, engine.past_len());
     return true;
 }
 
@@ -54,13 +120,10 @@ bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
     history.push_back({"user", user_input});
     std::vector<int> prompt_ids = tokenizer.apply_chat(history);
     if (prompt_ids.empty()) {
-        std::fprintf(stderr, "Chat: prompt is empty after tokenization\n");
+        std::fprintf(stderr, "[error] prompt is empty after tokenization\n");
         history.pop_back();
         return false;
     }
-
-    std::printf("Assistant> ");
-    std::fflush(stdout);
 
     GenerationResult result;
     std::string error;
@@ -77,7 +140,7 @@ bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
         /*reset_context=*/false);
 
     if (!ok) {
-        std::fprintf(stderr, "\nChat: %s\n", error.c_str());
+        std::fprintf(stderr, "\n[error] %s\n", error.c_str());
         history.pop_back();
         return false;
     }
@@ -86,10 +149,8 @@ bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
     history.push_back({"assistant", result.text});
 
     GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
-    std::printf("\n\n[ttft=%.2fs tpot=%.1fms prefill=%.1f tps decode=%.1f tps tokens=%d ctx=%d]\n",
-                metrics.ttft_ms / 1000.0, metrics.tpot_ms,
-                metrics.prefill_tps, metrics.decode_tps,
-                metrics.generated_tokens, engine.past_len());
+    std::printf("\n");
+    print_metric_block(metrics, engine.past_len());
     return true;
 }
 
@@ -135,9 +196,7 @@ int main(int argc, char** argv) {
     }
 
     // REPL mode: multi-turn conversation
-    std::printf("mollm_chat ready. prefill_seq_len=%d threads=%d ctx=%d\n",
-                prefill_seq_len, engine.config().num_threads, opts.n_ctx);
-    std::printf("Type /reset to clear context, /quit to exit.\n");
+    print_repl_banner(engine, prefill_seq_len, opts.n_ctx);
 
     std::vector<ChatMessage> history;
     history.push_back({"system", "You are a helpful assistant."});
@@ -153,7 +212,7 @@ int main(int argc, char** argv) {
             engine.reset();
             history.clear();
             history.push_back({"system", "You are a helpful assistant."});
-            std::printf("\nContext cleared.\n");
+            std::printf("--- context cleared ---\n");
             continue;
         }
         std::printf("\n");
