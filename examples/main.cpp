@@ -10,12 +10,6 @@
 
 namespace {
 
-// 80-column separator lines for visual grouping (plain ASCII, pipe-safe).
-static const char* const kSepHeavy =
-    "================================================================================";
-static const char* const kSepLight =
-    "--------------------------------------------------------------------------------";
-
 // mollm ASCII logo (figlet "standard" font, pure ASCII).
 static const char* const kMollmLogo = R"(
                  _ _
@@ -38,13 +32,11 @@ std::string meta_get(const std::unordered_map<std::string, std::string>& meta,
     return it == meta.end() ? std::string() : it->second;
 }
 
-// Print the full REPL banner: heavy top, logo, light divider, model/config
-// fields from package metadata + engine config, command hint, heavy bottom.
+// Print the full REPL banner: logo, model/config fields, command hint.
+// No separator lines — grouping is done with blank lines and indentation.
 void print_repl_banner(const LLMEngine& engine, int prefill_seq_len, int n_ctx) {
     const auto& meta = engine.package_metadata();
-    std::printf("%s\n", kSepHeavy);
     std::printf("%s\n", kMollmLogo);
-    std::printf("%s\n", kSepLight);
     banner_kv("model",    meta_get(meta, "model_name"));
     banner_kv("arch",     meta_get(meta, "architecture"));
     banner_kv("layers",   meta_get(meta, "num_layers"));
@@ -53,10 +45,10 @@ void print_repl_banner(const LLMEngine& engine, int prefill_seq_len, int n_ctx) 
     banner_kv("ctx",      std::to_string(n_ctx));
     banner_kv("threads",  std::to_string(engine.config().num_threads));
     banner_kv("prefill",  std::to_string(prefill_seq_len));
-    std::printf("%s\n", kSepLight);
+    std::printf("\n");
     std::printf(" /reset   clear context\n");
     std::printf(" /quit    exit\n");
-    std::printf("%s\n", kSepHeavy);
+    std::printf("\n");
 }
 
 // Compact one-liner header for single-shot mode.
@@ -77,14 +69,14 @@ void print_single_shot_header(const LLMEngine& engine) {
 // Print an aligned metric block (key 10-wide left, value 12-wide right).
 // Used at the end of each turn (single-shot and multi-turn).
 void print_metric_block(const GenerationMetrics& m, int ctx_len) {
-    std::printf("%s\n", kSepLight);
+    std::printf("\n");
     std::printf(" %-10s %12.2f s\n",   "ttft",    m.ttft_ms / 1000.0);
     std::printf(" %-10s %12.1f ms\n",  "tpot",    m.tpot_ms);
     std::printf(" %-10s %12.1f t/s\n", "prefill", m.prefill_tps);
     std::printf(" %-10s %12.1f t/s\n", "decode",  m.decode_tps);
     std::printf(" %-10s %12d\n",       "tokens",  m.generated_tokens);
     std::printf(" %-10s %12d\n",       "ctx",     ctx_len);
-    std::printf("%s\n", kSepLight);
+    std::printf("\n");
 }
 
 bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
