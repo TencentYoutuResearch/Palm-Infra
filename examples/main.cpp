@@ -16,6 +16,15 @@ static const char* const kSepHeavy =
 static const char* const kSepLight =
     "--------------------------------------------------------------------------------";
 
+// mollm ASCII logo (figlet "standard" font, pure ASCII).
+static const char* const kMollmLogo = R"(
+                 _ _
+ _ __ ___   ___ | | |_ __ ___
+| '_ ` _ \ / _ \| | | '_ ` _ \
+| | | | | | (_) | | | | | | | |
+|_| |_| |_|\___/|_|_|_| |_| |_|
+)";
+
 // Print one banner line " key      : value" only if value is non-empty.
 void banner_kv(const char* key, const std::string& value) {
     if (value.empty()) return;
@@ -29,12 +38,12 @@ std::string meta_get(const std::unordered_map<std::string, std::string>& meta,
     return it == meta.end() ? std::string() : it->second;
 }
 
-// Print the full REPL banner: heavy top, title, light divider, model/config
+// Print the full REPL banner: heavy top, logo, light divider, model/config
 // fields from package metadata + engine config, command hint, heavy bottom.
 void print_repl_banner(const LLMEngine& engine, int prefill_seq_len, int n_ctx) {
     const auto& meta = engine.package_metadata();
     std::printf("%s\n", kSepHeavy);
-    std::printf(" mollm chat\n");
+    std::printf("%s\n", kMollmLogo);
     std::printf("%s\n", kSepLight);
     banner_kv("model",    meta_get(meta, "model_name"));
     banner_kv("arch",     meta_get(meta, "architecture"));
