@@ -97,6 +97,29 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
 ./build_i8mm/mollm_chat --package qwen35_4b_w4g128.mollm --threads 4
 ```
 
+```
+
+                 _ _
+ _ __ ___   ___ | | |_ __ ___
+| '_ ` _ \ / _ \| | | '_ ` _ \
+| | | | | | (_) | | | | | | | |
+|_| |_| |_|\___/|_|_|_| |_| |_|
+
+ model     : Qwen3.6-35B-A3B
+ arch      : qwen3.5-moe
+ layers    : 40
+ hidden    : 2048
+ quant     : w4g128
+ ctx       : 16384
+ threads   : 4
+
+ /reset   clear context
+ /quit    exit
+
+
+>
+```
+
 Interactive chat commands:
 
 ```text

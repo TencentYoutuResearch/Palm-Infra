@@ -35,7 +35,7 @@ std::string meta_get(const std::unordered_map<std::string, std::string>& meta,
 
 // Print the full REPL banner: logo, model/config fields, command hint.
 // No separator lines — grouping is done with blank lines and indentation.
-void print_repl_banner(const LLMEngine& engine, int prefill_seq_len, int n_ctx) {
+void print_repl_banner(const LLMEngine& engine, int n_ctx) {
     const auto& meta = engine.package_metadata();
     std::printf("%s\n", kMollmLogo);
     banner_kv("model",    meta_get(meta, "model_name"));
@@ -45,7 +45,6 @@ void print_repl_banner(const LLMEngine& engine, int prefill_seq_len, int n_ctx) 
     banner_kv("quant",    meta_get(meta, "quantization"));
     banner_kv("ctx",      std::to_string(n_ctx));
     banner_kv("threads",  std::to_string(engine.config().num_threads));
-    banner_kv("prefill",  std::to_string(prefill_seq_len));
     std::printf("\n");
     std::printf(" /reset   clear context\n");
     std::printf(" /quit    exit\n");
@@ -273,7 +272,7 @@ int main(int argc, char** argv) {
     }
 
     // REPL mode: multi-turn conversation
-    print_repl_banner(engine, prefill_seq_len, opts.n_ctx);
+    print_repl_banner(engine, opts.n_ctx);
 
     std::vector<ChatMessage> history;
     history.push_back({"system", "You are a helpful assistant."});
