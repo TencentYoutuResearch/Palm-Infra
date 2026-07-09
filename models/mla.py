@@ -32,6 +32,7 @@ from transpile import (
     quantize_weight_w8_group, save_package,
     write_quantized_weight_file_cpp,
 )
+from model_metadata import infer_hf_model_name
 
 
 def _w4mix_promote_to_w8(wname: str) -> bool:
@@ -457,8 +458,9 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int | None = None,
 
     # ---- Step 4: Pack into single .mollm file ----
     print(f"\nPacking {output_path}...")
+    fallback_model_name = f"Youtu-LLM-{num_layers}L"
     metadata = {
-        "model_name": f"Youtu-LLM-{num_layers}L",
+        "model_name": infer_hf_model_name(model_dir, cfg, fallback_model_name),
         "architecture": "mla",
         "num_layers": num_layers,
         "hidden_size": cfg['hidden_size'],

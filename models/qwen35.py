@@ -24,6 +24,7 @@ from transpile import (
     quantize_weight_w8_group, save_package,
     write_quantized_weight_file_cpp,
 )
+from model_metadata import infer_hf_model_name
 
 
 def _layer_index(wname: str) -> int | None:
@@ -663,8 +664,9 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int | None = No
 
     # ---- Step 4: Pack into single .mollm file ----
     print(f"\nPacking {output_path}...")
+    fallback_model_name = f"Qwen3.5-{num_layers}L"
     metadata = {
-        "model_name": f"Qwen3.5-{num_layers}L",
+        "model_name": infer_hf_model_name(model_dir, cfg, fallback_model_name),
         "architecture": "qwen3.5",
         "num_layers": num_layers,
         "hidden_size": tc['hidden_size'],

@@ -257,6 +257,7 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
     result.prefill_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
     if (next < 0) {
         error = "engine prefill failed";
+        engine.park_workers();
         return false;
     }
 
@@ -270,6 +271,7 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
     append_token(next);
     if (next == eos_id) {
         result.hit_eos = true;
+        engine.park_workers();
         return true;
     }
 
@@ -278,6 +280,7 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
         next = engine.decode(next);
         if (next < 0) {
             error = "engine decode failed";
+            engine.park_workers();
             return false;
         }
         append_token(next);

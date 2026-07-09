@@ -239,6 +239,14 @@ void ThreadPool::worker_loop(int thread_id) {
         while (true) {
             if (stop_.load(std::memory_order_acquire)) return;
             if (worker_ready_[thread_id].load(std::memory_order_acquire)) break;
+            if (parked_.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(park_mtx_);
+                park_cv_.wait(lk, [this] {
+                    return !parked_.load(std::memory_order_acquire) ||
+                           stop_.load(std::memory_order_acquire);
+                });
+                continue;
+            }
             __asm__ __volatile__("yield" ::: "memory");
         }
 

@@ -23,3 +23,5 @@ tmp/
 # docs/ — local-only (architecture notes, optimization logs, state tracking)
 docs/
 docs_local_backup/
+
+calibration_data_v5_rc.txt
