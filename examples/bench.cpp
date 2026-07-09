@@ -108,13 +108,16 @@ void human_row_int(const char* key, long long value, const char* unit) {
 }
 
 // Default machine-parseable output (byte-identical to pre-polish behavior).
-void print_kv_summary(double load_ms, const GenerationMetrics& m,
+void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_bytes,
+                      const GenerationMetrics& m,
                       const GenerationResult& result, double total_ms,
                       const LLMEngine& engine, const CliCommonOptions& opts,
                       double pack_ms, long long pack_calls,
                       double q8_quant_a_ms, long long q8_quant_a_calls,
                       double mm_ms) {
     std::printf("load_ms=%.2f\n", load_ms);
+    std::printf("load_warmup_ms=%.2f\n", load_warmup_ms);
+    std::printf("load_warmup_mb=%.1f\n", load_warmup_bytes / 1e6);
     std::printf("threads=%d\n", engine.config().num_threads);
     std::printf("prompt_tokens=%d\n", m.prompt_tokens);
     std::printf("generated_tokens=%d\n", m.generated_tokens);
@@ -164,21 +167,24 @@ void print_kv_summary(double load_ms, const GenerationMetrics& m,
 }
 
 // Human-readable output: top summary line + grouped aligned sections.
-void print_human_summary(double load_ms, const GenerationMetrics& m,
+void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warmup_bytes,
+                         const GenerationMetrics& m,
                          const GenerationResult& result, double total_ms,
                          const LLMEngine& engine, const CliCommonOptions& opts,
                          double pack_ms, long long pack_calls,
                          double q8_quant_a_ms, long long q8_quant_a_calls,
                          double mm_ms) {
     // Top summary line — one-glance overview.
-    std::printf("=== mollm bench ===  pp=%.1f t/s  tg=%.1f t/s  peak_rss=%.1f MB  load=%.1f ms\n",
-                m.prefill_tps, m.decode_tps, peak_rss_mb(), load_ms);
+    std::printf("=== mollm bench ===  pp=%.1f t/s  tg=%.1f t/s  peak_rss=%.1f MB  load=%.1f ms  load_warmup=%.1f ms\n",
+                m.prefill_tps, m.decode_tps, peak_rss_mb(), load_ms, load_warmup_ms);
 
     // load section
     std::printf("%s\n", kSepLight);
     std::printf(" load\n");
     std::printf("%s\n", kSepLight);
     human_row("load_ms",     load_ms,                    "ms");
+    human_row("load_warmup_ms", load_warmup_ms,           "ms");
+    human_row("load_warmup_mb", load_warmup_bytes / 1e6,  "MB");
     human_row_int("threads", engine.config().num_threads, "");
 
     // prefill section
@@ -287,6 +293,16 @@ int main(int argc, char** argv) {
     auto load_end = std::chrono::steady_clock::now();
     double load_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
 
+    double load_warmup_ms = 0.0;
+    size_t load_warmup_bytes = 0;
+    if (opts.load_warmup && engine.package_weights_mmap_backed()) {
+        auto warmup_start = std::chrono::steady_clock::now();
+        load_warmup_bytes = engine.warmup_package_weights();
+        auto warmup_end = std::chrono::steady_clock::now();
+        load_warmup_ms =
+            std::chrono::duration<double, std::milli>(warmup_end - warmup_start).count();
+    }
+
     engine.set_profile_enabled(opts.profile);
 
     std::vector<int> prompt_ids;
@@ -343,13 +359,15 @@ int main(int argc, char** argv) {
     long long q8_quant_a_calls = mollm_q8_quant_a_calls();
     double mm_ms = mollm_matmul_total_ms();
 
-    // Dispatch to the selected output format. "kv" (default) is byte-identical
-    // to pre-polish behavior so existing parsing scripts keep working.
+    // Dispatch to the selected output format. "kv" stays machine-parseable for
+    // benchmark scripts.
     if (opts.output_format == "human") {
-        print_human_summary(load_ms, metrics, result, total_ms, engine, opts,
+        print_human_summary(load_ms, load_warmup_ms, load_warmup_bytes,
+                            metrics, result, total_ms, engine, opts,
                             pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
     } else {
-        print_kv_summary(load_ms, metrics, result, total_ms, engine, opts,
+        print_kv_summary(load_ms, load_warmup_ms, load_warmup_bytes,
+                         metrics, result, total_ms, engine, opts,
                          pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
     }
 

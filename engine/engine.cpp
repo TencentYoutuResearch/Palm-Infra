@@ -3,10 +3,13 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <vector>
 
 #include <fcntl.h>
@@ -19,6 +22,8 @@
 // ---------------------------------------------------------------------------
 
 namespace {
+
+volatile uint8_t g_package_warmup_sink = 0;
 
 bool env_flag_enabled(const char* name) {
     const char* value = std::getenv(name);
@@ -235,110 +240,138 @@ void maybe_pack_int4_weight(Tensor& t, const std::string& key,
 #endif
 }
 
-/// Temperature scaling + softmax in-place.
-/// Returns the softmax sum (should be ~1.0).
-float softmax_inplace(float* logits, int n, float temperature) {
-    float max_val = logits[0];
-    for (int i = 1; i < n; i++) max_val = std::max(max_val, logits[i]);
+struct SamplerCandidate {
+    int id = 0;
+    float logit = 0.0f;
+    float prob = 0.0f;
+};
 
-    float inv_t = (temperature > 0.0f) ? (1.0f / temperature) : 1.0f;
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        logits[i] = std::exp((logits[i] - max_val) * inv_t);
-        sum += logits[i];
+struct MinLogitHeapCompare {
+    bool operator()(const SamplerCandidate& a, const SamplerCandidate& b) const {
+        return a.logit > b.logit;
     }
-    if (sum > 0.0f) {
-        float inv_sum = 1.0f / sum;
-        for (int i = 0; i < n; i++) logits[i] *= inv_sum;
+};
+
+struct SamplerScratch {
+    std::vector<SamplerCandidate> candidates;
+};
+
+int argmax_token(const float* logits, int vocab_size) {
+#if HAS_NEON
+    if (vocab_size >= 4) {
+        static const int32_t kLaneOffsetsData[4] = {0, 1, 2, 3};
+        int32x4_t lane_offsets = vld1q_s32(kLaneOffsetsData);
+        float32x4_t best_vals = vld1q_f32(logits);
+        int32x4_t best_idxs = lane_offsets;
+
+        int i = 4;
+        for (; i + 4 <= vocab_size; i += 4) {
+            float32x4_t vals = vld1q_f32(logits + i);
+            int32x4_t idxs = vaddq_s32(vdupq_n_s32(i), lane_offsets);
+            uint32x4_t mask = vcgtq_f32(vals, best_vals);
+            best_vals = vbslq_f32(mask, vals, best_vals);
+            best_idxs = vbslq_s32(mask, idxs, best_idxs);
+        }
+
+        float lane_vals[4];
+        int32_t lane_idxs[4];
+        vst1q_f32(lane_vals, best_vals);
+        vst1q_s32(lane_idxs, best_idxs);
+
+        int best = lane_idxs[0];
+        float best_val = lane_vals[0];
+        for (int lane = 1; lane < 4; lane++) {
+            if (lane_vals[lane] > best_val ||
+                (lane_vals[lane] == best_val && lane_idxs[lane] < best)) {
+                best = lane_idxs[lane];
+                best_val = lane_vals[lane];
+            }
+        }
+        for (; i < vocab_size; i++) {
+            if (logits[i] > best_val) {
+                best = i;
+                best_val = logits[i];
+            }
+        }
+        return best;
     }
-    return sum;
-}
-
-/// Top-k filtering: zero out probabilities below the k-th largest.
-void top_k_filter(float* probs, int n, int top_k) {
-    if (top_k <= 0 || top_k >= n) return;
-
-    // Partial sort: find the top_k-th largest element
-    std::vector<float> copy(probs, probs + n);
-    std::nth_element(copy.begin(), copy.begin() + top_k - 1, copy.end(),
-                     std::greater<float>());
-    float threshold = copy[top_k - 1];
-
-    for (int i = 0; i < n; i++) {
-        if (probs[i] < threshold) probs[i] = 0.0f;
-    }
-}
-
-/// Top-p (nucleus) filtering: keep smallest set of tokens whose cumulative
-/// probability >= top_p.
-void top_p_filter(float* probs, int n, float top_p) {
-    if (top_p <= 0.0f || top_p >= 1.0f) return;
-
-    // Sort indices by probability descending
-    std::vector<int> indices(n);
-    for (int i = 0; i < n; i++) indices[i] = i;
-    std::sort(indices.begin(), indices.end(),
-              [&](int a, int b) { return probs[a] > probs[b]; });
-
-    float cumsum = 0.0f;
-    int cutoff = 0;
-    for (int i = 0; i < n; i++) {
-        cumsum += probs[indices[i]];
-        if (cumsum >= top_p) { cutoff = i + 1; break; }
-    }
-
-    // Zero out everything below cutoff
-    float threshold = probs[indices[std::min(cutoff, n - 1)]];
-    for (int i = 0; i < n; i++) {
-        if (probs[i] < threshold) probs[i] = 0.0f;
-    }
-}
-
-/// Multinomial sample from probability distribution.
-int sample_multinomial(const float* probs, int n, float random_val) {
-    float cumsum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cumsum += probs[i];
-        if (random_val < cumsum) return i;
-    }
-    // Fallback: argmax
+#endif
     int best = 0;
-    for (int i = 1; i < n; i++) if (probs[i] > probs[best]) best = i;
+    for (int i = 1; i < vocab_size; i++) {
+        if (logits[i] > logits[best]) best = i;
+    }
     return best;
 }
 
-/// Full sample pipeline: logits → temperature → softmax → top-k → top-p → sample.
+SamplerScratch& sampler_scratch() {
+    static thread_local SamplerScratch scratch;
+    return scratch;
+}
+
+/// Full sample pipeline: logits -> top-k -> softmax -> top-p -> sample.
 int sample_token(float* logits, int vocab_size,
                   float temperature, int top_k, float top_p,
                   unsigned int* seed) {
-    if (temperature <= 0.0f) {
-        // Greedy: just argmax
-        int best = 0;
-        for (int i = 1; i < vocab_size; i++)
-            if (logits[i] > logits[best]) best = i;
-        return best;
+    if (vocab_size <= 0) return 0;
+    if (temperature <= 0.0f || top_k == 1) return argmax_token(logits, vocab_size);
+
+    int k = top_k > 0 ? std::min(top_k, vocab_size) : vocab_size;
+    auto& candidates = sampler_scratch().candidates;
+    candidates.clear();
+    candidates.reserve((size_t)k);
+
+    MinLogitHeapCompare heap_compare;
+    for (int i = 0; i < vocab_size; i++) {
+        SamplerCandidate cand{i, logits[i], 0.0f};
+        if ((int)candidates.size() < k) {
+            candidates.push_back(cand);
+            std::push_heap(candidates.begin(), candidates.end(), heap_compare);
+        } else if (cand.logit > candidates.front().logit) {
+            std::pop_heap(candidates.begin(), candidates.end(), heap_compare);
+            candidates.back() = cand;
+            std::push_heap(candidates.begin(), candidates.end(), heap_compare);
+        }
+    }
+    if (candidates.empty()) return 0;
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const SamplerCandidate& a, const SamplerCandidate& b) {
+                  return a.logit > b.logit;
+              });
+
+    float max_logit = candidates[0].logit;
+    float inv_t = 1.0f / temperature;
+    float sum = 0.0f;
+    for (auto& cand : candidates) {
+        cand.prob = std::exp((cand.logit - max_logit) * inv_t);
+        sum += cand.prob;
+    }
+    if (!(sum > 0.0f) || !std::isfinite(sum)) {
+        return candidates[0].id;
     }
 
-    softmax_inplace(logits, vocab_size, temperature);
-    top_k_filter(logits, vocab_size, top_k);
-    top_p_filter(logits, vocab_size, top_p);
-
-    // Re-normalize after filtering
-    float sum = 0.0f;
-    for (int i = 0; i < vocab_size; i++) sum += logits[i];
-    if (sum > 0.0f) {
-        float inv_sum = 1.0f / sum;
-        for (int i = 0; i < vocab_size; i++) logits[i] *= inv_sum;
-    } else {
-        // All probs zeroed — fallback to argmax
-        int best = 0;
-        for (int i = 1; i < vocab_size; i++)
-            if (logits[i] > logits[best]) best = i;
-        return best;
+    int active = (int)candidates.size();
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float cutoff_mass = top_p * sum;
+        float cumulative = 0.0f;
+        for (int i = 0; i < (int)candidates.size(); i++) {
+            cumulative += candidates[i].prob;
+            if (cumulative >= cutoff_mass) {
+                active = i + 1;
+                break;
+            }
+        }
+        sum = cumulative;
     }
 
     float r = (float)rand_r(seed) / (float)RAND_MAX;
-    return sample_multinomial(logits, vocab_size, r);
+    float target = r * sum;
+    float cumulative = 0.0f;
+    for (int i = 0; i < active; i++) {
+        cumulative += candidates[i].prob;
+        if (target <= cumulative) return candidates[i].id;
+    }
+    return candidates[active - 1].id;
 }
 
 void release_pool_tensor(BufferPool& pool, Tensor& t) {
@@ -494,12 +527,44 @@ LLMEngine::~LLMEngine() {
         munmap(package_mmap_, package_mmap_size_);
         package_mmap_      = nullptr;
         package_mmap_size_ = 0;
+        package_weights_base_ = nullptr;
+        package_weights_size_ = 0;
     }
+    package_weights_storage_.clear();
+    package_weights_resident_ = false;
 
     // Remove extracted temp files from /tmp.
     for (const auto& path : temp_files_) {
         std::remove(path.c_str());
     }
+}
+
+size_t LLMEngine::warmup_package_weights() {
+    if (!package_weights_base_ || package_weights_size_ == 0) return 0;
+    if (package_weights_resident_) return 0;
+
+    long page_size_long = sysconf(_SC_PAGESIZE);
+    size_t page_size = page_size_long > 0 ? (size_t)page_size_long : 4096;
+
+#if defined(MADV_WILLNEED)
+    uintptr_t start = reinterpret_cast<uintptr_t>(package_weights_base_);
+    uintptr_t aligned_start = (start / page_size) * page_size;
+    size_t prefix = (size_t)(start - aligned_start);
+    madvise(reinterpret_cast<void*>(aligned_start),
+            prefix + package_weights_size_,
+            MADV_WILLNEED);
+#endif
+
+    const uint8_t* p = package_weights_base_;
+    const size_t len = package_weights_size_;
+
+    uint8_t sink = 0;
+    for (size_t off = 0; off < len; off += page_size) {
+        sink ^= p[off];
+    }
+    sink ^= p[len - 1];
+    g_package_warmup_sink ^= sink;
+    return len;
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +1620,89 @@ using json = nlohmann::json;
 
 static constexpr uint32_t PACKAGE_MAGIC_C = 0x4D4C4F4D;  // "MOLM"
 
+namespace {
+
+struct PackageHeaderInfo {
+    uint64_t meta_off = 0, meta_len = 0;
+    uint64_t tok_off = 0, tok_len = 0;
+    uint64_t jin_off = 0, jin_len = 0;
+    uint64_t pf_off = 0, pf_len = 0;
+    uint64_t dc_off = 0, dc_len = 0;
+    uint64_t w_off = 0, w_len = 0;
+};
+
+bool read_exact_at(int fd, uint64_t offset, void* dst, size_t len, const char* label) {
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    size_t done = 0;
+    while (done < len) {
+        size_t chunk = std::min<size_t>(len - done, 64 * 1024 * 1024);
+        ssize_t n = pread(fd, out + done, chunk, static_cast<off_t>(offset + done));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "Engine: failed to read %s: %s\n", label, strerror(errno));
+            return false;
+        }
+        if (n == 0) {
+            fprintf(stderr, "Engine: short read while reading %s\n", label);
+            return false;
+        }
+        done += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool section_in_file(uint64_t off, uint64_t len, size_t file_size, const char* label) {
+    uint64_t size = static_cast<uint64_t>(file_size);
+    if (off > size || len > size - off) {
+        fprintf(stderr, "Engine: package %s section extends beyond file\n", label);
+        return false;
+    }
+    if (len > static_cast<uint64_t>(SIZE_MAX)) {
+        fprintf(stderr, "Engine: package %s section is too large for this platform\n", label);
+        return false;
+    }
+    return true;
+}
+
+bool parse_package_header(const uint8_t* header, size_t file_size,
+                          PackageHeaderInfo& out) {
+    if (file_size < 128) {
+        fprintf(stderr, "Engine: package too small\n");
+        return false;
+    }
+
+    uint32_t magic = 0, version = 0;
+    std::memcpy(&magic, header + 0, 4);
+    std::memcpy(&version, header + 4, 4);
+    (void)version;
+    if (magic != PACKAGE_MAGIC_C) {
+        fprintf(stderr, "Engine: bad package magic 0x%08x\n", magic);
+        return false;
+    }
+
+    std::memcpy(&out.meta_off, header + 8, 8);
+    std::memcpy(&out.meta_len, header + 16, 8);
+    std::memcpy(&out.tok_off, header + 24, 8);
+    std::memcpy(&out.tok_len, header + 32, 8);
+    std::memcpy(&out.jin_off, header + 40, 8);
+    std::memcpy(&out.jin_len, header + 48, 8);
+    std::memcpy(&out.pf_off, header + 56, 8);
+    std::memcpy(&out.pf_len, header + 64, 8);
+    std::memcpy(&out.dc_off, header + 72, 8);
+    std::memcpy(&out.dc_len, header + 80, 8);
+    std::memcpy(&out.w_off, header + 88, 8);
+    std::memcpy(&out.w_len, header + 96, 8);
+
+    return section_in_file(out.meta_off, out.meta_len, file_size, "metadata") &&
+           section_in_file(out.tok_off, out.tok_len, file_size, "tokenizer") &&
+           section_in_file(out.jin_off, out.jin_len, file_size, "chat template") &&
+           section_in_file(out.pf_off, out.pf_len, file_size, "prefill graph") &&
+           section_in_file(out.dc_off, out.dc_len, file_size, "decode graph") &&
+           section_in_file(out.w_off, out.w_len, file_size, "weights");
+}
+
+} // namespace
+
 bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                               std::string& dc_path, std::string& tok_path,
                               std::string& jin_path) {
@@ -1566,6 +1714,156 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
     struct stat st;
     if (fstat(fd, &st) != 0) { close(fd); return false; }
     size_t file_size = st.st_size;
+
+    uint8_t header[128];
+    if (!read_exact_at(fd, 0, header, sizeof(header), "package header")) {
+        close(fd);
+        return false;
+    }
+
+    PackageHeaderInfo ph;
+    if (!parse_package_header(header, file_size, ph)) {
+        close(fd);
+        return false;
+    }
+
+    auto parse_metadata = [&](const std::string& meta_str) -> bool {
+        try {
+            auto meta = json::parse(meta_str);
+            if (meta.contains("prefill_seq_len")) {
+                package_prefill_seq_len_ = meta["prefill_seq_len"].get<int>();
+            }
+            if (meta.contains("weights")) {
+                for (auto& [name, info] : meta["weights"].items()) {
+                    if (!info.is_array() || info.size() < 2) {
+                        fprintf(stderr, "Engine: bad package metadata for weight %s\n",
+                                name.c_str());
+                        return false;
+                    }
+                    uint64_t off = info[0].get<uint64_t>();
+                    uint64_t sz = info[1].get<uint64_t>();
+                    if (off > ph.w_len || sz > ph.w_len - off) {
+                        fprintf(stderr, "Engine: package weight %s extends beyond weights section\n",
+                                name.c_str());
+                        return false;
+                    }
+                    package_weight_map_[name] = {off, sz};
+                }
+            }
+            // Retain all top-level scalar fields for CLI banner / display.
+            // Skip "weights" (object) and any non-scalar. ints/bools are stringified.
+            for (auto it = meta.begin(); it != meta.end(); ++it) {
+                const std::string& key = it.key();
+                if (key == "weights") continue;
+                if (it->is_string()) {
+                    package_metadata_[key] = it->get<std::string>();
+                } else if (it->is_number_integer()) {
+                    package_metadata_[key] = std::to_string(it->get<int64_t>());
+                } else if (it->is_number_unsigned()) {
+                    package_metadata_[key] = std::to_string(it->get<uint64_t>());
+                } else if (it->is_boolean()) {
+                    package_metadata_[key] = it->get<bool>() ? "true" : "false";
+                }
+                // arrays / objects / layer_types list are skipped (not needed for banner)
+            }
+        } catch (std::exception& e) {
+            fprintf(stderr, "Engine: failed to parse package metadata: %s\n", e.what());
+            return false;
+        }
+        return true;
+    };
+
+    // Extract graphs + tokenizer + jinja to temp files
+    pid_t pid = getpid();
+    auto write_tmp_from_memory = [&](const uint8_t* base, const char* label,
+                                     uint64_t off, uint64_t len,
+                                     std::string& out_path) -> bool {
+        if (len == 0) return true;
+        out_path = "/tmp/mollm_pkg_" + std::to_string(pid) + "_" + label;
+        std::ofstream f(out_path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(base + off), static_cast<std::streamsize>(len));
+        if (!f) {
+            fprintf(stderr, "Engine: failed to write extracted package section %s\n", label);
+            return false;
+        }
+        temp_files_.push_back(out_path);
+        return true;
+    };
+    auto write_tmp_from_fd = [&](const char* label, uint64_t off, uint64_t len,
+                                 std::string& out_path) -> bool {
+        if (len == 0) return true;
+        out_path = "/tmp/mollm_pkg_" + std::to_string(pid) + "_" + label;
+        std::ofstream f(out_path, std::ios::binary);
+        if (!f) {
+            fprintf(stderr, "Engine: failed to create extracted package section %s\n", label);
+            return false;
+        }
+        std::vector<uint8_t> buf(1024 * 1024);
+        uint64_t done = 0;
+        while (done < len) {
+            size_t chunk = static_cast<size_t>(
+                std::min<uint64_t>(buf.size(), len - done));
+            if (!read_exact_at(fd, off + done, buf.data(), chunk, label)) {
+                return false;
+            }
+            f.write(reinterpret_cast<const char*>(buf.data()), chunk);
+            if (!f) {
+                fprintf(stderr, "Engine: failed to write extracted package section %s\n", label);
+                return false;
+            }
+            done += chunk;
+        }
+        temp_files_.push_back(out_path);
+        return true;
+    };
+
+    if (cfg_.weight_loading == WeightLoadingMode::RESIDENT) {
+        std::string meta_str(static_cast<size_t>(ph.meta_len), '\0');
+        if (!read_exact_at(fd, ph.meta_off, meta_str.data(), meta_str.size(),
+                           "package metadata")) {
+            close(fd);
+            return false;
+        }
+        if (!parse_metadata(meta_str)) {
+            close(fd);
+            return false;
+        }
+
+        try {
+            package_weights_storage_.resize(static_cast<size_t>(ph.w_len));
+        } catch (const std::bad_alloc&) {
+            fprintf(stderr,
+                    "Engine: failed to allocate %.1f MB for resident package weights; try --mmap\n",
+                    ph.w_len / 1e6);
+            close(fd);
+            return false;
+        }
+        if (ph.w_len > 0 &&
+            !read_exact_at(fd, ph.w_off, package_weights_storage_.data(),
+                           package_weights_storage_.size(), "package weights")) {
+            close(fd);
+            return false;
+        }
+        package_weights_base_ = package_weights_storage_.empty()
+                                    ? nullptr
+                                    : package_weights_storage_.data();
+        package_weights_size_ = package_weights_storage_.size();
+        package_weights_resident_ = true;
+
+        bool ok = write_tmp_from_fd("prefill.graph", ph.pf_off, ph.pf_len, pf_path) &&
+                  write_tmp_from_fd("decode.graph", ph.dc_off, ph.dc_len, dc_path) &&
+                  write_tmp_from_fd("tokenizer.json", ph.tok_off, ph.tok_len, tok_path) &&
+                  write_tmp_from_fd("chat_template.jinja", ph.jin_off, ph.jin_len, jin_path);
+        close(fd);
+        if (!ok) return false;
+
+        fprintf(stderr,
+                "Engine: loaded package %s (%.1f MB, %zu weights, prefill_seq=%d, weights=resident)\n",
+                path.c_str(), file_size / 1e6, package_weight_map_.size(),
+                package_prefill_seq_len_);
+        return true;
+    }
+
     void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (mapped == MAP_FAILED) {
@@ -1576,89 +1874,24 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
     package_mmap_size_ = file_size;
 
     const uint8_t* base = static_cast<const uint8_t*>(mapped);
+    package_weights_base_ = base + ph.w_off;
+    package_weights_size_ = static_cast<size_t>(ph.w_len);
+    package_weights_resident_ = false;
 
-    if (file_size < 128) {
-        fprintf(stderr, "Engine: package too small\n");
+    std::string meta_str(reinterpret_cast<const char*>(base + ph.meta_off),
+                         static_cast<size_t>(ph.meta_len));
+    if (!parse_metadata(meta_str)) {
         return false;
     }
 
-    uint32_t magic, version;
-    std::memcpy(&magic, base + 0, 4);
-    std::memcpy(&version, base + 4, 4);
-    if (magic != PACKAGE_MAGIC_C) {
-        fprintf(stderr, "Engine: bad package magic 0x%08x\n", magic);
+    if (!write_tmp_from_memory(base, "prefill.graph", ph.pf_off, ph.pf_len, pf_path) ||
+        !write_tmp_from_memory(base, "decode.graph", ph.dc_off, ph.dc_len, dc_path) ||
+        !write_tmp_from_memory(base, "tokenizer.json", ph.tok_off, ph.tok_len, tok_path) ||
+        !write_tmp_from_memory(base, "chat_template.jinja", ph.jin_off, ph.jin_len, jin_path)) {
         return false;
     }
 
-    // Parse header (6 offset/len pairs at bytes 8-103)
-    uint64_t meta_off, meta_len, tok_off, tok_len, jin_off, jin_len;
-    uint64_t pf_off, pf_len, dc_off, dc_len, w_off, w_len;
-    std::memcpy(&meta_off, base + 8, 8);
-    std::memcpy(&meta_len, base + 16, 8);
-    std::memcpy(&tok_off, base + 24, 8);
-    std::memcpy(&tok_len, base + 32, 8);
-    std::memcpy(&jin_off, base + 40, 8);
-    std::memcpy(&jin_len, base + 48, 8);
-    std::memcpy(&pf_off, base + 56, 8);
-    std::memcpy(&pf_len, base + 64, 8);
-    std::memcpy(&dc_off, base + 72, 8);
-    std::memcpy(&dc_len, base + 80, 8);
-    std::memcpy(&w_off, base + 88, 8);
-    std::memcpy(&w_len, base + 96, 8);
-
-    package_weights_base_ = base + w_off;
-
-    // Parse metadata JSON
-    std::string meta_str(reinterpret_cast<const char*>(base + meta_off), meta_len);
-    try {
-        auto meta = json::parse(meta_str);
-        if (meta.contains("prefill_seq_len")) {
-            package_prefill_seq_len_ = meta["prefill_seq_len"].get<int>();
-        }
-        if (meta.contains("weights")) {
-            for (auto& [name, info] : meta["weights"].items()) {
-                uint64_t off = info[0].get<uint64_t>();
-                uint64_t sz = info[1].get<uint64_t>();
-                package_weight_map_[name] = {off, sz};
-            }
-        }
-        // Retain all top-level scalar fields for CLI banner / display.
-        // Skip "weights" (object) and any non-scalar. ints/bools are stringified.
-        for (auto it = meta.begin(); it != meta.end(); ++it) {
-            const std::string& key = it.key();
-            if (key == "weights") continue;
-            if (it->is_string()) {
-                package_metadata_[key] = it->get<std::string>();
-            } else if (it->is_number_integer()) {
-                package_metadata_[key] = std::to_string(it->get<int64_t>());
-            } else if (it->is_number_unsigned()) {
-                package_metadata_[key] = std::to_string(it->get<uint64_t>());
-            } else if (it->is_boolean()) {
-                package_metadata_[key] = it->get<bool>() ? "true" : "false";
-            }
-            // arrays / objects / layer_types list are skipped (not needed for banner)
-        }
-    } catch (std::exception& e) {
-        fprintf(stderr, "Engine: failed to parse package metadata: %s\n", e.what());
-        return false;
-    }
-
-    // Extract graphs + tokenizer + jinja to temp files
-    pid_t pid = getpid();
-    auto write_tmp = [&](const char* label, uint64_t off, uint64_t len, std::string& out_path) {
-        if (len == 0) return;
-        out_path = "/tmp/mollm_pkg_" + std::to_string(pid) + "_" + label;
-        std::ofstream f(out_path, std::ios::binary);
-        f.write(reinterpret_cast<const char*>(base + off), len);
-        if (f) temp_files_.push_back(out_path);
-    };
-
-    write_tmp("prefill.graph", pf_off, pf_len, pf_path);
-    write_tmp("decode.graph", dc_off, dc_len, dc_path);
-    write_tmp("tokenizer.json", tok_off, tok_len, tok_path);
-    write_tmp("chat_template.jinja", jin_off, jin_len, jin_path);
-
-    fprintf(stderr, "Engine: loaded package %s (%.1f MB, %zu weights, prefill_seq=%d)\n",
+    fprintf(stderr, "Engine: loaded package %s (%.1f MB, %zu weights, prefill_seq=%d, weights=mmap)\n",
             path.c_str(), file_size / 1e6, package_weight_map_.size(),
             package_prefill_seq_len_);
     return true;

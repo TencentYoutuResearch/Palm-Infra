@@ -1,6 +1,6 @@
 # Quantization Optimization Log
 
-*Last updated: 2026-07-07*
+*Last updated: 2026-07-09*
 
 This log tracks quantized-kernel optimization separately from the Qwen3.5 FP16
 optimization log. `docs/QUANTIZATION.md` describes the format and correctness
@@ -59,6 +59,158 @@ ctest --test-dir build --output-on-failure -E 'test_e2e|bench_matmul|bench_sdpa'
 ```
 
 All passed.
+
+## Attempt 41: Decode Speed Attribution A/B
+
+### Goal
+
+Explain why current mollm decode is faster than the corresponding llama.cpp
+rows instead of relying on implementation inspection alone.
+
+### Method
+
+Single-process diagnostic A/B, not a replacement for the strict 5-run headline
+tables. Protocol was still pp256 + tg64, warmup=3, 4 threads, temperature=0.
+Primary checks used Youtu-LLM-2B and Qwen3.5-4B because 0.8B is noisy.
+
+### Endpoint A/B
+
+W8 q8dot is the dominant decode win. Disabling the Q8 activation dot path forces
+the older dequant/scalar-style paths and collapses decode throughput:
+
+| Model / package | default | diagnostic env | pp/tg | decode effect |
+|---|---:|---|---:|---:|
+| Youtu-LLM-2B W8PC | 235.42 / 94.31 | `MOLLM_W8_NO_Q8_DOT=1` | 62.05 / 16.58 | 5.7x slower |
+| Youtu-LLM-2B W8PC | 235.42 / 94.31 | `MOLLM_W8_ONFLY_FP16=1 MOLLM_W8_NO_Q8_DOT=1` | 75.26 / 8.29 | 11.4x slower |
+| Qwen3.5-4B W8PC | 118.22 / 45.99 | `MOLLM_W8_NO_Q8_DOT=1` | 30.95 / 8.08 | 5.7x slower |
+
+W4 decode is also dot-path dominated, but the already-default BG128 path does
+not have a runtime switch that cleanly falls back to row-major without changing
+the package. The available GEMV activation-quantizer A/B shows only a small
+incremental contribution:
+
+| Model / package | default | diagnostic env | pp/tg | decode effect |
+|---|---:|---|---:|---:|
+| Youtu-LLM-2B W4G128 BG128 | 240.21 / 110.77 | `MOLLM_W4_GEMV_SCALAR_QA=1` | 238.68 / 106.34 | 4.0% slower |
+| Qwen3.5-4B W4G128 BG128 | 114.73 / 55.10 | `MOLLM_W4_GEMV_SCALAR_QA=1` | 113.68 / 53.10 | 3.6% slower |
+
+### Profile Evidence
+
+Short profile run, Youtu-LLM-2B, pp256 + tg16, warmup=1, threads=4:
+
+| Package | decode path | decode MATMUL share | lmhead path |
+|---|---|---:|---|
+| FP16 | `fp16_gemv_interleaved_fp16acc` | 93.9% | `fp16_gemv_interleaved_fp16acc` |
+| W8PC | `q8dot_gemv_repack` | 89.8% | `q8dot_gemv_repack` |
+| W4G128 BG128 | `q4dot_gemv_bg128` | 87.6% | `q4dot_gemv_bg128` |
+
+Representative per-shape decode GEMV throughput on the dominant Youtu MLP
+shape `(M=1, N=12288, K=2048)`:
+
+| Package | path | avg ms/call | GMAC/s |
+|---|---|---:|---:|
+| FP16 | `fp16_gemv_interleaved_fp16acc` | 0.230 | 109.21 |
+| W8PC | `q8dot_gemv_repack` | 0.117 | 215.43 |
+| W4G128 BG128 | `q4dot_gemv_bg128` | 0.096 | 262.91 |
+
+The same profile shows decode-side non-matmul work is small: SDPA is about
+4.4-9.3% depending on precision, while reshape/slice/permute are each near
+zero. This makes the decode result mostly a GEMV/layout result, not a hidden
+executor artifact.
+
+### Interpretation
+
+Current decode speed comes from three measured factors:
+
+1. M==1 shape-specialized GEMV is the actual runtime path for graph matmuls and
+   explicit `lm_head.weights`.
+2. Quantized decode uses package/load-time B layouts that match those GEMV
+   kernels (`q8dot_gemv_repack` for W8, direct `q4dot_gemv_bg128` for W4).
+3. Static decode workspace reuse removes repeated temporary release/reacquire
+   overhead; the earlier memory-management A/B measured about a 5% decode
+   improvement on Qwen3.5-4B and about a 3-4% improvement on Youtu-LLM-2B.
+
+The evidence does not support a claim that executor overhead is the main reason
+for the llama.cpp decode gap. Decode is matmul-bound, and the W8 A/B shows that
+removing the q8dot GEMV path alone costs roughly 5.7x on both primary models.
+
+## Attempt 42: Resident Weight Loading and mmap Page-In Warmup
+
+### Goal
+
+Improve first-turn chat latency for large packages, especially 35B MoE, where
+the first interaction can otherwise pay lazy disk page-in cost.
+
+### Implementation
+
+- Added `WeightLoadingMode::{RESIDENT,MMAP}`.
+- Default package weight loading is now `RESIDENT`: the engine reads the
+  package weight section into engine-owned memory during load, then tensors
+  point at that resident buffer.
+- mmap remains available via `--mmap` for lower explicit load time and A/B
+  testing.
+- Added `LLMEngine::warmup_package_weights()` for mmap mode.
+- mmap warmup covers the package weight section only, not package headers,
+  metadata, or extracted graph/tokenizer files.
+- On platforms with `MADV_WILLNEED`, it first asks the kernel to prefetch the
+  mapped range, then touches one byte per page so the work is paid before the
+  first prompt.
+- `mollm_chat` and `mollm_bench` enable mmap warmup by default only when
+  `--mmap` is used; pass `--no-load-warmup` to skip it.
+- `mollm_bench` reports `load_warmup_ms` and `load_warmup_mb` separately from
+  prefill/decode timings, so existing warmed `pp/tg` comparisons remain
+  comparable with prior `warmup=3` benchmark runs.
+
+### Smoke Check
+
+Qwen3.5-0.8B W4G128 BG128, 4 threads, `prompt_tokens=8`, `max_new_tokens=1`,
+`warmup=0`:
+
+| Mode | load_ms | load_warmup_ms | load_warmup_mb | ttft_ms |
+|---|---:|---:|---:|---:|
+| resident default | 536.04 | 0.00 | 0.0 | 36.62 |
+| `--mmap` | 210.96 | 24.75 | 933.5 | 35.45 |
+| `--mmap --no-load-warmup` | 199.37 | 0.00 | 0.0 | 49.60 |
+
+This is a cold/warm smoke check, not a headline benchmark. The important
+behavior is that the default resident path removes weight mmap page faults from
+first-token latency, while the mmap A/B path can still expose page-in cost as
+load warmup instead of hiding it inside TTFT.
+
+## Attempt 43: Chat Sampler and Streaming Overhead
+
+### Goal
+
+Reduce the gap between interactive `mollm_chat` throughput and `mollm_bench`
+when using non-greedy sampling and streaming output.
+
+### Implementation
+
+- Reworked `sample_token()` from full-vocab softmax + full-vocab top-k/top-p
+  filtering to a top-k candidate path:
+  - keep only the best `top_k` logits with a fixed-size min-heap,
+  - sort that small candidate set,
+  - run softmax/top-p/sample only over the candidate set.
+- `temperature=0` still takes the greedy argmax path, now with a NEON vector
+  max scan on AArch64 instead of scalar full-vocab comparison.
+- Kept CLI semantics where `top_p=0` disables top-p instead of forcing argmax.
+- Replaced per-token `printf + fflush` in `mollm_chat` with a small stream
+  buffer. It is time-driven: flush on newline, after about 80 ms, after 512
+  buffered bytes as a safety cap, and always at the end of generation.
+
+### Smoke Check
+
+Qwen3.5-0.8B W4G128 BG128, prompt `"你好"`, 4 threads, `max_new_tokens=16`,
+`warmup=1`, default resident loading:
+
+| Tool / sampling | decode_tps | Notes |
+|---|---:|---|
+| `mollm_bench --temperature 0` | 264.43 | median of 5, NEON argmax |
+| `mollm_bench` default sampling | 262.52 | median of 5, optimized sampler path |
+| `mollm_chat` default sampling | 265.0 | buffered streaming output smoke |
+
+This is a functional smoke comparison. The main expected win is lower
+interactive overhead when sampling is enabled and output is streamed.
 
 ## Attempt 40: Qwen3.5-MoE W4 Bring-up and First Bottleneck Profile
 

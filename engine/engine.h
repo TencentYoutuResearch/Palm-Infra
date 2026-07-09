@@ -61,12 +61,18 @@ inline const void* cache_data(const void* data) {
 // EngineConfig
 // ---------------------------------------------------------------------------
 
+enum class WeightLoadingMode {
+    MMAP,
+    RESIDENT,
+};
+
 struct EngineConfig {
     std::string package_path;         // .mollm single-file package (required)
     int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;
     int num_threads = 4;
+    WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
 
     // Sampling params
     float temperature = 0.6f;         // 0 = greedy (argmax)
@@ -163,6 +169,13 @@ public:
     /// Park worker threads (drop idle CPU). Auto-resumes on next prefill/decode.
     void park_workers() { thread_pool_.park(); }
 
+    /// Touch mmap'd package weight pages so first-token latency does not pay
+    /// lazy page-in cost. Returns the number of bytes covered.
+    size_t warmup_package_weights();
+    bool package_weights_mmap_backed() const {
+        return package_weights_base_ != nullptr && !package_weights_resident_;
+    }
+
     // exposed for testing
     Tensor build_causal_mask(int seq_len, int past_len);
     void generate_rope_cache(int seq_len, int start_pos,
@@ -190,6 +203,9 @@ private:
     void* package_mmap_ = nullptr;
     size_t package_mmap_size_ = 0;
     const uint8_t* package_weights_base_ = nullptr;
+    size_t package_weights_size_ = 0;
+    bool package_weights_resident_ = false;
+    std::vector<uint8_t> package_weights_storage_;
     // weight filename → (offset, size) within weights region
     std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> package_weight_map_;
     // prefill_seq_len from package metadata

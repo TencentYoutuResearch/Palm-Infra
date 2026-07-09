@@ -1,5 +1,6 @@
 #include "examples/cli_common.h"
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -79,6 +80,42 @@ void print_metric_block(const GenerationMetrics& m, int ctx_len) {
     std::printf("\n");
 }
 
+size_t common_prefix_len(const std::vector<int>& a, const std::vector<int>& b) {
+    size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) i++;
+    return i;
+}
+
+class TokenStreamPrinter {
+public:
+    void append(const std::string& piece) {
+        if (piece.empty()) return;
+        pending_ += piece;
+
+        auto now = std::chrono::steady_clock::now();
+        bool time_due = now - last_flush_ >= std::chrono::milliseconds(80);
+        bool size_due = pending_.size() >= 512;
+        bool newline = piece.find('\n') != std::string::npos;
+        if (time_due || size_due || newline) {
+            flush();
+        }
+    }
+
+    void flush() {
+        if (pending_.empty()) return;
+        std::printf("%s", pending_.c_str());
+        std::fflush(stdout);
+        pending_.clear();
+        last_flush_ = std::chrono::steady_clock::now();
+    }
+
+private:
+    std::string pending_;
+    std::chrono::steady_clock::time_point last_flush_ =
+        std::chrono::steady_clock::now();
+};
+
 bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
                        const std::string& prompt, int /*prefill_seq_len*/,
                        int max_new_tokens) {
@@ -94,15 +131,14 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
 
     GenerationResult result;
     std::string error;
+    TokenStreamPrinter stream;
     bool ok = generate_greedy(
         engine, tokenizer, prompt_ids, max_new_tokens, tokenizer.eos_id(), result,
         error,
-        [](int, const std::string& piece) {
-            if (!piece.empty()) {
-                std::printf("%s", piece.c_str());
-                std::fflush(stdout);
-            }
+        [&](int, const std::string& piece) {
+            stream.append(piece);
         });
+    stream.flush();
 
     if (!ok) {
         std::fprintf(stderr, "\n[error] %s\n", error.c_str());
@@ -117,39 +153,69 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
 
 bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
                     std::vector<ChatMessage>& history,
+                    std::vector<int>& cached_token_ids,
                     const std::string& user_input, int max_new_tokens) {
     history.push_back({"user", user_input});
-    std::vector<int> prompt_ids = tokenizer.apply_chat(history);
-    if (prompt_ids.empty()) {
+    std::vector<int> full_prompt_ids = tokenizer.apply_chat(history);
+    if (full_prompt_ids.empty()) {
         std::fprintf(stderr, "[error] prompt is empty after tokenization\n");
         history.pop_back();
         return false;
     }
 
+    size_t prefix = common_prefix_len(cached_token_ids, full_prompt_ids);
+    if (prefix < cached_token_ids.size()) {
+        // The retokenized history diverged from the actual KV prefix. Fall back
+        // to a full rebuild rather than appending tokens onto a wrong cache.
+        engine.reset();
+        cached_token_ids.clear();
+        prefix = 0;
+    }
+    std::vector<int> prompt_delta(full_prompt_ids.begin() + (ptrdiff_t)prefix,
+                                  full_prompt_ids.end());
+
     GenerationResult result;
     std::string error;
-    // reset_context=false: multi-turn, don't wipe KV cache.
+    TokenStreamPrinter stream;
+    // reset_context=false: multi-turn, keep the KV cache and prefill only the
+    // prompt suffix that was not already consumed by previous turns.
     bool ok = generate_greedy(
-        engine, tokenizer, prompt_ids, max_new_tokens, tokenizer.eos_id(), result,
+        engine, tokenizer, prompt_delta, max_new_tokens, tokenizer.eos_id(), result,
         error,
-        [](int, const std::string& piece) {
-            if (!piece.empty()) {
-                std::printf("%s", piece.c_str());
-                std::fflush(stdout);
-            }
+        [&](int, const std::string& piece) {
+            stream.append(piece);
         },
         /*reset_context=*/false);
+    stream.flush();
 
     if (!ok) {
         std::fprintf(stderr, "\n[error] %s\n", error.c_str());
         history.pop_back();
+        engine.reset();
+        cached_token_ids.clear();
         return false;
     }
 
     // Add assistant response to history for next turn.
     history.push_back({"assistant", result.text});
 
-    GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
+    cached_token_ids.insert(cached_token_ids.end(),
+                            prompt_delta.begin(), prompt_delta.end());
+    if (result.token_ids.size() > 1) {
+        cached_token_ids.insert(cached_token_ids.end(),
+                                result.token_ids.begin(),
+                                result.token_ids.end() - 1);
+    }
+    if ((int)cached_token_ids.size() != engine.past_len()) {
+        std::fprintf(stderr,
+                     "[warn] prefix cache length mismatch (cached=%zu engine=%d); "
+                     "next turn will rebuild context\n",
+                     cached_token_ids.size(), engine.past_len());
+        engine.reset();
+        cached_token_ids.clear();
+    }
+
+    GenerationMetrics metrics = compute_generation_metrics(prompt_delta.size(), result);
     std::printf("\n");
     print_metric_block(metrics, engine.past_len());
     return true;
@@ -176,6 +242,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "chat: %s\n", error.c_str());
         return 1;
     }
+    if (opts.load_warmup && engine.package_weights_mmap_backed()) {
+        std::fprintf(stderr, "Engine: warming package weight pages...\n");
+        auto warmup_start = std::chrono::steady_clock::now();
+        size_t warmup_bytes = engine.warmup_package_weights();
+        auto warmup_end = std::chrono::steady_clock::now();
+        double warmup_ms =
+            std::chrono::duration<double, std::milli>(warmup_end - warmup_start).count();
+        std::fprintf(stderr, "Engine: warmed %.1f MB in %.2f ms\n",
+                     warmup_bytes / 1e6, warmup_ms);
+    }
 
     // Single-shot mode: --prompt "text" or --prompt-file <path>
     std::string prompt_text = opts.prompt;
@@ -201,6 +277,7 @@ int main(int argc, char** argv) {
 
     std::vector<ChatMessage> history;
     history.push_back({"system", "You are a helpful assistant."});
+    std::vector<int> cached_token_ids;
 
     std::string line;
     while (true) {
@@ -213,11 +290,13 @@ int main(int argc, char** argv) {
             engine.reset();
             history.clear();
             history.push_back({"system", "You are a helpful assistant."});
+            cached_token_ids.clear();
             std::printf("--- context cleared ---\n");
             continue;
         }
         std::printf("\n");
-        run_turn_multi(engine, tokenizer, history, line, opts.max_new_tokens);
+        run_turn_multi(engine, tokenizer, history, cached_token_ids,
+                       line, opts.max_new_tokens);
     }
 
     return 0;

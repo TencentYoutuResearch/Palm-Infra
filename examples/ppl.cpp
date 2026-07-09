@@ -20,6 +20,7 @@ struct Options {
     int chunk_size = 256;
     int n_ctx = 4096;
     int threads = 4;
+    WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     bool prepend_bos = false;
     bool tokenize_only = false;
 };
@@ -48,6 +49,7 @@ void print_usage(const char* argv0) {
     std::printf("  --chunk-size <int>    Prefill chunk size for CE passes (default 256)\n");
     std::printf("  --n-ctx <int>         Context size (default 4096)\n");
     std::printf("  --threads <int>       Worker threads (default 4)\n");
+    std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --prepend-bos         Prepend tokenizer BOS before scoring\n");
     std::printf("  --tokenize-only       Print token ids and exit before running the model\n");
 }
@@ -101,6 +103,8 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
                 error = "invalid value for --threads";
                 return false;
             }
+        } else if (arg == "--mmap") {
+            opts.weight_loading = WeightLoadingMode::MMAP;
         } else if (arg == "--prepend-bos") {
             opts.prepend_bos = true;
         } else if (arg == "--tokenize-only") {
@@ -168,6 +172,7 @@ int main(int argc, char** argv) {
     cfg.n_ctx = opts.n_ctx;
     cfg.num_threads = opts.threads;
     cfg.temperature = 0.0f;
+    cfg.weight_loading = opts.weight_loading;
     if (!engine.load(cfg)) {
         std::fprintf(stderr, "ppl: failed to load package\n");
         return 1;

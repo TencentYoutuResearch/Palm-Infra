@@ -20,6 +20,8 @@ struct CliCommonOptions {
     bool profile = false;
     int warmup = 1;
     bool static_padded = false;  // pad short prompts to graph_seq_len (A/B vs DYNAMIC)
+    WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
+    bool load_warmup = true;     // touch mmap'd package weights after load
 
     // Sampling
     float temperature = 0.6f;

@@ -35,7 +35,10 @@ in W8 when pure W4 loses too much quality.
 The chart compares FP16, W8, and W4 throughput. Protocol unless noted: Apple M5
 Pro, 4 threads, `pp256 + tg64`, `warmup=3`, 5 independent runs, median
 throughput. `pp` is prompt/prefill tokens per second; `tg` is generated/decode
-tokens per second. Higher numbers are bolded in the tables below.
+tokens per second. Packages are loaded into resident memory by default; mmap
+loading remains available with `--mmap` for A/B testing. If mmap page warmup is
+used, benchmark output reports it separately as `load_warmup_ms`, outside the
+measured prefill/decode timings. Higher numbers are bolded in the tables below.
 
 ### FP16
 
@@ -69,6 +72,14 @@ tokens per second. Higher numbers are bolded in the tables below.
 
 Overall: mollm decode is already strong, especially with W4 packages. Prefill is
 still the main optimization target on dense models.
+
+## Why Decode Is Fast
+
+- Highly optimized AArch64 GEMV kernels for FP16, W8, and W4 decode.
+- Decode-friendly packed weight layouts, including direct W4G128 package
+  layout.
+- Static reusable decode workspace to avoid per-token allocation churn.
+- Prefill is still the main optimization target on dense models.
 
 ## Quick Start
 
@@ -190,6 +201,10 @@ MoE chat:
 ./build_i8mm/mollm_chat --package qwen36_moe_40l_w4g128.mollm --threads 4
 ```
 
+By default, `mollm_chat` loads package weights into resident memory. For mmap
+A/B testing, pass `--mmap`; mmap page warmup is enabled unless you also pass
+`--no-load-warmup`.
+
 ## Benchmark
 
 Standard mollm benchmark:
@@ -219,6 +234,8 @@ mollm/
 
 - Prefill performance optimization, especially for W8/W4 dense-model prompt
   processing.
+- Full prefix caching for chat and serving workloads, building on the current
+  single-user REPL cache.
 - Metal and CUDA backends while keeping the CPU runtime as the portable
   baseline.
 - More model families beyond the current Qwen, Youtu, and Qwen-MoE coverage.
