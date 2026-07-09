@@ -1,0 +1,146 @@
+<svg width="1180" height="880" viewBox="0 0 1180 880" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">mollm throughput comparison</title>
+  <desc id="desc">Horizontal bar charts comparing mollm and llama.cpp FP16, W8, and W4 prompt prefill and decode throughput on Apple M5 Pro with four threads.</desc>
+  <rect width="1180" height="880" fill="#ffffff"/>
+  <style>
+    .title { font: 700 26px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #101828; }
+    .subtitle { font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #667085; }
+    .section { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #101828; }
+    .panel { font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475467; }
+    .label { font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #344054; }
+    .tick { font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #667085; }
+    .value { font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #344054; }
+    .mollm { fill: #2563eb; }
+    .llama { fill: #94a3b8; }
+    .grid { stroke: #eaecf0; stroke-width: 1; }
+    .axis { stroke: #cbd5e1; stroke-width: 1; }
+    .rule { stroke: #eef2f6; stroke-width: 1; }
+  </style>
+
+  <text x="40" y="44" class="title">Throughput comparison</text>
+  <text x="40" y="69" class="subtitle">Apple M5 Pro, 4 threads, pp256 + tg64, median of 5 runs. Higher is better.</text>
+  <rect x="850" y="34" width="16" height="10" rx="2" class="mollm"/>
+  <text x="874" y="44" class="label">mollm</text>
+  <rect x="940" y="34" width="16" height="10" rx="2" class="llama"/>
+  <text x="964" y="44" class="label">llama.cpp</text>
+
+  <text x="40" y="114" class="section">FP16</text>
+  <text x="200" y="114" class="panel">Prompt / prefill pp256 tokens/s</text>
+  <text x="700" y="114" class="panel">Decode tg64 tokens/s</text>
+  <line x1="40" y1="128" x2="1140" y2="128" class="rule"/>
+  <line x1="200" y1="134" x2="200" y2="286" class="grid"/>
+  <line x1="305" y1="134" x2="305" y2="286" class="grid"/>
+  <line x1="410" y1="134" x2="410" y2="286" class="grid"/>
+  <line x1="515" y1="134" x2="515" y2="286" class="grid"/>
+  <line x1="620" y1="134" x2="620" y2="286" class="grid"/>
+  <line x1="700" y1="134" x2="700" y2="286" class="grid"/>
+  <line x1="805" y1="134" x2="805" y2="286" class="grid"/>
+  <line x1="910" y1="134" x2="910" y2="286" class="grid"/>
+  <line x1="1015" y1="134" x2="1015" y2="286" class="grid"/>
+  <line x1="1120" y1="134" x2="1120" y2="286" class="grid"/>
+
+  <text x="40" y="161" class="label">Qwen3.5-0.8B</text>
+  <rect x="200" y="140" width="315.7" height="13" rx="2" class="mollm"/><text x="522" y="151" class="value">601.38</text>
+  <rect x="200" y="158" width="348.9" height="13" rx="2" class="llama"/><text x="555" y="169" class="value">664.54</text>
+  <rect x="700" y="140" width="185.5" height="13" rx="2" class="mollm"/><text x="892" y="151" class="value">123.68</text>
+  <rect x="700" y="158" width="146.8" height="13" rx="2" class="llama"/><text x="853" y="169" class="value">97.87</text>
+
+  <text x="40" y="207" class="label">Youtu-LLM-2B</text>
+  <rect x="200" y="186" width="114.8" height="13" rx="2" class="mollm"/><text x="321" y="197" class="value">218.67</text>
+  <rect x="200" y="204" width="135.4" height="13" rx="2" class="llama"/><text x="342" y="215" class="value">257.93</text>
+  <rect x="700" y="186" width="78.2" height="13" rx="2" class="mollm"/><text x="785" y="197" class="value">52.12</text>
+  <rect x="700" y="204" width="67.7" height="13" rx="2" class="llama"/><text x="775" y="215" class="value">45.12</text>
+
+  <text x="40" y="253" class="label">Qwen3.5-4B</text>
+  <rect x="200" y="232" width="53.8" height="13" rx="2" class="mollm"/><text x="261" y="243" class="value">102.48</text>
+  <rect x="200" y="250" width="74.8" height="13" rx="2" class="llama"/><text x="282" y="261" class="value">142.44</text>
+  <rect x="700" y="232" width="37.5" height="13" rx="2" class="mollm"/><text x="745" y="243" class="value">25.00</text>
+  <rect x="700" y="250" width="33.5" height="13" rx="2" class="llama"/><text x="741" y="261" class="value">22.33</text>
+
+  <line x1="200" y1="286" x2="620" y2="286" class="axis"/>
+  <text x="196" y="304" class="tick">0</text><text x="296" y="304" class="tick">200</text><text x="401" y="304" class="tick">400</text><text x="506" y="304" class="tick">600</text><text x="611" y="304" class="tick">800</text>
+  <line x1="700" y1="286" x2="1120" y2="286" class="axis"/>
+  <text x="696" y="304" class="tick">0</text><text x="799" y="304" class="tick">70</text><text x="901" y="304" class="tick">140</text><text x="1009" y="304" class="tick">210</text><text x="1111" y="304" class="tick">280</text>
+
+  <text x="40" y="354" class="section">W8</text>
+  <text x="200" y="354" class="panel">Prompt / prefill pp256 tokens/s</text>
+  <text x="700" y="354" class="panel">Decode tg64 tokens/s</text>
+  <line x1="40" y1="368" x2="1140" y2="368" class="rule"/>
+  <line x1="200" y1="374" x2="200" y2="526" class="grid"/>
+  <line x1="305" y1="374" x2="305" y2="526" class="grid"/>
+  <line x1="410" y1="374" x2="410" y2="526" class="grid"/>
+  <line x1="515" y1="374" x2="515" y2="526" class="grid"/>
+  <line x1="620" y1="374" x2="620" y2="526" class="grid"/>
+  <line x1="700" y1="374" x2="700" y2="526" class="grid"/>
+  <line x1="805" y1="374" x2="805" y2="526" class="grid"/>
+  <line x1="910" y1="374" x2="910" y2="526" class="grid"/>
+  <line x1="1015" y1="374" x2="1015" y2="526" class="grid"/>
+  <line x1="1120" y1="374" x2="1120" y2="526" class="grid"/>
+
+  <text x="40" y="401" class="label">Qwen3.5-0.8B</text>
+  <rect x="200" y="380" width="352.7" height="13" rx="2" class="mollm"/><text x="559" y="391" class="value">671.73</text>
+  <rect x="200" y="398" width="410.6" height="13" rx="2" class="llama"/><text x="617" y="409" class="value">782.16</text>
+  <rect x="700" y="380" width="326.5" height="13" rx="2" class="mollm"/><text x="1033" y="391" class="value">217.69</text>
+  <rect x="700" y="398" width="251.4" height="13" rx="2" class="llama"/><text x="958" y="409" class="value">167.63</text>
+
+  <text x="40" y="447" class="label">Youtu-LLM-2B</text>
+  <rect x="200" y="426" width="132.9" height="13" rx="2" class="mollm"/><text x="340" y="437" class="value">253.05</text>
+  <rect x="200" y="444" width="138.6" height="13" rx="2" class="llama"/><text x="346" y="455" class="value">263.95</text>
+  <rect x="700" y="426" width="134.3" height="13" rx="2" class="mollm"/><text x="842" y="437" class="value">89.53</text>
+  <rect x="700" y="444" width="129.9" height="13" rx="2" class="llama"/><text x="837" y="455" class="value">86.58</text>
+
+  <text x="40" y="493" class="label">Qwen3.5-4B</text>
+  <rect x="200" y="472" width="62.2" height="13" rx="2" class="mollm"/><text x="270" y="483" class="value">118.55</text>
+  <rect x="200" y="490" width="71.2" height="13" rx="2" class="llama"/><text x="279" y="501" class="value">135.58</text>
+  <rect x="700" y="472" width="70.0" height="13" rx="2" class="mollm"/><text x="778" y="483" class="value">46.64</text>
+  <rect x="700" y="490" width="60.8" height="13" rx="2" class="llama"/><text x="768" y="501" class="value">40.50</text>
+
+  <line x1="200" y1="526" x2="620" y2="526" class="axis"/>
+  <text x="196" y="544" class="tick">0</text><text x="296" y="544" class="tick">200</text><text x="401" y="544" class="tick">400</text><text x="506" y="544" class="tick">600</text><text x="611" y="544" class="tick">800</text>
+  <line x1="700" y1="526" x2="1120" y2="526" class="axis"/>
+  <text x="696" y="544" class="tick">0</text><text x="799" y="544" class="tick">70</text><text x="901" y="544" class="tick">140</text><text x="1009" y="544" class="tick">210</text><text x="1111" y="544" class="tick">280</text>
+
+  <text x="40" y="604" class="section">W4</text>
+  <text x="200" y="604" class="panel">Prompt / prefill pp256 tokens/s</text>
+  <text x="700" y="604" class="panel">Decode tg64 tokens/s</text>
+  <line x1="40" y1="618" x2="1140" y2="618" class="rule"/>
+  <line x1="200" y1="624" x2="200" y2="822" class="grid"/>
+  <line x1="305" y1="624" x2="305" y2="822" class="grid"/>
+  <line x1="410" y1="624" x2="410" y2="822" class="grid"/>
+  <line x1="515" y1="624" x2="515" y2="822" class="grid"/>
+  <line x1="620" y1="624" x2="620" y2="822" class="grid"/>
+  <line x1="700" y1="624" x2="700" y2="822" class="grid"/>
+  <line x1="805" y1="624" x2="805" y2="822" class="grid"/>
+  <line x1="910" y1="624" x2="910" y2="822" class="grid"/>
+  <line x1="1015" y1="624" x2="1015" y2="822" class="grid"/>
+  <line x1="1120" y1="624" x2="1120" y2="822" class="grid"/>
+
+  <text x="40" y="651" class="label">Qwen3.5-0.8B</text>
+  <rect x="200" y="630" width="356.2" height="13" rx="2" class="mollm"/><text x="563" y="641" class="value">678.41</text>
+  <rect x="200" y="648" width="407.4" height="13" rx="2" class="llama"/><text x="614" y="659" class="value">775.95</text>
+  <rect x="700" y="630" width="389.1" height="13" rx="2" class="mollm"/><text x="1096" y="641" class="value">259.43</text>
+  <rect x="700" y="648" width="286.3" height="13" rx="2" class="llama"/><text x="993" y="659" class="value">190.89</text>
+
+  <text x="40" y="697" class="label">Youtu-LLM-2B</text>
+  <rect x="200" y="676" width="130.2" height="13" rx="2" class="mollm"/><text x="338" y="687" class="value">248.08</text>
+  <rect x="200" y="694" width="139.4" height="13" rx="2" class="llama"/><text x="347" y="705" class="value">265.58</text>
+  <rect x="700" y="676" width="173.5" height="13" rx="2" class="mollm"/><text x="881" y="687" class="value">115.64</text>
+  <rect x="700" y="694" width="145.7" height="13" rx="2" class="llama"/><text x="853" y="705" class="value">97.15</text>
+
+  <text x="40" y="743" class="label">Qwen3.5-4B</text>
+  <rect x="200" y="722" width="60.6" height="13" rx="2" class="mollm"/><text x="268" y="733" class="value">115.37</text>
+  <rect x="200" y="740" width="73.8" height="13" rx="2" class="llama"/><text x="281" y="751" class="value">140.51</text>
+  <rect x="700" y="722" width="83.9" height="13" rx="2" class="mollm"/><text x="791" y="733" class="value">55.94</text>
+  <rect x="700" y="740" width="66.4" height="13" rx="2" class="llama"/><text x="774" y="751" class="value">44.25</text>
+
+  <text x="40" y="789" class="label">Qwen3.6-35B-A3B</text>
+  <rect x="200" y="768" width="69.2" height="13" rx="2" class="mollm"/><text x="277" y="779" class="value">131.80</text>
+  <rect x="200" y="786" width="61.4" height="13" rx="2" class="llama"/><text x="269" y="797" class="value">116.93</text>
+  <rect x="700" y="768" width="90.5" height="13" rx="2" class="mollm"/><text x="798" y="779" class="value">60.31</text>
+  <rect x="700" y="786" width="65.6" height="13" rx="2" class="llama"/><text x="773" y="797" class="value">43.73</text>
+
+  <line x1="200" y1="822" x2="620" y2="822" class="axis"/>
+  <text x="196" y="840" class="tick">0</text><text x="296" y="840" class="tick">200</text><text x="401" y="840" class="tick">400</text><text x="506" y="840" class="tick">600</text><text x="611" y="840" class="tick">800</text>
+  <line x1="700" y1="822" x2="1120" y2="822" class="axis"/>
+  <text x="696" y="840" class="tick">0</text><text x="799" y="840" class="tick">70</text><text x="901" y="840" class="tick">140</text><text x="1009" y="840" class="tick">210</text><text x="1111" y="840" class="tick">280</text>
+</svg>
