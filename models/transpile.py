@@ -1063,6 +1063,109 @@ def _write_weight_file(path: str, data: np.ndarray,
 PACKAGE_MAGIC   = 0x4D4C4F4D  # "MOLM"
 PACKAGE_VERSION = 1
 PACKAGE_HEADER_SIZE = 128
+WEIGHT_HEADER_STRUCT = struct.Struct("<IIIIQQQQQQQQII")
+
+
+def _read_weight_header(path: str) -> dict:
+    with open(path, "rb") as f:
+        raw = f.read(WEIGHT_HEADER_STRUCT.size)
+    if len(raw) != WEIGHT_HEADER_STRUCT.size:
+        raise ValueError(f"weight file too small: {path}")
+
+    (magic, flags, ndim, precision,
+     s0, s1, s2, s3,
+     data_offset, data_size,
+     scales_offset, scales_size,
+     group_size, num_groups) = WEIGHT_HEADER_STRUCT.unpack(raw)
+    if magic != WEIGHT_MAGIC:
+        raise ValueError(f"bad weight magic in {path}: 0x{magic:08x}")
+    return {
+        "flags": flags,
+        "ndim": ndim,
+        "precision": precision,
+        "shape": [s0, s1, s2, s3],
+        "data_offset": data_offset,
+        "data_size": data_size,
+        "scales_offset": scales_offset,
+        "scales_size": scales_size,
+        "group_size": group_size,
+        "num_groups": num_groups,
+    }
+
+
+def _augment_moe_expert_storage(meta: dict,
+                                weight_files: dict,
+                                weight_paths: dict):
+    """Resolve MoE expert aggregate tensors into package byte ranges.
+
+    `qwen35_moe.py` emits logical per-layer split metadata. At package time we
+    know each weight file's offset in the package weight region and can also
+    parse the XMAP header, so fill in exact per-expert data/scales byte ranges.
+    Existing runtimes ignore this object; SSD offload can use it later.
+    """
+    storage = meta.get("moe_expert_storage")
+    if not isinstance(storage, dict):
+        return
+    layers = storage.get("layers")
+    if not isinstance(layers, list):
+        return
+
+    num_experts = int(storage.get("num_experts") or meta.get("num_experts") or 0)
+    if num_experts <= 0:
+        return
+
+    for layer in layers:
+        if not isinstance(layer, dict):
+            continue
+        layer_num_experts = int(layer.get("num_experts") or num_experts)
+        if layer_num_experts <= 0:
+            continue
+        for key in ("gate_up", "down"):
+            spec = layer.get(key)
+            if not isinstance(spec, dict):
+                continue
+            ref = spec.get("weight")
+            if ref not in weight_files and ref and not ref.startswith("./"):
+                ref = f"./{ref}"
+            if not ref or ref not in weight_files or ref not in weight_paths:
+                raise KeyError(f"MoE expert metadata references unknown weight: {spec.get('weight')}")
+
+            header = _read_weight_header(weight_paths[ref])
+            weight_offset, weight_size = weight_files[ref]
+            rows_per_expert = int(spec["rows_per_expert"])
+            expected_rows = layer_num_experts * rows_per_expert
+            if int(header["shape"][0]) != expected_rows:
+                raise ValueError(
+                    f"MoE expert metadata row mismatch for {ref}: "
+                    f"shape[0]={header['shape'][0]} expected={expected_rows}"
+                )
+            if header["data_size"] % layer_num_experts != 0:
+                raise ValueError(f"MoE expert data size is not expert-aligned: {ref}")
+            if header["scales_size"] and header["scales_size"] % layer_num_experts != 0:
+                raise ValueError(f"MoE expert scale size is not expert-aligned: {ref}")
+
+            groups_per_row = 0
+            if header["group_size"]:
+                cols = int(spec.get("cols") or header["shape"][1])
+                groups_per_row = (cols + int(header["group_size"]) - 1) // int(header["group_size"])
+
+            spec["weight"] = ref
+            spec["weight_offset"] = weight_offset
+            spec["weight_size"] = weight_size
+            spec["precision"] = header["precision"]
+            spec["flags"] = header["flags"]
+            spec["shape"] = header["shape"]
+            spec["data_offset"] = header["data_offset"]
+            spec["data_size"] = header["data_size"]
+            spec["scales_offset"] = header["scales_offset"]
+            spec["scales_size"] = header["scales_size"]
+            spec["group_size"] = header["group_size"]
+            spec["groups_per_row"] = groups_per_row
+            spec["expert_data_bytes"] = header["data_size"] // layer_num_experts
+            spec["expert_scales_bytes"] = (
+                header["scales_size"] // layer_num_experts
+                if header["scales_size"] else 0
+            )
 
 
 def save_package(output_path: str,
@@ -1098,6 +1201,7 @@ def save_package(output_path: str,
 
         # Step 3: collect weight files referenced by both graphs
         weight_files = {}  # relative_name -> (offset, size)
+        weight_paths = {}  # relative_name -> filesystem path used for packing
         weight_entries = []  # (path, size), in package order
         weights_len = 0
 
@@ -1121,10 +1225,12 @@ def save_package(output_path: str,
                 weights_len += size
                 weight_entries.append((wpath, size))
                 weight_files[ref] = [offset, size]
+                weight_paths[ref] = wpath
 
         # Step 4: build metadata
         meta = dict(metadata)
         meta["weights"] = weight_files
+        _augment_moe_expert_storage(meta, weight_files, weight_paths)
         meta_json = json.dumps(meta, ensure_ascii=False).encode('utf-8')
 
         # Step 5: read tokenizer + jinja bytes

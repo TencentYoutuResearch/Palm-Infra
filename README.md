@@ -68,7 +68,7 @@ measured prefill/decode timings. Higher numbers are bolded in the tables below.
 
 | Model | mollm W4 pp/tg | llama.cpp Q4_0 pp/tg | Result |
 |---|---:|---:|---|
-| Qwen3.6-35B-A3B | **131.80** / **60.31** | 116.93 / 43.73 | mollm faster prefill and decode |
+| Qwen3.6-35B-A3B | **142.30** / **66.02** | 116.93 / 43.73 | mollm 1.22x prefill, 1.51x decode |
 
 Overall: mollm decode is already strong, especially with W4 packages. Prefill is
 still the main optimization target on dense models.

@@ -167,6 +167,49 @@ def _required_weight_names(tc: dict, num_layers: int) -> set[str]:
     return names
 
 
+def _moe_expert_storage_metadata(weights_dir: str, tc: dict, num_layers: int) -> dict:
+    """Describe per-expert byte-addressable slices inside aggregate tensors.
+
+    The runtime still consumes the two aggregate tensors per layer. This
+    metadata makes each routed expert independently addressable for future SSD
+    offload/cache paths:
+
+      gate_up: [num_experts * 2I, H], split into E contiguous [2I, H] blocks
+      down:    [num_experts * H,  I], split into E contiguous [H, I] blocks
+
+    `save_package()` resolves these logical splits into package offsets and
+    per-expert data/scales byte sizes after it knows the final weight layout.
+    """
+    hidden_size = tc["hidden_size"]
+    intermediate = tc["moe_intermediate_size"]
+    num_experts = tc["num_experts"]
+    layers = []
+    for layer_idx in range(num_layers):
+        mlp_pfx = f"model_language_model_layers_{layer_idx}_mlp"
+        layers.append({
+            "layer": layer_idx,
+            "num_experts": num_experts,
+            "gate_up": {
+                "weight": os.path.join(weights_dir, f"{mlp_pfx}_experts_gate_up_proj.weights"),
+                "rows_per_expert": 2 * intermediate,
+                "cols": hidden_size,
+                "logical_shape": [num_experts, 2 * intermediate, hidden_size],
+            },
+            "down": {
+                "weight": os.path.join(weights_dir, f"{mlp_pfx}_experts_down_proj.weights"),
+                "rows_per_expert": hidden_size,
+                "cols": intermediate,
+                "logical_shape": [num_experts, hidden_size, intermediate],
+            },
+        })
+    return {
+        "version": 1,
+        "layout": "aggregate_rows_v1",
+        "num_experts": num_experts,
+        "layers": layers,
+    }
+
+
 def export_weights(model_dir: Path, weights_dir: str, cfg: dict, num_layers: int,
                    quant: str = "fp16"):
     os.makedirs(weights_dir, exist_ok=True)
@@ -418,7 +461,7 @@ def _build_layer(g, x, layer_idx, weights_dir, tc,
 
 
 def convert_qwen35_moe(model_dir: str, output_path: str, num_layers: int | None = None,
-                       prefill_seq_len: int = 256, n_ctx: int = 4096,
+                       prefill_seq_len: int = 256, n_ctx: int = 16384,
                        quant: str = "fp16"):
     model_dir = Path(model_dir)
     quant = _canonical_quant(quant)
@@ -469,6 +512,7 @@ def convert_qwen35_moe(model_dir: str, output_path: str, num_layers: int | None 
             "num_experts_per_tok": tc["num_experts_per_tok"],
             "moe_intermediate_size": tc["moe_intermediate_size"],
             "shared_expert_intermediate_size": tc["shared_expert_intermediate_size"],
+            "moe_expert_storage": _moe_expert_storage_metadata(weights_rel, tc, num_layers),
             "quantization": quant,
         }
 
