@@ -246,19 +246,23 @@ static bool validate_inputs(const std::vector<const Tensor*>& inputs,
                             int num_experts,
                             int top_k,
                             int intermediate_size,
-                            int shared_intermediate_size) {
-    if (inputs.size() < 8) {
-        std::fprintf(stderr, "MOE: expected 8 inputs, got %zu\n", inputs.size());
+                            int shared_intermediate_size,
+                            bool has_shared_expert) {
+    size_t required_inputs = has_shared_expert ? 8 : 4;
+    if (inputs.size() < required_inputs) {
+        std::fprintf(stderr, "MOE: expected at least %zu inputs, got %zu\n",
+                     required_inputs, inputs.size());
         return false;
     }
-    for (int i = 0; i < 8; i++) {
+    for (size_t i = 0; i < required_inputs; i++) {
         if (!inputs[i] || !inputs[i]->data) {
-            std::fprintf(stderr, "MOE: missing input %d\n", i);
+            std::fprintf(stderr, "MOE: missing input %zu\n", i);
             return false;
         }
     }
     if (hidden_size <= 0 || num_experts <= 0 || top_k <= 0 ||
-        intermediate_size <= 0 || shared_intermediate_size <= 0 ||
+        intermediate_size <= 0 ||
+        (has_shared_expert && shared_intermediate_size <= 0) ||
         top_k > num_experts) {
         std::fprintf(stderr,
                      "MOE: bad params hidden=%d experts=%d top_k=%d intermediate=%d shared=%d\n",
@@ -362,9 +366,16 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       int num_experts,
                       int top_k,
                       int intermediate_size,
-                      int shared_intermediate_size) {
+                      int shared_intermediate_size,
+                      int router_score_func,
+                      bool norm_topk_prob,
+                      bool has_shared_expert,
+                      int n_group,
+                      int topk_group,
+                      float routed_scaling_factor) {
     if (!validate_inputs(inputs, output, hidden_size, num_experts, top_k,
-                         intermediate_size, shared_intermediate_size)) {
+                         intermediate_size, shared_intermediate_size,
+                         has_shared_expert)) {
         return;
     }
 
@@ -372,10 +383,11 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     const Tensor& router = *inputs[1];
     const Tensor& experts_gate_up = *inputs[2];
     const Tensor& experts_down = *inputs[3];
-    const Tensor& shared_gate = *inputs[4];
-    const Tensor& shared_up = *inputs[5];
-    const Tensor& shared_down = *inputs[6];
-    const Tensor& shared_expert_gate = *inputs[7];
+    const Tensor* router_bias = inputs.size() > 8 ? inputs[8] : nullptr;
+    const Tensor* shared_gate = has_shared_expert ? inputs[4] : nullptr;
+    const Tensor* shared_up = has_shared_expert ? inputs[5] : nullptr;
+    const Tensor* shared_down = has_shared_expert ? inputs[6] : nullptr;
+    const Tensor* shared_expert_gate = has_shared_expert ? inputs[7] : nullptr;
 
     assert(hidden.prec == Precision::FP32);
     const int seq_len = (int)hidden.shape[1];
@@ -401,6 +413,15 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
 
     std::vector<int> top_idx((size_t)seq_len * (size_t)top_k);
     std::vector<float> top_w((size_t)seq_len * (size_t)top_k);
+    std::vector<float> router_scores(router_score_func == 1
+        ? (size_t)seq_len * (size_t)num_experts : 0);
+    std::vector<float> choice_scores(router_score_func == 1
+        ? (size_t)num_experts : 0);
+    const float* bias_data = router_bias && router_bias->data
+        ? router_bias->ptr<float>() : nullptr;
+    if (n_group <= 0) n_group = 1;
+    if (topk_group <= 0 || topk_group > n_group) topk_group = n_group;
+    int experts_per_group = num_experts / n_group;
     if (profile) stage_start = moe_profile_now();
     for (int t = 0; t < seq_len; t++) {
         const float* logits = router_logits.data() + (size_t)t * num_experts;
@@ -412,8 +433,57 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             weights[k] = -std::numeric_limits<float>::infinity();
         }
 
+        const float* weight_source = logits;
+        if (router_score_func == 1) {
+            float* scores = router_scores.data() + (size_t)t * num_experts;
+            for (int e = 0; e < num_experts; e++) {
+                scores[e] = sigmoid_scalar(logits[e]);
+                choice_scores[e] = scores[e] + (bias_data ? bias_data[e] : 0.0f);
+            }
+            if (n_group > 1 && experts_per_group > 0 && topk_group < n_group) {
+                std::vector<float> group_scores(n_group, -std::numeric_limits<float>::infinity());
+                std::vector<int> group_idx(topk_group, 0);
+                std::vector<float> group_top(topk_group, -std::numeric_limits<float>::infinity());
+                for (int g = 0; g < n_group; g++) {
+                    float best0 = -std::numeric_limits<float>::infinity();
+                    float best1 = -std::numeric_limits<float>::infinity();
+                    int begin = g * experts_per_group;
+                    int end = begin + experts_per_group;
+                    for (int e = begin; e < end; e++) {
+                        float v = choice_scores[e];
+                        if (v > best0) {
+                            best1 = best0;
+                            best0 = v;
+                        } else if (v > best1) {
+                            best1 = v;
+                        }
+                    }
+                    group_scores[g] = best0 + best1;
+                    for (int k = 0; k < topk_group; k++) {
+                        if (group_scores[g] > group_top[k]) {
+                            for (int s = topk_group - 1; s > k; s--) {
+                                group_top[s] = group_top[s - 1];
+                                group_idx[s] = group_idx[s - 1];
+                            }
+                            group_top[k] = group_scores[g];
+                            group_idx[k] = g;
+                            break;
+                        }
+                    }
+                }
+                std::vector<unsigned char> keep_group(n_group, 0);
+                for (int k = 0; k < topk_group; k++) keep_group[group_idx[k]] = 1;
+                for (int e = 0; e < num_experts; e++) {
+                    int g = e / experts_per_group;
+                    if (!keep_group[g]) choice_scores[e] = -std::numeric_limits<float>::infinity();
+                }
+            }
+            weight_source = scores;
+        }
+
+        const float* select_source = router_score_func == 1 ? choice_scores.data() : logits;
         for (int e = 0; e < num_experts; e++) {
-            float v = logits[e];
+            float v = select_source[e];
             for (int k = 0; k < top_k; k++) {
                 if (v > weights[k]) {
                     for (int s = top_k - 1; s > k; s--) {
@@ -427,61 +497,76 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             }
         }
 
-        float max_top = weights[0];
-        float sum_top = 0.0f;
-        for (int k = 0; k < top_k; k++) {
-            weights[k] = std::exp(weights[k] - max_top);
-            sum_top += weights[k];
+        if (router_score_func == 1) {
+            float sum_top = 0.0f;
+            for (int k = 0; k < top_k; k++) {
+                weights[k] = weight_source[idx[k]];
+                sum_top += weights[k];
+            }
+            if (norm_topk_prob) {
+                float inv_top = sum_top > 0.0f ? 1.0f / sum_top : 0.0f;
+                for (int k = 0; k < top_k; k++) weights[k] *= inv_top;
+            }
+            for (int k = 0; k < top_k; k++) weights[k] *= routed_scaling_factor;
+        } else {
+            float max_top = weights[0];
+            float sum_top = 0.0f;
+            for (int k = 0; k < top_k; k++) {
+                weights[k] = std::exp(weights[k] - max_top);
+                sum_top += weights[k];
+            }
+            float inv_top = sum_top > 0.0f ? 1.0f / sum_top : 0.0f;
+            for (int k = 0; k < top_k; k++) weights[k] *= inv_top;
         }
-        float inv_top = sum_top > 0.0f ? 1.0f / sum_top : 0.0f;
-        for (int k = 0; k < top_k; k++) weights[k] *= inv_top;
     }
     if (profile) moe_profile_add(MoeProfileStage::TopK, stage_start);
 
     // Shared expert: shared_down(silu(shared_gate(x)) * shared_up(x))
     // multiplied by sigmoid(shared_expert_gate(x)).
-    std::vector<float> shared_gate_out((size_t)seq_len * (size_t)shared_intermediate_size);
-    std::vector<float> shared_up_out((size_t)seq_len * (size_t)shared_intermediate_size);
-    std::vector<float> shared_inter((size_t)seq_len * (size_t)shared_intermediate_size);
-    std::vector<float> shared_down_out((size_t)seq_len * (size_t)hidden_size);
-    std::vector<float> shared_scale((size_t)seq_len);
+    if (has_shared_expert) {
+        std::vector<float> shared_gate_out((size_t)seq_len * (size_t)shared_intermediate_size);
+        std::vector<float> shared_up_out((size_t)seq_len * (size_t)shared_intermediate_size);
+        std::vector<float> shared_inter((size_t)seq_len * (size_t)shared_intermediate_size);
+        std::vector<float> shared_down_out((size_t)seq_len * (size_t)hidden_size);
+        std::vector<float> shared_scale((size_t)seq_len);
 
-    Tensor shared_gate_b = make_weight_view_2d(shared_gate, shared_intermediate_size, hidden_size);
-    Tensor shared_up_b = make_weight_view_2d(shared_up, shared_intermediate_size, hidden_size);
-    Tensor shared_gate_t = make_fp32_tensor(shared_gate_out.data(), shared_intermediate_size, seq_len);
-    Tensor shared_up_t = make_fp32_tensor(shared_up_out.data(), shared_intermediate_size, seq_len);
+        Tensor shared_gate_b = make_weight_view_2d(*shared_gate, shared_intermediate_size, hidden_size);
+        Tensor shared_up_b = make_weight_view_2d(*shared_up, shared_intermediate_size, hidden_size);
+        Tensor shared_gate_t = make_fp32_tensor(shared_gate_out.data(), shared_intermediate_size, seq_len);
+        Tensor shared_up_t = make_fp32_tensor(shared_up_out.data(), shared_intermediate_size, seq_len);
 
-    if (profile) stage_start = moe_profile_now();
-    kernel_matmul_fp32(hidden, shared_gate_b, shared_gate_t, thread_pool);
-    kernel_matmul_fp32(hidden, shared_up_b, shared_up_t, thread_pool);
-    for (int t = 0; t < seq_len; t++) {
-        float* dst = shared_inter.data() + (size_t)t * shared_intermediate_size;
-        const float* gate = shared_gate_out.data() + (size_t)t * shared_intermediate_size;
-        const float* up = shared_up_out.data() + (size_t)t * shared_intermediate_size;
-        for (int j = 0; j < shared_intermediate_size; j++) {
-            dst[j] = silu_scalar(gate[j]) * up[j];
+        if (profile) stage_start = moe_profile_now();
+        kernel_matmul_fp32(hidden, shared_gate_b, shared_gate_t, thread_pool);
+        kernel_matmul_fp32(hidden, shared_up_b, shared_up_t, thread_pool);
+        for (int t = 0; t < seq_len; t++) {
+            float* dst = shared_inter.data() + (size_t)t * shared_intermediate_size;
+            const float* gate = shared_gate_out.data() + (size_t)t * shared_intermediate_size;
+            const float* up = shared_up_out.data() + (size_t)t * shared_intermediate_size;
+            for (int j = 0; j < shared_intermediate_size; j++) {
+                dst[j] = silu_scalar(gate[j]) * up[j];
+            }
         }
-    }
-    if (profile) moe_profile_add(MoeProfileStage::SharedGateUp, stage_start);
+        if (profile) moe_profile_add(MoeProfileStage::SharedGateUp, stage_start);
 
-    Tensor shared_inter_t = make_fp32_tensor(shared_inter.data(), shared_intermediate_size, seq_len);
-    Tensor shared_down_b = make_weight_view_2d(shared_down, hidden_size, shared_intermediate_size);
-    Tensor shared_down_t = make_fp32_tensor(shared_down_out.data(), hidden_size, seq_len);
-    std::vector<float> shared_gate_scale_out((size_t)seq_len);
-    Tensor shared_scale_b = make_weight_view_2d(shared_expert_gate, 1, hidden_size);
-    Tensor shared_scale_t = make_fp32_tensor(shared_gate_scale_out.data(), 1, seq_len);
+        Tensor shared_inter_t = make_fp32_tensor(shared_inter.data(), shared_intermediate_size, seq_len);
+        Tensor shared_down_b = make_weight_view_2d(*shared_down, hidden_size, shared_intermediate_size);
+        Tensor shared_down_t = make_fp32_tensor(shared_down_out.data(), hidden_size, seq_len);
+        std::vector<float> shared_gate_scale_out((size_t)seq_len);
+        Tensor shared_scale_b = make_weight_view_2d(*shared_expert_gate, 1, hidden_size);
+        Tensor shared_scale_t = make_fp32_tensor(shared_gate_scale_out.data(), 1, seq_len);
 
-    if (profile) stage_start = moe_profile_now();
-    kernel_matmul_fp32(shared_inter_t, shared_down_b, shared_down_t, thread_pool);
-    kernel_matmul_fp32(hidden, shared_scale_b, shared_scale_t, thread_pool);
-    for (int t = 0; t < seq_len; t++) {
-        shared_scale[t] = sigmoid_scalar(shared_gate_scale_out[t]);
-        const float* src = shared_down_out.data() + (size_t)t * hidden_size;
-        float* dst = out_data + (int64_t)t * ldo;
-        float scale = shared_scale[t];
-        for (int d = 0; d < hidden_size; d++) dst[d] += scale * src[d];
+        if (profile) stage_start = moe_profile_now();
+        kernel_matmul_fp32(shared_inter_t, shared_down_b, shared_down_t, thread_pool);
+        kernel_matmul_fp32(hidden, shared_scale_b, shared_scale_t, thread_pool);
+        for (int t = 0; t < seq_len; t++) {
+            shared_scale[t] = sigmoid_scalar(shared_gate_scale_out[t]);
+            const float* src = shared_down_out.data() + (size_t)t * hidden_size;
+            float* dst = out_data + (int64_t)t * ldo;
+            float scale = shared_scale[t];
+            for (int d = 0; d < hidden_size; d++) dst[d] += scale * src[d];
+        }
+        if (profile) moe_profile_add(MoeProfileStage::SharedDown, stage_start);
     }
-    if (profile) moe_profile_add(MoeProfileStage::SharedDown, stage_start);
 
     std::vector<int> counts(num_experts, 0);
     for (int t = 0; t < seq_len; t++) {

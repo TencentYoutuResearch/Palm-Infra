@@ -5,6 +5,8 @@ Usage:
     python3 models/converter.py <model_dir> <output.mollm> [quant]
 
 The converter reads <model_dir>/config.json to determine the model type:
+    - model_type "qwen3"    → Qwen3 decoder-only converter (qwen3.py)
+    - model_type "qwen3_moe" → Qwen3 MoE-compatible converter (qwen3_moe.py)
     - model_type "qwen3_5"  → Qwen3.5 converter (qwen35.py)
     - model_type "qwen3_5_moe" → Qwen3.5-MoE text converter (qwen35_moe.py)
     - model_type "youtu"    → Youtu-LLM MLA converter (mla.py)
@@ -19,6 +21,8 @@ from pathlib import Path
 
 # Supported model types: model_type → (converter_module, converter_func)
 SUPPORTED_MODELS = {
+    "qwen3":       ("qwen3",      "convert_qwen3"),
+    "qwen3_moe":   ("qwen3_moe",  "convert_qwen3_moe"),
     "qwen3_5":     ("qwen35",     "convert_qwen35"),
     "qwen3_5_moe": ("qwen35_moe", "convert_qwen35_moe"),
     "youtu":       ("mla",        "convert_mla"),
@@ -35,7 +39,24 @@ def detect_model_type(model_dir: str) -> str:
     with open(config_path) as f:
         cfg = json.load(f)
     model_type = cfg.get("model_type", "")
+    if model_type not in SUPPORTED_MODELS and _looks_like_qwen3_moe(cfg):
+        return "qwen3_moe"
     return model_type
+
+
+def _looks_like_qwen3_moe(cfg: dict) -> bool:
+    """Detect Qwen3-style decoder MoE configs without naming private forks."""
+    required = (
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "moe_intermediate_size",
+        "num_experts_per_tok",
+    )
+    has_experts = "n_routed_experts" in cfg or "num_experts" in cfg
+    return has_experts and all(k in cfg for k in required)
 
 
 def main():

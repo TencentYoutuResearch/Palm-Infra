@@ -1,6 +1,6 @@
 # Current State
 
-*Last updated: 2026-07-06*
+*Last updated: 2026-07-14*
 
 ## 项目概述
 
@@ -8,7 +8,9 @@
 目前在 Apple Silicon 上开发和测试，移动端 ARM（Qualcomm Oryon、MediaTek）在 roadmap 中。
 Python 转译前端 → `.mollm` 单文件打包 → C++ 执行器 + NEON FP16FML kernels。
 
-支持三个模型系列：
+支持的主要模型系列：
+- **Qwen3 dense text models**（GQA）
+- **Qwen3-30B-A3B MoE**（Qwen3-MoE，128 experts / top-8）
 - **Qwen3.5-4B**（hybrid linear/full attention：Gated DeltaNet + GQA）
 - **Qwen3.5-0.8B**（同架构）
 - **Youtu-LLM-2B**（MLA）
@@ -50,6 +52,19 @@ W4G128 direct BG128 / Q4_0:
 | Youtu-LLM-2B | 248.08 / 115.64 | 265.58 / 97.15 | 1.07x slower | 1.19x faster |
 | Qwen3.5-4B | 115.37 / 55.94 | 140.51 / 44.25 | 1.22x slower | 1.26x faster |
 
+Qwen3-MoE W4G128 / Q4_0:
+
+2026-07-14 fan-on strict rerun, 5 independent process medians. mollm uses
+`qwen3_30b_a3b_w4g128.mollm`; llama.cpp uses locally converted
+`Qwen3-30B-A3B-Q4_0.gguf` with the same BLAS-on, Metal-off CPU build. The
+llama.cpp `--fuse-gate-up-exps` converter path failed for Qwen3Moe in this
+local checkout (`Missing FFN_GATE_UP_EXP`), so the Q4_0 GGUF uses the default
+separate gate/up expert tensors.
+
+| Model | mollm W4G128 pp/tg | llama.cpp Q4_0 pp/tg | prefill gap | decode gap |
+|-------|-------------------:|---------------------:|------------:|-----------:|
+| Qwen3-30B-A3B | 142.92 / 65.66 | 110.34 / 60.77 | 1.30x faster | 1.08x faster |
+
 Interpretation:
 - FP16 decode remains faster than llama.cpp F16 on all three models in this
   rerun; prefill remains slower.
@@ -67,6 +82,10 @@ Interpretation:
   ~9.0 GiB on disk and peaks around 16.8 GB RSS in the latest full rerun. W8PC
   4B is ~5.1 GiB on disk and peaks around 11.0 GB RSS; W4G128 direct BG128 4B
   peaks around 5.0 GB RSS.
+- Qwen3-30B-A3B MoE is the first large official Qwen3-MoE CPU baseline in this
+  tree. With the current fused MoE op and aggregated expert package layout,
+  mollm is faster than the local llama.cpp Q4_0 CPU baseline on both prefill
+  and decode under the same pp256/tg64 protocol.
 
 ### 2026-07-01 内存管理分支 benchmark 审计
 

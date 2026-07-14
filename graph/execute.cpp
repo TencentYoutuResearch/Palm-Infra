@@ -508,10 +508,19 @@ void CPUBackend::dispatch(const GraphNode& node,
         int top_k = graph_params::get_i32(params, 2, 0);
         int intermediate_size = graph_params::get_i32(params, 3, 0);
         int shared_intermediate_size = graph_params::get_i32(params, 4, intermediate_size);
+        int router_score_func = graph_params::get_i32(params, 5, 0);
+        bool norm_topk_prob = graph_params::get_i32(params, 6, 1) != 0;
+        bool has_shared_expert = graph_params::get_i32(params, 7, 1) != 0;
+        int n_group = graph_params::get_i32(params, 8, 1);
+        int topk_group = graph_params::get_i32(params, 9, 1);
+        float routed_scaling_factor = graph_params::get_f32(params, 0, 1.0f);
         if (output) {
             kernel_qwen3_moe(inputs, *output, thread_pool,
                              hidden_size, num_experts, top_k,
-                             intermediate_size, shared_intermediate_size);
+                             intermediate_size, shared_intermediate_size,
+                             router_score_func, norm_topk_prob,
+                             has_shared_expert, n_group, topk_group,
+                             routed_scaling_factor);
         }
         break;
     }

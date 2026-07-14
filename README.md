@@ -20,9 +20,10 @@ or int4 kernels optimized for ARM dot-product instructions.
 
 | Model family | Status |
 |---|---|
+| Qwen3 dense text models | FP16, W8, W4 |
+| Qwen3-30B-A3B MoE | text-only W4 path |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4 |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
-| Qwen3.5/3.6-35B-A3B MoE | text-only FP16/W4 path |
 
 The most tested runtime path today is `w4g128`: it has the lowest memory use and
 the fastest decode speed in mollm. `w4mixg128` keeps selected sensitive tensors
@@ -68,7 +69,7 @@ measured prefill/decode timings. Higher numbers are bolded in the tables below.
 
 | Model | mollm W4 pp/tg | llama.cpp Q4_0 pp/tg | Result |
 |---|---:|---:|---|
-| Qwen3.6-35B-A3B | **142.30** / **66.02** | 116.93 / 43.73 | mollm 1.22x prefill, 1.51x decode |
+| Qwen3-30B-A3B | **142.92** / **65.66** | 110.34 / 60.77 | mollm 1.30x prefill, 1.08x decode |
 
 Overall: mollm decode is already strong, especially with W4 packages. Prefill is
 still the main optimization target on dense models.
@@ -105,9 +106,9 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
 | | | | | | (_) | | | | | | | |
 |_| |_| |_|\___/|_|_|_| |_| |_|
 
- model     : Qwen3.6-35B-A3B
- arch      : qwen3.5-moe
- layers    : 40
+ model     : Qwen3-30B-A3B
+ arch      : qwen3-moe
+ layers    : 48
  hidden    : 2048
  quant     : w4g128
  ctx       : 16384
@@ -169,8 +170,8 @@ MoE example:
 
 ```bash
 python3 models/converter.py \
-    /path/to/Qwen3.6-35B-A3B \
-    qwen36_moe_40l_w4g128.mollm \
+    /path/to/Qwen3-30B-A3B \
+    qwen3_30b_a3b_w4g128.mollm \
     w4g128
 ```
 
@@ -178,6 +179,8 @@ Supported `config.json` model types:
 
 | `model_type` | Supported models |
 |---|---|
+| `qwen3` | Qwen3 dense text models |
+| `qwen3_moe` | Qwen3 MoE text models |
 | `qwen3_5` | Qwen3.5 dense text models |
 | `qwen3_5_moe` | Qwen3.5/3.6 MoE text models |
 | `youtu` | Youtu-LLM MLA models |
@@ -199,7 +202,7 @@ Notes:
   runtime prefill is dynamic: short prompts are not padded to 256 unless you
   explicitly pass `--static-padded`.
 - Converted packages store a user-facing model name from the Hugging Face config
-  or model directory, so chat displays names such as `Qwen3.6-35B-A3B`.
+  or model directory, so chat displays names such as `Qwen3-30B-A3B`.
 
 ## Run Chat
 
@@ -221,7 +224,7 @@ One-shot deterministic smoke test:
 MoE chat:
 
 ```bash
-./build_i8mm/mollm_chat --package qwen36_moe_40l_w4g128.mollm --threads 4
+./build_i8mm/mollm_chat --package qwen3_30b_a3b_w4g128.mollm --threads 4
 ```
 
 By default, `mollm_chat` loads package weights into resident memory. For mmap

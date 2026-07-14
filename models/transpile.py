@@ -713,22 +713,36 @@ class GraphBuilder:
             shared_gate: int, shared_up: int, shared_down: int,
             shared_expert_gate: int,
             hidden_size: int, num_experts: int, top_k: int,
-            intermediate_size: int, shared_intermediate_size: int) -> int:
-        """Fused Qwen3.5-MoE sparse MLP.
+            intermediate_size: int, shared_intermediate_size: int,
+            router_bias: int | None = None,
+            router_score_func: int = 0,
+            norm_topk_prob: bool = True,
+            has_shared_expert: bool = True,
+            n_group: int = 1,
+            topk_group: int = 1,
+            routed_scaling_factor: float = 1.0) -> int:
+        """Fused Qwen-style sparse MLP.
 
         The expert tensors keep HF row-major layout:
           experts_gate_up [num_experts, 2*intermediate, hidden]
           experts_down    [num_experts, hidden, intermediate]
         """
         sx = self._nodes[hidden].out_shape
+        inputs = [hidden, router, experts_gate_up, experts_down,
+                  shared_gate, shared_up, shared_down, shared_expert_gate]
+        if router_bias is not None:
+            inputs.append(router_bias)
         return self._add(OpType.MOE,
-                         [hidden, router, experts_gate_up, experts_down,
-                          shared_gate, shared_up, shared_down,
-                          shared_expert_gate],
+                         inputs,
                          sx,
                          prec=Precision.FP32,
                          i32=[hidden_size, num_experts, top_k,
-                              intermediate_size, shared_intermediate_size])
+                              intermediate_size, shared_intermediate_size,
+                              router_score_func,
+                              1 if norm_topk_prob else 0,
+                              1 if has_shared_expert else 0,
+                              n_group, topk_group],
+                         f32=[float(routed_scaling_factor)])
 
     # ---- save ----
 
