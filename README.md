@@ -22,6 +22,7 @@ or int4 kernels optimized for ARM dot-product instructions.
 |---|---|
 | Qwen3 dense text models | FP16, W8, W4 |
 | Qwen3-30B-A3B MoE | text-only W4 path |
+| Qwen3.6-35B-A3B MoE | text-only W4 path |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4 |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
 
@@ -69,6 +70,7 @@ measured prefill/decode timings. Higher numbers are bolded in the tables below.
 
 | Model | mollm W4 pp/tg | llama.cpp Q4_0 pp/tg | Result |
 |---|---:|---:|---|
+| Qwen3.6-35B-A3B | **142.30** / **66.02** | 116.93 / 43.73 | mollm 1.22x prefill, 1.51x decode |
 | Qwen3-30B-A3B | **142.92** / **65.66** | 110.34 / 60.77 | mollm 1.30x prefill, 1.08x decode |
 
 Overall: mollm decode is already strong, especially with W4 packages. Prefill is
