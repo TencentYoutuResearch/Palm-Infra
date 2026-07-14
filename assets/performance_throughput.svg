@@ -134,15 +134,15 @@
   <rect x="700" y="740" width="66.4" height="13" rx="2" class="llama"/><text x="774" y="751" class="value">44.25</text>
 
   <text x="40" y="789" class="label">Qwen3.6-35B-A3B</text>
-  <rect x="200" y="768" width="74.7" height="13" rx="2" class="mollm"/><text x="283" y="779" class="value">142.30</text>
+  <rect x="200" y="768" width="73.3" height="13" rx="2" class="mollm"/><text x="281" y="779" class="value">139.63</text>
   <rect x="200" y="786" width="61.4" height="13" rx="2" class="llama"/><text x="269" y="797" class="value">116.93</text>
-  <rect x="700" y="768" width="99.0" height="13" rx="2" class="mollm"/><text x="807" y="779" class="value">66.02</text>
+  <rect x="700" y="768" width="98.0" height="13" rx="2" class="mollm"/><text x="806" y="779" class="value">65.32</text>
   <rect x="700" y="786" width="65.6" height="13" rx="2" class="llama"/><text x="773" y="797" class="value">43.73</text>
 
   <text x="40" y="835" class="label">Qwen3-30B-A3B</text>
-  <rect x="200" y="814" width="75.0" height="13" rx="2" class="mollm"/><text x="283" y="825" class="value">142.92</text>
+  <rect x="200" y="814" width="75.3" height="13" rx="2" class="mollm"/><text x="283" y="825" class="value">143.50</text>
   <rect x="200" y="832" width="57.9" height="13" rx="2" class="llama"/><text x="266" y="843" class="value">110.34</text>
-  <rect x="700" y="814" width="98.5" height="13" rx="2" class="mollm"/><text x="806" y="825" class="value">65.66</text>
+  <rect x="700" y="814" width="95.8" height="13" rx="2" class="mollm"/><text x="804" y="825" class="value">63.85</text>
   <rect x="700" y="832" width="91.2" height="13" rx="2" class="llama"/><text x="799" y="843" class="value">60.77</text>
 
   <line x1="200" y1="868" x2="620" y2="868" class="axis"/>
