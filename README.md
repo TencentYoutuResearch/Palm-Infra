@@ -1,4 +1,8 @@
-# mollm
+# palm-infra
+
+AI Infra projects from Palm Team. Currently includes `mollm`.
+
+## mollm
 
 ```
                  _ _
