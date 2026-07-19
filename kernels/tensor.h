@@ -53,6 +53,14 @@ struct Tensor {
     int64_t     shape[4] = {0, 1, 1, 1};
     size_t      stride[4] = {0, 0, 0, 0};  // stride in bytes
     void*       data     = nullptr;
+    // GPU backend (Metal) device storage. Inert on the CPU path (stay null/0),
+    // so all existing CPU logic and the default CPU build are unaffected.
+    //   device_data   = opaque id<MTLBuffer> handle backing this tensor.
+    //   device_offset = byte offset into that buffer's contents (views cannot
+    //     pointer-offset an MTLBuffer the way a char* can, so the handle stays
+    //     the same and the offset is carried separately).
+    void*       device_data   = nullptr;
+    size_t      device_offset = 0;
     uint32_t    owner_id = 0;  // debug owner for pooled storage; 0 = unknown/non-pooled
     uint64_t    storage_id = 0; // debug allocation identity; copied by borrowed views
     const float* scales = nullptr; // quant scales for INT8/INT4 weights; borrowed from weight file
@@ -231,6 +239,7 @@ struct Tensor {
         v.stride[2] = v.stride[1];
         v.stride[3] = v.stride[2];
         v.data = static_cast<char*>(data) + offset;
+        v.device_offset = device_offset + offset;  // inert on CPU (offset 0-based, data drives)
         return v;
     }
 
@@ -246,6 +255,7 @@ struct Tensor {
         v.stride[2] = v.stride[1] * ne1;
         v.stride[3] = v.stride[2];
         v.data = static_cast<char*>(data) + offset;
+        v.device_offset = device_offset + offset;  // inert on CPU
         return v;
     }
 

@@ -1,5 +1,12 @@
 #include "engine/engine.h"
 #include "kernels/matmul.h"
+#ifdef MOLLM_METAL
+#include "engine/metal_backend.h"
+// Downcast the owned Backend* to MetalBackend* (non-null iff Metal active).
+static inline MetalBackend* as_metal(const std::unique_ptr<Backend>& b) {
+    return static_cast<MetalBackend*>(b.get());
+}
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -706,6 +713,11 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.q8_repack_data = nullptr;
             t.q4_repack_data = nullptr;
             t.q4_g128_data = nullptr;
+#ifdef MOLLM_METAL
+            // Alias this weight into the registered device weight buffer so the
+            // Metal backend can read it (device_offset = ptr - region base).
+            if (metal_backend_) as_metal(metal_backend_)->wrap_weight(t);
+#endif
         };
 
         // Package mode: resolve weight from package mmap via offset map.
@@ -887,6 +899,24 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
 
     // Allocate cache/state data buffers from engine-owned persistent storage
     // (once, at load time). Graph runtime pools are execution-temporary only.
+    // Allocate a persistent buffer for a cache tensor. On Metal, allocate a
+    // device MTLBuffer (Shared storage, so the CacheMetadata header stays
+    // host-readable/writable and SDPA appends device-side). On CPU, use the
+    // engine persistent_pool_. Returns the host-visible pointer (buf).
+    auto alloc_cache_buf = [&](Tensor* t, size_t total) -> void* {
+#ifdef MOLLM_METAL
+        if (metal_backend_) {
+            as_metal(metal_backend_)->alloc_persistent(*t, total);
+            return t->data;  // = [buffer contents], host-visible
+        }
+#endif
+        void* buf = persistent_pool_.acquire(total);
+        t->data     = buf;
+        t->owner_id = persistent_pool_.id();
+        t->storage_id = persistent_pool_.storage_id(buf);
+        return buf;
+    };
+
     for (auto& cp : caches_) {
         // Standard KV cache
         if (cp.k) {
@@ -896,7 +926,7 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             size_t data_bytes = (size_t)hd * n_ctx * nkv * es;
             size_t total = CacheMetadata::SIZE + data_bytes;
 
-            void* buf = persistent_pool_.acquire(total);
+            void* buf = alloc_cache_buf(cp.k, total);
             std::memset(buf, 0, CacheMetadata::SIZE);
 
             auto* meta = cache_meta(buf);
@@ -905,10 +935,7 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             meta->num_kv_heads    = (uint64_t)nkv;
             meta->head_dim        = (uint64_t)hd;
 
-            cp.k->data     = buf;
             cp.k->mem_type = MemoryType::POOLED;
-            cp.k->owner_id = persistent_pool_.id();
-            cp.k->storage_id = persistent_pool_.storage_id(buf);
             cp.k->shape[0] = (int64_t)total / (int64_t)es;
             cp.k->compute_strides();
         }
@@ -919,7 +946,7 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             size_t data_bytes = (size_t)vd * n_ctx * nkv * es;
             size_t total = CacheMetadata::SIZE + data_bytes;
 
-            void* buf = persistent_pool_.acquire(total);
+            void* buf = alloc_cache_buf(cp.v, total);
             std::memset(buf, 0, CacheMetadata::SIZE);
 
             auto* meta = cache_meta(buf);
@@ -928,10 +955,7 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             meta->num_kv_heads    = (uint64_t)nkv;
             meta->v_head_dim      = (uint64_t)vd;
 
-            cp.v->data     = buf;
             cp.v->mem_type = MemoryType::POOLED;
-            cp.v->owner_id = persistent_pool_.id();
-            cp.v->storage_id = persistent_pool_.storage_id(buf);
             cp.v->shape[0] = (int64_t)total / (int64_t)es;
             cp.v->compute_strides();
         }
@@ -997,6 +1021,31 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     exec_ctx_decode_.thread_pool  = &thread_pool_;
     exec_ctx_prefill_.backend     = &cpu_backend_;
     exec_ctx_decode_.backend      = &cpu_backend_;
+    metal_backend_.reset();
+    if (cfg_.device == Device::METAL) {
+#ifdef MOLLM_METAL
+        metal_backend_.reset(new MetalBackend());
+        if (!as_metal(metal_backend_)->available()) {
+            fprintf(stderr, "Engine: Metal backend unavailable; falling back to CPU\n");
+            metal_backend_.reset();
+            cfg_.device = Device::CPU;
+        } else {
+            exec_ctx_prefill_.backend = metal_backend_.get();
+            exec_ctx_decode_.backend  = metal_backend_.get();
+            // The Metal backend wraps the weight region via newBufferWithBytesNoCopy.
+            // mmap'd file-backed pages are NOT reliably GPU-accessible that way
+            // (the GPU reads zeros), so force RESIDENT weights when Metal is active.
+            if (cfg_.weight_loading == WeightLoadingMode::MMAP) {
+                fprintf(stderr, "Engine: Metal backend requires resident weights; "
+                                "ignoring --mmap\n");
+                cfg_.weight_loading = WeightLoadingMode::RESIDENT;
+            }
+        }
+#else
+        fprintf(stderr, "Engine: built without MOLLM_METAL; using CPU backend\n");
+        cfg_.device = Device::CPU;
+#endif
+    }
     exec_ctx_prefill_.reuse_static_workspace = false;
     exec_ctx_prefill_.reuse_same_shape_workspace = true;
     exec_ctx_decode_.reuse_static_workspace  = true;
@@ -1018,6 +1067,17 @@ bool LLMEngine::load(const EngineConfig& cfg) {
             cfg_.tokenizer_path = tok_tmp;
         }
     }
+
+#ifdef MOLLM_METAL
+    // Wrap the whole package weight region as one zero-copy MTLBuffer so each
+    // weight tensor can alias it via device_offset (set in setup_weight).
+    if (metal_backend_ && package_weights_base_ && package_weights_size_) {
+        if (!as_metal(metal_backend_)->register_weight_region(
+                const_cast<uint8_t*>(package_weights_base_), package_weights_size_)) {
+            fprintf(stderr, "Engine: failed to register weight region with Metal\n");
+        }
+    }
+#endif
 
     // Load prefill graph first (establishes shared weights)
     const std::string& pf_path_load = cfg.use_decode_as_prefill ? dc_path : pf_path;
@@ -1208,7 +1268,16 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
     C.owner_id = graph_prefill_.runtime.pool.id();
     C.storage_id = graph_prefill_.runtime.pool.storage_id(c_buf);
 
-    kernel_matmul_fp32(A, *lm_head_weight_, C, exec_ctx_decode_.thread_pool);
+#ifdef MOLLM_METAL
+    if (metal_backend_ && lm_head_weight_->prec == Precision::FP16 &&
+        lm_head_weight_->device_data) {
+        as_metal(metal_backend_)->lm_head_gemv(
+            A.ptr<float>(), *lm_head_weight_, C.ptr<float>(), vocab_size, hidden_dim);
+    } else
+#endif
+    {
+        kernel_matmul_fp32(A, *lm_head_weight_, C, exec_ctx_decode_.thread_pool);
+    }
 
     float* scores = C.ptr<float>();
     int token = sample_token(scores, vocab_size,
@@ -1242,7 +1311,16 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
         Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
                                   vocab_size, 1, 1, 1, logits.data() + p * vocab_size);
 
-        kernel_matmul_fp32(A, *lm_head_weight_, C, exec_ctx_decode_.thread_pool);
+#ifdef MOLLM_METAL
+        if (metal_backend_ && lm_head_weight_->prec == Precision::FP16 &&
+            lm_head_weight_->device_data) {
+            as_metal(metal_backend_)->lm_head_gemv(
+                A.ptr<float>(), *lm_head_weight_, C.ptr<float>(), vocab_size, hidden_dim);
+        } else
+#endif
+        {
+            kernel_matmul_fp32(A, *lm_head_weight_, C, exec_ctx_decode_.thread_pool);
+        }
     }
 
     return logits;
@@ -1310,19 +1388,37 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
         const std::string& name = node.params.str[0];
         Tensor* t = &tensors[node.id];
 
+        bool is_boundary = false;
         if (name == "hidden") {
-            *t = hidden;
+            *t = hidden; is_boundary = true;
         } else if (name == "mask") {
-            *t = mask;
+            *t = mask; is_boundary = true;
         } else if (name == "cos") {
-            *t = cos;
+            *t = cos; is_boundary = true;
         } else if (name == "sin") {
-            *t = sin;
+            *t = sin; is_boundary = true;
         }
         // cache_k/cache_v/gdn state are persistent INPUT tensors.
+
+#ifdef MOLLM_METAL
+        // Boundary inputs are produced on the host (embed/rope/mask); upload
+        // their bytes into a device buffer so GPU kernels can read them.
+        // Cache/state INPUTs are already device-resident (allocate_caches).
+        if (metal_backend_ && is_boundary && t->data) {
+            as_metal(metal_backend_)->upload_input(*t, name, t->data, t->nbytes());
+        }
+#else
+        (void)is_boundary;
+#endif
     }
 
+#ifdef MOLLM_METAL
+    if (metal_backend_) metal_backend_->begin_graph();
+#endif
     execute_graph(exec_ctx);
+#ifdef MOLLM_METAL
+    if (metal_backend_) metal_backend_->end_graph();
+#endif
 
     if (!graph.graph_outputs.empty()) {
         uint32_t out_id = graph.graph_outputs.back();

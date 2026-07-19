@@ -2,6 +2,7 @@
 
 #include "graph/graph.h"
 #include "kernels/tensor.h"
+#include "graph/buffer_pool.h"
 
 class ThreadPool;
 
@@ -45,6 +46,45 @@ public:
     virtual void dispatch(const GraphNode& node,
                           const std::vector<const Tensor*>& inputs,
                           Tensor* output, ThreadPool* thread_pool) = 0;
+
+    // -----------------------------------------------------------------------
+    // Storage allocation hooks.
+    //
+    // execute_graph() calls these instead of touching BufferPool directly, so
+    // a device-resident backend (Metal) can allocate device storage rather
+    // than host memory. The default implementation is the exact host BufferPool
+    // behaviour the CPU executor used before, so CPU semantics are byte-identical.
+    // -----------------------------------------------------------------------
+
+    /// Allocate storage for a node output of `nbytes`. Sets out.data (host
+    /// pointer, possibly a device buffer's shared contents), out.mem_type,
+    /// out.owner_id, out.storage_id. Returns out.data (non-null on success).
+    virtual void* alloc_output(Tensor& out, size_t nbytes, BufferPool* pool) {
+        void* buf = pool->acquire(nbytes);
+        if (!buf) return nullptr;
+        out.data     = buf;
+        out.mem_type = MemoryType::POOLED;
+        out.owner_id = pool->id();
+        out.storage_id = pool->storage_id(buf);
+        return buf;
+    }
+
+    /// Release storage previously allocated via alloc_output(). Only called for
+    /// tensors with mem_type==POOLED. Does not null the tensor fields — the
+    /// executor does that after this returns.
+    virtual void free_output(Tensor& t, BufferPool* pool) {
+        pool->release(t.data, t.nbytes());
+    }
+
+    /// True when intermediates live in device (GPU) buffers rather than host
+    /// BufferPool memory. The executor uses this to classify borrowed views by
+    /// op type instead of host-pointer equality.
+    virtual bool is_device_resident() const { return false; }
+
+    /// Called by run_graph() before/after a full execute_graph() pass so a
+    /// device backend can open/commit a command buffer around the whole graph.
+    virtual void begin_graph() {}
+    virtual void end_graph() {}
 };
 
 // ---------------------------------------------------------------------------

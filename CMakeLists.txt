@@ -17,6 +17,7 @@ find_package(Threads REQUIRED)
 option(MOLLM_BUILD_TESTS "Build tests" ON)
 option(MOLLM_BUILD_EXAMPLE "Build example CLI" ON)
 option(MOLLM_ARM_NATIVE "Build ARM64 kernels with -mcpu=native for local benchmarking" OFF)
+option(MOLLM_METAL "Build the Metal GPU backend (Apple only)" OFF)
 set(MOLLM_ARM_I8MM "AUTO" CACHE STRING
     "ARM64 i8mm kernel target mode: AUTO, ON, or OFF")
 set_property(CACHE MOLLM_ARM_I8MM PROPERTY STRINGS AUTO ON OFF)
@@ -141,6 +142,78 @@ if(APPLE)
 endif()
 
 # ---------------------------------------------------------------------------
+# Metal GPU backend (optional, Apple only)
+# ---------------------------------------------------------------------------
+
+if(MOLLM_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "MOLLM_METAL requires an Apple platform")
+    endif()
+    enable_language(OBJCXX)
+
+    find_library(METAL_LIBRARY Metal REQUIRED)
+    find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
+
+    # Compile the shader library: .metal -> .air -> default.metallib
+    set(MOLLM_METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/mollm.metal)
+    set(MOLLM_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/mollm.air)
+    set(MOLLM_METALLIB  ${CMAKE_CURRENT_BINARY_DIR}/default.metallib)
+
+    # Probe: does the toolchain support the Metal 4 tensor API (mpp::tensor_ops)?
+    # If so, compile with -std=metal4.0 -DMOLLM_METAL_TENSOR so the fast
+    # tensor-API GEMM kernel is built. The backend still checks GPU family at
+    # runtime (M5/A19+) before dispatching to it, falling back to simdgroup.
+    set(MOLLM_METAL_FLAGS "")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E echo "#include <metal_tensor>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\nkernel void _p(){}"
+        OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/_tensor_probe.metal)
+    execute_process(
+        COMMAND xcrun -sdk macosx metal -std=metal4.0 -c
+                ${CMAKE_CURRENT_BINARY_DIR}/_tensor_probe.metal
+                -o ${CMAKE_CURRENT_BINARY_DIR}/_tensor_probe.air
+        RESULT_VARIABLE MOLLM_METAL_TENSOR_RC
+        OUTPUT_QUIET ERROR_QUIET)
+    if(MOLLM_METAL_TENSOR_RC EQUAL 0)
+        message(STATUS "Metal 4 tensor API available — enabling tensor GEMM kernel")
+        set(MOLLM_METAL_FLAGS -std=metal4.0 -DMOLLM_METAL_TENSOR)
+        target_compile_definitions(mollm_lib PUBLIC MOLLM_METAL_TENSOR=1)
+    else()
+        message(STATUS "Metal 4 tensor API not available — simdgroup GEMM only")
+    endif()
+
+    add_custom_command(
+        OUTPUT ${MOLLM_METAL_AIR}
+        COMMAND xcrun -sdk macosx metal ${MOLLM_METAL_FLAGS} -c ${MOLLM_METAL_SRC}
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal
+                -o ${MOLLM_METAL_AIR}
+        DEPENDS ${MOLLM_METAL_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/metal_common.h
+        COMMENT "Compiling Metal shaders (mollm.metal -> mollm.air)"
+        VERBATIM)
+    add_custom_command(
+        OUTPUT ${MOLLM_METALLIB}
+        COMMAND xcrun -sdk macosx metallib ${MOLLM_METAL_AIR} -o ${MOLLM_METALLIB}
+        DEPENDS ${MOLLM_METAL_AIR}
+        COMMENT "Linking Metal library (default.metallib)"
+        VERBATIM)
+    add_custom_target(mollm_metallib ALL DEPENDS ${MOLLM_METALLIB})
+    add_dependencies(mollm_lib mollm_metallib)
+
+    target_sources(mollm_lib PRIVATE
+        engine/metal_backend.mm
+        graph/metal_pool.mm)
+    # The Objective-C++ sources use ARC bridge-cast ownership semantics.
+    set_source_files_properties(
+        engine/metal_backend.mm graph/metal_pool.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_compile_definitions(mollm_lib PUBLIC
+        MOLLM_METAL=1
+        MOLLM_METALLIB_PATH="${MOLLM_METALLIB}")
+    target_link_libraries(mollm_lib PUBLIC ${METAL_LIBRARY} ${FOUNDATION_LIBRARY})
+    message(STATUS "Metal backend enabled (metallib: ${MOLLM_METALLIB})")
+endif()
+
+# ---------------------------------------------------------------------------
 # example CLI
 # ---------------------------------------------------------------------------
 
@@ -202,6 +275,10 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_e2e           tests/test_e2e.cpp)
     add_mollm_test(test_quantized_e2e tests/test_quantized_e2e.cpp)
     add_mollm_test(test_thread_pool_stress tests/test_thread_pool_stress.cpp)
+
+    if(MOLLM_METAL)
+        add_mollm_test(test_metal_ops tests/test_metal_ops.cpp)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

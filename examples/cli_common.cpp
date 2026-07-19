@@ -98,6 +98,22 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.profile = true;
         } else if (arg == "--static-padded") {
             opts.static_padded = true;
+        } else if (arg == "--device") {
+            if (!require_value(argc, argv, i, "--device", value, error)) return false;
+            std::string dev(value);
+            if (dev == "cpu") {
+                opts.device = Device::CPU;
+            } else if (dev == "metal") {
+#ifdef MOLLM_METAL
+                opts.device = Device::METAL;
+#else
+                error = "--device metal requires a build with -DMOLLM_METAL=ON";
+                return false;
+#endif
+            } else {
+                error = std::string("unknown --device value '") + dev + "' (use cpu|metal)";
+                return false;
+            }
         } else if (arg == "--mmap") {
             opts.weight_loading = WeightLoadingMode::MMAP;
         } else if (arg == "--load-warmup") {
@@ -163,6 +179,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --threads <int>          Default: 4\n");
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
+    std::printf("  --device <cpu|metal>     Compute backend (metal requires MOLLM_METAL build)\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load when using mmap\n");
     std::printf("  --no-load-warmup        Skip mmap page-in warmup\n");
@@ -190,6 +207,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.top_p = opts.top_p;
     cfg.seed = (unsigned int)opts.seed;
     cfg.static_padded = opts.static_padded;
+    cfg.device = opts.device;
     cfg.weight_loading = opts.weight_loading;
     return cfg;
 }

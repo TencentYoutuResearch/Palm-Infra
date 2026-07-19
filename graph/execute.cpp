@@ -1142,6 +1142,10 @@ void execute_graph(ExecContext& ctx) {
     auto& nodes  = ctx.graph->nodes;
     auto& tensors = ctx.graph->runtime.tensors;
     auto* pool   = ctx.pool;
+    // Device-resident backends (Metal) keep intermediates in device buffers,
+    // so borrowed-view detection can't rely on host-pointer equality; classify
+    // views by op type instead, and skip the host owner-id assertions.
+    const bool device_resident = ctx.backend && ctx.backend->is_device_resident();
 
     // Compute seq_val once for dynamic shape injection.
     // In DYNAMIC mode this = runtime_seq_len; in STATIC_PADDED mode = padded_seq_len.
@@ -1184,7 +1188,11 @@ void execute_graph(ExecContext& ctx) {
         bool borrowed = is_always_borrowed_view_op(node.op_type);
         if (node.op_type == OpType::RESHAPE && !node.inputs.empty()) {
             const Tensor& src = tensors[node.inputs[0]];
-            borrowed = shares_storage(t, src);
+            // On a device backend the output host pointer may be a device alias
+            // (or null), so shares_storage() pointer equality is unreliable.
+            // RESHAPE borrows iff its input is contiguous — known statically.
+            borrowed = device_resident ? src.is_contiguous()
+                                       : shares_storage(t, src);
         }
         borrowed_view[node.id] = borrowed ? 1 : 0;
     }
@@ -1211,16 +1219,18 @@ void execute_graph(ExecContext& ctx) {
             if (borrowed_view[node.id]) continue;
             auto& t = tensors[node.id];
             if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
-                if (t.owner_id != 0 && t.owner_id != pool->id()) {
+                if (!device_resident && t.owner_id != 0 && t.owner_id != pool->id()) {
                     std::fprintf(stderr,
                                  "execute_graph: owner mismatch before release for node %u (%p owner=%u pool=%u)\n",
                                  node.id, t.data, t.owner_id, pool->id());
                     assert(false && "execute_graph owner mismatch");
                     return;
                 }
-                pool->release(t.data, t.nbytes());
+                ctx.backend->free_output(t, pool);
             }
             t.data = nullptr;
+            t.device_data = nullptr;
+            t.device_offset = 0;
             t.mem_type = MemoryType::NONE;
             t.owner_id = 0;
             t.storage_id = 0;
@@ -1304,22 +1314,31 @@ void execute_graph(ExecContext& ctx) {
             }
             if (nbytes > 0) {
                 if (needs_allocation) {
-                    void* buf = pool->acquire(nbytes);
+                    // alloc_output() sets out.data/mem_type/owner_id/storage_id.
+                    // Default (CPU) impl is the old host BufferPool path;
+                    // a device backend allocates an MTLBuffer and records it in
+                    // out.device_data.
+                    void* buf = ctx.backend->alloc_output(out, nbytes, pool);
                     if (!buf) {
                         fprintf(stderr, "execute: pool acquire failed for node %u (%zu bytes)\n",
                                 node.id, nbytes);
                         return;
                     }
-                    out.data     = buf;
-                    out.mem_type = MemoryType::POOLED;
-                    out.owner_id = pool->id();
-                    out.storage_id = pool->storage_id(buf);
                 }
             }
         }
 
         // dispatch via backend
         ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
+
+        if (getenv("MOLLM_DUMP_NODES") && out.data && out.prec == Precision::FP32) {
+            const float* d = (const float*)out.data;
+            fprintf(stderr, "NODE %u op=%d shape=%lld,%lld,%lld,%lld  %.5f %.5f %.5f\n",
+                    node.id, (int)node.op_type,
+                    (long long)out.shape[0], (long long)out.shape[1],
+                    (long long)out.shape[2], (long long)out.shape[3],
+                    d[0], out.nelements()>1?d[1]:0, out.nelements()>2?d[2]:0);
+        }
 
         // Release completed tensors. Classify borrowed views before mutating
         // any producer in this release batch; a producer and its view can have
@@ -1334,7 +1353,9 @@ void execute_graph(ExecContext& ctx) {
                 rel_borrowed[r] = 1;
             } else if (op == OpType::RESHAPE && !nodes[rel_id].inputs.empty()) {
                 auto& t = tensors[rel_id];
-                rel_borrowed[r] = shares_storage(t, tensors[nodes[rel_id].inputs[0]]) ? 1 : 0;
+                const Tensor& src = tensors[nodes[rel_id].inputs[0]];
+                rel_borrowed[r] = (device_resident ? src.is_contiguous()
+                                                   : shares_storage(t, src)) ? 1 : 0;
             }
         }
 
@@ -1347,6 +1368,8 @@ void execute_graph(ExecContext& ctx) {
                     continue;
                 if (rel_borrowed[r]) {
                     t.data = nullptr;
+                    t.device_data = nullptr;
+                    t.device_offset = 0;
                     t.mem_type = MemoryType::NONE;
                     t.owner_id = 0;
                     t.storage_id = 0;
@@ -1354,15 +1377,17 @@ void execute_graph(ExecContext& ctx) {
                 }
             }
             if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
-                if (t.owner_id != 0 && t.owner_id != pool->id()) {
+                if (!device_resident && t.owner_id != 0 && t.owner_id != pool->id()) {
                     std::fprintf(stderr,
                                  "execute_graph: owner mismatch in release_queue for node %u (%p owner=%u pool=%u)\n",
                                  rel_id, t.data, t.owner_id, pool->id());
                     assert(false && "execute_graph release_queue owner mismatch");
                     return;
                 }
-                pool->release(t.data, t.nbytes());
+                ctx.backend->free_output(t, pool);
                 t.data     = nullptr;
+                t.device_data = nullptr;
+                t.device_offset = 0;
                 t.mem_type = MemoryType::NONE;
                 t.owner_id = 0;
                 t.storage_id = 0;

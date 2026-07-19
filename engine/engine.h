@@ -6,6 +6,7 @@
 #include "kernels/tensor.h"
 #include "kernels/threading.h"
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -66,8 +67,14 @@ enum class WeightLoadingMode {
     RESIDENT,
 };
 
+enum class Device {
+    CPU,
+    METAL,
+};
+
 struct EngineConfig {
     std::string package_path;         // .mollm single-file package (required)
+    Device device = Device::CPU;      // compute backend (METAL requires MOLLM_METAL)
     int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;
@@ -193,6 +200,9 @@ private:
     ExecContext exec_ctx_decode_;
     ThreadPool thread_pool_;
     CPUBackend cpu_backend_;     // owned by engine; assigned to ExecContexts
+    // Owned Metal backend (as base Backend* so the header needs no ObjC/Metal
+    // include). Non-null iff Metal is active; Backend has a virtual destructor.
+    std::unique_ptr<Backend> metal_backend_;
     int past_len_ = 0;
 
     // Shared mmap'd weight files (path → MappedFile)
