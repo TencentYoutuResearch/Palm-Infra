@@ -58,6 +58,7 @@ class OpType(IntEnum):
     SIGMOID        = 72
     EXP            = 73
     SOFTPLUS       = 74
+    SWIGLU         = 75
     QUANTIZE_KV    = 80
     DEQUANTIZE_KV  = 81
     GATED_DELTANET_DECODE  = 110
@@ -235,6 +236,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
 
     if op in (OpType.RMS_NORM, OpType.LAYER_NORM,
               OpType.SILU, OpType.GELU, OpType.SIGMOID, OpType.EXP, OpType.SOFTPLUS,
+              OpType.SWIGLU,
               OpType.ROTARY_EMBED,
               OpType.TILE, OpType.CONTIGUOUS,
               OpType.QUANTIZE_KV, OpType.DEQUANTIZE_KV,
@@ -450,6 +452,17 @@ class GraphBuilder:
     def softplus(self, x: int) -> int:
         return self._add(OpType.SOFTPLUS, [x], self._nodes[x].out_shape,
                          prec=self._nodes[x].out_prec)
+
+    def swiglu(self, merged: int) -> int:
+        """Fused SwiGLU over a merged [2I, ...] tensor: out = silu(gate) * up,
+        where gate = merged[0:I] and up = merged[I:2I] along dim 0. Output dim0 = I.
+        The op reads both halves from the single merged buffer (with merged's dim1
+        row stride), so it does NOT rely on stride-aware slice views."""
+        sx = list(self._nodes[merged].out_shape)
+        assert sx[0] % 2 == 0, f"swiglu merged dim0 must be even, got {sx[0]}"
+        out = tuple([sx[0] // 2] + sx[1:])
+        return self._add(OpType.SWIGLU, [merged], out,
+                         prec=self._nodes[merged].out_prec)
 
     # ---- position encoding ----
 

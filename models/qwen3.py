@@ -110,8 +110,54 @@ def export_weights(weights: dict[str, np.ndarray], weights_dir: str,
             save(wname.replace(".", "_"), d)
             continue
 
+        # Skip mlp.gate_proj / mlp.up_proj — merged below into gate_up_proj so the
+        # graph runs one large matmul + a fused SWIGLU op.
+        if ".mlp.gate_proj." in wname or ".mlp.up_proj." in wname:
+            continue
+        # Skip self_attn q/k/v_proj — merged below into qkv_proj (one matmul + slice).
+        if (".self_attn.q_proj." in wname or ".self_attn.k_proj." in wname
+                or ".self_attn.v_proj." in wname):
+            continue
+
         d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
         save(wname.replace(".", "_"), d, quantizable=True, raw_name=wname)
+
+    # Merge self_attn q/k/v_proj per layer into one [q+k+v, hidden] weight
+    # (concat along dim 0 = output/N). One matmul + slice at inference.
+    import re as _re_qkv
+    qkv_pat = _re_qkv.compile(r'^model\.layers\.(\d+)\.self_attn\.q_proj\.weight$')
+    qkv_ids = sorted({int(m.group(1)) for wname in weights
+                      for m in [qkv_pat.match(wname)] if m})
+    for layer_idx in qkv_ids:
+        qn = f"model.layers.{layer_idx}.self_attn.q_proj.weight"
+        kn = f"model.layers.{layer_idx}.self_attn.k_proj.weight"
+        vn = f"model.layers.{layer_idx}.self_attn.v_proj.weight"
+        if kn not in weights or vn not in weights:
+            continue
+        merged = np.concatenate([weights[qn], weights[kn], weights[vn]], axis=0)
+        if merged.dtype != np.float16:
+            merged = merged.astype(np.float16)
+        save(f"model_layers_{layer_idx}_self_attn_qkv_proj_weight", merged,
+             quantizable=True,
+             raw_name=f"model.layers.{layer_idx}.self_attn.qkv_proj.weight")
+
+    # Merge mlp.gate_proj + mlp.up_proj per layer into one [2*intermediate, hidden]
+    # weight (concat along dim 0 = output/N). One matmul + SWIGLU at inference.
+    import re
+    layer_pat = re.compile(r'^model\.layers\.(\d+)\.mlp\.gate_proj\.weight$')
+    layer_ids = sorted({int(m.group(1)) for wname in weights
+                        for m in [layer_pat.match(wname)] if m})
+    for layer_idx in layer_ids:
+        gate_name = f"model.layers.{layer_idx}.mlp.gate_proj.weight"
+        up_name   = f"model.layers.{layer_idx}.mlp.up_proj.weight"
+        if up_name not in weights:
+            continue
+        merged = np.concatenate([weights[gate_name], weights[up_name]], axis=0)
+        if merged.dtype != np.float16:
+            merged = merged.astype(np.float16)
+        save(f"model_layers_{layer_idx}_mlp_gate_up_proj_weight", merged,
+             quantizable=True,
+             raw_name=f"model.layers.{layer_idx}.mlp.gate_up_proj.weight")
 
     if lm_head_source is None:
         raise KeyError("No lm_head.weight or model.embed_tokens.weight found")
@@ -228,17 +274,15 @@ def _build_layer(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
     x_normed2 = g.rms_norm(x, w_ln2, eps=eps)
 
     mlp_pfx = f"{pfx}_mlp"
-    w_gate = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_gate_proj_weight.weights"),
-                      (intermediate, hidden_size), Precision.FP16)
-    w_up = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_up_proj_weight.weights"),
-                    (intermediate, hidden_size), Precision.FP16)
+    # Fused gate/up: one [2*intermediate, hidden] matmul (activation=NONE so the
+    # Metal tensor GEMM fast path is used) + a fused SWIGLU op (silu(gate)*up).
+    w_gate_up = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_gate_up_proj_weight.weights"),
+                         (2 * intermediate, hidden_size), Precision.FP16)
     w_down = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_down_proj_weight.weights"),
                       (hidden_size, intermediate), Precision.FP16)
 
-    gate = g.matmul(x_normed2, w_gate)
-    up = g.matmul(x_normed2, w_up)
-    gate = g.silu(gate)
-    mlp_hidden = g.mul(gate, up)
+    merged = g.matmul(x_normed2, w_gate_up)
+    mlp_hidden = g.swiglu(merged)
     mlp_out = g.matmul(mlp_hidden, w_down)
     return g.add(x, mlp_out)
 
@@ -253,16 +297,15 @@ def _build_attention(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
     _S = SEQ_SYMBOL.bind(seq_len) if is_prefill else seq_len
     pfx = f"model_layers_{layer_idx}_self_attn"
 
-    w_q = g.weight(os.path.join(weights_dir, f"{pfx}_q_proj_weight.weights"),
-                   (num_heads * head_dim, hidden_size), Precision.FP16)
-    w_k = g.weight(os.path.join(weights_dir, f"{pfx}_k_proj_weight.weights"),
-                   (num_kv_heads * head_dim, hidden_size), Precision.FP16)
-    w_v = g.weight(os.path.join(weights_dir, f"{pfx}_v_proj_weight.weights"),
-                   (num_kv_heads * head_dim, hidden_size), Precision.FP16)
-
-    query = g.matmul(x, w_q)
-    k = g.matmul(x, w_k)
-    v = g.matmul(x, w_v)
+    # Fused QKV: one [q_dim+k_dim+v_dim, hidden] matmul (activation=NONE → Metal
+    # tensor GEMM), then slice into q/k/v. The small k/v projections (N=1024)
+    # have poor tensor-engine occupancy alone; sharing one large matmul helps.
+    q_dim = num_heads * head_dim
+    kv_dim = num_kv_heads * head_dim
+    w_qkv = g.weight(os.path.join(weights_dir, f"{pfx}_qkv_proj_weight.weights"),
+                     (q_dim + 2 * kv_dim, hidden_size), Precision.FP16)
+    qkv = g.matmul(x, w_qkv)
+    query, k, v = g.slice(qkv, [q_dim, kv_dim, kv_dim], dim=0)
 
     w_qn = g.weight(os.path.join(weights_dir, f"{pfx}_q_norm_weight.weights"),
                     (head_dim,), Precision.FP32)

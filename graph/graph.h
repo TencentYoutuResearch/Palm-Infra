@@ -93,6 +93,7 @@ enum class OpType : uint32_t {
     SIGMOID  = 72,   // 1 / (1 + exp(-x))
     EXP      = 73,   // exp(x)
     SOFTPLUS = 74,   // log(1 + exp(x))
+    SWIGLU   = 75,   // silu(gate) * up over a merged [2I,...] tensor (gate|up halves)
 
     // KV cache
     QUANTIZE_KV   = 80,
@@ -131,6 +132,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::SIGMOID: return "SIGMOID";
     case OpType::EXP: return "EXP";
     case OpType::SOFTPLUS: return "SOFTPLUS";
+    case OpType::SWIGLU: return "SWIGLU";
     case OpType::QUANTIZE_KV: return "QUANTIZE_KV";
     case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";
     case OpType::GATED_DELTANET_DECODE: return "GATED_DELTANET_DECODE";

@@ -860,6 +860,36 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::SWIGLU:
+        // Fused SwiGLU over a merged [2I, ...] tensor: out[i] = silu(gate[i]) * up[i],
+        // gate = row[0..I), up = row[I..2I). Reads both halves from the single merged
+        // row (stride-aware); output is dense [I, ...]. NOT a slice-view consumer.
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            const Tensor& m = *inputs[0];
+            const char* m_base = static_cast<const char*>(m.data);
+            StrideIter it = compute_stride_iter(m);   // it.n_inner = 2I
+            const int I = it.n_inner / 2;
+            float* dst_row = output->ptr<float>();
+            for (int i3 = 0; i3 < it.d3; i3++) {
+                const char* p3 = m_base + i3 * it.s3;
+                for (int i2 = 0; i2 < it.d2; i2++) {
+                    const char* p2 = p3 + i2 * it.s2;
+                    for (int i1 = 0; i1 < it.d1; i1++) {
+                        const float* row = reinterpret_cast<const float*>(p2 + i1 * it.s1);
+                        const float* gate = row;
+                        const float* up   = row + I;
+                        for (int i = 0; i < I; i++) {
+                            float g = gate[i];
+                            float sg = g / (1.f + std::exp(-g));  // silu(g)
+                            dst_row[i] = sg * up[i];
+                        }
+                        dst_row += I;
+                    }
+                }
+            }
+        }
+        break;
+
     case OpType::SIGMOID:
         if (inputs.size() >= 1 && inputs[0] && output) {
             float* o = output->ptr<float>();
