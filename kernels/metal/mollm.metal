@@ -724,6 +724,18 @@ kernel void silu_f32(
     O[p.out_offset + gid] = v / (1.0f + exp(-v));
 }
 
+// SIGMOID: 1 / (1 + exp(-x)) (contiguous).
+kernel void sigmoid_f32(
+    device const float*   X      [[buffer(0)]],
+    device float*         O      [[buffer(2)]],
+    constant EwiseParams& p      [[buffer(3)]],
+    uint  gid                    [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.n) return;
+    float v = X[p.a_offset + gid];
+    O[p.out_offset + gid] = 1.0f / (1.0f + exp(-v));
+}
+
 // Fused SwiGLU: reads gate/up halves from a single merged [2I, rows] buffer
 // (gate = row[0..I), up = row[I..2I)), writes dense out[row*I + i] =
 // silu(gate[i]) * up[i]. Splits internally with the merged row stride so it does
@@ -743,6 +755,257 @@ kernel void swiglu_f32(
     float g = M[base + (uint)i];
     float u = M[base + (uint)(I + i)];
     O[p.out_offset + gid] = (g / (1.0f + exp(-g))) * u;
+}
+
+// ---------------------------------------------------------------------------
+// ShortConv: depth-wise causal conv1d + silu, one thread per group. Mirrors the
+// CPU kernel (execute.cpp OpType::SHORTCONV). Each group is independent (own
+// state, own output rows), so one thread walks that group's sequence序 serially.
+//   window[i+k] = k<(ksize-1) ? state[i+k-...]  actually: prepend state then x.
+//   For position i in [0,seq): sum = Σ_{k=0..ksize} win[i+k]*w[g,k], out=silu(sum),
+//   where win = [state(ksize-1) | x(seq)]. state updated to last (ksize-1) x vals.
+// grid = ceil(groups) threadgroups; ksize<=4 (KMAX). Persistent state buffer is
+// read AND written in-place (like the KV cache append).
+// ---------------------------------------------------------------------------
+kernel void shortconv_f32(
+    device const float*      X     [[buffer(0)]],
+    device const float*      W     [[buffer(1)]],
+    device float*            STATE [[buffer(2)]],
+    device float*            O     [[buffer(4)]],
+    constant ShortConvParams& p    [[buffer(3)]],
+    uint  gid                      [[thread_position_in_grid]])
+{
+    const int KMAX = 4;
+    int g = int(gid);
+    if (g >= p.groups) return;
+    int ks = p.kernel_size;          // <= KMAX
+    int pre = ks - 1;                // state window length
+    int seq = p.seq;
+    int nreal = (p.n_real > 0 && p.n_real < seq) ? p.n_real : seq;
+
+    device const float* w = W + p.w_offset + (uint)g * (uint)ks;
+    device float* cs = STATE + p.state_offset + (uint)g * (uint)pre;
+    device const float* x = X + p.x_offset;      // layout [seq, groups]: x[s*groups+g]
+    device float* o = O + p.out_offset + (uint)g * (uint)seq;
+
+    // Load state prefix into a register window [win(pre)]. At position i the
+    // conv window is [win(pre) , x[i]] (win holds the previous `pre` values).
+    float win[KMAX];                 // last `pre` values seen (pre <= KMAX-1)
+    float st0[KMAX];                 // snapshot of the incoming state (for edge case)
+    for (int p_ = 0; p_ < pre; p_++) { win[p_] = cs[p_]; st0[p_] = cs[p_]; }
+
+    for (int i = 0; i < seq; i++) {
+        float xi = x[(uint)i * (uint)p.groups + (uint)g];
+        float sum = 0.0f;
+        for (int k = 0; k < pre; k++) sum += win[k] * w[k];
+        sum += xi * w[pre];
+        o[i] = (i < nreal) ? (sum / (1.0f + exp(-sum))) : 0.0f;   // silu on real positions
+        // shift window left, append xi
+        for (int k = 0; k < pre - 1; k++) win[k] = win[k + 1];
+        if (pre > 0) win[pre - 1] = xi;
+    }
+
+    // New state = last `pre` elements of the window [old_state(pre) | x(nreal)].
+    //   index j in [nreal, nreal+pre): if j < pre -> old_state[j], else x[j-pre].
+    for (int p_ = 0; p_ < pre; p_++) {
+        int j = nreal + p_;                 // position in the [state|x] window
+        cs[p_] = (j < pre) ? st0[j]
+                           : x[(uint)(j - pre) * (uint)p.groups + (uint)g];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GDN decode (seq=1): fused Gated Delta Rule + RMSNormGated for one token.
+// One THREADGROUP per value head; V_dim threads (thread dv owns state column
+// [*,dv], kv_mem[dv], attn_out[dv]). Mirrors kernels/gdn_neon.h gdn_recurrence.
+// State [num_v_heads, k_dim, v_dim] read+written in place (device buffer).
+//   grid: threadgroups = num_v_heads; threads = v_dim (<=256).
+// Threadgroup mem: sq[k_dim], sk[k_dim] (staged+L2-normed q/k), plus reduction.
+// ---------------------------------------------------------------------------
+inline float gdn_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return exp(x);
+    return log(1.0f + exp(x));
+}
+
+kernel void gdn_decode_f32(
+    device const float*   QKV    [[buffer(0)]],
+    device const float*   A      [[buffer(1)]],
+    device const float*   B      [[buffer(2)]],
+    device const float*   Z      [[buffer(5)]],
+    device const float*   ALOG   [[buffer(6)]],
+    device const float*   DTB    [[buffer(7)]],
+    device const float*   NORMW  [[buffer(8)]],
+    device float*         STATE  [[buffer(9)]],
+    device float*         O      [[buffer(4)]],
+    constant GdnParams&   p      [[buffer(3)]],
+    threadgroup float*    sh     [[threadgroup(0)]],
+    uint  vh                     [[threadgroup_position_in_grid]],
+    uint  dv                     [[thread_position_in_threadgroup]],
+    uint  nthreads               [[threads_per_threadgroup]])
+{
+    int K = p.k_dim, V = p.v_dim;
+    if ((int)vh >= p.num_v_heads) return;
+    int repeat = p.num_v_heads / p.num_heads;
+    int kh = (int)vh / repeat;
+
+    int qkv_dim = p.num_heads * K;                 // q block width (= k block width)
+    uint q_base = p.qkv_offset + (uint)(kh * K);
+    uint k_base = p.qkv_offset + (uint)qkv_dim + (uint)(kh * K);
+    uint v_base = p.qkv_offset + (uint)(2 * qkv_dim) + (uint)((int)vh * V);
+
+    // Threadgroup layout: sq[K] | sk[K] | red[nthreads]
+    threadgroup float* sq  = sh;
+    threadgroup float* sk  = sq + K;
+    threadgroup float* red = sk + K;
+
+    // Stage q,k; L2-normalize (cooperative). Each thread handles strided dims.
+    for (int d = (int)dv; d < K; d += (int)nthreads) { sq[d] = QKV[q_base + d]; sk[d] = QKV[k_base + d]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // L2 norm of q and k: reduce sum of squares over K.
+    float qss = 0.0f, kss = 0.0f;
+    for (int d = (int)dv; d < K; d += (int)nthreads) { qss += sq[d]*sq[d]; kss += sk[d]*sk[d]; }
+    // reduce qss then kss via shared mem.
+    red[dv] = qss; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthreads/2; s>0; s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}    
+    float q_inv = 1.0f / sqrt(red[0] + p.l2_eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[dv] = kss; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthreads/2; s>0; s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}    
+    float k_inv = 1.0f / sqrt(red[0] + p.l2_eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int d = (int)dv; d < K; d += (int)nthreads) { sq[d] *= q_inv; sk[d] *= k_inv; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Gate scalars (per value head).
+    float a_h = A[p.a_offset + vh];
+    float b_h = B[p.b_offset + vh];
+    float sp = gdn_softplus(a_h + DTB[p.dtb_offset + vh]);
+    float g_exp = exp((-exp(ALOG[p.Alog_offset + vh])) * sp);
+    float beta  = 1.0f / (1.0f + exp(-b_h));       // sigmoid(b)
+
+    // NOTE: host dispatches exactly V threads, so dv < V for all threads (all
+    // must reach the RMSNorm barriers below — no early return allowed).
+    device float* state_h = STATE + p.state_offset + (uint)((int)vh * K * V);
+    float vv = QKV[v_base + dv];
+
+    // Pass 1: decay state rows + kv_mem[dv] = Σ_dk state[dk,dv]*k[dk].
+    float kv = 0.0f;
+    for (int dk = 0; dk < K; dk++) {
+        float r = state_h[dk*V + dv] * g_exp;
+        state_h[dk*V + dv] = r;
+        kv += r * sk[dk];
+    }
+    float delta = (vv - kv) * beta;
+    // Pass 2: state[dk,dv] += k[dk]*delta ; attn_out[dv] = Σ state[dk,dv]*q[dk].
+    float attn = 0.0f;
+    for (int dk = 0; dk < K; dk++) {
+        float r = state_h[dk*V + dv] + sk[dk]*delta;
+        state_h[dk*V + dv] = r;
+        attn += r * sq[dk];
+    }
+    attn *= p.scale;
+
+    // RMSNormGated: rms over v_dim (reduction), then *norm_w * silu(z).
+    red[dv] = attn*attn; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = nthreads/2; s>0; s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}    
+    float rms = 1.0f / sqrt(red[0] / (float)V + p.rms_eps);
+    float normed = attn * rms * NORMW[p.norm_offset + dv];
+    float z = Z[p.z_offset + (uint)((int)vh * V) + dv];
+    float silu_z = z / (1.0f + exp(-z));
+    O[p.out_offset + (uint)((int)vh * V) + dv] = normed * silu_z;
+}
+
+// ---------------------------------------------------------------------------
+// GDN prefill (seq>1): same recurrence as decode, looped sequentially over the
+// token dim (state is recurrent). One THREADGROUP per value head; V_dim threads.
+// LAYOUT DIFFERS FROM DECODE:
+//   qkv is [qkv_total, seq] (dim-major): qkv[(base+d)*seq + t]
+//   a/b/z/out are [seq, dim] (seq-major): a[t*num_v_heads+vh], out[t*zdim+vh*V+dv]
+// Correctness-first (serial over t); optimize later. grid: num_v_heads tg, V thr.
+// Threadgroup mem: sq[K] + sk[K] + red[V].
+// ---------------------------------------------------------------------------
+kernel void gdn_prefill_f32(
+    device const float*   QKV    [[buffer(0)]],
+    device const float*   A      [[buffer(1)]],
+    device const float*   B      [[buffer(2)]],
+    device const float*   Z      [[buffer(5)]],
+    device const float*   ALOG   [[buffer(6)]],
+    device const float*   DTB    [[buffer(7)]],
+    device const float*   NORMW  [[buffer(8)]],
+    device float*         STATE  [[buffer(9)]],
+    device float*         O      [[buffer(4)]],
+    constant GdnParams&   p      [[buffer(3)]],
+    threadgroup float*    sh     [[threadgroup(0)]],
+    uint  vh                     [[threadgroup_position_in_grid]],
+    uint  dv                     [[thread_position_in_threadgroup]],
+    uint  nthreads               [[threads_per_threadgroup]])
+{
+    int K = p.k_dim, V = p.v_dim, S = p.seq_len;
+    if ((int)vh >= p.num_v_heads) return;
+    int nreal = (p.n_real > 0 && p.n_real < S) ? p.n_real : S;
+    int repeat = p.num_v_heads / p.num_heads;
+    int kh = (int)vh / repeat;
+    int qkv_dim = p.num_heads * K;
+    int zdim = p.num_v_heads * V;
+
+    threadgroup float* sq  = sh;
+    threadgroup float* sk  = sq + K;
+    threadgroup float* red = sk + K;
+
+    device float* state_h = STATE + p.state_offset + (uint)((int)vh * K * V);
+    float neg_exp_A = -exp(ALOG[p.Alog_offset + vh]);
+
+    for (int t = 0; t < S; t++) {
+        if (t >= nreal) {   // zero padding output rows
+            O[p.out_offset + (uint)(t*zdim) + (uint)((int)vh*V) + dv] = 0.0f;
+            continue;
+        }
+        // Stage q,k for token t: qkv[(base+d)*seq + t]  (dim-major layout).
+        uint qb = p.qkv_offset + (uint)(kh * K);
+        uint kb = p.qkv_offset + (uint)qkv_dim + (uint)(kh * K);
+        for (int d = (int)dv; d < K; d += (int)nthreads) {
+            sq[d] = QKV[(qb + (uint)d) * (uint)S + (uint)t];
+            sk[d] = QKV[(kb + (uint)d) * (uint)S + (uint)t];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float qss=0.0f, kss=0.0f;
+        for (int d=(int)dv; d<K; d+=(int)nthreads){ qss+=sq[d]*sq[d]; kss+=sk[d]*sk[d]; }
+        red[dv]=qss; threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint s=nthreads/2;s>0;s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}
+        float qi=1.0f/sqrt(red[0]+p.l2_eps); threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[dv]=kss; threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint s=nthreads/2;s>0;s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}
+        float ki=1.0f/sqrt(red[0]+p.l2_eps); threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(int d=(int)dv; d<K; d+=(int)nthreads){ sq[d]*=qi; sk[d]*=ki; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // gate scalars for (t, vh): a/b are [seq, num_v_heads].
+        float a_h = A[p.a_offset + (uint)(t*p.num_v_heads) + vh];
+        float b_h = B[p.b_offset + (uint)(t*p.num_v_heads) + vh];
+        float sp = gdn_softplus(a_h + DTB[p.dtb_offset + vh]);
+        float g_exp = exp(neg_exp_A * sp);
+        float beta  = 1.0f/(1.0f+exp(-b_h));
+        float vv = QKV[(p.qkv_offset + (uint)(2*qkv_dim) + (uint)((int)vh*V) + dv) * (uint)S + (uint)t];
+
+        // Pass1
+        float kv = 0.0f;
+        for (int dk=0; dk<K; dk++){ float r=state_h[dk*V+dv]*g_exp; state_h[dk*V+dv]=r; kv+=r*sk[dk]; }
+        float delta = (vv - kv) * beta;
+        // Pass2
+        float attn = 0.0f;
+        for (int dk=0; dk<K; dk++){ float r=state_h[dk*V+dv]+sk[dk]*delta; state_h[dk*V+dv]=r; attn+=r*sq[dk]; }
+        attn *= p.scale;
+        // RMSNormGated
+        red[dv]=attn*attn; threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint s=nthreads/2;s>0;s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}
+        float rms=1.0f/sqrt(red[0]/(float)V + p.rms_eps);
+        float normed = attn*rms*NORMW[p.norm_offset + dv];
+        float z = Z[p.z_offset + (uint)(t*zdim) + (uint)((int)vh*V) + dv];
+        float silu_z = z/(1.0f+exp(-z));
+        O[p.out_offset + (uint)(t*zdim) + (uint)((int)vh*V) + dv] = normed * silu_z;
+        threadgroup_barrier(mem_flags::mem_threadgroup);  // state consistent before next t
+    }
 }
 
 // ---------------------------------------------------------------------------

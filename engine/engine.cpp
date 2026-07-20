@@ -964,12 +964,9 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         // No CacheMetadata header — GDN state is a plain FP32 buffer.
         if (cp.gdn_state) {
             size_t data_bytes = (size_t)cp.gdn_v_dim * cp.gdn_k_dim * cp.gdn_num_heads * sizeof(float);
-            void* buf = persistent_pool_.acquire(data_bytes);
+            void* buf = alloc_cache_buf(cp.gdn_state, data_bytes);  // Metal: sets device_data
             std::memset(buf, 0, data_bytes);
-            cp.gdn_state->data     = buf;
             cp.gdn_state->mem_type = MemoryType::POOLED;
-            cp.gdn_state->owner_id = persistent_pool_.id();
-            cp.gdn_state->storage_id = persistent_pool_.storage_id(buf);
             cp.gdn_state->shape[0] = (int64_t)cp.gdn_v_dim;
             cp.gdn_state->shape[1] = (int64_t)cp.gdn_k_dim;
             cp.gdn_state->shape[2] = (int64_t)cp.gdn_num_heads;
@@ -980,12 +977,9 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         if (cp.gdn_conv) {
             int kernel_m1 = cp.gdn_conv_kernel - 1;
             size_t data_bytes = (size_t)cp.gdn_conv_groups * kernel_m1 * sizeof(float);
-            void* buf = persistent_pool_.acquire(data_bytes);
+            void* buf = alloc_cache_buf(cp.gdn_conv, data_bytes);  // Metal: sets device_data
             std::memset(buf, 0, data_bytes);
-            cp.gdn_conv->data     = buf;
             cp.gdn_conv->mem_type = MemoryType::POOLED;
-            cp.gdn_conv->owner_id = persistent_pool_.id();
-            cp.gdn_conv->storage_id = persistent_pool_.storage_id(buf);
             cp.gdn_conv->shape[0] = (int64_t)cp.gdn_conv_groups;
             cp.gdn_conv->shape[1] = (int64_t)kernel_m1;
             cp.gdn_conv->shape[2] = 1;

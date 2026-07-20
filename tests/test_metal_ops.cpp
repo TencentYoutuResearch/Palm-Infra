@@ -258,6 +258,170 @@ int main() {
         CHECK(close((const float*)O.data, ref.data(), n, 1e-5f, 1e-4f), "SILU n=512");
     }
 
+    // ---- SIGMOID ----
+    {
+        int n = 512;
+        Tensor X = make_dev(mb, Precision::FP32, n, 1);
+        Tensor O = make_dev(mb, Precision::FP32, n, 1);
+        std::vector<float> x(n);
+        fill_rand(x.data(), n);
+        memcpy(X.data, x.data(), n*4);
+        metal_op(mb, OpType::SIGMOID, {&X}, O);
+        std::vector<float> ref(n);
+        for (int i=0;i<n;i++) ref[i]=1.0f/(1.0f+std::exp(-x[i]));
+        CHECK(close((const float*)O.data, ref.data(), n, 1e-5f, 1e-4f), "SIGMOID n=512");
+    }
+
+    // ---- SHORTCONV: depth-wise causal conv1d + silu (ksize=4) ----
+    // Reference (mirrors execute.cpp): window = [state(3) | x(seq)]; per group g,
+    // out[g,i] = silu(Σ_{k} win[i+k]*w[g,k]); state' = last 3 real x values.
+    auto run_shortconv = [&](int groups, int seq, const char* label) {
+        const int ks = 4, pre = ks - 1;
+        Tensor X = make_dev(mb, Precision::FP32, groups, seq);   // data [seq, groups]
+        Tensor W = make_dev(mb, Precision::FP32, groups, ks);
+        Tensor ST = make_dev(mb, Precision::FP32, groups, pre);  // persistent state
+        Tensor O = make_dev(mb, Precision::FP32, groups, seq);
+        std::vector<float> x(groups*seq), w(groups*ks), st(groups*pre);
+        fill_rand(x.data(), x.size()); fill_rand(w.data(), w.size()); fill_rand(st.data(), st.size());
+        memcpy(X.data, x.data(), x.size()*4);
+        memcpy(W.data, w.data(), w.size()*4);
+        memcpy(ST.data, st.data(), st.size()*4);
+        std::vector<int> i32 = {ks, seq};   // kernel_size, n_real
+        metal_op(mb, OpType::SHORTCONV, {&X,&W,&ST}, O, i32);
+        // Reference output + state.
+        std::vector<float> ref(groups*seq), rst(groups*pre);
+        for (int g=0; g<groups; g++) {
+            std::vector<float> win(pre+seq);
+            for (int p=0;p<pre;p++) win[p]=st[g*pre+p];
+            for (int s=0;s<seq;s++) win[pre+s]=x[s*groups+g];   // x layout [seq,groups]
+            for (int i=0;i<seq;i++){
+                float sum=0; for(int k=0;k<ks;k++) sum+=win[i+k]*w[g*ks+k];
+                ref[g*seq+i]=sum/(1.0f+std::exp(-sum));
+            }
+            for (int p=0;p<pre;p++) rst[g*pre+p]=win[seq+p]; // last 3 of [state|x]
+        }
+        bool ok_out = close((const float*)O.data, ref.data(), groups*seq, 2e-4f, 2e-4f);
+        bool ok_st  = close((const float*)ST.data, rst.data(), groups*pre, 2e-4f, 2e-4f);
+        CHECK(ok_out && ok_st, label);
+    };
+    run_shortconv(64, 1, "SHORTCONV decode groups=64 seq=1");
+    run_shortconv(48, 8, "SHORTCONV prefill groups=48 seq=8");
+    run_shortconv(6144, 4, "SHORTCONV groups=6144 seq=4 (prod width)");
+
+    // ---- GATED_DELTANET_DECODE (seq=1): GDN recurrence + RMSNormGated ----
+    // Scalar reference mirrors kernels/gdn_neon.h gdn_recurrence.
+    {
+        int H = 4, VH = 4, K = 128, Vd = 128;   // repeat=1
+        float l2eps = 1e-6f, rmseps = 1e-6f, scale = 1.0f/std::sqrt((float)K);
+        int qkv_dim = H*K, qkv_total = 2*H*K + VH*Vd, zdim = VH*Vd;
+        // buffers (seq=1)
+        Tensor QKV = make_dev(mb, Precision::FP32, qkv_total, 1);
+        Tensor A = make_dev(mb, Precision::FP32, H, 1);
+        Tensor B = make_dev(mb, Precision::FP32, H, 1);
+        Tensor Z = make_dev(mb, Precision::FP32, zdim, 1);
+        Tensor ALG = make_dev(mb, Precision::FP32, VH, 1);
+        Tensor DTB = make_dev(mb, Precision::FP32, VH, 1);
+        Tensor NRM = make_dev(mb, Precision::FP32, Vd, 1);
+        Tensor ST = make_dev(mb, Precision::FP32, VH*K*Vd, 1);
+        Tensor O = make_dev(mb, Precision::FP32, zdim, 1);
+        std::vector<float> qkv(qkv_total), a(H), b(H), z(zdim), alg(VH), dtb(VH), nrm(Vd), st((size_t)VH*K*Vd);
+        fill_rand(qkv.data(), qkv.size()); fill_rand(a.data(), H); fill_rand(b.data(), H);
+        fill_rand(z.data(), zdim); fill_rand(alg.data(), VH); fill_rand(dtb.data(), VH);
+        fill_rand(nrm.data(), Vd); fill_rand(st.data(), st.size());
+        memcpy(QKV.data,qkv.data(),qkv.size()*4); memcpy(A.data,a.data(),H*4); memcpy(B.data,b.data(),H*4);
+        memcpy(Z.data,z.data(),zdim*4); memcpy(ALG.data,alg.data(),VH*4); memcpy(DTB.data,dtb.data(),VH*4);
+        memcpy(NRM.data,nrm.data(),Vd*4); memcpy(ST.data,st.data(),st.size()*4);
+        std::vector<int> i32 = {H, K, Vd, 1, 1, 4, 0, VH};
+        std::vector<float> f32 = {rmseps, l2eps, scale};
+        std::vector<const Tensor*> ins = {&QKV,&A,&B,&Z,&ALG,&DTB,&NRM,&ST};
+        metal_op(mb, OpType::GATED_DELTANET_DECODE, ins, O, i32, f32);
+
+        // reference
+        std::vector<float> ref(zdim), rst = st;
+        auto silu=[](float x){return x/(1.f+std::exp(-x));};
+        for (int vh=0; vh<VH; vh++){
+            int kh = vh; // repeat=1
+            std::vector<float> q(K), kk(K), v(Vd);
+            for(int d=0;d<K;d++){ q[d]=qkv[kh*K+d]; kk[d]=qkv[qkv_dim+kh*K+d]; }
+            for(int d=0;d<Vd;d++) v[d]=qkv[2*qkv_dim+vh*Vd+d];
+            double qs=0,ks=0; for(int d=0;d<K;d++){qs+=(double)q[d]*q[d];ks+=(double)kk[d]*kk[d];}
+            float qi=1.f/std::sqrt((float)qs+l2eps), ki=1.f/std::sqrt((float)ks+l2eps);
+            for(int d=0;d<K;d++){q[d]*=qi;kk[d]*=ki;}
+            float sp = (a[vh]+dtb[vh]>20.f)?(a[vh]+dtb[vh]):((a[vh]+dtb[vh]<-20.f)?std::exp(a[vh]+dtb[vh]):std::log1p(std::exp(a[vh]+dtb[vh])));
+            float gexp=std::exp(-std::exp(alg[vh])*sp), beta=1.f/(1.f+std::exp(-b[vh]));
+            float* S = rst.data()+(size_t)vh*K*Vd;
+            std::vector<float> kv(Vd,0);
+            for(int dk=0;dk<K;dk++)for(int dvv=0;dvv<Vd;dvv++){ S[dk*Vd+dvv]*=gexp; kv[dvv]+=S[dk*Vd+dvv]*kk[dk]; }
+            std::vector<float> delta(Vd); for(int dvv=0;dvv<Vd;dvv++) delta[dvv]=(v[dvv]-kv[dvv])*beta;
+            std::vector<float> attn(Vd,0);
+            for(int dk=0;dk<K;dk++)for(int dvv=0;dvv<Vd;dvv++){ S[dk*Vd+dvv]+=kk[dk]*delta[dvv]; attn[dvv]+=S[dk*Vd+dvv]*q[dk]; }
+            double ss=0; for(int dvv=0;dvv<Vd;dvv++){attn[dvv]*=scale; ss+=(double)attn[dvv]*attn[dvv];}
+            float rms=1.f/std::sqrt((float)(ss/Vd)+rmseps);
+            for(int dvv=0;dvv<Vd;dvv++) ref[vh*Vd+dvv]=attn[dvv]*rms*nrm[dvv]*silu(z[vh*Vd+dvv]);
+        }
+        bool ok_out = close((const float*)O.data, ref.data(), zdim, 3e-3f, 3e-3f);
+        bool ok_st  = close((const float*)ST.data, rst.data(), (int)st.size(), 3e-3f, 3e-3f);
+        CHECK(ok_out && ok_st, "GDN_DECODE H=4 K=128 V=128");
+    }
+
+    // ---- GATED_DELTANET_PREFILL (seq>1): recurrence over tokens ----
+    // Layout: qkv [qkv_total, seq] (dim-major); a/b/z/out [seq, dim] (seq-major).
+    {
+        int H = 4, VH = 4, K = 128, Vd = 128, S = 6;
+        float l2eps = 1e-6f, rmseps = 1e-6f, scale = 1.0f/std::sqrt((float)K);
+        int qkv_dim = H*K, qkv_total = 2*H*K + VH*Vd, zdim = VH*Vd;
+        Tensor QKV = make_dev(mb, Precision::FP32, qkv_total, S);   // [qkv_total, seq]
+        Tensor A = make_dev(mb, Precision::FP32, VH, S);            // [seq, VH] data
+        Tensor B = make_dev(mb, Precision::FP32, VH, S);
+        Tensor Z = make_dev(mb, Precision::FP32, zdim, S);          // [seq, zdim]
+        Tensor ALG = make_dev(mb, Precision::FP32, VH, 1);
+        Tensor DTB = make_dev(mb, Precision::FP32, VH, 1);
+        Tensor NRM = make_dev(mb, Precision::FP32, Vd, 1);
+        Tensor ST = make_dev(mb, Precision::FP32, VH*K*Vd, 1);
+        Tensor O = make_dev(mb, Precision::FP32, zdim, S);          // [seq, zdim]
+        std::vector<float> qkv((size_t)qkv_total*S), a((size_t)VH*S), b((size_t)VH*S),
+                           z((size_t)zdim*S), alg(VH), dtb(VH), nrm(Vd), st((size_t)VH*K*Vd);
+        fill_rand(qkv.data(),qkv.size()); fill_rand(a.data(),a.size()); fill_rand(b.data(),b.size());
+        fill_rand(z.data(),z.size()); fill_rand(alg.data(),VH); fill_rand(dtb.data(),VH);
+        fill_rand(nrm.data(),Vd); fill_rand(st.data(),st.size());
+        memcpy(QKV.data,qkv.data(),qkv.size()*4); memcpy(A.data,a.data(),a.size()*4);
+        memcpy(B.data,b.data(),b.size()*4); memcpy(Z.data,z.data(),z.size()*4);
+        memcpy(ALG.data,alg.data(),VH*4); memcpy(DTB.data,dtb.data(),VH*4);
+        memcpy(NRM.data,nrm.data(),Vd*4); memcpy(ST.data,st.data(),st.size()*4);
+        std::vector<int> i32 = {H, K, Vd, S, 1, 4, 0, VH};
+        std::vector<float> f32 = {rmseps, l2eps, scale};
+        std::vector<const Tensor*> ins = {&QKV,&A,&B,&Z,&ALG,&DTB,&NRM,&ST};
+        metal_op(mb, OpType::GATED_DELTANET_PREFILL, ins, O, i32, f32);
+
+        std::vector<float> ref((size_t)zdim*S), rst = st;
+        auto silu=[](float x){return x/(1.f+std::exp(-x));};
+        for (int vh=0; vh<VH; vh++){
+            int kh=vh; float* S_=rst.data()+(size_t)vh*K*Vd;
+            for (int t=0;t<S;t++){
+                std::vector<float> q(K),kk(K),v(Vd);
+                for(int d=0;d<K;d++){ q[d]=qkv[(size_t)(kh*K+d)*S+t]; kk[d]=qkv[(size_t)(qkv_dim+kh*K+d)*S+t]; }
+                for(int d=0;d<Vd;d++) v[d]=qkv[(size_t)(2*qkv_dim+vh*Vd+d)*S+t];
+                double qs=0,ks=0; for(int d=0;d<K;d++){qs+=(double)q[d]*q[d];ks+=(double)kk[d]*kk[d];}
+                float qi=1.f/std::sqrt((float)qs+l2eps), ki=1.f/std::sqrt((float)ks+l2eps);
+                for(int d=0;d<K;d++){q[d]*=qi;kk[d]*=ki;}
+                float ab=a[(size_t)t*VH+vh]+dtb[vh];
+                float sp=(ab>20.f)?ab:((ab<-20.f)?std::exp(ab):std::log1p(std::exp(ab)));
+                float gexp=std::exp(-std::exp(alg[vh])*sp), beta=1.f/(1.f+std::exp(-b[(size_t)t*VH+vh]));
+                std::vector<float> kv(Vd,0);
+                for(int dk=0;dk<K;dk++)for(int dvv=0;dvv<Vd;dvv++){ S_[dk*Vd+dvv]*=gexp; kv[dvv]+=S_[dk*Vd+dvv]*kk[dk]; }
+                std::vector<float> delta(Vd); for(int dvv=0;dvv<Vd;dvv++) delta[dvv]=(v[dvv]-kv[dvv])*beta;
+                std::vector<float> attn(Vd,0);
+                for(int dk=0;dk<K;dk++)for(int dvv=0;dvv<Vd;dvv++){ S_[dk*Vd+dvv]+=kk[dk]*delta[dvv]; attn[dvv]+=S_[dk*Vd+dvv]*q[dk]; }
+                double ss=0; for(int dvv=0;dvv<Vd;dvv++){attn[dvv]*=scale; ss+=(double)attn[dvv]*attn[dvv];}
+                float rms=1.f/std::sqrt((float)(ss/Vd)+rmseps);
+                for(int dvv=0;dvv<Vd;dvv++) ref[(size_t)t*zdim+vh*Vd+dvv]=attn[dvv]*rms*nrm[dvv]*silu(z[(size_t)t*zdim+vh*Vd+dvv]);
+            }
+        }
+        bool ok_out = close((const float*)O.data, ref.data(), (int)((size_t)zdim*S), 5e-3f, 5e-3f);
+        bool ok_st  = close((const float*)ST.data, rst.data(), (int)st.size(), 5e-3f, 5e-3f);
+        CHECK(ok_out && ok_st, "GDN_PREFILL H=4 K=128 V=128 S=6");
+    }
+
     // ---- SWIGLU: silu(gate)*up over merged [2I, S] (dim0=2I inner) ----
     {
         int I = 48, S = 5;                 // merged dim0 = 2I = 96, S rows

@@ -605,16 +605,11 @@ void MetalBackend::dispatch(const GraphNode& node,
 
     case OpType::CONTIGUOUS: {
         const Tensor& src = *inputs[0];
-        // Fast path: if src is already dense row-major, CONTIGUOUS is a no-op —
-        // alias the device buffer (zero-copy) and skip the kernel dispatch. This
-        // is common in DECODE (seq=1) where the attention transposes collapse to
-        // identity, saving ~144 dispatches/step.
-        if (src.is_contiguous()) {
-            *output = src;
-            output->device_data = src.device_data;
-            output->device_offset = src.device_offset;
-            break;
-        }
+        // NOTE: no zero-copy alias fast-path here. The executor does not treat
+        // CONTIGUOUS as view-like (only RESHAPE/PERMUTE/SLICE), so aliasing the
+        // output onto src's buffer left the pre-allocated output orphaned and the
+        // alias dangling once src's owner was deferred-freed — corrupting results
+        // under deferred (whole-graph) execution. Always materialize via kernel.
         TensorDesc d{};
         for (int i=0;i<4;i++){ d.shape[i]=(int)src.shape[i]; d.stride[i]=estride(src,i);}        
         d.offset = eoffset(src);
@@ -905,6 +900,100 @@ void MetalBackend::dispatch(const GraphNode& node,
         [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         dispatch_1d(ps, p.n);
+        break;
+    }
+
+    case OpType::SIGMOID: {
+        const Tensor& X = *inputs[0];
+        Tensor& O = *output;
+        EwiseParams p{};
+        p.n = (int)O.nelements();
+        p.a_offset = eoffset(X);
+        p.out_offset = eoffset(O);
+        id<MTLComputePipelineState> ps = impl_->pipeline("sigmoid_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        dispatch_1d(ps, p.n);
+        break;
+    }
+
+    case OpType::GATED_DELTANET_DECODE:
+    case OpType::GATED_DELTANET_PREFILL: {
+        // Fused Gated Delta Rule + RMSNormGated. inputs (gdn.h contract):
+        // [0]qkv [1]a [2]b [3]z [4]A_log [5]dt_bias [6]norm_w [7]state; out[0].
+        // One threadgroup per value head, v_dim threads. decode=seq1; prefill
+        // loops seq serially. qkv layout: decode [seq,dim](seq=1); prefill [dim,seq].
+        const Tensor& QKV = *inputs[0]; const Tensor& Aa = *inputs[1];
+        const Tensor& Bb  = *inputs[2]; const Tensor& Zz = *inputs[3];
+        const Tensor& ALG = *inputs[4]; const Tensor& DTB = *inputs[5];
+        const Tensor& NRM = *inputs[6]; const Tensor& ST  = *inputs[7];
+        Tensor& O = *output;
+        GdnParams p{};
+        p.num_heads   = params.i32.size()>0 ? params.i32[0] : 16;
+        p.k_dim       = params.i32.size()>1 ? params.i32[1] : 128;
+        p.v_dim       = params.i32.size()>2 ? params.i32[2] : 128;
+        p.seq_len     = params.i32.size()>3 ? params.i32[3] : 1;
+        p.use_qk_l2norm = params.i32.size()>4 ? params.i32[4] : 1;
+        p.n_real      = params.i32.size()>6 ? params.i32[6] : 0;
+        p.num_v_heads = (params.i32.size()>7 && params.i32[7]>0) ? params.i32[7] : p.num_heads;
+        p.rms_eps     = params.f32.size()>0 ? params.f32[0] : 1e-6f;
+        p.l2_eps      = params.f32.size()>1 ? params.f32[1] : 1e-6f;
+        p.scale       = params.f32.size()>2 ? params.f32[2] : 0.f;
+        if (p.scale == 0.f) p.scale = 1.f / std::sqrt((float)p.k_dim);
+        p.qkv_offset = eoffset(QKV); p.a_offset = eoffset(Aa); p.b_offset = eoffset(Bb);
+        p.z_offset = eoffset(Zz); p.Alog_offset = eoffset(ALG); p.dtb_offset = eoffset(DTB);
+        p.norm_offset = eoffset(NRM); p.state_offset = eoffset(ST); p.out_offset = eoffset(O);
+        const char* gk = (op == OpType::GATED_DELTANET_PREFILL) ? "gdn_prefill_f32" : "gdn_decode_f32";
+        id<MTLComputePipelineState> ps = impl_->pipeline(gk);
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&QKV) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&Aa)  offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&Bb)  offset:0 atIndex:2];
+        [enc setBuffer:buf_of(&O)   offset:0 atIndex:4];
+        [enc setBuffer:buf_of(&Zz)  offset:0 atIndex:5];
+        [enc setBuffer:buf_of(&ALG) offset:0 atIndex:6];
+        [enc setBuffer:buf_of(&DTB) offset:0 atIndex:7];
+        [enc setBuffer:buf_of(&NRM) offset:0 atIndex:8];
+        [enc setBuffer:buf_of(&ST)  offset:0 atIndex:9];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        // threadgroup: sq[K] + sk[K] + red[V] floats.
+        NSUInteger smem = (NSUInteger)(2*p.k_dim + p.v_dim) * sizeof(float);
+        [enc setThreadgroupMemoryLength:smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.num_v_heads,1,1)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)p.v_dim,1,1)];
+        break;
+    }
+
+    case OpType::SHORTCONV: {
+        // Depth-wise causal conv1d + silu. inputs = {x, w, conv_state}; output.
+        // conv_state is a persistent device buffer, read+written in-place. One
+        // thread per group (groups is large: 6144/8192).
+        const Tensor& X = *inputs[0];
+        const Tensor& W = *inputs[1];
+        const Tensor& STATE = *inputs[2];   // GPU buffer written in-place by kernel
+        Tensor& O = *output;
+        ShortConvParams p{};
+        p.kernel_size = params.i32.size()>0 ? params.i32[0] : 4;
+        p.groups = (int)X.shape[0];
+        p.seq = (int)X.shape[1];
+        p.n_real = params.i32.size()>1 ? params.i32[1] : p.seq;
+        p.x_offset = eoffset(X);
+        p.w_offset = eoffset(W);
+        p.state_offset = eoffset(STATE);
+        p.out_offset = eoffset(O);
+        id<MTLComputePipelineState> ps = impl_->pipeline("shortconv_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&W) offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&STATE) offset:0 atIndex:2];
+        [enc setBuffer:buf_of(&O) offset:0 atIndex:4];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        // One thread per group; bounds-checked threadgroups (M5 dispatchThreads bug).
+        NSUInteger tg = 64;
+        MTLSize tgc = MTLSizeMake(((NSUInteger)p.groups + tg - 1)/tg, 1, 1);
+        [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
         break;
     }
 

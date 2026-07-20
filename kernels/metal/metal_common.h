@@ -74,6 +74,52 @@ struct SwigluParams {
     int   merged_row_stride; // elements between rows (tokens) in merged (= 2I)
 };
 
+// Fused Gated Delta Rule (GDN) linear-attention core for Qwen3.5.
+// See kernels/gdn.h for the full algorithm/layout contract. All matmul-derived
+// inputs are [seq, dim] row-major (ptr[t*dim+d]). State [num_v_heads, k_dim, v_dim]
+// (state[vh*k_dim*v_dim + dk*v_dim + dv]) read+written in place.
+//   qkv layout per token t: [ q(num_heads*k_dim) | k(num_heads*k_dim) | v(num_v_heads*v_dim) ]
+struct GdnParams {
+    int   num_heads;      // key heads (q/k/a/b)
+    int   num_v_heads;    // value heads (v/z/out/state); repeat = num_v_heads/num_heads
+    int   k_dim;
+    int   v_dim;
+    int   seq_len;
+    int   n_real;         // real (non-padded) tokens; 0 = all
+    int   use_qk_l2norm;
+    float rms_eps;
+    float l2_eps;
+    float scale;
+    // element offsets into each bound buffer
+    uint  qkv_offset;
+    uint  a_offset;
+    uint  b_offset;
+    uint  z_offset;
+    uint  Alog_offset;
+    uint  dtb_offset;
+    uint  norm_offset;
+    uint  state_offset;
+    uint  out_offset;
+};
+
+// Depth-wise causal conv1d + silu (ShortConv). One thread per group.
+//   x     : [groups, seq] with data layout [seq, groups] -> x[s*groups + g]
+//   w     : [groups, kernel_size]                        -> w[g*ksize + k]
+//   state : [groups, kernel_size-1] persistent, in-place -> state[g*(ksize-1) + p]
+//   out   : [groups, seq]                                -> out[g*seq + i]
+// window for position i = [state(ksize-1) | x[0..seq)]; out[i]=silu(sum win[i+k]*w[k]).
+// state after: last (ksize-1) real x values.
+struct ShortConvParams {
+    int  groups;
+    int  seq;
+    int  kernel_size;      // e.g. 4
+    int  n_real;           // real (non-padded) positions to process
+    uint x_offset;         // element offsets into each bound buffer
+    uint w_offset;
+    uint state_offset;
+    uint out_offset;
+};
+
 // KV-cache append: copy K_cur/V_cur (FP32) rows into the FP16 cache at
 // position (past + s), per kv-head. cache element offset already accounts for
 // the 64-byte CacheMetadata header (added on the host as a byte offset).
