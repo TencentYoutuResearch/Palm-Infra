@@ -23,6 +23,7 @@ struct Options {
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     bool prepend_bos = false;
     bool tokenize_only = false;
+    Device device = Device::CPU;
 };
 
 bool parse_int(const char* text, int& out) {
@@ -103,6 +104,17 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
                 error = "invalid value for --threads";
                 return false;
             }
+        } else if (arg == "--device") {
+            if (i + 1 >= argc) { error = "--device requires a value"; return false; }
+            std::string dev = argv[++i];
+            if (dev == "cpu") opts.device = Device::CPU;
+            else if (dev == "metal") {
+#ifdef MOLLM_METAL
+                opts.device = Device::METAL;
+#else
+                error = "--device metal requires a build with -DMOLLM_METAL=ON"; return false;
+#endif
+            } else { error = std::string("unknown --device '") + dev + "' (cpu|metal)"; return false; }
         } else if (arg == "--mmap") {
             opts.weight_loading = WeightLoadingMode::MMAP;
         } else if (arg == "--prepend-bos") {
@@ -173,6 +185,7 @@ int main(int argc, char** argv) {
     cfg.num_threads = opts.threads;
     cfg.temperature = 0.0f;
     cfg.weight_loading = opts.weight_loading;
+    cfg.device = opts.device;
     if (!engine.load(cfg)) {
         std::fprintf(stderr, "ppl: failed to load package\n");
         return 1;
