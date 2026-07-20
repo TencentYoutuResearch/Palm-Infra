@@ -9,19 +9,12 @@ using namespace metal;
 using namespace mpp::tensor_ops;
 
 // ---------------------------------------------------------------------------
-// Tensor-API GEMM (Metal 4, mpp::tensor_ops) — the fast path on M5/A19+.
+// Tensor-API GEMM (Metal 4 mpp::tensor_ops) — the fast prefill path on M5/A19+.
 // C[M,N] = A[M,K] (fp32 activations) * B[N,K]^T (fp16 weights).
-// Adapted from llama.cpp kernel_mul_mm (tensor path). Activations are staged in
-// threadgroup memory as half [NRA(M) x NK]; weights are read directly from
-// device as a 2D tensor [K x N] (row n at b_offset + n*b_row_stride, K contig,
-// so as a [K,N] tensor the stride is {1, b_row_stride}). matmul2d does the MMA
-// on the M5 tensor units. Output C is [N(inner), M]: element (m,n) at
-// c_offset + m*c_row_stride + n → as an [M,N]-logical tensor with strides
-// {c_row_stride, 1} (row=m stride c_row_stride, col=n stride 1).
-//
-// Tile (from llama): NRA=64 (M), NRB=128 (N), NK=32. 4 simdgroups, 128 threads.
-// threadgroup(0): A staging = NRA*NK halves = 64*32 = 2048 halves = 4KB.
-// grid: threadgroups = (ceil(N/128), ceil(M/64)); threads/tg = 128.
+// Weights (our N) are staged into threadgroup memory as half; activations (our M)
+// are read straight from device as a 2D tensor. matmul2d runs the MMA on the
+// tensor units. Output C element (m,n) at c_offset + m*c_row_stride + n.
+// Tile NRA=64 (weights) x NRB=128 (activations) x NK=32; 4 simdgroups, 128 threads.
 // ---------------------------------------------------------------------------
 kernel void gemm_tensor_f32a_f16b_f32c(
     device const float*   A      [[buffer(0)]],
@@ -32,14 +25,8 @@ kernel void gemm_tensor_f32a_f16b_f32c(
     uint3  tgpig                 [[threadgroup_position_in_grid]],
     ushort tiitg                 [[thread_index_in_threadgroup]])
 {
-    // Mirror llama's tensor kernel roles EXACTLY (this is the key fix):
-    //   - llama STAGES srcA=weights into threadgroup `sa`; wraps srcB=activations
-    //     as the device tensor tB. Output dst[ne0=weightN, ne1=tokenM].
-    // Map to us: stage WEIGHTS (our N dim) into sa (tile NRA=64), wrap
-    // ACTIVATIONS (our M dim) as device tB (dim NRB tile=128). descriptor
-    // (NRB, NRA, NK, false, true) with run(mB=act, mA=wt). Output [ourN, ourM].
-    const int NRA = 64;    // weights tile (our N)  — staged
-    const int NRB = 128;   // activations tile (our M) — device
+    const int NRA = 64;    // weights tile (our N), staged into threadgroup
+    const int NRB = 128;   // activations tile (our M), read from device
     const int NK  = 32;    // K chunk
     const int NUM_THREADS = 128;
 
@@ -47,14 +34,11 @@ kernel void gemm_tensor_f32a_f16b_f32c(
     const int ra = (int)tgpig.y * NRA;   // first weight-row (our N) of tile
     const int rb = (int)tgpig.x * NRB;   // first activation-row (our M) of tile
 
-    // Weights staged as tensor [NK, NRA] (default col-major: physical k + n*NK).
-    // Stage sa[k + n_local*NK] = weight(ra + n_local, loop_k + k).
+    // Weights staged as tensor [NK, NRA]: sa[k + n_local*NK] = weight(ra+n_local, loop_k+k).
     threadgroup half* sa = shmem;
     auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
 
-    // Activations as device tensor [K, M]: element (k,m) = act(m,k) at
-    // a_offset + m*a_row_stride + k → strides {1 (k), a_row_stride (m)}.
-    // (fp32 activations read directly; the API converts to the compute type.)
+    // Activations as a device tensor [K, M]: element (k,m) at a_offset + m*a_row_stride + k.
     device const float* ptrA = A + p.a_offset;
     auto tB = tensor((device float*)ptrA, dextents<int32_t,2>(K, M),
                      array<int,2>({1, p.a_row_stride}));
@@ -62,11 +46,12 @@ kernel void gemm_tensor_f32a_f16b_f32c(
     matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
              matmul2d_descriptor::mode::multiply_accumulate),
              execution_simdgroups<4>> mm;
+    // The tensor unit only accumulates in FP32; a `half` cooperative tensor is
+    // rejected at compile time ("Unsupported type"). No FP16-accumulate option here.
     auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
-    // A-staging unroll factor: each work-item loads UNROLL contiguous K values
-    // (llama's FOR_UNROLL(16) pattern). NRA*NK/UNROLL = 2048/16 = 128 work-items
-    // == one per thread, no re-stride loop, contiguous vectorizable device reads.
+    // Each work-item stages UNROLL contiguous K halves (one per thread, no
+    // re-stride loop → contiguous vectorizable device reads).
     const int UNROLL = 16;
     const int A_WORK = NRA * (NK / UNROLL);   // 64 * 2 = 128
 
@@ -107,9 +92,8 @@ kernel void gemm_tensor_f32a_f16b_f32c(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Output dst[ourN, ourM] (llama's [ne0,ne1]). Our C element (m,n) at
-    // m*c_row_stride + n → as [ourN, ourM] tensor: strides {1 (n), c_row_stride (m)}.
-    // slice (ra = weight/N-off, rb = act/M-off).
+    // Store: C element (m,n) at m*c_row_stride + n, as an [N, M] tensor with
+    // strides {1, c_row_stride}, sliced at (ra=weight/N-offset, rb=act/M-offset).
     device float* dstC = C + p.c_offset;
     auto tD = tensor(dstC, dextents<int32_t,2>(N, M), array<int,2>({1, p.c_row_stride}));
     cT.store(tD.slice(ra, rb));
@@ -136,26 +120,16 @@ inline float apply_activation(float v, int act) {
 }
 
 // ---------------------------------------------------------------------------
-// Tiled GEMM using Apple simdgroup 8x8 matrix instructions.
-// C[M,N] = A[M,K] (fp32) * B[N,K]^T (fp16).
-//   A (activations) element (m,k) at A[a_offset + m*a_row_stride + k]  (K contig)
-//   B (weights)     element (n,k) at B[b_offset + n*b_row_stride + k]  (K contig, [N,K])
-//   C element (m,n) at C[c_offset + m*c_row_stride + n]                (N contig)
-//
-// 32(M) x 32(N) output tile / threadgroup, 4 simdgroups, each a 2x2 grid of
-// simdgroup_float8x8 accumulators (16x16 sub-tile). K streamed in chunks of 8.
-//
-// HALF-STAGING (llama.cpp mul_mm technique): A and B tiles are staged in
-// threadgroup memory as HALF (activations downcast fp32->fp16 on load), and the
-// MMA uses simdgroup_half8x8 with fp32 accumulation. This halves threadgroup
-// bandwidth and uses the faster half MMA path. Matches llama.cpp's f16 numerics;
-// PPL/coherence validated. C = A · B^T via loading the B tile transposed.
-//
-// Weight buffer B is bound at its 64-bit byte offset by the dispatcher
-// (p.b_offset==0) to avoid uint32 element-offset overflow for the 8.8GB region.
-// grid: threadgroups = (ceil(N/32), ceil(M/32)); threads/tg = 128.
-// threadgroup(0): staging = (32*8 + 32*8) halves = 512 halves = 1KB; the FP32
-// edge-store scratch (256 floats = 1KB) reuses the same region after compute.
+// Tiled GEMM (simdgroup 8x8 matrix instructions) — fallback when the tensor
+// path is unavailable. C[M,N] = A[M,K] (fp32) * B[N,K]^T (fp16).
+//   A element (m,k) at a_offset + m*a_row_stride + k
+//   B element (n,k) at b_offset + n*b_row_stride + k
+//   C element (m,n) at c_offset + m*c_row_stride + n
+// 32x32 output tile / threadgroup, 4 simdgroups (2x2 grid of simdgroup_float8x8
+// accumulators each), K streamed in chunks of 8. A/B tiles staged as half
+// (activations downcast on load) with fp32 accumulation; B loaded transposed.
+// B is bound at its 64-bit byte offset (p.b_offset==0) to avoid uint32
+// element-offset overflow over the multi-GB weight region.
 // ---------------------------------------------------------------------------
 kernel void gemm_tiled_f32a_f16b_f32c(
     device const float*   A      [[buffer(0)]],
@@ -320,8 +294,8 @@ kernel void gemm_tiledN64_f32a_f16b_f32c(
 }
 
 // ---------------------------------------------------------------------------
-// Tiled GEMM, 64(M) x 32(N) tile — larger tile for higher prefill throughput
-// (llama.cpp mul_mm uses a comparable 64x32). Same math as the 32x32 kernel:
+// Tiled GEMM, 64(M) x 32(N) tile — larger tile for higher prefill throughput.
+// Same math as the 32x32 kernel:
 // C[M,N] = A[M,K](fp32) * B[N,K]^T(fp16). 4 simdgroups, 128 threads. Each sg
 // owns a 32(M) x 16(N) region = 4x2 grid of simdgroup_float8x8 accumulators
 // (8 total per sg). A tile [64 M x 8 K], B tile [32 N x 8 K] staged as float.
@@ -445,18 +419,14 @@ kernel void gemm_f32a_f16b_f32c(
 }
 
 // ---------------------------------------------------------------------------
-// GEMV v2: M==1 decode fast path. C[1,N] = A[1,K] * B[N,K]^T. Mirrors llama.cpp
-// `kernel_mul_mv_t_t`:
-//   - Each threadgroup owns NR0=2 output rows (r0 = tgpig.x*NR0). The activation
-//     slice each lane loads is REUSED across both rows (halves activation reads).
-//   - NSG simdgroups split K: SG sgitg processes NF-element chunks strided by
-//     NSG*NF*32, accumulating a partial dot per row. A cross-SG reduction
-//     (simd_sum + shmem) combines the NSG partials. This parallelizes large K
+// GEMV v2: M==1 decode fast path. C[1,N] = A[1,K] * B[N,K]^T.
+//   - Each threadgroup owns NR0=2 output rows; the activation slice each lane
+//     loads is reused across both rows (halves activation reads).
+//   - NSG simdgroups split K into strided chunks and accumulate partial dots,
+//     combined by a cross-SG reduction (simd_sum + shmem). This spreads large K
 //     (e.g. down_proj K=9728) across up to NSG*32 lanes instead of 32.
-//   - Weight (B, half) read directly from device; activation (A, f32) read
-//     directly from device (no staging — the reuse across NR0 rows is the win).
-// grid: threadgroups = (ceil(N/NR0), 1, 1); threads/tg = (32, NSG, 1).
-// shmem: NR0 * 32 floats for the cross-SG reduction.
+//   - Weight and activation both read straight from device (no staging).
+// grid: (ceil(N/NR0), 1, 1); threads/tg = (32, NSG, 1); shmem NR0*32 floats.
 // NR0 (output rows per threadgroup) is a function constant (default 2); the host
 // picks it per GPU/model. Max supported = 8 (register array sumf[NR0MAX]).
 // ---------------------------------------------------------------------------
@@ -519,7 +489,7 @@ kernel void gemv2_f32a_f16b_f32c(
             sumf[row] += aval * float(bx[row][k]);
     }
 
-    // ---- cross-simdgroup reduction (llama helper_mv_reduce_and_write) ----
+    // ---- cross-simdgroup reduction: combine each SG's partial dots ----
     // shmem laid out [NR0][NW]; sg0 reduces the per-SG partials for each row.
     for (short row = 0; row < NR0; ++row) {
         if (sgitg == 0) shmem[row * NW + lane] = 0.0f;
@@ -758,14 +728,11 @@ kernel void swiglu_f32(
 }
 
 // ---------------------------------------------------------------------------
-// ShortConv: depth-wise causal conv1d + silu, one thread per group. Mirrors the
-// CPU kernel (execute.cpp OpType::SHORTCONV). Each group is independent (own
-// state, own output rows), so one thread walks that group's sequence序 serially.
-//   window[i+k] = k<(ksize-1) ? state[i+k-...]  actually: prepend state then x.
-//   For position i in [0,seq): sum = Σ_{k=0..ksize} win[i+k]*w[g,k], out=silu(sum),
-//   where win = [state(ksize-1) | x(seq)]. state updated to last (ksize-1) x vals.
-// grid = ceil(groups) threadgroups; ksize<=4 (KMAX). Persistent state buffer is
-// read AND written in-place (like the KV cache append).
+// ShortConv: depth-wise causal conv1d + silu, one thread per group (groups are
+// independent, so each thread walks its own sequence). For position i:
+// out[i] = silu(Σ_k win[i+k]*w[g,k]) over win = [state(ksize-1) | x(seq)]; the
+// persistent state is then updated in place to the last (ksize-1) x values.
+// ksize<=4 (KMAX). Matches the CPU SHORTCONV kernel.
 // ---------------------------------------------------------------------------
 kernel void shortconv_f32(
     device const float*      X     [[buffer(0)]],
@@ -816,11 +783,10 @@ kernel void shortconv_f32(
 
 // ---------------------------------------------------------------------------
 // GDN decode (seq=1): fused Gated Delta Rule + RMSNormGated for one token.
-// One THREADGROUP per value head; V_dim threads (thread dv owns state column
-// [*,dv], kv_mem[dv], attn_out[dv]). Mirrors kernels/gdn_neon.h gdn_recurrence.
-// State [num_v_heads, k_dim, v_dim] read+written in place (device buffer).
-//   grid: threadgroups = num_v_heads; threads = v_dim (<=256).
-// Threadgroup mem: sq[k_dim], sk[k_dim] (staged+L2-normed q/k), plus reduction.
+// One threadgroup per value head; v_dim threads (thread dv owns state column
+// [*,dv], kv_mem[dv], attn_out[dv]). State [num_v_heads, k_dim, v_dim] is read
+// and written in place. Threadgroup mem holds the staged, L2-normed q/k plus a
+// reduction scratch. Matches the CPU GDN kernel.
 // ---------------------------------------------------------------------------
 inline float gdn_softplus(float x) {
     if (x > 20.0f) return x;
@@ -1159,38 +1125,22 @@ kernel void sdpa_prefill_f32(
 }
 
 // ---------------------------------------------------------------------------
-// (Removed: old KV-split flash-attention `sdpa_prefill_fa_f32`. Superseded by
-// the llama-style query-split `sdpa_prefill_fa2_f32` below, which is faster and
-// simpler. History in git.)
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// SDPA prefill v2 — llama.cpp `kernel_flash_attn_ext` structure.
-//   grid: ((S+Q-1)/Q, num_heads), threads (32, NSG). One threadgroup handles a
-//   tile of Q=8 query rows for one head, with NSG=4 simdgroups (128 threads).
+// Flash-attention prefill. grid ((S+Q-1)/Q, num_heads), threads (32, NSG): one
+// threadgroup handles a tile of Q=8 query rows for one head across NSG=4
+// simdgroups (128 threads).
+//   - K/V read straight from device into the simdgroup MMA (FP16 cache rows are
+//     contiguous), so no threadgroup staging or per-block barrier.
+//   - QK/PV matmuls are cooperative over all Q queries; KV columns are split
+//     across simdgroups for the QK GEMM, each writing its stripe into `ss`.
+//   - Online-softmax state (M/S) is split by query row (SG sgitg owns rows
+//     {sgitg, sgitg+NSG, ...}), so there is no cross-simdgroup merge.
+//   - O accumulator lives in threadgroup `so` (float) and is rescaled elementwise.
+// Threadgroup memory: sq[Q*DK] half + so[Q*PV] float + ss[Q*SH] float
+//   (SH=2*C, PV=PAD(DV,64)); ~10 KB at DK=DV=128, within the 32 KB limit.
 //
-// Key structural choices (vs the old sdpa_prefill_fa_f32):
-//   - K/V read DIRECTLY from device global memory into the simdgroup MMA (the
-//     FP16 cache rows are contiguous with stride = head_dim / v_head_dim), so
-//     NO threadgroup staging of K/V and NO per-block staging barrier.
-//   - QK / PV matmuls are cooperative over all Q queries; the KV *columns* are
-//     split across simdgroups for the QK GEMM (pk += sgitg*8*DK), each SG storing
-//     its column stripe into the shared score buffer ss.
-//   - The online-softmax STATE (M/S) is split by QUERY ROW: simdgroup sgitg owns
-//     rows {sgitg, sgitg+NSG, ...} (NQ = Q/NSG rows). No cross-simdgroup merge.
-//   - O accumulator lives in threadgroup memory `so` (half), rescaled ELEMENTWISE
-//     (so4[...] *= ms), not via a diagonal-matrix MMA.
-//
-// Threadgroup memory: sq[Q*DK] half(2B) + so[Q*PV] float(4B) + ss[Q*SH] float(4B),
-//   SH=2*C, PV=PAD(DV,64). For DK=DV=128: 8*128*2 + 8*128*4 + 8*128*4 =
-//   2048 + 4096 + 4096 = 10240 bytes = 10 KB. Fits the 32 KB limit.
-//   so is float (matches llama o_t=float) so simdgroup_load/store of float8x8
-//   accumulators work directly. dk/dv runtime (Phase A); Q/C/NSG compile-time.
-// ---------------------------------------------------------------------------
-// Function constants (Phase B): specialize dk/dv at pipeline-compile time so the
-// QK/PV MMA loop bounds (DK8, DV8, NO) are compile-time constants → fully
-// unrolled, no runtime-variable loop overhead. When the host does not set them
-// (index not defined), DK/DV fall back to the runtime SdpaParams values (Phase A
-// behavior). mollm's function-constant namespace was previously empty.
+// dk/dv are function constants: when the host specializes the pipeline they
+// become compile-time (fully unrolled MMA loops); otherwise they fall back to
+// the runtime SdpaParams values.
 constant int FC_SDPA_DK [[function_constant(0)]];
 constant int FC_SDPA_DV [[function_constant(1)]];
 constant bool FC_SDPA_HAS_DK = is_function_constant_defined(FC_SDPA_DK);
@@ -1208,8 +1158,8 @@ kernel void sdpa_prefill_fa2_f32(
     ushort tiisg                  [[thread_index_in_simdgroup]],
     ushort sgitg                  [[simdgroup_index_in_threadgroup]])
 {
-    const short QT  = 8;              // queries per threadgroup tile (llama nqptg)
-    const short C   = 64;             // KV columns per block         (llama ncpsg)
+    const short QT  = 8;              // queries per threadgroup tile
+    const short C   = 64;             // KV columns per block
     const short NSG = 4;              // simdgroups per threadgroup
     const short NW  = 32;             // simd width
     const short NQ  = QT / NSG;       // query rows owned by each simdgroup (=2)
@@ -1333,11 +1283,9 @@ kernel void sdpa_prefill_fa2_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ---- O += P * V : direct-global V read ----
-        // so holds [QT x PV] O accumulators (half in threadgroup mem). Split the
-        // PV8 output 8-col blocks across simdgroups (stripe stride 8*NSG). P (=ss,
-        // float) loads as simdgroup_float8x8; V loads as simdgroup_half8x8 direct
-        // from global. Metal MMA accepts float(P) x half(V) -> float(O). Mirrors
-        // llama:6316-6384.
+        // so holds [QT x PV] O accumulators. Split the PV8 output 8-col blocks
+        // across simdgroups. P (=ss, float) loads as float8x8; V loads as half8x8
+        // straight from device; the MMA takes float(P) x half(V) -> float(O).
         {
             const short NO = PV8 / NSG;   // output 8x8 col blocks per SG
             simdgroup_float8x8 lo[8];     // NO <= 8 (PV<=256, NSG=4)

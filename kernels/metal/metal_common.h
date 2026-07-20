@@ -75,10 +75,10 @@ struct SwigluParams {
 };
 
 // Fused Gated Delta Rule (GDN) linear-attention core for Qwen3.5.
-// See kernels/gdn.h for the full algorithm/layout contract. All matmul-derived
-// inputs are [seq, dim] row-major (ptr[t*dim+d]). State [num_v_heads, k_dim, v_dim]
-// (state[vh*k_dim*v_dim + dk*v_dim + dv]) read+written in place.
-//   qkv layout per token t: [ q(num_heads*k_dim) | k(num_heads*k_dim) | v(num_v_heads*v_dim) ]
+// qkv split per token: [ q(num_heads*k_dim) | k(num_heads*k_dim) | v(num_v_heads*v_dim) ].
+// Decode reads qkv as [seq,dim] (seq=1); prefill reads it as [qkv_total,seq]
+// (dim-major), while a/b/z/out stay [seq,dim]. State [num_v_heads,k_dim,v_dim]
+// (state[vh*k_dim*v_dim + dk*v_dim + dv]) is read and written in place.
 struct GdnParams {
     int   num_heads;      // key heads (q/k/a/b)
     int   num_v_heads;    // value heads (v/z/out/state); repeat = num_v_heads/num_heads

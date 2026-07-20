@@ -103,7 +103,7 @@ struct MetalBackend::Impl {
     }
 
     // Specialized-pipeline cache keyed by name + function-constant tuple. Used by
-    // the flash-attention prefill kernel to bake dk/dv in at compile time (Phase B).
+    // the flash-attention prefill kernel to bake dk/dv in at compile time.
     // Falls back to nil on failure; caller then uses the plain name-keyed pipeline.
     std::unordered_map<std::string, id<MTLComputePipelineState>> spec_pipelines;
     id<MTLComputePipelineState> pipeline_fa2(int dk, int dv) {
@@ -605,11 +605,9 @@ void MetalBackend::dispatch(const GraphNode& node,
 
     case OpType::CONTIGUOUS: {
         const Tensor& src = *inputs[0];
-        // NOTE: no zero-copy alias fast-path here. The executor does not treat
-        // CONTIGUOUS as view-like (only RESHAPE/PERMUTE/SLICE), so aliasing the
-        // output onto src's buffer left the pre-allocated output orphaned and the
-        // alias dangling once src's owner was deferred-freed — corrupting results
-        // under deferred (whole-graph) execution. Always materialize via kernel.
+        // Always materialize via kernel — don't add a zero-copy alias here: the
+        // executor doesn't treat CONTIGUOUS as view-like, so an alias dangles once
+        // src is deferred-freed, corrupting results under whole-graph execution.
         TensorDesc d{};
         for (int i=0;i<4;i++){ d.shape[i]=(int)src.shape[i]; d.stride[i]=estride(src,i);}        
         d.offset = eoffset(src);
@@ -660,10 +658,9 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.activation = (act == 3) ? 1 : 0;   // map Activation::SILU -> shader 1
 
         if (p.M == 1) {
-            // GEMV v2 (llama mul_mv style): each threadgroup owns NR0=2 output
-            // rows; NSG simdgroups split K and reduce via shmem. NSG scales with
-            // K (like llama: min(4,(K+127)/128)) so large-K matmuls (down_proj
-            // K=9728) get up to 4x32 lanes. MOLLM_METAL_GEMV_OLD=1 -> old kernel.
+            // GEMV v2: each threadgroup owns NR0=2 output rows; NSG simdgroups
+            // split K and reduce via shmem, so large-K matmuls (down_proj K=9728)
+            // get up to 4x32 lanes. MOLLM_METAL_GEMV_OLD=1 -> old kernel.
             static const bool gemv_old = (getenv("MOLLM_METAL_GEMV_OLD") != nullptr);
             // NR0 = output rows per threadgroup (activation reuse). Default 2;
             // tune via MOLLM_METAL_GEMV_NR0 (1..8).
@@ -720,9 +717,8 @@ void MetalBackend::dispatch(const GraphNode& node,
             MatmulParams pt = p; pt.b_offset = 0;
 #ifdef MOLLM_METAL_TENSOR
             if (impl_->has_tensor) {
-                // Metal 4 tensor-API GEMM (fast path on M5/A19+). Mirrors llama:
-                // weights (our N) staged NRA=64 tile; activations (our M) device
-                // NRB=128 tile; NK=32. A staged as half → NRA*NK=2048 halves=4KB.
+                // Metal 4 tensor-API GEMM (fast path on M5/A19+): weights staged in
+                // a 64-row tile, activations as a device tensor, NK=32.
                 // grid: tgpig.y = N/64, tgpig.x = M/128.
                 id<MTLComputePipelineState> ps = impl_->pipeline("gemm_tensor_f32a_f16b_f32c");
                 // Bind A (activations) and B (weights) at their 64-bit byte
@@ -1111,8 +1107,8 @@ void MetalBackend::dispatch(const GraphNode& node,
 
         bool decode_path = (src_seqlen == 1);
         // Prefill SDPA routing:
-        //   default -> sdpa_prefill_fa2_f32 (llama-style FA: query-split, direct-
-        //              global K/V MMA, threadgroup-O elementwise rescale).
+        //   default -> sdpa_prefill_fa2_f32 (flash attention: query-split,
+        //              direct-global K/V MMA, threadgroup-O elementwise rescale).
         //   MOLLM_METAL_SDPA_SIMPLE=1 -> per-query online-softmax sdpa_prefill_f32.
         // fa2 requires dk/dv %8, <=256 (C=64 & PV8 divisible by NSG=4 always hold).
         static const bool use_simple = (getenv("MOLLM_METAL_SDPA_SIMPLE") != nullptr);
@@ -1143,10 +1139,9 @@ void MetalBackend::dispatch(const GraphNode& node,
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_heads,1,1)
                 threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         } else if (fa2_ok) {
-            // llama-style FA: one threadgroup (NSG simdgroups, 32*NSG threads) per
-            // (query-tile=Q, head). Threadgroup memory (bytes):
-            //   sq[Q*DK] half(2B) + so[Q*PV] float(4B) + ss[Q*SH] float(4B),
-            //   SH=2*C, PV=PAD(DV,64).
+            // Flash attention: one threadgroup (NSG simdgroups, 32*NSG threads) per
+            // (query-tile=Q, head). Threadgroup memory:
+            //   sq[Q*DK] half + so[Q*PV] float + ss[Q*SH] float, SH=2*C, PV=PAD(DV,64).
             const int PV = ((v_head_dim + 63) / 64) * 64;
             const int SH = 2 * 64;
             size_t tg_bytes = (size_t)FA2_Q * head_dim * 2   // sq (half)
@@ -1168,8 +1163,7 @@ void MetalBackend::dispatch(const GraphNode& node,
     }
 
     default:
-        fprintf(stderr, "MetalBackend: unsupported op %d for phase-1 dense path\n",
-                (int)op);
+        fprintf(stderr, "MetalBackend: unsupported op %d\n", (int)op);
         assert(false && "unsupported metal op");
         break;
     }
