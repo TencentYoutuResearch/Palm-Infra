@@ -3,6 +3,8 @@
 
 using namespace metal;
 
+inline float apply_activation(float v, int act);
+
 #ifdef MOLLM_METAL_TENSOR
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -97,6 +99,237 @@ kernel void gemm_tensor_f32a_f16b_f32c(
     device float* dstC = C + p.c_offset;
     auto tD = tensor(dstC, dextents<int32_t,2>(N, M), array<int,2>({1, p.c_row_stride}));
     cT.store(tD.slice(ra, rb));
+}
+
+// W8A16 GEMM: identical to gemm_tensor but weights are int8 + per-group scale,
+// dequantized to half during staging (sa[...] = half(int8 * scale)). Reuses the
+// same fp16 matmul2d downstream — activations stay float. Handles any group_size
+// via the per-(row,group) scale lookup during staging.
+kernel void gemm_tensor_w8_f32a_i8b_f32c(
+    device const float*    A      [[buffer(0)]],
+    device const int8_t*   B      [[buffer(1)]],
+    device float*          C      [[buffer(2)]],
+    device const float*    SCALES [[buffer(4)]],
+    constant MatmulW8Params& p    [[buffer(3)]],
+    threadgroup half*      shmem  [[threadgroup(0)]],
+    uint3  tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 64, NRB = 128, NK = 32, NUM_THREADS = 128;
+    const int M = p.M, N = p.N, K = p.K;
+    const int gpr = p.groups_per_row, gs = p.group_size;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup half* sa = shmem;
+    auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
+    device const float* ptrA = A + p.a_offset;
+    auto tB = tensor((device float*)ptrA, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, p.a_row_stride}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    const int UNROLL = 16;
+    const int A_WORK = NRA * (NK / UNROLL);
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        for (int work = tiitg; work < A_WORK; work += NUM_THREADS) {
+            int nl = work / (NK / UNROLL), sub = work % (NK / UNROLL);
+            int kbase = sub * UNROLL, gn = ra + nl, gk0 = loop_k + kbase;
+            threadgroup half* dst = sa + nl*NK + kbase;
+            if (gn < N) {
+                device const int8_t* wrow = B + (uint)gn * (uint)K + gk0;
+                device const float*  srow = SCALES + (uint)gn * (uint)gpr;
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i) {
+                    int k = gk0 + i;
+                    dst[i] = (k < K) ? (half)((float)wrow[i] * srow[k / gs]) : (half)0;
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i) dst[i] = (half)0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, rb);
+        mm.run(mB, mA, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float* dstC = C + p.c_offset;
+    auto tD = tensor(dstC, dextents<int32_t,2>(N, M), array<int,2>({1, p.c_row_stride}));
+    cT.store(tD.slice(ra, rb));
+}
+
+// --- W8A8 int8xint8->int32 GEMM -------------------------------------------
+// C[M,N] = A_i8[M,K] * W_i8[N,K]^T, then dequant: out = int32*scale_a[m]*scale_w[n].
+// Same tiling as the fp16 gemm_tensor: weights staged into threadgroup as int8,
+// activations read as a device tensor, matmul2d accumulates in int32. The int32
+// tile is stored to threadgroup, then threads write the dequantized fp32 output.
+// Manual per-thread fragment packing is intentionally avoided: the cooperative
+// tensor register layout is compiler-dependent and only the tensor .load/.store
+// path is portable across the offline (metallib) and online compilers.
+kernel void gemm_w8a8_i8a_i8b_f32c(
+    device const int8_t*  A       [[buffer(0)]],   // int8 activations [M,K]
+    device const int8_t*  B       [[buffer(1)]],   // int8 weights [N,K]
+    device float*         C       [[buffer(2)]],   // fp32 out [M,N] ([N,M]-strided)
+    device const float*   SCALE_A [[buffer(4)]],   // per-token [M]
+    device const float*   SCALE_W [[buffer(5)]],   // per-channel [N]
+    constant MatmulW8A8Params& p  [[buffer(3)]],
+    threadgroup int8_t*   shmem   [[threadgroup(0)]],
+    uint3  tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 64;    // weights tile (our N), staged into threadgroup
+    const int NRB = 64;    // activations tile (our M)
+    const int NK  = 32;    // K chunk
+    const int NUM_THREADS = 128;
+    const int M = p.M, N = p.N, K = p.K;
+    const int ra = (int)tgpig.y * NRA;   // first weight row (our N)
+    const int rb = (int)tgpig.x * NRB;   // first activation row (our M)
+
+    threadgroup int8_t* sa = shmem;      // staged weights [NK, NRA]
+    auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
+    // A as device tensor [K, M]: element (m,k) at m*K + k -> strides {1, K}.
+    auto tB = tensor((device int8_t*)A, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, K}));
+
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), int32_t>();
+
+    const int UNROLL = 16;
+    const int A_WORK = NRA * (NK / UNROLL);
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        for (int work = tiitg; work < A_WORK; work += NUM_THREADS) {
+            int nl = work / (NK / UNROLL), sub = work % (NK / UNROLL);
+            int kbase = sub * UNROLL, gn = ra + nl, gk0 = loop_k + kbase;
+            threadgroup int8_t* dst = sa + nl*NK + kbase;
+            if (gn < N) {
+                device const int8_t* wrow = B + (ulong)gn * (ulong)K + gk0;
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i)
+                    dst[i] = (gk0 + i < K) ? wrow[i] : (int8_t)0;
+            } else {
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i) dst[i] = (int8_t)0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, rb);
+        mm.run(mB, mA, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store int32 accumulators to threadgroup [NRA(N), NRB(M)], then dequant.
+    threadgroup int32_t* si = (threadgroup int32_t*)shmem;   // reuse shmem (NRA*NRB int32)
+    auto tI = tensor(si, dextents<int32_t,2>(NRB, NRA));      // [M-tile, N-tile]
+    cT.store(tI);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float* Cout = C + p.c_offset;
+    for (int idx = tiitg; idx < NRA * NRB; idx += NUM_THREADS) {
+        int nl = idx / NRB;          // weight/N within tile
+        int ml = idx % NRB;          // activation/M within tile
+        int ni = ra + nl, mi = rb + ml;
+        if (mi < M && ni < N) {
+            int32_t acc = si[ml * NRA + nl];   // tI is [NRB, NRA] row-major
+            float v = (float)acc * SCALE_A[mi] * SCALE_W[ni];
+            Cout[mi * p.c_row_stride + ni] = apply_activation(v, p.activation);
+        }
+    }
+}
+
+// --- W4A8 int8 x per-group int4 GEMM --------------------------------------
+// C[M,N] = A_i8[M,K] * W_i4[N,K/2], per-group symmetric int4 weights. Same
+// int8xint8->int32 matmul2d as W8A8, but weights are unpacked from nibbles at
+// staging and the accumulator is flushed per weight-scale group. Weight nibble:
+// byte = W[n*(K/2)+k/2]; low nibble = even k, high = odd k; w = nibble-16 if >=8.
+// Group-major: each group (group_size K) accumulates into its own int32 tile,
+// then flushes (int32 * scale_w[n,group]) into an fp32 tile; final *scale_a[m].
+kernel void gemm_w4a8_i8a_i4b_f32c(
+    device const int8_t*  A       [[buffer(0)]],   // int8 activations [M,K]
+    device const uint8_t* B       [[buffer(1)]],   // int4 weights [N,K/2]
+    device float*         C       [[buffer(2)]],   // fp32 out [M,N] ([N,M]-strided)
+    device const float*   SCALE_A [[buffer(4)]],   // per-token [M]
+    device const float*   SCALE_W [[buffer(5)]],   // per-group [N, groups_per_row]
+    constant MatmulW4A8Params& p  [[buffer(3)]],
+    threadgroup int8_t*   shmem   [[threadgroup(0)]],
+    uint3  tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 64, NRB = 64, NK = 32, NUM_THREADS = 128;
+    const int M = p.M, N = p.N, K = p.K;
+    const int GS = p.group_size, GPR = p.groups_per_row;
+    const int ra = (int)tgpig.y * NRA;   // first weight row (our N)
+    const int rb = (int)tgpig.x * NRB;   // first activation row (our M)
+
+    // threadgroup: [ facc: NRB*NRA float (persists across groups) | scratch:
+    // staged int8 weights / int32 store tile (reused, never simultaneously) ].
+    threadgroup float*   facc = (threadgroup float*)shmem;
+    threadgroup int8_t*  sa   = (threadgroup int8_t*)(shmem + NRA*NRB*sizeof(float));
+    threadgroup int32_t* si   = (threadgroup int32_t*)sa;
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) facc[idx] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
+    auto tB = tensor((device int8_t*)A, dextents<int32_t,2>(K, M), array<int,2>({1, K}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+
+    const int UNROLL = 16, A_WORK = NRA * (NK / UNROLL);
+    for (int g0 = 0; g0 < K; g0 += GS) {
+        int g = g0 / GS;
+        int gend = min(g0 + GS, K);
+        auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), int32_t>();
+        for (int loop_k = g0; loop_k < gend; loop_k += NK) {
+            for (int work = tiitg; work < A_WORK; work += NUM_THREADS) {
+                int nl = work / (NK / UNROLL), sub = work % (NK / UNROLL);
+                int kbase = sub * UNROLL, gn = ra + nl, gk0 = loop_k + kbase;
+                threadgroup int8_t* dst = sa + nl*NK + kbase;
+                if (gn < N) {
+                    device const uint8_t* wr = B + (ulong)gn * ((ulong)K/2) + (gk0/2);
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; i += 2) {
+                        uint8_t byte = ((gk0 + i) < K) ? wr[i/2] : 0;
+                        int lo = byte & 0x0F; if (lo >= 8) lo -= 16;
+                        int hi = (byte >> 4) & 0x0F; if (hi >= 8) hi -= 16;
+                        dst[i]   = (int8_t)(((gk0 + i)   < K) ? lo : 0);
+                        dst[i+1] = (int8_t)(((gk0 + i+1) < K) ? hi : 0);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; ++i) dst[i] = 0;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            auto mA = tA.slice(0, 0);
+            auto mB = tB.slice(loop_k, rb);
+            mm.run(mB, mA, cT);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        cT.store(tensor(si, dextents<int32_t,2>(NRB, NRA)));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+            int nl = idx / NRB, ml = idx % NRB, ni = ra + nl;
+            if (ni < N) facc[ml*NRA + nl] += (float)si[ml*NRA + nl]
+                                             * SCALE_W[(ulong)ni * GPR + g];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float* Cout = C + p.c_offset;
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+        int nl = idx / NRB, ml = idx % NRB, ni = ra + nl, mi = rb + ml;
+        if (mi < M && ni < N) {
+            float v = facc[ml*NRA + nl] * SCALE_A[mi];
+            Cout[mi * p.c_row_stride + ni] = apply_activation(v, p.activation);
+        }
+    }
 }
 #endif // MOLLM_METAL_TENSOR
 
@@ -505,6 +738,167 @@ kernel void gemv2_f32a_f16b_f32c(
             if (lane == 0 && r0 + row < p.N)
                 C[p.c_offset + r0 + row] = apply_activation(tot, p.activation);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W8 decode GEMV: C[1,N] = (A[1,K] fp32) * (W[N,K] int8) with per-group weight
+// scale. int8 weight × float activation (no activation quant); the group scale
+// is applied in the K accumulation so any group_size works. Same threadgroup
+// structure as gemv2 (NR0 rows/tg, NSG simdgroups split K, shmem reduce).
+// grid: (ceil(N/NR0),1,1); threads (32, NSG, 1); shmem NR0*32 floats.
+// ---------------------------------------------------------------------------
+kernel void gemv_w8_f32a_i8b_f32c(
+    device const float*    A      [[buffer(0)]],
+    device const int8_t*   B      [[buffer(1)]],
+    device float*          C      [[buffer(2)]],
+    device const float*    SCALES [[buffer(4)]],
+    constant MatmulW8Params& p    [[buffer(3)]],
+    threadgroup float*     shmem  [[threadgroup(0)]],
+    uint  tgx                     [[threadgroup_position_in_grid]],
+    ushort lane                   [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]],
+    ushort nsg                    [[simdgroups_per_threadgroup]])
+{
+    const short NR0 = 2, NR0MAX = 2, NW = 32;
+    device const float* a = A + p.a_offset;
+    const int r0 = (int)tgx * NR0;
+    const int gpr = p.groups_per_row, gs = p.group_size;
+
+    device const int8_t* bx[NR0MAX];
+    device const float*  sc[NR0MAX];
+    for (short row = 0; row < NR0; ++row) {
+        bx[row] = B + (uint)(r0 + row) * (uint)p.K;               // int8 weight row
+        sc[row] = SCALES + (uint)(r0 + row) * (uint)gpr;          // per-row group scales
+    }
+    float sumf[NR0MAX]; for (short r=0;r<NR0;++r) sumf[r]=0.0f;
+
+    // Each lane strides K; scale applied per group boundary. w8pc (gpr==1) →
+    // one scale/row, factored out at the end (fast path); else per-group.
+    if (gpr == 1) {
+        for (int k = (int)sgitg*NW + (int)lane; k < p.K; k += NW*(int)nsg) {
+            float av = a[k];
+            for (short r=0;r<NR0;++r) sumf[r] += av * (float)bx[r][k];
+        }
+        for (short r=0;r<NR0;++r) sumf[r] *= sc[r][0];            // one scale per row
+    } else {
+        for (int k = (int)sgitg*NW + (int)lane; k < p.K; k += NW*(int)nsg) {
+            float av = a[k]; int g = k / gs;
+            for (short r=0;r<NR0;++r) sumf[r] += av * ((float)bx[r][k]) * sc[r][g];
+        }
+    }
+
+    // cross-simdgroup reduction (same as gemv2)
+    for (short r=0;r<NR0;++r){ if(sgitg==0) shmem[r*NW+lane]=0.0f; sumf[r]=simd_sum(sumf[r]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short r=0;r<NR0;++r) if(lane==0) shmem[r*NW+sgitg]=sumf[r];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg==0) {
+        for (short r=0;r<NR0;++r){
+            float tot = simd_sum(shmem[r*NW+lane]);
+            if (lane==0 && r0+r < p.N) C[p.c_offset + r0+r] = apply_activation(tot, p.activation);
+        }
+    }
+}
+
+// W4 decode GEMV: C[1,N] = A[1,K] (fp32) * W_i4[N,K/2] (per-group symmetric int4).
+// Nibble: byte = B[n*(K/2)+k/2]; low = even k, high = odd k; w = nibble-16 if>=8.
+// Per-group weight scale scale_w[n*gpr + k/gs] applied inside the group sum.
+kernel void gemv_w4_f32a_i4b_f32c(
+    device const float*    A      [[buffer(0)]],
+    device const uint8_t*  B      [[buffer(1)]],
+    device float*          C      [[buffer(2)]],
+    device const float*    SCALES [[buffer(4)]],
+    constant MatmulW8Params& p    [[buffer(3)]],
+    threadgroup float*     shmem  [[threadgroup(0)]],
+    uint  tgx                     [[threadgroup_position_in_grid]],
+    ushort lane                   [[thread_index_in_simdgroup]],
+    ushort sgitg                  [[simdgroup_index_in_threadgroup]],
+    ushort nsg                    [[simdgroups_per_threadgroup]])
+{
+    const short NR0 = 2, NR0MAX = 2, NW = 32;
+    device const float* a = A + p.a_offset;
+    const int r0 = (int)tgx * NR0;
+    const int gpr = p.groups_per_row, gs = p.group_size;
+    const uint row_bytes = (uint)p.K / 2;   // K/2 bytes per weight row
+
+    device const uint8_t* bx[NR0MAX];
+    device const float*   sc[NR0MAX];
+    for (short row = 0; row < NR0; ++row) {
+        bx[row] = B + (uint)(r0 + row) * row_bytes;
+        sc[row] = SCALES + (uint)(r0 + row) * (uint)gpr;
+    }
+    float sumf[NR0MAX]; for (short r=0;r<NR0;++r) sumf[r]=0.0f;
+
+    // Each lane strides over BYTES (2 K each); weight scale applied per group.
+    for (int kb = (int)sgitg*NW + (int)lane; kb < (int)row_bytes; kb += NW*(int)nsg) {
+        int ke = kb*2;            // even k
+        float ae = a[ke], ao = a[ke+1];
+        int ge = ke / gs, go = (ke+1) / gs;
+        for (short r=0;r<NR0;++r) {
+            uint8_t byte = bx[r][kb];
+            int lo = byte & 0x0F; if (lo >= 8) lo -= 16;
+            int hi = (byte >> 4) & 0x0F; if (hi >= 8) hi -= 16;
+            sumf[r] += ae * (float)lo * sc[r][ge] + ao * (float)hi * sc[r][go];
+        }
+    }
+
+    for (short r=0;r<NR0;++r){ if(sgitg==0) shmem[r*NW+lane]=0.0f; sumf[r]=simd_sum(sumf[r]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short r=0;r<NR0;++r) if(lane==0) shmem[r*NW+sgitg]=sumf[r];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg==0) {
+        for (short r=0;r<NR0;++r){
+            float tot = simd_sum(shmem[r*NW+lane]);
+            if (lane==0 && r0+r < p.N) C[p.c_offset + r0+r] = apply_activation(tot, p.activation);
+        }
+    }
+}
+
+// Per-token int8 quantization of activations for the W8A8 GEMM.
+//   in : fp32 A[M,K], element (m,k) at a_offset + m*a_row_stride + k
+//   out: int8 A_i8[M,K] contiguous (a_i8[m*K + k]) + fp32 scale_a[M]
+// One threadgroup per row m: absmax reduce over K, scale = absmax/127, then
+// round each element. Rows with absmax==0 get scale 0 (all zeros out).
+kernel void quantize_act_i8(
+    device const float*   A       [[buffer(0)]],
+    device int8_t*        A_I8     [[buffer(2)]],
+    device float*         SCALE_A  [[buffer(4)]],
+    constant QuantActParams& p     [[buffer(3)]],
+    threadgroup float*    shmem    [[threadgroup(0)]],
+    uint  m                        [[threadgroup_position_in_grid]],
+    ushort lane                    [[thread_index_in_simdgroup]],
+    ushort sgitg                   [[simdgroup_index_in_threadgroup]],
+    ushort nsg                     [[simdgroups_per_threadgroup]])
+{
+    const int K = p.K;
+    device const float* a = A + p.a_offset + (uint)m * (uint)p.a_row_stride;
+    device int8_t*      o = A_I8 + (uint)m * (uint)K;
+
+    // 1) absmax over the row (two-level: simd_sum-style max via simd_max).
+    float amax = 0.0f;
+    for (int k = (int)sgitg*32 + (int)lane; k < K; k += 32*(int)nsg)
+        amax = fmax(amax, fabs(a[k]));
+    amax = simd_max(amax);
+    if (lane == 0) shmem[sgitg] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        float v = (lane < nsg) ? shmem[lane] : 0.0f;
+        v = simd_max(v);
+        if (lane == 0) shmem[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax = shmem[0];
+
+    float scale = amax / 127.0f;
+    float inv   = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    if (sgitg == 0 && lane == 0) SCALE_A[m] = scale;
+
+    // 2) quantize (round-to-nearest, clamp to int8 range).
+    for (int k = (int)sgitg*32 + (int)lane; k < K; k += 32*(int)nsg) {
+        int q = (int)rint(a[k] * inv);
+        q = clamp(q, -127, 127);
+        o[k] = (int8_t)q;
     }
 }
 

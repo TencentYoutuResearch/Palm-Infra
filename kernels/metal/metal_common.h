@@ -30,6 +30,65 @@ struct MatmulParams {
     int  activation;     // 0=NONE, 1=SILU (fused, phase-1 optional)
 };
 
+// W8 (int8 weight-only) matmul: C[M,N] = A[M,K](fp32) * W_int8[N,K] * scale_w.
+// Weight is int8 row-major [N,K]; per-group fp32 scales at
+// scale[n*groups_per_row + k/group_size]. Weight and scales are bound separately.
+struct MatmulW8Params {
+    int  M;
+    int  N;
+    int  K;
+    uint a_offset;         // elements into A buffer
+    uint c_offset;         // elements into C buffer
+    int  a_row_stride;
+    int  c_row_stride;
+    int  activation;
+    int  groups_per_row;   // (K + group_size - 1) / group_size (w8pc => 1)
+    int  group_size;       // K for per-channel (w8pc)
+    // weight int8 and scales are bound at their own byte offsets (buffers 1, 4)
+};
+
+// W8A8 GEMM: int8 activations x int8 weights -> int32 -> dequant to fp32 C.
+// Activations quantized per-token (row m) to int8 with scale_a[m]; weights are
+// int8 [N,K] with per-channel scale_w[n]. out[m,n] = int32 * scale_a[m]*scale_w[n].
+struct MatmulW8A8Params {
+    int  M;
+    int  N;
+    int  K;
+    uint c_offset;
+    int  c_row_stride;
+    int  activation;
+    // int8 A (buffer 0), int8 W (buffer 1), C (buffer 2), scale_a (buffer 4),
+    // scale_w (buffer 5) bound at byte offsets; a is [M,K] contiguous (K inner).
+};
+
+// W4A8 GEMM: int8 activations x per-group symmetric int4 weights -> fp32 C.
+// Weights packed [N, K/2] (byte = low nibble at even k, high nibble at odd k;
+// w = nibble>=8 ? nibble-16 : nibble). Per-group fp32 scales scale_w[n*gpr+k/gs].
+// Activations quantized per-token to int8 with scale_a[m]. out[m,n] =
+// scale_a[m] * sum_g scale_w[n,g] * (int32 dot over group g).
+struct MatmulW4A8Params {
+    int  M;
+    int  N;
+    int  K;
+    uint c_offset;
+    int  c_row_stride;
+    int  activation;
+    int  group_size;       // 128
+    int  groups_per_row;   // K / group_size
+    // int8 A (buffer 0), int4 W (buffer 1), C (buffer 2), scale_a (buffer 4),
+    // scale_w (buffer 5) bound at byte offsets; A is [M,K] contiguous (K inner).
+};
+
+// Per-token activation quantization: A_f32[M,K] -> A_i8[M,K] + scale_a[M].
+// scale_a[m] = absmax(row m)/127; a_i8[m,k] = round(a[m,k]/scale_a[m]).
+struct QuantActParams {
+    int  M;
+    int  K;
+    uint a_offset;         // elements into fp32 A
+    int  a_row_stride;     // elements between rows of A
+    // out int8 A (buffer 2) contiguous [M,K]; scale_a (buffer 4) [M].
+};
+
 // RMS norm over dim0 (innermost). rows = product of dims 1..3.
 struct RmsNormParams {
     int   dim0;          // normalized length

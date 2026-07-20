@@ -21,6 +21,13 @@
 #define MOLLM_METALLIB_PATH ""
 #endif
 
+// CPU-side INT4 BG128 packed block (mirror of the one in kernels/matmul.cpp),
+// used to decode int4 weights into a Metal-friendly raw layout at load time.
+struct alignas(16) Q4B8G128Block {
+    float   scales[8];
+    uint8_t q[4][8][16];
+};
+
 // ===========================================================================
 // MetalBackend::Impl
 // ===========================================================================
@@ -321,6 +328,10 @@ void MetalBackend::lm_head_gemv(const float* a_host, const Tensor& weight,
 // weight region + persistent buffers
 // ===========================================================================
 
+bool MetalBackend::has_tensor_path() const {
+    return impl_->has_tensor;
+}
+
 bool MetalBackend::register_weight_region(void* base, size_t size) {
     if (!impl_->ok || !base || size == 0) return false;
     @autoreleasepool {
@@ -353,6 +364,46 @@ void MetalBackend::wrap_weight(Tensor& t) {
     }
     t.device_data = (__bridge void*)impl_->weight_buffer;
     t.device_offset = (size_t)(ptr - base);
+}
+
+void MetalBackend::wrap_weight_int4_g128(Tensor& t) {
+    // INT4 weights ship in the CPU-only Q4B8G128Block layout (scales+nibbles
+    // interleaved per 128-K block). The Metal W4A8 kernels want a simple raw
+    // [N,K/2] nibble array + [N,gpr] fp32 scales, so decode once at load time
+    // into a dedicated device buffer: [ nibbles (N*K/2) | scales (N*gpr f32) ].
+    // device_offset stays 0 (nibbles at start); scales live at byte N*(K/2),
+    // which the W4 dispatch binds directly (co-located, no weight_base math).
+    if (!(t.prec == Precision::INT4 && t.is_q4_g128_packed && t.q4_g128_data)) return;
+    const int N = (int)t.shape[0], K = (int)t.shape[1];
+    const int gpr = (int)t.groups_per_row;         // K/128
+    const size_t nib_bytes = (size_t)N * (K / 2);
+    const size_t sc_bytes  = (size_t)N * gpr * sizeof(float);
+    @autoreleasepool {
+        id<MTLBuffer> b = [impl_->device newBufferWithLength:nib_bytes + sc_bytes
+                                                     options:MTLResourceStorageModeShared];
+        impl_->persistent.push_back(b);
+        uint8_t* nib = (uint8_t*)[b contents];
+        float*   sc  = (float*)(nib + nib_bytes);
+        const auto* blocks = reinterpret_cast<const Q4B8G128Block*>(t.q4_g128_data);
+        // Block (n/8, g) holds 8 channels x 4 K-sub-blocks(32K) x 16 bytes.
+        // channel c (n=n_tile+c), k-sub qgi, byte b -> raw k = g*128+qgi*32+2b
+        // (low nibble) and +1 (high). Copy the 16 raw bytes straight through
+        // (same nibble order as raw [N,K/2]); copy per-channel per-group scale.
+        for (int n = 0; n < N; n++) {
+            int nt = (n / 8), c = n % 8;
+            uint8_t* nrow = nib + (size_t)n * (K / 2);
+            for (int g = 0; g < gpr; g++) {
+                const Q4B8G128Block& blk = blocks[(size_t)nt * gpr + g];
+                sc[(size_t)n * gpr + g] = blk.scales[c];
+                for (int qgi = 0; qgi < 4; qgi++)
+                    std::memcpy(nrow + (size_t)(g * 128 + qgi * 32) / 2,
+                                blk.q[qgi][c], 16);
+            }
+        }
+        t.device_data = (__bridge void*)b;
+        t.device_offset = 0;
+        t.scales = sc;   // host-visible; dispatch uses co-located byte offset
+    }
 }
 
 void MetalBackend::alloc_persistent(Tensor& t, size_t nbytes) {
@@ -657,6 +708,57 @@ void MetalBackend::dispatch(const GraphNode& node,
         int act = params.i32.size()>0 ? params.i32[0] : 0;
         p.activation = (act == 3) ? 1 : 0;   // map Activation::SILU -> shader 1
 
+        if (p.M == 1 && B.prec == Precision::INT8) {
+            // W8 decode: int8 weight x float activation, per-group weight scale.
+            // Weight int8 + fp32 scales both live in the weight region; bind each
+            // at its byte offset (scales offset relative to weight_base).
+            MatmulW8Params w{};
+            w.M = p.M; w.N = p.N; w.K = p.K;
+            w.a_offset = eoffset(A); w.c_offset = eoffset(C);
+            w.a_row_stride = p.a_row_stride; w.c_row_stride = p.c_row_stride;
+            w.activation = p.activation;
+            w.group_size = (int)B.group_size;
+            w.groups_per_row = (int)B.groups_per_row;
+            size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
+            const int NR0 = 2, NSG = std::min(8, (p.K + 127) / 128);
+            id<MTLComputePipelineState> ps = impl_->pipeline("gemv_w8_f32a_i8b_f32c");
+            [enc setComputePipelineState:ps];
+            [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
+            [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
+            [enc setBuffer:impl_->weight_buffer offset:scales_boff atIndex:4];
+            [enc setBytes:&w length:sizeof(w) atIndex:3];
+            [enc setThreadgroupMemoryLength:(NSUInteger)(NR0*32*sizeof(float)) atIndex:0];
+            NSUInteger tgc = ((NSUInteger)p.N + NR0 - 1)/NR0;
+            [enc dispatchThreadgroups:MTLSizeMake(tgc,1,1)
+                threadsPerThreadgroup:MTLSizeMake(32,(NSUInteger)NSG,1)];
+            break;
+        }
+        if (p.M == 1 && B.prec == Precision::INT4) {
+            // W4 decode: per-group symmetric int4 weight x float activation.
+            MatmulW8Params w{};
+            w.M = p.M; w.N = p.N; w.K = p.K;
+            w.a_offset = eoffset(A); w.c_offset = eoffset(C);
+            w.a_row_stride = p.a_row_stride; w.c_row_stride = p.c_row_stride;
+            w.activation = p.activation;
+            w.group_size = (int)B.group_size;
+            w.groups_per_row = (int)B.groups_per_row;
+            // Decoded W4 buffer layout: [ nibbles (N*K/2) | scales (N*gpr f32) ].
+            size_t scales_boff = (size_t)p.N * (p.K / 2);
+            const int NR0 = 2, NSG = std::min(8, (p.K/2 + 63) / 64);
+            id<MTLComputePipelineState> ps = impl_->pipeline("gemv_w4_f32a_i4b_f32c");
+            [enc setComputePipelineState:ps];
+            [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
+            [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
+            [enc setBuffer:buf_of(&B) offset:scales_boff atIndex:4];
+            [enc setBytes:&w length:sizeof(w) atIndex:3];
+            [enc setThreadgroupMemoryLength:(NSUInteger)(NR0*32*sizeof(float)) atIndex:0];
+            NSUInteger tgc = ((NSUInteger)p.N + NR0 - 1)/NR0;
+            [enc dispatchThreadgroups:MTLSizeMake(tgc,1,1)
+                threadsPerThreadgroup:MTLSizeMake(32,(NSUInteger)std::max(1,NSG),1)];
+            break;
+        }
         if (p.M == 1) {
             // GEMV v2: each threadgroup owns NR0=2 output rows; NSG simdgroups
             // split K and reduce via shmem, so large-K matmuls (down_proj K=9728)
@@ -700,6 +802,156 @@ void MetalBackend::dispatch(const GraphNode& node,
                 NSUInteger tgcount = ((NSUInteger)p.N + rows_per_tg - 1) / rows_per_tg;
                 [enc dispatchThreadgroups:MTLSizeMake(tgcount,1,1)
                     threadsPerThreadgroup:MTLSizeMake(rows_per_tg * 32, 1, 1)];
+            }
+        } else if (B.prec == Precision::INT8) {
+            // W8 prefill GEMM. Two paths:
+            //  - W8A8 (opt-in, per-channel weights only): quantize activations
+            //    per-token to int8, run int8xint8->int32 MMA, dequant at store.
+            //  - W8A16 (default): dequant int8 weight->half during staging, reuse
+            //    the fp16 tensor MMA. Requires the tensor path.
+#ifdef MOLLM_METAL_TENSOR
+            static const bool w8a8 = (getenv("MOLLM_METAL_W8A8") != nullptr);
+            if (impl_->has_tensor && w8a8 && B.groups_per_row == 1) {
+                // --- W8A8: quantize A -> int8 scratch, then int8 MMA ----------
+                size_t a_i8_bytes = (size_t)p.M * (size_t)p.K;      // [M,K] contiguous
+                size_t sa_bytes   = (size_t)p.M * sizeof(float);    // scale_a[M]
+                void* a_i8_h = impl_->pool->acquire(a_i8_bytes);
+                void* sa_h   = impl_->pool->acquire(sa_bytes);
+                id<MTLBuffer> a_i8 = (__bridge id<MTLBuffer>)a_i8_h;
+                id<MTLBuffer> sa   = (__bridge id<MTLBuffer>)sa_h;
+                impl_->pending_free.push_back({a_i8_h, a_i8_bytes});
+                impl_->pending_free.push_back({sa_h,   sa_bytes});
+
+                // 1) per-token activation quantization.
+                {
+                    QuantActParams q{};
+                    q.M = p.M; q.K = p.K;
+                    q.a_offset = A.device_offset / sizeof(float);   // A bound at 0
+                    q.a_row_stride = p.a_row_stride;
+                    id<MTLComputePipelineState> qps = impl_->pipeline("quantize_act_i8");
+                    [enc setComputePipelineState:qps];
+                    [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
+                    [enc setBuffer:a_i8 offset:0 atIndex:2];
+                    [enc setBuffer:sa   offset:0 atIndex:4];
+                    [enc setBytes:&q length:sizeof(q) atIndex:3];
+                    const NSUInteger nsg = 8;   // 8*32 = 256 threads/row
+                    [enc setThreadgroupMemoryLength:nsg*sizeof(float) atIndex:0];
+                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.M,1,1)
+                        threadsPerThreadgroup:MTLSizeMake(32,nsg,1)];
+                }
+                // 2) int8xint8->int32 GEMM with dequant at store.
+                {
+                    MatmulW8A8Params w{};
+                    w.M = p.M; w.N = p.N; w.K = p.K;
+                    w.c_offset = eoffset(C);
+                    w.c_row_stride = p.c_row_stride;
+                    w.activation = p.activation;
+                    size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
+                    id<MTLComputePipelineState> ps = impl_->pipeline("gemm_w8a8_i8a_i8b_f32c");
+                    [enc setComputePipelineState:ps];
+                    [enc setBuffer:a_i8 offset:0 atIndex:0];
+                    [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                    [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
+                    [enc setBytes:&w length:sizeof(w) atIndex:3];
+                    [enc setBuffer:sa offset:0 atIndex:4];
+                    [enc setBuffer:impl_->weight_buffer offset:scales_boff atIndex:5];
+                    // NRB=64 (M) x NRA=64 (N) tile / threadgroup, 128 threads;
+                    // int32 accumulators staged in 64*64*4 = 16KB threadgroup.
+                    [enc setThreadgroupMemoryLength:64*64*sizeof(int32_t) atIndex:0];
+                    MTLSize tgc = MTLSizeMake(((NSUInteger)p.M + 63)/64,
+                                              ((NSUInteger)p.N + 63)/64, 1);
+                    [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+                }
+                break;
+            }
+            if (impl_->has_tensor) {
+                MatmulW8Params w{};
+                w.M = p.M; w.N = p.N; w.K = p.K;
+                w.a_offset = 0; w.c_offset = eoffset(C);
+                w.a_row_stride = p.a_row_stride; w.c_row_stride = p.c_row_stride;
+                w.activation = p.activation;
+                w.group_size = (int)B.group_size;
+                w.groups_per_row = (int)B.groups_per_row;
+                size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
+                id<MTLComputePipelineState> ps = impl_->pipeline("gemm_tensor_w8_f32a_i8b_f32c");
+                [enc setComputePipelineState:ps];
+                [enc setBuffer:buf_of(&A) offset:A.device_offset atIndex:0];
+                [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
+                [enc setBuffer:impl_->weight_buffer offset:scales_boff atIndex:4];
+                [enc setBytes:&w length:sizeof(w) atIndex:3];
+                [enc setThreadgroupMemoryLength:64*32*sizeof(uint16_t) atIndex:0];
+                MTLSize tgc = MTLSizeMake(((NSUInteger)p.M + 127)/128,
+                                          ((NSUInteger)p.N + 63)/64, 1);
+                [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            } else
+#endif
+            {
+                fprintf(stderr, "MetalBackend: W8 GEMM requires tensor path (M5/A19+)\n");
+                assert(false && "W8 GEMM needs tensor path");
+            }
+        } else if (B.prec == Precision::INT4) {
+            // W4A8 prefill GEMM: quantize A per-token to int8, unpack per-group
+            // int4 weights at staging, int8 MMA, per-group dequant. Requires the
+            // tensor path; no fp16 fallback (int4 not consumable otherwise).
+#ifdef MOLLM_METAL_TENSOR
+            if (impl_->has_tensor) {
+                size_t a_i8_bytes = (size_t)p.M * (size_t)p.K;
+                size_t sa_bytes   = (size_t)p.M * sizeof(float);
+                void* a_i8_h = impl_->pool->acquire(a_i8_bytes);
+                void* sa_h   = impl_->pool->acquire(sa_bytes);
+                id<MTLBuffer> a_i8 = (__bridge id<MTLBuffer>)a_i8_h;
+                id<MTLBuffer> sa   = (__bridge id<MTLBuffer>)sa_h;
+                impl_->pending_free.push_back({a_i8_h, a_i8_bytes});
+                impl_->pending_free.push_back({sa_h,   sa_bytes});
+
+                // 1) per-token activation quantization -> int8 [M,K] + scale_a[M].
+                {
+                    QuantActParams q{};
+                    q.M = p.M; q.K = p.K;
+                    q.a_offset = A.device_offset / sizeof(float);
+                    q.a_row_stride = p.a_row_stride;
+                    id<MTLComputePipelineState> qps = impl_->pipeline("quantize_act_i8");
+                    [enc setComputePipelineState:qps];
+                    [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
+                    [enc setBuffer:a_i8 offset:0 atIndex:2];
+                    [enc setBuffer:sa   offset:0 atIndex:4];
+                    [enc setBytes:&q length:sizeof(q) atIndex:3];
+                    const NSUInteger nsg = 8;
+                    [enc setThreadgroupMemoryLength:nsg*sizeof(float) atIndex:0];
+                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.M,1,1)
+                        threadsPerThreadgroup:MTLSizeMake(32,nsg,1)];
+                }
+                // 2) int8 x per-group int4 GEMM with per-group dequant.
+                {
+                    MatmulW4A8Params w{};
+                    w.M = p.M; w.N = p.N; w.K = p.K;
+                    w.c_offset = eoffset(C);
+                    w.c_row_stride = p.c_row_stride;
+                    w.activation = p.activation;
+                    w.group_size = (int)B.group_size;
+                    w.groups_per_row = (int)B.groups_per_row;
+                    // Decoded W4 buffer: [ nibbles (N*K/2) | scales (N*gpr f32) ].
+                    size_t scales_boff = (size_t)p.N * (p.K / 2);
+                    id<MTLComputePipelineState> ps = impl_->pipeline("gemm_w4a8_i8a_i4b_f32c");
+                    [enc setComputePipelineState:ps];
+                    [enc setBuffer:a_i8 offset:0 atIndex:0];
+                    [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                    [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
+                    [enc setBytes:&w length:sizeof(w) atIndex:3];
+                    [enc setBuffer:sa offset:0 atIndex:4];
+                    [enc setBuffer:buf_of(&B) offset:scales_boff atIndex:5];
+                    // facc (64*64 f32) + scratch (64*64 i32) = 32KB threadgroup.
+                    [enc setThreadgroupMemoryLength:2*64*64*sizeof(int32_t) atIndex:0];
+                    MTLSize tgc = MTLSizeMake(((NSUInteger)p.M + 63)/64,
+                                              ((NSUInteger)p.N + 63)/64, 1);
+                    [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+                }
+            } else
+#endif
+            {
+                fprintf(stderr, "MetalBackend: W4 GEMM requires tensor path (M5/A19+)\n");
+                assert(false && "W4 GEMM needs tensor path");
             }
         } else if (p.activation == 0) {
             // Tiled GEMM (simdgroup 8x8 MMA; activation=NONE — Qwen3 emits SILU

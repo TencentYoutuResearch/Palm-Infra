@@ -646,6 +646,156 @@ int main() {
     run_sdpa128(256, 0, "SDPA prefill hd=128 S=256 past=0");
     run_sdpa128(70, 13, "SDPA prefill hd=128 S=70 past=13"); // ragged Q tile + C cross + past
 
+    // ---- W8A8 prefill GEMM (int8 activations x int8 per-channel weights) ----
+    // Guards the int8xint8->int32 tensor path, whose cooperative-tensor layout
+    // is compiler-sensitive (must match between offline metallib and runtime).
+    // Enabled via MOLLM_METAL_W8A8; weights + scales live in a registered region.
+    {
+        setenv("MOLLM_METAL_W8A8", "1", 1);
+        for (int ci = 0; ci < 3 && mb.has_tensor_path(); ci++) {
+            int M = ci==0 ? 40 : (ci==1 ? 256 : 33);
+            int K = ci==0 ? 256 : (ci==1 ? 1024 : 96);
+            int N = ci==0 ? 96  : (ci==1 ? 512  : 80);
+
+            std::vector<float> a(M*K); fill_rand(a.data(), M*K);
+            // int8 per-channel weights + fp32 scales laid out in one region.
+            std::vector<int8_t> wi(N*K);
+            std::vector<float>  sw(N);
+            for (int n = 0; n < N; n++) {
+                float mx = 0; std::vector<float> row(K);
+                for (int k = 0; k < K; k++) { row[k] = (float)rand()/RAND_MAX - 0.5f;
+                    mx = std::max(mx, std::fabs(row[k])); }
+                float s = mx / 127.0f, inv = mx > 0 ? 127.0f/mx : 0; sw[n] = s;
+                for (int k = 0; k < K; k++) {
+                    int q = (int)std::lround(row[k]*inv);
+                    wi[n*K+k] = (int8_t)std::max(-127, std::min(127, q));
+                }
+            }
+            // One region: [ int8 weights (N*K) | pad to 4B | fp32 scales (N) ].
+            size_t woff = 0, soff = (N*K + 3) & ~size_t(3);
+            size_t region = soff + N*sizeof(float);
+            std::vector<uint8_t> buf(region, 0);
+            memcpy(buf.data()+woff, wi.data(), N*K);
+            memcpy(buf.data()+soff, sw.data(), N*sizeof(float));
+            mb.register_weight_region(buf.data(), region);
+
+            Tensor A = make_dev(mb, Precision::FP32, K, M);
+            memcpy(A.data, a.data(), M*K*sizeof(float));
+            Tensor C = make_dev(mb, Precision::FP32, N, M);
+
+            Tensor B = Tensor::create(Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1, nullptr);
+            B.data = buf.data() + woff;
+            B.scales = (const float*)(buf.data() + soff);
+            B.group_size = (uint32_t)K;          // per-channel
+            B.groups_per_row = 1;
+            B.num_groups = (uint32_t)N;
+            mb.wrap_weight(B);
+
+            metal_matmul(mb, A, B, C);
+
+            // Reference: quantize A per token, int8 matmul, dequant.
+            std::vector<float> ref(M*N);
+            for (int m = 0; m < M; m++) {
+                float mx = 0; for (int k = 0; k < K; k++) mx = std::max(mx, std::fabs(a[k+m*K]));
+                float sa = mx/127.0f, inv = mx>0 ? 127.0f/mx : 0;
+                for (int n = 0; n < N; n++) {
+                    long acc = 0;
+                    for (int k = 0; k < K; k++) {
+                        int qa = std::max(-127, std::min(127, (int)std::lround(a[k+m*K]*inv)));
+                        acc += (long)qa * (long)wi[n*K+k];
+                    }
+                    ref[m*N+n] = (float)acc * sa * sw[n];
+                }
+            }
+            char label[64];
+            snprintf(label, sizeof(label), "W8A8 GEMM M=%d K=%d N=%d", M, K, N);
+            CHECK(close((const float*)C.data, ref.data(), M*N, 2e-3f, 2e-2f), label);
+        }
+        unsetenv("MOLLM_METAL_W8A8");
+    }
+
+    // ---- W4A8 prefill GEMM (int8 activations x per-group int4 weights) ------
+    // Weights ship in the CPU Q4B8G128Block layout; the Metal backend decodes
+    // them to raw nibbles at wrap_weight time. Build a matching packed blob in a
+    // registered weight region so wrap_weight's decode path is exercised.
+    {
+        struct alignas(16) Q4B8G128Block { float scales[8]; uint8_t q[4][8][16]; };
+        for (int ci = 0; ci < 2 && mb.has_tensor_path(); ci++) {
+            int M = ci==0 ? 40 : 128;
+            int K = ci==0 ? 256 : 512;      // multiple of 128
+            int N = ci==0 ? 48  : 80;
+            int GS = 128, GPR = K / GS;
+
+            std::vector<float> a(M*K); fill_rand(a.data(), M*K);
+            // reference int4 weights (signed [-8,7]) + per-group scales.
+            std::vector<int8_t> wq(N*K);
+            std::vector<float>  sw(N*GPR);
+            for (int n = 0; n < N; n++) {
+                for (int g = 0; g < GPR; g++) sw[n*GPR+g] = 0.0006f + 0.00002f*((n+g)%11);
+                for (int k = 0; k < K; k++) { int v=(rand()%16)-8; if(v==8)v=7; wq[n*K+k]=(int8_t)v; }
+            }
+            // pack into Q4B8G128Block[ (N/8 padded) x GPR ]: block(nt,g).q[qgi][c]
+            // = channel (nt*8+c)'s 16 bytes for K-sub qgi (raw k=g*128+qgi*32+2b lo/+1 hi).
+            int Np = ((N + 7)/8)*8;
+            std::vector<Q4B8G128Block> blocks((size_t)(Np/8)*GPR);
+            std::memset(blocks.data(), 0, blocks.size()*sizeof(Q4B8G128Block));
+            for (int nt = 0; nt < Np/8; nt++)
+              for (int g = 0; g < GPR; g++) {
+                Q4B8G128Block& blk = blocks[(size_t)nt*GPR + g];
+                for (int c = 0; c < 8; c++) {
+                    int n = nt*8 + c;
+                    blk.scales[c] = (n < N) ? sw[n*GPR+g] : 0.f;
+                    if (n >= N) continue;
+                    for (int qgi = 0; qgi < 4; qgi++)
+                      for (int b = 0; b < 16; b++) {
+                        int k = g*128 + qgi*32 + 2*b;
+                        int lo = wq[n*K+k]   & 0x0F;
+                        int hi = wq[n*K+k+1] & 0x0F;
+                        blk.q[qgi][c][b] = (uint8_t)((hi<<4)|lo);
+                      }
+                }
+              }
+            size_t region = blocks.size()*sizeof(Q4B8G128Block);
+            mb.register_weight_region(blocks.data(), region);
+
+            Tensor A = make_dev(mb, Precision::FP32, K, M);
+            memcpy(A.data, a.data(), M*K*sizeof(float));
+            Tensor C = make_dev(mb, Precision::FP32, N, M);
+
+            Tensor B = Tensor::create(Precision::INT4, MemoryType::EXTERNAL, N, K, 1, 1, nullptr);
+            B.data = blocks.data();
+            B.group_size = (uint32_t)GS;
+            B.groups_per_row = (uint32_t)GPR;
+            B.num_groups = (uint32_t)(N*GPR);
+            B.is_q4_g128_packed = true;
+            B.q4_g128_data = blocks.data();
+            B.scales = sw.data();          // placeholder; decode rebuilds from blocks
+            mb.wrap_weight(B);
+            mb.wrap_weight_int4_g128(B);   // decode packed blocks -> raw nibbles
+
+            metal_matmul(mb, A, B, C);
+
+            // reference: per-token int8 quant of A, per-group int4 dot, dequant.
+            std::vector<float> ref(M*N);
+            for (int m = 0; m < M; m++) {
+                float mx=0; for (int k=0;k<K;k++) mx=std::max(mx,std::fabs(a[k+m*K]));
+                float sa=mx/127.0f, inv=mx>0?127.0f/mx:0;
+                for (int n = 0; n < N; n++) {
+                    double acc=0;
+                    for (int g=0; g<GPR; g++){ long d=0;
+                        for (int k=g*GS;k<(g+1)*GS;k++){
+                            int qa=std::max(-127,std::min(127,(int)std::lround(a[k+m*K]*inv)));
+                            d += (long)qa * (long)wq[n*K+k]; }
+                        acc += (double)d * sw[n*GPR+g]; }
+                    ref[m*N+n]=(float)(acc*sa);
+                }
+            }
+            char label[64];
+            snprintf(label, sizeof(label), "W4A8 GEMM M=%d K=%d N=%d", M, K, N);
+            CHECK(close((const float*)C.data, ref.data(), M*N, 2e-3f, 3e-2f), label);
+        }
+    }
+
     if (failures == 0) printf("All Metal op parity tests passed.\n");
     return failures ? 1 : 0;
 }

@@ -714,11 +714,25 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.q4_repack_data = nullptr;
             t.q4_g128_data = nullptr;
 #ifdef MOLLM_METAL
-            // Alias this weight into the registered device weight buffer so the
-            // Metal backend can read it (device_offset = ptr - region base).
+            // Alias this weight into the registered device weight buffer NOW,
+            // while t.data still points at the raw mmap region (before any CPU
+            // load-time repacking rewrites t.data to an out-of-region buffer).
+            // INT4 g128 weights need a second pass after quant metadata is set
+            // (see finalize_metal_weight) to decode the packed block layout.
             if (metal_backend_) as_metal(metal_backend_)->wrap_weight(t);
 #endif
         };
+
+#ifdef MOLLM_METAL
+        // Second pass for INT4 g128 weights: once quant metadata + q4_g128_data
+        // are populated, decode the CPU Q4B8G128Block layout into a Metal raw
+        // nibble+scale device buffer. No-op for non-INT4 weights.
+        auto finalize_metal_weight = [&]() {
+            if (metal_backend_) as_metal(metal_backend_)->wrap_weight_int4_g128(t);
+        };
+#else
+        auto finalize_metal_weight = [&]() {};
+#endif
 
         // Package mode: resolve weight from package mmap via offset map.
         // The weight path (e.g. "./foo.weights") is looked up in
@@ -757,6 +771,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                 }
                 maybe_pack_int8_weight(t, wref, data, packed_weights_);
                 maybe_pack_int4_weight(t, wref, data, packed_weights_);
+                finalize_metal_weight();
                 continue;
             }
         }
@@ -806,6 +821,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         }
         maybe_pack_int8_weight(t, wpath, t.data, packed_weights_);
         maybe_pack_int4_weight(t, wpath, t.data, packed_weights_);
+        finalize_metal_weight();
     }
 
     // Find special externally-driven weights. lm_head is stored explicitly in

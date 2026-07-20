@@ -57,6 +57,10 @@ public:
 
     // --- Metal-specific helpers ---
 
+    /// True if the Metal 4 tensor API (int8/fp16 matmul2d) is usable on this GPU
+    /// (M5 / A19+). Gates the fast tensor GEMM and W8A8 int8-MMA paths.
+    bool has_tensor_path() const;
+
     /// Register the whole package weight region as one shared MTLBuffer wrapping
     /// the mmap (newBufferWithBytesNoCopy). Individual weight tensors then carry
     /// device_offset = (weight ptr - base). Returns false if wrapping failed.
@@ -65,6 +69,11 @@ public:
     /// After register_weight_region, point a weight/constant tensor at the
     /// shared weight buffer with the correct device_offset (from t.data).
     void wrap_weight(Tensor& t);
+
+    /// Second pass for INT4 g128 weights (call after quant metadata is set):
+    /// decode the CPU Q4B8G128Block layout into a Metal-friendly raw nibble +
+    /// scale device buffer and repoint t at it. No-op for non-INT4 weights.
+    void wrap_weight_int4_g128(Tensor& t);
 
     /// Allocate a device-resident buffer of nbytes and point t at it (used for
     /// KV cache and boundary buffers). Sets t.device_data / t.device_offset and
