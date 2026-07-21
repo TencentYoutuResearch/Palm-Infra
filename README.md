@@ -12,12 +12,13 @@ AI Infra projects from Palm Team. Currently includes `mollm`.
 |_| |_| |_|\___/|_|_|_| |_| |_|
 ```
 
-`mollm` is a small C++ LLM runtime for ARM CPUs. It converts Hugging Face model
-directories into one `.mollm` file containing the graph, weights, tokenizer, and
-chat template, then runs that package directly with mmap-backed weights.
+`mollm` is a small C++ LLM runtime for ARM CPUs, with experimental Apple Metal
+support. It converts supported Hugging Face model directories into one `.mollm`
+file containing the graph, weights, tokenizer, and chat template, then runs
+that package directly.
 
-The current focus is fast local CPU inference on Apple Silicon and other modern
-ARM CPUs. FP16 uses NEON FP16FML kernels; quantized models use weight-only int8
+The current focus is fast local inference on Apple Silicon and other modern ARM
+CPUs. FP16 uses NEON FP16FML kernels; quantized CPU models use weight-only int8
 or int4 kernels optimized for ARM dot-product instructions.
 
 ## What Works
@@ -51,8 +52,8 @@ measured prefill/decode timings. Higher numbers are bolded in the tables below.
 | Model | mollm pp/tg | llama.cpp pp/tg | Result |
 |---|---:|---:|---|
 | Qwen3.5-0.8B | 601.38 / **123.68** | **664.54** / 97.87 | llama faster prefill, mollm faster decode |
-| Youtu-LLM-2B | 218.67 / **52.12** | **257.93** / 45.12 | llama faster prefill, mollm faster decode |
-| Qwen3.5-4B | 102.48 / **25.00** | **142.44** / 22.33 | llama faster prefill, mollm faster decode |
+| Youtu-LLM-2B | 236.12 / **51.32** | **258.13** / 46.73 | llama faster prefill, mollm faster decode |
+| Qwen3.5-4B | 104.37 / **25.22** | **144.30** / 22.14 | llama faster prefill, mollm faster decode |
 
 ### W8
 
@@ -250,6 +251,20 @@ Standard mollm benchmark:
     --threads 4
 ```
 
+## Local HTTP server
+
+```bash
+./build_i8mm/mollm_server \
+    --package qwen35_4b_w4g128.mollm \
+    --host 127.0.0.1 --port 8080 --threads 4
+```
+
+The initial server implements `GET /v1/models` and OpenAI-compatible
+`POST /v1/chat/completions`, including SSE streaming. It also retains a
+single exact token-prefix KV cache between serialized requests. Generation is
+currently deterministic (`temperature=0`). See [SERVER.md](SERVER.md)
+for API examples and limitations.
+
 ## Project Layout
 
 ```text
@@ -258,7 +273,7 @@ mollm/
 ├── graph/      Graph format, executor, mmap package loading, BufferPool
 ├── engine/     LLMEngine, tokenizer, chat/generation lifecycle
 ├── models/     Python converters and graph builders
-├── examples/   mollm_chat, mollm_bench, mollm_ppl
+├── examples/   mollm_chat, mollm_server, mollm_bench, mollm_ppl
 └── tests/      Unit, stress, and end-to-end tests
 ```
 
@@ -266,11 +281,25 @@ mollm/
 
 - Prefill performance optimization, especially for W8/W4 dense-model prompt
   processing.
-- Full prefix caching for chat and serving workloads, building on the current
-  single-user REPL cache.
-- Metal and CUDA backends while keeping the CPU runtime as the portable
+- Improve experimental Metal performance, especially quantized prefill, MoE
+  prefill, and CPU/GPU synchronization overhead.
+- Full prefix caching for serving workloads, building on the current single-user
+  REPL cache.
+- Broader accelerator coverage while keeping the CPU runtime as the portable
   baseline.
 - More model families beyond the current Qwen, Youtu, and Qwen-MoE coverage.
 - Vision model support, including multimodal Qwen-style architectures.
 - SSD offload for larger models and MoE experts that do not fit comfortably in
   memory.
+
+## License
+
+Copyright 2026 Tencent. Licensed under the Apache License 2.0. See
+[LICENSE](LICENSE) and [NOTICE](NOTICE). Bundled dependency notices are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Acknowledgments
+
+- [Cider](https://github.com/Mininglamp-AI/cider), whose work on W8A8/W4A8
+  inference with Metal 4 INT8 TensorOps on Apple Silicon informed mollm's
+  experimental quantized Metal path.

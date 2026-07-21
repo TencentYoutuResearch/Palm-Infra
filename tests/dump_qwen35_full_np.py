@@ -8,7 +8,9 @@ import os, sys
 import numpy as np
 import torch
 
-MODEL_DIR = sys.argv[1] if len(sys.argv) > 1 else "/Users/molly/workspace-youtulm-ncnn/Qwen3.5-0.8B"
+if len(sys.argv) < 2:
+    raise SystemExit(f"usage: {sys.argv[0]} MODEL_DIR")
+MODEL_DIR = sys.argv[1]
 OUT_DIR = "/tmp/qwen35_full_ref"
 DEC_OUT_DIR = "/tmp/qwen35_decode_ref"
 

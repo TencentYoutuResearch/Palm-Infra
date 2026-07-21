@@ -118,3 +118,19 @@ void kernel_rms_norm(const Tensor& x, const Tensor& weight,
     rms_norm_scalar(x_ptr, w_ptr, o_ptr, D, N, eps, ldx, ldo);
 #endif
 }
+
+void kernel_layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias,
+                       float eps, Tensor& out) {
+    const int d = (int)x.shape[0], n = (int)x.shape[1];
+    const int ldx = (int)(x.stride[1] / sizeof(float));
+    const int ldo = (int)(out.stride[1] / sizeof(float));
+    const float *xp=x.ptr<float>(), *wp=weight.ptr<float>(), *bp=bias.ptr<float>();
+    float* op=out.ptr<float>();
+    for(int row=0; row<n; ++row) {
+        const float* in=xp+(size_t)row*ldx; float* dst=op+(size_t)row*ldo;
+        float mean=0.f; for(int i=0;i<d;i++) mean+=in[i]; mean/=d;
+        float var=0.f; for(int i=0;i<d;i++){float z=in[i]-mean;var+=z*z;} var/=d;
+        float scale=1.f/std::sqrt(var+eps);
+        for(int i=0;i<d;i++) dst[i]=(in[i]-mean)*scale*wp[i]+bp[i];
+    }
+}

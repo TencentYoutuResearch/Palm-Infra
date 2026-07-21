@@ -3,7 +3,9 @@ import torch, sys, os, json
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 
-model_path = '/Users/molly/workspace-youtulm-ncnn/Youtu-LLM-2B'
+if len(sys.argv) < 2:
+    raise SystemExit(f"usage: {sys.argv[0]} MODEL_DIR")
+model_path = sys.argv[1]
 model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.float16)
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 

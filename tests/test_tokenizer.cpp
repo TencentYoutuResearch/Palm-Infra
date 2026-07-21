@@ -1,5 +1,6 @@
 #include "engine/tokenizer.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -37,12 +38,51 @@ static bool load_first(Tokenizer& tok, const std::vector<std::string>& paths) {
 int main() {
     bool ran_any = false;
 
+    // RWKV-world vocabulary: longest byte-prefix matching over the official
+    // `id python-bytes-literal byte_length` format. This is deliberately a
+    // tiny fixture; the production vocabulary has the same syntax.
+    {
+        const char* path = "/tmp/mollm_rwkv_vocab_test.txt";
+        {
+            std::ofstream f(path);
+            f << "0 b'<EOD>' 5\n";
+            f << "1 b'a' 1\n";
+            f << "2 b'b' 1\n";
+            f << "3 b'ab' 2\n";
+            f << "4 '\\xe4\\xbd\\xa0' 3\n";
+            f << "5 '\\xe5\\xa5\\xbd' 3\n";
+            f << "6 b'User: ab\\n\\nAssistant:' 20\n";
+        }
+        Tokenizer tok;
+        CHECK(tok.load(path), "RWKV world vocabulary loads");
+        check_ids(tok.encode("abab"), {3, 3}, "RWKV longest-prefix encoding");
+        check_ids(tok.encode("你好"), {4, 5}, "RWKV UTF-8 literal decoding");
+        CHECK(tok.decode(std::vector<int>{3, 3}) == "abab", "RWKV decode round-trip");
+        CHECK(tok.apply_chat("ab") == std::vector<int>({3}), "RWKV raw prompt (no HF chat template)");
+        tok.set_rwkv_legacy_chat_template(true);
+        CHECK(tok.apply_chat("ab") == std::vector<int>({6}),
+              "RWKV legacy chat template");
+        CHECK(tok.stop_sequences() == std::vector<std::string>({"\n\n"}),
+              "RWKV legacy text stop sequence");
+        std::remove(path);
+        ran_any = true;
+    }
+
     {
         Tokenizer tok;
-        bool loaded = load_first(tok, {
-            "/Users/molly/workspace-youtulm-ncnn/Youtu-LLM-2B/tokenizer.json",
-            "/home/molly/Youtu-LLM-2B/tokenizer.json",
-        });
+        const char* fixture = std::getenv("MOLLM_RWKV_TOKENIZER");
+        if (fixture && tok.load(fixture)) {
+            ran_any = true;
+            auto ids = tok.encode("你好，RWKV!");
+            CHECK(!ids.empty(), "official RWKV vocabulary encodes UTF-8 prompt");
+            CHECK(tok.decode(ids) == "你好，RWKV!", "official RWKV vocabulary round-trip");
+        }
+    }
+
+    {
+        Tokenizer tok;
+        const char* fixture = std::getenv("MOLLM_YOUTU_TOKENIZER");
+        bool loaded = fixture && load_first(tok, {fixture});
         if (loaded) {
             ran_any = true;
 
@@ -67,10 +107,8 @@ int main() {
 
     {
         Tokenizer tok;
-        bool loaded = load_first(tok, {
-            "/Users/molly/Qwen3.6-35B-A3B/tokenizer.json",
-            "/home/molly/Qwen3.6-35B-A3B/tokenizer.json",
-        });
+        const char* fixture = std::getenv("MOLLM_QWEN_TOKENIZER");
+        bool loaded = fixture && load_first(tok, {fixture});
         if (loaded) {
             ran_any = true;
             CHECK(tok.vocab_size() > 248000, "Qwen vocab size > 248k");

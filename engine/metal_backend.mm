@@ -1,6 +1,7 @@
 #include "engine/metal_backend.h"
 #include "graph/metal_pool.h"
 #include "graph/graph.h"
+#include "kernels/moe.h"
 #include "kernels/metal/metal_common.h"
 
 #import <Metal/Metal.h>
@@ -366,7 +367,7 @@ void MetalBackend::wrap_weight(Tensor& t) {
     t.device_offset = (size_t)(ptr - base);
 }
 
-void MetalBackend::wrap_weight_int4_g128(Tensor& t) {
+void MetalBackend::wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128) {
     // INT4 weights ship in the CPU-only Q4B8G128Block layout (scales+nibbles
     // interleaved per 128-K block). The Metal W4A8 kernels want a simple raw
     // [N,K/2] nibble array + [N,gpr] fp32 scales, so decode once at load time
@@ -374,7 +375,25 @@ void MetalBackend::wrap_weight_int4_g128(Tensor& t) {
     // device_offset stays 0 (nibbles at start); scales live at byte N*(K/2),
     // which the W4 dispatch binds directly (co-located, no weight_base math).
     if (!(t.prec == Precision::INT4 && t.is_q4_g128_packed && t.q4_g128_data)) return;
-    const int N = (int)t.shape[0], K = (int)t.shape[1];
+    // Ordinary linear weights are [N,K,1,1]. Fused MoE expert weights retain
+    // their logical 3-D shape [E,N_per_expert,K], but the packed storage is the
+    // same flat sequence of rows. Flatten every dimension before the final K
+    // dimension so both layouts decode identically.
+    int last = 3;
+    while (last > 1 && t.shape[last] == 1) --last;
+    const int K = (int)t.shape[last];
+    int64_t rows64 = 1;
+    for (int d = 0; d < last; ++d) rows64 *= t.shape[d];
+    const int N = (int)rows64;
+    // Expert tensors dominate MoE package size. Keep their native BG128 blocks
+    // zero-copy; the selected-expert tensor kernel decodes blocks while staging.
+    // Materializing a second raw-W4 copy here adds ~9GB and causes UMA paging.
+    // Aggregate packages serialize experts flattened as [E*N,K], so the
+    // loader passes keep_native_bg128 based on the explicit weight role.
+    if (keep_native_bg128 || last >= 2) {
+        wrap_weight(t);
+        return;
+    }
     const int gpr = (int)t.groups_per_row;         // K/128
     const size_t nib_bytes = (size_t)N * (K / 2);
     const size_t sc_bytes  = (size_t)N * gpr * sizeof(float);
@@ -402,7 +421,9 @@ void MetalBackend::wrap_weight_int4_g128(Tensor& t) {
         }
         t.device_data = (__bridge void*)b;
         t.device_offset = 0;
-        t.scales = sc;   // host-visible; dispatch uses co-located byte offset
+        // Keep t.scales pointing at the package's CPU layout. Metal binds the
+        // co-located decoded scales by byte offset, while hybrid/CPU kernels
+        // still need the original BG128 tensor metadata.
     }
 }
 
@@ -457,7 +478,9 @@ void MetalBackend::free_output(Tensor& t, BufferPool* /*pool*/) {
     // end_graph(). Releasing a buffer to the pool now would let a later node
     // reacquire and overwrite it while earlier (not-yet-executed) kernels still
     // depend on its contents. Defer all frees until after waitUntilCompleted.
-    if (t.device_data) impl_->pending_free.push_back({t.device_data, t.nbytes()});
+    if (!t.device_data) return;
+    if (impl_->cmd) impl_->pending_free.push_back({t.device_data, t.nbytes()});
+    else impl_->pool->release(t.device_data, t.nbytes());
 }
 
 // ===========================================================================
@@ -559,7 +582,7 @@ void MetalBackend::end_graph() {
 
 void MetalBackend::dispatch(const GraphNode& node,
                             const std::vector<const Tensor*>& inputs,
-                            Tensor* output, ThreadPool* /*thread_pool*/) {
+                            Tensor* output, ThreadPool* thread_pool) {
     id<MTLComputeCommandEncoder> enc = impl_->enc;
     const OpParams& params = node.params;
     const OpType op = node.op_type;
@@ -704,9 +727,11 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.a_row_stride = estride(A, 1);       // elements between rows of A (>= K)
         p.b_row_stride = (int)B.shape[1];     // K: elements between weight rows
         p.c_row_stride = estride(C, 1);       // elements between rows of C (>= N)
-        // fused activation: params.i32[0]=activation (0 NONE, 3 SILU per Activation enum)
+        // fused activation: params.i32[0]=Activation (0 NONE, 1 SILU).
         int act = params.i32.size()>0 ? params.i32[0] : 0;
-        p.activation = (act == 3) ? 1 : 0;   // map Activation::SILU -> shader 1
+        p.activation = (act == 1) ? 1 : 0;
+        p.act_n_begin = params.i32.size()>1 ? params.i32[1] : 0;
+        p.act_n_len = params.i32.size()>2 ? params.i32[2] : -1;
 
         if (p.M == 1 && B.prec == Precision::INT8) {
             // W8 decode: int8 weight x float activation, per-group weight scale.
@@ -717,6 +742,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.a_offset = eoffset(A); w.c_offset = eoffset(C);
             w.a_row_stride = p.a_row_stride; w.c_row_stride = p.c_row_stride;
             w.activation = p.activation;
+            w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
             w.group_size = (int)B.group_size;
             w.groups_per_row = (int)B.groups_per_row;
             size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
@@ -741,6 +767,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.a_offset = eoffset(A); w.c_offset = eoffset(C);
             w.a_row_stride = p.a_row_stride; w.c_row_stride = p.c_row_stride;
             w.activation = p.activation;
+            w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
             w.group_size = (int)B.group_size;
             w.groups_per_row = (int)B.groups_per_row;
             // Decoded W4 buffer layout: [ nibbles (N*K/2) | scales (N*gpr f32) ].
@@ -846,6 +873,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     w.c_offset = eoffset(C);
                     w.c_row_stride = p.c_row_stride;
                     w.activation = p.activation;
+                    w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
                     size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
                     id<MTLComputePipelineState> ps = impl_->pipeline("gemm_w8a8_i8a_i8b_f32c");
                     [enc setComputePipelineState:ps];
@@ -870,6 +898,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 w.a_offset = 0; w.c_offset = eoffset(C);
                 w.a_row_stride = p.a_row_stride; w.c_row_stride = p.c_row_stride;
                 w.activation = p.activation;
+                w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
                 w.group_size = (int)B.group_size;
                 w.groups_per_row = (int)B.groups_per_row;
                 size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
@@ -884,6 +913,15 @@ void MetalBackend::dispatch(const GraphNode& node,
                 MTLSize tgc = MTLSizeMake(((NSUInteger)p.M + 127)/128,
                                           ((NSUInteger)p.N + 63)/64, 1);
                 [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+                if (w.activation != 0 && w.act_n_len != 0) {
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    id<MTLComputePipelineState> aps =
+                        impl_->pipeline("matmul_w8_activation_range_f32");
+                    [enc setComputePipelineState:aps];
+                    [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
+                    [enc setBytes:&w length:sizeof(w) atIndex:3];
+                    grid1d(p.M * p.N);
+                }
             } else
 #endif
             {
@@ -929,6 +967,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     w.c_offset = eoffset(C);
                     w.c_row_stride = p.c_row_stride;
                     w.activation = p.activation;
+                    w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
                     w.group_size = (int)B.group_size;
                     w.groups_per_row = (int)B.groups_per_row;
                     // Decoded W4 buffer: [ nibbles (N*K/2) | scales (N*gpr f32) ].
@@ -1046,7 +1085,9 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.dim0 = (int)X.shape[0];
         p.rows = (int)(X.shape[1]*X.shape[2]*X.shape[3]);
         p.x_offset = eoffset(X);
-        p.w_offset = eoffset(W);
+        // Bind large-package weights at their 64-bit byte offset. A uint32
+        // element offset overflows once the shared region exceeds 16GB.
+        p.w_offset = 0;
         p.out_offset = eoffset(O);
         p.x_row_stride = estride(X, 1);
         p.out_row_stride = estride(O, 1);
@@ -1054,7 +1095,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         id<MTLComputePipelineState> ps = impl_->pipeline("rms_norm_f32");
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&W) offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&W) offset:W.device_offset atIndex:1];
         [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         NSUInteger tg = 256;
@@ -1079,11 +1120,15 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.rope_dim = rope_dim;
         p.seq_len = (int)in.shape[1];
         p.heads   = (int)in.shape[2];
+        p.interleave = params.i32.size()>1 ? params.i32[1] : 1;
         p.x_offset = eoffset(X);
         p.cos_offset = eoffset(COS);
         p.sin_offset = eoffset(SIN);
-        p.x_stride_pos = estride(in, 1);
-        p.x_stride_head = estride(in, 2);
+        // RoPE operates on X. When `in` is a strided view, the copy below
+        // materializes it into dense X, so carrying the input strides into the
+        // in-place kernel would skip rows and eventually access past X.
+        p.x_stride_pos = estride(X, 1);
+        p.x_stride_head = estride(X, 2);
         // Copy input -> output buffer (rope in place), if different buffers.
         if (buf_of(&in) != buf_of(&X) || in.device_offset != X.device_offset) {
             // use blit copy via contiguous kernel (contiguous input assumed)
@@ -1096,6 +1141,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             [enc setBuffer:buf_of(&X) offset:0 atIndex:2];
             [enc setBytes:&d length:sizeof(d) atIndex:3];
             grid1d((int)X.nelements());
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
         id<MTLComputePipelineState> ps = impl_->pipeline("rope_f32");
         [enc setComputePipelineState:ps];
@@ -1121,6 +1167,10 @@ void MetalBackend::dispatch(const GraphNode& node,
         EwiseParams p{};
         p.n = (int)O.nelements();
         p.broadcast_b = (B.nelements()==1) ? 1 : 0;
+        p.shape0 = (int)O.shape[0];
+        p.a_row_stride = estride(A, 1);
+        p.b_row_stride = estride(B, 1);
+        p.out_row_stride = estride(O, 1);
         p.a_offset = eoffset(A);
         p.b_offset = eoffset(B);
         p.out_offset = eoffset(O);
@@ -1331,6 +1381,9 @@ void MetalBackend::dispatch(const GraphNode& node,
             };
             append(K_cur, *K_cache, head_dim, k_cache_eoff);
             append(V_cur, *V_cache, v_head_dim, v_cache_eoff);
+            // Attention immediately reads the cache regions written by the two
+            // append dispatches in this same compute encoder.
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
 
         // 2) Attention compute.
@@ -1411,6 +1464,259 @@ void MetalBackend::dispatch(const GraphNode& node,
             [enc dispatchThreadgroups:MTLSizeMake(tgc,1,1)
                 threadsPerThreadgroup:MTLSizeMake(sg_per_tg*32,1,1)];
         }
+        break;
+    }
+
+    case OpType::TILE: {
+        // MLA: broadcast k_rope [rope_dim, seq, 1] -> [.., .., num_heads] along
+        // dim 2. Only the dim-2 fast path is implemented (all MLA needs).
+        const Tensor& src = *inputs[0];
+        int reps[4] = {1,1,1,1};
+        for (int i = 0; i < 4 && i < (int)params.i32.size(); i++) reps[i] = params.i32[i];
+        if (!(reps[0]==1 && reps[1]==1 && reps[3]==1 && reps[2]>=1)) {
+            fprintf(stderr, "MetalBackend: TILE only supports dim-2 broadcast "
+                            "(reps=%d,%d,%d,%d)\n", reps[0],reps[1],reps[2],reps[3]);
+            assert(false && "metal TILE: dim-2 only");
+            break;
+        }
+        TensorDesc d{};
+        d.shape[0]=(int)src.shape[0]; d.shape[1]=(int)src.shape[1];
+        d.shape[2]=reps[2];           d.shape[3]=1;
+        for (int i=0;i<4;i++) d.stride[i]=estride(src,i);
+        d.offset = eoffset(src);
+        id<MTLComputePipelineState> ps = impl_->pipeline("tile_dim2_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&src) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(output) offset:0 atIndex:2];
+        [enc setBytes:&d length:sizeof(d) atIndex:3];
+        const NSUInteger tx = 64, ty = 4;
+        MTLSize tgs = MTLSizeMake(tx, ty, 1);
+        MTLSize tgc = MTLSizeMake(((NSUInteger)d.shape[0]+tx-1)/tx,
+                                  ((NSUInteger)d.shape[1]+ty-1)/ty,
+                                  (NSUInteger)d.shape[2]);
+        [enc dispatchThreadgroups:tgc threadsPerThreadgroup:tgs];
+        break;
+    }
+
+    case OpType::CONCAT: {
+        // MLA: q_full=[q_nope|q_rope], k_full=[k_nope|k_rope] along dim 0. Only
+        // dim-0 (the MLA case) is implemented. One dispatch per input slab.
+        int dim = params.i32.size()>0 ? params.i32[0] : 0;
+        if (dim != 0) {
+            fprintf(stderr, "MetalBackend: CONCAT only supports dim=0 (got %d)\n", dim);
+            assert(false && "metal CONCAT: dim-0 only");
+            break;
+        }
+        id<MTLComputePipelineState> ps = impl_->pipeline("concat_dim0_f32");
+        [enc setComputePipelineState:ps];
+        int dim_offset = 0;
+        for (size_t i = 0; i < inputs.size(); i++) {
+            if (!inputs[i] || !inputs[i]->device_data) continue;
+            const Tensor& src = *inputs[i];
+            ConcatParams p{};
+            for (int k=0;k<4;k++){ p.shape[k]=(int)src.shape[k]; p.stride[k]=estride(src,k); }
+            p.offset = eoffset(src);
+            p.dim_offset = dim_offset;
+            p.out_shape0 = (int)output->shape[0];
+            [enc setBuffer:buf_of(&src) offset:0 atIndex:0];
+            [enc setBuffer:buf_of(output) offset:0 atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            const NSUInteger tx = 64, ty = 4;
+            MTLSize tgs = MTLSizeMake(tx, ty, 1);
+            MTLSize tgc = MTLSizeMake(((NSUInteger)p.shape[0]+tx-1)/tx,
+                                      ((NSUInteger)p.shape[1]+ty-1)/ty,
+                                      (NSUInteger)p.shape[2]);
+            [enc dispatchThreadgroups:tgc threadsPerThreadgroup:tgs];
+            dim_offset += (int)src.shape[0];
+        }
+        break;
+    }
+
+    case OpType::MOE: {
+        int hidden_size = params.i32.size()>0 ? params.i32[0] : (int)output->shape[0];
+        int num_experts = params.i32.size()>1 ? params.i32[1] : 0;
+        int top_k = params.i32.size()>2 ? params.i32[2] : 0;
+        int intermediate = params.i32.size()>3 ? params.i32[3] : 0;
+        int shared_intermediate = params.i32.size()>4 ? params.i32[4] : intermediate;
+        int router_score_func = params.i32.size()>5 ? params.i32[5] : 0;
+        bool norm_topk = params.i32.size()>6 ? params.i32[6] != 0 : true;
+        bool has_shared = params.i32.size()>7 ? params.i32[7] != 0 : true;
+        int n_group = params.i32.size()>8 ? params.i32[8] : 1;
+        int topk_group = params.i32.size()>9 ? params.i32[9] : 1;
+        float routed_scale = params.f32.size()>0 ? params.f32[0] : 1.0f;
+
+        // Youtu-v2/Qwen3 W4 routed experts: keep the whole operation on GPU.
+        // The decoded expert buffers are flat row-major despite their logical
+        // 3-D Tensor shape (see wrap_weight_int4_g128).
+        // Decode uses selected-expert tensor MMA by default on Metal 4 GPUs.
+        // Prefill stays on the CPU hybrid path until expert-grouped M tiles are
+        // available; disable GPU decode for diagnostics with MOLLM_METAL_MOE_CPU.
+        bool gpu_w4 = !getenv("MOLLM_METAL_MOE_CPU") && impl_->has_tensor &&
+            !has_shared && router_score_func == 1 && inputs.size() > 8 &&
+            inputs[1]->prec == Precision::FP16 && inputs[2]->prec == Precision::INT4 &&
+            inputs[3]->prec == Precision::INT4 && top_k <= 16 && n_group <= 16 &&
+            inputs[0]->shape[1] == 1;  // selected M=1 tensor tiles are decode-only
+        if (gpu_w4) {
+            const Tensor& x = *inputs[0]; const Tensor& router = *inputs[1];
+            const Tensor& gu = *inputs[2]; const Tensor& down = *inputs[3];
+            const Tensor& bias = *inputs[8];
+            int seq = (int)x.shape[1];
+            size_t idx_bytes=(size_t)seq*top_k*sizeof(int);
+            size_t tw_bytes=(size_t)seq*top_k*sizeof(float);
+            size_t logits_bytes=(size_t)seq*num_experts*sizeof(float);
+            size_t merged_bytes=(size_t)seq*top_k*2*intermediate*sizeof(float);
+            void* idx_h=impl_->pool->acquire(idx_bytes), *tw_h=impl_->pool->acquire(tw_bytes);
+            void* logits_h=impl_->pool->acquire(logits_bytes);
+            void* merged_h=impl_->pool->acquire(merged_bytes);
+            id<MTLBuffer> idx=(__bridge id<MTLBuffer>)idx_h;
+            id<MTLBuffer> tw=(__bridge id<MTLBuffer>)tw_h;
+            id<MTLBuffer> logits=(__bridge id<MTLBuffer>)logits_h;
+            id<MTLBuffer> merged=(__bridge id<MTLBuffer>)merged_h;
+            MoeW4Params mp{};
+            mp.hidden=hidden_size;mp.experts=num_experts;mp.top_k=top_k;
+            mp.intermediate=intermediate;mp.seq_len=seq;mp.n_group=std::max(1,n_group);
+            mp.topk_group=std::max(1,topk_group);mp.norm_topk=norm_topk;
+            mp.routed_scale=routed_scale;mp.hidden_offset=eoffset(x);mp.output_offset=eoffset(*output);
+            mp.hidden_row_stride=estride(x,1);mp.output_row_stride=estride(*output,1);
+            mp.gu_groups_per_row=(int)gu.groups_per_row;
+            mp.down_groups_per_row=(int)down.groups_per_row;
+            size_t gu_rows=(size_t)num_experts*2*intermediate;
+            size_t down_rows=(size_t)num_experts*hidden_size;
+
+            [enc setComputePipelineState:impl_->pipeline("moe_router_logits_f16")];
+            [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
+            [enc setBuffer:buf_of(&router) offset:router.device_offset atIndex:1];
+            [enc setBuffer:logits offset:0 atIndex:2];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
+            [enc setThreadgroupMemoryLength:4*sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(num_experts,seq,1)
+                threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            [enc setComputePipelineState:impl_->pipeline("moe_select_sigmoid")];
+            [enc setBuffer:logits offset:0 atIndex:0];[enc setBuffer:idx offset:0 atIndex:1];
+            [enc setBuffer:tw offset:0 atIndex:2];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
+            [enc setBuffer:buf_of(&bias) offset:bias.device_offset atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)seq+63)/64,1,1)
+                threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+
+#ifdef MOLLM_METAL_TENSOR
+            if (impl_->has_tensor) {
+                int selections=seq*top_k;
+                size_t qx_bytes=(size_t)seq*hidden_size, sx_bytes=(size_t)seq*sizeof(float);
+                size_t qi_bytes=(size_t)selections*intermediate;
+                size_t si_bytes=(size_t)selections*sizeof(float);
+                size_t selected_bytes=(size_t)selections*hidden_size*sizeof(float);
+                void* qx_h=impl_->pool->acquire(qx_bytes),*sx_h=impl_->pool->acquire(sx_bytes);
+                void* qi_h=impl_->pool->acquire(qi_bytes),*si_h=impl_->pool->acquire(si_bytes);
+                void* selected_h=impl_->pool->acquire(selected_bytes);
+                id<MTLBuffer> qx=(__bridge id<MTLBuffer>)qx_h;
+                id<MTLBuffer> sx=(__bridge id<MTLBuffer>)sx_h;
+                id<MTLBuffer> qi=(__bridge id<MTLBuffer>)qi_h;
+                id<MTLBuffer> si=(__bridge id<MTLBuffer>)si_h;
+                id<MTLBuffer> selected=(__bridge id<MTLBuffer>)selected_h;
+                auto quantize = [&](id<MTLBuffer> src, uint src_off, int rows, int K,
+                                    int row_stride, id<MTLBuffer> dst, id<MTLBuffer> scales) {
+                    QuantActParams q{};q.M=rows;q.K=K;q.a_offset=src_off;q.a_row_stride=row_stride;
+                    [enc setComputePipelineState:impl_->pipeline("quantize_act_i8")];
+                    [enc setBuffer:src offset:0 atIndex:0];[enc setBuffer:dst offset:0 atIndex:2];
+                    [enc setBytes:&q length:sizeof(q) atIndex:3];[enc setBuffer:scales offset:0 atIndex:4];
+                    [enc setThreadgroupMemoryLength:8*sizeof(float) atIndex:0];
+                    [enc dispatchThreadgroups:MTLSizeMake(rows,1,1)
+                        threadsPerThreadgroup:MTLSizeMake(32,8,1)];
+                };
+                quantize(buf_of(&x),(uint)eoffset(x),seq,hidden_size,estride(x,1),qx,sx);
+                auto selected_gemm = [&](id<MTLBuffer> a,id<MTLBuffer> sa,const Tensor& w,
+                                         size_t rows_total,int N,int K,int rows_per_expert,
+                                         int activation_rows,int repeat,id<MTLBuffer> dst,int dst_stride) {
+                    SelectedW4A8Params sp{};sp.selections=selections;sp.N=N;sp.K=K;
+                    sp.c_row_stride=dst_stride;sp.group_size=(int)w.group_size;
+                    sp.groups_per_row=(int)w.groups_per_row;sp.rows_per_expert=rows_per_expert;
+                    sp.activation_rows=activation_rows;sp.activation_repeat=repeat;
+                    [enc setComputePipelineState:impl_->pipeline("gemm_selected_w4a8_i8a_i4b_f32c")];
+                    [enc setBuffer:a offset:0 atIndex:0];[enc setBuffer:buf_of(&w) offset:w.device_offset atIndex:1];
+                    [enc setBuffer:dst offset:0 atIndex:2];[enc setBytes:&sp length:sizeof(sp) atIndex:3];
+                    [enc setBuffer:sa offset:0 atIndex:4];
+                    [enc setBuffer:buf_of(&w) offset:w.device_offset+rows_total*(K/2) atIndex:5];
+                    [enc setBuffer:idx offset:0 atIndex:6];
+                    [enc setThreadgroupMemoryLength:2*64*64*sizeof(int32_t) atIndex:0];
+                    [enc dispatchThreadgroups:MTLSizeMake(1,(N+63)/64,selections)
+                        threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+                };
+                selected_gemm(qx,sx,gu,gu_rows,2*intermediate,hidden_size,
+                              2*intermediate,seq,top_k,merged,2*intermediate);
+                [enc setComputePipelineState:impl_->pipeline("moe_swiglu_selected")];
+                [enc setBuffer:merged offset:0 atIndex:0];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                NSUInteger sw_n=(NSUInteger)selections*intermediate;
+                [enc dispatchThreadgroups:MTLSizeMake((sw_n+255)/256,1,1)
+                    threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                quantize(merged,0,selections,intermediate,2*intermediate,qi,si);
+                selected_gemm(qi,si,down,down_rows,hidden_size,intermediate,
+                              hidden_size,selections,1,selected,hidden_size);
+                [enc setComputePipelineState:impl_->pipeline("moe_combine_selected")];
+                [enc setBuffer:selected offset:0 atIndex:0];[enc setBuffer:buf_of(output) offset:0 atIndex:2];
+                [enc setBytes:&mp length:sizeof(mp) atIndex:3];[enc setBuffer:tw offset:0 atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake((hidden_size+63)/64,(seq+3)/4,1)
+                    threadsPerThreadgroup:MTLSizeMake(64,4,1)];
+                impl_->pending_free.push_back({qx_h,qx_bytes});impl_->pending_free.push_back({sx_h,sx_bytes});
+                impl_->pending_free.push_back({qi_h,qi_bytes});impl_->pending_free.push_back({si_h,si_bytes});
+                impl_->pending_free.push_back({selected_h,selected_bytes});
+                impl_->pending_free.push_back({idx_h,idx_bytes});impl_->pending_free.push_back({tw_h,tw_bytes});
+                impl_->pending_free.push_back({logits_h,logits_bytes});impl_->pending_free.push_back({merged_h,merged_bytes});
+                break;
+            }
+#endif
+
+            [enc setComputePipelineState:impl_->pipeline("moe_gate_up_w4")];
+            [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
+            [enc setBuffer:buf_of(&gu) offset:gu.device_offset atIndex:1];
+            [enc setBuffer:merged offset:0 atIndex:2];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
+            [enc setBuffer:buf_of(&gu) offset:gu.device_offset+gu_rows*(hidden_size/2) atIndex:4];
+            [enc setBuffer:idx offset:0 atIndex:5];
+            [enc setThreadgroupMemoryLength:4*sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((2*intermediate+3)/4,top_k,seq)
+                threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+
+            [enc setComputePipelineState:impl_->pipeline("moe_swiglu_selected")];
+            [enc setBuffer:merged offset:0 atIndex:0];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
+            NSUInteger sw_n=(NSUInteger)seq*top_k*intermediate;
+            [enc dispatchThreadgroups:MTLSizeMake((sw_n+255)/256,1,1)
+                threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+
+            [enc setComputePipelineState:impl_->pipeline("moe_down_combine_w4")];
+            [enc setBuffer:merged offset:0 atIndex:0];
+            [enc setBuffer:buf_of(&down) offset:down.device_offset atIndex:1];
+            [enc setBuffer:buf_of(output) offset:0 atIndex:2];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
+            [enc setBuffer:buf_of(&down) offset:down.device_offset+down_rows*(intermediate/2) atIndex:4];
+            [enc setBuffer:idx offset:0 atIndex:5];[enc setBuffer:tw offset:0 atIndex:6];
+            [enc setThreadgroupMemoryLength:4*sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((hidden_size+3)/4,seq,1)
+                threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            impl_->pending_free.push_back({idx_h,idx_bytes});
+            impl_->pending_free.push_back({tw_h,tw_bytes});
+            impl_->pending_free.push_back({logits_h,logits_bytes});
+            impl_->pending_free.push_back({merged_h,merged_bytes});
+            break;
+        }
+
+        // Generic correctness fallback for FP16/W8/shared-expert variants.
+        if (impl_->enc) { [impl_->enc endEncoding]; impl_->enc = nil; }
+        if (impl_->cmd) {
+            [impl_->cmd commit];
+            [impl_->cmd waitUntilCompleted];
+            if (impl_->cmd.status == MTLCommandBufferStatusError) {
+                NSError* e = impl_->cmd.error;
+                fprintf(stderr, "MetalBackend: pre-MOE command buffer error: %s\n",
+                        e ? e.localizedDescription.UTF8String : "?");
+            }
+            impl_->cmd = nil;
+        }
+
+        kernel_qwen3_moe(inputs, *output, thread_pool,
+                         hidden_size, num_experts, top_k,
+                         intermediate, shared_intermediate,
+                         router_score_func, norm_topk, has_shared,
+                         n_group, topk_group, routed_scale);
+
+        impl_->cmd = [impl_->queue commandBuffer];
+        impl_->enc = [impl_->cmd computeCommandEncoder];
         break;
     }
 

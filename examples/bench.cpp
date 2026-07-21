@@ -310,6 +310,10 @@ int main(int argc, char** argv) {
         // Dummy-token mode: skip chat template, use raw token IDs.
         // Token 0 is always valid (embed() falls back to it for OOB).
         prompt_ids.assign(opts.prompt_tokens, 0);
+        // Benchmarking must consume exactly the requested tg length. RWKV
+        // legacy chat stop sequences are irrelevant for raw dummy tokens and
+        // may otherwise terminate a run early on a generated "\n\n".
+        tokenizer.set_rwkv_legacy_chat_template(false);
     } else {
         prompt_ids = tokenizer.apply_chat(opts.prompt);
     }
@@ -321,11 +325,12 @@ int main(int argc, char** argv) {
     // graph_seq_len-sized chunks). No upper bound check here — only the
     // per-chunk size matters, and that's enforced inside the engine.
 
+    const int benchmark_eos_id = opts.prompt_tokens > 0 ? -1 : tokenizer.eos_id();
     for (int i = 0; i < opts.warmup; i++) {
         GenerationResult warmup_result;
         std::string warmup_error;
         if (!generate_greedy(engine, tokenizer, prompt_ids, opts.max_new_tokens,
-                             tokenizer.eos_id(), warmup_result, warmup_error)) {
+                             benchmark_eos_id, warmup_result, warmup_error)) {
             std::fprintf(stderr, "bench warmup failed: %s\n", warmup_error.c_str());
             return 1;
         }
@@ -342,7 +347,7 @@ int main(int argc, char** argv) {
     GenerationResult result;
     auto total_start = std::chrono::steady_clock::now();
     if (!generate_greedy(engine, tokenizer, prompt_ids, opts.max_new_tokens,
-                         tokenizer.eos_id(), result, error)) {
+                         benchmark_eos_id, result, error)) {
         std::fprintf(stderr, "bench: %s\n", error.c_str());
         return 1;
     }

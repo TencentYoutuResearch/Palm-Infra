@@ -6,6 +6,7 @@
 #include "kernels/attention.h"
 #include "kernels/gdn.h"
 #include "kernels/moe.h"
+#include "kernels/rwkv.h"
 #include "kernels/tensor.h"
 #include "kernels/activations.h"  // for Activation enum + sigmoid_f32_neon
 #include <algorithm>
@@ -203,8 +204,8 @@ static inline void unary_stride_aware(float* dst, const Tensor& src,
 // shape/stride. Their shapes (d0..d3) must match.
 template <typename Kernel4>
 static inline void binary_stride_aware(float* dst,
-                                        const Tensor& a, const Tensor& b,
-                                        Kernel4 kernel_4) {
+                                       const Tensor& a, const Tensor& b,
+                                       Kernel4 kernel_4) {
     const char* a_base = static_cast<const char*>(a.data);
     const char* b_base = static_cast<const char*>(b.data);
 
@@ -253,6 +254,44 @@ static inline void binary_stride_aware(float* dst,
     }
 }
 
+// Elementwise operations commonly apply a per-channel parameter [D, 1] to a
+// sequence tensor [D, S].  The fast helper above deliberately assumes equal
+// shapes; using it for this case walks past the one-row parameter buffer on
+// token 1 and beyond.  Keep that fast path for equal tensors and use this
+// stride-aware broadcast path only when a dimension in b is singleton.
+template <typename ScalarOp>
+static inline void binary_broadcast_from_b(float* dst, const Tensor& a,
+                                           const Tensor& b, ScalarOp op) {
+    const char* a_base = static_cast<const char*>(a.data);
+    const char* b_base = static_cast<const char*>(b.data);
+    size_t flat = 0;
+    for (int64_t i3 = 0; i3 < a.shape[3]; ++i3) {
+        const int64_t b3 = b.shape[3] == 1 ? 0 : i3;
+        for (int64_t i2 = 0; i2 < a.shape[2]; ++i2) {
+            const int64_t b2 = b.shape[2] == 1 ? 0 : i2;
+            for (int64_t i1 = 0; i1 < a.shape[1]; ++i1) {
+                const int64_t b1 = b.shape[1] == 1 ? 0 : i1;
+                const float* ap = reinterpret_cast<const float*>(
+                    a_base + i3 * a.stride[3] + i2 * a.stride[2] + i1 * a.stride[1]);
+                const float* bp = reinterpret_cast<const float*>(
+                    b_base + b3 * b.stride[3] + b2 * b.stride[2] + b1 * b.stride[1]);
+                for (int64_t i0 = 0; i0 < a.shape[0]; ++i0) {
+                    const int64_t b0 = b.shape[0] == 1 ? 0 : i0;
+                    dst[flat + i0] = op(ap[i0], bp[b0]);
+                }
+                flat += a.shape[0];
+            }
+        }
+    }
+}
+
+static inline bool broadcasts_to(const Tensor& b, const Tensor& a) {
+    for (int d = 0; d < 4; ++d) {
+        if (b.shape[d] != 1 && b.shape[d] != a.shape[d]) return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // prepare_execution
 // ---------------------------------------------------------------------------
@@ -286,7 +325,9 @@ void prepare_execution(ExecContext& ctx) {
         if (node.op_type == OpType::SDPA || node.op_type == OpType::SDPA_MLA ||
             node.op_type == OpType::GATED_DELTANET_PREFILL ||
             node.op_type == OpType::GATED_DELTANET_DECODE ||
-            node.op_type == OpType::SHORTCONV) {
+            node.op_type == OpType::SHORTCONV || node.op_type == OpType::RWKV7 ||
+            node.op_type == OpType::RWKV_TOKEN_SHIFT) {
+            // RWKV ops also mutate persistent recurrent state.
             return;
         }
     }
@@ -400,7 +441,15 @@ void inject_runtime_shapes(ExecContext& ctx) {
     if (n_real <= 0) return;
     const bool patch_seq_len = !ctx.static_padded;  // DYNAMIC mode only
     for (auto& n : nodes) {
-        if (n.op_type == OpType::GATED_DELTANET_PREFILL) {
+        if (n.op_type == OpType::RWKV7) {
+            if(n.params.i32.size()<=3) n.params.i32.resize(4,0);
+            n.params.i32[3]=n_real;
+            if(patch_seq_len && n.params.i32.size()>2) n.params.i32[2]=n_real;
+        } else if (n.op_type == OpType::RWKV_TOKEN_SHIFT) {
+            if(n.params.i32.size()<=2) n.params.i32.resize(3,0);
+            n.params.i32[2]=n_real;
+            if(patch_seq_len && n.params.i32.size()>1) n.params.i32[1]=n_real;
+        } else if (n.op_type == OpType::GATED_DELTANET_PREFILL) {
             if (n.params.i32.size() <= 6) n.params.i32.resize(7, 0);
             n.params.i32[6] = n_real;  // n_real_tokens (skip padding positions)
             if (patch_seq_len && n.params.i32.size() > 3) {
@@ -524,6 +573,12 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
     }
+    case OpType::RWKV_TOKEN_SHIFT:
+        kernel_rwkv_token_shift(params, inputs, *output);
+        break;
+    case OpType::RWKV7:
+        kernel_rwkv7(params, inputs, *output, thread_pool);
+        break;
     case OpType::SHORTCONV: {
         // ShortConv: depth-wise causal conv1d + silu.
         // Input x comes from matmul: shape [groups, seq], data [seq, groups] row-major.
@@ -663,6 +718,13 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::LAYER_NORM:
+        if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
+            float eps = graph_params::get_f32(params, 0, 1e-5f);
+            kernel_layer_norm(*inputs[0], *inputs[1], *inputs[2], eps, *output);
+        }
+        break;
+
     case OpType::CONCAT:
         // Concatenate inputs along specified dimension. Materializes output and
         // respects input strides, so view inputs remain correct.
@@ -752,6 +814,12 @@ void CPUBackend::dispatch(const GraphNode& node,
             float* o = output->ptr<float>();
             const float* ap = a.ptr<float>();
             const float* bp = b.ptr<float>();
+            if (a.nelements() != b.nelements() && b.nelements() != 1 &&
+                broadcasts_to(b, a)) {
+                binary_broadcast_from_b(o, a, b,
+                                        [](float av, float bv) { return av + bv; });
+                break;
+            }
 #if HAS_NEON
             if (a.nelements() == b.nelements()) {
                 int i = 0;
@@ -798,6 +866,11 @@ void CPUBackend::dispatch(const GraphNode& node,
                 break;
             }
             float* o = output->ptr<float>();
+            if (a.nelements() != b.nelements() && broadcasts_to(b, a)) {
+                binary_broadcast_from_b(o, a, b,
+                                        [](float av, float bv) { return av * bv; });
+                break;
+            }
 #if HAS_NEON
             binary_stride_aware(o, a, b,
                 [](float32x4_t av, float32x4_t bv) { return vmulq_f32(av, bv); });
@@ -860,6 +933,18 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::TANH:
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            const Tensor& src=*inputs[0]; const char* base=(const char*)src.data;
+            StrideIter it=compute_stride_iter(src); float* dst=output->ptr<float>();
+            for(int i3=0;i3<it.d3;i3++) for(int i2=0;i2<it.d2;i2++) for(int i1=0;i1<it.d1;i1++) {
+                const float* row=(const float*)(base+i3*it.s3+i2*it.s2+i1*it.s1);
+                for(int i=0;i<it.n_inner;i++) dst[i]=std::tanh(row[i]);
+                dst += it.n_inner;
+            }
+        }
+        break;
+
     case OpType::SWIGLU:
         // Fused SwiGLU over a merged [2I, ...] tensor: out[i] = silu(gate[i]) * up[i],
         // gate = row[0..I), up = row[I..2I). Reads both halves from the single merged
@@ -914,6 +999,27 @@ void CPUBackend::dispatch(const GraphNode& node,
                 }
             }
 #endif
+        }
+        break;
+
+    case OpType::SIGMOID_EXACT:
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            const Tensor& src = *inputs[0];
+            const char* src_base = static_cast<const char*>(src.data);
+            StrideIter it = compute_stride_iter(src);
+            float* dst = output->ptr<float>();
+            for (int i3 = 0; i3 < it.d3; i3++) {
+                const char* p3 = src_base + i3 * it.s3;
+                for (int i2 = 0; i2 < it.d2; i2++) {
+                    const char* p2 = p3 + i2 * it.s2;
+                    for (int i1 = 0; i1 < it.d1; i1++) {
+                        const float* row = reinterpret_cast<const float*>(p2 + i1 * it.s1);
+                        for (int i = 0; i < it.n_inner; i++)
+                            dst[i] = 1.f / (1.f + std::exp(-row[i]));
+                        dst += it.n_inner;
+                    }
+                }
+            }
         }
         break;
 
@@ -1339,7 +1445,6 @@ void execute_graph(ExecContext& ctx) {
                     (long long)out.shape[2], (long long)out.shape[3],
                     d[0], out.nelements()>1?d[1]:0, out.nelements()>2?d[2]:0);
         }
-
         // Release completed tensors. Classify borrowed views before mutating
         // any producer in this release batch; a producer and its view can have
         // the same last-use node.

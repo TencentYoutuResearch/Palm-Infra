@@ -4,6 +4,7 @@
 using namespace metal;
 
 inline float apply_activation(float v, int act);
+inline float apply_activation_at(float v, int act, int n, int begin, int len);
 
 #ifdef MOLLM_METAL_TENSOR
 #include <metal_tensor>
@@ -162,6 +163,21 @@ kernel void gemm_tensor_w8_f32a_i8b_f32c(
     cT.store(tD.slice(ra, rb));
 }
 
+// Post-pass for tensor W8 GEMM, whose cooperative tensor store cannot apply a
+// per-column fused activation. Operates in place on row-strided C.
+kernel void matmul_w8_activation_range_f32(
+    device float* C [[buffer(2)]],
+    constant MatmulW8Params& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.M * p.N) return;
+    int m = int(gid) / p.N, n = int(gid) % p.N;
+    if (p.act_n_len == 0 ||
+        (p.act_n_len > 0 && (n < p.act_n_begin || n >= p.act_n_begin + p.act_n_len))) return;
+    uint idx = p.c_offset + (uint)m * (uint)p.c_row_stride + (uint)n;
+    C[idx] = apply_activation(C[idx], p.activation);
+}
+
 // --- W8A8 int8xint8->int32 GEMM -------------------------------------------
 // C[M,N] = A_i8[M,K] * W_i8[N,K]^T, then dequant: out = int32*scale_a[m]*scale_w[n].
 // Same tiling as the fp16 gemm_tensor: weights staged into threadgroup as int8,
@@ -238,7 +254,8 @@ kernel void gemm_w8a8_i8a_i8b_f32c(
         if (mi < M && ni < N) {
             int32_t acc = si[ml * NRA + nl];   // tI is [NRB, NRA] row-major
             float v = (float)acc * SCALE_A[mi] * SCALE_W[ni];
-            Cout[mi * p.c_row_stride + ni] = apply_activation(v, p.activation);
+            Cout[mi * p.c_row_stride + ni] = apply_activation_at(
+                v, p.activation, ni, p.act_n_begin, p.act_n_len);
         }
     }
 }
@@ -327,9 +344,51 @@ kernel void gemm_w4a8_i8a_i4b_f32c(
         int nl = idx / NRB, ml = idx % NRB, ni = ra + nl, mi = rb + ml;
         if (mi < M && ni < N) {
             float v = facc[ml*NRA + nl] * SCALE_A[mi];
-            Cout[mi * p.c_row_stride + ni] = apply_activation(v, p.activation);
+            Cout[mi * p.c_row_stride + ni] = apply_activation_at(
+                v, p.activation, ni, p.act_n_begin, p.act_n_len);
         }
     }
+}
+
+// One independent M=1 W4 tensor GEMM per routed (token,top-k) selection.
+// z selects the activation row and expert; y tiles that expert's output rows.
+kernel void gemm_selected_w4a8_i8a_i4b_f32c(
+    device const int8_t* A [[buffer(0)]], device const uint8_t* B [[buffer(1)]],
+    device float* C [[buffer(2)]], constant SelectedW4A8Params& p [[buffer(3)]],
+    device const float* SCALE_A [[buffer(4)]], device const float* SCALE_W [[buffer(5)]],
+    device const int* expert_idx [[buffer(6)]], threadgroup int8_t* shmem [[threadgroup(0)]],
+    uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    const int NRA=64,NRB=64,NK=32,NT=128;int sel=(int)tg.z;if(sel>=p.selections)return;
+    int ra=(int)tg.y*NRA,expert=expert_idx[sel];
+    threadgroup float* facc=(threadgroup float*)shmem;
+    threadgroup int8_t* sa=shmem+NRA*NRB*sizeof(float);threadgroup int32_t* si=(threadgroup int32_t*)sa;
+    for(int i=tid;i<NRA*NRB;i+=NT)facc[i]=0.0f;threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto tA=tensor(sa,dextents<int32_t,2>(NK,NRA));
+    auto tB=tensor((device int8_t*)A,dextents<int32_t,2>(p.K,p.activation_rows),array<int,2>({1,p.K}));
+    matmul2d<matmul2d_descriptor(NRB,NRA,NK,false,true,true,
+        matmul2d_descriptor::mode::multiply_accumulate),execution_simdgroups<4>> mm;
+    const int UNROLL=16,A_WORK=NRA*(NK/UNROLL);ulong expert_row=(ulong)expert*p.rows_per_expert;
+    const ulong BG128_BYTES=544;
+    for(int g0=0;g0<p.K;g0+=p.group_size){int g=g0/p.group_size,gend=min(g0+p.group_size,p.K);
+        auto ct=mm.get_destination_cooperative_tensor<decltype(tB),decltype(tA),int32_t>();
+        for(int lk=g0;lk<gend;lk+=NK){for(int work=tid;work<A_WORK;work+=NT){int nl=work/(NK/UNROLL);
+            int sub=work%(NK/UNROLL),kb=sub*UNROLL,gn=ra+nl,gk=lk+kb;threadgroup int8_t* dst=sa+nl*NK+kb;
+            if(gn<p.N){ulong flatrow=expert_row+gn,nt=flatrow/8;int ch=(int)(flatrow%8);
+                int qgi=(gk%128)/32;device const uint8_t* block=B+(nt*p.groups_per_row+g)*BG128_BYTES;
+                device const uint8_t* wr=block+32+qgi*128+ch*16+(gk%32)/2;
+                #pragma unroll
+                for(int i=0;i<UNROLL;i+=2){uint8_t q=(gk+i<p.K)?wr[i/2]:0;int lo=q&15,hi=q>>4;
+                    if(lo>=8)lo-=16;if(hi>=8)hi-=16;dst[i]=(int8_t)lo;dst[i+1]=(int8_t)hi;}}
+            else for(int i=0;i<UNROLL;i++)dst[i]=0;}
+            threadgroup_barrier(mem_flags::mem_threadgroup);auto ma=tA.slice(0,0);
+            int ar=sel/max(p.activation_repeat,1);auto mb=tB.slice(lk,ar);
+            mm.run(mb,ma,ct);threadgroup_barrier(mem_flags::mem_threadgroup);}
+        ct.store(tensor(si,dextents<int32_t,2>(NRB,NRA)));threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(int i=tid;i<NRA;i+=NT){int gn=ra+i;if(gn<p.N){ulong flatrow=expert_row+gn,nt=flatrow/8;
+            int ch=(int)(flatrow%8);device const float* bsc=(device const float*)(B+(nt*p.groups_per_row+g)*BG128_BYTES);
+            facc[i]+=(float)si[i]*bsc[ch];}}threadgroup_barrier(mem_flags::mem_threadgroup);}
+    int ar=sel/max(p.activation_repeat,1);
+    for(int i=tid;i<NRA;i+=NT){int gn=ra+i;if(gn<p.N)C[(ulong)sel*p.c_row_stride+gn]=facc[i]*SCALE_A[ar];}
 }
 #endif // MOLLM_METAL_TENSOR
 
@@ -350,6 +409,11 @@ inline float apply_activation(float v, int act) {
         return v / (1.0f + exp(-v));
     }
     return v;
+}
+
+inline float apply_activation_at(float v, int act, int n, int begin, int len) {
+    bool in_range = len < 0 || (len > 0 && n >= begin && n < begin + len);
+    return in_range ? apply_activation(v, act) : v;
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +711,7 @@ kernel void gemm_f32a_f16b_f32c(
         acc += av.x*float(bv.x) + av.y*float(bv.y) + av.z*float(bv.z) + av.w*float(bv.w);
     }
     for (int k = (K4<<2); k < p.K; k++) acc += a_row[k] * float(B[p.b_offset + (uint)n*p.b_row_stride + k]);
-    acc = apply_activation(acc, p.activation);
+    acc = apply_activation_at(acc, p.activation, n, p.act_n_begin, p.act_n_len);
     C[p.c_offset + (uint)m * p.c_row_stride + n] = acc;
 }
 
@@ -736,7 +800,8 @@ kernel void gemv2_f32a_f16b_f32c(
         for (short row = 0; row < NR0; ++row) {
             float tot = simd_sum(shmem[row * NW + lane]);
             if (lane == 0 && r0 + row < p.N)
-                C[p.c_offset + r0 + row] = apply_activation(tot, p.activation);
+                C[p.c_offset + r0 + row] = apply_activation_at(
+                    tot, p.activation, r0 + row, p.act_n_begin, p.act_n_len);
         }
     }
 }
@@ -796,7 +861,8 @@ kernel void gemv_w8_f32a_i8b_f32c(
     if (sgitg==0) {
         for (short r=0;r<NR0;++r){
             float tot = simd_sum(shmem[r*NW+lane]);
-            if (lane==0 && r0+r < p.N) C[p.c_offset + r0+r] = apply_activation(tot, p.activation);
+            if (lane==0 && r0+r < p.N) C[p.c_offset + r0+r] = apply_activation_at(
+                tot, p.activation, r0+r, p.act_n_begin, p.act_n_len);
         }
     }
 }
@@ -850,8 +916,160 @@ kernel void gemv_w4_f32a_i4b_f32c(
     if (sgitg==0) {
         for (short r=0;r<NR0;++r){
             float tot = simd_sum(shmem[r*NW+lane]);
-            if (lane==0 && r0+r < p.N) C[p.c_offset + r0+r] = apply_activation(tot, p.activation);
+            if (lane==0 && r0+r < p.N) C[p.c_offset + r0+r] = apply_activation_at(
+                tot, p.activation, r0+r, p.act_n_begin, p.act_n_len);
         }
+    }
+}
+
+// Correctness-oriented fully-GPU MoE path for Qwen/Youtu W4-G128 experts.
+kernel void moe_router_logits_f16(
+    device const float* x [[buffer(0)]], device const half* router [[buffer(1)]],
+    device float* logits [[buffer(2)]], constant MoeW4Params& p [[buffer(3)]],
+    threadgroup float* sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]]) {
+    int e=(int)tg.x,t=(int)tg.y;if(e>=p.experts||t>=p.seq_len)return;
+    device const float* a=x+p.hidden_offset+(ulong)t*p.hidden_row_stride;
+    device const half* w=router+(ulong)e*p.hidden;float sum=0.0f;
+    for(int h=(int)sg*32+(int)lane;h<p.hidden;h+=(int)nsg*32)sum+=a[h]*(float)w[h];
+    sum=simd_sum(sum);if(lane==0)sh[sg]=sum;threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(sg==0){float z=lane<nsg?sh[lane]:0.0f;z=simd_sum(z);if(lane==0)logits[(ulong)t*p.experts+e]=z;}
+}
+
+kernel void moe_select_sigmoid(
+    device const float* logits [[buffer(0)]], device int* top_idx [[buffer(1)]],
+    device float* top_w [[buffer(2)]], constant MoeW4Params& p [[buffer(3)]],
+    device const float* bias [[buffer(4)]], uint t [[thread_position_in_grid]]) {
+    if(t>=(uint)p.seq_len)return;device const float* lp=logits+(ulong)t*p.experts;
+    float chosen[16];int indices[16];for(int k=0;k<p.top_k;k++){chosen[k]=-INFINITY;indices[k]=0;}
+    const int epg=p.experts/max(p.n_group,1);float b0[16],b1[16];
+    for(int g=0;g<p.n_group;g++){b0[g]=-INFINITY;b1[g]=-INFINITY;}
+    for(int e=0;e<p.experts;e++){float s=1.0f/(1.0f+exp(-lp[e]))+bias[e];int g=e/max(epg,1);
+        if(s>b0[g]){b1[g]=b0[g];b0[g]=s;}else if(s>b1[g])b1[g]=s;}
+    bool keep[16];for(int g=0;g<p.n_group;g++)keep[g]=false;
+    for(int n=0;n<p.topk_group;n++){int bg=0;float bv=-INFINITY;for(int g=0;g<p.n_group;g++)
+        if(!keep[g]&&b0[g]+b1[g]>bv){bv=b0[g]+b1[g];bg=g;}keep[bg]=true;}
+    for(int e=0;e<p.experts;e++){if(!keep[e/max(epg,1)])continue;float c=1.0f/(1.0f+exp(-lp[e]))+bias[e];
+        for(int k=0;k<p.top_k;k++)if(c>chosen[k]){for(int j=p.top_k-1;j>k;j--){chosen[j]=chosen[j-1];indices[j]=indices[j-1];}
+            chosen[k]=c;indices[k]=e;break;}}
+    float sum=0.0f;for(int k=0;k<p.top_k;k++){chosen[k]=1.0f/(1.0f+exp(-lp[indices[k]]));sum+=chosen[k];}
+    float mul=p.routed_scale*((p.norm_topk&&sum>0.0f)?1.0f/sum:1.0f);
+    for(int k=0;k<p.top_k;k++){top_idx[t*p.top_k+k]=indices[k];top_w[t*p.top_k+k]=chosen[k]*mul;}
+}
+
+// Legacy fused router retained as a simple reference implementation.
+kernel void moe_route_sigmoid_f16(
+    device const float* x [[buffer(0)]], device const half* router [[buffer(1)]],
+    device int* top_idx [[buffer(2)]], device float* top_w [[buffer(4)]],
+    device const float* bias [[buffer(5)]], constant MoeW4Params& p [[buffer(3)]],
+    uint t [[thread_position_in_grid]]) {
+    if (t >= (uint)p.seq_len) return;
+    device const float* xt = x + p.hidden_offset + (ulong)t*p.hidden_row_stride;
+    float chosen[16]; int indices[16];
+    for (int k=0;k<p.top_k;k++){ chosen[k]=-INFINITY; indices[k]=0; }
+    const int epg = p.experts / max(p.n_group, 1);
+    float group_best0[16], group_best1[16];
+    for(int g=0;g<p.n_group;g++){group_best0[g]=-INFINITY;group_best1[g]=-INFINITY;}
+    // First pass obtains the two best biased scores in every group.
+    for (int e=0;e<p.experts;e++) {
+        float v=0.0f; device const half* wr=router+(ulong)e*p.hidden;
+        for(int h=0;h<p.hidden;h++) v += xt[h]*(float)wr[h];
+        float s=1.0f/(1.0f+exp(-v)); float c=s+bias[e]; int g=e/max(epg,1);
+        if(c>group_best0[g]){group_best1[g]=group_best0[g];group_best0[g]=c;}
+        else if(c>group_best1[g]) group_best1[g]=c;
+    }
+    bool keep[16]; for(int g=0;g<p.n_group;g++) keep[g]=false;
+    for(int n=0;n<p.topk_group;n++) { int bg=0; float bv=-INFINITY;
+        for(int g=0;g<p.n_group;g++) if(!keep[g] && group_best0[g]+group_best1[g]>bv)
+            {bv=group_best0[g]+group_best1[g];bg=g;} keep[bg]=true; }
+    // Recompute scores and select experts from retained groups.
+    for (int e=0;e<p.experts;e++) { if(!keep[e/max(epg,1)]) continue;
+        float v=0.0f; device const half* wr=router+(ulong)e*p.hidden;
+        for(int h=0;h<p.hidden;h++) v += xt[h]*(float)wr[h];
+        float s=1.0f/(1.0f+exp(-v)); float c=s+bias[e];
+        for(int k=0;k<p.top_k;k++) if(c>chosen[k]) { for(int j=p.top_k-1;j>k;j--)
+            {chosen[j]=chosen[j-1];indices[j]=indices[j-1];} chosen[k]=c;indices[k]=e;break; }
+    }
+    float sum=0.0f;
+    for(int k=0;k<p.top_k;k++){ int e=indices[k]; float v=0.0f;
+        device const half* wr=router+(ulong)e*p.hidden;
+        for(int h=0;h<p.hidden;h++) v+=xt[h]*(float)wr[h];
+        chosen[k]=1.0f/(1.0f+exp(-v)); sum+=chosen[k]; }
+    float mul=p.routed_scale*((p.norm_topk && sum>0.0f)?1.0f/sum:1.0f);
+    for(int k=0;k<p.top_k;k++){top_idx[t*p.top_k+k]=indices[k];top_w[t*p.top_k+k]=chosen[k]*mul;}
+}
+
+inline float moe_w4_dot(device const float* a, device const uchar* w,
+                        device const float* scales, int K, int gpr,
+                        ushort lane, ushort sg, ushort nsg) {
+    float sum=0.0f;
+    for(int kb=(int)sg*32+(int)lane;kb<K/2;kb+=(int)nsg*32){uchar q=w[kb];int lo=q&15,hi=q>>4;
+        if(lo>=8)lo-=16;if(hi>=8)hi-=16;int k=kb*2;
+        sum += a[k]*(float)lo*scales[k/128] + a[k+1]*(float)hi*scales[(k+1)/128];}
+    return simd_sum(sum);
+}
+
+kernel void moe_gate_up_w4(
+    device const float* x [[buffer(0)]], device const uchar* w [[buffer(1)]],
+    device float* merged [[buffer(2)]], constant MoeW4Params& p [[buffer(3)]],
+    device const float* scales [[buffer(4)]], device const int* idx [[buffer(5)]],
+    threadgroup float* sh [[threadgroup(0)]], uint3 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]]) {
+    int row0=(int)tg.x*4,ktop=(int)tg.y,t=(int)tg.z;
+    int e=idx[t*p.top_k+ktop];
+    for(int rr=0;rr<4;rr++){int row=row0+rr;if(row>=2*p.intermediate)break;
+        ulong flatrow=(ulong)e*(2*p.intermediate)+row;
+        float v=moe_w4_dot(x+p.hidden_offset+(ulong)t*p.hidden_row_stride,
+            w+flatrow*(p.hidden/2),scales+flatrow*p.gu_groups_per_row,p.hidden,p.gu_groups_per_row,lane,sg,nsg);
+        if(lane==0)sh[sg]=v;threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(sg==0){float z=lane<nsg?sh[lane]:0.0f;z=simd_sum(z);if(lane==0)
+            merged[((ulong)t*p.top_k+ktop)*(2*p.intermediate)+row]=z;}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void moe_swiglu_selected(
+    device float* merged [[buffer(0)]], constant MoeW4Params& p [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+    uint block=i/(uint)p.intermediate,j=i%(uint)p.intermediate;
+    if(block>=(uint)(p.seq_len*p.top_k))return;ulong base=(ulong)block*(2*p.intermediate);
+    float g=merged[base+j],u=merged[base+p.intermediate+j];
+    merged[base+j]=(g/(1.0f+exp(-g)))*u;
+}
+
+kernel void moe_combine_selected(
+    device const float* selected [[buffer(0)]], device float* out [[buffer(2)]],
+    constant MoeW4Params& p [[buffer(3)]], device const float* topw [[buffer(4)]],
+    uint2 pos [[thread_position_in_grid]]) {
+    uint d=pos.x,t=pos.y;if(d>=(uint)p.hidden||t>=(uint)p.seq_len)return;float v=0.0f;
+    for(int k=0;k<p.top_k;k++)v+=selected[((ulong)t*p.top_k+k)*p.hidden+d]*topw[t*p.top_k+k];
+    out[p.output_offset+(ulong)t*p.output_row_stride+d]=v;
+}
+
+kernel void moe_down_combine_w4(
+    device const float* merged [[buffer(0)]], device const uchar* w [[buffer(1)]],
+    device float* out [[buffer(2)]], constant MoeW4Params& p [[buffer(3)]],
+    device const float* scales [[buffer(4)]], device const int* idx [[buffer(5)]],
+    device const float* topw [[buffer(6)]], threadgroup float* sh [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]], ushort nsg [[simdgroups_per_threadgroup]]) {
+    int d0=(int)tg.x*4,t=(int)tg.y;
+    for(int dd=0;dd<4;dd++){int d=d0+dd;if(d>=p.hidden)break;float total=0.0f;
+      for(int q=0;q<p.top_k;q++){int e=idx[t*p.top_k+q];ulong base=((ulong)t*p.top_k+q)*(2*p.intermediate);
+        float local=0.0f;ulong row=(ulong)e*p.hidden+d;device const uchar* wr=w+row*(p.intermediate/2);
+        device const float* sc=scales+row*p.down_groups_per_row;
+        for(int kb=(int)sg*32+(int)lane;kb<p.intermediate/2;kb+=(int)nsg*32){uchar z=wr[kb];int lo=z&15,hi=z>>4;
+            if(lo>=8)lo-=16;if(hi>=8)hi-=16;int j=kb*2;
+            float a=merged[base+j],a1=merged[base+j+1];
+            local+=a*(float)lo*sc[j/128]+a1*(float)hi*sc[(j+1)/128];}
+        local=simd_sum(local);if(lane==0)sh[sg]=local;threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(sg==0){float z=lane<nsg?sh[lane]:0.0f;z=simd_sum(z);if(lane==0)sh[0]=z;}threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(sg==0&&lane==0)total+=sh[0]*topw[t*p.top_k+q];threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      if(sg==0&&lane==0)out[p.output_offset+(ulong)t*p.output_row_stride+d]=total;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -956,7 +1174,8 @@ kernel void gemv_f32a_f16b_f32c(
         partial += (staged ? as[k] : a[k]) * float(b[k]);
     float dot = simd_sum(partial);
     if (lane == 0) {
-        C[p.c_offset + n] = apply_activation(dot, p.activation);
+        C[p.c_offset + n] = apply_activation_at(
+            dot, p.activation, n, p.act_n_begin, p.act_n_len);
     }
 }
 
@@ -1040,10 +1259,12 @@ kernel void rope_f32(
     float c = COS[p.cos_offset + (uint)pos * half_dim + i];
     float s = SIN[p.sin_offset + (uint)pos * half_dim + i];
 
-    float x0 = base[i];
-    float x1 = base[i + half_dim];
-    base[i]            = x0 * c - x1 * s;
-    base[i + half_dim] = x1 * c + x0 * s;
+    int i0 = p.interleave ? 2 * i : i;
+    int i1 = p.interleave ? 2 * i + 1 : i + half_dim;
+    float x0 = base[i0];
+    float x1 = base[i1];
+    base[i0] = x0 * c - x1 * s;
+    base[i1] = x1 * c + x0 * s;
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,9 +1278,11 @@ kernel void add_f32(
     uint  gid                    [[thread_position_in_grid]])
 {
     if (int(gid) >= p.n) return;
-    float a = A[p.a_offset + gid];
-    float b = p.broadcast_b ? B[p.b_offset] : B[p.b_offset + gid];
-    O[p.out_offset + gid] = a + b;
+    uint col = gid % (uint)p.shape0, row = gid / (uint)p.shape0;
+    float a = A[p.a_offset + row * (uint)p.a_row_stride + col];
+    float b = p.broadcast_b ? B[p.b_offset]
+                            : B[p.b_offset + row * (uint)p.b_row_stride + col];
+    O[p.out_offset + row * (uint)p.out_row_stride + col] = a + b;
 }
 
 // Elementwise multiply (contiguous), with scalar-b broadcast.
@@ -1071,9 +1294,11 @@ kernel void mul_f32(
     uint  gid                    [[thread_position_in_grid]])
 {
     if (int(gid) >= p.n) return;
-    float a = A[p.a_offset + gid];
-    float b = p.broadcast_b ? B[p.b_offset] : B[p.b_offset + gid];
-    O[p.out_offset + gid] = a * b;
+    uint col = gid % (uint)p.shape0, row = gid / (uint)p.shape0;
+    float a = A[p.a_offset + row * (uint)p.a_row_stride + col];
+    float b = p.broadcast_b ? B[p.b_offset]
+                            : B[p.b_offset + row * (uint)p.b_row_stride + col];
+    O[p.out_offset + row * (uint)p.out_row_stride + col] = a * b;
 }
 
 // SILU: x * sigmoid(x) (contiguous).
@@ -1420,6 +1645,50 @@ kernel void contiguous3d_f32(
              + (uint)i2 * in.stride[2];
     // Dense (row-major over shape) output index = i0 + i1*s0 + i2*s0*s1.
     uint dst = (uint)i0 + (uint)i1 * (uint)s0 + (uint)i2 * (uint)s0 * (uint)s1;
+    OUT[dst] = IN[src];
+}
+
+// ---------------------------------------------------------------------------
+// TILE (dim-2 broadcast): [s0, s1, 1] -> [s0, s1, reps2] (MLA k_rope broadcast
+// across heads). Source dim-2 index is always 0; source may be strided.
+// in.shape = SOURCE [s0,s1,1]; grid = (s0, s1, reps2). Dense row-major output.
+// ---------------------------------------------------------------------------
+kernel void tile_dim2_f32(
+    device const float*   IN     [[buffer(0)]],
+    device float*         OUT    [[buffer(2)]],
+    constant TensorDesc&  in     [[buffer(3)]],
+    uint3 gid                    [[thread_position_in_grid]])
+{
+    int s0 = in.shape[0], s1 = in.shape[1], reps2 = in.shape[2];
+    int i0 = int(gid.x), i1 = int(gid.y), r = int(gid.z);
+    if (i0 >= s0 || i1 >= s1 || r >= reps2) return;
+
+    uint src = in.offset + (uint)i0 * in.stride[0] + (uint)i1 * in.stride[1];
+    uint dst = (uint)i0 + (uint)i1 * (uint)s0 + (uint)r * (uint)s0 * (uint)s1;
+    OUT[dst] = IN[src];
+}
+
+// ---------------------------------------------------------------------------
+// CONCAT along dim 0: write one (possibly strided) source into its dim-0 slab
+// of a dense output [out_shape0, s1, s2] (shape[3]==1). grid = (s0, s1, s2) of
+// the SOURCE. Dispatched once per concat input with its own dim_offset.
+// ---------------------------------------------------------------------------
+kernel void concat_dim0_f32(
+    device const float*   IN     [[buffer(0)]],
+    device float*         OUT    [[buffer(2)]],
+    constant ConcatParams& p     [[buffer(3)]],
+    uint3 gid                    [[thread_position_in_grid]])
+{
+    int s0 = p.shape[0], s1 = p.shape[1], s2 = p.shape[2];
+    int i0 = int(gid.x), i1 = int(gid.y), i2 = int(gid.z);
+    if (i0 >= s0 || i1 >= s1 || i2 >= s2) return;
+
+    uint src = p.offset + (uint)i0 * p.stride[0]
+             + (uint)i1 * p.stride[1] + (uint)i2 * p.stride[2];
+    // dense output over [out_shape0, s1, s2], dim-0 shifted by dim_offset.
+    uint o0 = (uint)(p.dim_offset + i0);
+    uint dst = o0 + (uint)i1 * (uint)p.out_shape0
+             + (uint)i2 * (uint)p.out_shape0 * (uint)s1;
     OUT[dst] = IN[src];
 }
 

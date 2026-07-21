@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -62,10 +63,12 @@ static CeResult compute_ce(LLMEngine& eng, const std::vector<int>& token_ids) {
 }
 
 int main(int argc, char** argv) {
-    const char* fp16_package = argc > 1 ? argv[1] :
-        "/Users/molly/workspace-youtulm-ncnn/mollm/qwen35_0.8b.mollm";
-    const char* quant_package = argc > 2 ? argv[2] :
-        "/Users/molly/workspace-youtulm-ncnn/mollm/qwen35_0.8b_w8pc.mollm";
+    const char* fp16_package = argc > 1 ? argv[1] : "../qwen35_0.8b.mollm";
+    const char* quant_package = argc > 2 ? argv[2] : "../qwen35_0.8b_w8pc.mollm";
+    if (!std::ifstream(fp16_package).good() || !std::ifstream(quant_package).good()) {
+        std::printf("SKIP: quantized e2e model packages not found (pass paths as argv[1:2])\n");
+        return 0;
+    }
 
     int n_ppl_tokens = 32;
     if (argc > 3) {

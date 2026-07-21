@@ -47,9 +47,11 @@ static Tensor make_dev(MetalBackend& mb, Precision prec, int d0, int d1) {
 }
 
 // Run a single MATMUL node on the Metal backend.
-static void metal_matmul(MetalBackend& mb, Tensor& A, Tensor& B, Tensor& C) {
+static void metal_matmul(MetalBackend& mb, Tensor& A, Tensor& B, Tensor& C,
+                         const std::vector<int>& i32 = {}) {
     GraphNode node;
     node.op_type = OpType::MATMUL;
+    node.params.i32 = i32;
     std::vector<const Tensor*> ins = { &A, &B };
     mb.begin_graph();
     mb.dispatch(node, ins, &C, nullptr);
@@ -115,6 +117,28 @@ int main() {
             }
 
         CHECK(close((const float*)C.data, ref.data(), M*N, 1e-3f, 2e-2f), "GEMM M=8 K=64 N=32");
+    }
+
+    // ---- GEMM fused SiLU on only the gate half (MLA merged gate/up) --------
+    {
+        int M=3, K=64, N=32, gate=16;
+        Tensor A=make_dev(mb, Precision::FP32, K, M);
+        Tensor B=make_dev(mb, Precision::FP16, N, K);
+        Tensor C=make_dev(mb, Precision::FP32, N, M);
+        std::vector<float> a(M*K), bf(N*K), ref(M*N);
+        fill_rand(a.data(), a.size()); fill_rand(bf.data(), bf.size());
+        memcpy(A.data, a.data(), a.size()*sizeof(float));
+        __fp16* bh=(__fp16*)B.data;
+        for (int i=0;i<N*K;i++) bh[i]=(__fp16)bf[i];
+        metal_matmul(mb, A, B, C, {1,0,gate});
+        for (int m=0;m<M;m++) for (int n=0;n<N;n++) {
+            double sum=0;
+            for (int k=0;k<K;k++) sum += (double)a[m*K+k]*(double)(float)bh[n*K+k];
+            float v=(float)sum;
+            ref[m*N+n] = n < gate ? v/(1.0f+std::exp(-v)) : v;
+        }
+        CHECK(close((const float*)C.data, ref.data(), M*N, 1e-3f, 2e-2f),
+              "GEMM partial fused SiLU gate=[0,16), up unchanged");
     }
 
     // ---- GEMM larger, tile-aligned (exercises fast simdgroup_store path) ----
@@ -242,6 +266,24 @@ int main() {
         std::vector<float> ref(n);
         for (int i=0;i<n;i++) ref[i]=a[i]*b[i];
         CHECK(close((const float*)O.data, ref.data(), n, 1e-5f, 1e-5f), "MUL n=512");
+    }
+
+    // ---- MUL of gate/up slice views with inherited wide row stride --------
+    {
+        int I=24, rows=5, full=2*I;
+        Tensor M=make_dev(mb,Precision::FP32,full,rows);
+        Tensor G=M, U=M;
+        G.shape[0]=I;
+        U.shape[0]=I; U.device_offset=(size_t)I*sizeof(float);
+        Tensor O=make_dev(mb,Precision::FP32,I,rows);
+        std::vector<float> merged(full*rows),ref(I*rows);
+        fill_rand(merged.data(),merged.size());
+        memcpy(M.data,merged.data(),merged.size()*sizeof(float));
+        metal_op(mb,OpType::MUL,{&G,&U},O);
+        for(int r=0;r<rows;r++) for(int i=0;i<I;i++)
+            ref[r*I+i]=merged[r*full+i]*merged[r*full+I+i];
+        CHECK(close((const float*)O.data,ref.data(),ref.size(),1e-6f,1e-6f),
+              "MUL strided gate/up slice views");
     }
 
     // ---- SILU ----
@@ -478,19 +520,46 @@ int main() {
         memcpy(COS.data, cs.data(), cs.size()*4);
         memcpy(SIN.data, sn.data(), sn.size()*4);
         // X starts as a copy target; dispatch copies IN->X then rotates.
-        metal_op(mb, OpType::ROTARY_EMBED, {&IN,&COS,&SIN}, X, {hd});
-        // reference: for each head, pos, pair i: rotate (in[i], in[i+half]) by (cos,sin)[pos*half+i]
+        metal_op(mb, OpType::ROTARY_EMBED, {&IN,&COS,&SIN}, X, {hd,1});
+        // interleaved reference: rotate adjacent pairs (2i, 2i+1).
         std::vector<float> ref(hd*S*H);
         for (int h=0;h<H;h++)
             for (int p=0;p<S;p++)
                 for (int i=0;i<half;i++){
                     int base = h*(hd*S) + p*hd;   // [hd, S, H] row-major: stride pos=hd, head=hd*S
-                    float x0=in[base+i], x1=in[base+i+half];
+                    float x0=in[base+2*i], x1=in[base+2*i+1];
                     float c=cs[p*half+i], s=sn[p*half+i];
-                    ref[base+i]      = x0*c - x1*s;
-                    ref[base+i+half] = x0*s + x1*c;
+                    ref[base+2*i]   = x0*c - x1*s;
+                    ref[base+2*i+1] = x0*s + x1*c;
                 }
-        CHECK(close((const float*)X.data, ref.data(), hd*S*H, 1e-4f, 1e-3f), "ROPE hd=64 S=4 H=2");
+        CHECK(close((const float*)X.data, ref.data(), hd*S*H, 1e-4f, 1e-3f),
+              "ROPE interleaved hd=64 S=4 H=2");
+    }
+
+    // ---- ROPE materializes a non-zero-offset, wide-stride slice (MLA) ------
+    {
+        int full=96, off=32, hd=64, S=7, H=2, half=hd/2;
+        Tensor PARENT=make_dev3(mb, Precision::FP32, full, S, H);
+        Tensor IN=PARENT;
+        IN.shape[0]=hd; IN.device_offset=(size_t)off*sizeof(float);
+        Tensor X=make_dev3(mb, Precision::FP32, hd, S, H);
+        Tensor COS=make_dev(mb, Precision::FP32, half, S);
+        Tensor SIN=make_dev(mb, Precision::FP32, half, S);
+        std::vector<float> parent(full*S*H), cs(half*S), sn(half*S), ref(hd*S*H);
+        fill_rand(parent.data(), parent.size());
+        for(int i=0;i<half*S;i++){cs[i]=std::cos(0.013f*i);sn[i]=std::sin(0.013f*i);}
+        memcpy(PARENT.data,parent.data(),parent.size()*sizeof(float));
+        memcpy(COS.data,cs.data(),cs.size()*sizeof(float));
+        memcpy(SIN.data,sn.data(),sn.size()*sizeof(float));
+        metal_op(mb,OpType::ROTARY_EMBED,{&IN,&COS,&SIN},X,{hd,0});
+        for(int h=0;h<H;h++) for(int p=0;p<S;p++) for(int i=0;i<half;i++){
+            int src=h*full*S+p*full+off;
+            int dst=h*hd*S+p*hd;
+            float x0=parent[src+i],x1=parent[src+i+half],c=cs[p*half+i],s=sn[p*half+i];
+            ref[dst+i]=x0*c-x1*s; ref[dst+i+half]=x0*s+x1*c;
+        }
+        CHECK(close((const float*)X.data,ref.data(),ref.size(),1e-4f,1e-3f),
+              "ROPE strided non-zero-offset slice -> dense output");
     }
 
     // ---- CONTIGUOUS: materialize a permuted (strided) tensor ----
@@ -794,6 +863,100 @@ int main() {
             snprintf(label, sizeof(label), "W4A8 GEMM M=%d K=%d N=%d", M, K, N);
             CHECK(close((const float*)C.data, ref.data(), M*N, 2e-3f, 3e-2f), label);
         }
+    }
+
+    // ---- MATMUL from PERMUTE -> non-zero dim-0 SLICE view ------------------
+    // Mirrors MLA's v path: [qk_nope+v, heads, seq] is permuted to
+    // [qk_nope+v, seq, heads], then the second dim-0 slab is consumed as a
+    // matrix.  K remains contiguous, but A has both a non-zero device offset
+    // and a row stride inherited from the wider parent.
+    {
+        int fullK=24, offset=16, K=8, M=7, N=12;
+        Tensor SRC = make_dev3(mb, Precision::FP32, fullK, 1, M);
+        Tensor P   = make_dev3(mb, Precision::FP32, fullK, M, 1);
+        Tensor A   = make_dev(mb, Precision::FP32, K, M);
+        Tensor B   = make_dev(mb, Precision::FP16, N, K);
+        Tensor C   = make_dev(mb, Precision::FP32, N, M);
+        std::vector<float> src(fullK*M), bf(N*K);
+        fill_rand(src.data(), src.size()); fill_rand(bf.data(), bf.size());
+        memcpy(SRC.data, src.data(), src.size()*sizeof(float));
+        __fp16* bh = (__fp16*)B.data;
+        for (int i=0;i<N*K;i++) bh[i] = (__fp16)bf[i];
+
+        metal_op(mb, OpType::PERMUTE, {&SRC}, P, {0,2,1,3});
+        metal_op(mb, OpType::SLICE, {&P}, A, {0,offset,K});
+        metal_matmul(mb, A, B, C);
+
+        std::vector<float> ref(M*N);
+        for (int m=0;m<M;m++) for (int n=0;n<N;n++) {
+            double sum=0;
+            for (int k=0;k<K;k++)
+                sum += (double)src[offset+k + m*fullK] * (double)(float)bh[n*K+k];
+            ref[m*N+n] = (float)sum;
+        }
+        CHECK(close((const float*)C.data, ref.data(), M*N, 1e-3f, 2e-2f),
+              "MATMUL A=PERMUTE->SLICE(dim0, offset>0)");
+    }
+
+    // ---- TILE dim-2 broadcast (MLA k_rope -> heads) ------------------------
+    {
+        int s0 = 16, s1 = 5, reps = 4;   // [rope_dim, seq, 1] -> [.., .., heads]
+        Tensor IN  = make_dev3(mb, Precision::FP32, s0, s1, 1);
+        Tensor OUT = make_dev3(mb, Precision::FP32, s0, s1, reps);
+        std::vector<float> in(s0*s1); fill_rand(in.data(), s0*s1);
+        memcpy(IN.data, in.data(), s0*s1*sizeof(float));
+        metal_op(mb, OpType::TILE, {&IN}, OUT, {1,1,reps,1});
+        std::vector<float> ref(s0*s1*reps);
+        for (int r=0;r<reps;r++) for (int i1=0;i1<s1;i1++) for (int i0=0;i0<s0;i0++)
+            ref[i0 + i1*s0 + r*s0*s1] = in[i0 + i1*s0];
+        CHECK(close((const float*)OUT.data, ref.data(), s0*s1*reps, 1e-6f, 1e-6f),
+              "TILE dim2 s0=16 s1=5 reps=4");
+    }
+
+    // ---- CONCAT dim-0 of two dense 3D tensors ------------------------------
+    {
+        int a0=6, b0=10, s1=5, s2=3;     // [feat, seq, heads]
+        Tensor A = make_dev3(mb, Precision::FP32, a0, s1, s2);
+        Tensor B = make_dev3(mb, Precision::FP32, b0, s1, s2);
+        Tensor OUT = make_dev3(mb, Precision::FP32, a0+b0, s1, s2);
+        std::vector<float> a(a0*s1*s2), b(b0*s1*s2);
+        fill_rand(a.data(), a0*s1*s2); fill_rand(b.data(), b0*s1*s2);
+        memcpy(A.data, a.data(), a.size()*sizeof(float));
+        memcpy(B.data, b.data(), b.size()*sizeof(float));
+        metal_op(mb, OpType::CONCAT, {&A,&B}, OUT, {0});
+        int O0=a0+b0;
+        std::vector<float> ref(O0*s1*s2);
+        for (int i2=0;i2<s2;i2++) for (int i1=0;i1<s1;i1++) {
+            for (int i0=0;i0<a0;i0++) ref[i0 + i1*O0 + i2*O0*s1] = a[i0 + i1*a0 + i2*a0*s1];
+            for (int i0=0;i0<b0;i0++) ref[(a0+i0) + i1*O0 + i2*O0*s1] = b[i0 + i1*b0 + i2*b0*s1];
+        }
+        CHECK(close((const float*)OUT.data, ref.data(), O0*s1*s2, 1e-6f, 1e-6f),
+              "CONCAT dim0 [6|10] s1=5 s2=3 dense");
+    }
+
+    // ---- CONCAT dim-0 with a STRIDED (sliced) input ------------------------
+    // Mirrors MLA: one operand is a dim-0 slice view of a larger tensor.
+    {
+        int full0=12, keep=6, b0=6, s1=4, s2=3;
+        Tensor FULL = make_dev3(mb, Precision::FP32, full0, s1, s2);  // parent
+        Tensor B    = make_dev3(mb, Precision::FP32, b0, s1, s2);
+        Tensor OUT  = make_dev3(mb, Precision::FP32, keep+b0, s1, s2);
+        std::vector<float> full(full0*s1*s2), b(b0*s1*s2);
+        fill_rand(full.data(), full.size()); fill_rand(b.data(), b.size());
+        memcpy(FULL.data, full.data(), full.size()*sizeof(float));
+        memcpy(B.data, b.data(), b.size()*sizeof(float));
+        // A = FULL[0:keep] along dim0 as a view (stride preserved = full0 rows).
+        Tensor A = FULL;
+        A.shape[0] = keep;   // device_offset 0, strides unchanged (stride[1]=full0)
+        metal_op(mb, OpType::CONCAT, {&A,&B}, OUT, {0});
+        int O0=keep+b0;
+        std::vector<float> ref(O0*s1*s2);
+        for (int i2=0;i2<s2;i2++) for (int i1=0;i1<s1;i1++) {
+            for (int i0=0;i0<keep;i0++) ref[i0 + i1*O0 + i2*O0*s1] = full[i0 + i1*full0 + i2*full0*s1];
+            for (int i0=0;i0<b0;i0++)   ref[(keep+i0) + i1*O0 + i2*O0*s1] = b[i0 + i1*b0 + i2*b0*s1];
+        }
+        CHECK(close((const float*)OUT.data, ref.data(), O0*s1*s2, 1e-6f, 1e-6f),
+              "CONCAT dim0 strided(A=slice) [6|6] s1=4 s2=3");
     }
 
     if (failures == 0) printf("All Metal op parity tests passed.\n");

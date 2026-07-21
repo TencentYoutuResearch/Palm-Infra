@@ -21,6 +21,7 @@ int main() {
         CHECK(mask.ptr<float>()[5] < -1e30f, "mask[1,2]=-inf");
     }
 
+
     {
         Tensor mask = eng.build_causal_mask(1, 5);
         CHECK(mask.shape[0] == 6 && mask.shape[1] == 1, "mask with past shape 6x1");

@@ -3,6 +3,7 @@
 #include "graph/graph.h"
 #include "kernels/threading.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -230,6 +231,11 @@ bool load_runtime(const CliCommonOptions& opts, Tokenizer& tokenizer,
         error = std::string("failed to load tokenizer: ") + tok_path;
         return false;
     }
+    auto rwkv_template = engine.package_metadata().find("rwkv_chat_template");
+    if (rwkv_template != engine.package_metadata().end() &&
+        rwkv_template->second == "rwkv_legacy") {
+        tokenizer.set_rwkv_legacy_chat_template(true);
+    }
     prefill_seq_len = 256;  // TODO: expose from engine
     return true;
 }
@@ -289,15 +295,80 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
         return false;
     }
 
+    const std::vector<std::string> stop_sequences = tokenizer.stop_sequences();
+    // Keep the normal Transformer path exactly token-based. This is the hot
+    // decode loop for every non-RWKV model, so do not put RWKV string matching
+    // or an extra per-token branch on it.
+    if (stop_sequences.empty()) {
+        auto append_token = [&](int token_id) {
+            result.token_ids.push_back(token_id);
+            std::string piece = decode_piece(tokenizer, token_id);
+            result.text += piece;
+            if (on_token) on_token(token_id, piece);
+        };
+        append_token(next);
+        if (next == eos_id) {
+            result.hit_eos = true;
+            engine.park_workers();
+            return true;
+        }
+        auto decode_start = std::chrono::steady_clock::now();
+        while ((int)result.token_ids.size() < max_new_tokens) {
+            next = engine.decode(next);
+            if (next < 0) {
+                error = "engine decode failed";
+                engine.park_workers();
+                return false;
+            }
+            append_token(next);
+            if (next == eos_id) {
+                result.hit_eos = true;
+                break;
+            }
+        }
+        auto decode_end = std::chrono::steady_clock::now();
+        result.decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+        engine.park_workers();
+        return true;
+    }
+
+    // RWKV legacy path only: stop by decoded bytes because the delimiter may
+    // be split across several RWKV-world tokens.
+    size_t max_stop_len = 0;
+    for (const auto& stop : stop_sequences) max_stop_len = std::max(max_stop_len, stop.size());
+    std::string pending_text;
+
+    // Keep up to max_stop_len-1 bytes pending so a delimiter split across
+    // RWKV byte tokens is neither emitted nor missed in streaming mode.
+    auto emit = [&](const std::string& text, int token_id) {
+        if (text.empty()) return;
+        result.text += text;
+        if (on_token) on_token(token_id, text);
+    };
     auto append_token = [&](int token_id) {
         result.token_ids.push_back(token_id);
         std::string piece = decode_piece(tokenizer, token_id);
-        result.text += piece;
-        if (on_token) on_token(token_id, piece);
+        pending_text += piece;
+        size_t stop_at = std::string::npos;
+        for (const auto& stop : stop_sequences) {
+            size_t at = pending_text.find(stop);
+            if (at != std::string::npos && (stop_at == std::string::npos || at < stop_at)) stop_at = at;
+        }
+        if (stop_at != std::string::npos) {
+            emit(pending_text.substr(0, stop_at), token_id);
+            pending_text.clear();
+            return true;
+        }
+        if (pending_text.size() > max_stop_len - 1) {
+            size_t n = pending_text.size() - (max_stop_len - 1);
+            emit(pending_text.substr(0, n), token_id);
+            pending_text.erase(0, n);
+        }
+        return false;
     };
 
-    append_token(next);
-    if (next == eos_id) {
+    bool hit_text_stop = append_token(next);
+    if (hit_text_stop || next == eos_id) {
         result.hit_eos = true;
         engine.park_workers();
         return true;
@@ -311,12 +382,14 @@ bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
             engine.park_workers();
             return false;
         }
-        append_token(next);
-        if (next == eos_id) {
+        hit_text_stop = append_token(next);
+        if (hit_text_stop || next == eos_id) {
             result.hit_eos = true;
             break;
         }
     }
+    // No delimiter was found: flush the bytes held back for boundary matching.
+    emit(pending_text, result.token_ids.empty() ? -1 : result.token_ids.back());
     auto decode_end = std::chrono::steady_clock::now();
     result.decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
     // Park workers after generation completes to drop idle CPU to ~0%

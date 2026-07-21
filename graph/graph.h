@@ -71,6 +71,7 @@ enum class OpType : uint32_t {
     // activations
     SILU = 30,
     GELU = 31,
+    TANH = 32,
 
     // position encoding
     ROTARY_EMBED = 40,
@@ -93,7 +94,10 @@ enum class OpType : uint32_t {
     SIGMOID  = 72,   // 1 / (1 + exp(-x))
     EXP      = 73,   // exp(x)
     SOFTPLUS = 74,   // log(1 + exp(x))
+    // Scalar IEEE sigmoid for numerically sensitive recurrent graphs.
+    // SIGMOID keeps the vector approximation used by transformer paths.
     SWIGLU   = 75,   // silu(gate) * up over a merged [2I,...] tensor (gate|up halves)
+    SIGMOID_EXACT = 76,
 
     // KV cache
     QUANTIZE_KV   = 80,
@@ -107,6 +111,8 @@ enum class OpType : uint32_t {
     // MOE_COMBINE        = 121,
     // GATED_ATTENTION    = 130,
     SHORTCONV      = 140,
+    RWKV7           = 150,
+    RWKV_TOKEN_SHIFT = 151,
 };
 
 inline const char* op_type_name(OpType op) {
@@ -118,6 +124,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::LAYER_NORM: return "LAYER_NORM";
     case OpType::SILU: return "SILU";
     case OpType::GELU: return "GELU";
+    case OpType::TANH: return "TANH";
     case OpType::ROTARY_EMBED: return "ROTARY_EMBED";
     case OpType::SDPA: return "SDPA";
     case OpType::SDPA_MLA: return "SDPA_MLA";
@@ -132,6 +139,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::SIGMOID: return "SIGMOID";
     case OpType::EXP: return "EXP";
     case OpType::SOFTPLUS: return "SOFTPLUS";
+    case OpType::SIGMOID_EXACT: return "SIGMOID_EXACT";
     case OpType::SWIGLU: return "SWIGLU";
     case OpType::QUANTIZE_KV: return "QUANTIZE_KV";
     case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";
@@ -139,6 +147,8 @@ inline const char* op_type_name(OpType op) {
     case OpType::GATED_DELTANET_PREFILL: return "GATED_DELTANET_PREFILL";
     case OpType::MOE: return "MOE";
     case OpType::SHORTCONV: return "SHORTCONV";
+    case OpType::RWKV7: return "RWKV7";
+    case OpType::RWKV_TOKEN_SHIFT: return "RWKV_TOKEN_SHIFT";
     }
     return "UNKNOWN";
 }

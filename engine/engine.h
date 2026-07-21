@@ -91,9 +91,9 @@ struct EngineConfig {
     // Callers (e.g. CLI) read this to load the Tokenizer after engine.load().
     std::string tokenizer_path;
 
-    // Test-only: when true, load the decode graph as the prefill graph too
-    // (so prefill() runs the seq=1 decode graph). Used by test_e2e to verify
-    // the decode path's PPL independently from the prefill path.
+    // When true, load the decode graph as the prefill graph too (so prefill()
+    // runs the seq=1 graph). Used by test_e2e; enabled automatically for the
+    // current RWKV v7 correctness-first path.
     bool use_decode_as_prefill = false;
 
     // When true, prefill pads short prompts to graph_seq_len (build-time
@@ -258,6 +258,13 @@ private:
         int gdn_num_heads = 0;
         int gdn_conv_groups = 0;
         int gdn_conv_kernel = 0;
+
+        Tensor* rwkv_state = nullptr;
+        Tensor* rwkv_att_shift = nullptr;
+        Tensor* rwkv_ffn_shift = nullptr;
+        int rwkv_head_size = 0;
+        int rwkv_num_heads = 0;
+        int rwkv_hidden_size = 0;
 
         bool is_linear_attn = false;
     };

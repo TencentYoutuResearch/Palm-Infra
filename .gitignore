@@ -18,6 +18,8 @@ compile_commands.json
 *.graph
 tmp/build_asan/
 *.mollm
+*.pth
+*.gguf
 tmp/
 
 # docs/ — local-only (architecture notes, optimization logs, state tracking)

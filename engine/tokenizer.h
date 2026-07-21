@@ -26,7 +26,16 @@ public:
 
     int bos_id() const { return bos_id_; }
     int eos_id() const { return eos_id_; }
-    int vocab_size() const { return (int)id_to_piece_.size(); }
+    // RWKV .pth packages carry this fixed legacy template in package metadata.
+    // It mirrors rwkv-mobile: "User: ...\n\nAssistant:".
+    void set_rwkv_legacy_chat_template(bool enabled);
+    // Text stop sequences are needed for RWKV-world: a delimiter may span
+    // multiple byte tokens, so eos_id alone is insufficient.
+    std::vector<std::string> stop_sequences() const;
+    int vocab_size() const {
+        return format_ == Format::RWKV_WORLD ? (int)rwkv_id_to_bytes_.size()
+                                            : (int)id_to_piece_.size();
+    }
 
     // Wrap a single user message in the model's chat template.
     // Convenience wrapper for single-turn prompts.
@@ -44,6 +53,7 @@ public:
     std::vector<int> apply_chat(const std::vector<ChatMessage>& messages) const;
 
 private:
+    enum class Format { HF_BPE, RWKV_WORLD } format_ = Format::HF_BPE;
     std::unordered_map<std::string, int> vocab_;
     std::vector<std::string> id_to_piece_;
 
@@ -64,6 +74,13 @@ private:
 
     int bos_id_ = 128000;
     int eos_id_ = 128001;
+
+    struct TrieNode { std::unordered_map<uint8_t, int> next; int token = -1; };
+    std::vector<TrieNode> rwkv_trie_;
+    std::vector<std::string> rwkv_id_to_bytes_;
+    bool rwkv_legacy_chat_template_ = false;
+    bool load_rwkv_vocab(const std::string& path);
+    std::vector<int> encode_rwkv(const std::string& text) const;
 
     void build_byte_tables();
     std::vector<std::string> pre_tokenize(const std::string& text) const;

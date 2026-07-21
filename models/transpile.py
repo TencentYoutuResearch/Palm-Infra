@@ -44,6 +44,7 @@ class OpType(IntEnum):
     LAYER_NORM     = 21
     SILU           = 30
     GELU           = 31
+    TANH           = 32
     ROTARY_EMBED   = 40
     SDPA           = 50
     SDPA_MLA       = 51
@@ -59,12 +60,15 @@ class OpType(IntEnum):
     EXP            = 73
     SOFTPLUS       = 74
     SWIGLU         = 75
+    SIGMOID_EXACT  = 76
     QUANTIZE_KV    = 80
     DEQUANTIZE_KV  = 81
     GATED_DELTANET_DECODE  = 110
     GATED_DELTANET_PREFILL = 111
     MOE            = 120
     SHORTCONV      = 140
+    RWKV7          = 150
+    RWKV_TOKEN_SHIFT = 151
 
 class Precision(IntEnum):
     FP32 = 0
@@ -235,12 +239,13 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
         return _CONST4
 
     if op in (OpType.RMS_NORM, OpType.LAYER_NORM,
-              OpType.SILU, OpType.GELU, OpType.SIGMOID, OpType.EXP, OpType.SOFTPLUS,
+              OpType.SILU, OpType.GELU, OpType.TANH, OpType.SIGMOID, OpType.SIGMOID_EXACT, OpType.EXP, OpType.SOFTPLUS,
               OpType.SWIGLU,
               OpType.ROTARY_EMBED,
               OpType.TILE, OpType.CONTIGUOUS,
               OpType.QUANTIZE_KV, OpType.DEQUANTIZE_KV,
               OpType.SHORTCONV,
+              OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT,
               OpType.MOE):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
@@ -431,6 +436,12 @@ class GraphBuilder:
         return self._add(OpType.RMS_NORM, [x, weight], sx,
                          prec=self._nodes[x].out_prec, f32=[eps])
 
+    def layer_norm(self, x: int, weight: int, bias: int,
+                   eps: float = 1e-5) -> int:
+        return self._add(OpType.LAYER_NORM, [x, weight, bias],
+                         self._nodes[x].out_shape,
+                         prec=self._nodes[x].out_prec, f32=[eps])
+
     # ---- activations ----
 
     def silu(self, x: int) -> int:
@@ -441,8 +452,17 @@ class GraphBuilder:
         return self._add(OpType.GELU, [x], self._nodes[x].out_shape,
                          prec=self._nodes[x].out_prec)
 
+    def tanh(self, x: int) -> int:
+        return self._add(OpType.TANH, [x], self._nodes[x].out_shape,
+                         prec=self._nodes[x].out_prec)
+
     def sigmoid(self, x: int) -> int:
         return self._add(OpType.SIGMOID, [x], self._nodes[x].out_shape,
+                         prec=self._nodes[x].out_prec)
+
+    def sigmoid_exact(self, x: int) -> int:
+        """IEEE sigmoid for recurrent paths where approximation error compounds."""
+        return self._add(OpType.SIGMOID_EXACT, [x], self._nodes[x].out_shape,
                          prec=self._nodes[x].out_prec)
 
     def exp(self, x: int) -> int:
@@ -673,6 +693,28 @@ class GraphBuilder:
         return self._add(OpType.SHORTCONV, [x, weight, conv_state], sx,
                          prec=self._nodes[x].out_prec,
                          i32=[kernel_size])
+
+    def rwkv_token_shift(self, x: int, state: int,
+                         hidden_size: int, seq_len: int) -> int:
+        """Return previous_x - x and update the persistent previous_x."""
+        return self._add(OpType.RWKV_TOKEN_SHIFT, [x, state],
+                         self._nodes[x].out_shape, prec=Precision.FP32,
+                         i32=[hidden_size, seq_len, 0])
+
+    def rwkv7(self, r: int, w_delta: int, k: int, v: int, a_delta: int,
+              gate_delta: int, v_delta: int, v_first: int, w0: int, a0: int,
+              v0: int, k_k: int, k_a: int, r_k: int, norm_w: int, norm_b: int,
+              state: int,
+              num_heads: int, head_size: int, seq_len: int,
+              group_norm_eps: float = 64e-5, first_layer: bool = False) -> int:
+        """Fused RWKV-7 WKV recurrence and post-recurrence group norm."""
+        return self._add(OpType.RWKV7,
+                         [r, w_delta, k, v, a_delta, gate_delta, v_delta,
+                          v_first, w0, a0, v0, k_k, k_a, r_k, norm_w, norm_b,
+                          state],
+                         self._nodes[r].out_shape, prec=Precision.FP32,
+                         i32=[num_heads, head_size, seq_len, 0, int(first_layer)],
+                         f32=[group_norm_eps])
 
     def gated_deltanet(self, qkv_conv: int, a_out: int, b_out: int, z_out: int,
                        A_log: int, dt_bias: int, norm_weight: int, gdn_state: int,

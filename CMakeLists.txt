@@ -45,6 +45,7 @@ set(SOURCES
     kernels/gdn_decode.cpp
     kernels/gdn_prefill.cpp
     kernels/moe.cpp
+    kernels/rwkv.cpp
     kernels/threading.cpp
     # engine
     engine/engine.cpp
@@ -58,6 +59,7 @@ set(HEADERS
     kernels/rope.h
     kernels/attention.h
     kernels/moe.h
+    kernels/rwkv.h
     kernels/threading.h
     graph/buffer_pool.h
     graph/mmap_file.h
@@ -234,6 +236,14 @@ if(MOLLM_BUILD_EXAMPLE)
         examples/ppl.cpp
     )
     target_link_libraries(mollm_ppl PRIVATE mollm_lib)
+
+    if(UNIX)
+        add_executable(mollm_server
+            examples/server.cpp
+            examples/cli_common.cpp
+        )
+        target_link_libraries(mollm_server PRIVATE mollm_lib)
+    endif()
 endif()
 
 add_executable(mollm-quantize tools/quantize_weight.cpp)
@@ -270,6 +280,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_rope          tests/test_rope.cpp)
     add_mollm_test(test_attention     tests/test_attention.cpp)
     add_mollm_test(test_gdn           tests/test_gdn.cpp)
+    add_mollm_test(test_rwkv_e2e      tests/test_rwkv_e2e.cpp)
     add_mollm_test(test_engine        tests/test_engine.cpp)
     add_mollm_test(test_tokenizer     tests/test_tokenizer.cpp)
     add_mollm_test(test_e2e           tests/test_e2e.cpp)

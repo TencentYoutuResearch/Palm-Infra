@@ -7,6 +7,86 @@
 #include <fstream>
 #include <limits>
 
+static int rwkv_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// The official RWKV world vocabulary stores a Python bytes/string literal per
+// line: `id literal byte_length`. This parser deliberately handles the escape
+// forms used by that file without depending on Python at runtime.
+static std::string rwkv_literal(const std::string& s) {
+    size_t b=0, e=s.size(); char quote=0;
+    if (s.size() >= 3 && s[0]=='b' && (s[1]=='\'' || s[1]=='"')) { b=2; quote=s[1]; }
+    else if (s.size() >= 2 && (s[0]=='\'' || s[0]=='"')) { b=1; quote=s[0]; }
+    else return s;
+    if (e>b && s[e-1]==quote) --e;
+    std::string out;
+    for (size_t i=b;i<e;++i) {
+        if (s[i]!='\\' || ++i>=e) { out+=s[i]; continue; }
+        switch (s[i]) {
+        case 'n': out+='\n'; break; case 't': out+='\t'; break; case 'r': out+='\r'; break;
+        case '\\': out+='\\'; break; case '\'': out+='\''; break; case '"': out+='"'; break;
+        case 'x': if(i+2<e) { int h=rwkv_hex(s[i+1]), l=rwkv_hex(s[i+2]);
+                     if(h>=0&&l>=0) { out+=(char)((h<<4)|l); i+=2; break; } } out+='x'; break;
+        default: out+=s[i]; break;
+        }
+    }
+    return out;
+}
+
+bool Tokenizer::load_rwkv_vocab(const std::string& path) {
+    std::ifstream f(path); if (!f.is_open()) return false;
+    format_=Format::RWKV_WORLD; rwkv_trie_.assign(1, {}); rwkv_id_to_bytes_.clear();
+    std::string line;
+    while (std::getline(f,line)) {
+        size_t first=line.find(' '), last=line.rfind(' ');
+        if(first==std::string::npos || last<=first) continue;
+        int id; try { id=std::stoi(line.substr(0,first)); } catch (...) { return false; }
+        std::string bytes=rwkv_literal(line.substr(first+1,last-first-1));
+        if(id<0 || bytes.empty()) continue;
+        if((size_t)id>=rwkv_id_to_bytes_.size()) rwkv_id_to_bytes_.resize((size_t)id+1);
+        rwkv_id_to_bytes_[id]=bytes;
+        int n=0; for(uint8_t c:bytes) { auto it=rwkv_trie_[n].next.find(c); if(it==rwkv_trie_[n].next.end()) {
+                int next=(int)rwkv_trie_.size(); rwkv_trie_[n].next[c]=next; rwkv_trie_.push_back({}); n=next;
+            } else n=it->second; }
+        rwkv_trie_[n].token=id;
+    }
+    bos_id_=0; eos_id_=0;
+    return rwkv_trie_.size()>1;
+}
+
+void Tokenizer::set_rwkv_legacy_chat_template(bool enabled) {
+    if (format_ != Format::RWKV_WORLD) return;
+    rwkv_legacy_chat_template_ = enabled;
+    // rwkv-mobile uses "\n\n" as the legacy end-of-turn marker. In the
+    // official world vocabulary it is token 261; only adopt it when verified
+    // so an alternate vocabulary remains safe.
+    if (enabled && rwkv_id_to_bytes_.size() > 261 && rwkv_id_to_bytes_[261] == "\n\n") {
+        eos_id_ = 261;
+    } else {
+        eos_id_ = 0;
+    }
+}
+
+std::vector<std::string> Tokenizer::stop_sequences() const {
+    if (format_ == Format::RWKV_WORLD && rwkv_legacy_chat_template_)
+        return {"\n\n"};  // rwkv-mobile's legacy end-of-turn delimiter
+    return {};
+}
+
+std::vector<int> Tokenizer::encode_rwkv(const std::string& text) const {
+    std::vector<int> ids; size_t pos=0;
+    while(pos<text.size()) { int node=0,best=-1; size_t p=pos,bestp=pos;
+        while(p<text.size()) { auto it=rwkv_trie_[node].next.find((uint8_t)text[p]); if(it==rwkv_trie_[node].next.end()) break;
+            node=it->second; ++p; if(rwkv_trie_[node].token>=0) { best=rwkv_trie_[node].token; bestp=p; } }
+        if(best<0) return {}; ids.push_back(best); pos=bestp;
+    }
+    return ids;
+}
+
 using json = nlohmann::json;
 
 // --- GPT-2 byte-to-unicode table -------------------------------------------
@@ -41,6 +121,16 @@ void Tokenizer::build_byte_tables() {
 // --- Load tokenizer.json ---------------------------------------------------
 
 bool Tokenizer::load(const std::string& path) {
+    // Packages historically extract the tokenizer payload as `tokenizer.json`
+    // regardless of its source filename. Sniff the first non-whitespace byte
+    // so an embedded RWKV vocabulary is still recognized after extraction.
+    {
+        std::ifstream probe(path);
+        char c = 0;
+        while (probe.get(c) && std::isspace((unsigned char)c)) {}
+        if (!probe || c != '{') return load_rwkv_vocab(path);
+    }
+    format_ = Format::HF_BPE;
     std::ifstream f(path);
     if (!f.is_open()) {
         fprintf(stderr, "tokenizer: cannot open %s\n", path.c_str());
@@ -555,6 +645,7 @@ split_added_tokens(const std::string& text,
 }
 
 std::vector<int> Tokenizer::encode(const std::string& text) const {
+    if (format_ == Format::RWKV_WORLD) return encode_rwkv(text);
     if (text.empty()) return {};
 
     auto segments = split_added_tokens(text, added_patterns_, added_tokens_);
@@ -594,11 +685,18 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
 // --- Decode -----------------------------------------------------------------
 
 std::string Tokenizer::decode(int id) const {
+    if (format_ == Format::RWKV_WORLD)
+        return (id >= 0 && (size_t)id < rwkv_id_to_bytes_.size()) ? rwkv_id_to_bytes_[id] : std::string();
     if (id < 0 || id >= (int)id_to_piece_.size()) return "";
     return unicode_to_bytes(id_to_piece_[id]);
 }
 
 std::string Tokenizer::decode(const std::vector<int>& ids) const {
+    if (format_ == Format::RWKV_WORLD) {
+        std::string out;
+        for (int id : ids) if (id >= 0 && (size_t)id < rwkv_id_to_bytes_.size()) out += rwkv_id_to_bytes_[id];
+        return out;
+    }
     std::string out;
     for (int id : ids) {
         if (id < 0 || id >= (int)id_to_piece_.size()) continue;
@@ -614,6 +712,10 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
 // --- Chat template ----------------------------------------------------------
 
 std::vector<int> Tokenizer::apply_chat(const std::string& user_message) const {
+    if (format_ == Format::RWKV_WORLD) {
+        if (!rwkv_legacy_chat_template_) return encode(user_message);
+        return apply_chat(std::vector<ChatMessage>{{"user", user_message}});
+    }
     // Single-turn: wrap one user message WITHOUT system prompt
     // (matches transformers default behavior).
     // For ChatML models (Qwen3.5), the template includes <think> tags.
@@ -623,6 +725,30 @@ std::vector<int> Tokenizer::apply_chat(const std::string& user_message) const {
 }
 
 std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages) const {
+    if (format_ == Format::RWKV_WORLD) {
+        if (rwkv_legacy_chat_template_) {
+            // Match rwkv-mobile's legacy template exactly. Native RWKV .pth
+            // files have no tokenizer_config/chat_template, so this is set by
+            // the converter as explicit package metadata rather than guessed.
+            std::string prompt;
+            for (size_t i = 0; i < messages.size(); ++i) {
+                const auto& message = messages[i];
+                std::string role = message.role == "user" ? "User" :
+                                   message.role == "assistant" ? "Assistant" : "System";
+                prompt += role + ": " + message.content;
+                if (i + 1 < messages.size()) prompt += "\n\n";
+            }
+            if (!messages.empty()) {
+                prompt += "\n\n";
+                const auto& last = messages.back().role;
+                prompt += last == "assistant" ? "User:" : "Assistant:";
+            }
+            return encode(prompt);
+        }
+        std::string prompt;
+        for (const auto& message : messages) prompt += message.content;
+        return encode(prompt);
+    }
     // Detect chat format from available special tokens.
     // ChatML (Qwen3.5): <|im_start|>{role}\n{content}<|im_end|>\n
     // Llama-3 (Youtu-LLM-2B): <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>

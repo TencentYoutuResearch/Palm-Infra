@@ -15,3 +15,6 @@
 
 void kernel_rms_norm(const Tensor& x, const Tensor& weight,
                      float eps, Tensor& out);
+
+void kernel_layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias,
+                       float eps, Tensor& out);

@@ -61,10 +61,13 @@ int main(int argc, char** argv) {
     }
     // argv[1] = qwen35 .mollm package (Qwen3.5-0.8B transpiled)
     // argv[2] = youtu .mollm package (Youtu-LLM-2B transpiled)
-    const char* qwen35_package = argc > 1 ? argv[1] :
-        "/Users/molly/workspace-youtulm-ncnn/mollm/qwen35_0.8b.mollm";
-    const char* youtu_package = argc > 2 ? argv[2] :
-        "/Users/molly/workspace-youtulm-ncnn/mollm/youtu-llm-2b.mollm";
+    const char* qwen35_package = argc > 1 ? argv[1] : "../qwen35_0.8b.mollm";
+    const char* youtu_package = argc > 2 ? argv[2] : "../youtu-llm-2b.mollm";
+    struct stat st{};
+    if (stat(qwen35_package, &st) != 0 || stat(youtu_package, &st) != 0) {
+        std::printf("SKIP: e2e model packages not found (pass paths as argv[1:2])\n");
+        return 0;
+    }
 
     // Load qwen35 tokenizer first (from package via a throwaway engine load)
     Tokenizer tokenizer;

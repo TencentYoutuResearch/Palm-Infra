@@ -2,7 +2,7 @@
 """mollm model converter — auto-detect model type from config.json and dispatch.
 
 Usage:
-    python3 models/converter.py <model_dir> <output.mollm> [quant]
+    python3 models/converter.py <model_dir|checkpoint.pth> <output.mollm> [quant]
 
 The converter reads <model_dir>/config.json to determine the model type:
     - model_type "qwen3"    → Qwen3 decoder-only converter (qwen3.py)
@@ -71,6 +71,16 @@ def main():
 
     model_dir = sys.argv[1]
     output_path = sys.argv[2]
+
+    # RWKV v7 is distributed primarily as an official .pth state_dict, not a
+    # Hugging Face directory. It has a dedicated converter and no HF config.
+    if model_dir.lower().endswith(".pth"):
+        if len(sys.argv) > 3:
+            print("RWKV v7 converter accepts no quant mode yet; use rwkv7.py --help for options")
+            sys.exit(1)
+        from rwkv7 import convert_rwkv7
+        convert_rwkv7(model_dir, output_path)
+        return
     prefill_seq_len = DEFAULT_PREFILL_SEQ_LEN
     quant = "fp16"
 

@@ -275,7 +275,6 @@ int main(int argc, char** argv) {
     print_repl_banner(engine, opts.n_ctx);
 
     std::vector<ChatMessage> history;
-    history.push_back({"system", "You are a helpful assistant."});
     std::vector<int> cached_token_ids;
 
     std::string line;
@@ -288,7 +287,6 @@ int main(int argc, char** argv) {
         if (line == "/reset") {
             engine.reset();
             history.clear();
-            history.push_back({"system", "You are a helpful assistant."});
             cached_token_ids.clear();
             std::printf("--- context cleared ---\n");
             continue;

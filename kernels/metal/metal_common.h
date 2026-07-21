@@ -14,6 +14,17 @@ struct TensorDesc {
     uint  offset;      // element offset into the bound buffer
 };
 
+// CONCAT along dim 0: copy one source's dim-0 slab into a dense output.
+// Source may be strided (view); output is dense over shape [out_shape0, s1, s2]
+// (shape[3]==1, the MLA case). Dispatched once per concat input.
+struct ConcatParams {
+    int  shape[4];       // SOURCE shape
+    int  stride[4];      // SOURCE element strides
+    uint offset;         // SOURCE element offset
+    int  dim_offset;     // running dim-0 offset of this source within the output
+    int  out_shape0;     // total concatenated dim-0 (output dim-0 extent)
+};
+
 // Matmul params: C[M,N] = A[M,K] (fp32) * B[N,K]^T (fp16, row-major [N,K]).
 // A is row-major [M,K]; B is stored row-major [N,K] (weights), so C[m,n] =
 // sum_k A[m,k]*B[n,k]. Offsets in elements.
@@ -28,6 +39,8 @@ struct MatmulParams {
     int  b_row_stride;   // elements between rows of B (>= K)
     int  c_row_stride;   // elements between rows of C (>= N)
     int  activation;     // 0=NONE, 1=SILU (fused, phase-1 optional)
+    int  act_n_begin;    // first output column receiving activation
+    int  act_n_len;      // -1=all columns, 0=none, >0=range length
 };
 
 // W8 (int8 weight-only) matmul: C[M,N] = A[M,K](fp32) * W_int8[N,K] * scale_w.
@@ -42,6 +55,8 @@ struct MatmulW8Params {
     int  a_row_stride;
     int  c_row_stride;
     int  activation;
+    int  act_n_begin;
+    int  act_n_len;
     int  groups_per_row;   // (K + group_size - 1) / group_size (w8pc => 1)
     int  group_size;       // K for per-channel (w8pc)
     // weight int8 and scales are bound at their own byte offsets (buffers 1, 4)
@@ -57,6 +72,8 @@ struct MatmulW8A8Params {
     uint c_offset;
     int  c_row_stride;
     int  activation;
+    int  act_n_begin;
+    int  act_n_len;
     // int8 A (buffer 0), int8 W (buffer 1), C (buffer 2), scale_a (buffer 4),
     // scale_w (buffer 5) bound at byte offsets; a is [M,K] contiguous (K inner).
 };
@@ -73,10 +90,24 @@ struct MatmulW4A8Params {
     uint c_offset;
     int  c_row_stride;
     int  activation;
+    int  act_n_begin;
+    int  act_n_len;
     int  group_size;       // 128
     int  groups_per_row;   // K / group_size
     // int8 A (buffer 0), int4 W (buffer 1), C (buffer 2), scale_a (buffer 4),
     // scale_w (buffer 5) bound at byte offsets; A is [M,K] contiguous (K inner).
+};
+
+struct SelectedW4A8Params {
+    int selections;
+    int N;
+    int K;
+    int c_row_stride;
+    int group_size;
+    int groups_per_row;
+    int rows_per_expert;
+    int activation_rows;
+    int activation_repeat;
 };
 
 // Per-token activation quantization: A_f32[M,K] -> A_i8[M,K] + scale_a[M].
@@ -107,6 +138,7 @@ struct RopeParams {
     int   rope_dim;
     int   seq_len;
     int   heads;
+    int   interleave;    // 1: pairs (0,1), 0: pairs (0, half)
     uint  x_offset;
     uint  cos_offset;
     uint  sin_offset;
@@ -118,6 +150,10 @@ struct RopeParams {
 struct EwiseParams {
     int   n;             // total elements (contiguous fast path)
     int   broadcast_b;   // 1 if b is scalar (nelements==1)
+    int   shape0;        // logical inner width (for strided row views)
+    int   a_row_stride;
+    int   b_row_stride;
+    int   out_row_stride;
     uint  a_offset;
     uint  b_offset;
     uint  out_offset;
@@ -131,6 +167,26 @@ struct SwigluParams {
     uint  merged_offset;     // element offset into merged buffer
     uint  out_offset;        // element offset into output buffer
     int   merged_row_stride; // elements between rows (tokens) in merged (= 2I)
+};
+
+// Fused routed-expert MoE using decoded row-major W4-G128 expert weights.
+// Route buffers are [seq,top_k]; merged is [seq,top_k,2*intermediate].
+struct MoeW4Params {
+    int hidden;
+    int experts;
+    int top_k;
+    int intermediate;
+    int seq_len;
+    int n_group;
+    int topk_group;
+    int norm_topk;
+    float routed_scale;
+    uint hidden_offset;
+    uint output_offset;
+    int hidden_row_stride;
+    int output_row_stride;
+    int gu_groups_per_row;
+    int down_groups_per_row;
 };
 
 // Fused Gated Delta Rule (GDN) linear-attention core for Qwen3.5.

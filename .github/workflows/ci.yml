@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMOLLM_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build -j 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

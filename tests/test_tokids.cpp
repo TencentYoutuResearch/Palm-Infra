@@ -1,9 +1,13 @@
 #include "engine/tokenizer.h"
 #include <cstdio>
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: %s tokenizer.json\n", argv[0]);
+        return 2;
+    }
     Tokenizer tok;
-    tok.load("/Users/molly/workspace-youtulm-ncnn/Youtu-LLM-2B/tokenizer.json");
+    if (!tok.load(argv[1])) return 1;
     auto ids = tok.encode("Hello, world!");
     printf("Token IDs (%zu): ", ids.size());
     for (int id : ids) printf("%d ", id);

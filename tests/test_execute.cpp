@@ -119,6 +119,50 @@ int main() {
     CHECK(tp.at<float>(0, 1) == 2.0f, "permute data access via stride");
     CHECK(pool2.active_bytes() == 0, "zero-copy permute does not allocate pool buffer");
 
+    // ---- test: per-channel [D, 1] broadcast across sequence [D, S] ----
+    // RWKV time-mix parameters use this shape.  It must not advance the
+    // parameter pointer for every token row.
+    {
+        Graph gb;
+        for (uint32_t id = 0; id < 2; ++id) {
+            GraphNode in;
+            in.id = id;
+            in.op_type = OpType::INPUT;
+            in.out_shape[0] = 4;
+            in.out_shape[1] = id == 0 ? 3 : 1;
+            in.out_prec = Precision::FP32;
+            gb.nodes.push_back(in);
+        }
+        GraphNode mul;
+        mul.id = 2; mul.op_type = OpType::MUL; mul.inputs = {0, 1};
+        mul.out_shape[0] = 4; mul.out_shape[1] = 3; mul.out_prec = Precision::FP32;
+        gb.nodes.push_back(mul);
+        GraphNode add;
+        add.id = 3; add.op_type = OpType::ADD; add.inputs = {0, 1};
+        add.out_shape[0] = 4; add.out_shape[1] = 3; add.out_prec = Precision::FP32;
+        gb.nodes.push_back(add);
+        gb.graph_inputs = {0, 1};
+        gb.graph_outputs = {2, 3};
+        gb.runtime.tensors.resize(4);
+        float values[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+        float channels[4] = {10, 20, 30, 40};
+        gb.runtime.tensors[0] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                                4, 3, 1, 1, values);
+        gb.runtime.tensors[1] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                                4, 1, 1, 1, channels);
+        BufferPool pool_b;
+        ExecContext ctx_b;
+        ctx_b.graph = &gb; ctx_b.pool = &pool_b; ctx_b.backend = &cpu_backend;
+        prepare_execution(ctx_b);
+        execute_graph(ctx_b);
+        CHECK(gb.runtime.tensors[2].at<float>(0, 2) == 90.0f &&
+              gb.runtime.tensors[2].at<float>(3, 2) == 480.0f,
+              "MUL broadcasts channel vector across sequence");
+        CHECK(gb.runtime.tensors[3].at<float>(0, 2) == 19.0f &&
+              gb.runtime.tensors[3].at<float>(3, 2) == 52.0f,
+              "ADD broadcasts channel vector across sequence");
+    }
+
     // ---- test: slice(dim=0) + concat(dim=0) preserve row layout ----
     Graph g3;
     GraphNode in2;

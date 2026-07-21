@@ -409,7 +409,7 @@ bool shares_storage(const Tensor& a, const Tensor& b) {
     return a.data == b.data;
 }
 
-void release_graph_temporaries(Graph& graph) {
+void release_graph_temporaries(Graph& graph, Backend* backend) {
 #ifdef MOLLM_SKIP_GRAPH_TEMP_CLEANUP
     (void)graph;
     return;
@@ -442,7 +442,16 @@ void release_graph_temporaries(Graph& graph) {
         if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
         if (borrowed_view[node.id]) continue;
         Tensor& t = tensors[node.id];
-        release_pool_tensor(pool, t);
+        if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
+            if (backend) backend->free_output(t, &pool);
+            else release_pool_tensor(pool, t);
+        }
+        t.data = nullptr;
+        t.device_data = nullptr;
+        t.device_offset = 0;
+        t.mem_type = MemoryType::NONE;
+        t.owner_id = 0;
+        t.storage_id = 0;
     }
 }
 
@@ -483,7 +492,7 @@ void finish_graph_temporaries(Graph& graph, ExecContext& ctx) {
     if (ctx.reuse_static_workspace || ctx.reuse_same_shape_workspace) {
         clear_graph_borrowed_views(graph);
     } else {
-        release_graph_temporaries(graph);
+        release_graph_temporaries(graph, ctx.backend);
         invalidate_workspace_key(ctx);
     }
 }
@@ -728,7 +737,10 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         // are populated, decode the CPU Q4B8G128Block layout into a Metal raw
         // nibble+scale device buffer. No-op for non-INT4 weights.
         auto finalize_metal_weight = [&]() {
-            if (metal_backend_) as_metal(metal_backend_)->wrap_weight_int4_g128(t);
+            if (metal_backend_) {
+                bool is_aggregate_expert = wref.find("_experts_") != std::string::npos;
+                as_metal(metal_backend_)->wrap_weight_int4_g128(t, is_aggregate_expert);
+            }
         };
 #else
         auto finalize_metal_weight = [&]() {};
@@ -910,6 +922,27 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             caches_[layer_idx].gdn_conv = &t;
             caches_[layer_idx].gdn_conv_groups = (int)node.out_shape[0];
             caches_[layer_idx].gdn_conv_kernel = (int)node.out_shape[1] + 1;  // kernel-1 stored, kernel = dim+1
+        } else if (name.find("rwkv_state") == 0) {
+            int layer_idx = std::stoi(name.substr(10));
+            if (layer_idx >= (int)caches_.size()) caches_.resize(layer_idx + 1);
+            Tensor& t = g.runtime.tensors[node.id];
+            t.prec = node.out_prec;
+            for (int d=0; d<4; ++d) t.shape[d]=node.out_shape[d];
+            t.compute_strides();
+            caches_[layer_idx].rwkv_state=&t;
+            caches_[layer_idx].rwkv_head_size=(int)node.out_shape[0];
+            caches_[layer_idx].rwkv_num_heads=(int)node.out_shape[2];
+        } else if (name.find("rwkv_att_shift") == 0 || name.find("rwkv_ffn_shift") == 0) {
+            bool att = name.find("rwkv_att_shift") == 0;
+            int layer_idx = std::stoi(name.substr(att ? 14 : 14));
+            if (layer_idx >= (int)caches_.size()) caches_.resize(layer_idx + 1);
+            Tensor& t = g.runtime.tensors[node.id];
+            t.prec = node.out_prec;
+            for (int d=0; d<4; ++d) t.shape[d]=node.out_shape[d];
+            t.compute_strides();
+            if(att) caches_[layer_idx].rwkv_att_shift=&t;
+            else caches_[layer_idx].rwkv_ffn_shift=&t;
+            caches_[layer_idx].rwkv_hidden_size=(int)node.out_shape[0];
         }
     }
 
@@ -1002,6 +1035,16 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             cp.gdn_conv->shape[3] = 1;
             cp.gdn_conv->compute_strides();
         }
+        if (cp.rwkv_state) {
+            size_t bytes=cp.rwkv_state->nbytes();
+            void* buf=alloc_cache_buf(cp.rwkv_state, bytes); std::memset(buf,0,bytes);
+            cp.rwkv_state->mem_type=MemoryType::POOLED;
+        }
+        for (Tensor* shift : {cp.rwkv_att_shift, cp.rwkv_ffn_shift}) if (shift) {
+            size_t bytes=shift->nbytes();
+            void* buf=alloc_cache_buf(shift, bytes); std::memset(buf,0,bytes);
+            shift->mem_type=MemoryType::POOLED;
+        }
     }
 }
 
@@ -1078,6 +1121,15 @@ bool LLMEngine::load(const EngineConfig& cfg) {
         }
     }
 
+    // RWKV has recurrent state rather than an attention KV cache. Its generic
+    // batched graph cannot yet preserve the FP16 decode trajectory, so use the
+    // verified seq=1 graph repeatedly until a numerically compatible batched
+    // recurrence lands. prefill() handles the chunking transparently.
+    auto package_arch = package_metadata_.find("architecture");
+    if (package_arch != package_metadata_.end() && package_arch->second == "rwkv7") {
+        cfg_.use_decode_as_prefill = true;
+    }
+
 #ifdef MOLLM_METAL
     // Wrap the whole package weight region as one zero-copy MTLBuffer so each
     // weight tensor can alias it via device_offset (set in setup_weight).
@@ -1090,7 +1142,7 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 #endif
 
     // Load prefill graph first (establishes shared weights)
-    const std::string& pf_path_load = cfg.use_decode_as_prefill ? dc_path : pf_path;
+    const std::string& pf_path_load = cfg_.use_decode_as_prefill ? dc_path : pf_path;
     if (!load_graph(graph_prefill_, exec_ctx_prefill_, pf_path_load.c_str())) {
         return false;
     }
@@ -1154,6 +1206,12 @@ bool LLMEngine::load(const EngineConfig& cfg) {
             if (layer_idx < (int)caches_.size() && caches_[layer_idx].gdn_conv) {
                 graph_decode_.runtime.tensors[node.id] = *caches_[layer_idx].gdn_conv;
             }
+        } else if (name.find("rwkv_state") == 0) {
+            int i=std::stoi(name.substr(10)); if(i<(int)caches_.size()&&caches_[i].rwkv_state) graph_decode_.runtime.tensors[node.id]=*caches_[i].rwkv_state;
+        } else if (name.find("rwkv_att_shift") == 0) {
+            int i=std::stoi(name.substr(14)); if(i<(int)caches_.size()&&caches_[i].rwkv_att_shift) graph_decode_.runtime.tensors[node.id]=*caches_[i].rwkv_att_shift;
+        } else if (name.find("rwkv_ffn_shift") == 0) {
+            int i=std::stoi(name.substr(14)); if(i<(int)caches_.size()&&caches_[i].rwkv_ffn_shift) graph_decode_.runtime.tensors[node.id]=*caches_[i].rwkv_ffn_shift;
         }
     }
 
@@ -1166,7 +1224,7 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 // ---------------------------------------------------------------------------
 
 void LLMEngine::reset() {
-    release_graph_temporaries(graph_decode_);
+    release_graph_temporaries(graph_decode_, exec_ctx_decode_.backend);
     invalidate_workspace_key(exec_ctx_decode_);
     clear_graph_borrowed_views(graph_prefill_);
     past_len_ = 0;
@@ -1185,6 +1243,9 @@ void LLMEngine::reset() {
             size_t sz = (size_t)cp.gdn_conv_groups * (cp.gdn_conv_kernel - 1) * sizeof(float);
             std::memset(cp.gdn_conv->data, 0, sz);
         }
+        if(cp.rwkv_state) std::memset(cp.rwkv_state->data,0,cp.rwkv_state->nbytes());
+        if(cp.rwkv_att_shift) std::memset(cp.rwkv_att_shift->data,0,cp.rwkv_att_shift->nbytes());
+        if(cp.rwkv_ffn_shift) std::memset(cp.rwkv_ffn_shift->data,0,cp.rwkv_ffn_shift->nbytes());
     }
 }
 
@@ -1444,7 +1505,7 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
 // ---------------------------------------------------------------------------
 
 void LLMEngine::release_prefill_buffers() {
-    release_graph_temporaries(graph_prefill_);
+    release_graph_temporaries(graph_prefill_, exec_ctx_prefill_.backend);
     invalidate_workspace_key(exec_ctx_prefill_);
 }
 
@@ -1539,9 +1600,15 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
     }
 
+    const auto arch = package_metadata_.find("architecture");
+    const bool rwkv_batched = !cfg_.use_decode_as_prefill &&
+        arch != package_metadata_.end() && arch->second == "rwkv7";
+    const bool previous_fp32_acc = g_mollm_force_fp32_acc;
+    if (rwkv_batched) g_mollm_force_fp32_acc = true;
     mollm_set_matmul_profile_phase("prefill_graph");
     Tensor out = run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
     mollm_set_matmul_profile_phase("unscoped");
+    g_mollm_force_fp32_acc = previous_fp32_acc;
     Tensor copied = copy_tensor_contiguous(out, hidden_output_copy_);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
