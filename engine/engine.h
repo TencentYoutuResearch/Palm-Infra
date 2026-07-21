@@ -84,7 +84,7 @@ struct EngineConfig {
     // CPU-only MoE expert cache. A non-zero value enables SSD offload for
     // packages carrying `moe_expert_storage` metadata.
     size_t moe_ssd_cache_bytes = 0;
-    int moe_ssd_io_workers = 4;
+    int moe_ssd_io_workers = 8;
 
     // Sampling params
     float temperature = 0.6f;         // 0 = greedy (argmax)

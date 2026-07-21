@@ -1243,7 +1243,8 @@ def save_package(output_path: str,
                  weights_dir: str,
                  metadata: dict,
                  tokenizer_path: str = "",
-                 jinja_path: str = ""):
+                 jinja_path: str = "",
+                 remove_weight_files: bool = False):
     """Pack prefill+decode graphs + weights + tokenizer + jinja into a single .mollm file.
 
     Graphs are saved via the standard save() format (to temp files), then
@@ -1344,6 +1345,12 @@ def save_package(output_path: str,
                         if not n:
                             break
                         f.write(view[:n])
+                # Large converters keep intermediate .weights files only so
+                # they can assemble this package.  Reclaim each one after it
+                # has been copied: this prevents the final package and its
+                # complete temporary weight set from needing 2x disk space.
+                if remove_weight_files:
+                    os.remove(wpath)
 
         total = (hs + len(meta_json) + len(tok_bytes) + len(jinja_bytes)
                  + len(pf_bytes) + len(dc_bytes) + weights_len)

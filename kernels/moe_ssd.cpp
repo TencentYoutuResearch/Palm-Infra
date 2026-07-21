@@ -18,6 +18,7 @@ struct MoeSsdCache::Entry {
     bool loading = false;
     bool ready = false;
     bool failed = false;
+    int pending_reads = 0;
     bool fresh_miss = false;  // first acquire after a queued miss is not a hit
     std::vector<uint8_t> gate_up_data;
     std::vector<uint8_t> gate_up_scales;
@@ -80,6 +81,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
     {
         std::lock_guard<std::mutex> lock(mutex_);
         fd_ = fd;
+        io_workers_count_ = io_workers;
         capacity_bytes_ = capacity_bytes;
         resident_bytes_ = 0;
         clock_ = hits_ = misses_ = evictions_ = bytes_read_ = 0;
@@ -212,6 +214,7 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     entry->loading = true;
     entry->ready = false;
     entry->failed = false;
+    entry->pending_reads = 0;
     entry->fresh_miss = true;
     entry->gate_up_data.resize(static_cast<size_t>(gate_up->spec.data_bytes));
     entry->gate_up_scales.resize(static_cast<size_t>(gate_up->spec.scales_bytes));
@@ -241,18 +244,93 @@ bool MoeSsdCache::read_exact(uint64_t offset, void* dst, size_t bytes) const {
     return true;
 }
 
-bool MoeSsdCache::read_entry(Entry& entry) {
-    const uint64_t e = static_cast<uint64_t>(entry.expert);
-    return read_exact(entry.gate_up->spec.data_offset + e * entry.gate_up->spec.data_bytes,
-                      entry.gate_up_data.data(), entry.gate_up_data.size()) &&
-           (entry.gate_up_scales.empty() ||
-            read_exact(entry.gate_up->spec.scales_offset + e * entry.gate_up->spec.scales_bytes,
-                       entry.gate_up_scales.data(), entry.gate_up_scales.size())) &&
-           read_exact(entry.down->spec.data_offset + e * entry.down->spec.data_bytes,
-                      entry.down_data.data(), entry.down_data.size()) &&
-           (entry.down_scales.empty() ||
-            read_exact(entry.down->spec.scales_offset + e * entry.down->spec.scales_bytes,
-                       entry.down_scales.data(), entry.down_scales.size()));
+const std::vector<uint8_t>& MoeSsdCache::component_buffer(const Entry& entry,
+                                                           uint8_t component) {
+    switch (component) {
+    case 0: return entry.gate_up_data;
+    case 1: return entry.gate_up_scales;
+    case 2: return entry.down_data;
+    default: return entry.down_scales;
+    }
+}
+
+std::vector<uint8_t>& MoeSsdCache::component_buffer(Entry& entry, uint8_t component) {
+    return const_cast<std::vector<uint8_t>&>(component_buffer(
+        static_cast<const Entry&>(entry), component));
+}
+
+uint64_t MoeSsdCache::component_offset(const Entry& entry, uint8_t component) {
+    const uint64_t expert = static_cast<uint64_t>(entry.expert);
+    switch (component) {
+    case 0:
+        return entry.gate_up->spec.data_offset + expert * entry.gate_up->spec.data_bytes;
+    case 1:
+        return entry.gate_up->spec.scales_offset + expert * entry.gate_up->spec.scales_bytes;
+    case 2:
+        return entry.down->spec.data_offset + expert * entry.down->spec.data_bytes;
+    default:
+        return entry.down->spec.scales_offset + expert * entry.down->spec.scales_bytes;
+    }
+}
+
+void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries) {
+    if (entries.empty()) return;
+    std::vector<Entry*> sorted = entries;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const Entry* a, const Entry* b) { return a->expert < b->expert; });
+
+    // Four independent file regions make up one expert pair. Keep enough
+    // component jobs in flight to fill the I/O workers, but queue only a
+    // small expert batch at a time so the first pairs become ready while the
+    // main thread is already computing them. A single all-expert batch made
+    // every pair wait behind the final down/scales reads and lost that overlap.
+    const size_t batch_entries = std::max<size_t>(1, (size_t)io_workers_count_ / 4);
+    for (size_t batch_begin = 0; batch_begin < sorted.size(); batch_begin += batch_entries) {
+        const size_t batch_end = std::min(sorted.size(), batch_begin + batch_entries);
+        // Group only truly adjacent expert ids. Their slices are contiguous in
+        // the package, so one larger pread can feed every entry in the run.
+        for (uint8_t component = 0; component < 4; component++) {
+            size_t begin = batch_begin;
+            while (begin < batch_end) {
+                if (component_buffer(*sorted[begin], component).empty()) {
+                    ++begin;
+                    continue;
+                }
+                size_t end = begin + 1;
+                while (end < batch_end &&
+                       !component_buffer(*sorted[end], component).empty() &&
+                       sorted[end]->expert == sorted[end - 1]->expert + 1) {
+                    ++end;
+                }
+                IoJob job;
+                job.component = component;
+                job.entries.assign(sorted.begin() + static_cast<ptrdiff_t>(begin),
+                                   sorted.begin() + static_cast<ptrdiff_t>(end));
+                for (Entry* entry : job.entries) ++entry->pending_reads;
+                io_jobs_.push_back(std::move(job));
+                begin = end;
+            }
+        }
+    }
+}
+
+bool MoeSsdCache::read_job(const IoJob& job) {
+    if (job.entries.empty()) return false;
+    const size_t bytes_per_entry = component_buffer(*job.entries.front(), job.component).size();
+    if (bytes_per_entry == 0) return true;
+    const uint64_t offset = component_offset(*job.entries.front(), job.component);
+    if (job.entries.size() == 1) {
+        std::vector<uint8_t>& dst = component_buffer(*job.entries.front(), job.component);
+        return read_exact(offset, dst.data(), dst.size());
+    }
+
+    std::vector<uint8_t> merged(bytes_per_entry * job.entries.size());
+    if (!read_exact(offset, merged.data(), merged.size())) return false;
+    for (size_t i = 0; i < job.entries.size(); i++) {
+        std::vector<uint8_t>& dst = component_buffer(*job.entries[i], job.component);
+        std::memcpy(dst.data(), merged.data() + i * bytes_per_entry, bytes_per_entry);
+    }
+    return true;
 }
 
 void MoeSsdCache::io_worker_main() {
@@ -262,16 +340,21 @@ void MoeSsdCache::io_worker_main() {
             std::unique_lock<std::mutex> lock(mutex_);
             io_cv_.wait(lock, [&] { return stop_io_ || !io_jobs_.empty(); });
             if (stop_io_ && io_jobs_.empty()) return;
-            job = io_jobs_.front();
+            job = std::move(io_jobs_.front());
             io_jobs_.pop_front();
         }
-        bool ok = job.entry && read_entry(*job.entry);
+        bool ok = read_job(job);
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            job.entry->loading = false;
-            job.entry->ready = ok;
-            job.entry->failed = !ok;
-            if (ok) bytes_read_ += job.entry->bytes();
+            for (Entry* entry : job.entries) {
+                if (entry->pending_reads > 0) --entry->pending_reads;
+                if (!ok) entry->failed = true;
+                if (entry->pending_reads == 0) {
+                    entry->loading = false;
+                    entry->ready = !entry->failed;
+                    if (entry->ready) bytes_read_ += entry->bytes();
+                }
+            }
         }
         ready_cv_.notify_all();
     }
@@ -304,7 +387,7 @@ bool MoeSsdCache::request_many(const MoeSsdTensorSource* gate_up,
         return false;
     }
     std::vector<uint8_t> seen((size_t)gate_up->spec.num_experts, 0);
-    bool queued = false;
+    std::vector<Entry*> queued_entries;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (int expert : experts) {
@@ -319,12 +402,12 @@ bool MoeSsdCache::request_many(const MoeSsdTensorSource* gate_up,
             // Do not reserve beyond the per-layer byte budget. acquire() will
             // submit this expert later after an in-flight slot becomes ready.
             if (!entry) continue;
-            io_jobs_.push_back({entry});
             ++misses_;
-            queued = true;
+            queued_entries.push_back(entry);
         }
+        enqueue_entry_reads_locked(queued_entries);
     }
-    if (queued) io_cv_.notify_all();
+    if (!queued_entries.empty()) io_cv_.notify_all();
     return true;
 }
 
@@ -354,10 +437,10 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
     while (!entry) {
         entry = reserve_entry_locked(gate_up, down, expert);
         if (entry) {
-            io_jobs_.push_back({entry});
             ++misses_;
+            enqueue_entry_reads_locked({entry});
             lock.unlock();
-            io_cv_.notify_one();
+            io_cv_.notify_all();
             lock.lock();
             break;
         }

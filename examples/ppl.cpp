@@ -22,7 +22,7 @@ struct Options {
     int threads = 4;
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     int ssd_cache_mb = 0;
-    int ssd_io_workers = 4;
+    int ssd_io_workers = 8;
     bool prepend_bos = false;
     bool tokenize_only = false;
     Device device = Device::CPU;
@@ -54,7 +54,7 @@ void print_usage(const char* argv0) {
     std::printf("  --threads <int>       Worker threads (default 4)\n");
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>  CPU MoE SSD cache capacity\n");
-    std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 4)\n");
+    std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --prepend-bos         Prepend tokenizer BOS before scoring\n");
     std::printf("  --tokenize-only       Print token ids and exit before running the model\n");
 }

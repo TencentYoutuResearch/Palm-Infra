@@ -24,7 +24,7 @@ struct CliCommonOptions {
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     bool load_warmup = true;     // touch mmap'd package weights after load
     int ssd_cache_mb = 0;        // >0: page routed MoE experts from package
-    int ssd_io_workers = 4;      // dedicated pread workers for MoE SSD cache
+    int ssd_io_workers = 8;      // dedicated pread workers for MoE SSD cache
 
     // Sampling
     float temperature = 0.6f;

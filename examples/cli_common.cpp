@@ -201,7 +201,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --device <cpu|metal>     Compute backend (metal requires MOLLM_METAL build)\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache capacity; disables package warmup\n");
-    std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 4)\n");
+    std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load when using mmap\n");
     std::printf("  --no-load-warmup        Skip mmap page-in warmup\n");
     std::printf("  --warmup <int>            Default: 1 (used by benchmark)\n");

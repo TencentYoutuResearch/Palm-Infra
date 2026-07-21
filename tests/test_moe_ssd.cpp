@@ -73,6 +73,35 @@ int main() {
         check(stats.bytes_read == 24, "pread byte accounting");
     }
 
+    // With room for all three pairs, request adjacent experts together. This
+    // exercises the coalesced component reads: each component run is read as
+    // one contiguous range, then scattered back to the individual tensors.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 24, 8), "open coalesced async cache");
+        check(cache.add_source(spec("gate", 0)), "add coalesced gate source");
+        check(cache.add_source(spec("down", 6 * sizeof(uint16_t))),
+              "add coalesced down source");
+        const MoeSsdTensorSource* gate = cache.find_source("gate");
+        const MoeSsdTensorSource* down = cache.find_source("down");
+        check(gate && down, "find coalesced sources");
+        check(cache.request_many(gate, down, {0, 1, 2}),
+              "queue adjacent coalesced expert requests");
+
+        Tensor gu, dw;
+        check(cache.acquire(gate, down, 0, gu, dw), "acquire coalesced expert zero");
+        check(static_cast<const uint16_t*>(gu.data)[0] == 0x3c00 &&
+              static_cast<const uint16_t*>(dw.data)[1] == 0x4800,
+              "coalesced expert zero bytes match");
+        check(cache.acquire(gate, down, 2, gu, dw), "acquire coalesced expert two");
+        check(static_cast<const uint16_t*>(gu.data)[0] == 0x4500 &&
+              static_cast<const uint16_t*>(dw.data)[1] == 0x4c00,
+              "coalesced expert two bytes match");
+        MoeSsdCache::Stats stats = cache.stats();
+        check(stats.misses == 3 && stats.bytes_read == 24,
+              "coalesced reads preserve miss and byte accounting");
+    }
+
     // A one-entry cache cannot enqueue all requested experts at once. Verify
     // that the deferred requests are scheduled as earlier reads complete,
     // rather than blocking the caller before any compute can overlap them.

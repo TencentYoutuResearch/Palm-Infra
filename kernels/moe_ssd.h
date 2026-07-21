@@ -59,7 +59,7 @@ public:
     MoeSsdCache& operator=(const MoeSsdCache&) = delete;
 
     bool open(const std::string& package_path, size_t capacity_bytes,
-              int io_workers = 4);
+              int io_workers = 8);
     bool add_source(const MoeSsdTensorSpec& spec);
     const MoeSsdTensorSource* find_source(const std::string& weight_ref) const;
 
@@ -85,7 +85,13 @@ public:
 
 private:
     struct Entry;
-    struct IoJob { Entry* entry = nullptr; };
+    // One job reads a physically contiguous run of the same component
+    // (gate data/scales or down data/scales) for adjacent expert ids. Keeping
+    // components separate exposes a deep queue even for a single decode token.
+    struct IoJob {
+        std::vector<Entry*> entries;
+        uint8_t component = 0;
+    };
 
     bool valid_pair(const MoeSsdTensorSource* gate_up,
                     const MoeSsdTensorSource* down,
@@ -94,7 +100,12 @@ private:
                              const MoeSsdTensorSource* down, int expert);
     Entry* reserve_entry_locked(const MoeSsdTensorSource* gate_up,
                                 const MoeSsdTensorSource* down, int expert);
-    bool read_entry(Entry& entry);
+    static std::vector<uint8_t>& component_buffer(Entry& entry, uint8_t component);
+    static const std::vector<uint8_t>& component_buffer(const Entry& entry,
+                                                        uint8_t component);
+    static uint64_t component_offset(const Entry& entry, uint8_t component);
+    void enqueue_entry_reads_locked(const std::vector<Entry*>& entries);
+    bool read_job(const IoJob& job);
     bool read_exact(uint64_t offset, void* dst, size_t bytes) const;
     void io_worker_main();
     void stop_io_workers();
@@ -103,6 +114,7 @@ private:
                               const std::vector<uint8_t>& scales);
 
     int fd_ = -1;
+    int io_workers_count_ = 0;
     size_t capacity_bytes_ = 0;
     size_t resident_bytes_ = 0;
     uint64_t clock_ = 0;

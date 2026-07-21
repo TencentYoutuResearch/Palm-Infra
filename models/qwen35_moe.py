@@ -519,7 +519,8 @@ def convert_qwen35_moe(model_dir: str, output_path: str, num_layers: int | None 
         print(f"\nPacking {output_path}...")
         save_package(output_path, g_prefill, g_decode, weights_dir, metadata,
                      tokenizer_path=str(model_dir / "tokenizer.json"),
-                     jinja_path=str(model_dir / "chat_template.jinja"))
+                     jinja_path=str(model_dir / "chat_template.jinja"),
+                     remove_weight_files=True)
         print(f"\nDone! Output: {output_path}")
     finally:
         shutil.rmtree(tmp_dir)

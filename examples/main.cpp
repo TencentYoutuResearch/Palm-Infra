@@ -1,6 +1,7 @@
 #include "examples/cli_common.h"
 
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -8,6 +9,12 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#define MOLLM_HAVE_POSIX_TTY 1
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -19,6 +26,162 @@ static const char* const kMollmLogo = R"(
 | | | | | | (_) | | | | | | | |
 |_| |_| |_|\___/|_|_|_| |_| |_|
 )";
+
+uint32_t decode_utf8_codepoint(const std::string& text, size_t offset) {
+    const auto byte = [&](size_t i) { return static_cast<unsigned char>(text[offset + i]); };
+    const unsigned char first = byte(0);
+    if (first < 0x80) return first;
+    const int length = first < 0xe0 ? 2 : first < 0xf0 ? 3 : first < 0xf8 ? 4 : 1;
+    if (length == 1) return first;
+    if (offset + static_cast<size_t>(length) > text.size()) return first;
+    uint32_t codepoint = first & ((1u << (7 - length)) - 1);
+    for (int i = 1; i < length; ++i) {
+        const unsigned char next = byte(static_cast<size_t>(i));
+        if ((next & 0xc0) != 0x80) return first;
+        codepoint = (codepoint << 6) | (next & 0x3f);
+    }
+    return codepoint;
+}
+
+int terminal_columns(uint32_t codepoint) {
+    // Zero-width combining marks, followed by the common East Asian wide and
+    // emoji ranges. This is intentionally local: input editing should not
+    // depend on the process locale being configured before main().
+    if (codepoint == 0 || (codepoint >= 0x0300 && codepoint <= 0x036f) ||
+        (codepoint >= 0x200b && codepoint <= 0x200f) ||
+        (codepoint >= 0xfe00 && codepoint <= 0xfe0f)) {
+        return 0;
+    }
+    if ((codepoint >= 0x1100 && codepoint <= 0x115f) ||
+        (codepoint >= 0x2329 && codepoint <= 0x232a) ||
+        (codepoint >= 0x2e80 && codepoint <= 0xa4cf) ||
+        (codepoint >= 0xac00 && codepoint <= 0xd7a3) ||
+        (codepoint >= 0xf900 && codepoint <= 0xfaff) ||
+        (codepoint >= 0xfe10 && codepoint <= 0xfe6f) ||
+        (codepoint >= 0xff00 && codepoint <= 0xffe6) ||
+        (codepoint >= 0x1f300 && codepoint <= 0x1faff) ||
+        (codepoint >= 0x20000 && codepoint <= 0x3fffd)) {
+        return 2;
+    }
+    return 1;
+}
+
+void erase_terminal_columns(int columns) {
+    while (columns-- > 0) std::fputs("\b \b", stdout);
+    std::fflush(stdout);
+}
+
+// The terminal's canonical editor is allowed to erase UTF-8 one byte at a
+// time, and in practice several terminal/PTY combinations still display a
+// residue for CJK input.  REPL input is small, so handle it directly: retain
+// normal signal handling, but echo and erase complete UTF-8 code points.
+class TerminalLineReader {
+public:
+#if defined(MOLLM_HAVE_POSIX_TTY)
+    TerminalLineReader() {
+        if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &original_) != 0) {
+            return;
+        }
+        termios updated = original_;
+        // Handle Ctrl-C below instead of letting a signal terminate us while
+        // the terminal is in raw mode (which would leave the caller's shell
+        // without canonical input restoration).
+        updated.c_lflag &= ~(ICANON | ECHO | ISIG);
+        updated.c_cc[VMIN] = 1;
+        updated.c_cc[VTIME] = 0;
+        active_ = tcsetattr(STDIN_FILENO, TCSANOW, &updated) == 0;
+    }
+
+    ~TerminalLineReader() {
+        if (active_) tcsetattr(STDIN_FILENO, TCSANOW, &original_);
+    }
+#else
+    TerminalLineReader() = default;
+#endif
+
+    TerminalLineReader(const TerminalLineReader&) = delete;
+    TerminalLineReader& operator=(const TerminalLineReader&) = delete;
+
+    bool read_line(std::string& line) {
+#if !defined(MOLLM_HAVE_POSIX_TTY)
+        return static_cast<bool>(std::getline(std::cin, line));
+#else
+        if (!active_) return static_cast<bool>(std::getline(std::cin, line));
+        line.clear();
+        int escape_state = 0;
+        for (;;) {
+            char raw = 0;
+            const ssize_t read_bytes = read(STDIN_FILENO, &raw, 1);
+            if (read_bytes == 0) return false;
+            if (read_bytes < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            const unsigned char byte = static_cast<unsigned char>(raw);
+            if (escape_state != 0) {
+                if (escape_state == 1 && (byte == '[' || byte == 'O')) {
+                    escape_state = 2;
+                } else if (escape_state == 2 && byte >= 0x40 && byte <= 0x7e) {
+                    escape_state = 0;
+                } else {
+                    escape_state = 0;
+                }
+                continue;
+            }
+            if (byte == 0x1b) {
+                escape_state = 1;  // Ignore cursor-key escape sequences.
+                continue;
+            }
+            if (byte == '\r' || byte == '\n') {
+                std::fputs("\r\n", stdout);
+                std::fflush(stdout);
+                return true;
+            }
+            if (byte == 0x03) {  // Ctrl-C
+                std::fputs("^C\r\n", stdout);
+                std::fflush(stdout);
+                return false;
+            }
+            if (byte == 0x04) return !line.empty();  // Ctrl-D
+            if (byte == 0x08 || byte == 0x7f) {
+                if (line.empty()) continue;
+                size_t begin = line.size() - 1;
+                while (begin > 0 &&
+                       (static_cast<unsigned char>(line[begin]) & 0xc0) == 0x80) {
+                    --begin;
+                }
+                const int columns = terminal_columns(decode_utf8_codepoint(line, begin));
+                line.erase(begin);
+                erase_terminal_columns(columns);
+                continue;
+            }
+            if (byte == 0x15) {  // Ctrl-U
+                while (!line.empty()) {
+                    size_t begin = line.size() - 1;
+                    while (begin > 0 &&
+                           (static_cast<unsigned char>(line[begin]) & 0xc0) == 0x80) {
+                        --begin;
+                    }
+                    const int columns = terminal_columns(decode_utf8_codepoint(line, begin));
+                    line.erase(begin);
+                    erase_terminal_columns(columns);
+                }
+                continue;
+            }
+            if (byte < 0x20) continue;
+            line.push_back(raw);
+            std::fputc(raw, stdout);
+            std::fflush(stdout);
+        }
+#endif
+    }
+
+private:
+#if defined(MOLLM_HAVE_POSIX_TTY)
+    termios original_{};
+    bool active_ = false;
+#endif
+};
 
 // Print one banner line " key      : value" only if value is non-empty.
 void banner_kv(const char* key, const std::string& value) {
@@ -273,6 +436,7 @@ int main(int argc, char** argv) {
 
     // REPL mode: multi-turn conversation
     print_repl_banner(engine, opts.n_ctx);
+    TerminalLineReader line_reader;
 
     std::vector<ChatMessage> history;
     std::vector<int> cached_token_ids;
@@ -281,7 +445,7 @@ int main(int argc, char** argv) {
     while (true) {
         std::printf("\n> ");
         std::fflush(stdout);
-        if (!std::getline(std::cin, line)) break;
+        if (!line_reader.read_line(line)) break;
         if (line.empty()) continue;
         if (line == "/quit" || line == "/exit") break;
         if (line == "/reset") {
