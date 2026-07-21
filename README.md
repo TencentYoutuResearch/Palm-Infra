@@ -2,6 +2,8 @@
 
 AI Infra projects from Palm Team. Currently includes `mollm`.
 
+[中文文档](README_zh.md)
+
 ## mollm
 
 ```
