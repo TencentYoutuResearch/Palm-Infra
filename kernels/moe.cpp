@@ -1,5 +1,6 @@
 #include "kernels/moe.h"
 #include "kernels/matmul.h"
+#include "kernels/moe_ssd.h"
 #include "kernels/threading.h"
 
 #include <algorithm>
@@ -255,7 +256,11 @@ static bool validate_inputs(const std::vector<const Tensor*>& inputs,
         return false;
     }
     for (size_t i = 0; i < required_inputs; i++) {
-        if (!inputs[i] || !inputs[i]->data) {
+        // Routed expert aggregates may intentionally be data-less: the SSD
+        // cache supplies one selected expert pair at a time.
+        bool is_ssd_expert = (i == 2 || i == 3) && inputs[i] &&
+                             inputs[i]->moe_ssd_source != nullptr;
+        if (!inputs[i] || (!inputs[i]->data && !is_ssd_expert)) {
             std::fprintf(stderr, "MOE: missing input %zu\n", i);
             return false;
         }
@@ -383,6 +388,16 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     const Tensor& router = *inputs[1];
     const Tensor& experts_gate_up = *inputs[2];
     const Tensor& experts_down = *inputs[3];
+    const auto* gate_up_source = static_cast<const MoeSsdTensorSource*>(
+        experts_gate_up.moe_ssd_source);
+    const auto* down_source = static_cast<const MoeSsdTensorSource*>(
+        experts_down.moe_ssd_source);
+    const bool use_ssd = gate_up_source || down_source;
+    if (use_ssd && (!gate_up_source || !down_source ||
+                    gate_up_source->cache != down_source->cache)) {
+        std::fprintf(stderr, "MOE: incomplete SSD expert source pair\n");
+        return;
+    }
     const Tensor* router_bias = inputs.size() > 8 ? inputs[8] : nullptr;
     const Tensor* shared_gate = has_shared_expert ? inputs[4] : nullptr;
     const Tensor* shared_up = has_shared_expert ? inputs[5] : nullptr;
@@ -521,6 +536,25 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     }
     if (profile) moe_profile_add(MoeProfileStage::TopK, stage_start);
 
+    if (use_ssd) {
+        std::vector<int> selected_experts;
+        selected_experts.reserve((size_t)seq_len * (size_t)top_k);
+        for (int t = 0; t < seq_len; t++) {
+            for (int k = 0; k < top_k; k++) {
+                selected_experts.push_back(top_idx[(size_t)t * top_k + k]);
+            }
+        }
+        // Queue all cache misses before shared-expert work. The I/O workers
+        // can now fill them while this CPU thread executes the independent
+        // shared MLP below; acquire() only waits for a particular expert when
+        // its routed matmul is about to run.
+        if (!gate_up_source->cache->request_many(gate_up_source, down_source,
+                                                  selected_experts)) {
+            std::fprintf(stderr, "MOE: failed to queue SSD expert reads\n");
+            return;
+        }
+    }
+
     // Shared expert: shared_down(silu(shared_gate(x)) * shared_up(x))
     // multiplied by sigmoid(shared_expert_gate(x)).
     if (has_shared_expert) {
@@ -610,12 +644,24 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
 
         Tensor gate_up_b;
         Tensor down_b;
-        bool has_gate_up_view = make_weight_rows_view(
-            experts_gate_up, (int64_t)e * (2 * intermediate_size),
-            2 * intermediate_size, hidden_size, gate_up_b);
-        bool has_down_view = make_weight_rows_view(
-            experts_down, (int64_t)e * hidden_size,
-            hidden_size, intermediate_size, down_b);
+        bool has_gate_up_view = false;
+        bool has_down_view = false;
+        if (use_ssd) {
+            if (!gate_up_source->cache->acquire(gate_up_source, down_source, e,
+                                                gate_up_b, down_b)) {
+                std::fprintf(stderr, "MOE: failed to page in expert %d\n", e);
+                return;
+            }
+            has_gate_up_view = true;
+            has_down_view = true;
+        } else {
+            has_gate_up_view = make_weight_rows_view(
+                experts_gate_up, (int64_t)e * (2 * intermediate_size),
+                2 * intermediate_size, hidden_size, gate_up_b);
+            has_down_view = make_weight_rows_view(
+                experts_down, (int64_t)e * hidden_size,
+                hidden_size, intermediate_size, down_b);
+        }
 
         if (!has_gate_up_view || !has_down_view) {
             for (int i = 0; i < count; i++) {

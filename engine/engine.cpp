@@ -1,5 +1,6 @@
 #include "engine/engine.h"
 #include "kernels/matmul.h"
+#include "kernels/moe_ssd.h"
 #ifdef MOLLM_METAL
 #include "engine/metal_backend.h"
 // Downcast the owned Backend* to MetalBackend* (non-null iff Metal active).
@@ -753,6 +754,29 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             auto pit = package_weight_map_.find(wref);
             if (pit == package_weight_map_.end()) pit = package_weight_map_.find(wpath);
             if (pit != package_weight_map_.end()) {
+                const MoeSsdTensorSource* ssd_source = nullptr;
+                if (moe_ssd_cache_) {
+                    ssd_source = moe_ssd_cache_->find_source(wref);
+                    if (!ssd_source) ssd_source = moe_ssd_cache_->find_source(wpath);
+                }
+                if (ssd_source) {
+                    if (node.out_shape[0] != (int64_t)ssd_source->spec.rows *
+                                             ssd_source->spec.num_experts ||
+                        node.out_shape[1] != ssd_source->spec.cols) {
+                        fprintf(stderr, "Engine: MoE SSD shape mismatch for %s\n",
+                                wref.c_str());
+                        return false;
+                    }
+                    setup_weight(nullptr, ssd_source->spec.precision);
+                    t.moe_ssd_source = ssd_source;
+                    t.group_size = ssd_source->spec.group_size;
+                    t.groups_per_row = ssd_source->spec.groups_per_row;
+                    t.num_groups = static_cast<uint32_t>(node.out_shape[0]) *
+                                   ssd_source->spec.groups_per_row;
+                    // Do not set data/scales or invoke load-time packing: that
+                    // would fault or duplicate every routed expert tensor.
+                    continue;
+                }
                 const uint8_t* hdr = package_weights_base_ + pit->second.first;
                 // Read data_offset from weight header (byte 48, 8 bytes)
                 uint32_t flags = 0;
@@ -1065,6 +1089,16 @@ void LLMEngine::reset_profiles() {
 bool LLMEngine::load(const EngineConfig& cfg) {
     cfg_ = cfg;
     cfg_.num_threads = std::max(cfg_.num_threads, 1);
+    moe_ssd_cache_.reset();
+    if (cfg_.moe_ssd_cache_bytes != 0) {
+        if (cfg_.device != Device::CPU) {
+            fprintf(stderr, "Engine: MoE SSD offload is currently CPU-only\n");
+            return false;
+        }
+        // Expert tensors must remain unmaterialized; resident package loading
+        // would copy the complete aggregate tensors before the cache can help.
+        cfg_.weight_loading = WeightLoadingMode::MMAP;
+    }
     caches_.clear();
     embed_weight_ = nullptr;
     lm_head_weight_ = nullptr;
@@ -1922,6 +1956,72 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                     }
                     package_weight_map_[name] = {off, sz};
                 }
+            }
+            if (cfg_.moe_ssd_cache_bytes != 0) {
+                auto storage_it = meta.find("moe_expert_storage");
+                if (storage_it == meta.end() || !storage_it->is_object() ||
+                    !storage_it->contains("layers") || !(*storage_it)["layers"].is_array()) {
+                    fprintf(stderr,
+                            "Engine: --ssd-cache-mb requires package MoE expert storage metadata\n");
+                    return false;
+                }
+                auto cache = std::make_unique<MoeSsdCache>();
+                if (!cache->open(path, cfg_.moe_ssd_cache_bytes,
+                                 cfg_.moe_ssd_io_workers)) return false;
+                size_t source_count = 0;
+                for (const auto& layer : (*storage_it)["layers"]) {
+                    if (!layer.is_object()) {
+                        fprintf(stderr, "Engine: bad MoE expert layer metadata\n");
+                        return false;
+                    }
+                    int layer_index = layer.value("layer", -1);
+                    int num_experts = layer.value("num_experts",
+                                                  storage_it->value("num_experts", 0));
+                    for (const char* name : {"gate_up", "down"}) {
+                        if (!layer.contains(name) || !layer[name].is_object()) {
+                            fprintf(stderr, "Engine: missing MoE %s storage metadata\n", name);
+                            return false;
+                        }
+                        const auto& item = layer[name];
+                        MoeSsdTensorSpec spec;
+                        spec.weight_ref = item.value("weight", std::string());
+                        spec.layer = layer_index;
+                        spec.num_experts = num_experts;
+                        spec.rows = item.value("rows_per_expert", 0);
+                        spec.cols = item.value("cols", 0);
+                        spec.precision = static_cast<Precision>(item.value("precision", 99u));
+                        spec.flags = item.value("flags", 0u);
+                        spec.group_size = item.value("group_size", 0u);
+                        spec.groups_per_row = item.value("groups_per_row", 0u);
+                        uint64_t weight_offset = item.value("weight_offset", uint64_t{0});
+                        uint64_t data_offset = item.value("data_offset", uint64_t{0});
+                        uint64_t data_bytes = item.value("expert_data_bytes", uint64_t{0});
+                        uint64_t scales_offset = item.value("scales_offset", uint64_t{0});
+                        uint64_t scales_bytes = item.value("expert_scales_bytes", uint64_t{0});
+                        uint64_t all_data = data_bytes * static_cast<uint64_t>(num_experts);
+                        uint64_t all_scales = scales_bytes * static_cast<uint64_t>(num_experts);
+                        if (weight_offset > ph.w_len || data_offset > ph.w_len - weight_offset ||
+                            all_data > ph.w_len - weight_offset - data_offset ||
+                            (scales_bytes && (scales_offset > ph.w_len - weight_offset ||
+                             all_scales > ph.w_len - weight_offset - scales_offset))) {
+                            fprintf(stderr, "Engine: MoE expert range out of package bounds for %s\n",
+                                    spec.weight_ref.c_str());
+                            return false;
+                        }
+                        spec.data_offset = ph.w_off + weight_offset + data_offset;
+                        spec.data_bytes = data_bytes;
+                        spec.scales_offset = scales_bytes
+                            ? ph.w_off + weight_offset + scales_offset : 0;
+                        spec.scales_bytes = scales_bytes;
+                        if (!cache->add_source(spec)) return false;
+                        ++source_count;
+                    }
+                }
+                if (source_count == 0) {
+                    fprintf(stderr, "Engine: package has no MoE expert storage entries\n");
+                    return false;
+                }
+                moe_ssd_cache_ = std::move(cache);
             }
             // Retain all top-level scalar fields for CLI banner / display.
             // Skip "weights" (object) and any non-scalar. ints/bools are stringified.

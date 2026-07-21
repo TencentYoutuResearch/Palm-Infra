@@ -117,6 +117,18 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             }
         } else if (arg == "--mmap") {
             opts.weight_loading = WeightLoadingMode::MMAP;
+        } else if (arg == "--ssd-cache-mb") {
+            if (!require_value(argc, argv, i, "--ssd-cache-mb", value, error)) return false;
+            if (!parse_int(value, opts.ssd_cache_mb) || opts.ssd_cache_mb < 1) {
+                error = "invalid value for --ssd-cache-mb";
+                return false;
+            }
+        } else if (arg == "--ssd-io-workers") {
+            if (!require_value(argc, argv, i, "--ssd-io-workers", value, error)) return false;
+            if (!parse_int(value, opts.ssd_io_workers) || opts.ssd_io_workers < 1) {
+                error = "invalid value for --ssd-io-workers";
+                return false;
+            }
         } else if (arg == "--load-warmup") {
             opts.load_warmup = true;
         } else if (arg == "--no-load-warmup") {
@@ -162,6 +174,12 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         error = "missing required --package <file.mollm>";
         return false;
     }
+    if (opts.ssd_cache_mb > 0) {
+        // SSD offload uses explicit pread() rather than touching aggregate
+        // expert mappings. Warming all package pages would defeat it.
+        opts.weight_loading = WeightLoadingMode::MMAP;
+        opts.load_warmup = false;
+    }
 
     return true;
 }
@@ -182,6 +200,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
     std::printf("  --device <cpu|metal>     Compute backend (metal requires MOLLM_METAL build)\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
+    std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache capacity; disables package warmup\n");
+    std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 4)\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load when using mmap\n");
     std::printf("  --no-load-warmup        Skip mmap page-in warmup\n");
     std::printf("  --warmup <int>            Default: 1 (used by benchmark)\n");
@@ -210,6 +230,8 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.static_padded = opts.static_padded;
     cfg.device = opts.device;
     cfg.weight_loading = opts.weight_loading;
+    cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
+    cfg.moe_ssd_io_workers = opts.ssd_io_workers;
     return cfg;
 }
 

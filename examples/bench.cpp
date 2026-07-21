@@ -130,6 +130,15 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
     std::printf("decode_ms=%.2f\n", result.decode_ms);
     std::printf("total_ms=%.2f\n", total_ms);
     std::printf("peak_rss_mb=%.1f\n", peak_rss_mb());
+    if (engine.moe_ssd_offload_enabled()) {
+        auto ssd = engine.moe_ssd_stats();
+        std::printf("moe_ssd_cache_mb=%.1f\n", engine.config().moe_ssd_cache_bytes / 1e6);
+        std::printf("moe_ssd_io_workers=%d\n", engine.config().moe_ssd_io_workers);
+        std::printf("moe_ssd_hits=%llu moe_ssd_misses=%llu moe_ssd_evictions=%llu moe_ssd_read_mb=%.1f moe_ssd_resident_mb=%.1f\n",
+                    (unsigned long long)ssd.hits, (unsigned long long)ssd.misses,
+                    (unsigned long long)ssd.evictions, ssd.bytes_read / 1e6,
+                    ssd.resident_bytes / 1e6);
+    }
     {
         auto pre = engine.prefill_pool_stats();
         auto dec = engine.decode_pool_stats();
@@ -186,6 +195,15 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
     human_row("load_warmup_ms", load_warmup_ms,           "ms");
     human_row("load_warmup_mb", load_warmup_bytes / 1e6,  "MB");
     human_row_int("threads", engine.config().num_threads, "");
+    if (engine.moe_ssd_offload_enabled()) {
+        auto ssd = engine.moe_ssd_stats();
+        human_row("moe_ssd_cache_mb", engine.config().moe_ssd_cache_bytes / 1e6, "MB");
+        human_row_int("moe_ssd_io_workers", engine.config().moe_ssd_io_workers, "");
+        human_row_int("moe_ssd_hits", (long long)ssd.hits, "");
+        human_row_int("moe_ssd_misses", (long long)ssd.misses, "");
+        human_row_int("moe_ssd_evictions", (long long)ssd.evictions, "");
+        human_row("moe_ssd_read_mb", ssd.bytes_read / 1e6, "MB");
+    }
 
     // prefill section
     std::printf("%s\n", kSepLight);
@@ -339,6 +357,7 @@ int main(int argc, char** argv) {
     mollm_reset_pack_counters();
     mollm_reset_matmul_shape_profile();
     mollm_reset_moe_profile();
+    engine.reset_moe_ssd_stats();
 
     if (opts.profile) {
         engine.reset_profiles();

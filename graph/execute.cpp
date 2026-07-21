@@ -1437,7 +1437,10 @@ void execute_graph(ExecContext& ctx) {
         // dispatch via backend
         ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
 
-        if (getenv("MOLLM_DUMP_NODES") && out.data && out.prec == Precision::FP32) {
+        // Node dumping is an opt-in diagnostic.  Do not probe the process
+        // environment for every graph node in normal inference.
+        static const bool dump_nodes_enabled = getenv("MOLLM_DUMP_NODES") != nullptr;
+        if (dump_nodes_enabled && out.data && out.prec == Precision::FP32) {
             const float* d = (const float*)out.data;
             fprintf(stderr, "NODE %u op=%d shape=%lld,%lld,%lld,%lld  %.5f %.5f %.5f\n",
                     node.id, (int)node.op_type,

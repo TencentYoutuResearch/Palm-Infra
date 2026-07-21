@@ -5,6 +5,7 @@
 #include "engine/backend.h"
 #include "kernels/tensor.h"
 #include "kernels/threading.h"
+#include "kernels/moe_ssd.h"
 
 #include <memory>
 #include <string>
@@ -80,6 +81,10 @@ struct EngineConfig {
     float rope_theta = 500000.f;
     int num_threads = 4;
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
+    // CPU-only MoE expert cache. A non-zero value enables SSD offload for
+    // packages carrying `moe_expert_storage` metadata.
+    size_t moe_ssd_cache_bytes = 0;
+    int moe_ssd_io_workers = 4;
 
     // Sampling params
     float temperature = 0.6f;         // 0 = greedy (argmax)
@@ -182,6 +187,13 @@ public:
     bool package_weights_mmap_backed() const {
         return package_weights_base_ != nullptr && !package_weights_resident_;
     }
+    bool moe_ssd_offload_enabled() const { return moe_ssd_cache_ != nullptr; }
+    MoeSsdCache::Stats moe_ssd_stats() const {
+        return moe_ssd_cache_ ? moe_ssd_cache_->stats() : MoeSsdCache::Stats{};
+    }
+    void reset_moe_ssd_stats() {
+        if (moe_ssd_cache_) moe_ssd_cache_->reset_stats();
+    }
 
     // exposed for testing
     Tensor build_causal_mask(int seq_len, int past_len);
@@ -218,6 +230,8 @@ private:
     std::vector<uint8_t> package_weights_storage_;
     // weight filename → (offset, size) within weights region
     std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> package_weight_map_;
+    // Optional demand-paged storage for routed MoE experts.
+    std::unique_ptr<MoeSsdCache> moe_ssd_cache_;
     // prefill_seq_len from package metadata
     int package_prefill_seq_len_ = 256;
     // Full package-level metadata JSON fields (model_name, architecture,

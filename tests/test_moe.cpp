@@ -1,11 +1,13 @@
 #include "graph/execute.h"
 #include "engine/backend.h"
 #include "kernels/moe.h"
+#include "kernels/moe_ssd.h"
 #include "kernels/tensor.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <limits>
 #include <vector>
 
@@ -223,6 +225,56 @@ int main() {
             fp16_to_float(shared_expert_gate_h),
             ref_h, H, M, E, KTOP, I, SI);
     CHECK(close_enough(out_h, ref_h, 2e-2f), "kernel_qwen3_moe FP16 weights match rounded reference");
+
+    // The SSD route must be numerically identical to the ordinary aggregate
+    // expert path. Write the same FP16 expert slices to a temporary package
+    // stand-in, then leave the aggregate Tensor pointers intentionally null.
+    const char* ssd_path = "/tmp/mollm_test_moe_ssd_e2e.bin";
+    {
+        std::ofstream file(ssd_path, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(experts_gate_up_h.data()),
+                   (std::streamsize)(experts_gate_up_h.size() * sizeof(__fp16)));
+        file.write(reinterpret_cast<const char*>(experts_down_h.data()),
+                   (std::streamsize)(experts_down_h.size() * sizeof(__fp16)));
+    }
+    MoeSsdTensorSpec ssd_gu;
+    ssd_gu.weight_ref = "./gate";
+    ssd_gu.layer = 0;
+    ssd_gu.num_experts = E;
+    ssd_gu.rows = 2 * I;
+    ssd_gu.cols = H;
+    ssd_gu.precision = Precision::FP16;
+    ssd_gu.data_offset = 0;
+    ssd_gu.data_bytes = (uint64_t)(2 * I * H * sizeof(__fp16));
+    MoeSsdTensorSpec ssd_down;
+    ssd_down.weight_ref = "./down";
+    ssd_down.layer = 0;
+    ssd_down.num_experts = E;
+    ssd_down.rows = H;
+    ssd_down.cols = I;
+    ssd_down.precision = Precision::FP16;
+    ssd_down.data_offset = (uint64_t)(experts_gate_up_h.size() * sizeof(__fp16));
+    ssd_down.data_bytes = (uint64_t)(H * I * sizeof(__fp16));
+    MoeSsdCache ssd_cache;
+    CHECK(ssd_cache.open(ssd_path, (size_t)(ssd_gu.data_bytes + ssd_down.data_bytes)),
+          "open MoE SSD numerical cache");
+    CHECK(ssd_cache.add_source(ssd_gu) && ssd_cache.add_source(ssd_down),
+          "register MoE SSD numerical sources");
+    Tensor gu_ssd = gu_ht;
+    Tensor down_ssd = down_ht;
+    gu_ssd.data = nullptr;
+    down_ssd.data = nullptr;
+    gu_ssd.moe_ssd_source = ssd_cache.find_source("./gate");
+    down_ssd.moe_ssd_source = ssd_cache.find_source("./down");
+    std::vector<float> out_ssd(H * M, 0.0f);
+    Tensor out_ssd_t = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                      H, M, 1, 1, out_ssd.data());
+    std::vector<const Tensor*> inputs_ssd = {
+        &hidden_t, &router_ht, &gu_ssd, &down_ssd, &sg_ht, &su_ht, &sd_ht, &seg_ht,
+    };
+    kernel_qwen3_moe(inputs_ssd, out_ssd_t, nullptr, H, E, KTOP, I, SI);
+    CHECK(close_enough(out_ssd, ref_h, 2e-2f), "MoE SSD expert paging matches FP16 reference");
+    std::remove(ssd_path);
 
     // Exercise graph dispatch/allocation path.
     Graph g;
