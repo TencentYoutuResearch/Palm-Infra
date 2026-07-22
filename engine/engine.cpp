@@ -819,6 +819,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.shape[3] = node.out_shape[3];
             t.compute_strides();
             t.data = data;
+            t.rowmajor_data = data;
             t.mem_type = MemoryType::EXTERNAL;
             t.is_interleaved = false;
             t.is_q4_repacked = false;

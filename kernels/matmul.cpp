@@ -11,6 +11,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Post-hoc activation helpers (used by FP32 acc fallback kernels + standard
 // FP32 path + parallel M-sharded paths that can't fuse activation into their
@@ -4121,6 +4125,52 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     //   - FP16 accumulate: vfmaq_lane_f16 (2x throughput, default)
     //   - FP32 widen accumulate: vfmlalq_laneq_f16 (precision fallback)
     // - M <  8: scalar-A kernel (vfmaq_n_f32, only B packed) — GEMV path
+    // Accelerate's SGEMM reaches the Apple AMX path for large prefill
+    // matrices. Like llama.cpp's BLAS backend, convert the immutable FP16
+    // weight to a temporary FP32 plane per call. mollm's NEON kernel wins for
+    // short prompts; model-level sweeps put the crossover at roughly M=96.
+#if defined(__APPLE__)
+    static const bool accelerate_gemm = !env_flag_enabled("MOLLM_NO_ACCELERATE_GEMM");
+    static const int accelerate_min_m=env_int_or("MOLLM_ACCELERATE_GEMM_MIN_M",96);
+    if(accelerate_gemm && is_fp16 && B.rowmajor_data &&
+       M>=accelerate_min_m && N>=32 && K>=32) {
+        int n_threads=thread_pool?thread_pool->num_threads():1;
+        _timer.set_shape("accelerate_sgemm",M,N,K,0,0,false,false,n_threads);
+        const __fp16* src=reinterpret_cast<const __fp16*>(B.rowmajor_data);
+        std::vector<float> bf((size_t)N*K);
+        auto convert_rows=[&](int,int begin,int end) {
+            for(int n=begin;n<end;++n) {
+                const __fp16* in=src+(size_t)n*K;
+                float* out=bf.data()+(size_t)n*K;
+                int k=0;
+#if HAS_NEON
+                for(;k+7<K;k+=8) {
+                    float16x8_t h=vld1q_f16(in+k);
+                    vst1q_f32(out+k,vcvt_f32_f16(vget_low_f16(h)));
+                    vst1q_f32(out+k+4,vcvt_f32_f16(vget_high_f16(h)));
+                }
+#endif
+                for(;k<K;++k) out[k]=(float)in[k];
+            }
+        };
+        if(thread_pool&&n_threads>1) {
+            int chunk=std::max(1,(N+n_threads-1)/n_threads);
+            thread_pool->parallel_for(0,N,chunk,convert_rows);
+        } else convert_rows(0,0,N);
+        cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasTrans,
+                    M,N,K,1.f,a_ptr,lda,bf.data(),K,0.f,c_ptr,ldc);
+        if(act!=Activation::NONE&&act_n_len!=0) {
+            if(thread_pool&&n_threads>1) {
+                int chunk=std::max(1,(M+n_threads-1)/n_threads);
+                thread_pool->parallel_for(0,M,chunk,[&](int,int begin,int end) {
+                    apply_activation_to_range(c_ptr,M,N,ldc,begin,end,
+                                              act,act_n_begin,act_n_len);
+                });
+            } else apply_activation_to_range(c_ptr,M,N,ldc,0,M,act,act_n_begin,act_n_len);
+        }
+        return;
+    }
+#endif
     bool use_interleave = is_fp16 && HAS_NEON && !is_repacked
                        && g_matmul_config.use_interleave_pack;
     bool use_lane_fma = use_interleave && (M >= 8);
