@@ -325,9 +325,7 @@ void prepare_execution(ExecContext& ctx) {
         if (node.op_type == OpType::SDPA || node.op_type == OpType::SDPA_MLA ||
             node.op_type == OpType::GATED_DELTANET_PREFILL ||
             node.op_type == OpType::GATED_DELTANET_DECODE ||
-            node.op_type == OpType::SHORTCONV || node.op_type == OpType::RWKV7 ||
-            node.op_type == OpType::RWKV_TOKEN_SHIFT) {
-            // RWKV ops also mutate persistent recurrent state.
+            node.op_type == OpType::SHORTCONV) {
             return;
         }
     }

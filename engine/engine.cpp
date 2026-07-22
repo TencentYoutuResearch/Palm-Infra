@@ -1172,6 +1172,16 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     if (!load_graph(graph_prefill_, exec_ctx_prefill_, pf_path_load.c_str())) {
         return false;
     }
+    // RWKV state and token-shift buffers are persistent INPUT tensors, so the
+    // regular release queue can safely manage all materialized intermediates.
+    // Keeping every same-shape node output resident defeats that liveness and
+    // costs multiple gigabytes for a 256-token prefill graph.
+    for(const auto& node:graph_prefill_.nodes) {
+        if(node.op_type==OpType::RWKV7||node.op_type==OpType::RWKV_TOKEN_SHIFT) {
+            exec_ctx_prefill_.reuse_same_shape_workspace=false;
+            break;
+        }
+    }
 
     // Override config from graph metadata (takes precedence over CLI defaults)
     auto get_meta = [&](const char* key, const char* def) -> const char* {
