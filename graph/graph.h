@@ -98,6 +98,7 @@ enum class OpType : uint32_t {
     // SIGMOID keeps the vector approximation used by transformer paths.
     SWIGLU   = 75,   // silu(gate) * up over a merged [2I,...] tensor (gate|up halves)
     SIGMOID_EXACT = 76,
+    EXP_EXACT     = 77,
 
     // KV cache
     QUANTIZE_KV   = 80,
@@ -145,6 +146,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::EXP: return "EXP";
     case OpType::SOFTPLUS: return "SOFTPLUS";
     case OpType::SIGMOID_EXACT: return "SIGMOID_EXACT";
+    case OpType::EXP_EXACT: return "EXP_EXACT";
     case OpType::SWIGLU: return "SWIGLU";
     case OpType::QUANTIZE_KV: return "QUANTIZE_KV";
     case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";

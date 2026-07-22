@@ -1147,6 +1147,35 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::EXP_EXACT:
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            const Tensor& src = *inputs[0];
+            const int64_t total = src.nelements();
+            if (thread_pool && thread_pool->num_threads() > 1 &&
+                src.is_contiguous() && total >= 32768) {
+                const float* input = src.ptr<float>();
+                float* dst = output->ptr<float>();
+                int chunk = (int)((total + thread_pool->num_threads() - 1) /
+                                  thread_pool->num_threads());
+                chunk = std::max(chunk, 4096);
+                thread_pool->parallel_for(0, (int)total, chunk,
+                    [&](int, int begin, int end) {
+                        for (int i=begin;i<end;++i) dst[i]=std::exp(input[i]);
+                    });
+                break;
+            }
+            const char* base=static_cast<const char*>(src.data);
+            StrideIter it=compute_stride_iter(src);
+            float* dst=output->ptr<float>();
+            for(int i3=0;i3<it.d3;++i3) for(int i2=0;i2<it.d2;++i2)
+                for(int i1=0;i1<it.d1;++i1) {
+                    const float* row=reinterpret_cast<const float*>(
+                        base+i3*it.s3+i2*it.s2+i1*it.s1);
+                    for(int i=0;i<it.n_inner;++i) *dst++=std::exp(row[i]);
+                }
+        }
+        break;
+
     case OpType::SOFTPLUS:
         if (inputs.size() >= 1 && inputs[0] && output) {
             float* o = output->ptr<float>();

@@ -1,5 +1,6 @@
 #include "graph/execute.h"
 #include "engine/backend.h"
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -12,6 +13,26 @@ static int failures = 0;
 
 int main() {
     CPUBackend cpu_backend;  // shared across all ExecContexts below
+
+    // Recurrent decay must use the accurate path: even a small systematic
+    // exp error compounds each time the RWKV state is written back.
+    {
+        float input[] = {-8.0f, -3.25f, -0.606531f, 0.0f, 1.5f};
+        float result[5] = {};
+        Tensor src = Tensor::create(Precision::FP32, MemoryType::OWNED,
+                                    5, 1, 1, 1, input);
+        Tensor dst = Tensor::create(Precision::FP32, MemoryType::OWNED,
+                                    5, 1, 1, 1, result);
+        GraphNode exact;
+        exact.op_type = OpType::EXP_EXACT;
+        cpu_backend.dispatch(exact, {&src}, &dst, nullptr);
+        bool accurate = true;
+        for (int i = 0; i < 5; ++i)
+            accurate &= std::abs(result[i] - std::exp(input[i])) <=
+                        2.0e-7f * std::exp(input[i]);
+        CHECK(accurate, "EXP_EXACT matches std::exp for recurrent decay");
+    }
+
     // ---- build a simple chain: INPUT → RESHAPE → (end) ----
     Graph g;
 

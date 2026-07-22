@@ -46,9 +46,11 @@ def main() -> None:
     model = RWKV_RNN(cfg).eval()
 
     # The package folds blocks.0.ln0 into the embedding table and stores the
-    # resulting (no longer BF16-grid) values as FP16. Match that only newly
-    # quantized tensor while keeping activations and recurrent state FP32.
-    model.embedding.weight.data = model.embedding.weight.data.half().float()
+    # The mollm package stores matrix weights (including embedding and head)
+    # as FP16 while retaining vectors, activations, and recurrent state FP32.
+    for parameter in model.parameters():
+        if parameter.ndim == 2:
+            parameter.data = parameter.data.half().float()
 
     # rwkv-mobile truncates the final FFN to the last position when exporting
     # generation graphs. Disable only that export optimization so every input

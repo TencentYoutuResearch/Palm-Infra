@@ -136,7 +136,7 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
             return _lora(g,source,_weight(g,root,f"{a}_{n}1",tuple(w1.shape[::-1])),
                          _weight(g,root,f"{a}_{n}2",tuple(w2.shape[::-1])),activation)
         wd=lora("w",xw,"tanh"); ad=lora("a",xa); gd=lora("g",xg,"sigmoid_exact")
-        decay=g.exp(g.scalar_mul(g.sigmoid_exact(g.add(wd,av("w0"))),-0.606531))
+        decay=g.exp_exact(g.scalar_mul(g.sigmoid_exact(g.add(wd,av("w0"))),-0.606531))
         alpha=g.sigmoid_exact(g.add(ad,av("a0")))
         kk=g.rwkv_l2_norm(g.mul(k,av("k_k")),heads,hs,1e-6)
         kval=g.mul(k,g.scalar_add(g.mul(g.scalar_add(alpha,-1.0),av("k_a")),1.0))

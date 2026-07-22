@@ -61,6 +61,7 @@ class OpType(IntEnum):
     SOFTPLUS       = 74
     SWIGLU         = 75
     SIGMOID_EXACT  = 76
+    EXP_EXACT      = 77
     QUANTIZE_KV    = 80
     DEQUANTIZE_KV  = 81
     GATED_DELTANET_DECODE  = 110
@@ -245,7 +246,8 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
         return _CONST4
 
     if op in (OpType.RMS_NORM, OpType.LAYER_NORM,
-              OpType.SILU, OpType.GELU, OpType.TANH, OpType.SIGMOID, OpType.SIGMOID_EXACT, OpType.EXP, OpType.SOFTPLUS,
+              OpType.SILU, OpType.GELU, OpType.TANH, OpType.SIGMOID, OpType.SIGMOID_EXACT,
+              OpType.EXP, OpType.EXP_EXACT, OpType.SOFTPLUS,
               OpType.SWIGLU,
               OpType.ROTARY_EMBED,
               OpType.TILE, OpType.CONTIGUOUS,
@@ -475,6 +477,11 @@ class GraphBuilder:
 
     def exp(self, x: int) -> int:
         return self._add(OpType.EXP, [x], self._nodes[x].out_shape,
+                         prec=self._nodes[x].out_prec)
+
+    def exp_exact(self, x: int) -> int:
+        """IEEE exp for recurrent paths where approximation error compounds."""
+        return self._add(OpType.EXP_EXACT, [x], self._nodes[x].out_shape,
                          prec=self._nodes[x].out_prec)
 
     def softplus(self, x: int) -> int:
