@@ -227,7 +227,52 @@ static void kernel_rwkv7_core(const OpParams& p,
 #endif
                 for(int q=0;q<dhead*dhead;++q) s[q]=(float)state16[sb+q];
             } else std::memcpy(s,state32+sb,(size_t)dhead*dhead*sizeof(float));
-            for(int i=0;i<dhead;++i) {
+            int row=0;
+#if HAS_NEON
+            // Four-row register block: a/w/k/b/r are shared by the rows, so
+            // load each vector once instead of four times.
+            if((dhead&3)==0) for(;row+3<dhead;row+=4) {
+                float32x4_t sa0=vdupq_n_f32(0.f),sa1=sa0,sa2=sa0,sa3=sa0;
+                for(int j=0;j<dhead;j+=4) {
+                    const float32x4_t av=vld1q_f32(a+base+j);
+                    sa0=vfmaq_f32(sa0,vld1q_f32(s+(size_t)(row+0)*dhead+j),av);
+                    sa1=vfmaq_f32(sa1,vld1q_f32(s+(size_t)(row+1)*dhead+j),av);
+                    sa2=vfmaq_f32(sa2,vld1q_f32(s+(size_t)(row+2)*dhead+j),av);
+                    sa3=vfmaq_f32(sa3,vld1q_f32(s+(size_t)(row+3)*dhead+j),av);
+                }
+                const float sas[4]={vaddvq_f32(sa0),vaddvq_f32(sa1),
+                                    vaddvq_f32(sa2),vaddvq_f32(sa3)};
+                float32x4_t re0=vdupq_n_f32(0.f),re1=re0,re2=re0,re3=re0;
+                const float32x4_t vv0=vdupq_n_f32(v[base+row+0]);
+                const float32x4_t vv1=vdupq_n_f32(v[base+row+1]);
+                const float32x4_t vv2=vdupq_n_f32(v[base+row+2]);
+                const float32x4_t vv3=vdupq_n_f32(v[base+row+3]);
+                const float32x4_t sv0=vdupq_n_f32(sas[0]);
+                const float32x4_t sv1=vdupq_n_f32(sas[1]);
+                const float32x4_t sv2=vdupq_n_f32(sas[2]);
+                const float32x4_t sv3=vdupq_n_f32(sas[3]);
+                for(int j=0;j<dhead;j+=4) {
+                    const float32x4_t wv=vld1q_f32(w+base+j);
+                    const float32x4_t kv=vld1q_f32(k+base+j);
+                    const float32x4_t bv=vld1q_f32(b+base+j);
+                    const float32x4_t rv=vld1q_f32(r+base+j);
+#define RWKV_ROW_STEP(N) \
+                    float32x4_t x##N=vmulq_f32(vld1q_f32(s+(size_t)(row+N)*dhead+j),wv); \
+                    x##N=vfmaq_f32(x##N,vv##N,kv); \
+                    x##N=vfmaq_f32(x##N,sv##N,bv); \
+                    vst1q_f32(s+(size_t)(row+N)*dhead+j,x##N); \
+                    re##N=vfmaq_f32(re##N,x##N,rv)
+                    RWKV_ROW_STEP(0); RWKV_ROW_STEP(1);
+                    RWKV_ROW_STEP(2); RWKV_ROW_STEP(3);
+#undef RWKV_ROW_STEP
+                }
+                dst[base+row+0]=vaddvq_f32(re0);
+                dst[base+row+1]=vaddvq_f32(re1);
+                dst[base+row+2]=vaddvq_f32(re2);
+                dst[base+row+3]=vaddvq_f32(re3);
+            }
+#endif
+            for(int i=row;i<dhead;++i) {
                 float sa=0.f,result=0.f;
 #if HAS_NEON
                 if((dhead&3)==0) sa=rwkv_dot_neon(s+(size_t)i*dhead,a+base,dhead);
