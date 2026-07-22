@@ -138,6 +138,11 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                     (unsigned long long)ssd.hits, (unsigned long long)ssd.misses,
                     (unsigned long long)ssd.evictions, ssd.bytes_read / 1e6,
                     ssd.resident_bytes / 1e6);
+        std::printf("moe_ssd_cross_layer_tasks=%llu moe_ssd_cross_layer_dropped=%llu moe_ssd_cross_layer_experts=%llu moe_ssd_cross_layer_used=%llu\n",
+                    (unsigned long long)ssd.cross_layer_tasks,
+                    (unsigned long long)ssd.cross_layer_dropped,
+                    (unsigned long long)ssd.cross_layer_experts,
+                    (unsigned long long)ssd.cross_layer_used);
     }
     {
         auto pre = engine.prefill_pool_stats();
@@ -203,6 +208,10 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
         human_row_int("moe_ssd_misses", (long long)ssd.misses, "");
         human_row_int("moe_ssd_evictions", (long long)ssd.evictions, "");
         human_row("moe_ssd_read_mb", ssd.bytes_read / 1e6, "MB");
+        human_row_int("moe_ssd_cross_layer_tasks", (long long)ssd.cross_layer_tasks, "");
+        human_row_int("moe_ssd_cross_layer_dropped", (long long)ssd.cross_layer_dropped, "");
+        human_row_int("moe_ssd_cross_layer_experts", (long long)ssd.cross_layer_experts, "");
+        human_row_int("moe_ssd_cross_layer_used", (long long)ssd.cross_layer_used, "");
     }
 
     // prefill section

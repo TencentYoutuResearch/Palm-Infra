@@ -1215,6 +1215,8 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     exec_ctx_decode_.thread_pool  = &thread_pool_;
     exec_ctx_prefill_.trace_label = "prefill";
     exec_ctx_decode_.trace_label  = "decode";
+    exec_ctx_prefill_.moe_cross_layer_prefetch = false;
+    exec_ctx_decode_.moe_cross_layer_prefetch = cfg_.moe_ssd_cross_layer_prefetch;
     exec_ctx_prefill_.backend     = &cpu_backend_;
     exec_ctx_decode_.backend      = &cpu_backend_;
     metal_backend_.reset();
@@ -1498,9 +1500,17 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
     }
 
     float* scores = C.ptr<float>();
-    int token = sample_token(scores, vocab_size,
-                              cfg_.temperature, cfg_.top_k, cfg_.top_p,
-                              &cfg_.seed);
+    int token = 0;
+    {
+        // Keep sampling separate from the enclosing decode span.  In a Chrome
+        // trace this forms a clear token boundary: decode N -> sampler ->
+        // decode N+1.
+        mollm_trace::ScopedEvent trace_sampler("inference", "sampler", {},
+                                               "rail_response");
+        token = sample_token(scores, vocab_size,
+                             cfg_.temperature, cfg_.top_k, cfg_.top_p,
+                             &cfg_.seed);
+    }
 
     release_pool_tensor(graph_prefill_.runtime.pool, C);
 
@@ -2084,7 +2094,8 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 }
                 auto cache = std::make_unique<MoeSsdCache>();
                 if (!cache->open(path, cfg_.moe_ssd_cache_bytes,
-                                 cfg_.moe_ssd_io_workers)) return false;
+                                 cfg_.moe_ssd_io_workers,
+                                 cfg_.moe_ssd_cross_layer_prefetch)) return false;
                 size_t source_count = 0;
                 for (const auto& layer : (*storage_it)["layers"]) {
                     if (!layer.is_object()) {

@@ -23,6 +23,7 @@ struct Event {
     std::string category;
     std::string name;
     std::string args_json;
+    std::string color_name;
 };
 
 struct ThreadBuffer {
@@ -65,7 +66,8 @@ public:
     }
 
     void record(const char* category, const char* name, uint64_t start_ns,
-                uint64_t end_ns, const std::string& args_json) {
+                uint64_t end_ns, const std::string& args_json,
+                const char* color_name) {
         if (!enabled() || !category || !name || end_ns < start_ns) return;
         active_writers_.fetch_add(1, std::memory_order_acq_rel);
         if (!enabled()) {
@@ -78,6 +80,7 @@ public:
         event.category = category;
         event.name = name;
         event.args_json = args_json;
+        if (color_name) event.color_name = color_name;
         thread_buffer().events.push_back(std::move(event));
         active_writers_.fetch_sub(1, std::memory_order_release);
     }
@@ -158,6 +161,11 @@ public:
             } else {
                 std::fputs(",\"dur\":", file);
                 write_time_us(file, event.dur_ns);
+            }
+            if (!event.color_name.empty()) {
+                std::fputs(",\"cname\":\"", file);
+                write_json_string(file, event.color_name);
+                std::fputc('"', file);
             }
             if (!event.args_json.empty()) {
                 std::fputs(",\"args\":", file);
@@ -244,8 +252,8 @@ uint64_t now_ns() { return recorder().now_ns(); }
 void set_thread_name(const char* name) { recorder().set_thread_name(name); }
 void record_duration(const char* category, const char* name,
                      uint64_t start_ns, uint64_t end_ns,
-                     const std::string& args_json) {
-    recorder().record(category, name, start_ns, end_ns, args_json);
+                     const std::string& args_json, const char* color_name) {
+    recorder().record(category, name, start_ns, end_ns, args_json, color_name);
 }
 void record_flow(const char* category, const char* name, uint64_t timestamp_ns,
                  uint64_t flow_id, bool start, const std::string& args_json) {
@@ -254,11 +262,14 @@ void record_flow(const char* category, const char* name, uint64_t timestamp_ns,
 bool write() { return recorder().write(); }
 
 ScopedEvent::ScopedEvent(const char* category, const char* name,
-                         const std::string& args_json)
-    : category_(category), name_(name), args_json_(args_json), start_ns_(now_ns()) {}
+                         const std::string& args_json, const char* color_name)
+    : category_(category), name_(name), args_json_(args_json),
+      color_name_(color_name), start_ns_(now_ns()) {}
 
 ScopedEvent::~ScopedEvent() {
-    if (start_ns_ != 0) record_duration(category_, name_, start_ns_, now_ns(), args_json_);
+    if (start_ns_ != 0) {
+        record_duration(category_, name_, start_ns_, now_ns(), args_json_, color_name_);
+    }
 }
 
 } // namespace mollm_trace

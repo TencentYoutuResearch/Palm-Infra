@@ -1435,6 +1435,40 @@ void execute_graph(ExecContext& ctx) {
             }
         }
 
+        // Fate-style cross-layer gate prediction. At the beginning of MoE
+        // layer i, the gate input is already available. Feed its copied decode
+        // vector to the real router from the next MoE layer on an idle SSD
+        // worker, so its speculative reads can overlap this layer and the next
+        // attention block. The next layer always recomputes its exact route.
+        if (ctx.moe_cross_layer_prefetch && !device_resident &&
+            node.op_type == OpType::MOE && inputs.size() >= 4 && inputs[0] &&
+            inputs[0]->shape[1] == 1) {
+            const auto next_it = std::find_if(nodes.begin() + static_cast<ptrdiff_t>(i + 1),
+                                              nodes.end(),
+                                              [](const auto& candidate) {
+                                                  return candidate.op_type == OpType::MOE;
+                                              });
+            if (next_it != nodes.end() && next_it->inputs.size() >= 4) {
+                const auto& next_inputs = next_it->inputs;
+                const Tensor& next_router = tensors[next_inputs[1]];
+                const Tensor& next_gate = tensors[next_inputs[2]];
+                const Tensor& next_down = tensors[next_inputs[3]];
+                const Tensor* next_bias = next_inputs.size() > 8
+                    ? &tensors[next_inputs[8]] : nullptr;
+                MoeGateConfig config;
+                config.hidden_size = graph_params::get_i32(next_it->params, 0, 0);
+                config.num_experts = graph_params::get_i32(next_it->params, 1, 0);
+                config.top_k = graph_params::get_i32(next_it->params, 2, 0);
+                config.router_score_func = graph_params::get_i32(next_it->params, 5, 0);
+                config.n_group = graph_params::get_i32(next_it->params, 8, 1);
+                config.topk_group = graph_params::get_i32(next_it->params, 9, 1);
+                schedule_moe_cross_layer_prefetch(
+                    *inputs[0], next_router, next_bias,
+                    static_cast<const MoeSsdTensorSource*>(next_gate.moe_ssd_source),
+                    static_cast<const MoeSsdTensorSource*>(next_down.moe_ssd_source), config);
+            }
+        }
+
         // Dispatch is the useful unit in a trace: it captures one graph op
         // (matmul, attention, MoE, norm, ...) without recording allocator and
         // liveness bookkeeping as fake compute work.

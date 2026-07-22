@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -51,6 +52,10 @@ public:
         uint64_t misses = 0;
         uint64_t evictions = 0;
         uint64_t bytes_read = 0;
+        uint64_t cross_layer_tasks = 0;
+        uint64_t cross_layer_dropped = 0;
+        uint64_t cross_layer_experts = 0;
+        uint64_t cross_layer_used = 0;
         size_t resident_bytes = 0;
     };
 
@@ -60,7 +65,7 @@ public:
     MoeSsdCache& operator=(const MoeSsdCache&) = delete;
 
     bool open(const std::string& package_path, size_t capacity_bytes,
-              int io_workers = 8);
+              int io_workers = 8, bool enable_cross_layer_worker = false);
     bool add_source(const MoeSsdTensorSpec& spec);
     const MoeSsdTensorSource* find_source(const std::string& weight_ref) const;
 
@@ -79,6 +84,21 @@ public:
     bool request_many(const MoeSsdTensorSource* gate_up,
                       const MoeSsdTensorSource* down,
                       const std::vector<int>& experts);
+
+    // Speculative reads are only serviced after real router requests.
+    bool prefetch_many(const MoeSsdTensorSource* gate_up,
+                       const MoeSsdTensorSource* down,
+                       const std::vector<int>& experts);
+
+    // Queue a tiny gate-prediction task on an otherwise-idle SSD worker. The
+    // queue is bounded so stale predictions never accumulate behind decode.
+    bool submit_cross_layer_task(std::function<void()> task);
+
+    // A cross-layer prediction must not displace the next layer's real route
+    // when its per-layer RAM window is too small for both candidate sets.
+    bool can_prefetch_pairs(const MoeSsdTensorSource* gate_up,
+                            const MoeSsdTensorSource* down,
+                            size_t pairs) const;
 
     // Number of requested pairs currently resident or loading. Used by the
     // MoE kernel to detect when its route set exceeds the per-layer window.
@@ -110,22 +130,30 @@ private:
         std::vector<Entry*> entries;
         uint8_t component = 0;
         uint64_t trace_id = 0;
+        bool speculative = false;
     };
 
     bool valid_pair(const MoeSsdTensorSource* gate_up,
                     const MoeSsdTensorSource* down,
                     int expert) const;
+    bool request_many_impl(const MoeSsdTensorSource* gate_up,
+                           const MoeSsdTensorSource* down,
+                           const std::vector<int>& experts,
+                           bool speculative);
     Entry* find_entry_locked(const MoeSsdTensorSource* gate_up,
                              const MoeSsdTensorSource* down, int expert);
     Entry* reserve_entry_locked(const MoeSsdTensorSource* gate_up,
-                                const MoeSsdTensorSource* down, int expert);
+                                const MoeSsdTensorSource* down, int expert,
+                                bool speculative = false);
     static ByteBuffer& component_buffer(Entry& entry, uint8_t component);
     static const ByteBuffer& component_buffer(const Entry& entry, uint8_t component);
     static uint64_t component_offset(const Entry& entry, uint8_t component);
-    void enqueue_entry_reads_locked(const std::vector<Entry*>& entries);
+    void enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
+                                    bool low_priority = false);
     bool read_job(const IoJob& job);
     bool read_exact(uint64_t offset, void* dst, size_t bytes) const;
     void io_worker_main(int worker_index);
+    void cross_layer_worker_main();
     void stop_io_workers();
     static Tensor make_tensor(const MoeSsdTensorSource& source,
                               const uint8_t* data,
@@ -141,12 +169,20 @@ private:
     uint64_t misses_ = 0;
     uint64_t evictions_ = 0;
     uint64_t bytes_read_ = 0;
+    uint64_t cross_layer_tasks_count_ = 0;
+    uint64_t cross_layer_dropped_ = 0;
+    uint64_t cross_layer_experts_ = 0;
+    uint64_t cross_layer_used_ = 0;
     mutable std::mutex mutex_;
     std::condition_variable io_cv_;
+    std::condition_variable cross_layer_cv_;
     std::condition_variable ready_cv_;
     bool stop_io_ = false;
     std::deque<IoJob> io_jobs_;
+    std::deque<IoJob> low_priority_io_jobs_;
+    std::deque<std::function<void()>> cross_layer_tasks_;
     std::vector<std::thread> io_workers_;
+    std::thread cross_layer_worker_;
     std::unordered_map<std::string, MoeSsdTensorSource> sources_;
     std::unordered_set<int> layers_;
     using EntryList = std::list<std::unique_ptr<Entry>>;

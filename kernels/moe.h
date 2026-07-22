@@ -5,6 +5,28 @@
 #include <vector>
 
 class ThreadPool;
+struct MoeSsdTensorSource;
+
+// Router parameters needed to run the cross-layer gate predictor. The
+// prediction is advisory only: the next MoE layer always runs its real router.
+struct MoeGateConfig {
+    int hidden_size = 0;
+    int num_experts = 0;
+    int top_k = 0;
+    int router_score_func = 0;
+    int n_group = 1;
+    int topk_group = 1;
+};
+
+// Copy a decode gate input and schedule an approximate next-layer route on an
+// idle SSD worker. Returns false when the route cannot use SSD offload or the
+// worker queue is full.
+bool schedule_moe_cross_layer_prefetch(const Tensor& gate_input,
+                                       const Tensor& next_router,
+                                       const Tensor* next_router_bias,
+                                       const MoeSsdTensorSource* next_gate_up,
+                                       const MoeSsdTensorSource* next_down,
+                                       const MoeGateConfig& config);
 
 // Fused Qwen-style sparse MLP.
 //

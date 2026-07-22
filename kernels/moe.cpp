@@ -365,6 +365,103 @@ extern "C" void mollm_print_moe_profile(const char* title) {
     }
 }
 
+bool schedule_moe_cross_layer_prefetch(const Tensor& gate_input,
+                                       const Tensor& next_router,
+                                       const Tensor* next_router_bias,
+                                       const MoeSsdTensorSource* next_gate_up,
+                                       const MoeSsdTensorSource* next_down,
+                                       const MoeGateConfig& config) {
+    if (!next_gate_up || !next_down || !next_gate_up->cache ||
+        next_gate_up->cache != next_down->cache || gate_input.prec != Precision::FP32 ||
+        gate_input.shape[1] != 1 || config.hidden_size <= 0 ||
+        config.num_experts <= 0 || config.top_k <= 0 ||
+        next_router.shape[0] != config.num_experts ||
+        next_router.shape[1] != config.hidden_size) {
+        return false;
+    }
+
+    // Graph workspaces are reused on the next token, so clone the one decode
+    // vector before handing it to an asynchronous SSD worker.
+    const float* src = gate_input.ptr<float>();
+    std::vector<float> input(src, src + config.hidden_size);
+    MoeSsdCache* cache = next_gate_up->cache;
+    // Keep one full exact route's worth of slots available. Without this,
+    // speculative experts churn a small per-layer window before the real
+    // router reaches it.
+    if (!cache->can_prefetch_pairs(next_gate_up, next_down,
+                                   static_cast<size_t>(config.top_k) * 2)) {
+        return false;
+    }
+    return cache->submit_cross_layer_task(
+        [input = std::move(input), &next_router, next_router_bias,
+         next_gate_up, next_down, config, cache]() mutable {
+            std::vector<float> logits((size_t)config.num_experts);
+            Tensor a = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                      config.hidden_size, 1, 1, 1, input.data());
+            Tensor out = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                        config.num_experts, 1, 1, 1, logits.data());
+            {
+                mollm_trace::ScopedEvent trace_event(
+                    "ssd.predict", "next_layer_router",
+                    "{\"layer\":" + std::to_string(next_gate_up->spec.layer) + "}");
+                // This runs on one idle SSD worker rather than the inference
+                // pool, so it can overlap the current layer's compute.
+                kernel_matmul_fp32(a, next_router, out, nullptr);
+            }
+
+            std::vector<float> score((size_t)config.num_experts);
+            if (config.router_score_func == 1) {
+                for (int e = 0; e < config.num_experts; ++e) {
+                    float v = 1.0f / (1.0f + std::exp(-logits[(size_t)e]));
+                    score[(size_t)e] = v + (next_router_bias && next_router_bias->data
+                        ? next_router_bias->ptr<float>()[e] : 0.0f);
+                }
+                const int n_group = std::max(1, config.n_group);
+                const int topk_group = std::min(std::max(1, config.topk_group), n_group);
+                const int per_group = config.num_experts / n_group;
+                if (per_group > 0 && topk_group < n_group) {
+                    std::vector<int> groups((size_t)n_group);
+                    for (int g = 0; g < n_group; ++g) groups[(size_t)g] = g;
+                    std::partial_sort(groups.begin(), groups.begin() + topk_group, groups.end(),
+                        [&](int a_group, int b_group) {
+                            auto group_score = [&](int group) {
+                                const int begin = group * per_group;
+                                const int end = begin + per_group;
+                                float best0 = -std::numeric_limits<float>::infinity();
+                                float best1 = best0;
+                                for (int e = begin; e < end; ++e) {
+                                    const float v = score[(size_t)e];
+                                    if (v > best0) { best1 = best0; best0 = v; }
+                                    else if (v > best1) best1 = v;
+                                }
+                                return best0 + best1;
+                            };
+                            return group_score(a_group) > group_score(b_group);
+                        });
+                    std::vector<uint8_t> keep((size_t)n_group, 0);
+                    for (int k = 0; k < topk_group; ++k) keep[(size_t)groups[(size_t)k]] = 1;
+                    for (int e = 0; e < config.num_experts; ++e) {
+                        if (!keep[(size_t)(e / per_group)]) {
+                            score[(size_t)e] = -std::numeric_limits<float>::infinity();
+                        }
+                    }
+                }
+            } else {
+                score = std::move(logits);
+            }
+
+            const int count = std::min(config.top_k, config.num_experts);
+            std::vector<int> experts((size_t)config.num_experts);
+            for (int e = 0; e < config.num_experts; ++e) experts[(size_t)e] = e;
+            std::partial_sort(experts.begin(), experts.begin() + count, experts.end(),
+                [&](int a_expert, int b_expert) {
+                    return score[(size_t)a_expert] > score[(size_t)b_expert];
+                });
+            experts.resize((size_t)count);
+            cache->prefetch_many(next_gate_up, next_down, experts);
+        });
+}
+
 void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       Tensor& output,
                       ThreadPool* thread_pool,

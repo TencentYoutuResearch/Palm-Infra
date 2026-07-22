@@ -27,6 +27,9 @@ struct ExecContext {
     ThreadPool*   thread_pool = nullptr;
     Backend*      backend = nullptr;   // op dispatcher (CPU/NPU/...)
     bool          profile_enabled = false;
+    // Decode-only experimental SSD prefetch using the current gate input and
+    // the next MoE layer's router.
+    bool          moe_cross_layer_prefetch = false;
     // Label used by optional Chrome Trace events (normally prefill/decode).
     const char*   trace_label = "graph";
 

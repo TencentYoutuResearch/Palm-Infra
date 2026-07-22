@@ -85,6 +85,8 @@ struct EngineConfig {
     // packages carrying `moe_expert_storage` metadata.
     size_t moe_ssd_cache_bytes = 0;
     int moe_ssd_io_workers = 8;
+    // Experimental decode-only Fate-style next-layer gate prefetch.
+    bool moe_ssd_cross_layer_prefetch = false;
     // Wire dense mmap pages so a large expert cache cannot evict them.
     // Ignored unless SSD offload uses mmap weights.
     bool lock_dense_weights = true;

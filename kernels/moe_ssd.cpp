@@ -39,6 +39,7 @@ struct MoeSsdCache::Entry {
     bool failed = false;
     int pending_reads = 0;
     bool fresh_miss = false;  // first acquire after a queued miss is not a hit
+    bool speculative = false;
     ByteBuffer gate_up_data;
     ByteBuffer gate_up_scales;
     ByteBuffer down_data;
@@ -63,17 +64,21 @@ void MoeSsdCache::stop_io_workers() {
         stop_io_ = true;
     }
     io_cv_.notify_all();
+    cross_layer_cv_.notify_all();
     for (std::thread& worker : io_workers_) {
         if (worker.joinable()) worker.join();
     }
     io_workers_.clear();
+    if (cross_layer_worker_.joinable()) cross_layer_worker_.join();
     std::lock_guard<std::mutex> lock(mutex_);
     io_jobs_.clear();
+    low_priority_io_jobs_.clear();
+    cross_layer_tasks_.clear();
     stop_io_ = false;
 }
 
 bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
-                       int io_workers) {
+                       int io_workers, bool enable_cross_layer_worker) {
     if (capacity_bytes == 0 || io_workers < 1) {
         std::fprintf(stderr, "MoE SSD: cache capacity and I/O worker count must be non-zero\n");
         return false;
@@ -105,6 +110,8 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         capacity_bytes_ = capacity_bytes;
         resident_bytes_ = 0;
         clock_ = hits_ = misses_ = evictions_ = bytes_read_ = 0;
+        cross_layer_tasks_count_ = cross_layer_dropped_ = 0;
+        cross_layer_experts_ = cross_layer_used_ = 0;
         sources_.clear();
         layers_.clear();
         entries_.clear();
@@ -115,6 +122,9 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
     io_workers_.reserve((size_t)io_workers);
     for (int i = 0; i < io_workers; i++) {
         io_workers_.emplace_back(&MoeSsdCache::io_worker_main, this, i);
+    }
+    if (enable_cross_layer_worker) {
+        cross_layer_worker_ = std::thread(&MoeSsdCache::cross_layer_worker_main, this);
     }
     return true;
 }
@@ -187,7 +197,8 @@ MoeSsdCache::Entry* MoeSsdCache::find_entry_locked(
 }
 
 MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
-    const MoeSsdTensorSource* gate_up, const MoeSsdTensorSource* down, int expert) {
+    const MoeSsdTensorSource* gate_up, const MoeSsdTensorSource* down, int expert,
+    bool speculative) {
     const size_t required = static_cast<size_t>(gate_up->spec.data_bytes) +
                             static_cast<size_t>(gate_up->spec.scales_bytes) +
                             static_cast<size_t>(down->spec.data_bytes) +
@@ -238,6 +249,7 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     entry->failed = false;
     entry->pending_reads = 0;
     entry->fresh_miss = true;
+    entry->speculative = speculative;
     entry->gate_up_data.resize(static_cast<size_t>(gate_up->spec.data_bytes));
     entry->gate_up_scales.resize(static_cast<size_t>(gate_up->spec.scales_bytes));
     entry->down_data.resize(static_cast<size_t>(down->spec.data_bytes));
@@ -299,7 +311,8 @@ uint64_t MoeSsdCache::component_offset(const Entry& entry, uint8_t component) {
     }
 }
 
-void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries) {
+void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
+                                              bool low_priority) {
     if (entries.empty()) return;
     std::vector<Entry*> sorted = entries;
     std::sort(sorted.begin(), sorted.end(),
@@ -331,6 +344,7 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries)
                 IoJob job;
                 job.component = component;
                 job.trace_id = next_trace_id_++;
+                job.speculative = low_priority;
                 job.entries.assign(sorted.begin() + static_cast<ptrdiff_t>(begin),
                                    sorted.begin() + static_cast<ptrdiff_t>(end));
                 for (Entry* entry : job.entries) ++entry->pending_reads;
@@ -342,7 +356,8 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries)
                         ",\"first_expert\":" + std::to_string(first.expert) +
                         ",\"experts\":" + std::to_string(job.entries.size()) + "}");
                 }
-                io_jobs_.push_back(std::move(job));
+                if (low_priority) low_priority_io_jobs_.push_back(std::move(job));
+                else io_jobs_.push_back(std::move(job));
                 begin = end;
             }
         }
@@ -378,10 +393,17 @@ void MoeSsdCache::io_worker_main(int worker_index) {
         IoJob job;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            io_cv_.wait(lock, [&] { return stop_io_ || !io_jobs_.empty(); });
-            if (stop_io_ && io_jobs_.empty()) return;
-            job = std::move(io_jobs_.front());
-            io_jobs_.pop_front();
+            io_cv_.wait(lock, [&] {
+                return stop_io_ || !io_jobs_.empty() || !low_priority_io_jobs_.empty();
+            });
+            if (stop_io_ && io_jobs_.empty() && low_priority_io_jobs_.empty()) return;
+            if (!io_jobs_.empty()) {
+                job = std::move(io_jobs_.front());
+                io_jobs_.pop_front();
+            } else {
+                job = std::move(low_priority_io_jobs_.front());
+                low_priority_io_jobs_.pop_front();
+            }
         }
         std::string trace_args;
         if (mollm_trace::enabled() && !job.entries.empty()) {
@@ -392,11 +414,14 @@ void MoeSsdCache::io_worker_main(int worker_index) {
             trace_args = "{\"layer\":" + std::to_string(first.gate_up->spec.layer) +
                          ",\"first_expert\":" + std::to_string(first.expert) +
                          ",\"experts\":" + std::to_string(job.entries.size()) +
-                         ",\"component\":\"" + component + "\"}";
+                         ",\"component\":\"" + component + "\""
+                         ",\"kind\":\"" + (job.speculative ? "prefetch" : "route") + "\"}";
         }
         bool ok = false;
         {
-            mollm_trace::ScopedEvent trace_event("ssd.io", "pread", trace_args);
+            mollm_trace::ScopedEvent trace_event(
+                "ssd.io", job.speculative ? "pread.prefetch" : "pread.route", trace_args,
+                job.speculative ? "yellow" : "good");
             ok = read_job(job);
         }
         if (job.trace_id != 0) {
@@ -416,6 +441,22 @@ void MoeSsdCache::io_worker_main(int worker_index) {
             }
         }
         ready_cv_.notify_all();
+    }
+}
+
+void MoeSsdCache::cross_layer_worker_main() {
+    if (mollm_trace::enabled()) mollm_trace::set_thread_name("ssd-predict");
+    for (;;) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cross_layer_cv_.wait(lock, [&] { return stop_io_ || !cross_layer_tasks_.empty(); });
+            if (stop_io_) return;
+            task = std::move(cross_layer_tasks_.front());
+            cross_layer_tasks_.pop_front();
+        }
+        mollm_trace::ScopedEvent trace_event("ssd.predict", "cross_layer_gate");
+        task();
     }
 }
 
@@ -441,6 +482,19 @@ Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
 bool MoeSsdCache::request_many(const MoeSsdTensorSource* gate_up,
                                const MoeSsdTensorSource* down,
                                const std::vector<int>& experts) {
+    return request_many_impl(gate_up, down, experts, false);
+}
+
+bool MoeSsdCache::prefetch_many(const MoeSsdTensorSource* gate_up,
+                                const MoeSsdTensorSource* down,
+                                const std::vector<int>& experts) {
+    return request_many_impl(gate_up, down, experts, true);
+}
+
+bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
+                                    const MoeSsdTensorSource* down,
+                                    const std::vector<int>& experts,
+                                    bool speculative) {
     if (!gate_up || !down || !valid_pair(gate_up, down, 0)) {
         std::fprintf(stderr, "MoE SSD: invalid expert pair request\n");
         return false;
@@ -458,24 +512,55 @@ bool MoeSsdCache::request_many(const MoeSsdTensorSource* gate_up,
                 entry->used_at = ++clock_;
                 continue;
             }
-            entry = reserve_entry_locked(gate_up, down, expert);
+            entry = reserve_entry_locked(gate_up, down, expert, speculative);
             // Do not reserve beyond the per-layer byte budget. acquire() will
             // submit this expert later after an in-flight slot becomes ready.
             if (!entry) continue;
-            ++misses_;
+            if (speculative) ++cross_layer_experts_;
+            else ++misses_;
             queued_entries.push_back(entry);
         }
-        enqueue_entry_reads_locked(queued_entries);
+        enqueue_entry_reads_locked(queued_entries, speculative);
     }
     if (!queued_entries.empty()) io_cv_.notify_all();
     if (trace_start != 0) {
         mollm_trace::record_duration(
-            "ssd", "request_many", trace_start, mollm_trace::now_ns(),
+            speculative ? "ssd.predict" : "ssd",
+            speculative ? "prefetch_many" : "request_many", trace_start, mollm_trace::now_ns(),
             "{\"layer\":" + std::to_string(gate_up->spec.layer) +
             ",\"requested\":" + std::to_string(experts.size()) +
             ",\"queued\":" + std::to_string(queued_entries.size()) + "}");
     }
     return true;
+}
+
+bool MoeSsdCache::submit_cross_layer_task(std::function<void()> task) {
+    if (!task) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    constexpr size_t kMaxQueuedTasks = 2;
+    if (stop_io_ || !cross_layer_worker_.joinable() ||
+        cross_layer_tasks_.size() >= kMaxQueuedTasks) {
+        ++cross_layer_dropped_;
+        return false;
+    }
+    cross_layer_tasks_.push_back(std::move(task));
+    ++cross_layer_tasks_count_;
+    cross_layer_cv_.notify_one();
+    return true;
+}
+
+bool MoeSsdCache::can_prefetch_pairs(const MoeSsdTensorSource* gate_up,
+                                     const MoeSsdTensorSource* down,
+                                     size_t pairs) const {
+    if (!valid_pair(gate_up, down, 0) || pairs == 0) return false;
+    const size_t pair_bytes = static_cast<size_t>(gate_up->spec.data_bytes) +
+                              static_cast<size_t>(gate_up->spec.scales_bytes) +
+                              static_cast<size_t>(down->spec.data_bytes) +
+                              static_cast<size_t>(down->spec.scales_bytes);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t layer_capacity = layers_.empty() ? capacity_bytes_
+        : capacity_bytes_ / layers_.size();
+    return pair_bytes <= layer_capacity / pairs;
 }
 
 size_t MoeSsdCache::resident_count(const MoeSsdTensorSource* gate_up,
@@ -588,6 +673,10 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
         return false;
     }
     entry->used_at = ++clock_;
+    if (entry->speculative) {
+        ++cross_layer_used_;
+        entry->speculative = false;
+    }
     if (entry->fresh_miss) {
         entry->fresh_miss = false;
     } else {
@@ -606,7 +695,8 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
 
 MoeSsdCache::Stats MoeSsdCache::stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return {hits_, misses_, evictions_, bytes_read_, resident_bytes_};
+    return {hits_, misses_, evictions_, bytes_read_, cross_layer_tasks_count_,
+            cross_layer_dropped_, cross_layer_experts_, cross_layer_used_, resident_bytes_};
 }
 
 void MoeSsdCache::reset_stats() {
@@ -615,4 +705,8 @@ void MoeSsdCache::reset_stats() {
     misses_ = 0;
     evictions_ = 0;
     bytes_read_ = 0;
+    cross_layer_tasks_count_ = 0;
+    cross_layer_dropped_ = 0;
+    cross_layer_experts_ = 0;
+    cross_layer_used_ = 0;
 }
