@@ -31,6 +31,7 @@ enum class Activation : int32_t {
     SILU = 1,   // x * sigmoid(x) — SwiGLU gate
     GELU = 2,   // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) — tanh approx
     RELU = 3,   // max(0, x)
+    RELU_SQUARED = 4, // max(0, x)^2 — RWKV channel-mix
     // Future: GELU_ERF, SIGMOID, TANH, ...
 };
 
@@ -87,6 +88,10 @@ inline float apply_activation_scalar(float x, Activation act) {
     }
     case Activation::RELU:
         return x > 0.f ? x : 0.f;
+    case Activation::RELU_SQUARED: {
+        float y = x > 0.f ? x : 0.f;
+        return y * y;
+    }
     case Activation::NONE:
     default:
         return x;
@@ -114,6 +119,10 @@ inline float32x4_t apply_activation_f32_neon(float32x4_t x, Activation act) {
     }
     case Activation::RELU:
         return vmaxq_f32(x, vdupq_n_f32(0.f));
+    case Activation::RELU_SQUARED: {
+        float32x4_t y = vmaxq_f32(x, vdupq_n_f32(0.f));
+        return vmulq_f32(y, y);
+    }
     case Activation::NONE:
     default:
         return x;

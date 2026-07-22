@@ -147,8 +147,8 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
         xn=g.layer_norm(x,ln2w,ln2b); sx=g.rwkv_token_shift(xn,fshift,hidden,seq_len)
         xk=_mix(g,xn,sx,_scalar_weight(g,root,f"{f}_x_k",(hidden,)))
         kw=w[f"blocks.{i}.ffn.key.weight"]; vw=w[f"blocks.{i}.ffn.value.weight"]
-        key=g.matmul(xk,_weight(g,root,f"{f}_key_weight",tuple(kw.shape)),activation=Activation.RELU)
-        key=g.mul(key,key)
+        key=g.matmul(xk,_weight(g,root,f"{f}_key_weight",tuple(kw.shape)),
+                     activation=Activation.RELU_SQUARED)
         x=g.add(x,g.matmul(key,_weight(g,root,f"{f}_value_weight",tuple(vw.shape))))
     x=g.layer_norm(x,_scalar_weight(g,root,"final_norm_w",(hidden,)),_scalar_weight(g,root,"final_norm_b",(hidden,)))
     return g

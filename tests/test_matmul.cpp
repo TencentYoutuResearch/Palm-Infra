@@ -75,6 +75,23 @@ int main() {
         delete[] a_data; delete[] b_data; delete[] c_data; delete[] ref_c;
     }
 
+    // ---- fused ReLU-squared writeback ----
+    {
+        float a_data[4] = {-2.f, 1.f, 3.f, -4.f};
+        float b_data[4] = {1.f, 0.f, 0.f, 1.f};
+        float c_data[4] = {};
+        const float expected[4] = {0.f, 1.f, 9.f, 0.f};
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  2, 2, 1, 1, a_data);
+        Tensor B = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  2, 2, 1, 1, b_data);
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  2, 2, 1, 1, c_data);
+        kernel_matmul_fp32(A, B, C, nullptr, Activation::RELU_SQUARED);
+        CHECK(check_approx(c_data, expected, 4),
+              "matmul fused ReLU-squared activation");
+    }
+
     // ---- rectangular: 8x16 * 16x4 = 8x4 ----
     {
         int M = 8, K = 16, N = 4;

@@ -187,6 +187,7 @@ class Activation(IntEnum):
     SILU = 1   # x * sigmoid(x)  — SwiGLU gate
     GELU = 2   # 0.5 * x * (1 + tanh(...))  — tanh approximation
     RELU = 3   # max(0, x)
+    RELU_SQUARED = 4  # max(0, x)^2
 
 
 # ---------------------------------------------------------------------------
