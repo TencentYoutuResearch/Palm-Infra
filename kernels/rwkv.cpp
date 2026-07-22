@@ -218,8 +218,9 @@ static void kernel_rwkv7_core(const OpParams& p,
         std::vector<float> statef((size_t)dhead*dhead);
         for(int h=h_begin;h<h_end;++h) {
             const size_t sb=(size_t)h*dhead*dhead;
-            float* s=statef.data();
-            if(!state_fp16)
+            const bool direct_state=!state_fp16&&real==1;
+            float* s=direct_state?state32+sb:statef.data();
+            if(!state_fp16&&!direct_state)
                 std::memcpy(s,state32+sb,(size_t)dhead*dhead*sizeof(float));
             for(int t=0;t<real;++t) {
                 const size_t base=(size_t)t*hidden+(size_t)h*dhead;
@@ -311,7 +312,7 @@ static void kernel_rwkv7_core(const OpParams& p,
                     for(int q=0;q<dhead*dhead;++q) state16[sb+q]=(__fp16)s[q];
                 }
             }
-            if(!state_fp16)
+            if(!state_fp16&&!direct_state)
                 std::memcpy(state32+sb,s,(size_t)dhead*dhead*sizeof(float));
         }
     };
