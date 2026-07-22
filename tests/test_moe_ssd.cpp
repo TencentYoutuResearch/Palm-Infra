@@ -73,6 +73,36 @@ int main() {
         check(stats.bytes_read == 24, "pread byte accounting");
     }
 
+    // A bounded route window can release a consumed pair and immediately make
+    // room for the next expert without invalidating the still-needed entries.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 16, 2), "open sliding-window cache");
+        check(cache.add_source(spec("gate", 0)), "add sliding-window gate source");
+        check(cache.add_source(spec("down", 6 * sizeof(uint16_t))),
+              "add sliding-window down source");
+        const MoeSsdTensorSource* gate = cache.find_source("gate");
+        const MoeSsdTensorSource* down = cache.find_source("down");
+        check(gate && down, "find sliding-window sources");
+        check(cache.request_many(gate, down, {0, 1, 2}), "queue sliding-window routes");
+        check(cache.resident_count(gate, down, {0, 1, 2}) == 2,
+              "initial window honors cache capacity");
+        check(cache.contains(gate, down, 0) && cache.contains(gate, down, 1) &&
+              !cache.contains(gate, down, 2), "initial window retains earliest routes");
+
+        Tensor gu, dw;
+        check(cache.acquire(gate, down, 0, gu, dw), "acquire sliding-window expert zero");
+        check(cache.release(gate, down, 0), "release consumed expert zero");
+        check(cache.request_many(gate, down, {1, 2}), "advance sliding-window prefetch");
+        check(cache.resident_count(gate, down, {1, 2}) == 2,
+              "advanced window contains remaining routes");
+        check(cache.contains(gate, down, 1) && cache.contains(gate, down, 2),
+              "advanced window retains ready future route");
+        check(cache.acquire(gate, down, 2, gu, dw), "acquire prefetched expert two");
+        check(static_cast<const uint16_t*>(gu.data)[0] == 0x4500,
+              "advanced window preserves expert bytes");
+    }
+
     // With room for all three pairs, request adjacent experts together. This
     // exercises the coalesced component reads: each component run is read as
     // one contiguous range, then scattered back to the individual tensors.

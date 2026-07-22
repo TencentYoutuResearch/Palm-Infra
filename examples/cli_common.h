@@ -23,8 +23,13 @@ struct CliCommonOptions {
     Device device = Device::CPU;  // compute backend (--device cpu|metal)
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     bool load_warmup = true;     // touch mmap'd package weights after load
+    // Needed because SSD offload suppresses the default whole-package warmup,
+    // but an explicit --load-warmup can still warm only dense mmap weights.
+    bool load_warmup_explicit = false;
+    bool lock_dense_weights = false;  // pin dense mmap pages (SSD offload experiment)
     int ssd_cache_mb = 0;        // >0: page routed MoE experts from package
     int ssd_io_workers = 8;      // dedicated pread workers for MoE SSD cache
+    std::string trace_path;      // optional Chrome Trace / Perfetto JSON output
 
     // Sampling
     float temperature = 0.6f;

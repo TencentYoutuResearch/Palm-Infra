@@ -129,10 +129,21 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 error = "invalid value for --ssd-io-workers";
                 return false;
             }
+        } else if (arg == "--trace") {
+            if (!require_value(argc, argv, i, "--trace", value, error)) return false;
+            opts.trace_path = value;
+            if (opts.trace_path.empty()) {
+                error = "--trace path must not be empty";
+                return false;
+            }
         } else if (arg == "--load-warmup") {
             opts.load_warmup = true;
+            opts.load_warmup_explicit = true;
         } else if (arg == "--no-load-warmup") {
             opts.load_warmup = false;
+            opts.load_warmup_explicit = true;
+        } else if (arg == "--lock-dense-weights") {
+            opts.lock_dense_weights = true;
         } else if (arg == "--warmup") {
             if (!require_value(argc, argv, i, "--warmup", value, error)) return false;
             if (!parse_int(value, opts.warmup) || opts.warmup < 0) {
@@ -176,9 +187,10 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
     }
     if (opts.ssd_cache_mb > 0) {
         // SSD offload uses explicit pread() rather than touching aggregate
-        // expert mappings. Warming all package pages would defeat it.
+        // expert mappings. Keep default startup light, but honour an explicit
+        // --load-warmup: Engine then touches only dense mmap weights.
         opts.weight_loading = WeightLoadingMode::MMAP;
-        opts.load_warmup = false;
+        if (!opts.load_warmup_explicit) opts.load_warmup = false;
     }
 
     return true;
@@ -200,9 +212,11 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
     std::printf("  --device <cpu|metal>     Compute backend (metal requires MOLLM_METAL build)\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
-    std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache capacity; disables package warmup\n");
+    std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache capacity; defaults to no package warmup\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
-    std::printf("  --load-warmup           Touch mmap'd package weights after load when using mmap\n");
+    std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
+    std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
+    std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (SSD offload only)\n");
     std::printf("  --no-load-warmup        Skip mmap page-in warmup\n");
     std::printf("  --warmup <int>            Default: 1 (used by benchmark)\n");
     std::printf("  --temperature <float>     Default: 0.6 (0 = greedy)\n");
@@ -232,6 +246,8 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;
+    cfg.trace_path = opts.trace_path;
+    cfg.lock_dense_weights = opts.lock_dense_weights;
     return cfg;
 }
 

@@ -8,6 +8,7 @@
 #include "kernels/moe.h"
 #include "kernels/rwkv.h"
 #include "kernels/tensor.h"
+#include "kernels/trace.h"
 #include "kernels/activations.h"  // for Activation enum + sigmoid_f32_neon
 #include <algorithm>
 #include <cassert>
@@ -1434,8 +1435,21 @@ void execute_graph(ExecContext& ctx) {
             }
         }
 
-        // dispatch via backend
+        // Dispatch is the useful unit in a trace: it captures one graph op
+        // (matmul, attention, MoE, norm, ...) without recording allocator and
+        // liveness bookkeeping as fake compute work.
+        const uint64_t trace_start = mollm_trace::now_ns();
         ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
+        if (trace_start != 0) {
+            const std::string args =
+                "{\"graph\":\"" + std::string(ctx.trace_label ? ctx.trace_label : "graph") +
+                "\",\"node\":" + std::to_string(node.id) +
+                ",\"shape\":[" + std::to_string(out.shape[0]) + "," +
+                std::to_string(out.shape[1]) + "," + std::to_string(out.shape[2]) + "," +
+                std::to_string(out.shape[3]) + "]}";
+            mollm_trace::record_duration("graph", op_type_name(node.op_type), trace_start,
+                                         mollm_trace::now_ns(), args);
+        }
 
         // Node dumping is an opt-in diagnostic.  Do not probe the process
         // environment for every graph node in normal inference.

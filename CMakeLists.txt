@@ -46,6 +46,7 @@ set(SOURCES
     kernels/gdn_prefill.cpp
     kernels/moe.cpp
     kernels/moe_ssd.cpp
+    kernels/trace.cpp
     kernels/rwkv.cpp
     kernels/threading.cpp
     # engine
@@ -61,6 +62,7 @@ set(HEADERS
     kernels/attention.h
     kernels/moe.h
     kernels/moe_ssd.h
+    kernels/trace.h
     kernels/rwkv.h
     kernels/threading.h
     graph/buffer_pool.h
@@ -277,6 +279,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_matmul        tests/test_matmul.cpp)
     add_mollm_test(test_moe           tests/test_moe.cpp)
     add_mollm_test(test_moe_ssd       tests/test_moe_ssd.cpp)
+    add_mollm_test(test_trace         tests/test_trace.cpp)
     add_mollm_test(bench_matmul       tests/bench_matmul.cpp)
     add_mollm_test(bench_sdpa         tests/bench_sdpa.cpp)
     add_mollm_test(test_norm          tests/test_norm.cpp)

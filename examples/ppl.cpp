@@ -23,6 +23,7 @@ struct Options {
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     int ssd_cache_mb = 0;
     int ssd_io_workers = 8;
+    std::string trace_path;
     bool prepend_bos = false;
     bool tokenize_only = false;
     Device device = Device::CPU;
@@ -55,6 +56,7 @@ void print_usage(const char* argv0) {
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>  CPU MoE SSD cache capacity\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
+    std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --prepend-bos         Prepend tokenizer BOS before scoring\n");
     std::printf("  --tokenize-only       Print token ids and exit before running the model\n");
 }
@@ -133,6 +135,13 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
                 error = "invalid value for --ssd-io-workers";
                 return false;
             }
+        } else if (arg == "--trace") {
+            if (!require_value("--trace", value)) return false;
+            opts.trace_path = value;
+            if (opts.trace_path.empty()) {
+                error = "--trace path must not be empty";
+                return false;
+            }
         } else if (arg == "--prepend-bos") {
             opts.prepend_bos = true;
         } else if (arg == "--tokenize-only") {
@@ -203,6 +212,7 @@ int main(int argc, char** argv) {
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;
+    cfg.trace_path = opts.trace_path;
     cfg.device = opts.device;
     if (!engine.load(cfg)) {
         std::fprintf(stderr, "ppl: failed to load package\n");

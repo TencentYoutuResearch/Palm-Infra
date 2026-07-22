@@ -27,6 +27,8 @@ struct ExecContext {
     ThreadPool*   thread_pool = nullptr;
     Backend*      backend = nullptr;   // op dispatcher (CPU/NPU/...)
     bool          profile_enabled = false;
+    // Label used by optional Chrome Trace events (normally prefill/decode).
+    const char*   trace_label = "graph";
 
     // Keep materialized tensors alive across execute_graph() calls when the
     // graph is fully static. Borrowed views are still cleared each call.

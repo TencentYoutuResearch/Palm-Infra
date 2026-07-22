@@ -85,6 +85,11 @@ struct EngineConfig {
     // packages carrying `moe_expert_storage` metadata.
     size_t moe_ssd_cache_bytes = 0;
     int moe_ssd_io_workers = 8;
+    // macOS CPU experiment: wire dense mmap pages so a large expert cache
+    // cannot evict them. Ignored unless SSD offload uses mmap weights.
+    bool lock_dense_weights = false;
+    // Optional Chrome Trace / Perfetto JSON path. Empty disables tracing.
+    std::string trace_path;
 
     // Sampling params
     float temperature = 0.6f;         // 0 = greedy (argmax)
@@ -184,6 +189,7 @@ public:
     /// Touch mmap'd package weight pages so first-token latency does not pay
     /// lazy page-in cost. Returns the number of bytes covered.
     size_t warmup_package_weights();
+    size_t lock_dense_package_weights();
     bool package_weights_mmap_backed() const {
         return package_weights_base_ != nullptr && !package_weights_resident_;
     }
@@ -230,6 +236,10 @@ private:
     std::vector<uint8_t> package_weights_storage_;
     // weight filename → (offset, size) within weights region
     std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> package_weight_map_;
+    // Aggregate expert ranges (relative to package_weights_base_) bypassed by
+    // SSD offload. Dense-only warmup must leave these untouched.
+    std::vector<std::pair<uint64_t, uint64_t>> moe_ssd_expert_ranges_;
+    std::vector<std::pair<void*, size_t>> locked_dense_ranges_;
     // Optional demand-paged storage for routed MoE experts.
     std::unique_ptr<MoeSsdCache> moe_ssd_cache_;
     // prefill_seq_len from package metadata

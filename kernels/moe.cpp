@@ -1,6 +1,7 @@
 #include "kernels/moe.h"
 #include "kernels/matmul.h"
 #include "kernels/moe_ssd.h"
+#include "kernels/trace.h"
 #include "kernels/threading.h"
 
 #include <algorithm>
@@ -398,6 +399,13 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         std::fprintf(stderr, "MOE: incomplete SSD expert source pair\n");
         return;
     }
+    std::string trace_layer_args;
+    if (mollm_trace::enabled()) {
+        trace_layer_args = use_ssd
+            ? "{\"layer\":" + std::to_string(gate_up_source->spec.layer) + "}"
+            : "{}";
+    }
+    mollm_trace::ScopedEvent trace_moe("compute", "moe", trace_layer_args);
     const Tensor* router_bias = inputs.size() > 8 ? inputs[8] : nullptr;
     const Tensor* shared_gate = has_shared_expert ? inputs[4] : nullptr;
     const Tensor* shared_up = has_shared_expert ? inputs[5] : nullptr;
@@ -423,7 +431,10 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     Tensor router_b = make_weight_view_2d(router, num_experts, hidden_size);
     Tensor router_out = make_fp32_tensor(router_logits.data(), num_experts, seq_len);
     if (profile) stage_start = moe_profile_now();
-    kernel_matmul_fp32(hidden, router_b, router_out, thread_pool);
+    {
+        mollm_trace::ScopedEvent trace_router("compute", "moe.router", trace_layer_args);
+        kernel_matmul_fp32(hidden, router_b, router_out, thread_pool);
+    }
     if (profile) moe_profile_add(MoeProfileStage::Router, stage_start);
 
     std::vector<int> top_idx((size_t)seq_len * (size_t)top_k);
@@ -438,7 +449,9 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     if (topk_group <= 0 || topk_group > n_group) topk_group = n_group;
     int experts_per_group = num_experts / n_group;
     if (profile) stage_start = moe_profile_now();
-    for (int t = 0; t < seq_len; t++) {
+    {
+        mollm_trace::ScopedEvent trace_topk("compute", "moe.topk", trace_layer_args);
+        for (int t = 0; t < seq_len; t++) {
         const float* logits = router_logits.data() + (size_t)t * num_experts;
         int* idx = top_idx.data() + (size_t)t * top_k;
         float* weights = top_w.data() + (size_t)t * top_k;
@@ -533,17 +546,25 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             float inv_top = sum_top > 0.0f ? 1.0f / sum_top : 0.0f;
             for (int k = 0; k < top_k; k++) weights[k] *= inv_top;
         }
+        }
     }
     if (profile) moe_profile_add(MoeProfileStage::TopK, stage_start);
 
+    std::vector<int> selected_experts;
+    bool stream_ssd_window = false;
     if (use_ssd) {
-        std::vector<int> selected_experts;
         selected_experts.reserve((size_t)seq_len * (size_t)top_k);
         for (int t = 0; t < seq_len; t++) {
             for (int k = 0; k < top_k; k++) {
                 selected_experts.push_back(top_idx[(size_t)t * top_k + k]);
             }
         }
+        // Routed computation walks experts in ascending id order below. Queue
+        // the same order so a cache too small for every routed pair holds the
+        // next experts to be consumed rather than an arbitrary router order.
+        std::sort(selected_experts.begin(), selected_experts.end());
+        selected_experts.erase(std::unique(selected_experts.begin(), selected_experts.end()),
+                               selected_experts.end());
         // Queue all cache misses before shared-expert work. The I/O workers
         // can now fill them while this CPU thread executes the independent
         // shared MLP below; acquire() only waits for a particular expert when
@@ -553,11 +574,14 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             std::fprintf(stderr, "MOE: failed to queue SSD expert reads\n");
             return;
         }
+        stream_ssd_window = gate_up_source->cache->resident_count(
+            gate_up_source, down_source, selected_experts) < selected_experts.size();
     }
 
     // Shared expert: shared_down(silu(shared_gate(x)) * shared_up(x))
     // multiplied by sigmoid(shared_expert_gate(x)).
     if (has_shared_expert) {
+        mollm_trace::ScopedEvent trace_shared("compute", "moe.shared", trace_layer_args);
         std::vector<float> shared_gate_out((size_t)seq_len * (size_t)shared_intermediate_size);
         std::vector<float> shared_up_out((size_t)seq_len * (size_t)shared_intermediate_size);
         std::vector<float> shared_inter((size_t)seq_len * (size_t)shared_intermediate_size);
@@ -632,13 +656,23 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         int count = counts[e];
         if (count == 0) continue;
         int begin = offsets[e];
-
+        std::string trace_expert_args;
+        if (mollm_trace::enabled()) {
+            trace_expert_args = "{\"expert\":" + std::to_string(e) +
+                                (use_ssd ? ",\"layer\":" +
+                                               std::to_string(gate_up_source->spec.layer)
+                                         : std::string()) + "}";
+        }
         if (profile) stage_start = moe_profile_now();
-        for (int i = 0; i < count; i++) {
-            int t = route_tokens[begin + i];
-            std::memcpy(expert_x.data() + (size_t)i * hidden_size,
-                        x_data + (int64_t)t * ldx,
-                        (size_t)hidden_size * sizeof(float));
+        {
+            mollm_trace::ScopedEvent trace_gather("compute", "moe.routed_gather",
+                                                   trace_expert_args);
+            for (int i = 0; i < count; i++) {
+                int t = route_tokens[begin + i];
+                std::memcpy(expert_x.data() + (size_t)i * hidden_size,
+                            x_data + (int64_t)t * ldx,
+                            (size_t)hidden_size * sizeof(float));
+            }
         }
         if (profile) moe_profile_add(MoeProfileStage::RoutedGather, stage_start);
 
@@ -675,33 +709,56 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             continue;
         }
 
-        Tensor expert_x_t = make_fp32_tensor(expert_x.data(), hidden_size, count);
-        Tensor gate_up_t = make_fp32_tensor(gate_up_out.data(), 2 * intermediate_size, count);
-        if (profile) stage_start = moe_profile_now();
-        kernel_matmul_fp32(expert_x_t, gate_up_b, gate_up_t, thread_pool);
-        for (int i = 0; i < count; i++) {
-            const float* gu = gate_up_out.data() + (size_t)i * (2 * intermediate_size);
-            float* dst = routed_inter.data() + (size_t)i * intermediate_size;
-            for (int j = 0; j < intermediate_size; j++) {
-                dst[j] = silu_scalar(gu[j]) * gu[intermediate_size + j];
+        {
+            // Keep the compute interval disjoint from acquire(): in a trace this
+            // makes I/O wait, input gather, and expert matmuls visually additive
+            // rather than a misleading pair of overlapping compute bars.
+            mollm_trace::ScopedEvent trace_compute("compute", "moe.routed_compute",
+                                                    trace_expert_args);
+            Tensor expert_x_t = make_fp32_tensor(expert_x.data(), hidden_size, count);
+            Tensor gate_up_t = make_fp32_tensor(gate_up_out.data(), 2 * intermediate_size, count);
+            if (profile) stage_start = moe_profile_now();
+            kernel_matmul_fp32(expert_x_t, gate_up_b, gate_up_t, thread_pool);
+            for (int i = 0; i < count; i++) {
+                const float* gu = gate_up_out.data() + (size_t)i * (2 * intermediate_size);
+                float* dst = routed_inter.data() + (size_t)i * intermediate_size;
+                for (int j = 0; j < intermediate_size; j++) {
+                    dst[j] = silu_scalar(gu[j]) * gu[intermediate_size + j];
+                }
+            }
+            if (profile) moe_profile_add(MoeProfileStage::RoutedGateUp, stage_start);
+
+            Tensor inter_t = make_fp32_tensor(routed_inter.data(), intermediate_size, count);
+            Tensor down_t = make_fp32_tensor(down_out.data(), hidden_size, count);
+            if (profile) stage_start = moe_profile_now();
+            kernel_matmul_fp32(inter_t, down_b, down_t, thread_pool);
+            if (profile) moe_profile_add(MoeProfileStage::RoutedDown, stage_start);
+
+            if (profile) stage_start = moe_profile_now();
+            for (int i = 0; i < count; i++) {
+                int t = route_tokens[begin + i];
+                float weight = route_weights[begin + i];
+                const float* src = down_out.data() + (size_t)i * hidden_size;
+                float* dst = out_data + (int64_t)t * ldo;
+                for (int d = 0; d < hidden_size; d++) dst[d] += weight * src[d];
+            }
+            if (profile) moe_profile_add(MoeProfileStage::RoutedScatter, stage_start);
+        }
+
+        if (use_ssd && stream_ssd_window) {
+            // Weight views are no longer used. Advance the bounded cache
+            // window immediately so this read overlaps the next ready expert.
+            gate_up_source->cache->release(gate_up_source, down_source, e);
+            auto next = std::upper_bound(selected_experts.begin(), selected_experts.end(), e);
+            for (; next != selected_experts.end(); ++next) {
+                if (!gate_up_source->cache->contains(gate_up_source, down_source, *next)) {
+                    // Submit one exact replacement. Passing every remaining
+                    // route would let request_many evict already-ready near
+                    // future experts while trying to reserve the far tail.
+                    gate_up_source->cache->request_many(gate_up_source, down_source, {*next});
+                    break;
+                }
             }
         }
-        if (profile) moe_profile_add(MoeProfileStage::RoutedGateUp, stage_start);
-
-        Tensor inter_t = make_fp32_tensor(routed_inter.data(), intermediate_size, count);
-        Tensor down_t = make_fp32_tensor(down_out.data(), hidden_size, count);
-        if (profile) stage_start = moe_profile_now();
-        kernel_matmul_fp32(inter_t, down_b, down_t, thread_pool);
-        if (profile) moe_profile_add(MoeProfileStage::RoutedDown, stage_start);
-
-        if (profile) stage_start = moe_profile_now();
-        for (int i = 0; i < count; i++) {
-            int t = route_tokens[begin + i];
-            float weight = route_weights[begin + i];
-            const float* src = down_out.data() + (size_t)i * hidden_size;
-            float* dst = out_data + (int64_t)t * ldo;
-            for (int d = 0; d < hidden_size; d++) dst[d] += weight * src[d];
-        }
-        if (profile) moe_profile_add(MoeProfileStage::RoutedScatter, stage_start);
     }
 }

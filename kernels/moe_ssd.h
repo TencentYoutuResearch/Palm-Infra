@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -79,18 +80,36 @@ public:
                       const MoeSsdTensorSource* down,
                       const std::vector<int>& experts);
 
+    // Number of requested pairs currently resident or loading. Used by the
+    // MoE kernel to detect when its route set exceeds the per-layer window.
+    size_t resident_count(const MoeSsdTensorSource* gate_up,
+                          const MoeSsdTensorSource* down,
+                          const std::vector<int>& experts) const;
+
+    bool contains(const MoeSsdTensorSource* gate_up,
+                  const MoeSsdTensorSource* down,
+                  int expert) const;
+
+    // Drop a pair once its borrowed Tensor views are no longer in use. This
+    // lets a small cache slide its async prefetch window forward.
+    bool release(const MoeSsdTensorSource* gate_up,
+                 const MoeSsdTensorSource* down,
+                 int expert);
+
     size_t capacity_bytes() const { return capacity_bytes_; }
     Stats stats() const;
     void reset_stats();
 
 private:
     struct Entry;
+    struct ByteBuffer;
     // One job reads a physically contiguous run of the same component
     // (gate data/scales or down data/scales) for adjacent expert ids. Keeping
     // components separate exposes a deep queue even for a single decode token.
     struct IoJob {
         std::vector<Entry*> entries;
         uint8_t component = 0;
+        uint64_t trace_id = 0;
     };
 
     bool valid_pair(const MoeSsdTensorSource* gate_up,
@@ -100,21 +119,21 @@ private:
                              const MoeSsdTensorSource* down, int expert);
     Entry* reserve_entry_locked(const MoeSsdTensorSource* gate_up,
                                 const MoeSsdTensorSource* down, int expert);
-    static std::vector<uint8_t>& component_buffer(Entry& entry, uint8_t component);
-    static const std::vector<uint8_t>& component_buffer(const Entry& entry,
-                                                        uint8_t component);
+    static ByteBuffer& component_buffer(Entry& entry, uint8_t component);
+    static const ByteBuffer& component_buffer(const Entry& entry, uint8_t component);
     static uint64_t component_offset(const Entry& entry, uint8_t component);
     void enqueue_entry_reads_locked(const std::vector<Entry*>& entries);
     bool read_job(const IoJob& job);
     bool read_exact(uint64_t offset, void* dst, size_t bytes) const;
-    void io_worker_main();
+    void io_worker_main(int worker_index);
     void stop_io_workers();
     static Tensor make_tensor(const MoeSsdTensorSource& source,
-                              const std::vector<uint8_t>& data,
-                              const std::vector<uint8_t>& scales);
+                              const uint8_t* data,
+                              const uint8_t* scales);
 
     int fd_ = -1;
     int io_workers_count_ = 0;
+    uint64_t next_trace_id_ = 1;
     size_t capacity_bytes_ = 0;
     size_t resident_bytes_ = 0;
     uint64_t clock_ = 0;
@@ -130,5 +149,12 @@ private:
     std::vector<std::thread> io_workers_;
     std::unordered_map<std::string, MoeSsdTensorSource> sources_;
     std::unordered_set<int> layers_;
-    std::vector<std::unique_ptr<Entry>> entries_;
+    using EntryList = std::list<std::unique_ptr<Entry>>;
+    EntryList entries_;
+    std::unordered_map<Entry*, EntryList::iterator> entry_locations_;
+    // Expert residency is partitioned by model layer. Keep that partition in
+    // the cache too: a 16+ GiB cache can have thousands of global entries,
+    // while one MoE layer only needs to inspect its own small route window.
+    std::unordered_map<int, std::vector<Entry*>> layer_entries_;
+    std::unordered_map<int, size_t> layer_resident_bytes_;
 };

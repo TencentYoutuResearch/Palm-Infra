@@ -1,6 +1,7 @@
 #include "engine/engine.h"
 #include "kernels/matmul.h"
 #include "kernels/moe_ssd.h"
+#include "kernels/trace.h"
 #ifdef MOLLM_METAL
 #include "engine/metal_backend.h"
 // Downcast the owned Backend* to MetalBackend* (non-null iff Metal active).
@@ -539,6 +540,15 @@ LLMEngine::~LLMEngine() {
     // Tensor data owned by BufferPool or EXTERNAL — no explicit free needed.
     // MappedFiles in shared_weights_ auto-close on destruction.
 
+    // Stop dedicated SSD readers before serializing their final trace events.
+    moe_ssd_cache_.reset();
+    if (!cfg_.trace_path.empty()) mollm_trace::write();
+
+    for (const auto& range : locked_dense_ranges_) {
+        munlock(range.first, range.second);
+    }
+    locked_dense_ranges_.clear();
+
     // Release .mollm package mmap (can be many GB — qwen35_4b is 8.4 GB).
     if (package_mmap_) {
         munmap(package_mmap_, package_mmap_size_);
@@ -563,25 +573,118 @@ size_t LLMEngine::warmup_package_weights() {
     long page_size_long = sysconf(_SC_PAGESIZE);
     size_t page_size = page_size_long > 0 ? (size_t)page_size_long : 4096;
 
-#if defined(MADV_WILLNEED)
-    uintptr_t start = reinterpret_cast<uintptr_t>(package_weights_base_);
-    uintptr_t aligned_start = (start / page_size) * page_size;
-    size_t prefix = (size_t)(start - aligned_start);
-    madvise(reinterpret_cast<void*>(aligned_start),
-            prefix + package_weights_size_,
-            MADV_WILLNEED);
-#endif
-
     const uint8_t* p = package_weights_base_;
     const size_t len = package_weights_size_;
 
-    uint8_t sink = 0;
-    for (size_t off = 0; off < len; off += page_size) {
-        sink ^= p[off];
+    std::vector<std::pair<uint64_t, uint64_t>> skipped = moe_ssd_expert_ranges_;
+    std::sort(skipped.begin(), skipped.end());
+    std::vector<std::pair<uint64_t, uint64_t>> merged;
+    for (const auto& range : skipped) {
+        if (range.second == 0 || range.first >= len) continue;
+        const uint64_t end = std::min<uint64_t>(len, range.first + range.second);
+        if (merged.empty() || range.first > merged.back().second) {
+            merged.push_back({range.first, end});
+        } else {
+            merged.back().second = std::max(merged.back().second, end);
+        }
     }
-    sink ^= p[len - 1];
+
+#if defined(MADV_WILLNEED)
+    // Preserve the eager readahead behaviour for ordinary mmap packages. In
+    // SSD mode it would pull aggregate expert tensors into the kernel cache,
+    // so dense-only warmup below intentionally relies on page touches alone.
+    if (merged.empty()) {
+        uintptr_t start = reinterpret_cast<uintptr_t>(package_weights_base_);
+        uintptr_t aligned_start = (start / page_size) * page_size;
+        size_t prefix = static_cast<size_t>(start - aligned_start);
+        madvise(reinterpret_cast<void*>(aligned_start), prefix + package_weights_size_,
+                MADV_WILLNEED);
+    }
+#endif
+
+    auto is_expert_offset = [&](size_t offset) {
+        for (const auto& range : merged) {
+            if (offset < range.first) return false;
+            if (offset < range.second) return true;
+        }
+        return false;
+    };
+
+    uint8_t sink = 0;
+    size_t warmed = 0;
+    for (size_t off = 0; off < len; off += page_size) {
+        if (is_expert_offset(off)) continue;
+        sink ^= p[off];
+        warmed += page_size;
+    }
+    if (len > 0 && !is_expert_offset(len - 1)) {
+        sink ^= p[len - 1];
+        warmed = std::min(len, warmed + 1);
+    }
     g_package_warmup_sink ^= sink;
-    return len;
+    return std::min(len, warmed);
+}
+
+size_t LLMEngine::lock_dense_package_weights() {
+    if (!package_weights_mmap_backed() || !moe_ssd_cache_ ||
+        !locked_dense_ranges_.empty()) {
+        return 0;
+    }
+
+    // Touch first: mlock guarantees residency of mapped pages but does not
+    // turn absent file pages into useful cache content by itself.
+    const size_t warmed = warmup_package_weights();
+    const size_t len = package_weights_size_;
+    const uint8_t* base = package_weights_base_;
+    const long system_page = sysconf(_SC_PAGESIZE);
+    const size_t page_size = system_page > 0 ? static_cast<size_t>(system_page) : 4096;
+
+    std::vector<std::pair<uint64_t, uint64_t>> skipped = moe_ssd_expert_ranges_;
+    std::sort(skipped.begin(), skipped.end());
+    std::vector<std::pair<uint64_t, uint64_t>> merged;
+    for (const auto& range : skipped) {
+        if (range.second == 0 || range.first >= len) continue;
+        const uint64_t end = std::min<uint64_t>(len, range.first + range.second);
+        if (merged.empty() || range.first > merged.back().second) {
+            merged.push_back({range.first, end});
+        } else {
+            merged.back().second = std::max(merged.back().second, end);
+        }
+    }
+
+    auto lock_range = [&](uint64_t begin, uint64_t end) -> bool {
+        if (begin >= end) return true;
+        const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(base) + begin;
+        const uintptr_t raw_end = reinterpret_cast<uintptr_t>(base) + end;
+        const uintptr_t aligned_begin = raw_begin / page_size * page_size;
+        const uintptr_t aligned_end = (raw_end + page_size - 1) / page_size * page_size;
+        const size_t bytes = aligned_end - aligned_begin;
+        void* address = reinterpret_cast<void*>(aligned_begin);
+        if (mlock(address, bytes) != 0) return false;
+        locked_dense_ranges_.push_back({address, bytes});
+        return true;
+    };
+
+    uint64_t cursor = 0;
+    bool complete = true;
+    for (const auto& range : merged) {
+        if (!lock_range(cursor, range.first)) {
+            complete = false;
+            break;
+        }
+        cursor = std::max(cursor, range.second);
+    }
+    if (complete) complete = lock_range(cursor, len);
+    if (!complete) {
+        const int err = errno;
+        for (const auto& range : locked_dense_ranges_) munlock(range.first, range.second);
+        locked_dense_ranges_.clear();
+        std::fprintf(stderr, "Engine: could not lock dense mmap weights: %s\n",
+                     std::strerror(err));
+        return 0;
+    }
+    std::fprintf(stderr, "Engine: locked %.1f MB of dense mmap weights\n", warmed / 1e6);
+    return warmed;
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,7 +1192,11 @@ void LLMEngine::reset_profiles() {
 bool LLMEngine::load(const EngineConfig& cfg) {
     cfg_ = cfg;
     cfg_.num_threads = std::max(cfg_.num_threads, 1);
+    mollm_trace::start(cfg_.trace_path);
+    mollm_trace::set_thread_name("main");
     moe_ssd_cache_.reset();
+    package_weight_map_.clear();
+    moe_ssd_expert_ranges_.clear();
     if (cfg_.moe_ssd_cache_bytes != 0) {
         if (cfg_.device != Device::CPU) {
             fprintf(stderr, "Engine: MoE SSD offload is currently CPU-only\n");
@@ -1106,6 +1213,8 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     thread_pool_.resize(cfg_.num_threads);
     exec_ctx_prefill_.thread_pool = &thread_pool_;
     exec_ctx_decode_.thread_pool  = &thread_pool_;
+    exec_ctx_prefill_.trace_label = "prefill";
+    exec_ctx_decode_.trace_label  = "decode";
     exec_ctx_prefill_.backend     = &cpu_backend_;
     exec_ctx_decode_.backend      = &cpu_backend_;
     metal_backend_.reset();
@@ -1153,6 +1262,10 @@ bool LLMEngine::load(const EngineConfig& cfg) {
         if (!tok_tmp.empty()) {
             cfg_.tokenizer_path = tok_tmp;
         }
+    }
+
+    if (cfg_.lock_dense_weights) {
+        lock_dense_package_weights();
     }
 
     // RWKV has recurrent state rather than an attention KV cache. Its generic
@@ -1544,6 +1657,7 @@ void LLMEngine::release_prefill_buffers() {
 }
 
 int LLMEngine::prefill(const std::vector<int>& token_ids) {
+    mollm_trace::ScopedEvent trace_prefill("inference", "prefill");
     int n = (int)token_ids.size();
     if (n == 0) return -1;
 
@@ -1581,6 +1695,7 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
 }
 
 Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
+    mollm_trace::ScopedEvent trace_prefill("inference", "prefill_hidden");
     int n = (int)token_ids.size();
     if (n == 0) return Tensor();
 
@@ -1750,6 +1865,7 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
 }
 
 int LLMEngine::decode(int token_id) {
+    mollm_trace::ScopedEvent trace_decode("inference", "decode");
     Tensor h = embed({token_id});
     h.shape[1] = 1;
     h.compute_strides();
@@ -1782,6 +1898,7 @@ int LLMEngine::decode(int token_id) {
 }
 
 Tensor LLMEngine::decode_hidden(int token_id) {
+    mollm_trace::ScopedEvent trace_decode("inference", "decode_hidden");
     Tensor h = embed({token_id});
     h.shape[1] = 1;
     h.compute_strides();
@@ -2007,6 +2124,12 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                             fprintf(stderr, "Engine: MoE expert range out of package bounds for %s\n",
                                     spec.weight_ref.c_str());
                             return false;
+                        }
+                        moe_ssd_expert_ranges_.push_back(
+                            {weight_offset + data_offset, all_data});
+                        if (all_scales != 0) {
+                            moe_ssd_expert_ranges_.push_back(
+                                {weight_offset + scales_offset, all_scales});
                         }
                         spec.data_offset = ph.w_off + weight_offset + data_offset;
                         spec.data_bytes = data_bytes;
