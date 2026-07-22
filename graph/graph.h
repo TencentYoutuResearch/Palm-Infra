@@ -117,6 +117,7 @@ enum class OpType : uint32_t {
     RWKV_L2_NORM     = 153,
     RWKV_GROUP_NORM  = 154,
     RWKV_BONUS       = 155,
+    RWKV_POST        = 157,
 };
 
 inline const char* op_type_name(OpType op) {
@@ -157,6 +158,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::RWKV_L2_NORM: return "RWKV_L2_NORM";
     case OpType::RWKV_GROUP_NORM: return "RWKV_GROUP_NORM";
     case OpType::RWKV_BONUS: return "RWKV_BONUS";
+    case OpType::RWKV_POST: return "RWKV_POST";
     }
     return "UNKNOWN";
 }

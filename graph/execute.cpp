@@ -586,6 +586,9 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::RWKV_BONUS:
         kernel_rwkv_bonus(params, inputs, *output);
         break;
+    case OpType::RWKV_POST:
+        kernel_rwkv_post(params, inputs, *output, thread_pool);
+        break;
     case OpType::RWKV7:
         kernel_rwkv7(params, inputs, *output, thread_pool);
         break;

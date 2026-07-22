@@ -198,6 +198,82 @@ void kernel_rwkv_bonus(const OpParams& p,
     }
 }
 
+void kernel_rwkv_post(const OpParams& p,
+                      const std::vector<const Tensor*>& in, Tensor& out,
+                      ThreadPool* thread_pool) {
+    if (in.size() < 8) return;
+    const int heads = graph_params::get_i32(p, 0, 0);
+    const int dhead = graph_params::get_i32(p, 1, 0);
+    const float eps = graph_params::get_f32(p, 0, 64e-5f);
+    const int hidden = heads * dhead;
+    if (hidden <= 0) return;
+    const int tokens = (int)(in[0]->nelements() / hidden);
+    const float *raw=in[0]->ptr<float>(), *r=in[1]->ptr<float>(),
+                *k=in[2]->ptr<float>(), *v=in[3]->ptr<float>(),
+                *rk=in[4]->ptr<float>(), *weight=in[5]->ptr<float>(),
+                *bias=in[6]->ptr<float>(), *gate=in[7]->ptr<float>();
+    float* dst=out.ptr<float>();
+    auto process=[&](int, int begin, int end) {
+        for (int group=begin; group<end; ++group) {
+            const int h=group%heads;
+            const size_t base=(size_t)group*dhead;
+            const size_t wb=(size_t)h*dhead;
+            float mean=0.f, var=0.f, bonus=0.f;
+#if HAS_NEON
+            if ((dhead&3)==0) {
+                float32x4_t sum=vdupq_n_f32(0.f), bsum=sum;
+                for (int j=0;j<dhead;j+=4) {
+                    sum=vaddq_f32(sum,vld1q_f32(raw+base+j));
+                    float32x4_t q=vmulq_f32(vld1q_f32(r+base+j),
+                                             vld1q_f32(k+base+j));
+                    bsum=vfmaq_f32(bsum,q,vld1q_f32(rk+wb+j));
+                }
+                mean=vaddvq_f32(sum)/dhead;
+                bonus=vaddvq_f32(bsum);
+                sum=vdupq_n_f32(0.f);
+                const float32x4_t mv=vdupq_n_f32(mean);
+                for (int j=0;j<dhead;j+=4) {
+                    float32x4_t q=vsubq_f32(vld1q_f32(raw+base+j),mv);
+                    sum=vfmaq_f32(sum,q,q);
+                }
+                var=vaddvq_f32(sum)/dhead;
+                const float32x4_t iv=vdupq_n_f32(1.f/std::sqrt(var+eps));
+                const float32x4_t bv=vdupq_n_f32(bonus);
+                for (int j=0;j<dhead;j+=4) {
+                    float32x4_t q=vmulq_f32(vsubq_f32(vld1q_f32(raw+base+j),mv),iv);
+                    q=vfmaq_f32(vld1q_f32(bias+wb+j),q,vld1q_f32(weight+wb+j));
+                    // Preserve the unfused graph's two rounding points here:
+                    // BONUS first multiplies v*bonus, then ADD combines it
+                    // with group norm.  An FMA is enough to change near-tied
+                    // logits after several recurrent decode steps.
+                    q=vaddq_f32(q,vmulq_f32(bv,vld1q_f32(v+base+j)));
+                    q=vmulq_f32(q,vld1q_f32(gate+base+j));
+                    vst1q_f32(dst+base+j,q);
+                }
+                continue;
+            }
+#endif
+            for(int j=0;j<dhead;++j) {
+                mean+=raw[base+j];
+                bonus+=r[base+j]*k[base+j]*rk[wb+j];
+            }
+            mean/=dhead;
+            for(int j=0;j<dhead;++j) { float q=raw[base+j]-mean; var+=q*q; }
+            const float inv=1.f/std::sqrt(var/dhead+eps);
+            for(int j=0;j<dhead;++j)
+                dst[base+j]=((raw[base+j]-mean)*inv*weight[wb+j]+bias[wb+j]
+                              +bonus*v[base+j])*gate[base+j];
+        }
+    };
+    const int groups=tokens*heads;
+    // A decode call has only `heads` small groups; dispatching the pool once
+    // per layer costs more than the work it distributes.  Prefill has enough
+    // independent (token, head) groups to amortize the synchronization.
+    if (thread_pool && tokens > 1 && groups >= 4)
+        thread_pool->parallel_for(0,groups,1,process);
+    else process(0,0,groups);
+}
+
 static void kernel_rwkv7_core(const OpParams& p,
                               const std::vector<const Tensor*>& in, Tensor& out,
                               ThreadPool* thread_pool) {

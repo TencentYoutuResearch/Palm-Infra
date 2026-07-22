@@ -73,6 +73,7 @@ class OpType(IntEnum):
     RWKV_L2_NORM   = 153
     RWKV_GROUP_NORM = 154
     RWKV_BONUS     = 155
+    RWKV_POST      = 157
 
 class Precision(IntEnum):
     FP32 = 0
@@ -252,6 +253,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.SHORTCONV,
               OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT, OpType.RWKV_MIX,
               OpType.RWKV_L2_NORM, OpType.RWKV_GROUP_NORM, OpType.RWKV_BONUS,
+              OpType.RWKV_POST,
               OpType.MOE):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
@@ -730,6 +732,16 @@ class GraphBuilder:
         return self._add(OpType.RWKV_BONUS, [r, k, v, r_k],
                          self._nodes[r].out_shape, prec=Precision.FP32,
                          i32=[num_heads, head_size])
+
+    def rwkv_post(self, raw: int, r: int, k: int, v: int, r_k: int,
+                  weight: int, bias: int, gate: int,
+                  num_heads: int, head_size: int,
+                  eps: float = 64e-5) -> int:
+        """Fused (group_norm(raw) + RWKV bonus(r,k,v)) * gate."""
+        return self._add(OpType.RWKV_POST,
+                         [raw, r, k, v, r_k, weight, bias, gate],
+                         self._nodes[raw].out_shape, prec=Precision.FP32,
+                         i32=[num_heads, head_size], f32=[eps])
 
     def rwkv7_core(self, r: int, decay: int, k: int, v: int,
                    a: int, b: int, state: int,

@@ -124,8 +124,8 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
         xn=g.layer_norm(x,ln1w,ln1b)
         sx=g.rwkv_token_shift(xn,ashift,hidden,seq_len)
         def av(n): return _scalar_weight(g,root,f"{a}_{n}",(hidden,))
-        xr=_mix(g,xn,sx,av("x_r")); xw=_mix(g,xn,sx,av("x_w")); xk=_mix(g,xn,sx,av("x_k"))
-        xv=_mix(g,xn,sx,av("x_v")); xa=_mix(g,xn,sx,av("x_a")); xg=_mix(g,xn,sx,av("x_g"))
+        mix_weights=[av(n) for n in ("x_r","x_w","x_k","x_v","x_a","x_g")]
+        xr,xw,xk,xv,xa,xg=(_mix(g,xn,sx,m) for m in mix_weights)
         def lin(n, source):
             arr=w[f"blocks.{i}.att.{n}.weight"]
             return g.matmul(source,_weight(g,root,f"{a}_{n}_weight",tuple(arr.shape)))
@@ -148,9 +148,8 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
             vval=g.add(v,g.mul(g.add(v_first,g.scalar_mul(v,-1.0)),vmix))
         raw=g.rwkv7_core(r,decay,kval,vval,g.scalar_mul(kk,-1.0),
                          g.mul(kk,alpha),state,heads,hs,seq_len)
-        norm=g.rwkv_group_norm(raw,av("ln_x_weight"),av("ln_x_bias"),heads,hs)
-        bonus=g.rwkv_bonus(r,kval,vval,av("r_k"),heads,hs)
-        att=g.mul(g.add(norm,bonus),gd)
+        att=g.rwkv_post(raw,r,kval,vval,av("r_k"),av("ln_x_weight"),
+                        av("ln_x_bias"),gd,heads,hs)
         outw=_weight(g,root,f"{a}_output_weight",tuple(w[f"blocks.{i}.att.output.weight"].shape))
         x=g.add(x,g.matmul(att,outw))
         ln2w=_scalar_weight(g,root,f"{p}_ln2_weight",(hidden,)); ln2b=_scalar_weight(g,root,f"{p}_ln2_bias",(hidden,))
