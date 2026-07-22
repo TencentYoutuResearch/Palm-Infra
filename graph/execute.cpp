@@ -833,6 +833,32 @@ void CPUBackend::dispatch(const GraphNode& node,
                                         [](float av, float bv) { return av + bv; });
                 break;
             }
+            if(thread_pool&&thread_pool->num_threads()>1&&N>=32768&&
+               a.is_contiguous()&&b.is_contiguous()&&output->is_contiguous()&&
+               (a.nelements()==b.nelements()||b.nelements()==1)) {
+                int chunk=(N+thread_pool->num_threads()-1)/thread_pool->num_threads();
+                chunk=((chunk+7)/8)*8;
+                thread_pool->parallel_for(0,N,chunk,[&](int,int begin,int end) {
+                    int i=begin;
+#if HAS_NEON
+                    if(a.nelements()==b.nelements()) {
+                        for(;i+7<end;i+=8) {
+                            vst1q_f32(o+i,vaddq_f32(vld1q_f32(ap+i),vld1q_f32(bp+i)));
+                            vst1q_f32(o+i+4,vaddq_f32(vld1q_f32(ap+i+4),vld1q_f32(bp+i+4)));
+                        }
+                    } else {
+                        float32x4_t bv=vdupq_n_f32(bp[0]);
+                        for(;i+7<end;i+=8) {
+                            vst1q_f32(o+i,vaddq_f32(vld1q_f32(ap+i),bv));
+                            vst1q_f32(o+i+4,vaddq_f32(vld1q_f32(ap+i+4),bv));
+                        }
+                    }
+#endif
+                    if(a.nelements()==b.nelements()) for(;i<end;++i)o[i]=ap[i]+bp[i];
+                    else for(;i<end;++i)o[i]=ap[i]+bp[0];
+                });
+                break;
+            }
 #if HAS_NEON
             if (a.nelements() == b.nelements()) {
                 int i = 0;
@@ -882,6 +908,25 @@ void CPUBackend::dispatch(const GraphNode& node,
             if (a.nelements() != b.nelements() && broadcasts_to(b, a)) {
                 binary_broadcast_from_b(o, a, b,
                                         [](float av, float bv) { return av * bv; });
+                break;
+            }
+            int N=(int)a.nelements();
+            if(thread_pool&&thread_pool->num_threads()>1&&N>=32768&&
+               a.nelements()==b.nelements()&&a.is_contiguous()&&b.is_contiguous()&&
+               output->is_contiguous()) {
+                const float* ap=a.ptr<float>(); const float* bp=b.ptr<float>();
+                int chunk=(N+thread_pool->num_threads()-1)/thread_pool->num_threads();
+                chunk=((chunk+7)/8)*8;
+                thread_pool->parallel_for(0,N,chunk,[&](int,int begin,int end) {
+                    int i=begin;
+#if HAS_NEON
+                    for(;i+7<end;i+=8) {
+                        vst1q_f32(o+i,vmulq_f32(vld1q_f32(ap+i),vld1q_f32(bp+i)));
+                        vst1q_f32(o+i+4,vmulq_f32(vld1q_f32(ap+i+4),vld1q_f32(bp+i+4)));
+                    }
+#endif
+                    for(;i<end;++i)o[i]=ap[i]*bp[i];
+                });
                 break;
             }
 #if HAS_NEON
