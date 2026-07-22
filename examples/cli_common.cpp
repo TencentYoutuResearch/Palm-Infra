@@ -133,6 +133,17 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.ssd_cross_layer_prefetch = true;
         } else if (arg == "--no-ssd-cross-layer-prefetch") {
             opts.ssd_cross_layer_prefetch = false;
+        } else if (arg == "--ssd-shallow-cache-layers") {
+            if (!require_value(argc, argv, i, "--ssd-shallow-cache-layers", value, error)) return false;
+            if (!parse_int(value, opts.ssd_shallow_cache_layers) ||
+                opts.ssd_shallow_cache_layers < 0) {
+                error = "invalid value for --ssd-shallow-cache-layers";
+                return false;
+            }
+        } else if (arg == "--ssd-global-cache") {
+            opts.ssd_global_cache = true;
+        } else if (arg == "--no-ssd-global-cache") {
+            opts.ssd_global_cache = false;
         } else if (arg == "--trace") {
             if (!require_value(argc, argv, i, "--trace", value, error)) return false;
             opts.trace_path = value;
@@ -220,7 +231,11 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache; pins dense weights by default\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
-    std::printf("  --ssd-cross-layer-prefetch  Experimental next-layer gate prefetch\n");
+    std::printf("  --ssd-cross-layer-prefetch  Next-layer gate prefetch (default with global cache)\n");
+    std::printf("  --no-ssd-cross-layer-prefetch  Disable next-layer gate prefetch\n");
+    std::printf("  --ssd-shallow-cache-layers <int>  Favor the first N MoE layers in the RAM cache\n");
+    std::printf("  --ssd-global-cache      Shared capacity pool across MoE layers (default)\n");
+    std::printf("  --no-ssd-global-cache   Use legacy equal per-layer cache (also disables prefetch)\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
     std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
@@ -254,7 +269,10 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;
-    cfg.moe_ssd_cross_layer_prefetch = opts.ssd_cross_layer_prefetch;
+    cfg.moe_ssd_cross_layer_prefetch = opts.ssd_global_cache &&
+                                         opts.ssd_cross_layer_prefetch;
+    cfg.moe_ssd_shallow_cache_layers = opts.ssd_shallow_cache_layers;
+    cfg.moe_ssd_global_cache = opts.ssd_global_cache;
     cfg.trace_path = opts.trace_path;
     cfg.lock_dense_weights = opts.lock_dense_weights;
     return cfg;

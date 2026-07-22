@@ -154,6 +154,66 @@ int main() {
         check(stats.evictions == 2, "one-entry cache evicts between deferred requests");
     }
 
+    // Shallow-favoring layout retains one streamable slot in every layer,
+    // then gives the remaining budget to early MoE layers. With 32 bytes, two
+    // layers need 8 bytes each for that baseline; layer zero gets the other
+    // 16 bytes and can retain all three of its expert pairs.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 32, 2), "open shallow-favoring cache");
+        auto gate0 = spec("gate0", 0);
+        auto down0 = spec("down0", 6 * sizeof(uint16_t));
+        auto gate1 = spec("gate1", 0);
+        auto down1 = spec("down1", 6 * sizeof(uint16_t));
+        gate1.layer = down1.layer = 1;
+        check(cache.add_source(gate0) && cache.add_source(down0) &&
+              cache.add_source(gate1) && cache.add_source(down1),
+              "add shallow-favoring sources");
+        check(cache.configure_shallow_favoring(1), "configure shallow-favoring layout");
+        check(cache.layer_capacity_bytes(0) == 24 && cache.layer_capacity_bytes(1) == 8,
+              "shallow layer receives the surplus cache budget");
+        const MoeSsdTensorSource* g0 = cache.find_source("gate0");
+        const MoeSsdTensorSource* d0 = cache.find_source("down0");
+        const MoeSsdTensorSource* g1 = cache.find_source("gate1");
+        const MoeSsdTensorSource* d1 = cache.find_source("down1");
+        check(cache.request_many(g0, d0, {0, 1, 2}), "queue shallow layer routes");
+        check(cache.request_many(g1, d1, {0, 1, 2}), "queue deep layer routes");
+        check(cache.resident_count(g0, d0, {0, 1, 2}) == 3,
+              "shallow layer retains all experts");
+        check(cache.resident_count(g1, d1, {0, 1, 2}) == 1,
+              "deep layer retains its streaming slot");
+    }
+
+    // A global pool lets one layer borrow capacity from every other layer.
+    // Once layer zero fills the three-pair cache, loading a layer-one expert
+    // evicts the global LRU rather than failing because layer one has no local
+    // quota left.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 24, 2), "open global-pool cache");
+        auto gate0 = spec("global_gate0", 0);
+        auto down0 = spec("global_down0", 6 * sizeof(uint16_t));
+        auto gate1 = spec("global_gate1", 0);
+        auto down1 = spec("global_down1", 6 * sizeof(uint16_t));
+        gate1.layer = down1.layer = 1;
+        check(cache.add_source(gate0) && cache.add_source(down0) &&
+              cache.add_source(gate1) && cache.add_source(down1),
+              "add global-pool sources");
+        check(cache.set_global_capacity_pool(true), "enable global capacity pool");
+        const MoeSsdTensorSource* g0 = cache.find_source("global_gate0");
+        const MoeSsdTensorSource* d0 = cache.find_source("global_down0");
+        const MoeSsdTensorSource* g1 = cache.find_source("global_gate1");
+        const MoeSsdTensorSource* d1 = cache.find_source("global_down1");
+        check(cache.request_many(g0, d0, {0, 1, 2}), "fill global cache from layer zero");
+        Tensor gu, dw;
+        check(cache.acquire(g0, d0, 0, gu, dw) && cache.acquire(g0, d0, 1, gu, dw) &&
+              cache.acquire(g0, d0, 2, gu, dw), "finish layer-zero global reads");
+        check(cache.request_many(g1, d1, {0}), "borrow global cache for layer one");
+        check(cache.contains(g1, d1, 0), "global pool admits the next layer");
+        check(cache.resident_count(g0, d0, {0, 1, 2}) == 2,
+              "global pool evicts one layer-zero LRU entry");
+    }
+
     std::remove(path.c_str());
     if (failures == 0) std::printf("All MoE SSD cache tests passed!\n");
     return failures == 0 ? 0 : 1;

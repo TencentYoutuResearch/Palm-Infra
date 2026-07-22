@@ -1216,7 +1216,8 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     exec_ctx_prefill_.trace_label = "prefill";
     exec_ctx_decode_.trace_label  = "decode";
     exec_ctx_prefill_.moe_cross_layer_prefetch = false;
-    exec_ctx_decode_.moe_cross_layer_prefetch = cfg_.moe_ssd_cross_layer_prefetch;
+    exec_ctx_decode_.moe_cross_layer_prefetch = cfg_.moe_ssd_global_cache &&
+                                                cfg_.moe_ssd_cross_layer_prefetch;
     exec_ctx_prefill_.backend     = &cpu_backend_;
     exec_ctx_decode_.backend      = &cpu_backend_;
     metal_backend_.reset();
@@ -1604,6 +1605,7 @@ void LLMEngine::generate_rope_cache(int seq_len, int start_pos,
 Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
                              const Tensor& hidden, const Tensor& mask,
                              const Tensor& cos, const Tensor& sin) {
+    if (moe_ssd_cache_) moe_ssd_cache_->begin_forward_pass();
     auto& tensors = graph.runtime.tensors;
 
     // Feed graph inputs by borrowing the caller-owned/helper tensors directly.
@@ -2095,6 +2097,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 auto cache = std::make_unique<MoeSsdCache>();
                 if (!cache->open(path, cfg_.moe_ssd_cache_bytes,
                                  cfg_.moe_ssd_io_workers,
+                                 cfg_.moe_ssd_global_cache &&
                                  cfg_.moe_ssd_cross_layer_prefetch)) return false;
                 size_t source_count = 0;
                 for (const auto& layer : (*storage_it)["layers"]) {
@@ -2154,6 +2157,17 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 if (source_count == 0) {
                     fprintf(stderr, "Engine: package has no MoE expert storage entries\n");
                     return false;
+                }
+                if (!cache->set_global_capacity_pool(cfg_.moe_ssd_global_cache)) return false;
+                if (!cache->configure_shallow_favoring(cfg_.moe_ssd_shallow_cache_layers)) {
+                    return false;
+                }
+                if (cfg_.moe_ssd_global_cache) {
+                    std::fprintf(stderr, "Engine: SSD cache uses a shared global capacity pool\n");
+                }
+                if (cfg_.moe_ssd_shallow_cache_layers > 0) {
+                    std::fprintf(stderr, "Engine: SSD cache favors the first %d MoE layers\n",
+                                 cfg_.moe_ssd_shallow_cache_layers);
                 }
                 moe_ssd_cache_ = std::move(cache);
             }

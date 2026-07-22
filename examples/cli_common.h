@@ -31,7 +31,9 @@ struct CliCommonOptions {
     bool lock_dense_weights = true;
     int ssd_cache_mb = 0;        // >0: page routed MoE experts from package
     int ssd_io_workers = 8;      // dedicated pread workers for MoE SSD cache
-    bool ssd_cross_layer_prefetch = false;  // experimental Fate-style predictor
+    bool ssd_cross_layer_prefetch = true;   // next-layer predictor (with global pool)
+    int ssd_shallow_cache_layers = 0;  // early MoE layers with priority cache quota
+    bool ssd_global_cache = true;   // dynamically shared cache capacity across layers
     std::string trace_path;      // optional Chrome Trace / Perfetto JSON output
 
     // Sampling

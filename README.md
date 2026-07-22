@@ -33,24 +33,24 @@ recently used SSD-backed expert pairs and is bounded by `--ssd-cache-mb`, so
 this is a real SSD-offload path rather than a resident 122B model.
 
 Real chat prompt, 4 CPU threads, 16 prompt tokens, 128 generated tokens,
-`warmup=1`, and locked dense weights:
+`warmup=1`, locked dense weights, and 5 independent process runs (median):
 
-| RAM cache for SSD-backed experts | Decode | Expert-cache hit rate | SSD reads |
-|---:|---:|---:|---:|
-| 1 GiB | 8.18 t/s | 0.0% | 272.0 GB |
-| 8 GiB | 10.98 t/s | 58.6% | 112.5 GB |
-| **16 GiB** | **11.79 t/s** | 74.5% | 69.4 GB |
-| 20 GiB | 9.19 t/s | 79.4% | 56.1 GB |
+| 16 GiB cache policy | Decode | Expert-cache hit rate | SSD reads |
+|---|---:|---:|---:|
+| Legacy equal per-layer cache, no prediction | 10.89 t/s | 74.5% | 69.4 GB |
+| **Default shared cache + cross-layer prefetch** | **13.54 t/s** | **89.3%** | 75.7 GB |
 
-16 GiB is the current sweet spot on this machine: it retains enough experts to
-avoid most SSD traffic without displacing the dense-weight working set. The
-strict `pp256 + tg64`, `warmup=3` five-process median for the same 16 GiB
-configuration is 37.99 pp / 6.39 tg; its decode starts from a much longer
-256-token context than the interactive measurement above.
+The default keeps one global RAM pool instead of fixed per-layer quotas. Its
+Least-Stale eviction policy protects current/future-layer experts, while a
+next-layer router prediction issues low-priority reads ahead of time. The
+prediction consumes slightly more SSD bandwidth but hides enough I/O latency
+to improve interactive decode. The strict `pp256 + tg64`, `warmup=3`
+five-process median for the same 16 GiB default is 37.99 pp / 8.46 tg; its
+decode starts from a much longer 256-token context than the interactive
+measurement above.
 
-The current expert cache policy is deliberately simple. Planned work includes a
-more effective expert-cache policy and predicting / prefetching routed experts
-during the attention phase, before the MoE layer needs them.
+Planned work includes cache-aware prefetch admission and predicting / prefetching
+routed experts during the attention phase, before the MoE layer needs them.
 
 ## What Works
 
@@ -111,12 +111,13 @@ Higher numbers are bolded in the tables below.
 |---|---:|---:|---|
 | Qwen3.6-35B-A3B | **139.63** / **65.32** | 116.93 / 43.73 | mollm 1.19x prefill, 1.49x decode |
 | Qwen3-30B-A3B | **143.50** / **63.85** | 110.34 / 60.77 | mollm 1.30x prefill, 1.05x decode |
-| Qwen3.5-122B-A10B (SSD offload) | **37.99** / **11.79** † | OOM | runs on a 48GB Mac |
+| Qwen3.5-122B-A10B (SSD offload) | **37.99** / **13.54** † | OOM | runs on a 48GB Mac |
 
 † Prefill is the five-process standard `pp256 + tg64`, `warmup=3` median.
-Decode is the best real ChatML-prompt result (16 prompt tokens, 128 generated
-tokens, `warmup=1`). Both use a 16 GiB RAM cache for SSD-backed experts and
-locked dense mmap weights. llama.cpp's CPU baseline could not fit in 48GB RAM.
+Decode is the five-process median on a real ChatML prompt (16 prompt tokens,
+128 generated tokens, `warmup=1`). Both use a 16 GiB RAM cache for SSD-backed
+experts, the default shared-cache/cross-layer-prefetch policy, and locked dense
+mmap weights. llama.cpp's CPU baseline could not fit in 48GB RAM.
 
 Overall: mollm decode is already strong, especially with W4 packages. Prefill is
 still the main optimization target on dense models.

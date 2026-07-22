@@ -85,8 +85,14 @@ struct EngineConfig {
     // packages carrying `moe_expert_storage` metadata.
     size_t moe_ssd_cache_bytes = 0;
     int moe_ssd_io_workers = 8;
-    // Experimental decode-only Fate-style next-layer gate prefetch.
-    bool moe_ssd_cross_layer_prefetch = false;
+    // Decode-only next-layer gate prefetch. Enabled with the shared SSD pool.
+    bool moe_ssd_cross_layer_prefetch = true;
+    // Number of early MoE layers to prioritize in the SSD expert cache.
+    // Zero retains equal per-layer partitions.
+    int moe_ssd_shallow_cache_layers = 0;
+    // Shared capacity across all MoE layers. Disable to reproduce the legacy
+    // equal-per-layer cache.
+    bool moe_ssd_global_cache = true;
     // Wire dense mmap pages so a large expert cache cannot evict them.
     // Ignored unless SSD offload uses mmap weights.
     bool lock_dense_weights = true;

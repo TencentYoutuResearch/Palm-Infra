@@ -67,6 +67,15 @@ public:
     bool open(const std::string& package_path, size_t capacity_bytes,
               int io_workers = 8, bool enable_cross_layer_worker = false);
     bool add_source(const MoeSsdTensorSpec& spec);
+    // Switch from isolated per-layer quotas to one shared capacity pool.
+    // Call before any expert I/O.
+    bool set_global_capacity_pool(bool enabled);
+    // Favor the first N MoE layers, while retaining one streaming slot for
+    // every layer. Call after registering all expert sources and before I/O.
+    bool configure_shallow_favoring(int shallow_layers);
+    // Mark the start of a graph forward pass. The global cache uses this
+    // boundary to distinguish stale entries from current/future entries.
+    void begin_forward_pass();
     const MoeSsdTensorSource* find_source(const std::string& weight_ref) const;
 
     // Fetch a single expert pair. The output Tensors borrow cache-owned
@@ -117,12 +126,17 @@ public:
                  int expert);
 
     size_t capacity_bytes() const { return capacity_bytes_; }
+    size_t layer_capacity_bytes(int layer) const;
     Stats stats() const;
     void reset_stats();
 
 private:
     struct Entry;
     struct ByteBuffer;
+    struct LayerLayout {
+        int num_experts = 0;
+        size_t pair_bytes = 0;
+    };
     // One job reads a physically contiguous run of the same component
     // (gate data/scales or down data/scales) for adjacent expert ids. Keeping
     // components separate exposes a deep queue even for a single decode token.
@@ -145,6 +159,8 @@ private:
     Entry* reserve_entry_locked(const MoeSsdTensorSource* gate_up,
                                 const MoeSsdTensorSource* down, int expert,
                                 bool speculative = false);
+    size_t layer_capacity_bytes_locked(int layer) const;
+    bool global_victim_before_locked(const Entry* candidate, const Entry* current) const;
     static ByteBuffer& component_buffer(Entry& entry, uint8_t component);
     static const ByteBuffer& component_buffer(const Entry& entry, uint8_t component);
     static uint64_t component_offset(const Entry& entry, uint8_t component);
@@ -185,6 +201,14 @@ private:
     std::thread cross_layer_worker_;
     std::unordered_map<std::string, MoeSsdTensorSource> sources_;
     std::unordered_set<int> layers_;
+    std::unordered_map<int, LayerLayout> layer_layouts_;
+    // Empty means the legacy equal-per-layer layout. Otherwise each value is
+    // a fixed per-layer quota computed by configure_shallow_favoring().
+    std::unordered_map<int, size_t> layer_capacity_bytes_;
+    bool global_capacity_pool_ = false;
+    int shallow_favoring_layers_ = 0;
+    uint64_t forward_epoch_ = 1;
+    int active_layer_ = -1;
     using EntryList = std::list<std::unique_ptr<Entry>>;
     EntryList entries_;
     std::unordered_map<Entry*, EntryList::iterator> entry_locations_;
