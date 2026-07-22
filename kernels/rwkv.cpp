@@ -6,6 +6,27 @@
 #include <cstring>
 #include <vector>
 
+#if HAS_NEON
+#include <arm_neon.h>
+
+static inline float rwkv_dot_neon(const float* a, const float* b, int n) {
+    float32x4_t sum = vdupq_n_f32(0.f);
+    for (int i = 0; i < n; i += 4)
+        sum = vfmaq_f32(sum, vld1q_f32(a + i), vld1q_f32(b + i));
+    return vaddvq_f32(sum);
+}
+
+static inline void rwkv_load_state_fp16(const __fp16* src, float* dst, int n) {
+    for (int i = 0; i < n; i += 4)
+        vst1q_f32(dst + i, vcvt_f32_f16(vld1_f16(src + i)));
+}
+
+static inline void rwkv_store_state_fp16(const float* src, __fp16* dst, int n) {
+    for (int i = 0; i < n; i += 4)
+        vst1_f16(dst + i, vcvt_f16_f32(vld1q_f32(src + i)));
+}
+#endif
+
 void kernel_rwkv_token_shift(const OpParams& p,
                              const std::vector<const Tensor*>& in, Tensor& out) {
     if (in.size() < 2) return;
@@ -56,6 +77,9 @@ void kernel_rwkv7(const OpParams& p, const std::vector<const Tensor*>& in,
     __fp16* state16 = state_fp16 ? reinterpret_cast<__fp16*>(in[16]->data) : nullptr;
     float* state32 = state_fp16 ? nullptr : reinterpret_cast<float*>(in[16]->data);
     float* dst = out.ptr<float>();
+#if HAS_NEON
+    const bool use_neon = (dhead & 3) == 0;
+#endif
     auto process_heads = [&](int, int h_begin, int h_end) {
       std::vector<float> raw(dhead), sa(dhead), kval(dhead), vval(dhead),
           kk(dhead), aval(dhead), decay(dhead), gate(dhead),
@@ -65,11 +89,27 @@ void kernel_rwkv7(const OpParams& p, const std::vector<const Tensor*>& in,
         const size_t state_base=(size_t)h*dhead*dhead;
         float* s=statef.data();
         if (state_fp16) {
+#if HAS_NEON
+            if (use_neon) rwkv_load_state_fp16(state16+state_base, s, dhead*dhead);
+            else
+#endif
             for (int i=0; i<dhead*dhead; ++i) s[i]=(float)state16[state_base+i];
         } else {
             std::memcpy(s, state32+state_base, (size_t)dhead*dhead*sizeof(float));
         }
         float knorm=0.f;
+#if HAS_NEON
+        if (use_neon) {
+            float32x4_t sum = vdupq_n_f32(0.f);
+            for (int j=0; j<dhead; j+=4) {
+                float32x4_t kv = vmulq_f32(vld1q_f32(k0+base+j),
+                                            vld1q_f32(kkw+(size_t)h*dhead+j));
+                vst1q_f32(kk.data()+j, kv);
+                sum = vfmaq_f32(sum, kv, kv);
+            }
+            knorm = vaddvq_f32(sum);
+        } else
+#endif
         for(int j=0;j<dhead;j++){ kk[j]=k0[base+j]*kkw[h*dhead+j]; knorm+=kk[j]*kk[j]; }
         knorm=1.f/(std::sqrt(knorm)+1e-6f);
         for(int j=0;j<dhead;j++){
@@ -86,27 +126,99 @@ void kernel_rwkv7(const OpParams& p, const std::vector<const Tensor*>& in,
             }
         }
         for (int i=0;i<dhead;i++) {
+#if HAS_NEON
+            if (use_neon) {
+                sa[i] = -rwkv_dot_neon(s+(size_t)i*dhead, kk.data(), dhead);
+                continue;
+            }
+#endif
             float q=0.f;
             for (int j=0;j<dhead;j++) q += s[(size_t)i*dhead+j] * (-kk[j]);
             sa[i]=q;
         }
-        for (int i=0;i<dhead;i++) for (int j=0;j<dhead;j++)
-            s[(size_t)i*dhead+j] = decay[j]*s[(size_t)i*dhead+j]
-                + vval[i]*kval[j] + sa[i]*(kk[j]*aval[j]);
         for (int i=0;i<dhead;i++) {
+#if HAS_NEON
+            if (use_neon) {
+                const float32x4_t vv = vdupq_n_f32(vval[i]);
+                const float32x4_t sav = vdupq_n_f32(sa[i]);
+                float* row = s+(size_t)i*dhead;
+                for (int j=0;j<dhead;j+=4) {
+                    float32x4_t sv = vmulq_f32(vld1q_f32(decay.data()+j),
+                                               vld1q_f32(row+j));
+                    sv = vfmaq_f32(sv, vv, vld1q_f32(kval.data()+j));
+                    float32x4_t kaa = vmulq_f32(vld1q_f32(kk.data()+j),
+                                                vld1q_f32(aval.data()+j));
+                    sv = vfmaq_f32(sv, sav, kaa);
+                    vst1q_f32(row+j, sv);
+                }
+                continue;
+            }
+#endif
+            for (int j=0;j<dhead;j++)
+                s[(size_t)i*dhead+j] = decay[j]*s[(size_t)i*dhead+j]
+                    + vval[i]*kval[j] + sa[i]*(kk[j]*aval[j]);
+        }
+        for (int i=0;i<dhead;i++) {
+#if HAS_NEON
+            if (use_neon) {
+                raw[i] = rwkv_dot_neon(s+(size_t)i*dhead, r+base, dhead);
+                continue;
+            }
+#endif
             float z=0.f;
             for (int j=0;j<dhead;j++) z += s[(size_t)i*dhead+j]*r[base+j];
             raw[i]=z;
         }
-        float mean=0.f; for(float z:raw) mean+=z; mean/=dhead;
-        float var=0.f; for(float z:raw){float q=z-mean;var+=q*q;} var/=dhead;
+        float mean=0.f, var=0.f, bonus=0.f;
+#if HAS_NEON
+        if (use_neon) {
+            float32x4_t sum = vdupq_n_f32(0.f);
+            for(int i=0;i<dhead;i+=4) sum=vaddq_f32(sum,vld1q_f32(raw.data()+i));
+            mean=vaddvq_f32(sum)/dhead;
+            const float32x4_t mv=vdupq_n_f32(mean);
+            sum=vdupq_n_f32(0.f);
+            for(int i=0;i<dhead;i+=4) {
+                float32x4_t q=vsubq_f32(vld1q_f32(raw.data()+i),mv);
+                sum=vfmaq_f32(sum,q,q);
+            }
+            var=vaddvq_f32(sum)/dhead;
+            sum=vdupq_n_f32(0.f);
+            for(int j=0;j<dhead;j+=4) {
+                float32x4_t q=vmulq_f32(vld1q_f32(r+base+j),
+                                        vld1q_f32(kval.data()+j));
+                sum=vfmaq_f32(sum,q,vld1q_f32(rk+(size_t)h*dhead+j));
+            }
+            bonus=vaddvq_f32(sum);
+        } else
+#endif
+        {
+            for(float z:raw) mean+=z; mean/=dhead;
+            for(float z:raw){float q=z-mean;var+=q*q;} var/=dhead;
+            for(int j=0;j<dhead;j++) bonus += r[base+j]*kval[j]*rk[h*dhead+j];
+        }
         float inv=1.f/std::sqrt(var+eps);
-        float bonus=0.f;
-        for(int j=0;j<dhead;j++) bonus += r[base+j]*kval[j]*rk[h*dhead+j];
+#if HAS_NEON
+        if (use_neon) {
+            const float32x4_t mv=vdupq_n_f32(mean);
+            const float32x4_t iv=vdupq_n_f32(inv);
+            const float32x4_t bv=vdupq_n_f32(bonus);
+            for(int i=0;i<dhead;i+=4) {
+                float32x4_t q=vmulq_f32(vsubq_f32(vld1q_f32(raw.data()+i),mv),iv);
+                q=vfmaq_f32(vld1q_f32(nb+(size_t)h*dhead+i),q,
+                            vld1q_f32(nw+(size_t)h*dhead+i));
+                q=vfmaq_f32(q,bv,vld1q_f32(vval.data()+i));
+                vst1q_f32(dst+base+i,vmulq_f32(q,vld1q_f32(gate.data()+i)));
+            }
+        } else
+#endif
         for(int i=0;i<dhead;i++)
             dst[base+i]=(((raw[i]-mean)*inv*nw[h*dhead+i]+nb[h*dhead+i])
                          +bonus*vval[i])*gate[i];
         if (state_fp16) {
+#if HAS_NEON
+            if (use_neon) rwkv_store_state_fp16(s, state16+state_base, dhead*dhead);
+            else
+#endif
             for (int i=0; i<dhead*dhead; ++i) state16[state_base+i]=(__fp16)s[i];
         } else {
             std::memcpy(state32+state_base, s, (size_t)dhead*dhead*sizeof(float));
