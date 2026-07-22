@@ -63,11 +63,13 @@ SSD 读取量，但隐藏了更多 I/O 延迟。相同 16 GiB 默认配置在严
 
 ### FP16
 
+在 Apple 平台上，mollm 会对满足条件的大型 FP16 prefill GEMM 使用 Accelerate SGEMM。
+
 | 模型 | mollm pp/tg | llama.cpp pp/tg | 结果 |
 |---|---:|---:|---|
-| Qwen3.5-0.8B | 601.38 / **123.68** | **664.54** / 97.87 | llama prefill 更快，mollm decode 更快 |
-| Youtu-LLM-2B | 236.12 / **51.32** | **258.13** / 46.73 | llama prefill 更快，mollm decode 更快 |
-| Qwen3.5-4B | 104.37 / **25.22** | **144.30** / 22.14 | llama prefill 更快，mollm decode 更快 |
+| Qwen3.5-0.8B | **757.74** / **123.68** | 664.54 / 97.87 | mollm 的 prefill 和 decode 均更快 |
+| Youtu-LLM-2B | **335.44** / **51.32** | 258.13 / 46.73 | mollm 的 prefill 和 decode 均更快 |
+| Qwen3.5-4B | 135.00 / **25.22** | **144.30** / 22.14 | llama prefill 更快，mollm decode 更快 |
 
 ### W8
 

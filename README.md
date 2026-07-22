@@ -83,11 +83,13 @@ Higher numbers are bolded in the tables below.
 
 ### FP16
 
+On Apple, mollm uses Accelerate SGEMM for eligible large FP16 prefill GEMMs.
+
 | Model | mollm pp/tg | llama.cpp pp/tg | Result |
 |---|---:|---:|---|
-| Qwen3.5-0.8B | 601.38 / **123.68** | **664.54** / 97.87 | llama faster prefill, mollm faster decode |
-| Youtu-LLM-2B | 236.12 / **51.32** | **258.13** / 46.73 | llama faster prefill, mollm faster decode |
-| Qwen3.5-4B | 104.37 / **25.22** | **144.30** / 22.14 | llama faster prefill, mollm faster decode |
+| Qwen3.5-0.8B | **757.74** / **123.68** | 664.54 / 97.87 | mollm faster prefill and decode |
+| Youtu-LLM-2B | **335.44** / **51.32** | 258.13 / 46.73 | mollm faster prefill and decode |
+| Qwen3.5-4B | 135.00 / **25.22** | **144.30** / 22.14 | llama faster prefill, mollm faster decode |
 
 ### W8
 

@@ -40,22 +40,22 @@
   <line x1="1120" y1="134" x2="1120" y2="286" class="grid"/>
 
   <text x="40" y="161" class="label">Qwen3.5-0.8B</text>
-  <rect x="200" y="140" width="315.7" height="13" rx="2" class="mollm"/><text x="522" y="151" class="value">601.38</text>
+  <rect x="200" y="140" width="397.8" height="13" rx="2" class="mollm"/><text x="605" y="151" class="value">757.74</text>
   <rect x="200" y="158" width="348.9" height="13" rx="2" class="llama"/><text x="555" y="169" class="value">664.54</text>
   <rect x="700" y="140" width="185.5" height="13" rx="2" class="mollm"/><text x="892" y="151" class="value">123.68</text>
   <rect x="700" y="158" width="146.8" height="13" rx="2" class="llama"/><text x="853" y="169" class="value">97.87</text>
 
   <text x="40" y="207" class="label">Youtu-LLM-2B</text>
-  <rect x="200" y="186" width="114.8" height="13" rx="2" class="mollm"/><text x="321" y="197" class="value">218.67</text>
-  <rect x="200" y="204" width="135.4" height="13" rx="2" class="llama"/><text x="342" y="215" class="value">257.93</text>
-  <rect x="700" y="186" width="78.2" height="13" rx="2" class="mollm"/><text x="785" y="197" class="value">52.12</text>
-  <rect x="700" y="204" width="67.7" height="13" rx="2" class="llama"/><text x="775" y="215" class="value">45.12</text>
+  <rect x="200" y="186" width="176.1" height="13" rx="2" class="mollm"/><text x="383" y="197" class="value">335.44</text>
+  <rect x="200" y="204" width="135.5" height="13" rx="2" class="llama"/><text x="342" y="215" class="value">258.13</text>
+  <rect x="700" y="186" width="77.0" height="13" rx="2" class="mollm"/><text x="784" y="197" class="value">51.32</text>
+  <rect x="700" y="204" width="70.1" height="13" rx="2" class="llama"/><text x="777" y="215" class="value">46.73</text>
 
   <text x="40" y="253" class="label">Qwen3.5-4B</text>
-  <rect x="200" y="232" width="53.8" height="13" rx="2" class="mollm"/><text x="261" y="243" class="value">102.48</text>
-  <rect x="200" y="250" width="74.8" height="13" rx="2" class="llama"/><text x="282" y="261" class="value">142.44</text>
-  <rect x="700" y="232" width="37.5" height="13" rx="2" class="mollm"/><text x="745" y="243" class="value">25.00</text>
-  <rect x="700" y="250" width="33.5" height="13" rx="2" class="llama"/><text x="741" y="261" class="value">22.33</text>
+  <rect x="200" y="232" width="70.9" height="13" rx="2" class="mollm"/><text x="278" y="243" class="value">135.00</text>
+  <rect x="200" y="250" width="75.8" height="13" rx="2" class="llama"/><text x="283" y="261" class="value">144.30</text>
+  <rect x="700" y="232" width="37.8" height="13" rx="2" class="mollm"/><text x="745" y="243" class="value">25.22</text>
+  <rect x="700" y="250" width="33.2" height="13" rx="2" class="llama"/><text x="741" y="261" class="value">22.14</text>
 
   <line x1="200" y1="286" x2="620" y2="286" class="axis"/>
   <text x="196" y="304" class="tick">0</text><text x="296" y="304" class="tick">200</text><text x="401" y="304" class="tick">400</text><text x="506" y="304" class="tick">600</text><text x="611" y="304" class="tick">800</text>
@@ -148,7 +148,7 @@
   <text x="40" y="881" class="label">Qwen3.5-122B SSD</text>
   <rect x="200" y="860" width="19.9" height="13" rx="2" class="mollm"/><text x="227" y="871" class="value">37.99</text>
   <text x="200" y="889" class="value">0 (OOM)</text>
-  <rect x="700" y="860" width="17.7" height="13" rx="2" class="mollm"/><text x="725" y="871" class="value">11.79</text>
+  <rect x="700" y="860" width="20.3" height="13" rx="2" class="mollm"/><text x="728" y="871" class="value">13.54</text>
   <text x="700" y="889" class="value">0 (OOM)</text>
 
   <line x1="200" y1="914" x2="620" y2="914" class="axis"/>
