@@ -733,7 +733,8 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::LAYER_NORM:
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
             float eps = graph_params::get_f32(params, 0, 1e-5f);
-            kernel_layer_norm(*inputs[0], *inputs[1], *inputs[2], eps, *output);
+            kernel_layer_norm(*inputs[0], *inputs[1], *inputs[2], eps, *output,
+                              thread_pool);
         }
         break;
 

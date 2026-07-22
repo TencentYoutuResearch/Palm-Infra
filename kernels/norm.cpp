@@ -1,4 +1,5 @@
 #include "kernels/norm.h"
+#include "kernels/threading.h"
 
 #include <algorithm>
 #include <cmath>
@@ -120,17 +121,21 @@ void kernel_rms_norm(const Tensor& x, const Tensor& weight,
 }
 
 void kernel_layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias,
-                       float eps, Tensor& out) {
+                       float eps, Tensor& out, ThreadPool* thread_pool) {
     const int d = (int)x.shape[0], n = (int)x.shape[1];
     const int ldx = (int)(x.stride[1] / sizeof(float));
     const int ldo = (int)(out.stride[1] / sizeof(float));
     const float *xp=x.ptr<float>(), *wp=weight.ptr<float>(), *bp=bias.ptr<float>();
     float* op=out.ptr<float>();
-    for(int row=0; row<n; ++row) {
+    auto process_rows=[&](int,int begin,int end) { for(int row=begin; row<end; ++row) {
         const float* in=xp+(size_t)row*ldx; float* dst=op+(size_t)row*ldo;
         float mean=0.f; for(int i=0;i<d;i++) mean+=in[i]; mean/=d;
         float var=0.f; for(int i=0;i<d;i++){float z=in[i]-mean;var+=z*z;} var/=d;
         float scale=1.f/std::sqrt(var+eps);
         for(int i=0;i<d;i++) dst[i]=(in[i]-mean)*scale*wp[i]+bp[i];
-    }
+    }};
+    if(thread_pool&&thread_pool->num_threads()>1&&n>=16) {
+        int chunk=std::max(1,(n+thread_pool->num_threads()-1)/thread_pool->num_threads());
+        thread_pool->parallel_for(0,n,chunk,process_rows);
+    } else process_rows(0,0,n);
 }
