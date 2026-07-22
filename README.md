@@ -6,6 +6,7 @@ AI Infra projects from Palm Team. Currently includes `mollm`.
 
 ## mollm
 
+mobile-oriented LLM inference engine.
 ```
                  _ _
  _ __ ___   ___ | | |_ __ ___
