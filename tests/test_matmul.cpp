@@ -871,6 +871,28 @@ int main() {
         delete[] q8_repack;
     }
 
+    // Large FP16 matmul with the original row-major weight retained beside
+    // the interleaved CPU pack. On Apple this exercises Accelerate SGEMM.
+    {
+        int M=96,K=64,N=64;
+        std::vector<float> a(M*K),w32(N*K),out(M*N),ref(M*N);
+        std::vector<__fp16> w16(N*K);
+        fill_rand(a.data(),M*K); fill_rand(w32.data(),N*K);
+        for(int i=0;i<N*K;++i) w16[i]=(__fp16)w32[i];
+        for(int i=0;i<N*K;++i) w32[i]=(float)w16[i];
+        __fp16* packed=pack_b_interleaved_full(w16.data(),N,K,K);
+        Tensor A=Tensor::create(Precision::FP32,MemoryType::EXTERNAL,K,M,1,1,a.data());
+        Tensor B=Tensor::create(Precision::FP16,MemoryType::EXTERNAL,N,K,1,1,packed);
+        Tensor C=Tensor::create(Precision::FP32,MemoryType::EXTERNAL,N,M,1,1,out.data());
+        B.is_interleaved=true; B.rowmajor_data=w16.data();
+        ThreadPool pool(4);
+        kernel_matmul_fp32(A,B,C,&pool);
+        ref_matmul(a.data(),w32.data(),ref.data(),M,N,K);
+        CHECK(check_approx(out.data(),ref.data(),M*N,2e-4f),
+              "FP16 large GEMM row-major sidecar");
+        delete[] packed;
+    }
+
     if (failures == 0) {
         printf("\nAll matmul tests passed!\n");
     } else {

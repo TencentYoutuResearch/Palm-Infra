@@ -142,6 +142,7 @@ if(APPLE)
     find_library(ACCELERATE_LIBRARY Accelerate)
     if(ACCELERATE_LIBRARY)
         target_link_libraries(mollm_lib PUBLIC ${ACCELERATE_LIBRARY})
+        target_compile_definitions(mollm_lib PRIVATE ACCELERATE_NEW_LAPACK)
     endif()
 endif()
 
