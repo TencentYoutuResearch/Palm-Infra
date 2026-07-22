@@ -26,7 +26,9 @@ struct CliCommonOptions {
     // Needed because SSD offload suppresses the default whole-package warmup,
     // but an explicit --load-warmup can still warm only dense mmap weights.
     bool load_warmup_explicit = false;
-    bool lock_dense_weights = false;  // pin dense mmap pages (SSD offload experiment)
+    // SSD expert offload benefits from keeping the always-used dense weights
+    // resident. Users on constrained systems can opt out explicitly.
+    bool lock_dense_weights = true;
     int ssd_cache_mb = 0;        // >0: page routed MoE experts from package
     int ssd_io_workers = 8;      // dedicated pread workers for MoE SSD cache
     std::string trace_path;      // optional Chrome Trace / Perfetto JSON output

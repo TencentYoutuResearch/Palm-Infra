@@ -1264,7 +1264,7 @@ bool LLMEngine::load(const EngineConfig& cfg) {
         }
     }
 
-    if (cfg_.lock_dense_weights) {
+    if (cfg_.lock_dense_weights && moe_ssd_cache_) {
         lock_dense_package_weights();
     }
 

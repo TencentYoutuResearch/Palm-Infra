@@ -23,6 +23,34 @@ The current focus is fast local inference on Apple Silicon and other modern ARM
 CPUs. FP16 uses NEON FP16FML kernels; quantized CPU models use weight-only int8
 or int4 kernels optimized for ARM dot-product instructions.
 
+## Now it runs a 122B model on a 48GB Mac
+
+`mollm` runs Qwen3.5-122B-A10B W4 on a 48GB Apple Silicon Mac by keeping the
+always-used dense weights locked in RAM and fetching only routed MoE expert
+pairs from the package with asynchronous `pread` workers. A RAM cache holds
+recently used SSD-backed expert pairs and is bounded by `--ssd-cache-mb`, so
+this is a real SSD-offload path rather than a resident 122B model.
+
+Real chat prompt, 4 CPU threads, 16 prompt tokens, 128 generated tokens,
+`warmup=1`, and locked dense weights:
+
+| RAM cache for SSD-backed experts | Decode | Expert-cache hit rate | SSD reads |
+|---:|---:|---:|---:|
+| 1 GiB | 8.18 t/s | 0.0% | 272.0 GB |
+| 8 GiB | 10.98 t/s | 58.6% | 112.5 GB |
+| **16 GiB** | **11.79 t/s** | 74.5% | 69.4 GB |
+| 20 GiB | 9.19 t/s | 79.4% | 56.1 GB |
+
+16 GiB is the current sweet spot on this machine: it retains enough experts to
+avoid most SSD traffic without displacing the dense-weight working set. The
+strict `pp256 + tg64`, `warmup=3` five-process median for the same 16 GiB
+configuration is 37.99 pp / 6.39 tg; its decode starts from a much longer
+256-token context than the interactive measurement above.
+
+The current expert cache policy is deliberately simple. Planned work includes a
+more effective expert-cache policy and predicting / prefetching routed experts
+during the attention phase, before the MoE layer needs them.
+
 ## What Works
 
 | Model family | Status |
@@ -30,6 +58,7 @@ or int4 kernels optimized for ARM dot-product instructions.
 | Qwen3 dense text models | FP16, W8, W4 |
 | Qwen3-30B-A3B MoE | text-only W4 path |
 | Qwen3.6-35B-A3B MoE | text-only W4 path |
+| Qwen3.5-122B-A10B MoE | CPU W4 with SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4 |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
 
@@ -44,10 +73,12 @@ in W8 when pure W4 loses too much quality.
 The chart compares FP16, W8, and W4 throughput. Protocol unless noted: Apple M5
 Pro, 4 threads, `pp256 + tg64`, `warmup=3`, 5 independent runs, median
 throughput. `pp` is prompt/prefill tokens per second; `tg` is generated/decode
-tokens per second. Packages are loaded into resident memory by default; mmap
-loading remains available with `--mmap` for A/B testing. If mmap page warmup is
-used, benchmark output reports it separately as `load_warmup_ms`, outside the
-measured prefill/decode timings. Higher numbers are bolded in the tables below.
+tokens per second. The 122B row (†) is an interactive real-prompt SSD-offload
+measurement; its strict `pp256 + tg64` median is given above. Packages are
+loaded into resident memory by default; mmap loading remains available with
+`--mmap` for A/B testing. If mmap page warmup is used, benchmark output reports
+it separately as `load_warmup_ms`, outside the measured prefill/decode timings.
+Higher numbers are bolded in the tables below.
 
 ### FP16
 
@@ -79,9 +110,35 @@ measured prefill/decode timings. Higher numbers are bolded in the tables below.
 |---|---:|---:|---|
 | Qwen3.6-35B-A3B | **139.63** / **65.32** | 116.93 / 43.73 | mollm 1.19x prefill, 1.49x decode |
 | Qwen3-30B-A3B | **143.50** / **63.85** | 110.34 / 60.77 | mollm 1.30x prefill, 1.05x decode |
+| Qwen3.5-122B-A10B (SSD offload) | **37.99** / **11.79** † | OOM | runs on a 48GB Mac |
+
+† Prefill is the five-process standard `pp256 + tg64`, `warmup=3` median.
+Decode is the best real ChatML-prompt result (16 prompt tokens, 128 generated
+tokens, `warmup=1`). Both use a 16 GiB RAM cache for SSD-backed experts and
+locked dense mmap weights. llama.cpp's CPU baseline could not fit in 48GB RAM.
 
 Overall: mollm decode is already strong, especially with W4 packages. Prefill is
 still the main optimization target on dense models.
+
+## Profile SSD I/O overlap
+
+Both `mollm_chat` and `mollm_bench` accept `--trace <path.json>` and write a
+Chrome Trace / Perfetto timeline when the process exits. Load the JSON into
+[Perfetto](https://ui.perfetto.dev/) to inspect prefill/decode, per-layer MoE
+routing and expert compute, cache `request_many` / `acquire`, and each SSD I/O
+worker's merged `pread` operations. Flow arrows connect queued reads to the
+worker that completes them, making missed overlap and shallow I/O queues easy
+to spot.
+
+```bash
+./build/mollm_bench \
+  --package /path/to/qwen35_122b_a10b_w4g128_ssd.mollm \
+  --ssd-cache-mb 16384 --ssd-io-workers 8 --threads 4 \
+  --prompt "Give me a short story" --max-new-tokens 128 --warmup 1 \
+  --trace /tmp/mollm_122b_trace.json
+```
+
+![Chrome Trace / Perfetto view of decode, MoE execution, and SSD I/O workers](assets/ssd_io_trace.png)
 
 ## Why Decode Is Fast
 

@@ -21,6 +21,7 @@ tmp/build_asan/
 *.pth
 *.gguf
 tmp/
+*.json
 
 # docs/ — local-only (architecture notes, optimization logs, state tracking)
 docs/

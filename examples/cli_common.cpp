@@ -144,6 +144,8 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.load_warmup_explicit = true;
         } else if (arg == "--lock-dense-weights") {
             opts.lock_dense_weights = true;
+        } else if (arg == "--no-lock-dense-weights") {
+            opts.lock_dense_weights = false;
         } else if (arg == "--warmup") {
             if (!require_value(argc, argv, i, "--warmup", value, error)) return false;
             if (!parse_int(value, opts.warmup) || opts.warmup < 0) {
@@ -212,11 +214,12 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
     std::printf("  --device <cpu|metal>     Compute backend (metal requires MOLLM_METAL build)\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
-    std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache capacity; defaults to no package warmup\n");
+    std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache; pins dense weights by default\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
-    std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (SSD offload only)\n");
+    std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
+    std::printf("  --no-lock-dense-weights Keep dense mmap weights pageable\n");
     std::printf("  --no-load-warmup        Skip mmap page-in warmup\n");
     std::printf("  --warmup <int>            Default: 1 (used by benchmark)\n");
     std::printf("  --temperature <float>     Default: 0.6 (0 = greedy)\n");
