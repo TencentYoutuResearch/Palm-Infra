@@ -1017,6 +1017,21 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::SIGMOID_EXACT:
         if (inputs.size() >= 1 && inputs[0] && output) {
             const Tensor& src = *inputs[0];
+            const int64_t total = src.nelements();
+            if (thread_pool && thread_pool->num_threads() > 1 &&
+                src.is_contiguous() && total >= 32768) {
+                const float* input = src.ptr<float>();
+                float* dst = output->ptr<float>();
+                int chunk = (int)((total + thread_pool->num_threads() - 1) /
+                                  thread_pool->num_threads());
+                chunk = std::max(chunk, 4096);
+                thread_pool->parallel_for(0, (int)total, chunk,
+                    [&](int, int begin, int end) {
+                        for (int i = begin; i < end; ++i)
+                            dst[i] = 1.f / (1.f + std::exp(-input[i]));
+                    });
+                break;
+            }
             const char* src_base = static_cast<const char*>(src.data);
             StrideIter it = compute_stride_iter(src);
             float* dst = output->ptr<float>();
