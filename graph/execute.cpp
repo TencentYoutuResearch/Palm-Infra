@@ -576,6 +576,9 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::RWKV_TOKEN_SHIFT:
         kernel_rwkv_token_shift(params, inputs, *output);
         break;
+    case OpType::RWKV_MIX:
+        kernel_rwkv_mix(params, inputs, *output);
+        break;
     case OpType::RWKV7:
         kernel_rwkv7(params, inputs, *output, thread_pool);
         break;

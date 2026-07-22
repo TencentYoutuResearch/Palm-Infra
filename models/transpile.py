@@ -69,6 +69,7 @@ class OpType(IntEnum):
     SHORTCONV      = 140
     RWKV7          = 150
     RWKV_TOKEN_SHIFT = 151
+    RWKV_MIX       = 152
 
 class Precision(IntEnum):
     FP32 = 0
@@ -245,7 +246,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.TILE, OpType.CONTIGUOUS,
               OpType.QUANTIZE_KV, OpType.DEQUANTIZE_KV,
               OpType.SHORTCONV,
-              OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT,
+              OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT, OpType.RWKV_MIX,
               OpType.MOE):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
@@ -700,6 +701,11 @@ class GraphBuilder:
         return self._add(OpType.RWKV_TOKEN_SHIFT, [x, state],
                          self._nodes[x].out_shape, prec=Precision.FP32,
                          i32=[hidden_size, seq_len, 0])
+
+    def rwkv_mix(self, x: int, shift: int, mix: int) -> int:
+        """Fused RWKV time mix: x + shift * mix."""
+        return self._add(OpType.RWKV_MIX, [x, shift, mix],
+                         self._nodes[x].out_shape, prec=Precision.FP32)
 
     def rwkv7(self, r: int, w_delta: int, k: int, v: int, a_delta: int,
               gate_delta: int, v_delta: int, v_first: int, w0: int, a0: int,

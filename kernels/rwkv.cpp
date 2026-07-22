@@ -54,6 +54,35 @@ void kernel_rwkv_token_shift(const OpParams& p,
                     (size_t)(seq - real) * hidden * sizeof(float));
 }
 
+void kernel_rwkv_mix(const OpParams&, const std::vector<const Tensor*>& in,
+                     Tensor& out) {
+    if (in.size() < 3) return;
+    const float* x = in[0]->ptr<float>();
+    const float* shift = in[1]->ptr<float>();
+    const float* mix = in[2]->ptr<float>();
+    float* dst = out.ptr<float>();
+    const int hidden = (int)in[2]->nelements();
+    const int64_t total = in[0]->nelements();
+    if (hidden <= 0 || total % hidden != 0) return;
+    const int rows = (int)(total / hidden);
+    for (int row = 0; row < rows; ++row) {
+        const size_t base = (size_t)row * hidden;
+        int d = 0;
+#if HAS_NEON
+        for (; d + 7 < hidden; d += 8) {
+            vst1q_f32(dst+base+d,
+                      vfmaq_f32(vld1q_f32(x+base+d),
+                                 vld1q_f32(shift+base+d),vld1q_f32(mix+d)));
+            vst1q_f32(dst+base+d+4,
+                      vfmaq_f32(vld1q_f32(x+base+d+4),
+                                 vld1q_f32(shift+base+d+4),vld1q_f32(mix+d+4)));
+        }
+#endif
+        for (; d < hidden; ++d)
+            dst[base+d] = x[base+d] + shift[base+d] * mix[d];
+    }
+}
+
 void kernel_rwkv7(const OpParams& p, const std::vector<const Tensor*>& in,
                   Tensor& out, ThreadPool* thread_pool) {
     if (in.size() < 17) return;

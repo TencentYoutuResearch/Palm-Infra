@@ -163,6 +163,47 @@ int main() {
               "ADD broadcasts channel vector across sequence");
     }
 
+    // ---- test: fused RWKV time mix x + shift * channel_mix ----
+    {
+        Graph gm;
+        for (uint32_t id = 0; id < 3; ++id) {
+            GraphNode in;
+            in.id = id;
+            in.op_type = OpType::INPUT;
+            in.out_shape[0] = 4;
+            in.out_shape[1] = id == 2 ? 1 : 2;
+            in.out_prec = Precision::FP32;
+            gm.nodes.push_back(in);
+        }
+        GraphNode mix;
+        mix.id = 3; mix.op_type = OpType::RWKV_MIX; mix.inputs = {0, 1, 2};
+        mix.out_shape[0] = 4; mix.out_shape[1] = 2;
+        mix.out_prec = Precision::FP32;
+        gm.nodes.push_back(mix);
+        gm.graph_inputs = {0, 1, 2};
+        gm.graph_outputs = {3};
+        gm.runtime.tensors.resize(4);
+        float x[8] = {1,2,3,4, 5,6,7,8};
+        float shift[8] = {2,2,2,2, 4,4,4,4};
+        float channels[4] = {0.5f,1.f,1.5f,2.f};
+        gm.runtime.tensors[0] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                               4, 2, 1, 1, x);
+        gm.runtime.tensors[1] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                               4, 2, 1, 1, shift);
+        gm.runtime.tensors[2] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                               4, 1, 1, 1, channels);
+        BufferPool pool_m;
+        ExecContext ctx_m;
+        ctx_m.graph = &gm; ctx_m.pool = &pool_m; ctx_m.backend = &cpu_backend;
+        prepare_execution(ctx_m);
+        execute_graph(ctx_m);
+        CHECK(gm.runtime.tensors[3].at<float>(0, 0) == 2.f &&
+              gm.runtime.tensors[3].at<float>(3, 0) == 8.f &&
+              gm.runtime.tensors[3].at<float>(0, 1) == 7.f &&
+              gm.runtime.tensors[3].at<float>(3, 1) == 16.f,
+              "RWKV_MIX fuses channel-wise multiply-add");
+    }
+
     // ---- test: slice(dim=0) + concat(dim=0) preserve row layout ----
     Graph g3;
     GraphNode in2;

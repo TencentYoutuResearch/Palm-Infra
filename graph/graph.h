@@ -113,6 +113,7 @@ enum class OpType : uint32_t {
     SHORTCONV      = 140,
     RWKV7           = 150,
     RWKV_TOKEN_SHIFT = 151,
+    RWKV_MIX         = 152,
 };
 
 inline const char* op_type_name(OpType op) {
@@ -149,6 +150,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::SHORTCONV: return "SHORTCONV";
     case OpType::RWKV7: return "RWKV7";
     case OpType::RWKV_TOKEN_SHIFT: return "RWKV_TOKEN_SHIFT";
+    case OpType::RWKV_MIX: return "RWKV_MIX";
     }
     return "UNKNOWN";
 }

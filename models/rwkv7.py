@@ -89,7 +89,7 @@ def _scalar_weight(g: GraphBuilder, root: str, name: str, shape: tuple) -> int:
 
 
 def _mix(g: GraphBuilder, x: int, sx: int, mix: int) -> int:
-    return g.add(x, g.mul(sx, mix))
+    return g.rwkv_mix(x, sx, mix)
 
 
 def _lora(g: GraphBuilder, x: int, w1: int, w2: int, activation=None) -> int:
