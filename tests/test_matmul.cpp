@@ -51,6 +51,7 @@ int main() {
     setenv("MOLLM_W4_PACKED_BG128", "1", 1);
     setenv("MOLLM_W4_GEMM_2D", "1", 1);
     setenv("MOLLM_W4_GEMM_N_BLOCK", "8", 1);
+    setenv("MOLLM_SPARSE_A_FORCE", "1", 1);
 
     // ---- small matmul: 4x4 * 4x4 = 4x4 ----
     {
@@ -891,6 +892,61 @@ int main() {
         CHECK(check_approx(out.data(),ref.data(),M*N,2e-4f),
               "FP16 large GEMM row-major sidecar");
         delete[] packed;
+    }
+
+    // Sparse-A decode GEMV: exact zeros from ReLU-squared are omitted while
+    // FP16/W8/W4 results remain consistent with their dequantized references.
+    {
+        constexpr int K = 128, N = 16;
+        std::vector<float> a(K, 0.f), w(N*K), ref(N), out(N);
+        a[3] = 0.5f; a[37] = 1.25f; a[68] = 0.75f; a[111] = 2.f;
+        for (int i = 0; i < N*K; ++i) w[i] = ((i * 13) % 31 - 15) * 0.01f;
+        ref_matmul(a.data(), w.data(), ref.data(), 1, N, K);
+        std::vector<__fp16> h(N*K);
+        for (int i = 0; i < N*K; ++i) h[i] = (__fp16)w[i];
+        __fp16* hp = pack_b_interleaved_full(h.data(), N, K, K);
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1, a.data());
+        Tensor B = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, N, K, 1, 1, hp);
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1, out.data());
+        kernel_gemv_sparse_a(A, B, C);
+        CHECK(check_approx(out.data(), ref.data(), N, 3e-3f), "sparse-A FP16 GEMV");
+        delete[] hp;
+
+        std::vector<int8_t> q8(N*K);
+        std::vector<float> s8(N), deq8(N*K), ref8(N);
+        for (int n = 0; n < N; ++n) {
+            s8[n] = 0.01f;
+            for (int k = 0; k < K; ++k) {
+                q8[n*K+k] = (int8_t)(((n*7+k*5)%31)-15);
+                deq8[n*K+k] = q8[n*K+k] * s8[n];
+            }
+        }
+        int8_t* q8p = pack_b_interleaved_int8_full(q8.data(), N, K, K);
+        B = Tensor::create(Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1, q8.data());
+        B.sparse_data=q8p; B.scales=s8.data(); B.group_size=K; B.groups_per_row=1;
+        ref_matmul(a.data(), deq8.data(), ref8.data(), 1, N, K);
+        kernel_gemv_sparse_a(A, B, C);
+        CHECK(check_approx(out.data(), ref8.data(), N, 4e-3f), "sparse-A W8 GEMV");
+        delete[] q8p;
+
+        std::vector<uint8_t> q4rows((size_t)N*K/2, 0);
+        std::vector<float> s4(N, 0.02f), deq4(N*K), ref4(N);
+        for (int n = 0; n < N; ++n) for (int k = 0; k < K; ++k) {
+            int q = ((n*3+k*5)%15)-7;
+            size_t idx=(size_t)n*(K/2)+k/2;
+            if(k&1) q4rows[idx]|=(uint8_t)((q&15)<<4); else q4rows[idx]|=(uint8_t)(q&15);
+            deq4[n*K+k]=q*s4[n];
+        }
+        uint8_t* q4dot=pack_b_q4dot_int4_full(q4rows.data(),N,K,K);
+        uint8_t* bg=pack_b_q4dot_g128_full(q4dot,s4.data(),N,K,1);
+        int8_t* q4s=pack_b_sparse_int4_g128_full(bg,N,K);
+        B=Tensor::create(Precision::INT4,MemoryType::EXTERNAL,N,K,1,1,bg);
+        B.sparse_data=q4s; B.q4_g128_data=bg; B.scales=s4.data();
+        B.group_size=128; B.groups_per_row=1;
+        ref_matmul(a.data(),deq4.data(),ref4.data(),1,N,K);
+        kernel_gemv_sparse_a(A,B,C);
+        CHECK(check_approx(out.data(),ref4.data(),N,4e-3f),"sparse-A W4 GEMV");
+        delete[] q4dot; delete[] bg; delete[] q4s;
     }
 
     if (failures == 0) {

@@ -533,6 +533,12 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::GEMV_SPARSE_A:
+        if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
+            kernel_gemv_sparse_a(*inputs[0], *inputs[1], *output, thread_pool);
+        }
+        break;
+
     case OpType::SDPA:
     case OpType::SDPA_MLA: {
         std::vector<Tensor*> sdpa_outs = { output };

@@ -62,6 +62,7 @@ class OpType(IntEnum):
     SWIGLU         = 75
     SIGMOID_EXACT  = 76
     EXP_EXACT      = 77
+    GEMV_SPARSE_A  = 78
     QUANTIZE_KV    = 80
     DEQUANTIZE_KV  = 81
     GATED_DELTANET_DECODE  = 110
@@ -262,7 +263,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
     if op in (OpType.ADD, OpType.MUL):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
-    if op == OpType.MATMUL:
+    if op in (OpType.MATMUL, OpType.GEMV_SPARSE_A):
         a = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, a[1], _CONST, _CONST)
 
@@ -438,6 +439,16 @@ class GraphBuilder:
         return self._add(OpType.MATMUL, [a, b], (N, M),
                          prec=self._nodes[a].out_prec,
                          i32=[int(activation), int(act_n_begin), int(act_n_len)])
+
+    def gemv_sparse_a(self, a: int, b: int) -> int:
+        """Matmul with a decode GEMV path that skips exact-zero A entries."""
+        sa = self._nodes[a].out_shape
+        sb = self._nodes[b].out_shape
+        K, M = sa[0], sa[1]
+        if sb[1] != K:
+            raise AssertionError(f"sparse GEMV K mismatch: {sa} vs {sb}")
+        return self._add(OpType.GEMV_SPARSE_A, [a, b], (sb[0], M),
+                         prec=self._nodes[a].out_prec)
 
     # ---- normalisation ----
 

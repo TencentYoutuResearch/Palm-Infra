@@ -13,7 +13,45 @@ from pathlib import Path
 
 import numpy as np
 
-from transpile import Activation, DimExpr, GraphBuilder, Precision, _write_weight_file, save_package
+from transpile import (
+    Activation, DimExpr, GraphBuilder, Precision, _write_weight_file,
+    quantize_weight_w8_group, save_package, write_quantized_weight_file_cpp,
+)
+
+
+def _canonical_quant(quant: str) -> str:
+    q = quant.lower()
+    if q in ("none", "fp16", "f16"):
+        return "fp16"
+    if q in ("w8", "w8pc"):
+        return "w8pc"
+    if q in ("w4", "w4mix", "w4mixg128"):
+        return "w4mixg128"
+    raise ValueError(f"unsupported RWKV quant mode: {quant}")
+
+
+def _is_small_lora(name: str) -> bool:
+    return name.endswith(("_w1", "_w2", "_a1", "_a2", "_v1", "_v2", "_g1", "_g2"))
+
+
+def _quant_spec(quant: str, name: str, k: int) -> tuple[str, int] | None:
+    quant = _canonical_quant(quant)
+    if quant == "fp16" or name == "embed_tokens":
+        return None
+    if quant == "w8pc":
+        return ("w8", k)
+    # Mixed W4: retain the vocabulary projection and low-rank attention
+    # adapters at W8; large attention/FFN matrices use symmetric W4G128.
+    if name == "lm_head" or _is_small_lora(name):
+        return ("w8", 128)
+    return ("w4", 128)
+
+
+def _matrix_precision(quant: str, name: str, k: int) -> Precision:
+    spec = _quant_spec(quant, name, k)
+    if spec is None:
+        return Precision.FP16
+    return Precision.INT8 if spec[0] == "w8" else Precision.INT4
 
 
 def _torch_load(path: Path) -> dict[str, np.ndarray]:
@@ -52,13 +90,28 @@ def _layer_norm(x: np.ndarray, weight: np.ndarray, bias: np.ndarray, eps=1e-5) -
             np.sqrt(y.var(-1, keepdims=True) + eps) * weight + bias)
 
 
-def export_weights(w: dict[str, np.ndarray], out: str) -> None:
+def export_weights(w: dict[str, np.ndarray], out: str, quant: str = "fp16") -> None:
     os.makedirs(out, exist_ok=True)
+    quant = _canonical_quant(quant)
     layers, _, _, _, _ = _info(w)
+    def save_matrix(name: str, arr: np.ndarray) -> None:
+        path = os.path.join(out, f"{name}.weights")
+        data = arr.astype(np.float16)
+        spec = _quant_spec(quant, name, data.shape[1])
+        if spec is None:
+            _write_weight_file(path, data)
+            return
+        kind, group = spec
+        if write_quantized_weight_file_cpp(path, data, kind, group,
+                                           required=(kind == "w4")):
+            return
+        q, scales, gs, ng = quantize_weight_w8_group(data, group)
+        _write_weight_file(path, q, scales=scales, group_size=gs, num_groups=ng)
+
     # The initial LN is conventionally folded into embedding lookup.
     emb = _layer_norm(w["emb.weight"], w["blocks.0.ln0.weight"], w["blocks.0.ln0.bias"])
-    _write_weight_file(os.path.join(out, "embed_tokens.weights"), emb.astype(np.float16))
-    _write_weight_file(os.path.join(out, "lm_head.weights"), w["head.weight"].astype(np.float16))
+    save_matrix("embed_tokens", emb)
+    save_matrix("lm_head", w["head.weight"])
     _write_weight_file(os.path.join(out, "final_norm_w.weights"), w["ln_out.weight"].astype(np.float32))
     _write_weight_file(os.path.join(out, "final_norm_b.weights"), w["ln_out.bias"].astype(np.float32))
 
@@ -76,13 +129,16 @@ def export_weights(w: dict[str, np.ndarray], out: str) -> None:
             # mollm's matmul consumes [out, in].
             if key.startswith(prefix + "att.") and key.endswith((".w1", ".w2", ".a1", ".a2", ".v1", ".v2", ".g1", ".g2")):
                 arr = arr.T
-            a = arr.astype(np.float16 if key.endswith(matrix_suffixes) else np.float32)
-            _write_weight_file(os.path.join(out, f"{name}.weights"), a)
+            if key.endswith(matrix_suffixes):
+                save_matrix(name, arr)
+            else:
+                _write_weight_file(os.path.join(out, f"{name}.weights"), arr.astype(np.float32))
 
 
-def _weight(g: GraphBuilder, root: str, name: str, shape: tuple, fp32=False) -> int:
+def _weight(g: GraphBuilder, root: str, name: str, shape: tuple,
+            fp32=False, quant="fp16") -> int:
     return g.weight(os.path.join(root, f"{name}.weights"), shape,
-                    Precision.FP32 if fp32 else Precision.FP16)
+                    Precision.FP32 if fp32 else _matrix_precision(quant, name, shape[1]))
 
 
 def _scalar_weight(g: GraphBuilder, root: str, name: str, shape: tuple) -> int:
@@ -100,13 +156,15 @@ def _lora(g: GraphBuilder, x: int, w1: int, w2: int, activation=None) -> int:
     return g.matmul(y, w2)
 
 
-def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool) -> GraphBuilder:
+def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool,
+                quant: str = "fp16") -> GraphBuilder:
     layers, vocab, hidden, heads, hs = _info(w)
     g = GraphBuilder()
     g.set_model_config(hidden_size=hidden, num_layers=layers, vocab_size=vocab,
                        model_type="rwkv7", rope_dim=0, rope_theta=0)
     g.weight(os.path.join(root, "embed_tokens.weights"), (vocab, hidden), Precision.FP16)
-    g.weight(os.path.join(root, "lm_head.weights"), (vocab, hidden), Precision.FP16)
+    g.weight(os.path.join(root, "lm_head.weights"), (vocab, hidden),
+             _matrix_precision(quant, "lm_head", hidden))
     dyn = (DimExpr.const(), DimExpr.seq(), DimExpr.const(), DimExpr.const()) if prefill else None
     x = g.input("hidden", (hidden, seq_len), dynamic=dyn)
     states=[]
@@ -128,13 +186,13 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
         xr,xw,xk,xv,xa,xg=(_mix(g,xn,sx,m) for m in mix_weights)
         def lin(n, source):
             arr=w[f"blocks.{i}.att.{n}.weight"]
-            return g.matmul(source,_weight(g,root,f"{a}_{n}_weight",tuple(arr.shape)))
+            return g.matmul(source,_weight(g,root,f"{a}_{n}_weight",tuple(arr.shape),quant=quant))
         r=lin("receptance",xr); k=lin("key",xk); v=lin("value",xv)
         # pth LoRA matrices are [hidden, rank] / [rank, hidden], unlike Linear weights.
         def lora(n, source, activation=None):
             w1=w[f"blocks.{i}.att.{n}1"]; w2=w[f"blocks.{i}.att.{n}2"]
-            return _lora(g,source,_weight(g,root,f"{a}_{n}1",tuple(w1.shape[::-1])),
-                         _weight(g,root,f"{a}_{n}2",tuple(w2.shape[::-1])),activation)
+            return _lora(g,source,_weight(g,root,f"{a}_{n}1",tuple(w1.shape[::-1]),quant=quant),
+                         _weight(g,root,f"{a}_{n}2",tuple(w2.shape[::-1]),quant=quant),activation)
         wd=lora("w",xw,"tanh"); ad=lora("a",xa); gd=lora("g",xg,"sigmoid_exact")
         decay=g.exp_exact(g.scalar_mul(g.sigmoid_exact(g.add(wd,av("w0"))),-0.606531))
         alpha=g.sigmoid_exact(g.add(ad,av("a0")))
@@ -150,30 +208,31 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
                          g.mul(kk,alpha),state,heads,hs,seq_len)
         att=g.rwkv_post(raw,r,kval,vval,av("r_k"),av("ln_x_weight"),
                         av("ln_x_bias"),gd,heads,hs)
-        outw=_weight(g,root,f"{a}_output_weight",tuple(w[f"blocks.{i}.att.output.weight"].shape))
+        outw=_weight(g,root,f"{a}_output_weight",tuple(w[f"blocks.{i}.att.output.weight"].shape),quant=quant)
         x=g.add(x,g.matmul(att,outw))
         ln2w=_scalar_weight(g,root,f"{p}_ln2_weight",(hidden,)); ln2b=_scalar_weight(g,root,f"{p}_ln2_bias",(hidden,))
         xn=g.layer_norm(x,ln2w,ln2b); sx=g.rwkv_token_shift(xn,fshift,hidden,seq_len)
         xk=_mix(g,xn,sx,_scalar_weight(g,root,f"{f}_x_k",(hidden,)))
         kw=w[f"blocks.{i}.ffn.key.weight"]; vw=w[f"blocks.{i}.ffn.value.weight"]
-        key=g.matmul(xk,_weight(g,root,f"{f}_key_weight",tuple(kw.shape)),
+        key=g.matmul(xk,_weight(g,root,f"{f}_key_weight",tuple(kw.shape),quant=quant),
                      activation=Activation.RELU_SQUARED)
-        x=g.add(x,g.matmul(key,_weight(g,root,f"{f}_value_weight",tuple(vw.shape))))
+        x=g.add(x,g.gemv_sparse_a(key,_weight(g,root,f"{f}_value_weight",tuple(vw.shape),quant=quant)))
     x=g.layer_norm(x,_scalar_weight(g,root,"final_norm_w",(hidden,)),_scalar_weight(g,root,"final_norm_b",(hidden,)))
     return g
 
 
 def convert_rwkv7(checkpoint: str, output_path: str, prefill_seq_len: int = 256,
-                  tokenizer_path: str = "") -> None:
+                  tokenizer_path: str = "", quant: str = "fp16") -> None:
     path=Path(checkpoint); w=_torch_load(path)
+    quant = _canonical_quant(quant)
     layers,vocab,hidden,heads,hs=_info(w)
     tmp=tempfile.mkdtemp(prefix="mollm_rwkv7_")
     try:
-        export_weights(w,tmp)
-        pre=build_graph(".",w,prefill_seq_len,True); dec=build_graph(".",w,1,False)
+        export_weights(w,tmp,quant)
+        pre=build_graph(".",w,prefill_seq_len,True,quant); dec=build_graph(".",w,1,False,quant)
         save_package(output_path,pre,dec,tmp,{"model_name":path.stem,"architecture":"rwkv7",
             "num_layers":layers,"hidden_size":hidden,"num_heads":heads,"head_dim":hs,
-            "vocab_size":vocab,"prefill_seq_len":prefill_seq_len,"quantization":"fp16",
+            "vocab_size":vocab,"prefill_seq_len":prefill_seq_len,"quantization":quant,
             "rwkv_chat_template":"rwkv_legacy",
             "experimental":True},tokenizer_path=tokenizer_path)
     finally:
@@ -185,5 +244,6 @@ if __name__ == "__main__":
     parser=argparse.ArgumentParser(description="convert an RWKV v7 .pth checkpoint")
     parser.add_argument("checkpoint"); parser.add_argument("output")
     parser.add_argument("--prefill-seq-len",type=int,default=256); parser.add_argument("--tokenizer",default="")
+    parser.add_argument("--quant",default="fp16",choices=("fp16","w8","w8pc","w4","w4mixg128"))
     args=parser.parse_args()
-    convert_rwkv7(args.checkpoint,args.output,args.prefill_seq_len,args.tokenizer)
+    convert_rwkv7(args.checkpoint,args.output,args.prefill_seq_len,args.tokenizer,args.quant)

@@ -208,13 +208,35 @@ void maybe_pack_int4_weight(Tensor& t, const std::string& key,
                             PackedWeightMap& packed_weights) {
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
     if (!is_2d_linear_weight(t)) return;
+    auto maybe_pack_sparse = [&]() {
+        size_t layer_pos = key.find("blocks_");
+        int layer = layer_pos == std::string::npos
+            ? 999 : std::atoi(key.c_str() + layer_pos + 7);
+        if (!t.q4_g128_data || layer >= 6 ||
+            key.find("_ffn_value_weight.weights") == std::string::npos) return;
+        std::string sparse_key = key + "#int4_sparse";
+        auto it = packed_weights.find(sparse_key);
+        if (it == packed_weights.end()) {
+            int N = (int)t.shape[0];
+            int K = (int)t.shape[1];
+            int8_t* packed = pack_b_sparse_int4_g128_full(t.q4_g128_data, N, K);
+            if (!packed) return;
+            size_t bytes = (size_t)((N + 7) / 8) * 8 * K;
+            std::vector<uint8_t> buf((uint8_t*)packed, (uint8_t*)packed + bytes);
+            delete[] packed;
+            it = packed_weights.emplace(sparse_key, std::move(buf)).first;
+        }
+        t.sparse_data = it->second.data();
+    };
     if (t.is_q4_g128_packed) {
         t.q4_g128_data = weight_data;
+        maybe_pack_sparse();
         return;
     }
     if (t.is_q4_repacked) {
         t.q4_repack_data = weight_data;
         maybe_pack_int4_g128_weight(t, key, weight_data, packed_weights);
+        maybe_pack_sparse();
         return;
     }
     if (!g_matmul_config.use_interleave_pack || !int4_q4dot_repack_supported(t)) return;
@@ -240,6 +262,7 @@ void maybe_pack_int4_weight(Tensor& t, const std::string& key,
     }
     t.q4_repack_data = it->second.data();
     maybe_pack_int4_g128_weight(t, key, t.q4_repack_data, packed_weights);
+    maybe_pack_sparse();
 #else
     (void)t;
     (void)key;
