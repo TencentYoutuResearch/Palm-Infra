@@ -1,4 +1,5 @@
 #include "kernels/rwkv.h"
+#include "kernels/threading.h"
 
 #include <algorithm>
 #include <cmath>
@@ -33,7 +34,7 @@ void kernel_rwkv_token_shift(const OpParams& p,
 }
 
 void kernel_rwkv7(const OpParams& p, const std::vector<const Tensor*>& in,
-                  Tensor& out, ThreadPool*) {
+                  Tensor& out, ThreadPool* thread_pool) {
     if (in.size() < 17) return;
     const int heads = graph_params::get_i32(p, 0, 0);
     const int dhead = graph_params::get_i32(p, 1, 0);
@@ -55,9 +56,12 @@ void kernel_rwkv7(const OpParams& p, const std::vector<const Tensor*>& in,
     __fp16* state16 = state_fp16 ? reinterpret_cast<__fp16*>(in[16]->data) : nullptr;
     float* state32 = state_fp16 ? nullptr : reinterpret_cast<float*>(in[16]->data);
     float* dst = out.ptr<float>();
-    std::vector<float> raw(dhead), sa(dhead), kval(dhead), vval(dhead), kk(dhead), aval(dhead), decay(dhead), gate(dhead), statef((size_t)dhead*dhead);
-    for (int t=0; t<real; ++t) for (int h=0; h<heads; ++h) {
-        const size_t base=(size_t)t*hidden+h*dhead;
+    auto process_heads = [&](int, int h_begin, int h_end) {
+      std::vector<float> raw(dhead), sa(dhead), kval(dhead), vval(dhead),
+          kk(dhead), aval(dhead), decay(dhead), gate(dhead),
+          statef((size_t)dhead*dhead);
+      for (int h=h_begin; h<h_end; ++h) for (int t=0; t<real; ++t) {
+        const size_t base=(size_t)t*hidden+(size_t)h*dhead;
         const size_t state_base=(size_t)h*dhead*dhead;
         float* s=statef.data();
         if (state_fp16) {
@@ -107,6 +111,12 @@ void kernel_rwkv7(const OpParams& p, const std::vector<const Tensor*>& in,
         } else {
             std::memcpy(state32+state_base, s, (size_t)dhead*dhead*sizeof(float));
         }
+      }
+    };
+    if (thread_pool && heads >= 4) {
+        thread_pool->parallel_for(0, heads, 1, process_heads);
+    } else {
+        process_heads(0, 0, heads);
     }
     if(real<seq) std::memset(dst+(size_t)real*hidden,0,
                              (size_t)(seq-real)*hidden*sizeof(float));

@@ -1155,15 +1155,6 @@ bool LLMEngine::load(const EngineConfig& cfg) {
         }
     }
 
-    // RWKV has recurrent state rather than an attention KV cache. Its generic
-    // batched graph cannot yet preserve the FP16 decode trajectory, so use the
-    // verified seq=1 graph repeatedly until a numerically compatible batched
-    // recurrence lands. prefill() handles the chunking transparently.
-    auto package_arch = package_metadata_.find("architecture");
-    if (package_arch != package_metadata_.end() && package_arch->second == "rwkv7") {
-        cfg_.use_decode_as_prefill = true;
-    }
-
 #ifdef MOLLM_METAL
     // Wrap the whole package weight region as one zero-copy MTLBuffer so each
     // weight tensor can alias it via device_offset (set in setup_weight).
@@ -1634,15 +1625,9 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
     }
 
-    const auto arch = package_metadata_.find("architecture");
-    const bool rwkv_batched = !cfg_.use_decode_as_prefill &&
-        arch != package_metadata_.end() && arch->second == "rwkv7";
-    const bool previous_fp32_acc = g_mollm_force_fp32_acc;
-    if (rwkv_batched) g_mollm_force_fp32_acc = true;
     mollm_set_matmul_profile_phase("prefill_graph");
     Tensor out = run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
     mollm_set_matmul_profile_phase("unscoped");
-    g_mollm_force_fp32_acc = previous_fp32_acc;
     Tensor copied = copy_tensor_contiguous(out, hidden_output_copy_);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
