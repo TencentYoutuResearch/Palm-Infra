@@ -215,7 +215,8 @@ static void kernel_rwkv7_core(const OpParams& p,
     float* state32=state_fp16?nullptr:reinterpret_cast<float*>(in[6]->data);
     float* dst=out.ptr<float>();
     auto process_heads=[&](int,int h_begin,int h_end) {
-        std::vector<float> statef((size_t)dhead*dhead);
+        std::vector<float> statef;
+        if(state_fp16||real!=1) statef.resize((size_t)dhead*dhead);
         for(int h=h_begin;h<h_end;++h) {
             const size_t sb=(size_t)h*dhead*dhead;
             const bool direct_state=!state_fp16&&real==1;
