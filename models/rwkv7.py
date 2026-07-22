@@ -64,7 +64,8 @@ def export_weights(w: dict[str, np.ndarray], out: str) -> None:
 
     # Keep the large matrices FP16. The recurrent WKV and token-shift state
     # remain FP32 in the runtime; scalar/norm parameters also stay FP32.
-    matrix_suffixes = ("receptance.weight", "key.weight", "value.weight", "output.weight")
+    matrix_suffixes = ("receptance.weight", "key.weight", "value.weight", "output.weight",
+                       ".w1", ".w2", ".a1", ".a2", ".v1", ".v2", ".g1", ".g2")
     for i in range(layers):
         prefix = f"blocks.{i}."
         for key, arr in w.items():
@@ -132,8 +133,8 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
         # pth LoRA matrices are [hidden, rank] / [rank, hidden], unlike Linear weights.
         def lora(n, source, activation=None):
             w1=w[f"blocks.{i}.att.{n}1"]; w2=w[f"blocks.{i}.att.{n}2"]
-            return _lora(g,source,_scalar_weight(g,root,f"{a}_{n}1",tuple(w1.shape[::-1])),
-                         _scalar_weight(g,root,f"{a}_{n}2",tuple(w2.shape[::-1])),activation)
+            return _lora(g,source,_weight(g,root,f"{a}_{n}1",tuple(w1.shape[::-1])),
+                         _weight(g,root,f"{a}_{n}2",tuple(w2.shape[::-1])),activation)
         wd=lora("w",xw,"tanh"); ad=lora("a",xa); gd=lora("g",xg,"sigmoid_exact")
         decay=g.exp(g.scalar_mul(g.sigmoid_exact(g.add(wd,av("w0"))),-0.606531))
         alpha=g.sigmoid_exact(g.add(ad,av("a0")))
