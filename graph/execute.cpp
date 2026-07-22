@@ -579,6 +579,15 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::RWKV_MIX:
         kernel_rwkv_mix(params, inputs, *output);
         break;
+    case OpType::RWKV_L2_NORM:
+        kernel_rwkv_l2_norm(params, inputs, *output);
+        break;
+    case OpType::RWKV_GROUP_NORM:
+        kernel_rwkv_group_norm(params, inputs, *output);
+        break;
+    case OpType::RWKV_BONUS:
+        kernel_rwkv_bonus(params, inputs, *output);
+        break;
     case OpType::RWKV7:
         kernel_rwkv7(params, inputs, *output, thread_pool);
         break;

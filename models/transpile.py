@@ -70,6 +70,9 @@ class OpType(IntEnum):
     RWKV7          = 150
     RWKV_TOKEN_SHIFT = 151
     RWKV_MIX       = 152
+    RWKV_L2_NORM   = 153
+    RWKV_GROUP_NORM = 154
+    RWKV_BONUS     = 155
 
 class Precision(IntEnum):
     FP32 = 0
@@ -248,6 +251,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.QUANTIZE_KV, OpType.DEQUANTIZE_KV,
               OpType.SHORTCONV,
               OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT, OpType.RWKV_MIX,
+              OpType.RWKV_L2_NORM, OpType.RWKV_GROUP_NORM, OpType.RWKV_BONUS,
               OpType.MOE):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
@@ -707,6 +711,33 @@ class GraphBuilder:
         """Fused RWKV time mix: x + shift * mix."""
         return self._add(OpType.RWKV_MIX, [x, shift, mix],
                          self._nodes[x].out_shape, prec=Precision.FP32)
+
+    def rwkv_l2_norm(self, x: int, num_heads: int, head_size: int,
+                     eps: float = 1e-12) -> int:
+        return self._add(OpType.RWKV_L2_NORM, [x], self._nodes[x].out_shape,
+                         prec=Precision.FP32, i32=[num_heads, head_size],
+                         f32=[eps])
+
+    def rwkv_group_norm(self, x: int, weight: int, bias: int,
+                        num_heads: int, head_size: int,
+                        eps: float = 64e-5) -> int:
+        return self._add(OpType.RWKV_GROUP_NORM, [x, weight, bias],
+                         self._nodes[x].out_shape, prec=Precision.FP32,
+                         i32=[num_heads, head_size], f32=[eps])
+
+    def rwkv_bonus(self, r: int, k: int, v: int, r_k: int,
+                   num_heads: int, head_size: int) -> int:
+        return self._add(OpType.RWKV_BONUS, [r, k, v, r_k],
+                         self._nodes[r].out_shape, prec=Precision.FP32,
+                         i32=[num_heads, head_size])
+
+    def rwkv7_core(self, r: int, decay: int, k: int, v: int,
+                   a: int, b: int, state: int,
+                   num_heads: int, head_size: int, seq_len: int) -> int:
+        """RWKV-7 recurrence only, matching ggml_rwkv_wkv7 boundaries."""
+        return self._add(OpType.RWKV7, [r, decay, k, v, a, b, state],
+                         self._nodes[r].out_shape, prec=Precision.FP32,
+                         i32=[num_heads, head_size, seq_len, 0, 0])
 
     def rwkv7(self, r: int, w_delta: int, k: int, v: int, a_delta: int,
               gate_delta: int, v_delta: int, v_first: int, w0: int, a0: int,

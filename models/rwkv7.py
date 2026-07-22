@@ -135,12 +135,21 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
             return _lora(g,source,_scalar_weight(g,root,f"{a}_{n}1",tuple(w1.shape[::-1])),
                          _scalar_weight(g,root,f"{a}_{n}2",tuple(w2.shape[::-1])),activation)
         wd=lora("w",xw,"tanh"); ad=lora("a",xa); gd=lora("g",xg,"sigmoid_exact")
-        vd=lora("v",xv) if i else gd  # ignored by the fused op for layer 0
-        if i == 0: v_first=v
-        att=g.rwkv7(r,wd,k,v,ad,gd,vd,v_first,
-                    av("w0"),av("a0"),av("v0"),av("k_k"),av("k_a"),av("r_k"),
-                    av("ln_x_weight"),av("ln_x_bias"),state,heads,hs,seq_len,
-                    first_layer=(i==0))
+        decay=g.exp(g.scalar_mul(g.sigmoid_exact(g.add(wd,av("w0"))),-0.606531))
+        alpha=g.sigmoid_exact(g.add(ad,av("a0")))
+        kk=g.rwkv_l2_norm(g.mul(k,av("k_k")),heads,hs,1e-6)
+        kval=g.mul(k,g.scalar_add(g.mul(g.scalar_add(alpha,-1.0),av("k_a")),1.0))
+        if i == 0:
+            v_first=v; vval=v
+        else:
+            vd=lora("v",xv)
+            vmix=g.sigmoid_exact(g.add(vd,av("v0")))
+            vval=g.add(v,g.mul(g.add(v_first,g.scalar_mul(v,-1.0)),vmix))
+        raw=g.rwkv7_core(r,decay,kval,vval,g.scalar_mul(kk,-1.0),
+                         g.mul(kk,alpha),state,heads,hs,seq_len)
+        norm=g.rwkv_group_norm(raw,av("ln_x_weight"),av("ln_x_bias"),heads,hs)
+        bonus=g.rwkv_bonus(r,kval,vval,av("r_k"),heads,hs)
+        att=g.mul(g.add(norm,bonus),gd)
         outw=_weight(g,root,f"{a}_output_weight",tuple(w[f"blocks.{i}.att.output.weight"].shape))
         x=g.add(x,g.matmul(att,outw))
         ln2w=_scalar_weight(g,root,f"{p}_ln2_weight",(hidden,)); ln2b=_scalar_weight(g,root,f"{p}_ln2_bias",(hidden,))

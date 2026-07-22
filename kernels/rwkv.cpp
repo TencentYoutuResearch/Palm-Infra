@@ -83,8 +83,198 @@ void kernel_rwkv_mix(const OpParams&, const std::vector<const Tensor*>& in,
     }
 }
 
+void kernel_rwkv_l2_norm(const OpParams& p,
+                         const std::vector<const Tensor*>& in, Tensor& out) {
+    if (in.empty()) return;
+    const int heads=graph_params::get_i32(p,0,0);
+    const int dhead=graph_params::get_i32(p,1,0);
+    const float eps=graph_params::get_f32(p,0,1e-12f);
+    const int hidden=heads*dhead;
+    const int tokens=(int)(in[0]->nelements()/hidden);
+    const float* src=in[0]->ptr<float>();
+    float* dst=out.ptr<float>();
+    for(int t=0;t<tokens;++t) for(int h=0;h<heads;++h) {
+        const size_t base=(size_t)t*hidden+(size_t)h*dhead;
+        float sum=0.f;
+#if HAS_NEON
+        if((dhead&3)==0) {
+            float32x4_t s=vdupq_n_f32(0.f);
+            for(int j=0;j<dhead;j+=4) {
+                float32x4_t x=vld1q_f32(src+base+j);
+                s=vfmaq_f32(s,x,x);
+            }
+            sum=vaddvq_f32(s);
+        } else
+#endif
+        for(int j=0;j<dhead;++j) sum+=src[base+j]*src[base+j];
+        const float inv=1.f/(std::sqrt(sum)+eps);
+        int j=0;
+#if HAS_NEON
+        for(;j+3<dhead;j+=4)
+            vst1q_f32(dst+base+j,vmulq_n_f32(vld1q_f32(src+base+j),inv));
+#endif
+        for(;j<dhead;++j) dst[base+j]=src[base+j]*inv;
+    }
+}
+
+void kernel_rwkv_group_norm(const OpParams& p,
+                            const std::vector<const Tensor*>& in, Tensor& out) {
+    if(in.size()<3) return;
+    const int heads=graph_params::get_i32(p,0,0);
+    const int dhead=graph_params::get_i32(p,1,0);
+    const float eps=graph_params::get_f32(p,0,64e-5f);
+    const int hidden=heads*dhead;
+    const int tokens=(int)(in[0]->nelements()/hidden);
+    const float *src=in[0]->ptr<float>(),*weight=in[1]->ptr<float>(),
+                *bias=in[2]->ptr<float>();
+    float* dst=out.ptr<float>();
+    for(int t=0;t<tokens;++t) for(int h=0;h<heads;++h) {
+        const size_t base=(size_t)t*hidden+(size_t)h*dhead;
+        float mean=0.f,var=0.f;
+#if HAS_NEON
+        if((dhead&3)==0) {
+            float32x4_t sum=vdupq_n_f32(0.f);
+            for(int j=0;j<dhead;j+=4) sum=vaddq_f32(sum,vld1q_f32(src+base+j));
+            mean=vaddvq_f32(sum)/dhead;
+            sum=vdupq_n_f32(0.f);
+            const float32x4_t mv=vdupq_n_f32(mean);
+            for(int j=0;j<dhead;j+=4) {
+                float32x4_t q=vsubq_f32(vld1q_f32(src+base+j),mv);
+                sum=vfmaq_f32(sum,q,q);
+            }
+            var=vaddvq_f32(sum)/dhead;
+        } else
+#endif
+        {
+            for(int j=0;j<dhead;++j) mean+=src[base+j]; mean/=dhead;
+            for(int j=0;j<dhead;++j){float q=src[base+j]-mean;var+=q*q;} var/=dhead;
+        }
+        const float inv=1.f/std::sqrt(var+eps);
+        int j=0;
+#if HAS_NEON
+        const float32x4_t mv=vdupq_n_f32(mean),iv=vdupq_n_f32(inv);
+        for(;j+3<dhead;j+=4) {
+            float32x4_t q=vmulq_f32(vsubq_f32(vld1q_f32(src+base+j),mv),iv);
+            q=vfmaq_f32(vld1q_f32(bias+(size_t)h*dhead+j),q,
+                        vld1q_f32(weight+(size_t)h*dhead+j));
+            vst1q_f32(dst+base+j,q);
+        }
+#endif
+        for(;j<dhead;++j)
+            dst[base+j]=(src[base+j]-mean)*inv*weight[h*dhead+j]+bias[h*dhead+j];
+    }
+}
+
+void kernel_rwkv_bonus(const OpParams& p,
+                       const std::vector<const Tensor*>& in, Tensor& out) {
+    if(in.size()<4) return;
+    const int heads=graph_params::get_i32(p,0,0);
+    const int dhead=graph_params::get_i32(p,1,0);
+    const int hidden=heads*dhead;
+    const int tokens=(int)(in[0]->nelements()/hidden);
+    const float *r=in[0]->ptr<float>(),*k=in[1]->ptr<float>(),
+                *v=in[2]->ptr<float>(),*rk=in[3]->ptr<float>();
+    float* dst=out.ptr<float>();
+    for(int t=0;t<tokens;++t) for(int h=0;h<heads;++h) {
+        const size_t base=(size_t)t*hidden+(size_t)h*dhead;
+        float bonus=0.f;
+#if HAS_NEON
+        if((dhead&3)==0) {
+            float32x4_t sum=vdupq_n_f32(0.f);
+            for(int j=0;j<dhead;j+=4) {
+                float32x4_t q=vmulq_f32(vld1q_f32(r+base+j),vld1q_f32(k+base+j));
+                sum=vfmaq_f32(sum,q,vld1q_f32(rk+(size_t)h*dhead+j));
+            }
+            bonus=vaddvq_f32(sum);
+        } else
+#endif
+        for(int j=0;j<dhead;++j) bonus+=r[base+j]*k[base+j]*rk[h*dhead+j];
+        int j=0;
+#if HAS_NEON
+        for(;j+3<dhead;j+=4)
+            vst1q_f32(dst+base+j,vmulq_n_f32(vld1q_f32(v+base+j),bonus));
+#endif
+        for(;j<dhead;++j) dst[base+j]=v[base+j]*bonus;
+    }
+}
+
+static void kernel_rwkv7_core(const OpParams& p,
+                              const std::vector<const Tensor*>& in, Tensor& out,
+                              ThreadPool* thread_pool) {
+    const int heads=graph_params::get_i32(p,0,0);
+    const int dhead=graph_params::get_i32(p,1,0);
+    const int seq=graph_params::get_i32(p,2,1);
+    int real=graph_params::get_i32(p,3,seq);
+    if(real<=0||real>seq) real=seq;
+    const int hidden=heads*dhead;
+    const float *r=in[0]->ptr<float>(),*w=in[1]->ptr<float>(),
+                *k=in[2]->ptr<float>(),*v=in[3]->ptr<float>(),
+                *a=in[4]->ptr<float>(),*b=in[5]->ptr<float>();
+    const bool state_fp16=in[6]->prec==Precision::FP16;
+    __fp16* state16=state_fp16?reinterpret_cast<__fp16*>(in[6]->data):nullptr;
+    float* state32=state_fp16?nullptr:reinterpret_cast<float*>(in[6]->data);
+    float* dst=out.ptr<float>();
+    auto process_heads=[&](int,int h_begin,int h_end) {
+        std::vector<float> statef((size_t)dhead*dhead);
+        for(int h=h_begin;h<h_end;++h) for(int t=0;t<real;++t) {
+            const size_t base=(size_t)t*hidden+(size_t)h*dhead;
+            const size_t sb=(size_t)h*dhead*dhead;
+            float* s=statef.data();
+            if(state_fp16) {
+#if HAS_NEON
+                if((dhead&3)==0) rwkv_load_state_fp16(state16+sb,s,dhead*dhead);
+                else
+#endif
+                for(int q=0;q<dhead*dhead;++q) s[q]=(float)state16[sb+q];
+            } else std::memcpy(s,state32+sb,(size_t)dhead*dhead*sizeof(float));
+            for(int i=0;i<dhead;++i) {
+                float sa=0.f,result=0.f;
+#if HAS_NEON
+                if((dhead&3)==0) sa=rwkv_dot_neon(s+(size_t)i*dhead,a+base,dhead);
+                else
+#endif
+                for(int j=0;j<dhead;++j) sa+=s[(size_t)i*dhead+j]*a[base+j];
+                int j=0;
+#if HAS_NEON
+                float32x4_t result4=vdupq_n_f32(0.f);
+                const float32x4_t vv=vdupq_n_f32(v[base+i]),sav=vdupq_n_f32(sa);
+                for(;j+3<dhead;j+=4) {
+                    float32x4_t sv=vmulq_f32(vld1q_f32(s+(size_t)i*dhead+j),
+                                             vld1q_f32(w+base+j));
+                    sv=vfmaq_f32(sv,vv,vld1q_f32(k+base+j));
+                    sv=vfmaq_f32(sv,sav,vld1q_f32(b+base+j));
+                    vst1q_f32(s+(size_t)i*dhead+j,sv);
+                    result4=vfmaq_f32(result4,sv,vld1q_f32(r+base+j));
+                }
+                result=vaddvq_f32(result4);
+#endif
+                for(;j<dhead;++j) {
+                    float& sv=s[(size_t)i*dhead+j];
+                    sv=sv*w[base+j]+v[base+i]*k[base+j]+sa*b[base+j];
+                    result+=sv*r[base+j];
+                }
+                dst[base+i]=result;
+            }
+            if(state_fp16) {
+#if HAS_NEON
+                if((dhead&3)==0) rwkv_store_state_fp16(s,state16+sb,dhead*dhead);
+                else
+#endif
+                for(int q=0;q<dhead*dhead;++q) state16[sb+q]=(__fp16)s[q];
+            } else std::memcpy(state32+sb,s,(size_t)dhead*dhead*sizeof(float));
+        }
+    };
+    if(thread_pool&&heads>=4) thread_pool->parallel_for(0,heads,1,process_heads);
+    else process_heads(0,0,heads);
+    if(real<seq) std::memset(dst+(size_t)real*hidden,0,(size_t)(seq-real)*hidden*sizeof(float));
+}
+
 void kernel_rwkv7(const OpParams& p, const std::vector<const Tensor*>& in,
                   Tensor& out, ThreadPool* thread_pool) {
+    if(in.size()==7) {
+        kernel_rwkv7_core(p,in,out,thread_pool);
+        return;
+    }
     if (in.size() < 17) return;
     const int heads = graph_params::get_i32(p, 0, 0);
     const int dhead = graph_params::get_i32(p, 1, 0);
