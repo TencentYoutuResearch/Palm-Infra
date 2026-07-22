@@ -111,9 +111,9 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
     x = g.input("hidden", (hidden, seq_len), dynamic=dyn)
     states=[]
     for i in range(layers):
-        # Persistent state is compact FP16. RWKV7 expands the WKV matrix to
-        # FP32 for each recurrence update before casting it back.
-        states.append((g.input(f"rwkv_state{i}", (hs, hs, heads), Precision.FP16),
+        # Match llama.cpp and the reference recurrence: WKV state remains FP32.
+        # This also avoids a full matrix conversion around every token.
+        states.append((g.input(f"rwkv_state{i}", (hs, hs, heads), Precision.FP32),
                        g.input(f"rwkv_att_shift{i}", (hidden,), Precision.FP16),
                        g.input(f"rwkv_ffn_shift{i}", (hidden,), Precision.FP16)))
 

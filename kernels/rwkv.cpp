@@ -216,18 +216,21 @@ static void kernel_rwkv7_core(const OpParams& p,
     float* dst=out.ptr<float>();
     auto process_heads=[&](int,int h_begin,int h_end) {
         std::vector<float> statef((size_t)dhead*dhead);
-        for(int h=h_begin;h<h_end;++h) for(int t=0;t<real;++t) {
-            const size_t base=(size_t)t*hidden+(size_t)h*dhead;
+        for(int h=h_begin;h<h_end;++h) {
             const size_t sb=(size_t)h*dhead*dhead;
             float* s=statef.data();
-            if(state_fp16) {
+            if(!state_fp16)
+                std::memcpy(s,state32+sb,(size_t)dhead*dhead*sizeof(float));
+            for(int t=0;t<real;++t) {
+                const size_t base=(size_t)t*hidden+(size_t)h*dhead;
+                if(state_fp16) {
 #if HAS_NEON
-                if((dhead&3)==0) rwkv_load_state_fp16(state16+sb,s,dhead*dhead);
-                else
+                    if((dhead&3)==0) rwkv_load_state_fp16(state16+sb,s,dhead*dhead);
+                    else
 #endif
-                for(int q=0;q<dhead*dhead;++q) s[q]=(float)state16[sb+q];
-            } else std::memcpy(s,state32+sb,(size_t)dhead*dhead*sizeof(float));
-            int row=0;
+                    for(int q=0;q<dhead*dhead;++q) s[q]=(float)state16[sb+q];
+                }
+                int row=0;
 #if HAS_NEON
             // Four-row register block: a/w/k/b/r are shared by the rows, so
             // load each vector once instead of four times.
@@ -300,13 +303,16 @@ static void kernel_rwkv7_core(const OpParams& p,
                 }
                 dst[base+i]=result;
             }
-            if(state_fp16) {
+                if(state_fp16) {
 #if HAS_NEON
-                if((dhead&3)==0) rwkv_store_state_fp16(s,state16+sb,dhead*dhead);
-                else
+                    if((dhead&3)==0) rwkv_store_state_fp16(s,state16+sb,dhead*dhead);
+                    else
 #endif
-                for(int q=0;q<dhead*dhead;++q) state16[sb+q]=(__fp16)s[q];
-            } else std::memcpy(state32+sb,s,(size_t)dhead*dhead*sizeof(float));
+                    for(int q=0;q<dhead*dhead;++q) state16[sb+q]=(__fp16)s[q];
+                }
+            }
+            if(!state_fp16)
+                std::memcpy(state32+sb,s,(size_t)dhead*dhead*sizeof(float));
         }
     };
     if(thread_pool&&heads>=4) thread_pool->parallel_for(0,heads,1,process_heads);
