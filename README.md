@@ -364,3 +364,5 @@ Copyright 2026 Tencent. Licensed under the Apache License 2.0. See
 - [Cider](https://github.com/Mininglamp-AI/cider), whose work on W8A8/W4A8
   inference with Metal 4 INT8 TensorOps on Apple Silicon informed mollm's
   experimental quantized Metal path.
+- Fang et al.'s [Fate](https://arxiv.org/abs/2502.12224), whose cross-layer
+  gate prediction inspired mollm's experimental expert-prefetch path.
