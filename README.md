@@ -32,6 +32,7 @@ or int4 kernels optimized for ARM dot-product instructions.
 | Qwen3.6-35B-A3B MoE | text-only W4 path |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4 |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
+| RWKV7 | FP16, W8, mixed W4; recurrent CPU prefill/decode |
 
 The most tested runtime path today is `w4g128`: it has the lowest memory use and
 the fastest decode speed in mollm. `w4mixg128` keeps selected sensitive tensors
@@ -72,6 +73,29 @@ measured prefill/decode timings. Higher numbers are bolded in the tables below.
 | Qwen3.5-0.8B | 678.41 / **259.43** | **775.95** / 190.89 | llama faster prefill, mollm faster decode |
 | Youtu-LLM-2B | 248.08 / **115.64** | **265.58** / 97.15 | llama faster prefill, mollm faster decode |
 | Qwen3.5-4B | 115.37 / **55.94** | **140.51** / 44.25 | llama faster prefill, mollm faster decode |
+
+### RWKV7 1.5B
+
+RWKV7 uses the same Apple M5 Pro CPU protocol described above. `base` is the
+regular FFN-down GEMV graph; `sparseA` replaces that edge with a decode-oriented
+operator that skips exact zeros produced by `ReLU²`. Prefill falls back to the
+regular GEMM. The llama.cpp rows use build `5c7c22c3e` with
+`GGML_BLAS=ON`, `GGML_METAL=OFF`, and `GGML_CPU_REPACK=ON`.
+
+| Precision | mollm base pp/tg | mollm sparseA pp/tg | llama.cpp pp/tg |
+|---|---:|---:|---:|
+| FP16 / F16 | 427.49 / 68.00 | **430.51 / 70.09** | 395.83 / 57.18 |
+| W8PC / Q8_0 | 274.16 / **121.34** | 287.10 / 117.90 | **377.64** / 96.50 |
+| W4 mixed / Q4_0 | 267.48 / 127.75 | 274.25 / **129.12** | **366.76** / 110.68 |
+
+The mixed W4 package keeps `lm_head` and the small attention `w/a/v/g`
+low-rank matrices in W8G128; large attention and FFN matrices use W4G128, and
+the embedding remains FP16. Observed FFN `ReLU²` nonzero density ranges from
+about 1.7% to 24.5%. FP16 uses sparseA broadly. W4 enables it only for the
+first six layers below a 3% density threshold. The W8 sparse kernel is
+implemented and tested, but the default policy falls back to the faster dense
+q8-dot GEMV; its two columns therefore mainly show run-to-run system variance,
+not a retained sparseA speedup.
 
 ### MoE W4
 
@@ -175,6 +199,14 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm w4mixg128
 ```
 
+RWKV7 checkpoints use the dedicated `.pth` converter:
+
+```bash
+python3 models/rwkv7.py model.pth rwkv7_fp16.mollm --quant fp16 --tokenizer rwkv_vocab_v20230424.txt
+python3 models/rwkv7.py model.pth rwkv7_w8pc.mollm --quant w8pc --tokenizer rwkv_vocab_v20230424.txt
+python3 models/rwkv7.py model.pth rwkv7_w4mixg128.mollm --quant w4mixg128 --tokenizer rwkv_vocab_v20230424.txt
+```
+
 MoE example:
 
 ```bash
@@ -193,6 +225,7 @@ Supported `config.json` model types:
 | `qwen3_5` | Qwen3.5 dense text models |
 | `qwen3_5_moe` | Qwen3.5/3.6 MoE text models |
 | `youtu` | Youtu-LLM MLA models |
+| RWKV7 `.pth` | Use `models/rwkv7.py` directly. |
 
 Quantization choices:
 
