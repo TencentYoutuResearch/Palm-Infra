@@ -153,6 +153,15 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                                                : static_cast<double>(hits) / attempts);
         }
         std::printf("\n");
+        std::printf("moe_ssd_cross_layer_rank_confidence=");
+        for (size_t i = 0; i < ssd.cross_layer_rank_attempts.size(); ++i) {
+            if (i != 0) std::printf(",");
+            const double sum = i < ssd.cross_layer_rank_confidence_sum.size()
+                ? ssd.cross_layer_rank_confidence_sum[i] : 0.0;
+            const uint64_t attempts = ssd.cross_layer_rank_attempts[i];
+            std::printf("%.3f", attempts == 0 ? 0.0 : sum / attempts);
+        }
+        std::printf("\n");
         uint64_t total_wait_ns = 0;
         uint64_t total_prediction_attempts = 0;
         uint64_t total_prediction_matches = 0;
@@ -180,7 +189,7 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
             if (index != 0) std::printf(";");
             const auto& layer = ssd.layers[index];
             std::printf(
-                "%d:%llu:%llu:%llu:%.3f:%llu:%llu:%llu:%llu",
+                "%d:%llu:%llu:%llu:%.3f:%llu:%llu:%llu:%llu:%llu:%llu",
                 layer.layer,
                 (unsigned long long)layer.demand_acquires,
                 (unsigned long long)layer.demand_hits,
@@ -188,6 +197,8 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                 layer.acquire_wait_ns / 1e6,
                 (unsigned long long)layer.prediction_attempts,
                 (unsigned long long)layer.prediction_matches,
+                (unsigned long long)layer.prefetch_selected,
+                (unsigned long long)layer.prefetch_admitted,
                 (unsigned long long)layer.unused_prefetch_evictions,
                 (unsigned long long)layer.short_term_reloads);
         }

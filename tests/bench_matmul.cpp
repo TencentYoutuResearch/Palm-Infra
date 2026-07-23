@@ -278,6 +278,8 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
     Tensor B = Tensor::create(is_int4 ? Precision::INT4 : is_int8 ? Precision::INT8 : is_fp16 ? Precision::FP16 : Precision::FP32,
                               MemoryType::EXTERNAL, N, K, 1, 1, b_raw);
+    if (is_fp16)
+        B.is_interleaved = g_matmul_config.use_interleave_pack;
     if (is_int8 || is_int4) {
         B.scales = scales_data;
         B.group_size = (uint32_t)group_size;

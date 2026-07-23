@@ -982,6 +982,7 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
     }
 #endif
     bool use_interleave = is_fp16 && HAS_NEON && !is_repacked &&
+                          B.is_interleaved &&
                           g_matmul_config.use_interleave_pack;
     bool use_lane_fma = use_interleave && (M >= 8);
     bool use_fp16_acc =

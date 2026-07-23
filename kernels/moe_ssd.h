@@ -75,6 +75,8 @@ public:
         uint64_t acquire_wait_ns = 0;
         uint64_t prediction_attempts = 0;
         uint64_t prediction_matches = 0;
+        uint64_t prefetch_selected = 0;
+        uint64_t prefetch_admitted = 0;
         uint64_t unused_prefetch_evictions = 0;
         uint64_t short_term_reloads = 0;
     };
@@ -92,6 +94,7 @@ public:
         size_t resident_bytes = 0;
         std::vector<uint64_t> cross_layer_rank_attempts;
         std::vector<uint64_t> cross_layer_rank_hits;
+        std::vector<double> cross_layer_rank_confidence_sum;
         std::vector<LayerStats> layers;
     };
 
@@ -183,6 +186,7 @@ private:
     struct PredictionRecord {
         uint64_t forward_epoch = 0;
         std::vector<int> experts;
+        std::vector<float> confidence;
     };
     struct LayerCounters {
         uint64_t demand_acquires = 0;
@@ -191,6 +195,8 @@ private:
         uint64_t acquire_wait_ns = 0;
         uint64_t prediction_attempts = 0;
         uint64_t prediction_matches = 0;
+        uint64_t prefetch_selected = 0;
+        uint64_t prefetch_admitted = 0;
         uint64_t unused_prefetch_evictions = 0;
         uint64_t short_term_reloads = 0;
     };
@@ -258,6 +264,7 @@ private:
     uint64_t cross_layer_rejected_ = 0;
     std::vector<uint64_t> cross_layer_rank_attempts_;
     std::vector<uint64_t> cross_layer_rank_hits_;
+    std::vector<double> cross_layer_rank_confidence_sum_;
     std::vector<uint64_t> prediction_policy_attempts_;
     std::vector<uint64_t> prediction_policy_hits_;
     mutable std::mutex mutex_;

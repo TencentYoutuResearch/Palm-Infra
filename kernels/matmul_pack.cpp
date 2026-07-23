@@ -72,6 +72,7 @@ void maybe_pack_fp16_weight(Tensor& weight, const std::string& key,
         it = packed_weights.emplace(key, std::move(buf)).first;
     }
     weight.data = it->second.data();
+    weight.is_interleaved = true;
 }
 
 void maybe_pack_int8_weight(Tensor& weight, const std::string& key,

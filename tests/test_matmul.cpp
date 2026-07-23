@@ -253,6 +253,7 @@ int main() {
             Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
             Tensor B = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, N, K, 1, 1, b_packed);
             Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
+            B.is_interleaved = true;
 
             // Enable interleaved packing
             g_matmul_config.use_interleave_pack = true;

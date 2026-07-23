@@ -136,6 +136,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         cross_layer_experts_ = cross_layer_used_ = cross_layer_rejected_ = 0;
         cross_layer_rank_attempts_.clear();
         cross_layer_rank_hits_.clear();
+        cross_layer_rank_confidence_sum_.clear();
         prediction_policy_attempts_.clear();
         prediction_policy_hits_.clear();
         sources_.clear();
@@ -573,7 +574,7 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
         if (!speculative) active_layer_ = gate_up->spec.layer;
         if (speculative) {
             pending_predictions_[gate_up->spec.layer] =
-                PredictionRecord{forward_epoch_, experts};
+                PredictionRecord{forward_epoch_, experts, confidence};
         } else {
             const auto prediction = pending_predictions_.find(gate_up->spec.layer);
             if (prediction != pending_predictions_.end() &&
@@ -582,6 +583,7 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                 if (cross_layer_rank_attempts_.size() < predicted.size()) {
                     cross_layer_rank_attempts_.resize(predicted.size());
                     cross_layer_rank_hits_.resize(predicted.size());
+                    cross_layer_rank_confidence_sum_.resize(predicted.size());
                 }
                 if (prediction_policy_attempts_.size() < predicted.size()) {
                     prediction_policy_attempts_.resize(predicted.size());
@@ -589,6 +591,10 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                 }
                 for (size_t rank = 0; rank < predicted.size(); ++rank) {
                     ++cross_layer_rank_attempts_[rank];
+                    if (rank < prediction->second.confidence.size()) {
+                        cross_layer_rank_confidence_sum_[rank] +=
+                            prediction->second.confidence[rank];
+                    }
                     ++prediction_policy_attempts_[rank];
                     const bool matched =
                         std::find(experts.begin(), experts.end(),
@@ -606,6 +612,8 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
             }
         }
         const size_t count = std::min(experts.size(), request_count);
+        if (speculative)
+            layer_stats_[gate_up->spec.layer].prefetch_selected += count;
         for (size_t index = 0; index < count; ++index) {
             const int expert = experts[index];
             const float prediction_confidence =
@@ -636,7 +644,10 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                 if (speculative) ++cross_layer_rejected_;
                 continue;
             }
-            if (speculative) ++cross_layer_experts_;
+            if (speculative) {
+                ++cross_layer_experts_;
+                ++layer_stats_[gate_up->spec.layer].prefetch_admitted;
+            }
             else ++misses_;
             queued_entries.push_back(entry);
         }
@@ -863,6 +874,8 @@ MoeSsdCache::Stats MoeSsdCache::stats() const {
     result.resident_bytes = resident_bytes_;
     result.cross_layer_rank_attempts = cross_layer_rank_attempts_;
     result.cross_layer_rank_hits = cross_layer_rank_hits_;
+    result.cross_layer_rank_confidence_sum =
+        cross_layer_rank_confidence_sum_;
     result.layers.reserve(layer_stats_.size());
     for (const auto& [layer, counters] : layer_stats_) {
         result.layers.push_back({
@@ -873,6 +886,8 @@ MoeSsdCache::Stats MoeSsdCache::stats() const {
             counters.acquire_wait_ns,
             counters.prediction_attempts,
             counters.prediction_matches,
+            counters.prefetch_selected,
+            counters.prefetch_admitted,
             counters.unused_prefetch_evictions,
             counters.short_term_reloads,
         });
@@ -897,6 +912,7 @@ void MoeSsdCache::reset_stats() {
     cross_layer_rejected_ = 0;
     cross_layer_rank_attempts_.clear();
     cross_layer_rank_hits_.clear();
+    cross_layer_rank_confidence_sum_.clear();
     pending_predictions_.clear();
     layer_stats_.clear();
     last_evicted_epoch_.clear();
