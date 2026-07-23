@@ -334,6 +334,35 @@ int main() {
         CHECK(close((const float*)O.data, ref.data(), n, 1e-5f, 1e-4f), "SIGMOID n=512");
     }
 
+    // ---- Remaining scalar activations (including recurrent exact variants) --
+    for (OpType op : {OpType::TANH, OpType::EXP, OpType::EXP_EXACT,
+                      OpType::SIGMOID_EXACT, OpType::SOFTPLUS}) {
+        int D = 37, rows = 3;
+        Tensor X = make_dev(mb, Precision::FP32, D, rows);
+        Tensor O = make_dev(mb, Precision::FP32, D, rows);
+        std::vector<float> x(D * rows), ref(D * rows);
+        for (int i = 0; i < D * rows; ++i)
+            x[i] = -6.0f + 12.0f * (float)i / (float)(D * rows - 1);
+        memcpy(X.data, x.data(), x.size() * sizeof(float));
+        metal_op(mb, op, {&X}, O);
+        for (int i = 0; i < D * rows; ++i) {
+            float v = x[i];
+            if (op == OpType::TANH)
+                ref[i] = std::tanh(v);
+            else if (op == OpType::EXP || op == OpType::EXP_EXACT)
+                ref[i] = std::exp(v);
+            else if (op == OpType::SIGMOID_EXACT)
+                ref[i] = 1.0f / (1.0f + std::exp(-v));
+            else
+                ref[i] = std::log1p(std::exp(v));
+        }
+        char label[64];
+        snprintf(label, sizeof(label), "%s D=37 rows=3",
+                 op_type_name(op));
+        CHECK(close((const float*)O.data, ref.data(), D * rows, 2e-5f, 2e-5f),
+              label);
+    }
+
     // ---- SHORTCONV: depth-wise causal conv1d + silu (ksize=4) ----
     // Reference (mirrors execute.cpp): window = [state(3) | x(seq)]; per group g,
     // out[g,i] = silu(Σ_{k} win[i+k]*w[g,k]); state' = last 3 real x values.
@@ -523,6 +552,41 @@ int main() {
             for(int i=0;i<D;i++) ref[r*D+i]=(float)(x[r*D+i]*inv*w[i]);
         }
         CHECK(close((const float*)O.data, ref.data(), D*rows, 1e-4f, 1e-3f), "RMS_NORM D=128 rows=8");
+    }
+
+    // ---- LAYER_NORM over dim0 ---------------------------------------------
+    {
+        int D = 127, rows = 5;
+        Tensor X = make_dev(mb, Precision::FP32, D, rows);
+        Tensor W = make_dev(mb, Precision::FP32, D, 1);
+        Tensor B = make_dev(mb, Precision::FP32, D, 1);
+        Tensor O = make_dev(mb, Precision::FP32, D, rows);
+        std::vector<float> x(D * rows), w(D), b(D), ref(D * rows);
+        fill_rand(x.data(), (int)x.size());
+        fill_rand(w.data(), D);
+        fill_rand(b.data(), D);
+        memcpy(X.data, x.data(), x.size() * sizeof(float));
+        memcpy(W.data, w.data(), w.size() * sizeof(float));
+        memcpy(B.data, b.data(), b.size() * sizeof(float));
+        const float eps = 1e-5f;
+        metal_op(mb, OpType::LAYER_NORM, {&X, &W, &B}, O, {}, {eps});
+        for (int row = 0; row < rows; ++row) {
+            double mean = 0.0;
+            for (int i = 0; i < D; ++i) mean += x[row * D + i];
+            mean /= D;
+            double var = 0.0;
+            for (int i = 0; i < D; ++i) {
+                double z = x[row * D + i] - mean;
+                var += z * z;
+            }
+            var /= D;
+            float scale = 1.0f / std::sqrt((float)var + eps);
+            for (int i = 0; i < D; ++i)
+                ref[row * D + i] =
+                    (x[row * D + i] - (float)mean) * scale * w[i] + b[i];
+        }
+        CHECK(close((const float*)O.data, ref.data(), D * rows, 2e-4f, 2e-3f),
+              "LAYER_NORM D=127 rows=5");
     }
 
     // ---- ROPE (interleave=false), layout [head_dim, seq, heads] ----

@@ -1238,6 +1238,53 @@ kernel void rms_norm_f32(
     }
 }
 
+// Layer norm over dim0. W and bias are bound at their byte offsets, so the
+// parameter block only carries activation/output offsets.
+kernel void layer_norm_f32(
+    device const float*      X     [[buffer(0)]],
+    device const float*      W     [[buffer(1)]],
+    device float*            O     [[buffer(2)]],
+    constant LayerNormParams& p    [[buffer(3)]],
+    device const float*      B     [[buffer(4)]],
+    uint  row                       [[threadgroup_position_in_grid]],
+    uint  tid                       [[thread_position_in_threadgroup]],
+    uint  tcount                    [[threads_per_threadgroup]])
+{
+    if (int(row) >= p.rows) return;
+    device const float* x = X + p.x_offset + row * (uint)p.x_row_stride;
+    device float* o = O + p.out_offset + row * (uint)p.out_row_stride;
+
+    uint lane = tid & 31u;
+    uint sg = tid >> 5;
+    uint n_sg = (tcount + 31u) / 32u;
+    threadgroup float sh[32];
+
+    float partial = 0.0f;
+    for (int i = int(tid); i < p.dim0; i += int(tcount)) partial += x[i];
+    partial = simd_sum(partial);
+    if (lane == 0) sh[sg] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = simd_sum((lane < n_sg) ? sh[lane] : 0.0f) / float(p.dim0);
+    // All SIMD groups must finish consuming the mean partials before any
+    // group reuses sh[] for variance partials.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    partial = 0.0f;
+    for (int i = int(tid); i < p.dim0; i += int(tcount)) {
+        float z = x[i] - mean;
+        partial += z * z;
+    }
+    partial = simd_sum(partial);
+    if (lane == 0) sh[sg] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float variance =
+        simd_sum((lane < n_sg) ? sh[lane] : 0.0f) / float(p.dim0);
+    float scale = rsqrt(variance + p.eps);
+
+    for (int i = int(tid); i < p.dim0; i += int(tcount))
+        o[i] = (x[i] - mean) * scale * W[i] + B[i];
+}
+
 // ---------------------------------------------------------------------------
 // RoPE, interleave=false (Qwen3). x layout [head_dim, seq, heads].
 // cos/sin are [rope_dim/2, seq] (per-position). One thread per (pair, pos, head).
@@ -1327,6 +1374,42 @@ kernel void sigmoid_f32(
     if (int(gid) >= p.n) return;
     float v = X[p.a_offset + gid];
     O[p.out_offset + gid] = 1.0f / (1.0f + exp(-v));
+}
+
+kernel void tanh_f32(
+    device const float* X [[buffer(0)]], device float* O [[buffer(2)]],
+    constant EwiseParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.n) return;
+    uint col = gid % (uint)p.shape0, row = gid / (uint)p.shape0;
+    float v = X[p.a_offset + row * (uint)p.a_row_stride + col];
+    O[p.out_offset + row * (uint)p.out_row_stride + col] = precise::tanh(v);
+}
+
+kernel void exp_f32(
+    device const float* X [[buffer(0)]], device float* O [[buffer(2)]],
+    constant EwiseParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.n) return;
+    uint col = gid % (uint)p.shape0, row = gid / (uint)p.shape0;
+    float v = X[p.a_offset + row * (uint)p.a_row_stride + col];
+    O[p.out_offset + row * (uint)p.out_row_stride + col] = precise::exp(v);
+}
+
+kernel void softplus_f32(
+    device const float* X [[buffer(0)]], device float* O [[buffer(2)]],
+    constant EwiseParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.n) return;
+    uint col = gid % (uint)p.shape0, row = gid / (uint)p.shape0;
+    float v = X[p.a_offset + row * (uint)p.a_row_stride + col];
+    float y = v > 20.0f ? v :
+              (v < -20.0f ? precise::exp(v) :
+                            precise::log(1.0f + precise::exp(v)));
+    O[p.out_offset + row * (uint)p.out_row_stride + col] = y;
 }
 
 // Fused SwiGLU: reads gate/up halves from a single merged [2I, rows] buffer

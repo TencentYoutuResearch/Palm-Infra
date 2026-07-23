@@ -132,6 +132,17 @@ struct RmsNormParams {
     float eps;
 };
 
+// Layer norm over dim0 (innermost). rows = product of dims 1..3.
+struct LayerNormParams {
+    int   dim0;
+    int   rows;
+    uint  x_offset;
+    uint  out_offset;
+    int   x_row_stride;
+    int   out_row_stride;
+    float eps;
+};
+
 // RoPE over interleaved=false (Qwen3). Applies to [head_dim, S, heads].
 struct RopeParams {
     int   head_dim;

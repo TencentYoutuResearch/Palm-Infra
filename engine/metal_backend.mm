@@ -199,6 +199,18 @@ uint eoffset(const Tensor& t) {
     return (uint)(t.device_offset / esize(t.prec));
 }
 
+int gemv_nsg_cap() {
+    static const int cap = [] {
+        const char* value = std::getenv("MOLLM_METAL_GEMV_NSG");
+        if (!value) return 4;
+        const int parsed = std::atoi(value);
+        return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
+                   ? parsed
+                   : 4;
+    }();
+    return cap;
+}
+
 } // namespace
 
 // ===========================================================================
@@ -295,7 +307,7 @@ void MetalBackend::lm_head_gemv(const float* a_host, const Tensor& weight,
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         // Use the tuned gemv2 (NR0=2 + NSG-split K) — same win as graph GEMVs.
         // lm_head N is huge (vocab), K=hidden; the NSG K-split + 2-row reuse help.
-        const int NR0 = 2, NSG = std::min(8, (K + 127) / 128);
+        const int NR0 = 2, NSG = std::min(gemv_nsg_cap(), (K + 127) / 128);
         id<MTLComputePipelineState> ps = impl_->pipeline_gemv2(NR0);
         if (ps) {
             [enc setComputePipelineState:ps];
@@ -509,20 +521,7 @@ void MetalBackend::sync_point() {
 }
 
 static const char* op_name(int op) {
-    switch (op) {
-    case 10:  return "MATMUL";
-    case 20:  return "RMS_NORM";
-    case 40:  return "ROTARY_EMBED";
-    case 50:  return "SDPA";
-    case 51:  return "SDPA_MLA";
-    case 60:  return "RESHAPE";
-    case 61:  return "PERMUTE";
-    case 65:  return "CONTIGUOUS";
-    case 70:  return "ADD";
-    case 71:  return "MUL";
-    case 30:  return "SILU";
-    default:  return "OP";
-    }
+    return op_type_name(static_cast<OpType>(op));
 }
 
 void MetalBackend::dump_profile() {
@@ -742,7 +741,8 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.group_size = (int)B.group_size;
             w.groups_per_row = (int)B.groups_per_row;
             size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
-            const int NR0 = 2, NSG = std::min(8, (p.K + 127) / 128);
+            const int NR0 = 2;
+            const int NSG = std::min(gemv_nsg_cap(), (p.K + 127) / 128);
             id<MTLComputePipelineState> ps = impl_->pipeline("gemv_w8_f32a_i8b_f32c");
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
@@ -768,7 +768,9 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.groups_per_row = (int)B.groups_per_row;
             // Decoded W4 buffer layout: [ nibbles (N*K/2) | scales (N*gpr f32) ].
             size_t scales_boff = (size_t)p.N * (p.K / 2);
-            const int NR0 = 2, NSG = std::min(8, (p.K/2 + 63) / 64);
+            const int NR0 = 2;
+            const int NSG =
+                std::min(gemv_nsg_cap(), (p.K / 2 + 63) / 64);
             id<MTLComputePipelineState> ps = impl_->pipeline("gemv_w4_f32a_i4b_f32c");
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
@@ -798,11 +800,12 @@ void MetalBackend::dispatch(const GraphNode& node,
             id<MTLComputePipelineState> gemv2_ps = gemv_old ? nil : impl_->pipeline_gemv2(NR0);
             if (gemv2_ps) {
                 [enc setComputePipelineState:gemv2_ps];
-                // NSG cap: number of simdgroups splitting K. 8 is the M5 sweet
-                // spot (large-K down_proj K=9728 / o_proj K=4096 get more lanes;
-                // plateaus past 8, tapers at 16).
-                constexpr int NSG_CAP = 8;
-                int nsg = std::min(NSG_CAP, (p.K + 127) / 128);
+                // Four SIMD groups give the best cross-model decode throughput
+                // on M5 Pro: enough K parallelism without the occupancy and
+                // reduction overhead of eight groups. The environment override
+                // keeps this tunable for future GPU families.
+                int nsg =
+                    std::min(gemv_nsg_cap(), (p.K + 127) / 128);
                 if (nsg < 1) nsg = 1;
                 [enc setThreadgroupMemoryLength:(NSUInteger)(NR0 * 32 * sizeof(float)) atIndex:0];
                 NSUInteger tgcount = ((NSUInteger)p.N + NR0 - 1) / NR0;
@@ -1067,6 +1070,33 @@ void MetalBackend::dispatch(const GraphNode& node,
         break;
     }
 
+    case OpType::LAYER_NORM: {
+        const Tensor& X = *inputs[0];
+        const Tensor& W = *inputs[1];
+        const Tensor& B = *inputs[2];
+        Tensor& O = *output;
+        LayerNormParams p{};
+        p.dim0 = (int)X.shape[0];
+        p.rows = (int)(X.shape[1] * X.shape[2] * X.shape[3]);
+        p.x_offset = eoffset(X);
+        p.out_offset = eoffset(O);
+        p.x_row_stride = estride(X, 1);
+        p.out_row_stride = estride(O, 1);
+        p.eps = params.f32.size() > 0 ? params.f32[0] : 1e-5f;
+        id<MTLComputePipelineState> ps = impl_->pipeline("layer_norm_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&W) offset:W.device_offset atIndex:1];
+        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:4];
+        NSUInteger tg = std::min<NSUInteger>(
+            256, ps.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        break;
+    }
+
     case OpType::ROTARY_EMBED: {
         Tensor& X = *output;                 // rope is in-place on the copied input
         const Tensor& in = *inputs[0];
@@ -1163,14 +1193,26 @@ void MetalBackend::dispatch(const GraphNode& node,
         break;
     }
 
-    case OpType::SIGMOID: {
+    case OpType::SIGMOID:
+    case OpType::SIGMOID_EXACT:
+    case OpType::TANH:
+    case OpType::EXP:
+    case OpType::EXP_EXACT:
+    case OpType::SOFTPLUS: {
         const Tensor& X = *inputs[0];
         Tensor& O = *output;
         EwiseParams p{};
         p.n = (int)O.nelements();
+        p.shape0 = (int)O.shape[0];
+        p.a_row_stride = estride(X, 1);
+        p.out_row_stride = estride(O, 1);
         p.a_offset = eoffset(X);
         p.out_offset = eoffset(O);
-        id<MTLComputePipelineState> ps = impl_->pipeline("sigmoid_f32");
+        const char* kernel =
+            (op == OpType::TANH) ? "tanh_f32" :
+            (op == OpType::EXP || op == OpType::EXP_EXACT) ? "exp_f32" :
+            (op == OpType::SOFTPLUS) ? "softplus_f32" : "sigmoid_f32";
+        id<MTLComputePipelineState> ps = impl_->pipeline(kernel);
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
         [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
