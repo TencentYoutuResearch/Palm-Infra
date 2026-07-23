@@ -103,8 +103,8 @@ size_t pack_b_q4dot_g128_bytes(int N, int K);
 uint8_t* pack_b_q4dot_g128_full(const uint8_t* B_q4dot, const float* scales,
                                 int N, int K, int groups_per_row);
 
-// Expand G128 nibbles into the same [N/8, K, 8] signed-byte layout used by
-// sparse-A GEMV. Only FFN down weights request this optional CPU pack.
+// Expand G128 nibbles into the [N/8,K,8] signed-byte layout consumed by
+// sparse-A GEMV. Exposed for sparse kernel validation.
 int8_t* pack_b_sparse_int4_g128_full(const void* B_g128, int N, int K);
 
 // Pack A [K, M] column-major FP32 → interleaved [M/8, K, 8] FP16.

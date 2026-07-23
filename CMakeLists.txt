@@ -38,6 +38,12 @@ set(SOURCES
     graph/execute.cpp
     # kernels
     kernels/matmul.cpp
+    kernels/matmul_pack.cpp
+    kernels/matmul_profile.cpp
+    kernels/matmul_quant.cpp
+    kernels/matmul_sparse.cpp
+    kernels/matmul_w4.cpp
+    kernels/matmul_w8.cpp
     kernels/norm.cpp
     kernels/rope.cpp
     kernels/attention.cpp
@@ -58,6 +64,8 @@ set(SOURCES
 set(HEADERS
     kernels/tensor.h
     kernels/matmul.h
+    kernels/matmul_internal.h
+    kernels/matmul_profile.h
     kernels/norm.h
     kernels/rope.h
     kernels/attention.h
