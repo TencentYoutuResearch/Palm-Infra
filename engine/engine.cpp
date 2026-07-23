@@ -20,6 +20,24 @@ static inline MetalBackend* as_metal(const std::unique_ptr<Backend>& b) {
 
 namespace {
 
+int metal_ssd_prefill_min_tokens() {
+    static int threshold = [] {
+        // On M5 Pro the crossover is noisy at 32 tokens because each MoE
+        // layer still introduces a GPU→CPU boundary; 64 is consistently on
+        // the Metal-favorable side while protecting short interactive prompts.
+        constexpr int kDefault = 64;
+        const char* value = std::getenv("MOLLM_METAL_SSD_PREFILL_MIN_TOKENS");
+        if (!value || !*value) return kDefault;
+        char* end = nullptr;
+        long parsed = std::strtol(value, &end, 10);
+        return end != value && *end == '\0' && parsed >= 1 &&
+                       parsed <= INT32_MAX
+                   ? static_cast<int>(parsed)
+                   : kDefault;
+    }();
+    return threshold;
+}
+
 void release_pool_tensor(BufferPool& pool, Tensor& t) {
     if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
         if (t.owner_id != 0 && t.owner_id != pool.id()) {
@@ -559,7 +577,40 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0)
         return -1;
+
+    Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
+    bool short_ssd_cpu_prefill = false;
+#ifdef MOLLM_METAL
+    short_ssd_cpu_prefill =
+        moe_ssd_cache_ && metal_backend_ &&
+        saved_prefill_backend == metal_backend_.get() &&
+        n < metal_ssd_prefill_min_tokens();
+    if (short_ssd_cpu_prefill) {
+        // Small-M GPU kernels plus one GPU→CPU synchronization per MoE layer
+        // lose to the CPU path. Drop dense Metal copies before CPU work so UMA
+        // pressure cannot slow the SSD expert kernels.
+        release_metal_prefill_weights();
+        release_graph_temporaries(graph_prefill_, saved_prefill_backend);
+        invalidate_workspace_key(exec_ctx_prefill_);
+        exec_ctx_prefill_.backend = &cpu_backend_;
+    } else {
+        prepare_metal_prefill_weights();
+    }
+#else
     prepare_metal_prefill_weights();
+#endif
+    auto finish_prefill_phase = [&] {
+        // Hybrid decode is CPU-only, so no prefill workspace is useful after
+        // the last chunk. Releasing it also makes backend switching explicit.
+        if (moe_ssd_cache_) {
+            release_graph_temporaries(graph_prefill_,
+                                      exec_ctx_prefill_.backend);
+            invalidate_workspace_key(exec_ctx_prefill_);
+        }
+        if (!short_ssd_cpu_prefill)
+            release_metal_prefill_weights();
+        exec_ctx_prefill_.backend = saved_prefill_backend;
+    };
 
     // Determine the graph's expected seq_len from its hidden input shape.
     int graph_seq_len = 1;
@@ -584,7 +635,7 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
                 stderr,
                 "prefill: context full (past=%d >= n_ctx=%d). Use /reset.\n",
                 past_len_, cfg_.n_ctx);
-            release_metal_prefill_weights();
+            finish_prefill_phase();
             return -1;
         }
         int chunk_size = std::min(remaining, graph_seq_len);
@@ -592,12 +643,12 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
                                token_ids.begin() + offset + chunk_size);
         last_token = prefill_chunk(chunk, past_len_);
         if (last_token < 0) {
-            release_metal_prefill_weights();
+            finish_prefill_phase();
             return -1;
         }
         offset += chunk_size;
     }
-    release_metal_prefill_weights();
+    finish_prefill_phase();
     return last_token;
 }
 
@@ -606,7 +657,25 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0)
         return Tensor();
+
+    Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
+    bool short_ssd_cpu_prefill = false;
+#ifdef MOLLM_METAL
+    short_ssd_cpu_prefill =
+        moe_ssd_cache_ && metal_backend_ &&
+        saved_prefill_backend == metal_backend_.get() &&
+        n < metal_ssd_prefill_min_tokens();
+    if (short_ssd_cpu_prefill) {
+        release_metal_prefill_weights();
+        release_graph_temporaries(graph_prefill_, saved_prefill_backend);
+        invalidate_workspace_key(exec_ctx_prefill_);
+        exec_ctx_prefill_.backend = &cpu_backend_;
+    } else {
+        prepare_metal_prefill_weights();
+    }
+#else
     prepare_metal_prefill_weights();
+#endif
 
     int graph_seq_len = 1;
     for (auto& node : graph_prefill_.nodes) {
@@ -680,7 +749,14 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     }
 
     finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
-    release_metal_prefill_weights();
+    if (moe_ssd_cache_) {
+        release_graph_temporaries(graph_prefill_,
+                                  exec_ctx_prefill_.backend);
+        invalidate_workspace_key(exec_ctx_prefill_);
+    }
+    if (!short_ssd_cpu_prefill)
+        release_metal_prefill_weights();
+    exec_ctx_prefill_.backend = saved_prefill_backend;
     return copied;
 }
 

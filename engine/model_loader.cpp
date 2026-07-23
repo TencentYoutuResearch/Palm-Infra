@@ -729,8 +729,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         if (moe_ssd_cache_) {
             as_metal(metal_backend_)->enable_weight_copy_mode();
             fprintf(stderr,
-                    "Engine: Metal/SSD hybrid uses Metal prefill and CPU "
-                    "decode; experts remain mmap-backed\n");
+                    "Engine: Metal/SSD hybrid adaptively selects CPU/Metal "
+                    "prefill and uses CPU decode; experts remain mmap-backed\n");
         } else {
             if (!as_metal(metal_backend_)
                      ->register_weight_region(
