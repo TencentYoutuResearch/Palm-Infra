@@ -147,6 +147,11 @@ void maybe_pack_int8_weight(Tensor& t, const std::string& key,
         }
         t.data = it->second.data();
         t.is_interleaved = true;
+        // The interleaved W8 buffer is exactly the [N/8,K,8] layout consumed
+        // by sparse-A GEMV, so expose it without building a second copy.
+        if (key.find("_ffn_value_weight.weights") != std::string::npos) {
+            t.sparse_data = t.data;
+        }
     }
 
     if (plan.build_q8dot) {
@@ -210,6 +215,7 @@ void maybe_pack_int4_weight(Tensor& t, const std::string& key,
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
     if (!is_2d_linear_weight(t)) return;
     auto maybe_pack_sparse = [&]() {
+        if (!env_flag_enabled("MOLLM_SPARSE_A_W4")) return;
         size_t layer_pos = key.find("blocks_");
         int layer = layer_pos == std::string::npos
             ? 999 : std::atoi(key.c_str() + layer_pos + 7);

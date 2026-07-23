@@ -38,6 +38,8 @@ struct BenchConfig {
     bool interleave_pack = true;   // B interleaved packing (FP16/INT8)
     bool no_interleave_pack = false;
     int group_size = 0;     // quant group size; 0 = per-channel
+    bool sparse_a = false;  // benchmark ReLU-squared sparse-A GEMV
+    int density_pct = 10;   // nonzero percentage for --sparse-a
 };
 
 struct BenchResult {
@@ -129,6 +131,15 @@ static BenchConfig parse_args(int argc, char** argv) {
                 std::fprintf(stderr, "bench_matmul: invalid --group-size\n");
                 std::exit(1);
             }
+        } else if (arg == "--sparse-a") {
+            cfg.sparse_a = true;
+        } else if (arg == "--density") {
+            if (!require_value(argc, argv, i, "--density", value)) std::exit(1);
+            if (!parse_int(value, cfg.density_pct) ||
+                cfg.density_pct < 0 || cfg.density_pct > 100) {
+                std::fprintf(stderr, "bench_matmul: invalid --density\n");
+                std::exit(1);
+            }
         } else if (arg == "--interleave-pack") {
             cfg.interleave_pack = true;
         } else if (arg == "--no-interleave-pack") {
@@ -172,6 +183,15 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     float* a_data = new float[M * K];
     float* c_data = new float[M * N];
     fill_rand(a_data, M * K);
+    if (cfg.sparse_a) {
+        if (M != 1) {
+            std::fprintf(stderr, "bench_matmul: --sparse-a requires M=1\n");
+            std::exit(1);
+        }
+        for (int k = 0; k < K; ++k) {
+            if ((k * 37 + 11) % 100 >= cfg.density_pct) a_data[k] = 0.f;
+        }
+    }
 
     void* b_raw = nullptr;
     float* b_fp32_data = nullptr;
@@ -183,6 +203,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     uint8_t* b_int4_data = nullptr;
     uint8_t* b_int4_q4dot_data = nullptr;
     uint8_t* b_int4_q4g128_data = nullptr;
+    int8_t* b_int4_sparse_data = nullptr;
     float* scales_data = nullptr;
     int group_size = cfg.group_size > 0 ? cfg.group_size : K;
     int groups_per_row = (K + group_size - 1) / group_size;
@@ -228,6 +249,10 @@ static BenchResult run_bench(const BenchConfig& cfg) {
             if (group_size == 128 && (K % 128) == 0) {
                 b_int4_q4g128_data = pack_b_q4dot_g128_full(
                     b_int4_q4dot_data, scales_data, N, K, groups_per_row);
+                if (cfg.sparse_a) {
+                    b_int4_sparse_data =
+                        pack_b_sparse_int4_g128_full(b_int4_q4g128_data, N, K);
+                }
             }
         }
     } else if (is_fp16) {
@@ -261,9 +286,11 @@ static BenchResult run_bench(const BenchConfig& cfg) {
         if (is_int8) {
             B.is_interleaved = g_matmul_config.use_interleave_pack;
             B.q8_repack_data = b_int8_q8dot_data;
+            if (cfg.sparse_a) B.sparse_data = b_int8_packed_data;
         } else {
             B.q4_repack_data = b_int4_q4dot_data;
             B.q4_g128_data = b_int4_q4g128_data;
+            B.sparse_data = b_int4_sparse_data;
         }
     }
     Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
@@ -273,7 +300,8 @@ static BenchResult run_bench(const BenchConfig& cfg) {
 
     // warmup
     for (int i = 0; i < cfg.warmup; i++) {
-        kernel_matmul_fp32(A, B, C, tp);
+        if (cfg.sparse_a) kernel_gemv_sparse_a(A, B, C, tp);
+        else kernel_matmul_fp32(A, B, C, tp);
     }
 
     // timed runs
@@ -281,7 +309,8 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     times.reserve(cfg.repeat);
     for (int i = 0; i < cfg.repeat; i++) {
         auto start = std::chrono::steady_clock::now();
-        kernel_matmul_fp32(A, B, C, tp);
+        if (cfg.sparse_a) kernel_gemv_sparse_a(A, B, C, tp);
+        else kernel_matmul_fp32(A, B, C, tp);
         auto end = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(end - start).count();
         times.push_back(ms);
@@ -309,6 +338,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     if (b_int8_q8dot_data) delete[] b_int8_q8dot_data;
     if (b_int4_q4dot_data) delete[] b_int4_q4dot_data;
     if (b_int4_q4g128_data) delete[] b_int4_q4g128_data;
+    if (b_int4_sparse_data) delete[] b_int4_sparse_data;
     if (is_int8) {
         delete[] b_int8_data;
         delete[] scales_data;
@@ -329,7 +359,8 @@ int main(int argc, char** argv) {
     std::printf("M=%d K=%d N=%d threads=%d prec=%s\n", cfg.M, cfg.K, cfg.N, cfg.num_threads,
                 cfg.use_int4 ? "INT4" : cfg.use_int8 ? "INT8" : cfg.use_fp16 ? "FP16" : "FP32");
     std::printf("  warmup=%d repeat=%d\n", cfg.warmup, cfg.repeat);
-    std::printf("  avg=%.2fms min=%.2fms max=%.2fms p50=%.2fms\n",
+    if (cfg.sparse_a) std::printf("  sparse_a=1 density=%d%%\n", cfg.density_pct);
+    std::printf("  avg=%.4fms min=%.4fms max=%.4fms p50=%.4fms\n",
                 result.avg_ms, result.min_ms, result.max_ms, result.p50_ms);
     std::printf("  GFLOPS=%.1f\n", result.gflops);
 

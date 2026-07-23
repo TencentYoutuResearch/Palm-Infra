@@ -4535,32 +4535,14 @@ void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
         kernel_matmul_fp32(A, B, C, thread_pool);
         return;
     }
-
-    const float* a = A.ptr<float>();
-    std::vector<int> nonzero;
-    nonzero.reserve(K / 2);
-    for (int k = 0; k < K; ++k) {
-        if (a[k] != 0.0f) nonzero.push_back(k);
-    }
-    if (std::getenv("MOLLM_SPARSE_DEBUG")) {
-        static int debug_count = 0;
-        if (debug_count++ < 48)
-            std::fprintf(stderr, "sparseA precision=%d density=%.4f nnz=%zu K=%d\n",
-                         (int)B.prec, (double)nonzero.size() / K, nonzero.size(), K);
-    }
-    // Quantized dot-product GEMV has a much lower dense cost than FP16 GEMV;
-    // only use scalar-sparse dequantization for the exceptionally sparse
-    // early FFN layers. FP16 crosses over at a much higher density.
-    size_t density_limit = B.prec == Precision::FP16 ? (size_t)K * 4 / 5
-        : (B.prec == Precision::INT4 ? (size_t)K * 3 / 100 : 0);
-    if (std::getenv("MOLLM_SPARSE_A_FORCE")) density_limit = K;
-    if (nonzero.size() >= density_limit) {
+    if (std::getenv("MOLLM_SPARSE_A_DISABLE")) {
         kernel_matmul_fp32(A, B, C, thread_pool);
         return;
     }
 
+    const float* a = A.ptr<float>();
+    const bool force_sparse = std::getenv("MOLLM_SPARSE_A_FORCE") != nullptr;
 #if HAS_NEON
-    float* c = C.ptr<float>();
     const bool fp16 = B.prec == Precision::FP16;
     const bool w8 = B.prec == Precision::INT8 && B.sparse_data && B.scales;
     const bool w4 = B.prec == Precision::INT4 && B.sparse_data && B.scales &&
@@ -4569,35 +4551,175 @@ void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
         kernel_matmul_fp32(A, B, C, thread_pool);
         return;
     }
+#else
+    kernel_matmul_fp32(A, B, C, thread_pool);
+    return;
+#endif
 
+    size_t density_limit = B.prec == Precision::FP16 ? (size_t)K * 4 / 5
+        : (B.prec == Precision::INT8 ? (size_t)K * 9 / 100
+        : (B.prec == Precision::INT4 && std::getenv("MOLLM_SPARSE_A_W4")
+               ? (size_t)K * 3 / 100 : 0));
+    if (!force_sparse && density_limit == 0) {
+        kernel_matmul_fp32(A, B, C, thread_pool);
+        return;
+    }
+    const bool sparse_debug = std::getenv("MOLLM_SPARSE_DEBUG") != nullptr;
+    // Decode calls this once per FFN layer. Reuse the index buffer so sparse
+    // dispatch does not allocate and free heap storage on every token.
+    static thread_local std::vector<int> nonzero;
+    nonzero.clear();
+    if (!force_sparse) {
+        nonzero.reserve(K / 2);
+        for (int k = 0; k < K; ++k) {
+            if (a[k] != 0.0f) {
+                nonzero.push_back(k);
+                if (!sparse_debug && nonzero.size() >= density_limit) {
+                    kernel_matmul_fp32(A, B, C, thread_pool);
+                    return;
+                }
+            }
+        }
+    }
+    if (sparse_debug) {
+        static int debug_count = 0;
+        if (debug_count++ < 48)
+            std::fprintf(stderr, "sparseA precision=%d density=%.4f nnz=%zu K=%d\n",
+                         (int)B.prec, (double)nonzero.size() / K, nonzero.size(), K);
+    }
+    if (!force_sparse && nonzero.size() >= density_limit) {
+        kernel_matmul_fp32(A, B, C, thread_pool);
+        return;
+    }
+
+#if HAS_NEON
+    float* c = C.ptr<float>();
     const __fp16* b16 = fp16 ? reinterpret_cast<const __fp16*>(B.data) : nullptr;
     const int8_t* b8 = w8 ? reinterpret_cast<const int8_t*>(B.sparse_data) : nullptr;
     const int8_t* b4 = w4 ? reinterpret_cast<const int8_t*>(B.sparse_data) : nullptr;
     const int gpr = (int)B.groups_per_row;
+    auto for_each_active = [&](auto&& fn) {
+        if (force_sparse) {
+            for (int k = 0; k < K; ++k) {
+                if (a[k] != 0.0f) fn(k);
+            }
+        } else {
+            for (int k : nonzero) fn(k);
+        }
+    };
 
     auto run_range = [&](int n_begin, int n_end) {
+        if (force_sparse) {
+            constexpr int N_BLOCK = 64;
+            for (int nb = n_begin; nb < n_end; nb += N_BLOCK) {
+                int block_end = std::min(nb + N_BLOCK, n_end);
+                int tiles = (block_end - nb + 7) / 8;
+                float16x8_t acc[8][2];
+                float16x8_t scales[8];
+                for (int t = 0; t < tiles; ++t) {
+                    acc[t][0] = vdupq_n_f16((__fp16)0);
+                    acc[t][1] = vdupq_n_f16((__fp16)0);
+                }
+                int last_group = -1;
+                for (int k = 0; k < K; ++k) {
+                    if (a[k] == 0.0f) continue;
+                    int group = fp16 ? 0 :
+                        std::min(k / (int)B.group_size, gpr - 1);
+                    if (!fp16 && group != last_group) {
+                        for (int t = 0; t < tiles; ++t) {
+                            int tn = nb + t * 8;
+                            int valid = std::min(8, N - tn);
+                            if (w4 && B.q4_g128_data) {
+                                const auto* blocks =
+                                    reinterpret_cast<const Q4B8G128Block*>(B.q4_g128_data);
+                                const float* st =
+                                    blocks[(size_t)(tn / 8) * gpr + group].scales;
+                                scales[t] = vcombine_f16(
+                                    vcvt_f16_f32(vld1q_f32(st)),
+                                    vcvt_f16_f32(vld1q_f32(st + 4)));
+                            } else if (gpr == 1 && valid == 8) {
+                                const float* st = B.scales + tn;
+                                scales[t] = vcombine_f16(
+                                    vcvt_f16_f32(vld1q_f32(st)),
+                                    vcvt_f16_f32(vld1q_f32(st + 4)));
+                            } else {
+                                float st[8] = {};
+                                for (int j = 0; j < valid; ++j) {
+                                    st[j] = B.scales[(size_t)(tn + j) * gpr + group];
+                                }
+                                scales[t] = vcombine_f16(
+                                    vcvt_f16_f32(vld1q_f32(st)),
+                                    vcvt_f16_f32(vld1q_f32(st + 4)));
+                            }
+                        }
+                        last_group = group;
+                    }
+                    int slot = k & 1;
+                    for (int t = 0; t < tiles; ++t) {
+                        int tn = nb + t * 8;
+                        float16x8_t weight;
+                        if (fp16) {
+                            const __fp16* tile =
+                                b16 + (size_t)(tn & ~7) * K;
+                            weight = vld1q_f16(tile + (size_t)k * 8);
+                        } else {
+                            const int8_t* tile =
+                                (w8 ? b8 : b4) + (size_t)(tn & ~7) * K;
+                            weight = vcvtq_f16_s16(
+                                vmovl_s8(vld1_s8(tile + (size_t)k * 8)));
+                            weight = vmulq_f16(weight, scales[t]);
+                        }
+                        acc[t][slot] =
+                            vfmaq_n_f16(acc[t][slot], weight, (__fp16)a[k]);
+                    }
+                }
+                for (int t = 0; t < tiles; ++t) {
+                    int tn = nb + t * 8;
+                    int valid = std::min(8, N - tn);
+                    float16x8_t sum = vaddq_f16(acc[t][0], acc[t][1]);
+                    float tmp[8];
+                    vst1q_f32(tmp, vcvt_f32_f16(vget_low_f16(sum)));
+                    vst1q_f32(tmp + 4, vcvt_f32_f16(vget_high_f16(sum)));
+                    for (int j = 0; j < valid; ++j) c[tn + j] = tmp[j];
+                }
+            }
+            return;
+        }
         for (int n = n_begin; n < n_end; n += 8) {
             int valid = std::min(8, N - n);
+            const __fp16* tile16 = fp16 ? b16 + (size_t)(n & ~7) * K : nullptr;
+            const int8_t* tile8 = !fp16 ? (w8 ? b8 : b4) + (size_t)(n & ~7) * K : nullptr;
             float16x8_t acc[4] = {
                 vdupq_n_f16((__fp16)0), vdupq_n_f16((__fp16)0),
                 vdupq_n_f16((__fp16)0), vdupq_n_f16((__fp16)0)};
             int slot = 0;
             int last_group = -1;
             float16x8_t scale = vdupq_n_f16((__fp16)0);
-            const __fp16* tile16 = fp16 ? b16 + (size_t)(n & ~7) * K : nullptr;
-            const int8_t* tile8 = !fp16 ? (w8 ? b8 : b4) + (size_t)(n & ~7) * K : nullptr;
-            for (int k : nonzero) {
+            for_each_active([&](int k) {
                 float16x8_t weight;
                 if (fp16) {
                     weight = vld1q_f16(tile16 + (size_t)k * 8);
                 } else {
                     int group = std::min(k / (int)B.group_size, gpr - 1);
                     if (group != last_group) {
-                        float st[8] = {};
-                        for (int j = 0; j < valid; ++j)
-                            st[j] = B.scales[(size_t)(n + j) * gpr + group];
-                        scale = vcombine_f16(vcvt_f16_f32(vld1q_f32(st)),
-                                             vcvt_f16_f32(vld1q_f32(st + 4)));
+                        if (w4 && B.q4_g128_data) {
+                            const auto* blocks =
+                                reinterpret_cast<const Q4B8G128Block*>(B.q4_g128_data);
+                            const float* st =
+                                blocks[(size_t)(n / 8) * gpr + group].scales;
+                            scale = vcombine_f16(vcvt_f16_f32(vld1q_f32(st)),
+                                                 vcvt_f16_f32(vld1q_f32(st + 4)));
+                        } else if (gpr == 1 && valid == 8) {
+                            const float* st = B.scales + n;
+                            scale = vcombine_f16(vcvt_f16_f32(vld1q_f32(st)),
+                                                 vcvt_f16_f32(vld1q_f32(st + 4)));
+                        } else {
+                            float st[8] = {};
+                            for (int j = 0; j < valid; ++j)
+                                st[j] = B.scales[(size_t)(n + j) * gpr + group];
+                            scale = vcombine_f16(vcvt_f16_f32(vld1q_f32(st)),
+                                                 vcvt_f16_f32(vld1q_f32(st + 4)));
+                        }
                         last_group = group;
                     }
                     weight = vcvtq_f16_s16(vmovl_s8(vld1_s8(tile8 + (size_t)k * 8)));
@@ -4605,12 +4727,12 @@ void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
                 }
                 acc[slot] = vfmaq_n_f16(acc[slot], weight, (__fp16)a[k]);
                 slot = (slot + 1) & 3;
-            }
-            float16x8_t sum = vaddq_f16(vaddq_f16(acc[0], acc[1]),
-                                         vaddq_f16(acc[2], acc[3]));
+            });
+            float16x8_t total = vaddq_f16(vaddq_f16(acc[0], acc[1]),
+                                          vaddq_f16(acc[2], acc[3]));
             float tmp[8];
-            vst1q_f32(tmp, vcvt_f32_f16(vget_low_f16(sum)));
-            vst1q_f32(tmp + 4, vcvt_f32_f16(vget_high_f16(sum)));
+            vst1q_f32(tmp, vcvt_f32_f16(vget_low_f16(total)));
+            vst1q_f32(tmp + 4, vcvt_f32_f16(vget_high_f16(total)));
             for (int j = 0; j < valid; ++j) c[n + j] = tmp[j];
         }
     };
