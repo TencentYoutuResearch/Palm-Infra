@@ -64,6 +64,13 @@ public:
     /// into individual Shared Metal buffers by wrap_weight().
     void enable_weight_copy_mode();
 
+    /// Drop only the per-weight buffers created by hybrid copy mode. Persistent
+    /// KV/state buffers and reusable boundary buffers remain alive.
+    void release_weight_copies();
+
+    /// True when hybrid copy mode currently owns at least one dense weight.
+    bool has_weight_copies() const;
+
     /// After register_weight_region, point a weight/constant tensor at the
     /// shared weight buffer with the correct device_offset (from t.data).
     void wrap_weight(Tensor& t);

@@ -501,6 +501,54 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
 // prefill / decode
 // ---------------------------------------------------------------------------
 
+void LLMEngine::prepare_metal_prefill_weights() {
+#ifdef MOLLM_METAL
+    if (!moe_ssd_cache_ || !metal_backend_ ||
+        exec_ctx_prefill_.backend != metal_backend_.get())
+        return;
+    auto* metal = as_metal(metal_backend_);
+    if (metal->has_weight_copies()) return;
+
+    for (auto& node : graph_prefill_.nodes) {
+        if (node.op_type != OpType::CONSTANT || node.params.str.empty())
+            continue;
+        Tensor& t = graph_prefill_.runtime.tensors[node.id];
+        // SSD expert aggregates deliberately have no resident source pointer.
+        if (!t.rowmajor_data) continue;
+        // CPU fallback kernels may use a packed/interleaved t.data. Temporarily
+        // expose the original mmap bytes only while recreating the Metal copy.
+        void* cpu_data = t.data;
+        t.data = const_cast<void*>(t.rowmajor_data);
+        t.device_data = nullptr;
+        t.device_offset = 0;
+        metal->wrap_weight(t);
+        t.data = cpu_data;
+        const bool aggregate_expert =
+            node.params.str[0].find("_experts_") != std::string::npos;
+        metal->wrap_weight_int4_g128(t, aggregate_expert);
+    }
+#endif
+}
+
+void LLMEngine::release_metal_prefill_weights() {
+#ifdef MOLLM_METAL
+    if (!moe_ssd_cache_ || !metal_backend_ ||
+        exec_ctx_prefill_.backend != metal_backend_.get())
+        return;
+    as_metal(metal_backend_)->release_weight_copies();
+    for (auto& node : graph_prefill_.nodes) {
+        if (node.op_type != OpType::CONSTANT || node.params.str.empty())
+            continue;
+        Tensor& t = graph_prefill_.runtime.tensors[node.id];
+        // KV caches and recurrent state are also CONSTANT nodes, but have no
+        // mmap-backed row-major weight source and must stay device-resident.
+        if (!t.rowmajor_data) continue;
+        t.device_data = nullptr;
+        t.device_offset = 0;
+    }
+#endif
+}
+
 void LLMEngine::release_prefill_buffers() {
     release_graph_temporaries(graph_prefill_, exec_ctx_prefill_.backend);
     invalidate_workspace_key(exec_ctx_prefill_);
@@ -511,6 +559,7 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0)
         return -1;
+    prepare_metal_prefill_weights();
 
     // Determine the graph's expected seq_len from its hidden input shape.
     int graph_seq_len = 1;
@@ -535,16 +584,20 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
                 stderr,
                 "prefill: context full (past=%d >= n_ctx=%d). Use /reset.\n",
                 past_len_, cfg_.n_ctx);
+            release_metal_prefill_weights();
             return -1;
         }
         int chunk_size = std::min(remaining, graph_seq_len);
         std::vector<int> chunk(token_ids.begin() + offset,
                                token_ids.begin() + offset + chunk_size);
         last_token = prefill_chunk(chunk, past_len_);
-        if (last_token < 0)
+        if (last_token < 0) {
+            release_metal_prefill_weights();
             return -1;
+        }
         offset += chunk_size;
     }
+    release_metal_prefill_weights();
     return last_token;
 }
 
@@ -553,6 +606,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0)
         return Tensor();
+    prepare_metal_prefill_weights();
 
     int graph_seq_len = 1;
     for (auto& node : graph_prefill_.nodes) {
@@ -626,6 +680,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     }
 
     finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
+    release_metal_prefill_weights();
     return copied;
 }
 

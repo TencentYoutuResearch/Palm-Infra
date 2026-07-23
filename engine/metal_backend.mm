@@ -51,6 +51,9 @@ struct MetalBackend::Impl {
 
     // persistent device buffers owned by the backend (KV cache)
     std::vector<id<MTLBuffer>> persistent;
+    // Dense weight copies used only during Metal prefill in SSD hybrid mode.
+    // Kept separate so they can be dropped before CPU expert decode on UMA.
+    std::vector<id<MTLBuffer>> weight_copies;
     std::unordered_map<const void*, id<MTLBuffer>> copied_weights;
     std::unordered_map<const void*, id<MTLBuffer>> decoded_q4_weights;
 
@@ -274,6 +277,7 @@ MetalBackend::~MetalBackend() {
         impl_->spec_pipelines.clear();
         impl_->copied_weights.clear();
         impl_->decoded_q4_weights.clear();
+        impl_->weight_copies.clear();
         impl_->persistent.clear();
         impl_->weight_buffer = nil;
         impl_->pool.reset();
@@ -370,6 +374,18 @@ void MetalBackend::enable_weight_copy_mode() {
     impl_->copy_weights = true;
 }
 
+void MetalBackend::release_weight_copies() {
+    if (!impl_->copy_weights) return;
+    synchronize_for_host_read();
+    impl_->copied_weights.clear();
+    impl_->decoded_q4_weights.clear();
+    impl_->weight_copies.clear();
+}
+
+bool MetalBackend::has_weight_copies() const {
+    return !impl_->weight_copies.empty();
+}
+
 void MetalBackend::wrap_weight(Tensor& t) {
     if (!t.data) return;
     if (!impl_->weight_buffer) {
@@ -384,12 +400,17 @@ void MetalBackend::wrap_weight(Tensor& t) {
             if (found != impl_->copied_weights.end()) {
                 t.device_data = (__bridge void*)found->second;
                 t.device_offset = 0;
-                t.data = [found->second contents];
             } else {
-                alloc_persistent(t, bytes);
-                std::memcpy(t.data, src, bytes);
-                impl_->copied_weights[src] =
-                    (__bridge id<MTLBuffer>)t.device_data;
+                @autoreleasepool {
+                    id<MTLBuffer> b =
+                        [impl_->device newBufferWithLength:bytes
+                                                   options:MTLResourceStorageModeShared];
+                    std::memcpy([b contents], src, bytes);
+                    impl_->weight_copies.push_back(b);
+                    impl_->copied_weights[src] = b;
+                    t.device_data = (__bridge void*)b;
+                    t.device_offset = 0;
+                }
             }
         }
         return;
@@ -445,7 +466,10 @@ void MetalBackend::wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128) {
     @autoreleasepool {
         id<MTLBuffer> b = [impl_->device newBufferWithLength:nib_bytes + sc_bytes
                                                      options:MTLResourceStorageModeShared];
-        impl_->persistent.push_back(b);
+        if (impl_->copy_weights)
+            impl_->weight_copies.push_back(b);
+        else
+            impl_->persistent.push_back(b);
         uint8_t* nib = (uint8_t*)[b contents];
         float*   sc  = (float*)(nib + nib_bytes);
         const auto* blocks = reinterpret_cast<const Q4B8G128Block*>(t.q4_g128_data);

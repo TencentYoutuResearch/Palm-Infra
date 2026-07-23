@@ -217,6 +217,9 @@ public:
                                        bool all_positions = false);
 
 private:
+    void prepare_metal_prefill_weights();
+    void release_metal_prefill_weights();
+
     EngineConfig cfg_;
     Graph graph_prefill_;
     Graph graph_decode_;
