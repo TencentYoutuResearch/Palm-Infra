@@ -47,9 +47,9 @@
   <rect x="700" y="232" width="37.8" height="13" rx="2" class="mollm"/><text x="745" y="243" class="value">25.22</text>
   <rect x="700" y="250" width="33.2" height="13" rx="2" class="llama"/><text x="741" y="261" class="value">22.14</text>
   <text x="40" y="299" class="label">RWKV7-1.5B</text>
-  <rect x="200" y="278" width="226.0" height="13" rx="2" class="mollm"/><text x="433" y="289" class="value">430.51</text>
+  <rect x="200" y="278" width="220.0" height="13" rx="2" class="mollm"/><text x="427" y="289" class="value">418.95</text>
   <rect x="200" y="296" width="207.8" height="13" rx="2" class="llama"/><text x="415" y="307" class="value">395.83</text>
-  <rect x="700" y="278" width="105.1" height="13" rx="2" class="mollm"/><text x="812" y="289" class="value">70.09</text>
+  <rect x="700" y="278" width="108.5" height="13" rx="2" class="mollm"/><text x="816" y="289" class="value">72.36</text>
   <rect x="700" y="296" width="85.8" height="13" rx="2" class="llama"/><text x="793" y="307" class="value">57.18</text>
   <line x1="200" y1="332" x2="620" y2="332" class="axis"/>
   <text x="196" y="350" class="tick">0</text><text x="296" y="350" class="tick">200</text><text x="401" y="350" class="tick">400</text><text x="506" y="350" class="tick">600</text><text x="611" y="350" class="tick">800</text>
@@ -78,9 +78,9 @@
   <rect x="700" y="518" width="70.0" height="13" rx="2" class="mollm"/><text x="778" y="529" class="value">46.64</text>
   <rect x="700" y="536" width="60.8" height="13" rx="2" class="llama"/><text x="768" y="547" class="value">40.50</text>
   <text x="40" y="585" class="label">RWKV7-1.5B</text>
-  <rect x="200" y="564" width="143.9" height="13" rx="2" class="mollm"/><text x="351" y="575" class="value">274.16</text>
+  <rect x="200" y="564" width="168.4" height="13" rx="2" class="mollm"/><text x="375" y="575" class="value">320.75</text>
   <rect x="200" y="582" width="198.3" height="13" rx="2" class="llama"/><text x="406" y="593" class="value">377.64</text>
-  <rect x="700" y="564" width="182.0" height="13" rx="2" class="mollm"/><text x="889" y="575" class="value">121.34</text>
+  <rect x="700" y="564" width="177.0" height="13" rx="2" class="mollm"/><text x="884" y="575" class="value">118.00</text>
   <rect x="700" y="582" width="144.8" height="13" rx="2" class="llama"/><text x="852" y="593" class="value">96.50</text>
   <line x1="200" y1="618" x2="620" y2="618" class="axis"/>
   <text x="196" y="636" class="tick">0</text><text x="296" y="636" class="tick">200</text><text x="401" y="636" class="tick">400</text><text x="506" y="636" class="tick">600</text><text x="611" y="636" class="tick">800</text>
@@ -109,9 +109,9 @@
   <rect x="700" y="804" width="83.9" height="13" rx="2" class="mollm"/><text x="791" y="815" class="value">55.94</text>
   <rect x="700" y="822" width="66.4" height="13" rx="2" class="llama"/><text x="774" y="833" class="value">44.25</text>
   <text x="40" y="871" class="label">RWKV7-1.5B mixed</text>
-  <rect x="200" y="850" width="144.0" height="13" rx="2" class="mollm"/><text x="351" y="861" class="value">274.25</text>
+  <rect x="200" y="850" width="161.9" height="13" rx="2" class="mollm"/><text x="369" y="861" class="value">308.33</text>
   <rect x="200" y="868" width="192.5" height="13" rx="2" class="llama"/><text x="400" y="879" class="value">366.76</text>
-  <rect x="700" y="850" width="193.7" height="13" rx="2" class="mollm"/><text x="901" y="861" class="value">129.12</text>
+  <rect x="700" y="850" width="203.8" height="13" rx="2" class="mollm"/><text x="911" y="861" class="value">135.85</text>
   <rect x="700" y="868" width="166.0" height="13" rx="2" class="llama"/><text x="873" y="879" class="value">110.68</text>
   <text x="40" y="917" class="label">Qwen3.6-35B-A3B</text>
   <rect x="200" y="896" width="73.3" height="13" rx="2" class="mollm"/><text x="281" y="907" class="value">139.63</text>

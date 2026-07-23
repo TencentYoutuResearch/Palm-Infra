@@ -91,7 +91,7 @@ On Apple, mollm uses Accelerate SGEMM for eligible large FP16 prefill GEMMs.
 | Qwen3.5-0.8B | **757.74** / **123.68** | 664.54 / 97.87 | mollm faster prefill and decode |
 | Youtu-LLM-2B | **335.44** / **51.32** | 258.13 / 46.73 | mollm faster prefill and decode |
 | Qwen3.5-4B | 135.00 / **25.22** | **144.30** / 22.14 | llama faster prefill, mollm faster decode |
-| RWKV7-1.5B | **430.51** / **70.09** | 395.83 / 57.18 | mollm faster prefill and decode |
+| RWKV7-1.5B | **418.95** / **72.36** | 395.83 / 57.18 | mollm faster prefill and decode |
 
 ### W8
 
@@ -100,7 +100,7 @@ On Apple, mollm uses Accelerate SGEMM for eligible large FP16 prefill GEMMs.
 | Qwen3.5-0.8B | 671.73 / **217.69** | **782.16** / 167.63 | llama faster prefill, mollm faster decode |
 | Youtu-LLM-2B | 253.05 / **89.53** | **263.95** / 86.58 | close prefill, mollm slightly faster decode |
 | Qwen3.5-4B | 118.55 / **46.64** | **135.58** / 40.50 | llama faster prefill, mollm faster decode |
-| RWKV7-1.5B | 274.16 / **121.34** | **377.64** / 96.50 | llama faster prefill, mollm faster decode |
+| RWKV7-1.5B | 320.75 / **118.00** | **377.64** / 96.50 | llama faster prefill, mollm faster decode |
 
 ### W4
 
@@ -109,10 +109,10 @@ On Apple, mollm uses Accelerate SGEMM for eligible large FP16 prefill GEMMs.
 | Qwen3.5-0.8B | 678.41 / **259.43** | **775.95** / 190.89 | llama faster prefill, mollm faster decode |
 | Youtu-LLM-2B | 248.08 / **115.64** | **265.58** / 97.15 | llama faster prefill, mollm faster decode |
 | Qwen3.5-4B | 115.37 / **55.94** | **140.51** / 44.25 | llama faster prefill, mollm faster decode |
-| RWKV7-1.5B mixed W4 | 274.25 / **129.12** | **366.76** / 110.68 | llama faster prefill, mollm faster decode |
+| RWKV7-1.5B mixed W4 | 308.33 / **135.85** | **366.76** / 110.68 | llama faster prefill, mollm faster decode |
 
-RWKV7 FP16 and mixed-W4 rows use its default sparse-A policy; W8 uses the
-default q8-dot dense GEMV path.
+RWKV7 uses sparse-A FFN GEMV where it improves endpoint performance; mixed W4
+keeps dense q4-dot GEMV by default.
 
 ### MoE W4
 
