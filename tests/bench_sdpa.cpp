@@ -159,8 +159,8 @@ static BenchResult run_bench(const BenchConfig& cfg) {
         __fp16* vdst = (__fp16*)cache_data(vc_buf);
         for (int g = 0; g < KV; g++) {
             for (int s = 0; s < past; s++) {
-                for (int d = 0; d < hd; d++) kdst[g*cap*hd + s*hd + d] = (__fp16)((float)rand()/RAND_MAX - 0.5f);
-                for (int d = 0; d < vd; d++) vdst[g*cap*vd + s*vd + d] = (__fp16)((float)rand()/RAND_MAX - 0.5f);
+                for (int d = 0; d < hd; d++) kdst[g*cap*hd + s*hd + d] = (__fp16)(static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f);
+                for (int d = 0; d < vd; d++) vdst[g*cap*vd + s*vd + d] = (__fp16)(static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f);
             }
         }
     } else {
@@ -168,8 +168,8 @@ static BenchResult run_bench(const BenchConfig& cfg) {
         float* vdst = (float*)cache_data(vc_buf);
         for (int g = 0; g < KV; g++) {
             for (int s = 0; s < past; s++) {
-                for (int d = 0; d < hd; d++) kdst[g*cap*hd + s*hd + d] = (float)rand()/RAND_MAX - 0.5f;
-                for (int d = 0; d < vd; d++) vdst[g*cap*vd + s*vd + d] = (float)rand()/RAND_MAX - 0.5f;
+                for (int d = 0; d < hd; d++) kdst[g*cap*hd + s*hd + d] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f;
+                for (int d = 0; d < vd; d++) vdst[g*cap*vd + s*vd + d] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f;
             }
         }
     }

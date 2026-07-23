@@ -8,7 +8,7 @@
 static int failures = 0;
 #define CHECK(cond, msg) do { if(!(cond)){fprintf(stderr,"FAIL: %s\n",msg);failures++;}else{printf("  PASS: %s\n",msg);} } while(0)
 
-static void fill_rand(float* d, int n) { for(int i=0;i<n;i++) d[i]=(float)rand()/RAND_MAX-0.5f; }
+static void fill_rand(float* d, int n) { for(int i=0;i<n;i++) d[i]=static_cast<float>(rand())/static_cast<float>(RAND_MAX)-0.5f; }
 
 // Build reference: concat K/V, compute SDPA naively
 static void ref_sdpa(const float* Q, const float* K_cache, const float* V_cache,

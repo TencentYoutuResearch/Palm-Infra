@@ -1,0 +1,43 @@
+set(test_root "@CMAKE_CURRENT_BINARY_DIR@/package_consumer_test")
+set(install_root "${test_root}/install")
+set(consumer_build "${test_root}/consumer")
+file(REMOVE_RECURSE "${test_root}")
+
+set(install_command
+    "@CMAKE_COMMAND@" --install "@CMAKE_CURRENT_BINARY_DIR@"
+    --prefix "${install_root}")
+if(NOT "@CMAKE_BUILD_TYPE@" STREQUAL "")
+    list(APPEND install_command --config "@CMAKE_BUILD_TYPE@")
+endif()
+execute_process(
+    COMMAND ${install_command}
+    RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "mollm package install failed: ${result}")
+endif()
+
+execute_process(
+    COMMAND "@CMAKE_COMMAND@"
+            -S "@CMAKE_CURRENT_SOURCE_DIR@/tests/package_consumer"
+            -B "${consumer_build}"
+            -G "@CMAKE_GENERATOR@"
+            "-DCMAKE_PREFIX_PATH=${install_root}"
+            "-DCMAKE_BUILD_TYPE=@CMAKE_BUILD_TYPE@"
+    RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "package consumer configure failed: ${result}")
+endif()
+
+execute_process(
+    COMMAND "@CMAKE_COMMAND@" --build "${consumer_build}"
+    RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "package consumer build failed: ${result}")
+endif()
+
+execute_process(
+    COMMAND "${consumer_build}/mollm_package_consumer"
+    RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "package consumer failed: ${result}")
+endif()

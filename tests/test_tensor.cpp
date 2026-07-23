@@ -32,6 +32,26 @@ int main() {
     CHECK(v2.shape[0] == 2 && v2.shape[1] == 3, "view_2d shape 2x3");
     CHECK(v2.data == a.data, "view_2d shares data");
 
+    // ---- storage identity ----
+    float storage[4] = {};
+    Tensor pooled =
+        Tensor::create(Precision::FP32, MemoryType::POOLED, 4, 1, 1, 1, storage);
+    pooled.owner_id = 7;
+    pooled.storage_id = 42;
+    Tensor pooled_view = pooled.view_1d(3, sizeof(float));
+    CHECK(pooled_view.data != pooled.data, "offset view has a distinct pointer");
+    CHECK(pooled_view.shares_storage_with(pooled),
+          "offset view retains pooled storage identity");
+    Tensor other_pool = pooled_view;
+    other_pool.owner_id = 8;
+    CHECK(!other_pool.shares_storage_with(pooled),
+          "storage ids are scoped by pool owner");
+    Tensor external_a =
+        Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 4, 1, 1, 1, storage);
+    Tensor external_b = external_a;
+    CHECK(external_a.shares_storage_with(external_b),
+          "external tensors fall back to pointer identity");
+
     // ---- reshape ----
     Tensor r = a.reshape(6, 2);
     CHECK(r.shape[0] == 6 && r.shape[1] == 2, "reshape 6x2");
@@ -68,14 +88,6 @@ int main() {
     // ---- is_contiguous after permute ----
     CHECK(!p.is_contiguous(), "permuted tensor not contiguous");
     CHECK(a.is_contiguous(), "original still contiguous");
-
-    // ---- is_contiguous_n ----
-    // a is 4x3 contiguous; after permute(1,0), dim 0 is not contiguous
-    // but dims >=1 are
-    CHECK(!p.is_contiguous_n(0), "permute: dim0 not contiguous");
-    // p = permute(1,0): shape[1]=4, stride[1]=2.  stride[0]*shape[0]=8*3=24.
-    // Since 2 != 24, dim1 is also not contiguous.  Correct.
-    CHECK(!p.is_contiguous_n(1), "permute: dim1 also not contiguous (stride 2 vs expected 24)");
 
     delete[] fd;
 

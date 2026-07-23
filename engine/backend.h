@@ -93,8 +93,8 @@ public:
 // Shape mode: DYNAMIC (no padding). Runtime injects actual seq_len into
 // SEQ-tagged dims via inject_runtime_shapes().
 //
-// dispatch() routes to dispatch_kernel() in graph/execute.cpp (the existing
-// kernel dispatcher). All current CPU kernels remain unchanged.
+// dispatch() is implemented in graph/cpu_backend.cpp and routes each graph op
+// to the corresponding CPU kernel.
 // ---------------------------------------------------------------------------
 
 class CPUBackend : public Backend {

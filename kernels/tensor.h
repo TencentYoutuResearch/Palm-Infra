@@ -148,20 +148,16 @@ struct Tensor {
         return true;
     }
 
-    /// True if dims [0..n) are contiguous (higher dims may be permuted).
-    bool is_contiguous_n(int n) const {
-        size_t expected = element_size();
-        if (stride[0] != expected) return false;
-        expected *= shape[0];
-        for (int i = 1; i < 4; i++) {
-            if (i > n) {
-                if (shape[i] != 1 && stride[i] != expected) return false;
-                expected *= shape[i];
-            } else {
-                expected = shape[i] * stride[i];
-            }
+    /// Whether two tensors refer to the same underlying allocation.
+    ///
+    /// Pooled tensors carry a stable storage identity, which remains valid for
+    /// views whose data pointers have been offset. External tensors do not
+    /// have that identity, so pointer equality is the best available fallback.
+    bool shares_storage_with(const Tensor& other) const {
+        if (storage_id != 0 && other.storage_id != 0) {
+            return owner_id == other.owner_id && storage_id == other.storage_id;
         }
-        return true;
+        return data == other.data;
     }
 
     // -----------------------------------------------------------------------

@@ -7,6 +7,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(CheckCXXSourceCompiles)
 include(CheckCXXSourceRuns)
+include(CMakePackageConfigHelpers)
+include(GNUInstallDirs)
 
 find_package(Threads REQUIRED)
 
@@ -35,6 +37,7 @@ set(SOURCES
     graph/buffer_pool.cpp
     graph/mmap_file.cpp
     graph/io.cpp
+    graph/cpu_backend.cpp
     graph/execute.cpp
     # kernels
     kernels/matmul.cpp
@@ -44,9 +47,12 @@ set(SOURCES
     kernels/matmul_sparse.cpp
     kernels/matmul_w4.cpp
     kernels/matmul_w8.cpp
+    kernels/elementwise.cpp
+    kernels/layout.cpp
     kernels/norm.cpp
     kernels/rope.cpp
     kernels/attention.cpp
+    kernels/shortconv.cpp
     kernels/gdn.cpp
     kernels/gdn_decode.cpp
     kernels/gdn_prefill.cpp
@@ -57,36 +63,40 @@ set(SOURCES
     kernels/threading.cpp
     # engine
     engine/engine.cpp
+    engine/package.cpp
     engine/sampler.cpp
     engine/tokenizer.cpp
 )
 
-set(HEADERS
-    kernels/tensor.h
-    kernels/matmul.h
-    kernels/matmul_internal.h
-    kernels/matmul_profile.h
-    kernels/norm.h
-    kernels/rope.h
-    kernels/attention.h
-    kernels/moe.h
-    kernels/moe_ssd.h
-    kernels/trace.h
-    kernels/rwkv.h
-    kernels/threading.h
+set(PUBLIC_ENGINE_HEADERS
+    engine/backend.h
+    engine/engine.h
+    engine/sampler.h
+    engine/tokenizer.h
+)
+
+set(PUBLIC_GRAPH_HEADERS
     graph/buffer_pool.h
     graph/mmap_file.h
     graph/graph.h
-    graph/io.cpp   # graph_load/graph_save declared in graph.h
     graph/execute.h
 )
 
-add_library(mollm_lib STATIC ${SOURCES})
-target_include_directories(mollm_lib PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann
+set(PUBLIC_KERNEL_HEADERS
+    kernels/moe_ssd.h
+    kernels/tensor.h
+    kernels/threading.h
 )
-target_link_libraries(mollm_lib PUBLIC)
+
+add_library(mollm_lib STATIC ${SOURCES})
+add_library(mollm::mollm ALIAS mollm_lib)
+set_target_properties(mollm_lib PROPERTIES EXPORT_NAME mollm)
+target_include_directories(mollm_lib PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/mollm>
+)
+target_link_libraries(mollm_lib PUBLIC Threads::Threads)
 
 # ---------------------------------------------------------------------------
 # platform detection for SIMD
@@ -224,8 +234,11 @@ if(MOLLM_METAL)
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(mollm_lib PUBLIC
         MOLLM_METAL=1
-        MOLLM_METALLIB_PATH="${MOLLM_METALLIB}")
+        "$<BUILD_INTERFACE:MOLLM_METALLIB_PATH=\"${MOLLM_METALLIB}\">"
+        "$<INSTALL_INTERFACE:MOLLM_METALLIB_PATH=\"${CMAKE_INSTALL_FULL_DATADIR}/mollm/default.metallib\">")
     target_link_libraries(mollm_lib PUBLIC ${METAL_LIBRARY} ${FOUNDATION_LIBRARY})
+    install(FILES ${MOLLM_METALLIB}
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/mollm)
     message(STATUS "Metal backend enabled (metallib: ${MOLLM_METALLIB})")
 endif()
 
@@ -274,6 +287,11 @@ add_custom_target(mollm_quantize_weight DEPENDS mollm-quantize)
 if(MOLLM_BUILD_TESTS)
     enable_testing()
 
+    configure_file(
+        cmake/RunPackageConsumer.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/RunPackageConsumer.cmake
+        @ONLY)
+
     function(add_mollm_test name src)
         add_executable(${name} ${src})
         target_link_libraries(${name} PRIVATE mollm_lib)
@@ -286,6 +304,8 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_graph         tests/test_graph.cpp)
     add_mollm_test(test_io            tests/test_io.cpp)
     add_mollm_test(test_execute       tests/test_execute.cpp)
+    add_mollm_test(test_elementwise   tests/test_elementwise.cpp)
+    add_mollm_test(test_layout        tests/test_layout.cpp)
     add_mollm_test(test_matmul        tests/test_matmul.cpp)
     add_mollm_test(test_moe           tests/test_moe.cpp)
     add_mollm_test(test_moe_ssd       tests/test_moe_ssd.cpp)
@@ -296,6 +316,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_norm          tests/test_norm.cpp)
     add_mollm_test(test_rope          tests/test_rope.cpp)
     add_mollm_test(test_attention     tests/test_attention.cpp)
+    add_mollm_test(test_shortconv     tests/test_shortconv.cpp)
     add_mollm_test(test_gdn           tests/test_gdn.cpp)
     add_mollm_test(test_rwkv_e2e      tests/test_rwkv_e2e.cpp)
     add_mollm_test(test_engine        tests/test_engine.cpp)
@@ -303,6 +324,10 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_e2e           tests/test_e2e.cpp)
     add_mollm_test(test_quantized_e2e tests/test_quantized_e2e.cpp)
     add_mollm_test(test_thread_pool_stress tests/test_thread_pool_stress.cpp)
+    add_test(
+        NAME test_package_install
+        COMMAND ${CMAKE_COMMAND}
+                -P ${CMAKE_CURRENT_BINARY_DIR}/RunPackageConsumer.cmake)
 
     if(MOLLM_METAL)
         add_mollm_test(test_metal_ops tests/test_metal_ops.cpp)
@@ -313,5 +338,31 @@ endif()
 # install
 # ---------------------------------------------------------------------------
 
-install(TARGETS mollm_lib ARCHIVE DESTINATION lib)
-install(FILES ${HEADERS} DESTINATION include/mollm)
+install(TARGETS mollm_lib
+        EXPORT mollmTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm)
+install(FILES ${PUBLIC_ENGINE_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/engine)
+install(FILES ${PUBLIC_GRAPH_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/graph)
+install(FILES ${PUBLIC_KERNEL_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/kernels)
+
+configure_package_config_file(
+    cmake/mollmConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/mollmConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/mollm)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/mollmConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+
+install(EXPORT mollmTargets
+        FILE mollmTargets.cmake
+        NAMESPACE mollm::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/mollm)
+install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/mollmConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/mollmConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/mollm)

@@ -17,7 +17,8 @@ static int failures = 0;
 } while(0)
 
 static void fill_rand(float* d, int n) {
-    for (int i = 0; i < n; i++) d[i] = (float)rand() / RAND_MAX - 0.5f;
+    for (int i = 0; i < n; i++)
+        d[i] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f;
 }
 
 // max abs / mean rel error check tuned for FP16 weights + FP32 accumulate.
@@ -732,7 +733,7 @@ int main() {
             std::vector<float>  sw(N);
             for (int n = 0; n < N; n++) {
                 float mx = 0; std::vector<float> row(K);
-                for (int k = 0; k < K; k++) { row[k] = (float)rand()/RAND_MAX - 0.5f;
+                for (int k = 0; k < K; k++) { row[k] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f;
                     mx = std::max(mx, std::fabs(row[k])); }
                 float s = mx / 127.0f, inv = mx > 0 ? 127.0f/mx : 0; sw[n] = s;
                 for (int k = 0; k < K; k++) {
