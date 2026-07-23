@@ -879,6 +879,9 @@ kernel void gemv_w8_f32a_i8b_f32c(
 // W4 decode GEMV: C[1,N] = A[1,K] (fp32) * W_i4[N,K/2] (per-group symmetric int4).
 // Nibble: byte = B[n*(K/2)+k/2]; low = even k, high = odd k; w = nibble-16 if>=8.
 // Per-group weight scale scale_w[n*gpr + k/gs] applied inside the group sum.
+constant int FC_GEMV_W4_NR0 [[function_constant(6)]];
+constant bool FC_GEMV_W4_HAS_NR0 =
+    is_function_constant_defined(FC_GEMV_W4_NR0);
 kernel void gemv_w4_f32a_i4b_f32c(
     device const float*    A      [[buffer(0)]],
     device const uint8_t*  B      [[buffer(1)]],
@@ -891,7 +894,9 @@ kernel void gemv_w4_f32a_i4b_f32c(
     ushort sgitg                  [[simdgroup_index_in_threadgroup]],
     ushort nsg                    [[simdgroups_per_threadgroup]])
 {
-    const short NR0 = 2, NR0MAX = 2, NW = 32;
+    const short NR0 =
+        FC_GEMV_W4_HAS_NR0 ? (short)FC_GEMV_W4_NR0 : (short)2;
+    const short NR0MAX = 8, NW = 32;
     device const float* a = A + p.a_offset;
     const int r0 = (int)tgx * NR0;
     const int gpr = p.groups_per_row, gs = p.group_size;

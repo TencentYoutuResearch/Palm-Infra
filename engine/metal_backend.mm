@@ -169,6 +169,29 @@ struct MetalBackend::Impl {
         spec_pipelines[key] = ps;
         return ps;
     }
+
+    id<MTLComputePipelineState> pipeline_gemv_w4(int nr0) {
+        char keyc[48];
+        snprintf(keyc, sizeof(keyc), "gemv_w4:nr0%d", nr0);
+        std::string key(keyc);
+        auto it = spec_pipelines.find(key);
+        if (it != spec_pipelines.end()) return it->second;
+
+        MTLFunctionConstantValues* cv = [[MTLFunctionConstantValues alloc] init];
+        [cv setConstantValue:&nr0 type:MTLDataTypeInt atIndex:6];
+        NSError* err = nil;
+        id<MTLFunction> fn =
+            [library newFunctionWithName:@"gemv_w4_f32a_i4b_f32c"
+                          constantValues:cv error:&err];
+        id<MTLComputePipelineState> ps = fn
+            ? [device newComputePipelineStateWithFunction:fn error:&err] : nil;
+        if (!ps)
+            fprintf(stderr,
+                    "MetalBackend: W4 GEMV nr0=%d pipeline failed: %s\n",
+                    nr0, err ? err.localizedDescription.UTF8String : "?");
+        spec_pipelines[key] = ps;
+        return ps;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -215,6 +238,22 @@ int gemv_nsg_cap() {
                    : 4;
     }();
     return cap;
+}
+
+int gemv_w4_nr0() {
+    static const int nr0 = [] {
+        const char* value = std::getenv("MOLLM_METAL_GEMV_W4_NR");
+        // One output row per threadgroup wins on M5 Pro. W4 unpacking and
+        // per-group scale state make multi-row reuse register-heavy: strict
+        // Qwen3.5-4B medians were 48.01 t/s (NR1), 47.02 (NR2), and 46.64
+        // (NR4). Keep an override for other GPU families.
+        if (!value) return 1;
+        const int parsed = std::atoi(value);
+        return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
+                   ? parsed
+                   : 1;
+    }();
+    return nr0;
 }
 
 } // namespace
@@ -821,7 +860,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.group_size = (int)B.group_size;
             w.groups_per_row = (int)B.groups_per_row;
             size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
-            const int NR0 = 2;
+            const int NR0 = gemv_w4_nr0();
             const int NSG = std::min(gemv_nsg_cap(), (p.K + 127) / 128);
             id<MTLComputePipelineState> ps = impl_->pipeline("gemv_w8_f32a_i8b_f32c");
             [enc setComputePipelineState:ps];
@@ -851,7 +890,8 @@ void MetalBackend::dispatch(const GraphNode& node,
             const int NR0 = 2;
             const int NSG =
                 std::min(gemv_nsg_cap(), (p.K / 2 + 63) / 64);
-            id<MTLComputePipelineState> ps = impl_->pipeline("gemv_w4_f32a_i4b_f32c");
+            id<MTLComputePipelineState> ps =
+                impl_->pipeline_gemv_w4(NR0);
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
             [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
