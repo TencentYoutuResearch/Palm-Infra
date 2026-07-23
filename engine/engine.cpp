@@ -209,13 +209,35 @@ void maybe_pack_int4_weight(Tensor& t, const std::string& key,
                             PackedWeightMap& packed_weights) {
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
     if (!is_2d_linear_weight(t)) return;
+    auto maybe_pack_sparse = [&]() {
+        size_t layer_pos = key.find("blocks_");
+        int layer = layer_pos == std::string::npos
+            ? 999 : std::atoi(key.c_str() + layer_pos + 7);
+        if (!t.q4_g128_data || layer >= 6 ||
+            key.find("_ffn_value_weight.weights") == std::string::npos) return;
+        std::string sparse_key = key + "#int4_sparse";
+        auto it = packed_weights.find(sparse_key);
+        if (it == packed_weights.end()) {
+            int N = (int)t.shape[0];
+            int K = (int)t.shape[1];
+            int8_t* packed = pack_b_sparse_int4_g128_full(t.q4_g128_data, N, K);
+            if (!packed) return;
+            size_t bytes = (size_t)((N + 7) / 8) * 8 * K;
+            std::vector<uint8_t> buf((uint8_t*)packed, (uint8_t*)packed + bytes);
+            delete[] packed;
+            it = packed_weights.emplace(sparse_key, std::move(buf)).first;
+        }
+        t.sparse_data = it->second.data();
+    };
     if (t.is_q4_g128_packed) {
         t.q4_g128_data = weight_data;
+        maybe_pack_sparse();
         return;
     }
     if (t.is_q4_repacked) {
         t.q4_repack_data = weight_data;
         maybe_pack_int4_g128_weight(t, key, weight_data, packed_weights);
+        maybe_pack_sparse();
         return;
     }
     if (!g_matmul_config.use_interleave_pack || !int4_q4dot_repack_supported(t)) return;
@@ -241,6 +263,7 @@ void maybe_pack_int4_weight(Tensor& t, const std::string& key,
     }
     t.q4_repack_data = it->second.data();
     maybe_pack_int4_g128_weight(t, key, t.q4_repack_data, packed_weights);
+    maybe_pack_sparse();
 #else
     (void)t;
     (void)key;
@@ -1271,16 +1294,6 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     if (cfg_.lock_dense_weights && moe_ssd_cache_) {
         lock_dense_package_weights();
     }
-
-    // RWKV has recurrent state rather than an attention KV cache. Its generic
-    // batched graph cannot yet preserve the FP16 decode trajectory, so use the
-    // verified seq=1 graph repeatedly until a numerically compatible batched
-    // recurrence lands. prefill() handles the chunking transparently.
-    auto package_arch = package_metadata_.find("architecture");
-    if (package_arch != package_metadata_.end() && package_arch->second == "rwkv7") {
-        cfg_.use_decode_as_prefill = true;
-    }
-
 #ifdef MOLLM_METAL
     // Wrap the whole package weight region as one zero-copy MTLBuffer so each
     // weight tensor can alias it via device_offset (set in setup_weight).
@@ -1296,6 +1309,16 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     const std::string& pf_path_load = cfg_.use_decode_as_prefill ? dc_path : pf_path;
     if (!load_graph(graph_prefill_, exec_ctx_prefill_, pf_path_load.c_str())) {
         return false;
+    }
+    // RWKV state and token-shift buffers are persistent INPUT tensors, so the
+    // regular release queue can safely manage all materialized intermediates.
+    // Keeping every same-shape node output resident defeats that liveness and
+    // costs multiple gigabytes for a 256-token prefill graph.
+    for(const auto& node:graph_prefill_.nodes) {
+        if(node.op_type==OpType::RWKV7||node.op_type==OpType::RWKV_TOKEN_SHIFT) {
+            exec_ctx_prefill_.reuse_same_shape_workspace=false;
+            break;
+        }
     }
 
     // Override config from graph metadata (takes precedence over CLI defaults)
@@ -1762,15 +1785,9 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         if (cp.v) cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
     }
 
-    const auto arch = package_metadata_.find("architecture");
-    const bool rwkv_batched = !cfg_.use_decode_as_prefill &&
-        arch != package_metadata_.end() && arch->second == "rwkv7";
-    const bool previous_fp32_acc = g_mollm_force_fp32_acc;
-    if (rwkv_batched) g_mollm_force_fp32_acc = true;
     mollm_set_matmul_profile_phase("prefill_graph");
     Tensor out = run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
     mollm_set_matmul_profile_phase("unscoped");
-    g_mollm_force_fp32_acc = previous_fp32_acc;
     Tensor copied = copy_tensor_contiguous(out, hidden_output_copy_);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);

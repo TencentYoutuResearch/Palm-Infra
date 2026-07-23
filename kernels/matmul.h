@@ -47,6 +47,9 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         int act_n_begin = 0,
                         int act_n_len = -1);
 
+void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
+                          ThreadPool* thread_pool = nullptr);
+
 // Pack full B [N, K] row-major → interleaved [N/8, K, 8] layout.
 // For each N-tile of 8 rows, transpose so that for fixed k,
 // B_packed[tile_base + k*8 + 0..7] are 8 consecutive FP16 values.
@@ -73,6 +76,10 @@ uint8_t* pack_b_q4dot_int4_full(const uint8_t* B_original, int N, int K, int K_w
 size_t pack_b_q4dot_g128_bytes(int N, int K);
 uint8_t* pack_b_q4dot_g128_full(const uint8_t* B_q4dot, const float* scales,
                                 int N, int K, int groups_per_row);
+
+// Expand G128 nibbles into the same [N/8, K, 8] signed-byte layout used by
+// sparse-A GEMV. Only FFN down weights request this optional CPU pack.
+int8_t* pack_b_sparse_int4_g128_full(const void* B_g128, int N, int K);
 
 // Pack A [K, M] column-major FP32 → interleaved [M/8, K, 8] FP16.
 // For each M-tile of 8 rows, 8 M values at the same k are stored consecutively.

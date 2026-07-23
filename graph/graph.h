@@ -98,6 +98,8 @@ enum class OpType : uint32_t {
     // SIGMOID keeps the vector approximation used by transformer paths.
     SWIGLU   = 75,   // silu(gate) * up over a merged [2I,...] tensor (gate|up halves)
     SIGMOID_EXACT = 76,
+    EXP_EXACT     = 77,
+    GEMV_SPARSE_A = 78,
 
     // KV cache
     QUANTIZE_KV   = 80,
@@ -113,6 +115,11 @@ enum class OpType : uint32_t {
     SHORTCONV      = 140,
     RWKV7           = 150,
     RWKV_TOKEN_SHIFT = 151,
+    RWKV_MIX         = 152,
+    RWKV_L2_NORM     = 153,
+    RWKV_GROUP_NORM  = 154,
+    RWKV_BONUS       = 155,
+    RWKV_POST        = 157,
 };
 
 inline const char* op_type_name(OpType op) {
@@ -140,6 +147,8 @@ inline const char* op_type_name(OpType op) {
     case OpType::EXP: return "EXP";
     case OpType::SOFTPLUS: return "SOFTPLUS";
     case OpType::SIGMOID_EXACT: return "SIGMOID_EXACT";
+    case OpType::EXP_EXACT: return "EXP_EXACT";
+    case OpType::GEMV_SPARSE_A: return "GEMV_SPARSE_A";
     case OpType::SWIGLU: return "SWIGLU";
     case OpType::QUANTIZE_KV: return "QUANTIZE_KV";
     case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";
@@ -149,6 +158,11 @@ inline const char* op_type_name(OpType op) {
     case OpType::SHORTCONV: return "SHORTCONV";
     case OpType::RWKV7: return "RWKV7";
     case OpType::RWKV_TOKEN_SHIFT: return "RWKV_TOKEN_SHIFT";
+    case OpType::RWKV_MIX: return "RWKV_MIX";
+    case OpType::RWKV_L2_NORM: return "RWKV_L2_NORM";
+    case OpType::RWKV_GROUP_NORM: return "RWKV_GROUP_NORM";
+    case OpType::RWKV_BONUS: return "RWKV_BONUS";
+    case OpType::RWKV_POST: return "RWKV_POST";
     }
     return "UNKNOWN";
 }

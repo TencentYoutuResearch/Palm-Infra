@@ -326,9 +326,7 @@ void prepare_execution(ExecContext& ctx) {
         if (node.op_type == OpType::SDPA || node.op_type == OpType::SDPA_MLA ||
             node.op_type == OpType::GATED_DELTANET_PREFILL ||
             node.op_type == OpType::GATED_DELTANET_DECODE ||
-            node.op_type == OpType::SHORTCONV || node.op_type == OpType::RWKV7 ||
-            node.op_type == OpType::RWKV_TOKEN_SHIFT) {
-            // RWKV ops also mutate persistent recurrent state.
+            node.op_type == OpType::SHORTCONV) {
             return;
         }
     }
@@ -536,6 +534,12 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::GEMV_SPARSE_A:
+        if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
+            kernel_gemv_sparse_a(*inputs[0], *inputs[1], *output, thread_pool);
+        }
+        break;
+
     case OpType::SDPA:
     case OpType::SDPA_MLA: {
         std::vector<Tensor*> sdpa_outs = { output };
@@ -576,6 +580,21 @@ void CPUBackend::dispatch(const GraphNode& node,
     }
     case OpType::RWKV_TOKEN_SHIFT:
         kernel_rwkv_token_shift(params, inputs, *output);
+        break;
+    case OpType::RWKV_MIX:
+        kernel_rwkv_mix(params, inputs, *output);
+        break;
+    case OpType::RWKV_L2_NORM:
+        kernel_rwkv_l2_norm(params, inputs, *output);
+        break;
+    case OpType::RWKV_GROUP_NORM:
+        kernel_rwkv_group_norm(params, inputs, *output);
+        break;
+    case OpType::RWKV_BONUS:
+        kernel_rwkv_bonus(params, inputs, *output);
+        break;
+    case OpType::RWKV_POST:
+        kernel_rwkv_post(params, inputs, *output, thread_pool);
         break;
     case OpType::RWKV7:
         kernel_rwkv7(params, inputs, *output, thread_pool);
@@ -722,7 +741,8 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::LAYER_NORM:
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
             float eps = graph_params::get_f32(params, 0, 1e-5f);
-            kernel_layer_norm(*inputs[0], *inputs[1], *inputs[2], eps, *output);
+            kernel_layer_norm(*inputs[0], *inputs[1], *inputs[2], eps, *output,
+                              thread_pool);
         }
         break;
 
@@ -821,6 +841,32 @@ void CPUBackend::dispatch(const GraphNode& node,
                                         [](float av, float bv) { return av + bv; });
                 break;
             }
+            if(thread_pool&&thread_pool->num_threads()>1&&N>=32768&&
+               a.is_contiguous()&&b.is_contiguous()&&output->is_contiguous()&&
+               (a.nelements()==b.nelements()||b.nelements()==1)) {
+                int chunk=(N+thread_pool->num_threads()-1)/thread_pool->num_threads();
+                chunk=((chunk+7)/8)*8;
+                thread_pool->parallel_for(0,N,chunk,[&](int,int begin,int end) {
+                    int i=begin;
+#if HAS_NEON
+                    if(a.nelements()==b.nelements()) {
+                        for(;i+7<end;i+=8) {
+                            vst1q_f32(o+i,vaddq_f32(vld1q_f32(ap+i),vld1q_f32(bp+i)));
+                            vst1q_f32(o+i+4,vaddq_f32(vld1q_f32(ap+i+4),vld1q_f32(bp+i+4)));
+                        }
+                    } else {
+                        float32x4_t bv=vdupq_n_f32(bp[0]);
+                        for(;i+7<end;i+=8) {
+                            vst1q_f32(o+i,vaddq_f32(vld1q_f32(ap+i),bv));
+                            vst1q_f32(o+i+4,vaddq_f32(vld1q_f32(ap+i+4),bv));
+                        }
+                    }
+#endif
+                    if(a.nelements()==b.nelements()) for(;i<end;++i)o[i]=ap[i]+bp[i];
+                    else for(;i<end;++i)o[i]=ap[i]+bp[0];
+                });
+                break;
+            }
 #if HAS_NEON
             if (a.nelements() == b.nelements()) {
                 int i = 0;
@@ -870,6 +916,25 @@ void CPUBackend::dispatch(const GraphNode& node,
             if (a.nelements() != b.nelements() && broadcasts_to(b, a)) {
                 binary_broadcast_from_b(o, a, b,
                                         [](float av, float bv) { return av * bv; });
+                break;
+            }
+            int N=(int)a.nelements();
+            if(thread_pool&&thread_pool->num_threads()>1&&N>=32768&&
+               a.nelements()==b.nelements()&&a.is_contiguous()&&b.is_contiguous()&&
+               output->is_contiguous()) {
+                const float* ap=a.ptr<float>(); const float* bp=b.ptr<float>();
+                int chunk=(N+thread_pool->num_threads()-1)/thread_pool->num_threads();
+                chunk=((chunk+7)/8)*8;
+                thread_pool->parallel_for(0,N,chunk,[&](int,int begin,int end) {
+                    int i=begin;
+#if HAS_NEON
+                    for(;i+7<end;i+=8) {
+                        vst1q_f32(o+i,vmulq_f32(vld1q_f32(ap+i),vld1q_f32(bp+i)));
+                        vst1q_f32(o+i+4,vmulq_f32(vld1q_f32(ap+i+4),vld1q_f32(bp+i+4)));
+                    }
+#endif
+                    for(;i<end;++i)o[i]=ap[i]*bp[i];
+                });
                 break;
             }
 #if HAS_NEON
@@ -1006,6 +1071,21 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::SIGMOID_EXACT:
         if (inputs.size() >= 1 && inputs[0] && output) {
             const Tensor& src = *inputs[0];
+            const int64_t total = src.nelements();
+            if (thread_pool && thread_pool->num_threads() > 1 &&
+                src.is_contiguous() && total >= 32768) {
+                const float* input = src.ptr<float>();
+                float* dst = output->ptr<float>();
+                int chunk = (int)((total + thread_pool->num_threads() - 1) /
+                                  thread_pool->num_threads());
+                chunk = std::max(chunk, 4096);
+                thread_pool->parallel_for(0, (int)total, chunk,
+                    [&](int, int begin, int end) {
+                        for (int i = begin; i < end; ++i)
+                            dst[i] = 1.f / (1.f + std::exp(-input[i]));
+                    });
+                break;
+            }
             const char* src_base = static_cast<const char*>(src.data);
             StrideIter it = compute_stride_iter(src);
             float* dst = output->ptr<float>();
@@ -1071,6 +1151,35 @@ void CPUBackend::dispatch(const GraphNode& node,
                 }
             }
 #endif
+        }
+        break;
+
+    case OpType::EXP_EXACT:
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            const Tensor& src = *inputs[0];
+            const int64_t total = src.nelements();
+            if (thread_pool && thread_pool->num_threads() > 1 &&
+                src.is_contiguous() && total >= 32768) {
+                const float* input = src.ptr<float>();
+                float* dst = output->ptr<float>();
+                int chunk = (int)((total + thread_pool->num_threads() - 1) /
+                                  thread_pool->num_threads());
+                chunk = std::max(chunk, 4096);
+                thread_pool->parallel_for(0, (int)total, chunk,
+                    [&](int, int begin, int end) {
+                        for (int i=begin;i<end;++i) dst[i]=std::exp(input[i]);
+                    });
+                break;
+            }
+            const char* base=static_cast<const char*>(src.data);
+            StrideIter it=compute_stride_iter(src);
+            float* dst=output->ptr<float>();
+            for(int i3=0;i3<it.d3;++i3) for(int i2=0;i2<it.d2;++i2)
+                for(int i1=0;i1<it.d1;++i1) {
+                    const float* row=reinterpret_cast<const float*>(
+                        base+i3*it.s3+i2*it.s2+i1*it.s1);
+                    for(int i=0;i<it.n_inner;++i) *dst++=std::exp(row[i]);
+                }
         }
         break;
 

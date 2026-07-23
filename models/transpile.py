@@ -61,6 +61,8 @@ class OpType(IntEnum):
     SOFTPLUS       = 74
     SWIGLU         = 75
     SIGMOID_EXACT  = 76
+    EXP_EXACT      = 77
+    GEMV_SPARSE_A  = 78
     QUANTIZE_KV    = 80
     DEQUANTIZE_KV  = 81
     GATED_DELTANET_DECODE  = 110
@@ -69,6 +71,11 @@ class OpType(IntEnum):
     SHORTCONV      = 140
     RWKV7          = 150
     RWKV_TOKEN_SHIFT = 151
+    RWKV_MIX       = 152
+    RWKV_L2_NORM   = 153
+    RWKV_GROUP_NORM = 154
+    RWKV_BONUS     = 155
+    RWKV_POST      = 157
 
 class Precision(IntEnum):
     FP32 = 0
@@ -186,6 +193,7 @@ class Activation(IntEnum):
     SILU = 1   # x * sigmoid(x)  — SwiGLU gate
     GELU = 2   # 0.5 * x * (1 + tanh(...))  — tanh approximation
     RELU = 3   # max(0, x)
+    RELU_SQUARED = 4  # max(0, x)^2
 
 
 # ---------------------------------------------------------------------------
@@ -239,20 +247,23 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
         return _CONST4
 
     if op in (OpType.RMS_NORM, OpType.LAYER_NORM,
-              OpType.SILU, OpType.GELU, OpType.TANH, OpType.SIGMOID, OpType.SIGMOID_EXACT, OpType.EXP, OpType.SOFTPLUS,
+              OpType.SILU, OpType.GELU, OpType.TANH, OpType.SIGMOID, OpType.SIGMOID_EXACT,
+              OpType.EXP, OpType.EXP_EXACT, OpType.SOFTPLUS,
               OpType.SWIGLU,
               OpType.ROTARY_EMBED,
               OpType.TILE, OpType.CONTIGUOUS,
               OpType.QUANTIZE_KV, OpType.DEQUANTIZE_KV,
               OpType.SHORTCONV,
-              OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT,
+              OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT, OpType.RWKV_MIX,
+              OpType.RWKV_L2_NORM, OpType.RWKV_GROUP_NORM, OpType.RWKV_BONUS,
+              OpType.RWKV_POST,
               OpType.MOE):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
     if op in (OpType.ADD, OpType.MUL):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
-    if op == OpType.MATMUL:
+    if op in (OpType.MATMUL, OpType.GEMV_SPARSE_A):
         a = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, a[1], _CONST, _CONST)
 
@@ -429,6 +440,16 @@ class GraphBuilder:
                          prec=self._nodes[a].out_prec,
                          i32=[int(activation), int(act_n_begin), int(act_n_len)])
 
+    def gemv_sparse_a(self, a: int, b: int) -> int:
+        """Matmul with a decode GEMV path that skips exact-zero A entries."""
+        sa = self._nodes[a].out_shape
+        sb = self._nodes[b].out_shape
+        K, M = sa[0], sa[1]
+        if sb[1] != K:
+            raise AssertionError(f"sparse GEMV K mismatch: {sa} vs {sb}")
+        return self._add(OpType.GEMV_SPARSE_A, [a, b], (sb[0], M),
+                         prec=self._nodes[a].out_prec)
+
     # ---- normalisation ----
 
     def rms_norm(self, x: int, weight: int, eps: float = 1e-6) -> int:
@@ -467,6 +488,11 @@ class GraphBuilder:
 
     def exp(self, x: int) -> int:
         return self._add(OpType.EXP, [x], self._nodes[x].out_shape,
+                         prec=self._nodes[x].out_prec)
+
+    def exp_exact(self, x: int) -> int:
+        """IEEE exp for recurrent paths where approximation error compounds."""
+        return self._add(OpType.EXP_EXACT, [x], self._nodes[x].out_shape,
                          prec=self._nodes[x].out_prec)
 
     def softplus(self, x: int) -> int:
@@ -700,6 +726,48 @@ class GraphBuilder:
         return self._add(OpType.RWKV_TOKEN_SHIFT, [x, state],
                          self._nodes[x].out_shape, prec=Precision.FP32,
                          i32=[hidden_size, seq_len, 0])
+
+    def rwkv_mix(self, x: int, shift: int, mix: int) -> int:
+        """Fused RWKV time mix: x + shift * mix."""
+        return self._add(OpType.RWKV_MIX, [x, shift, mix],
+                         self._nodes[x].out_shape, prec=Precision.FP32)
+
+    def rwkv_l2_norm(self, x: int, num_heads: int, head_size: int,
+                     eps: float = 1e-12) -> int:
+        return self._add(OpType.RWKV_L2_NORM, [x], self._nodes[x].out_shape,
+                         prec=Precision.FP32, i32=[num_heads, head_size],
+                         f32=[eps])
+
+    def rwkv_group_norm(self, x: int, weight: int, bias: int,
+                        num_heads: int, head_size: int,
+                        eps: float = 64e-5) -> int:
+        return self._add(OpType.RWKV_GROUP_NORM, [x, weight, bias],
+                         self._nodes[x].out_shape, prec=Precision.FP32,
+                         i32=[num_heads, head_size], f32=[eps])
+
+    def rwkv_bonus(self, r: int, k: int, v: int, r_k: int,
+                   num_heads: int, head_size: int) -> int:
+        return self._add(OpType.RWKV_BONUS, [r, k, v, r_k],
+                         self._nodes[r].out_shape, prec=Precision.FP32,
+                         i32=[num_heads, head_size])
+
+    def rwkv_post(self, raw: int, r: int, k: int, v: int, r_k: int,
+                  weight: int, bias: int, gate: int,
+                  num_heads: int, head_size: int,
+                  eps: float = 64e-5) -> int:
+        """Fused (group_norm(raw) + RWKV bonus(r,k,v)) * gate."""
+        return self._add(OpType.RWKV_POST,
+                         [raw, r, k, v, r_k, weight, bias, gate],
+                         self._nodes[raw].out_shape, prec=Precision.FP32,
+                         i32=[num_heads, head_size], f32=[eps])
+
+    def rwkv7_core(self, r: int, decay: int, k: int, v: int,
+                   a: int, b: int, state: int,
+                   num_heads: int, head_size: int, seq_len: int) -> int:
+        """RWKV-7 recurrence only, matching ggml_rwkv_wkv7 boundaries."""
+        return self._add(OpType.RWKV7, [r, decay, k, v, a, b, state],
+                         self._nodes[r].out_shape, prec=Precision.FP32,
+                         i32=[num_heads, head_size, seq_len, 0, 0])
 
     def rwkv7(self, r: int, w_delta: int, k: int, v: int, a_delta: int,
               gate_delta: int, v_delta: int, v_first: int, w0: int, a0: int,

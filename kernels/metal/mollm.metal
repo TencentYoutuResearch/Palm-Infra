@@ -408,6 +408,10 @@ inline float apply_activation(float v, int act) {
     if (act == 1) {  // SILU: x * sigmoid(x)
         return v / (1.0f + exp(-v));
     }
+    if (act == 4) {
+        float y = max(v, 0.0f);
+        return y * y;
+    }
     return v;
 }
 
