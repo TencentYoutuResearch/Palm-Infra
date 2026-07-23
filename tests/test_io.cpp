@@ -9,6 +9,37 @@ static int failures = 0;
     else { printf("  PASS: %s\n", msg); } \
 } while(0)
 
+static bool copy_file_without_last_byte(const char* source,
+                                        const char* destination) {
+    FILE* in = fopen(source, "rb");
+    FILE* out = fopen(destination, "wb");
+    if (!in || !out) {
+        if (in) fclose(in);
+        if (out) fclose(out);
+        return false;
+    }
+    fseek(in, 0, SEEK_END);
+    long size = ftell(in);
+    fseek(in, 0, SEEK_SET);
+    bool ok = size > 0;
+    for (long i = 0; ok && i + 1 < size; ++i) {
+        int byte = fgetc(in);
+        ok = byte != EOF && fputc(byte, out) != EOF;
+    }
+    ok = fclose(in) == 0 && fclose(out) == 0 && ok;
+    return ok;
+}
+
+static bool patch_u32(const char* path, long offset, uint32_t value) {
+    FILE* file = fopen(path, "r+b");
+    if (!file)
+        return false;
+    bool ok = fseek(file, offset, SEEK_SET) == 0 &&
+              fwrite(&value, sizeof(value), 1, file) == 1;
+    ok = fclose(file) == 0 && ok;
+    return ok;
+}
+
 int main() {
     // ---- build a test graph ----
     Graph g;
@@ -125,10 +156,46 @@ int main() {
     CHECK(g6.nodes[0].params.str[0] == "path/to/weights.bin", "str[0] matches");
     CHECK(g6.nodes[0].params.str[1] == "another/path.bin", "str[1] matches");
 
+    // ---- malformed input is rejected transactionally ----
+    CHECK(copy_file_without_last_byte("/tmp/test_graph.gllm",
+                                      "/tmp/test_graph_truncated.gllm"),
+          "write truncated graph");
+    CHECK(!graph_load(g2, "/tmp/test_graph_truncated.gllm"),
+          "reject truncated graph");
+    CHECK(g2.nodes.size() == 4 && g2.graph_outputs[0] == 3,
+          "failed load preserves destination graph");
+
+    CHECK(graph_save(g, "/tmp/test_graph_huge_count.gllm"),
+          "save graph for count corruption");
+    CHECK(patch_u32("/tmp/test_graph_huge_count.gllm", 12, UINT32_MAX),
+          "corrupt metadata count");
+    CHECK(!graph_load(g2, "/tmp/test_graph_huge_count.gllm"),
+          "reject impossible collection count");
+
+    CHECK(graph_save(g, "/tmp/test_graph_bad_ref.gllm"),
+          "save graph for reference corruption");
+    CHECK(patch_u32("/tmp/test_graph_bad_ref.gllm", 28, 99),
+          "corrupt graph output id");
+    CHECK(!graph_load(g2, "/tmp/test_graph_bad_ref.gllm"),
+          "reject out-of-range graph output");
+
+    Graph invalid;
+    GraphNode self_referencing;
+    self_referencing.id = 0;
+    self_referencing.inputs = {0};
+    invalid.nodes.push_back(self_referencing);
+    invalid.graph_outputs = {0};
+    CHECK(!graph_save(invalid, "/tmp/test_graph_invalid.gllm"),
+          "reject non-topological graph on save");
+
     // cleanup
     remove("/tmp/test_graph.gllm");
     remove("/tmp/test_graph_empty.gllm");
     remove("/tmp/test_graph_strs.gllm");
+    remove("/tmp/test_graph_truncated.gllm");
+    remove("/tmp/test_graph_huge_count.gllm");
+    remove("/tmp/test_graph_bad_ref.gllm");
+    remove("/tmp/test_graph_invalid.gllm");
 
     if (failures == 0) {
         printf("\nAll io tests passed!\n");

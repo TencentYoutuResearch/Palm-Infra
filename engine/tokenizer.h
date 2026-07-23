@@ -12,8 +12,8 @@
 
 // A single message in a chat conversation.
 struct ChatMessage {
-    std::string role;      // "system", "user", "assistant"
-    std::string content;   // message text
+    std::string role;     // "system", "user", "assistant"
+    std::string content;  // message text
 };
 
 class Tokenizer {
@@ -41,15 +41,8 @@ public:
     // Convenience wrapper for single-turn prompts.
     std::vector<int> apply_chat(const std::string& user_message) const;
 
-    // Build a multi-turn chat prompt from a list of messages.
-    // Produces Llama-3 format:
-    //   <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{sys}<|eot_id|>
-    //   <|start_header_id|>user<|end_header_id|>\n\n{user1}<|eot_id|>
-    //   <|start_header_id|>assistant<|end_header_id|>\n\n{asst1}<|eot_id|>
-    //   ...
-    //   <|start_header_id|>assistant<|end_header_id|>\n\n
-    // The last message should be from "user" — the template leaves the
-    // assistant header open for the model to continue.
+    // Build a multi-turn prompt using the loaded model's ChatML, Llama-3, or
+    // explicitly enabled legacy RWKV template.
     std::vector<int> apply_chat(const std::vector<ChatMessage>& messages) const;
 
 private:
@@ -61,7 +54,8 @@ private:
         size_t operator()(const std::pair<std::string, std::string>& p) const {
             size_t h1 = std::hash<std::string>{}(p.first);
             size_t h2 = std::hash<std::string>{}(p.second);
-            return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+            return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + 0x9e3779b9 +
+                         (h1 << 6) + (h1 >> 2));
         }
     };
     std::unordered_map<std::pair<std::string, std::string>, int, PairHash> merges_;
@@ -75,10 +69,14 @@ private:
     int bos_id_ = 128000;
     int eos_id_ = 128001;
 
-    struct TrieNode { std::unordered_map<uint8_t, int> next; int token = -1; };
+    struct TrieNode {
+        std::unordered_map<uint8_t, int> next;
+        int token = -1;
+    };
     std::vector<TrieNode> rwkv_trie_;
     std::vector<std::string> rwkv_id_to_bytes_;
     bool rwkv_legacy_chat_template_ = false;
+    bool load_impl(const std::string& path);
     bool load_rwkv_vocab(const std::string& path);
     std::vector<int> encode_rwkv(const std::string& text) const;
 

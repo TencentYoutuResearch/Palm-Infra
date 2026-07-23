@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <memory>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -16,6 +17,26 @@ MatmulConfig g_matmul_config;
 
 // Debug override: force FP32 accumulation (for precision comparison)
 bool g_mollm_force_fp32_acc = false;
+
+namespace {
+
+struct LocalActivationRange {
+    int begin;
+    int length;
+};
+
+LocalActivationRange local_activation_range(int global_begin,
+                                            int global_length,
+                                            int shard_begin, int shard_end) {
+    const int begin = std::max(0, global_begin - shard_begin);
+    if (global_length < 0)
+        return {begin, -1};
+    const int end = std::min(shard_end - shard_begin,
+                             global_begin + global_length - shard_begin);
+    return {begin, std::max(0, end - begin)};
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // scalar matmul (fallback)
@@ -42,11 +63,11 @@ static void matmul_fp32_scalar_range(const float* A, const float* B, float* C,
 }
 
 #if HAS_NEON
-__fp16* pack_a_interleaved_full(const float* A_original, int M, int K,
-                                int lda) {
+static std::unique_ptr<__fp16[]>
+pack_a_interleaved_full(const float* A_original, int M, int K, int lda) {
     auto t0 = std::chrono::steady_clock::now();
     int M_padded = ((M + 7) / 8) * 8; // round up to multiple of 8
-    __fp16* dst = new __fp16[(size_t)M_padded * K];
+    auto dst = std::make_unique<__fp16[]>((size_t)M_padded * K);
     for (int m_tile = 0; m_tile < M_padded; m_tile += 8) {
         int tile_valid = std::min(8, M - m_tile);
         if (tile_valid < 0)
@@ -1047,24 +1068,11 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                             // GEMV kernel uses absolute n indices (C + n_begin
                             // offset is added by kernel itself), so pass global
                             // range intersected with shard.
-                            int local_act_begin =
-                                std::max(0, act_n_begin - n_begin);
-                            int local_act_end;
-                            if (act_n_len < 0) {
-                                local_act_end = n_end - n_begin;
-                            } else {
-                                local_act_end =
-                                    std::min(n_end - n_begin,
-                                             act_n_begin + act_n_len - n_begin);
-                            }
-                            int local_act_len =
-                                (act_n_len < 0)
-                                    ? -1
-                                    : std::max(0,
-                                               local_act_end - local_act_begin);
+                            const auto local = local_activation_range(
+                                act_n_begin, act_n_len, n_begin, n_end);
                             matmul_fp16_neon_gemv_range_fp16acc(
                                 a_ptr, b_packed, c_ptr, K, n_begin, n_end, act,
-                                n_begin + local_act_begin, local_act_len);
+                                n_begin + local.begin, local.length);
                         });
                 }
             } else {
@@ -1082,24 +1090,11 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         0, N, n_chunk, [&](int, int n_begin, int n_end) {
                             matmul_fp16_neon_gemv_range(a_ptr, b_packed, c_ptr,
                                                         K, n_begin, n_end);
-                            int local_act_begin =
-                                std::max(0, act_n_begin - n_begin);
-                            int local_act_end;
-                            if (act_n_len < 0) {
-                                local_act_end = n_end - n_begin;
-                            } else {
-                                local_act_end =
-                                    std::min(n_end - n_begin,
-                                             act_n_begin + act_n_len - n_begin);
-                            }
-                            int local_act_len =
-                                (act_n_len < 0)
-                                    ? -1
-                                    : std::max(0,
-                                               local_act_end - local_act_begin);
+                            const auto local = local_activation_range(
+                                act_n_begin, act_n_len, n_begin, n_end);
                             matmul_apply_activation_gemv(
                                 c_ptr + n_begin, n_end - n_begin, act,
-                                local_act_begin, local_act_len);
+                                local.begin, local.length);
                         });
                 }
             }
@@ -1112,16 +1107,15 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                              : "fp16_gemm_interleaved_scalar_a",
                          M, N, K, 0, 0, false, false, n_threads);
 
-        __fp16* a_packed = nullptr;
+        std::unique_ptr<__fp16[]> a_packed;
         if (use_lane_fma && !use_parallel) {
             a_packed = pack_a_interleaved_full(a_ptr, M, K, lda);
         }
 
         if (!use_parallel) {
             if (use_lane_fma) {
-                dispatch_lane_fma(a_packed, b_packed, c_ptr, M, N, ldc, 0, M,
-                                  act, act_n_begin, act_n_len);
-                delete[] a_packed;
+                dispatch_lane_fma(a_packed.get(), b_packed, c_ptr, M, N, ldc,
+                                  0, M, act, act_n_begin, act_n_len);
             } else {
                 matmul_fp16_neon_8x8_range_packed(a_ptr, b_packed, c_ptr, M, N,
                                                   K, lda, ldc, 0, M);
@@ -1140,22 +1134,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                     matmul_fp16_neon_8x8_range_packed(
                         a_ptr, b_packed + n_begin_aligned * K, c_ptr + n_begin,
                         M, n_end - n_begin, K, lda, ldc, 0, M);
-                    int local_act_begin = std::max(0, act_n_begin - n_begin);
-                    int local_act_end;
-                    if (act_n_len < 0) {
-                        local_act_end = n_end - n_begin;
-                    } else {
-                        local_act_end = std::min(
-                            n_end - n_begin, act_n_begin + act_n_len - n_begin);
-                    }
-                    int local_act_len =
-                        (act_n_len < 0)
-                            ? -1
-                            : std::max(0, local_act_end - local_act_begin);
-                    if (act != Activation::NONE && local_act_len != 0) {
+                    const auto local = local_activation_range(
+                        act_n_begin, act_n_len, n_begin, n_end);
+                    if (act != Activation::NONE && local.length != 0) {
                         matmul_apply_activation(c_ptr + n_begin, M,
                                                 n_end - n_begin, ldc, 0, M, act,
-                                                local_act_begin, local_act_len);
+                                                local.begin, local.length);
                     }
                 });
         } else {
@@ -1169,7 +1153,7 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
 
             // Pre-pack A per M-tile ONCE (not per job).
             int m_tiles = (M + tile_m - 1) / tile_m;
-            std::vector<__fp16*> a_packed_tiles(m_tiles, nullptr);
+            std::vector<std::unique_ptr<__fp16[]>> a_packed_tiles(m_tiles);
             for (int i = 0; i < m_tiles; i++) {
                 int m_begin = i * tile_m;
                 int m_len = std::min(tile_m, M - m_begin);
@@ -1183,34 +1167,19 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                     int m_len = m_end - m_begin;
                     int n_len = n_end - n_begin;
                     int tile_idx = m_begin / tile_m;
-                    __fp16* a_slice_packed = a_packed_tiles[tile_idx];
+                    const __fp16* a_slice_packed =
+                        a_packed_tiles[tile_idx].get();
                     int n_begin_aligned = n_begin & ~7;
 
                     // Translate global act range to local shard coords.
-                    int local_act_begin = std::max(0, act_n_begin - n_begin);
-                    int local_act_end;
-                    if (act_n_len < 0) {
-                        local_act_end = n_len;
-                    } else {
-                        local_act_end =
-                            std::min(n_len, act_n_begin + act_n_len - n_begin);
-                    }
-                    int local_act_len =
-                        (act_n_len < 0)
-                            ? -1
-                            : std::max(0, local_act_end - local_act_begin);
+                    const auto local = local_activation_range(
+                        act_n_begin, act_n_len, n_begin, n_end);
 
                     dispatch_lane_fma(
                         a_slice_packed, b_packed + n_begin_aligned * K,
                         c_ptr + m_begin * ldc + n_begin, m_len, n_len, ldc, 0,
-                        m_len, act, local_act_begin, local_act_len);
+                        m_len, act, local.begin, local.length);
                 });
-
-            // Free pre-packed A slices.
-            for (int i = 0; i < m_tiles; i++) {
-                if (a_packed_tiles[i])
-                    delete[] a_packed_tiles[i];
-            }
         }
         return;
     }
@@ -1263,22 +1232,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                     matmul_fp16_range(a_ptr, b_fp16 + n_begin * K_weight,
                                       c_ptr + n_begin, M, n_end - n_begin, K,
                                       lda, K_weight, ldc, 0, M);
-                    int local_act_begin = std::max(0, act_n_begin - n_begin);
-                    int local_act_end;
-                    if (act_n_len < 0) {
-                        local_act_end = n_end - n_begin;
-                    } else {
-                        local_act_end = std::min(
-                            n_end - n_begin, act_n_begin + act_n_len - n_begin);
-                    }
-                    int local_act_len =
-                        (act_n_len < 0)
-                            ? -1
-                            : std::max(0, local_act_end - local_act_begin);
-                    if (act != Activation::NONE && local_act_len != 0) {
+                    const auto local = local_activation_range(
+                        act_n_begin, act_n_len, n_begin, n_end);
+                    if (act != Activation::NONE && local.length != 0) {
                         matmul_apply_activation(c_ptr + n_begin, M,
                                                 n_end - n_begin, ldc, 0, M, act,
-                                                local_act_begin, local_act_len);
+                                                local.begin, local.length);
                     }
                 });
         } else {
@@ -1286,22 +1245,12 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                 0, N, chunk_size, [&](int, int n_begin, int n_end) {
                     matmul_fp32_range_n(a_ptr, b_fp32, c_ptr, M, N, K, lda,
                                         K_weight, ldc, n_begin, n_end);
-                    int local_act_begin = std::max(0, act_n_begin - n_begin);
-                    int local_act_end;
-                    if (act_n_len < 0) {
-                        local_act_end = n_end - n_begin;
-                    } else {
-                        local_act_end = std::min(
-                            n_end - n_begin, act_n_begin + act_n_len - n_begin);
-                    }
-                    int local_act_len =
-                        (act_n_len < 0)
-                            ? -1
-                            : std::max(0, local_act_end - local_act_begin);
-                    if (act != Activation::NONE && local_act_len != 0) {
+                    const auto local = local_activation_range(
+                        act_n_begin, act_n_len, n_begin, n_end);
+                    if (act != Activation::NONE && local.length != 0) {
                         matmul_apply_activation(c_ptr + n_begin, M,
                                                 n_end - n_begin, ldc, 0, M, act,
-                                                local_act_begin, local_act_len);
+                                                local.begin, local.length);
                     }
                 });
         }

@@ -28,11 +28,12 @@ public:
     BufferPool();
     ~BufferPool() { clear(); }
 
-    // not copyable / movable (owns unique_ptrs)
+    // Not copyable. Moving transfers all owned allocations and the pool id so
+    // existing Tensor::owner_id values remain valid.
     BufferPool(const BufferPool&) = delete;
     BufferPool& operator=(const BufferPool&) = delete;
-    BufferPool(BufferPool&&) = default;
-    BufferPool& operator=(BufferPool&&) = default;
+    BufferPool(BufferPool&& other) noexcept;
+    BufferPool& operator=(BufferPool&& other) noexcept;
 
     /// Acquire a buffer of at least `bytes` bytes.
     void* acquire(size_t bytes);

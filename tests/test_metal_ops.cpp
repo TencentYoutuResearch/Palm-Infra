@@ -88,6 +88,25 @@ int main() {
         return 0;  // not a failure on non-Metal CI
     }
 
+    // A duplicate release must not enqueue the same MTLBuffer twice. Otherwise
+    // two live tensors can alias one pooled allocation.
+    {
+        Tensor released =
+            Tensor::create(Precision::FP32, MemoryType::NONE, 256);
+        mb.alloc_output(released, released.nbytes(), nullptr);
+        mb.free_output(released, nullptr);
+        mb.free_output(released, nullptr);
+
+        Tensor first = Tensor::create(Precision::FP32, MemoryType::NONE, 256);
+        Tensor second = Tensor::create(Precision::FP32, MemoryType::NONE, 256);
+        mb.alloc_output(first, first.nbytes(), nullptr);
+        mb.alloc_output(second, second.nbytes(), nullptr);
+        CHECK(first.device_data != second.device_data,
+              "Metal pool rejects duplicate release");
+        mb.free_output(first, nullptr);
+        mb.free_output(second, nullptr);
+    }
+
     // ---- GEMM: M=8, K=64, N=32 ----
     {
         int M = 8, K = 64, N = 32;

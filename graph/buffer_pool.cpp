@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // aligned allocation helper
@@ -47,6 +48,64 @@ void aligned_free(void* ptr) {
 } // anonymous namespace
 
 BufferPool::BufferPool() : id_(next_pool_id()) {}
+
+BufferPool::BufferPool(BufferPool&& other) noexcept
+    : free_(std::move(other.free_))
+#ifndef MOLLM_DISABLE_ACTIVE_TRACKING
+      , active_allocs_(std::move(other.active_allocs_))
+#endif
+#ifndef MOLLM_DISABLE_STORAGE_DEBUG
+      , storage_ids_(std::move(other.storage_ids_))
+#endif
+      , id_(other.id_), active_bytes_(other.active_bytes_),
+      peak_(other.peak_), acquire_count_(other.acquire_count_),
+      release_count_(other.release_count_) {
+    other.free_.clear();
+#ifndef MOLLM_DISABLE_ACTIVE_TRACKING
+    other.active_allocs_.clear();
+#endif
+#ifndef MOLLM_DISABLE_STORAGE_DEBUG
+    other.storage_ids_.clear();
+#endif
+    other.id_ = next_pool_id();
+    other.active_bytes_ = 0;
+    other.peak_ = 0;
+    other.acquire_count_ = 0;
+    other.release_count_ = 0;
+}
+
+BufferPool& BufferPool::operator=(BufferPool&& other) noexcept {
+    if (this == &other)
+        return *this;
+
+    clear();
+    free_ = std::move(other.free_);
+#ifndef MOLLM_DISABLE_ACTIVE_TRACKING
+    active_allocs_ = std::move(other.active_allocs_);
+#endif
+#ifndef MOLLM_DISABLE_STORAGE_DEBUG
+    storage_ids_ = std::move(other.storage_ids_);
+#endif
+    id_ = other.id_;
+    active_bytes_ = other.active_bytes_;
+    peak_ = other.peak_;
+    acquire_count_ = other.acquire_count_;
+    release_count_ = other.release_count_;
+
+    other.free_.clear();
+#ifndef MOLLM_DISABLE_ACTIVE_TRACKING
+    other.active_allocs_.clear();
+#endif
+#ifndef MOLLM_DISABLE_STORAGE_DEBUG
+    other.storage_ids_.clear();
+#endif
+    other.id_ = next_pool_id();
+    other.active_bytes_ = 0;
+    other.peak_ = 0;
+    other.acquire_count_ = 0;
+    other.release_count_ = 0;
+    return *this;
+}
 
 // ---------------------------------------------------------------------------
 // round_up

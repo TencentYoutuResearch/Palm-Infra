@@ -85,12 +85,13 @@ public:
 
     /// Pointer to the weight data (mmap'd).
     const void* data() const {
+        if (!mapped_) return nullptr;
         return static_cast<const char*>(mapped_) + header_.data_offset;
     }
 
     /// Pointer to quantization scales (may be nullptr).
     const void* scales() const {
-        if (header_.scales_size == 0) return nullptr;
+        if (!mapped_ || header_.scales_size == 0) return nullptr;
         return static_cast<const char*>(mapped_) + header_.scales_offset;
     }
 
@@ -108,7 +109,6 @@ public:
     void release_pages();
 
 private:
-    int    fd_      = -1;
     void*  mapped_  = nullptr;
     size_t file_size_ = 0;
     Header header_  = {};

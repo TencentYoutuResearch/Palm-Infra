@@ -2,6 +2,7 @@
 #include "kernels/tensor.h"
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <utility>   // std::move
 
 static int failures = 0;
@@ -32,6 +33,16 @@ static bool write_test_file(const char* path, const MappedFile::Header& hdr,
     }
     fclose(f);
     return true;
+}
+
+static bool write_header_only(const char* path,
+                              const MappedFile::Header& header) {
+    FILE* file = fopen(path, "wb");
+    if (!file)
+        return false;
+    bool ok = fwrite(&header, sizeof(header), 1, file) == 1;
+    ok = fclose(file) == 0 && ok;
+    return ok;
 }
 
 int main() {
@@ -73,6 +84,33 @@ int main() {
 
         mf.close();
         CHECK(!mf.is_open(), "is_open after close");
+    }
+
+    // ---- overflowed and structurally invalid ranges ----
+    {
+        MappedFile::Header hdr = {};
+        hdr.magic = MappedFile::MAGIC;
+        hdr.ndim = 1;
+        hdr.precision = (uint32_t)Precision::FP32;
+        hdr.shape[0] = 1;
+        hdr.data_offset = std::numeric_limits<uint64_t>::max() - 3;
+        hdr.data_size = 8;
+        CHECK(write_header_only("/tmp/test_mmap_overflow.bin", hdr),
+              "write overflowed range file");
+
+        MappedFile mf;
+        CHECK(!mf.open("/tmp/test_mmap_overflow.bin"),
+              "reject overflowed data range");
+        CHECK(!mf.is_open() && mf.data() == nullptr,
+              "failed open leaves no mapped data");
+
+        hdr.data_offset = 0;
+        hdr.data_size = 0;
+        hdr.ndim = 0;
+        CHECK(write_header_only("/tmp/test_mmap_bad_ndim.bin", hdr),
+              "write invalid ndim file");
+        CHECK(!mf.open("/tmp/test_mmap_bad_ndim.bin"),
+              "reject invalid dimension count");
     }
 
     // ---- with scales ----
@@ -153,6 +191,8 @@ int main() {
     remove("/tmp/test_mmap2.bin");
     remove("/tmp/test_mmap_bad.bin");
     remove("/tmp/test_mmap_move.bin");
+    remove("/tmp/test_mmap_overflow.bin");
+    remove("/tmp/test_mmap_bad_ndim.bin");
 
     if (failures == 0) {
         printf("\nAll mmap_file tests passed!\n");

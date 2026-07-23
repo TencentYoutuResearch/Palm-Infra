@@ -9,8 +9,8 @@
 //
 // Whole-graph-resident Metal (Apple GPU) backend. Intermediates live in
 // MTLBuffers (via MetalBufferPool); weights are wrapped zero-copy over the
-// package mmap region; the KV cache is device-resident. Only input/output
-// boundary tensors are copied host<->device.
+// resident package weight region; the KV cache is device-resident. Only
+// input/output boundary tensors are copied host<->device.
 //
 // This header is plain C++ (opaque void* handles, PIMPL) so it can be included
 // by pure-C++ translation units. The implementation is in metal_backend.mm.
@@ -47,14 +47,6 @@ public:
     void begin_graph() override;
     void end_graph() override;
 
-    /// Debug: flush the current command buffer (commit+wait) so intermediate
-    /// device buffers become host-readable. No-op unless MOLLM_METAL_SYNC_EACH.
-    void sync_point();
-
-    /// Print the accumulated per-op-type GPU time table (MOLLM_METAL_PROFILE)
-    /// to stderr and reset the counters. No-op if profiling is disabled.
-    void dump_profile();
-
     // --- Metal-specific helpers ---
 
     /// True if the Metal 4 tensor API (int8/fp16 matmul2d) is usable on this GPU
@@ -78,7 +70,7 @@ public:
     /// Allocate a device-resident buffer of nbytes and point t at it (used for
     /// KV cache and boundary buffers). Sets t.device_data / t.device_offset and
     /// t.data = [buffer contents] (Shared storage, host-visible). Persistent
-    /// buffers allocated here are owned by the backend until clear_persistent().
+    /// buffers allocated here are owned for the lifetime of the backend.
     void alloc_persistent(Tensor& t, size_t nbytes);
 
     /// Upload host bytes into a REUSABLE device buffer identified by `key`
@@ -97,10 +89,15 @@ public:
     void lm_head_gemv(const float* a_host, const Tensor& weight,
                       float* out_host, int N, int K, int activation = 0);
 
-    /// Opaque id<MTLDevice> for pool construction.
-    void* device() const;
-
 private:
+    /// Debug: flush the current command buffer (commit+wait) so intermediate
+    /// device buffers become host-readable. No-op unless MOLLM_METAL_SYNC_EACH.
+    void sync_point();
+
+    /// Print the accumulated per-op-type GPU time table (MOLLM_METAL_PROFILE)
+    /// to stderr and reset the counters. No-op if profiling is disabled.
+    void dump_profile();
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

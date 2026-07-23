@@ -6,9 +6,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <json.hpp>
+#include <limits>
 #include <new>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -18,6 +19,12 @@
 using json = nlohmann::json;
 
 static constexpr uint32_t PACKAGE_MAGIC = 0x4D4C4F4D; // "MOLM"
+static constexpr uint32_t PACKAGE_VERSION = 1;
+static constexpr uint64_t PACKAGE_HEADER_SIZE = 128;
+static constexpr uint64_t MAX_METADATA_SIZE = 256ull * 1024 * 1024;
+static constexpr uint64_t MAX_TOKENIZER_SIZE = 2ull * 1024 * 1024 * 1024;
+static constexpr uint64_t MAX_TEMPLATE_SIZE = 64ull * 1024 * 1024;
+static constexpr uint64_t MAX_GRAPH_SIZE = 1ull * 1024 * 1024 * 1024;
 
 namespace {
 
@@ -54,6 +61,72 @@ bool read_exact_at(int fd, uint64_t offset, void* dst, size_t len,
     return true;
 }
 
+bool write_exact(int fd, const void* src, size_t len, const char* label) {
+    const uint8_t* data = static_cast<const uint8_t*>(src);
+    size_t done = 0;
+    while (done < len) {
+        ssize_t written = write(fd, data + done, len - done);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            fprintf(stderr, "Engine: failed to write %s: %s\n", label,
+                    strerror(errno));
+            return false;
+        }
+        if (written == 0) {
+            fprintf(stderr, "Engine: short write while writing %s\n", label);
+            return false;
+        }
+        done += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+bool extract_temp_section(int source_fd, const uint8_t* mapped,
+                          uint64_t offset, uint64_t length, const char* label,
+                          std::string& out_path,
+                          std::vector<std::string>& temp_files) {
+    if (length == 0)
+        return true;
+
+    char path[] = "/tmp/mollm_pkg_XXXXXX";
+    int output_fd = mkstemp(path);
+    if (output_fd < 0) {
+        fprintf(stderr, "Engine: failed to create temporary %s: %s\n", label,
+                strerror(errno));
+        return false;
+    }
+
+    std::vector<uint8_t> buffer(1024 * 1024);
+    uint64_t done = 0;
+    bool ok = true;
+    while (ok && done < length) {
+        const size_t chunk = static_cast<size_t>(
+            std::min<uint64_t>(buffer.size(), length - done));
+        const void* source = nullptr;
+        if (mapped) {
+            source = mapped + offset + done;
+        } else {
+            ok = read_exact_at(source_fd, offset + done, buffer.data(), chunk,
+                               label);
+            source = buffer.data();
+        }
+        if (ok)
+            ok = write_exact(output_fd, source, chunk, label);
+        done += chunk;
+    }
+    if (close(output_fd) != 0)
+        ok = false;
+    if (!ok) {
+        std::remove(path);
+        return false;
+    }
+
+    out_path = path;
+    temp_files.push_back(out_path);
+    return true;
+}
+
 bool section_in_file(uint64_t off, uint64_t len, size_t file_size,
                      const char* label) {
     uint64_t size = static_cast<uint64_t>(file_size);
@@ -71,9 +144,16 @@ bool section_in_file(uint64_t off, uint64_t len, size_t file_size,
     return true;
 }
 
+bool checked_multiply(uint64_t a, uint64_t b, uint64_t& result) {
+    if (a != 0 && b > std::numeric_limits<uint64_t>::max() / a)
+        return false;
+    result = a * b;
+    return true;
+}
+
 bool parse_package_header(const uint8_t* header, size_t file_size,
                           PackageHeaderInfo& out) {
-    if (file_size < 128) {
+    if (file_size < PACKAGE_HEADER_SIZE) {
         fprintf(stderr, "Engine: package too small\n");
         return false;
     }
@@ -81,9 +161,14 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
     uint32_t magic = 0, version = 0;
     std::memcpy(&magic, header + 0, 4);
     std::memcpy(&version, header + 4, 4);
-    (void)version;
     if (magic != PACKAGE_MAGIC) {
         fprintf(stderr, "Engine: bad package magic 0x%08x\n", magic);
+        return false;
+    }
+    if (version != PACKAGE_VERSION) {
+        fprintf(stderr,
+                "Engine: unsupported package version %u (expected %u)\n",
+                version, PACKAGE_VERSION);
         return false;
     }
 
@@ -100,21 +185,66 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
     std::memcpy(&out.w_off, header + 88, 8);
     std::memcpy(&out.w_len, header + 96, 8);
 
-    return section_in_file(out.meta_off, out.meta_len, file_size, "metadata") &&
-           section_in_file(out.tok_off, out.tok_len, file_size, "tokenizer") &&
-           section_in_file(out.jin_off, out.jin_len, file_size,
-                           "chat template") &&
-           section_in_file(out.pf_off, out.pf_len, file_size,
-                           "prefill graph") &&
-           section_in_file(out.dc_off, out.dc_len, file_size, "decode graph") &&
-           section_in_file(out.w_off, out.w_len, file_size, "weights");
+    if (!section_in_file(out.meta_off, out.meta_len, file_size, "metadata") ||
+        !section_in_file(out.tok_off, out.tok_len, file_size, "tokenizer") ||
+        !section_in_file(out.jin_off, out.jin_len, file_size,
+                         "chat template") ||
+        !section_in_file(out.pf_off, out.pf_len, file_size,
+                         "prefill graph") ||
+        !section_in_file(out.dc_off, out.dc_len, file_size, "decode graph") ||
+        !section_in_file(out.w_off, out.w_len, file_size, "weights")) {
+        return false;
+    }
+
+    if (out.meta_len == 0 || out.meta_len > MAX_METADATA_SIZE ||
+        out.tok_len > MAX_TOKENIZER_SIZE ||
+        out.jin_len > MAX_TEMPLATE_SIZE ||
+        out.pf_len == 0 || out.pf_len > MAX_GRAPH_SIZE ||
+        out.dc_len == 0 || out.dc_len > MAX_GRAPH_SIZE) {
+        fprintf(stderr, "Engine: package contains an empty or oversized section\n");
+        return false;
+    }
+
+    struct Section {
+        uint64_t offset;
+        uint64_t length;
+        const char* label;
+    };
+    std::vector<Section> sections = {
+        {out.meta_off, out.meta_len, "metadata"},
+        {out.tok_off, out.tok_len, "tokenizer"},
+        {out.jin_off, out.jin_len, "chat template"},
+        {out.pf_off, out.pf_len, "prefill graph"},
+        {out.dc_off, out.dc_len, "decode graph"},
+        {out.w_off, out.w_len, "weights"},
+    };
+    sections.erase(
+        std::remove_if(sections.begin(), sections.end(),
+                       [](const Section& section) {
+                           return section.length == 0;
+                       }),
+        sections.end());
+    std::sort(sections.begin(), sections.end(),
+              [](const Section& a, const Section& b) {
+                  return a.offset < b.offset;
+              });
+    uint64_t previous_end = PACKAGE_HEADER_SIZE;
+    for (const Section& section : sections) {
+        if (section.offset < previous_end) {
+            fprintf(stderr, "Engine: package %s section overlaps header or "
+                            "another section\n",
+                    section.label);
+            return false;
+        }
+        previous_end = section.offset + section.length;
+    }
+    return true;
 }
 
 } // namespace
 
 bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
-                             std::string& dc_path, std::string& tok_path,
-                             std::string& jin_path) {
+                             std::string& dc_path, std::string& tok_path) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "Engine: failed to open package %s\n", path.c_str());
@@ -122,6 +252,13 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
     }
     struct stat st;
     if (fstat(fd, &st) != 0) {
+        close(fd);
+        return false;
+    }
+    if (st.st_size < 0 ||
+        static_cast<uint64_t>(st.st_size) >
+            static_cast<uint64_t>(SIZE_MAX)) {
+        fprintf(stderr, "Engine: package size is unsupported\n");
         close(fd);
         return false;
     }
@@ -144,6 +281,11 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
             auto meta = json::parse(meta_str);
             if (meta.contains("prefill_seq_len")) {
                 package_prefill_seq_len_ = meta["prefill_seq_len"].get<int>();
+                if (package_prefill_seq_len_ <= 0) {
+                    fprintf(stderr,
+                            "Engine: package prefill_seq_len must be positive\n");
+                    return false;
+                }
             }
             if (meta.contains("weights")) {
                 for (auto& [name, info] : meta["weights"].items()) {
@@ -219,11 +361,21 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                             item.value("scales_offset", uint64_t{0});
                         uint64_t scales_bytes =
                             item.value("expert_scales_bytes", uint64_t{0});
-                        uint64_t all_data =
-                            data_bytes * static_cast<uint64_t>(num_experts);
-                        uint64_t all_scales =
-                            scales_bytes * static_cast<uint64_t>(num_experts);
-                        if (weight_offset > ph.w_len ||
+                        uint64_t all_data = 0;
+                        uint64_t all_scales = 0;
+                        if (layer_index < 0 || num_experts <= 0 ||
+                            spec.rows <= 0 || spec.cols <= 0 ||
+                            static_cast<uint32_t>(spec.precision) >
+                                static_cast<uint32_t>(Precision::INT4) ||
+                            !checked_multiply(
+                                data_bytes,
+                                static_cast<uint64_t>(num_experts),
+                                all_data) ||
+                            !checked_multiply(
+                                scales_bytes,
+                                static_cast<uint64_t>(num_experts),
+                                all_scales) ||
+                            weight_offset > ph.w_len ||
                             data_offset > ph.w_len - weight_offset ||
                             all_data > ph.w_len - weight_offset - data_offset ||
                             (scales_bytes &&
@@ -307,60 +459,6 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
         return true;
     };
 
-    // Extract graphs + tokenizer + jinja to temp files
-    pid_t pid = getpid();
-    auto write_tmp_from_memory = [&](const uint8_t* base, const char* label,
-                                     uint64_t off, uint64_t len,
-                                     std::string& out_path) -> bool {
-        if (len == 0)
-            return true;
-        out_path = "/tmp/mollm_pkg_" + std::to_string(pid) + "_" + label;
-        std::ofstream f(out_path, std::ios::binary);
-        f.write(reinterpret_cast<const char*>(base + off),
-                static_cast<std::streamsize>(len));
-        if (!f) {
-            fprintf(stderr,
-                    "Engine: failed to write extracted package section %s\n",
-                    label);
-            return false;
-        }
-        temp_files_.push_back(out_path);
-        return true;
-    };
-    auto write_tmp_from_fd = [&](const char* label, uint64_t off, uint64_t len,
-                                 std::string& out_path) -> bool {
-        if (len == 0)
-            return true;
-        out_path = "/tmp/mollm_pkg_" + std::to_string(pid) + "_" + label;
-        std::ofstream f(out_path, std::ios::binary);
-        if (!f) {
-            fprintf(stderr,
-                    "Engine: failed to create extracted package section %s\n",
-                    label);
-            return false;
-        }
-        std::vector<uint8_t> buf(1024 * 1024);
-        uint64_t done = 0;
-        while (done < len) {
-            size_t chunk =
-                static_cast<size_t>(std::min<uint64_t>(buf.size(), len - done));
-            if (!read_exact_at(fd, off + done, buf.data(), chunk, label)) {
-                return false;
-            }
-            f.write(reinterpret_cast<const char*>(buf.data()), chunk);
-            if (!f) {
-                fprintf(
-                    stderr,
-                    "Engine: failed to write extracted package section %s\n",
-                    label);
-                return false;
-            }
-            done += chunk;
-        }
-        temp_files_.push_back(out_path);
-        return true;
-    };
-
     if (cfg_.weight_loading == WeightLoadingMode::RESIDENT) {
         std::string meta_str(static_cast<size_t>(ph.meta_len), '\0');
         if (!read_exact_at(fd, ph.meta_off, meta_str.data(), meta_str.size(),
@@ -396,13 +494,12 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
         package_weights_size_ = package_weights_storage_.size();
         package_weights_resident_ = true;
 
-        bool ok =
-            write_tmp_from_fd("prefill.graph", ph.pf_off, ph.pf_len, pf_path) &&
-            write_tmp_from_fd("decode.graph", ph.dc_off, ph.dc_len, dc_path) &&
-            write_tmp_from_fd("tokenizer.json", ph.tok_off, ph.tok_len,
-                              tok_path) &&
-            write_tmp_from_fd("chat_template.jinja", ph.jin_off, ph.jin_len,
-                              jin_path);
+        bool ok = extract_temp_section(fd, nullptr, ph.pf_off, ph.pf_len,
+                                       "prefill graph", pf_path, temp_files_) &&
+                  extract_temp_section(fd, nullptr, ph.dc_off, ph.dc_len,
+                                       "decode graph", dc_path, temp_files_) &&
+                  extract_temp_section(fd, nullptr, ph.tok_off, ph.tok_len,
+                                       "tokenizer", tok_path, temp_files_);
         close(fd);
         if (!ok)
             return false;
@@ -421,30 +518,30 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
         fprintf(stderr, "Engine: mmap failed for %s\n", path.c_str());
         return false;
     }
-    package_mmap_ = mapped;
-    package_mmap_size_ = file_size;
-
     const uint8_t* base = static_cast<const uint8_t*>(mapped);
-    package_weights_base_ = base + ph.w_off;
-    package_weights_size_ = static_cast<size_t>(ph.w_len);
-    package_weights_resident_ = false;
 
     std::string meta_str(reinterpret_cast<const char*>(base + ph.meta_off),
                          static_cast<size_t>(ph.meta_len));
     if (!parse_metadata(meta_str)) {
+        munmap(mapped, file_size);
         return false;
     }
 
-    if (!write_tmp_from_memory(base, "prefill.graph", ph.pf_off, ph.pf_len,
-                               pf_path) ||
-        !write_tmp_from_memory(base, "decode.graph", ph.dc_off, ph.dc_len,
-                               dc_path) ||
-        !write_tmp_from_memory(base, "tokenizer.json", ph.tok_off, ph.tok_len,
-                               tok_path) ||
-        !write_tmp_from_memory(base, "chat_template.jinja", ph.jin_off,
-                               ph.jin_len, jin_path)) {
+    if (!extract_temp_section(-1, base, ph.pf_off, ph.pf_len,
+                              "prefill graph", pf_path, temp_files_) ||
+        !extract_temp_section(-1, base, ph.dc_off, ph.dc_len, "decode graph",
+                              dc_path, temp_files_) ||
+        !extract_temp_section(-1, base, ph.tok_off, ph.tok_len, "tokenizer",
+                              tok_path, temp_files_)) {
+        munmap(mapped, file_size);
         return false;
     }
+
+    package_mmap_ = mapped;
+    package_mmap_size_ = file_size;
+    package_weights_base_ = base + ph.w_off;
+    package_weights_size_ = static_cast<size_t>(ph.w_len);
+    package_weights_resident_ = false;
 
     fprintf(stderr,
             "Engine: loaded package %s (%.1f MB, %zu weights, prefill_seq=%d, "

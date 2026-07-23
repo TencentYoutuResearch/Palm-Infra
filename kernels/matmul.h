@@ -106,9 +106,3 @@ uint8_t* pack_b_q4dot_g128_full(const uint8_t* B_q4dot, const float* scales,
 // Expand G128 nibbles into the [N/8,K,8] signed-byte layout consumed by
 // sparse-A GEMV. Exposed for sparse kernel validation.
 int8_t* pack_b_sparse_int4_g128_full(const void* B_g128, int N, int K);
-
-// Pack A [K, M] column-major FP32 → interleaved [M/8, K, 8] FP16.
-// For each M-tile of 8 rows, 8 M values at the same k are stored consecutively.
-// Enables vld1q_f16 contiguous load + vfmlalq_laneq_f16 lane-broadcast FMA.
-// Returns newly allocated buffer (caller owns, must delete[]).
-__fp16* pack_a_interleaved_full(const float* A_original, int M, int K, int lda);

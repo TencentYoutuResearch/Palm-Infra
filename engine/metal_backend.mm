@@ -264,7 +264,6 @@ MetalBackend::~MetalBackend() {
 }
 
 bool MetalBackend::available() const { return impl_ && impl_->ok; }
-void* MetalBackend::device() const { return impl_ ? (__bridge void*)impl_->device : nullptr; }
 
 void MetalBackend::lm_head_gemv(const float* a_host, const Tensor& weight,
                                 float* out_host, int N, int K, int activation) {

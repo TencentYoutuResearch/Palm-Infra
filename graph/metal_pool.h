@@ -38,7 +38,8 @@ public:
     /// Acquire an id<MTLBuffer> of at least `bytes`. Returns opaque handle.
     void* acquire(size_t bytes);
 
-    /// Return a buffer to the pool (does NOT free the MTLBuffer).
+    /// Return an active buffer to the pool (does NOT free the MTLBuffer).
+    /// Foreign or already released handles are ignored.
     void release(void* buffer, size_t bytes);
 
     /// CPU-visible contents pointer of a buffer (Shared storage).

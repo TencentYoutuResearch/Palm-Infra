@@ -38,6 +38,42 @@ static bool load_first(Tokenizer& tok, const std::vector<std::string>& paths) {
 int main() {
     bool ran_any = false;
 
+    // Loading is transactional: successful reloads replace all prior state,
+    // while a failed reload leaves the current tokenizer usable.
+    {
+        const char* first_path = "/tmp/mollm_tokenizer_reload_first.json";
+        const char* second_path = "/tmp/mollm_tokenizer_reload_second.json";
+        {
+            std::ofstream f(first_path);
+            f << R"({"model":{"vocab":{"a":0},"merges":[]},"added_tokens":[{"id":2,"content":"<old>"},{"id":3,"content":"<|im_end|>"}]})";
+        }
+        {
+            std::ofstream f(second_path);
+            f << R"({"model":{"vocab":{"b":0},"merges":[]},"added_tokens":[]})";
+        }
+
+        Tokenizer tok;
+        CHECK(tok.load(first_path), "first HF tokenizer loads");
+        check_ids(tok.encode("<old>"), {2}, "first HF added token encodes");
+        CHECK(tok.eos_id() == 3, "first HF tokenizer sets eos");
+
+        CHECK(!tok.load("/tmp/mollm_tokenizer_missing.json"),
+              "failed tokenizer reload is reported");
+        check_ids(tok.encode("<old>"), {2},
+                  "failed reload preserves tokenizer state");
+
+        CHECK(tok.load(second_path), "second HF tokenizer loads");
+        CHECK(tok.vocab_size() == 1, "successful reload replaces vocabulary");
+        CHECK(tok.encode("<old>").empty(),
+              "successful reload removes old added tokens");
+        CHECK(tok.eos_id() == 128001,
+              "successful reload resets special-token defaults");
+
+        std::remove(first_path);
+        std::remove(second_path);
+        ran_any = true;
+    }
+
     // RWKV-world vocabulary: longest byte-prefix matching over the official
     // `id python-bytes-literal byte_length` format. This is deliberately a
     // tiny fixture; the production vocabulary has the same syntax.

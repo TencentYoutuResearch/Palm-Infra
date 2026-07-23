@@ -57,15 +57,16 @@ void* MetalBufferPool::acquire(size_t bytes) {
     return buf;
 }
 
-void MetalBufferPool::release(void* buffer, size_t bytes) {
-    if (!buffer) return;
-    size_t bucket = round_up(bytes);
+void MetalBufferPool::release(void* buffer, size_t /*bytes*/) {
+    if (!buffer)
+        return;
     auto ai = active_.find(buffer);
-    if (ai != active_.end()) {
-        bucket = ai->second;
-        active_bytes_ -= bucket;
-        active_.erase(ai);
-    }
+    if (ai == active_.end())
+        return;
+
+    const size_t bucket = ai->second;
+    active_bytes_ -= bucket;
+    active_.erase(ai);
     free_[bucket].push_back(buffer);
 }
 

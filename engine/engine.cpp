@@ -1,4 +1,5 @@
 #include "engine/engine.h"
+#include "engine/input_prep.h"
 #include "engine/sampler.h"
 #include "kernels/matmul.h"
 #include "kernels/moe_ssd.h"
@@ -14,7 +15,6 @@ static inline MetalBackend* as_metal(const std::unique_ptr<Backend>& b) {
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -987,9 +987,8 @@ bool LLMEngine::load(const EngineConfig& cfg) {
     }
     std::string pf_path, dc_path;
     {
-        std::string tok_tmp, jin_tmp;
-        if (!load_package(cfg.package_path, pf_path, dc_path, tok_tmp,
-                          jin_tmp)) {
+        std::string tok_tmp;
+        if (!load_package(cfg.package_path, pf_path, dc_path, tok_tmp)) {
             return false;
         }
         if (!tok_tmp.empty()) {
@@ -1340,12 +1339,7 @@ Tensor LLMEngine::build_causal_mask(int seq_len, int past_len) {
                                  seq_len, 1, 1, buf);
     mask.owner_id = graph_prefill_.runtime.pool.id();
     mask.storage_id = graph_prefill_.runtime.pool.storage_id(buf);
-    float* d = mask.ptr<float>();
-    for (int i = 0; i < seq_len; i++) {
-        for (int j = 0; j < total; j++) {
-            d[i * total + j] = (j > past_len + i) ? -1e38f : 0.f;
-        }
-    }
+    mollm::detail::fill_causal_mask(mask.ptr<float>(), seq_len, past_len);
     return mask;
 }
 
@@ -1366,16 +1360,8 @@ void LLMEngine::generate_rope_cache(int seq_len, int start_pos, Tensor& cos,
     cos.storage_id = graph_prefill_.runtime.pool.storage_id(cb);
     sin.storage_id = graph_prefill_.runtime.pool.storage_id(sb);
 
-    for (int n = 0; n < seq_len; n++) {
-        int pos = start_pos + n;
-        for (int i = 0; i < half; i++) {
-            float theta =
-                1.0f / std::pow(cfg_.rope_theta, 2.0f * i / cfg_.rope_dim);
-            float angle = pos * theta;
-            cos.ptr<float>()[n * half + i] = std::cos(angle);
-            sin.ptr<float>()[n * half + i] = std::sin(angle);
-        }
-    }
+    mollm::detail::fill_rope_cache(cos.ptr<float>(), sin.ptr<float>(), seq_len,
+                                   start_pos, cfg_.rope_dim, cfg_.rope_theta);
 }
 
 // ---------------------------------------------------------------------------
@@ -1748,32 +1734,4 @@ Tensor LLMEngine::decode_hidden(int token_id) {
 
     finish_graph_temporaries(graph_decode_, exec_ctx_decode_);
     return copied;
-}
-
-void LLMEngine::dump_prefill_add_outputs(const char* dir) {
-    int add_idx = 0;
-    for (auto& node : graph_prefill_.nodes) {
-        if (node.op_type != OpType::ADD)
-            continue;
-        auto& t = graph_prefill_.runtime.tensors[node.id];
-        if (!t.data || t.prec != Precision::FP32)
-            continue;
-        add_idx++;
-        char fname[256];
-        snprintf(fname, sizeof(fname), "%s/add_%04d.f32", dir, add_idx);
-        FILE* f = fopen(fname, "wb");
-        if (!f)
-            continue;
-        const float* p = t.ptr<float>();
-        int d0 = (int)t.shape[0];
-        int d1 = (int)t.shape[1];
-        if (d1 > 1) {
-            size_t ldx = t.stride[1] / sizeof(float);
-            fwrite(p + (d1 - 1) * ldx, sizeof(float), d0, f);
-        } else {
-            fwrite(p, sizeof(float), d0, f);
-        }
-        fclose(f);
-    }
-    fprintf(stderr, "Dumped %d ADD outputs to %s/\n", add_idx, dir);
 }

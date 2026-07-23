@@ -156,8 +156,6 @@ public:
     const std::unordered_map<std::string, std::string>& package_metadata() const {
         return package_metadata_;
     }
-    Tensor* embed_weight() { return embed_weight_; }
-    Tensor* lm_head_weight() { return lm_head_weight_; }
     void set_profile_enabled(bool enabled);
     void reset_profiles();
     const ExecContext& prefill_exec_ctx() const { return exec_ctx_prefill_; }
@@ -187,17 +185,12 @@ public:
     /// execute_graph call since there's no next chunk).
     void release_prefill_buffers();
 
-    // Dump ADD node outputs (last token) from prefill graph to dir.
-    // Each layer has 2 ADD nodes: attention residual + MLP residual.
-    void dump_prefill_add_outputs(const char* dir);
-
     /// Park worker threads (drop idle CPU). Auto-resumes on next prefill/decode.
     void park_workers() { thread_pool_.park(); }
 
     /// Touch mmap'd package weight pages so first-token latency does not pay
     /// lazy page-in cost. Returns the number of bytes covered.
     size_t warmup_package_weights();
-    size_t lock_dense_package_weights();
     bool package_weights_mmap_backed() const {
         return package_weights_base_ != nullptr && !package_weights_resident_;
     }
@@ -209,10 +202,6 @@ public:
         if (moe_ssd_cache_) moe_ssd_cache_->reset_stats();
     }
 
-    // exposed for testing
-    Tensor build_causal_mask(int seq_len, int past_len);
-    void generate_rope_cache(int seq_len, int start_pos,
-                             Tensor& cos, Tensor& sin);
     /// Return raw logits. If all_positions=true, returns vocab_size*seq_len
     /// floats (seq_len blocks of vocab_size). Otherwise just the last position.
     std::vector<float> run_lmhead_raw(const Tensor& hidden, int n_tokens = 1,
@@ -302,6 +291,10 @@ private:
     /// Embed tokens.
     Tensor embed(const std::vector<int>& token_ids, int pad_to = 0);
 
+    Tensor build_causal_mask(int seq_len, int past_len);
+    void generate_rope_cache(int seq_len, int start_pos,
+                             Tensor& cos, Tensor& sin);
+
     /// Run lm_head on the last hidden state.
     int run_lmhead(const Tensor& hidden, int n_tokens = 1);
 
@@ -313,8 +306,8 @@ private:
     /// Load a single graph and set up its CONSTANT nodes from shared weights.
     bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path);
     bool load_package(const std::string& path, std::string& pf_path,
-                      std::string& dc_path, std::string& tok_path,
-                      std::string& jin_path);
+                      std::string& dc_path, std::string& tok_path);
+    size_t lock_dense_package_weights();
 
     /// Allocate KV cache buffers with metadata header.
     void allocate_caches(Graph& g, int n_ctx);

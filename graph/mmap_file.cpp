@@ -92,28 +92,57 @@ static void release_pages_m(void* ptr, size_t len) {
 
 #endif // _WIN32
 
+namespace {
+
+bool range_within_file(uint64_t offset, uint64_t length, size_t file_size) {
+    return offset <= file_size && length <= file_size - offset;
+}
+
+bool valid_header(const MappedFile::Header& header, size_t file_size) {
+    constexpr uint32_t known_flags = MappedFile::FLAG_INT4_Q4DOT |
+                                     MappedFile::FLAG_INT4_BG128;
+    if ((header.flags & ~known_flags) != 0 ||
+        header.ndim == 0 || header.ndim > 4 ||
+        header.precision > 3) {
+        return false;
+    }
+    if (!range_within_file(header.data_offset, header.data_size, file_size) ||
+        !range_within_file(header.scales_offset, header.scales_size,
+                           file_size)) {
+        return false;
+    }
+    if ((header.data_size != 0 &&
+         header.data_offset < sizeof(MappedFile::Header)) ||
+        (header.scales_size != 0 &&
+         header.scales_offset < sizeof(MappedFile::Header))) {
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // MappedFile
 // ---------------------------------------------------------------------------
 
 MappedFile::MappedFile(MappedFile&& other) noexcept
-    : fd_(other.fd_), mapped_(other.mapped_), file_size_(other.file_size_),
+    : mapped_(other.mapped_), file_size_(other.file_size_),
       header_(other.header_) {
-    other.fd_       = -1;
     other.mapped_   = nullptr;
     other.file_size_ = 0;
+    other.header_ = {};
 }
 
 MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
     if (this != &other) {
         close();
-        fd_        = other.fd_;
         mapped_    = other.mapped_;
         file_size_ = other.file_size_;
         header_    = other.header_;
-        other.fd_       = -1;
         other.mapped_   = nullptr;
         other.file_size_ = 0;
+        other.header_ = {};
     }
     return *this;
 }
@@ -145,11 +174,11 @@ bool MappedFile::open(const char* path) {
         return false;
     }
 
-    // validate offsets
-    if (header_.data_offset + header_.data_size > size ||
-        header_.scales_offset + header_.scales_size > size) {
-        fprintf(stderr, "MappedFile: %s data/scales extend beyond file\n", path);
+    if (!valid_header(header_, size)) {
+        fprintf(stderr, "MappedFile: %s has an invalid header or range\n",
+                path);
         unmap_file(ptr, size);
+        header_ = {};
         return false;
     }
 
@@ -164,7 +193,7 @@ void MappedFile::close() {
         mapped_    = nullptr;
         file_size_ = 0;
     }
-    fd_ = -1;
+    header_ = {};
 }
 
 void MappedFile::prefetch() {

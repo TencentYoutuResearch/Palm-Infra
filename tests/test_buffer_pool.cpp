@@ -1,5 +1,6 @@
 #include "graph/buffer_pool.h"
 #include <cstdio>
+#include <utility>
 
 static int failures = 0;
 
@@ -88,6 +89,32 @@ int main() {
     CHECK(p7 != nullptr, "acquire 65 → MIN_BUCKET");
     CHECK(reinterpret_cast<uintptr_t>(p7) % BufferPool::ALIGNMENT == 0, "aligned pointer");
     pool3.release(p7, 65);
+
+    // ---- move ownership ----
+    BufferPool move_source;
+    void* moved_active = move_source.acquire(1500);
+    uint32_t source_id = move_source.id();
+    uint64_t moved_storage_id = move_source.storage_id(moved_active);
+
+    BufferPool move_target;
+    move_target.acquire(3000);  // move-assignment must release this allocation
+    move_target = std::move(move_source);
+    CHECK(move_target.id() == source_id, "move assignment transfers pool id");
+    CHECK(move_target.active_bytes() == 2048,
+          "move assignment transfers active allocation");
+    CHECK(move_target.storage_id(moved_active) == moved_storage_id,
+          "move assignment preserves storage identity");
+    CHECK(move_source.id() != source_id &&
+              move_source.active_bytes() == 0 &&
+              move_source.pool_bytes() == 0,
+          "moved-from pool is reusable and empty");
+    move_target.release(moved_active, 1500);
+
+    BufferPool move_constructed(std::move(move_target));
+    CHECK(move_constructed.id() == source_id,
+          "move construction transfers pool id");
+    CHECK(move_constructed.pool_bytes() == 2048,
+          "move construction transfers freelist");
 
     if (failures == 0) {
         printf("\nAll buffer_pool tests passed!\n");

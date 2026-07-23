@@ -63,6 +63,7 @@ set(SOURCES
     kernels/threading.cpp
     # engine
     engine/engine.cpp
+    engine/input_prep.cpp
     engine/package.cpp
     engine/sampler.cpp
     engine/tokenizer.cpp
