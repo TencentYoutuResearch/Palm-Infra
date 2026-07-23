@@ -58,8 +58,10 @@ set(SOURCES
     kernels/gdn_decode.cpp
     kernels/gdn_prefill.cpp
     kernels/moe.cpp
+    kernels/moe_routing.cpp
     kernels/moe_ssd.cpp
     kernels/moe_ssd_io.cpp
+    kernels/moe_ssd_predict.cpp
     kernels/trace.cpp
     kernels/rwkv.cpp
     kernels/threading.cpp
@@ -317,6 +319,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_elementwise   tests/test_elementwise.cpp)
     add_mollm_test(test_layout        tests/test_layout.cpp)
     add_mollm_test(test_matmul        tests/test_matmul.cpp)
+    add_mollm_test(test_moe_routing  tests/test_moe_routing.cpp)
     add_mollm_test(test_moe           tests/test_moe.cpp)
     add_mollm_test(test_moe_ssd       tests/test_moe_ssd.cpp)
     add_mollm_test(test_trace         tests/test_trace.cpp)

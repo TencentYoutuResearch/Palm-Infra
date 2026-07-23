@@ -45,6 +45,26 @@ struct MoeSsdTensorSource {
     MoeSsdCache* cache = nullptr;
 };
 
+// Router metadata used by the advisory next-layer SSD prefetch predictor.
+struct MoeSsdPredictConfig {
+    int hidden_size = 0;
+    int num_experts = 0;
+    int top_k = 0;
+    int router_score_func = 0;
+    int n_group = 1;
+    int topk_group = 1;
+};
+
+// Copy one decode gate input and schedule prediction of the next MoE layer's
+// expert reads. The real next-layer router always recomputes the exact route.
+bool schedule_moe_cross_layer_prefetch(
+    const Tensor& gate_input,
+    const Tensor& next_router,
+    const Tensor* next_router_bias,
+    const MoeSsdTensorSource* next_gate_up,
+    const MoeSsdTensorSource* next_down,
+    const MoeSsdPredictConfig& config);
+
 class MoeSsdCache {
 public:
     struct Stats {
@@ -156,6 +176,9 @@ private:
                            bool speculative);
     Entry* find_entry_locked(const MoeSsdTensorSource* gate_up,
                              const MoeSsdTensorSource* down, int expert);
+    const Entry* find_entry_locked(const MoeSsdTensorSource* gate_up,
+                                   const MoeSsdTensorSource* down,
+                                   int expert) const;
     Entry* reserve_entry_locked(const MoeSsdTensorSource* gate_up,
                                 const MoeSsdTensorSource* down, int expert,
                                 bool speculative = false);

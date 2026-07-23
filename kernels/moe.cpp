@@ -1,5 +1,6 @@
 #include "kernels/moe.h"
 #include "kernels/matmul.h"
+#include "kernels/moe_routing.h"
 #include "kernels/moe_ssd.h"
 #include "kernels/trace.h"
 #include "kernels/threading.h"
@@ -132,6 +133,23 @@ static inline float sigmoid_scalar(float x) {
 
 static inline float silu_scalar(float x) {
     return x * sigmoid_scalar(x);
+}
+
+static void apply_swiglu(const float* gate,
+                         const float* up,
+                         float* output,
+                         int rows,
+                         int width,
+                         int gate_stride,
+                         int up_stride,
+                         int output_stride) {
+    for (int row = 0; row < rows; ++row) {
+        const float* gate_row = gate + static_cast<size_t>(row) * gate_stride;
+        const float* up_row = up + static_cast<size_t>(row) * up_stride;
+        float* output_row = output + static_cast<size_t>(row) * output_stride;
+        for (int col = 0; col < width; ++col)
+            output_row[col] = silu_scalar(gate_row[col]) * up_row[col];
+    }
 }
 
 static Tensor make_fp32_tensor(float* data, int cols, int rows) {
@@ -300,9 +318,10 @@ static bool routed_ffn_scalar_fallback(const Tensor& experts_gate_up,
                              gu_base + (int64_t)r * hidden_size,
                              x, hidden_size);
     }
-    for (int j = 0; j < intermediate_size; j++) {
-        inter[j] = silu_scalar(gate_up[j]) * gate_up[intermediate_size + j];
-    }
+    apply_swiglu(gate_up.data(), gate_up.data() + intermediate_size,
+                 inter.data(), 1, intermediate_size,
+                 2 * intermediate_size, 2 * intermediate_size,
+                 intermediate_size);
     for (int d = 0; d < hidden_size; d++) {
         float sum = 0.0f;
         int64_t row = (int64_t)expert_id * hidden_size + d;
@@ -363,103 +382,6 @@ extern "C" void mollm_print_moe_profile(const char* title) {
                     avg_ms,
                     pct);
     }
-}
-
-bool schedule_moe_cross_layer_prefetch(const Tensor& gate_input,
-                                       const Tensor& next_router,
-                                       const Tensor* next_router_bias,
-                                       const MoeSsdTensorSource* next_gate_up,
-                                       const MoeSsdTensorSource* next_down,
-                                       const MoeGateConfig& config) {
-    if (!next_gate_up || !next_down || !next_gate_up->cache ||
-        next_gate_up->cache != next_down->cache || gate_input.prec != Precision::FP32 ||
-        gate_input.shape[1] != 1 || config.hidden_size <= 0 ||
-        config.num_experts <= 0 || config.top_k <= 0 ||
-        next_router.shape[0] != config.num_experts ||
-        next_router.shape[1] != config.hidden_size) {
-        return false;
-    }
-
-    // Graph workspaces are reused on the next token, so clone the one decode
-    // vector before handing it to an asynchronous SSD worker.
-    const float* src = gate_input.ptr<float>();
-    std::vector<float> input(src, src + config.hidden_size);
-    MoeSsdCache* cache = next_gate_up->cache;
-    // Keep one full exact route's worth of slots available. Without this,
-    // speculative experts churn a small per-layer window before the real
-    // router reaches it.
-    if (!cache->can_prefetch_pairs(next_gate_up, next_down,
-                                   static_cast<size_t>(config.top_k) * 2)) {
-        return false;
-    }
-    return cache->submit_cross_layer_task(
-        [input = std::move(input), &next_router, next_router_bias,
-         next_gate_up, next_down, config, cache]() mutable {
-            std::vector<float> logits((size_t)config.num_experts);
-            Tensor a = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
-                                      config.hidden_size, 1, 1, 1, input.data());
-            Tensor out = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
-                                        config.num_experts, 1, 1, 1, logits.data());
-            {
-                mollm_trace::ScopedEvent trace_event(
-                    "ssd.predict", "next_layer_router",
-                    "{\"layer\":" + std::to_string(next_gate_up->spec.layer) + "}");
-                // This runs on one idle SSD worker rather than the inference
-                // pool, so it can overlap the current layer's compute.
-                kernel_matmul_fp32(a, next_router, out, nullptr);
-            }
-
-            std::vector<float> score((size_t)config.num_experts);
-            if (config.router_score_func == 1) {
-                for (int e = 0; e < config.num_experts; ++e) {
-                    float v = 1.0f / (1.0f + std::exp(-logits[(size_t)e]));
-                    score[(size_t)e] = v + (next_router_bias && next_router_bias->data
-                        ? next_router_bias->ptr<float>()[e] : 0.0f);
-                }
-                const int n_group = std::max(1, config.n_group);
-                const int topk_group = std::min(std::max(1, config.topk_group), n_group);
-                const int per_group = config.num_experts / n_group;
-                if (per_group > 0 && topk_group < n_group) {
-                    std::vector<int> groups((size_t)n_group);
-                    for (int g = 0; g < n_group; ++g) groups[(size_t)g] = g;
-                    std::partial_sort(groups.begin(), groups.begin() + topk_group, groups.end(),
-                        [&](int a_group, int b_group) {
-                            auto group_score = [&](int group) {
-                                const int begin = group * per_group;
-                                const int end = begin + per_group;
-                                float best0 = -std::numeric_limits<float>::infinity();
-                                float best1 = best0;
-                                for (int e = begin; e < end; ++e) {
-                                    const float v = score[(size_t)e];
-                                    if (v > best0) { best1 = best0; best0 = v; }
-                                    else if (v > best1) best1 = v;
-                                }
-                                return best0 + best1;
-                            };
-                            return group_score(a_group) > group_score(b_group);
-                        });
-                    std::vector<uint8_t> keep((size_t)n_group, 0);
-                    for (int k = 0; k < topk_group; ++k) keep[(size_t)groups[(size_t)k]] = 1;
-                    for (int e = 0; e < config.num_experts; ++e) {
-                        if (!keep[(size_t)(e / per_group)]) {
-                            score[(size_t)e] = -std::numeric_limits<float>::infinity();
-                        }
-                    }
-                }
-            } else {
-                score = std::move(logits);
-            }
-
-            const int count = std::min(config.top_k, config.num_experts);
-            std::vector<int> experts((size_t)config.num_experts);
-            for (int e = 0; e < config.num_experts; ++e) experts[(size_t)e] = e;
-            std::partial_sort(experts.begin(), experts.begin() + count, experts.end(),
-                [&](int a_expert, int b_expert) {
-                    return score[(size_t)a_expert] > score[(size_t)b_expert];
-                });
-            experts.resize((size_t)count);
-            cache->prefetch_many(next_gate_up, next_down, experts);
-        });
 }
 
 void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
@@ -534,115 +456,26 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     }
     if (profile) moe_profile_add(MoeProfileStage::Router, stage_start);
 
-    std::vector<int> top_idx((size_t)seq_len * (size_t)top_k);
-    std::vector<float> top_w((size_t)seq_len * (size_t)top_k);
-    std::vector<float> router_scores(router_score_func == 1
-        ? (size_t)seq_len * (size_t)num_experts : 0);
-    std::vector<float> choice_scores(router_score_func == 1
-        ? (size_t)num_experts : 0);
+    std::vector<int> top_idx;
+    std::vector<float> top_w;
     const float* bias_data = router_bias && router_bias->data
         ? router_bias->ptr<float>() : nullptr;
-    if (n_group <= 0) n_group = 1;
-    if (topk_group <= 0 || topk_group > n_group) topk_group = n_group;
-    int experts_per_group = num_experts / n_group;
+    mollm::detail::MoeRoutingParams routing;
+    routing.num_experts = num_experts;
+    routing.top_k = top_k;
+    routing.score_func = router_score_func;
+    routing.normalize_topk = norm_topk_prob;
+    routing.num_groups = n_group;
+    routing.topk_groups = topk_group;
+    routing.scaling_factor = routed_scaling_factor;
     if (profile) stage_start = moe_profile_now();
     {
         mollm_trace::ScopedEvent trace_topk("compute", "moe.topk", trace_layer_args);
-        for (int t = 0; t < seq_len; t++) {
-        const float* logits = router_logits.data() + (size_t)t * num_experts;
-        int* idx = top_idx.data() + (size_t)t * top_k;
-        float* weights = top_w.data() + (size_t)t * top_k;
-
-        for (int k = 0; k < top_k; k++) {
-            idx[k] = 0;
-            weights[k] = -std::numeric_limits<float>::infinity();
-        }
-
-        const float* weight_source = logits;
-        if (router_score_func == 1) {
-            float* scores = router_scores.data() + (size_t)t * num_experts;
-            for (int e = 0; e < num_experts; e++) {
-                scores[e] = sigmoid_scalar(logits[e]);
-                choice_scores[e] = scores[e] + (bias_data ? bias_data[e] : 0.0f);
-            }
-            if (n_group > 1 && experts_per_group > 0 && topk_group < n_group) {
-                std::vector<float> group_scores(n_group, -std::numeric_limits<float>::infinity());
-                std::vector<int> group_idx(topk_group, 0);
-                std::vector<float> group_top(topk_group, -std::numeric_limits<float>::infinity());
-                for (int g = 0; g < n_group; g++) {
-                    float best0 = -std::numeric_limits<float>::infinity();
-                    float best1 = -std::numeric_limits<float>::infinity();
-                    int begin = g * experts_per_group;
-                    int end = begin + experts_per_group;
-                    for (int e = begin; e < end; e++) {
-                        float v = choice_scores[e];
-                        if (v > best0) {
-                            best1 = best0;
-                            best0 = v;
-                        } else if (v > best1) {
-                            best1 = v;
-                        }
-                    }
-                    group_scores[g] = best0 + best1;
-                    for (int k = 0; k < topk_group; k++) {
-                        if (group_scores[g] > group_top[k]) {
-                            for (int s = topk_group - 1; s > k; s--) {
-                                group_top[s] = group_top[s - 1];
-                                group_idx[s] = group_idx[s - 1];
-                            }
-                            group_top[k] = group_scores[g];
-                            group_idx[k] = g;
-                            break;
-                        }
-                    }
-                }
-                std::vector<unsigned char> keep_group(n_group, 0);
-                for (int k = 0; k < topk_group; k++) keep_group[group_idx[k]] = 1;
-                for (int e = 0; e < num_experts; e++) {
-                    int g = e / experts_per_group;
-                    if (!keep_group[g]) choice_scores[e] = -std::numeric_limits<float>::infinity();
-                }
-            }
-            weight_source = scores;
-        }
-
-        const float* select_source = router_score_func == 1 ? choice_scores.data() : logits;
-        for (int e = 0; e < num_experts; e++) {
-            float v = select_source[e];
-            for (int k = 0; k < top_k; k++) {
-                if (v > weights[k]) {
-                    for (int s = top_k - 1; s > k; s--) {
-                        weights[s] = weights[s - 1];
-                        idx[s] = idx[s - 1];
-                    }
-                    weights[k] = v;
-                    idx[k] = e;
-                    break;
-                }
-            }
-        }
-
-        if (router_score_func == 1) {
-            float sum_top = 0.0f;
-            for (int k = 0; k < top_k; k++) {
-                weights[k] = weight_source[idx[k]];
-                sum_top += weights[k];
-            }
-            if (norm_topk_prob) {
-                float inv_top = sum_top > 0.0f ? 1.0f / sum_top : 0.0f;
-                for (int k = 0; k < top_k; k++) weights[k] *= inv_top;
-            }
-            for (int k = 0; k < top_k; k++) weights[k] *= routed_scaling_factor;
-        } else {
-            float max_top = weights[0];
-            float sum_top = 0.0f;
-            for (int k = 0; k < top_k; k++) {
-                weights[k] = std::exp(weights[k] - max_top);
-                sum_top += weights[k];
-            }
-            float inv_top = sum_top > 0.0f ? 1.0f / sum_top : 0.0f;
-            for (int k = 0; k < top_k; k++) weights[k] *= inv_top;
-        }
+        if (!mollm::detail::select_moe_routes(
+                router_logits.data(), seq_len, bias_data, routing,
+                top_idx, top_w)) {
+            std::fprintf(stderr, "MOE: failed to select routed experts\n");
+            return;
         }
     }
     if (profile) moe_profile_add(MoeProfileStage::TopK, stage_start);
@@ -693,14 +526,10 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         if (profile) stage_start = moe_profile_now();
         kernel_matmul_fp32(hidden, shared_gate_b, shared_gate_t, thread_pool);
         kernel_matmul_fp32(hidden, shared_up_b, shared_up_t, thread_pool);
-        for (int t = 0; t < seq_len; t++) {
-            float* dst = shared_inter.data() + (size_t)t * shared_intermediate_size;
-            const float* gate = shared_gate_out.data() + (size_t)t * shared_intermediate_size;
-            const float* up = shared_up_out.data() + (size_t)t * shared_intermediate_size;
-            for (int j = 0; j < shared_intermediate_size; j++) {
-                dst[j] = silu_scalar(gate[j]) * up[j];
-            }
-        }
+        apply_swiglu(shared_gate_out.data(), shared_up_out.data(),
+                     shared_inter.data(), seq_len, shared_intermediate_size,
+                     shared_intermediate_size, shared_intermediate_size,
+                     shared_intermediate_size);
         if (profile) moe_profile_add(MoeProfileStage::SharedGateUp, stage_start);
 
         Tensor shared_inter_t = make_fp32_tensor(shared_inter.data(), shared_intermediate_size, seq_len);
@@ -816,13 +645,11 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             Tensor gate_up_t = make_fp32_tensor(gate_up_out.data(), 2 * intermediate_size, count);
             if (profile) stage_start = moe_profile_now();
             kernel_matmul_fp32(expert_x_t, gate_up_b, gate_up_t, thread_pool);
-            for (int i = 0; i < count; i++) {
-                const float* gu = gate_up_out.data() + (size_t)i * (2 * intermediate_size);
-                float* dst = routed_inter.data() + (size_t)i * intermediate_size;
-                for (int j = 0; j < intermediate_size; j++) {
-                    dst[j] = silu_scalar(gu[j]) * gu[intermediate_size + j];
-                }
-            }
+            apply_swiglu(gate_up_out.data(),
+                         gate_up_out.data() + intermediate_size,
+                         routed_inter.data(), count, intermediate_size,
+                         2 * intermediate_size, 2 * intermediate_size,
+                         intermediate_size);
             if (profile) moe_profile_add(MoeProfileStage::RoutedGateUp, stage_start);
 
             Tensor inter_t = make_fp32_tensor(routed_inter.data(), intermediate_size, count);

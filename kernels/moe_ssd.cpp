@@ -319,9 +319,18 @@ bool MoeSsdCache::valid_pair(const MoeSsdTensorSource* gate_up,
 
 MoeSsdCache::Entry* MoeSsdCache::find_entry_locked(
     const MoeSsdTensorSource* gate_up, const MoeSsdTensorSource* down, int expert) {
+    return const_cast<Entry*>(
+        static_cast<const MoeSsdCache*>(this)->find_entry_locked(
+            gate_up, down, expert));
+}
+
+const MoeSsdCache::Entry* MoeSsdCache::find_entry_locked(
+    const MoeSsdTensorSource* gate_up,
+    const MoeSsdTensorSource* down,
+    int expert) const {
     auto layer = layer_entries_.find(gate_up->spec.layer);
     if (layer == layer_entries_.end()) return nullptr;
-    for (Entry* entry : layer->second) {
+    for (const Entry* entry : layer->second) {
         if (entry->gate_up == gate_up && entry->down == down && entry->expert == expert) {
             return entry;
         }
@@ -586,18 +595,12 @@ size_t MoeSsdCache::resident_count(const MoeSsdTensorSource* gate_up,
     std::vector<uint8_t> seen((size_t)gate_up->spec.num_experts, 0);
     size_t count = 0;
     std::lock_guard<std::mutex> lock(mutex_);
-    auto layer = layer_entries_.find(gate_up->spec.layer);
-    if (layer == layer_entries_.end()) return 0;
     for (int expert : experts) {
         if (expert < 0 || expert >= gate_up->spec.num_experts || seen[(size_t)expert]) continue;
         seen[(size_t)expert] = 1;
-        for (const Entry* entry : layer->second) {
-            if (entry->gate_up == gate_up && entry->down == down && entry->expert == expert) {
-                if (!entry->is_failed())
-                    ++count;
-                break;
-            }
-        }
+        const Entry* entry = find_entry_locked(gate_up, down, expert);
+        if (entry && !entry->is_failed())
+            ++count;
     }
     return count;
 }
@@ -607,14 +610,8 @@ bool MoeSsdCache::contains(const MoeSsdTensorSource* gate_up,
                            int expert) const {
     if (!valid_pair(gate_up, down, expert)) return false;
     std::lock_guard<std::mutex> lock(mutex_);
-    auto layer = layer_entries_.find(gate_up->spec.layer);
-    if (layer == layer_entries_.end()) return false;
-    for (const Entry* entry : layer->second) {
-        if (entry->gate_up == gate_up && entry->down == down && entry->expert == expert) {
-            return !entry->is_failed();
-        }
-    }
-    return false;
+    const Entry* entry = find_entry_locked(gate_up, down, expert);
+    return entry && !entry->is_failed();
 }
 
 bool MoeSsdCache::release(const MoeSsdTensorSource* gate_up,
@@ -622,18 +619,12 @@ bool MoeSsdCache::release(const MoeSsdTensorSource* gate_up,
                           int expert) {
     if (!valid_pair(gate_up, down, expert)) return false;
     std::lock_guard<std::mutex> lock(mutex_);
-    auto layer = layer_entries_.find(gate_up->spec.layer);
-    if (layer == layer_entries_.end()) return false;
-    for (auto it = layer->second.begin(); it != layer->second.end(); ++it) {
-        Entry* entry = *it;
-        if (entry->gate_up != gate_up || entry->down != down || entry->expert != expert) continue;
-        // release() is called only after routed compute has finished. Do not
-        // invalidate an in-flight asynchronous read if a caller violates that
-        // lifetime contract.
-        if (entry->is_loading()) return false;
-        return remove_entry_locked(entry, true) != nullptr;
-    }
-    return false;
+    Entry* entry = find_entry_locked(gate_up, down, expert);
+    // release() is called only after routed compute has finished. Do not
+    // invalidate an in-flight asynchronous read if a caller violates that
+    // lifetime contract.
+    if (!entry || entry->is_loading()) return false;
+    return remove_entry_locked(entry, true) != nullptr;
 }
 
 bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,

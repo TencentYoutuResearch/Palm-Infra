@@ -1,6 +1,7 @@
 #include "graph/execute.h"
 #include "engine/backend.h"
 #include "kernels/moe.h"
+#include "kernels/moe_ssd.h"
 #include "kernels/tensor.h"
 #include "kernels/trace.h"
 #include <algorithm>
@@ -415,7 +416,7 @@ void execute_graph(ExecContext& ctx) {
                 const Tensor& next_down = tensors[next_inputs[3]];
                 const Tensor* next_bias = next_inputs.size() > 8
                     ? &tensors[next_inputs[8]] : nullptr;
-                MoeGateConfig config;
+                MoeSsdPredictConfig config;
                 config.hidden_size = graph_params::get_i32(next_it->params, 0, 0);
                 config.num_experts = graph_params::get_i32(next_it->params, 1, 0);
                 config.top_k = graph_params::get_i32(next_it->params, 2, 0);
