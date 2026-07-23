@@ -705,7 +705,8 @@ void MetalBackend::dispatch(const GraphNode& node,
         break;
     }
 
-    case OpType::MATMUL: {
+    case OpType::MATMUL:
+    case OpType::GEMV_SPARSE_A: {
         const Tensor& A = *inputs[0];
         const Tensor& B = *inputs[1];
         Tensor& C = *output;

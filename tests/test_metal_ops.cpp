@@ -49,9 +49,10 @@ static Tensor make_dev(MetalBackend& mb, Precision prec, int d0, int d1) {
 
 // Run a single MATMUL node on the Metal backend.
 static void metal_matmul(MetalBackend& mb, Tensor& A, Tensor& B, Tensor& C,
-                         const std::vector<int>& i32 = {}) {
+                         const std::vector<int>& i32 = {},
+                         OpType op = OpType::MATMUL) {
     GraphNode node;
-    node.op_type = OpType::MATMUL;
+    node.op_type = op;
     node.params.i32 = i32;
     std::vector<const Tensor*> ins = { &A, &B };
     mb.begin_graph();
@@ -211,6 +212,28 @@ int main() {
             }
 
         CHECK(close((const float*)C.data, ref.data(), M*N, 1e-3f, 2e-2f), "GEMV M=1 K=128 N=64");
+    }
+
+    // ---- GEMV_SPARSE_A correctness fallback through the tuned dense GEMV ---
+    {
+        int K = 128, N = 64;
+        Tensor A = make_dev(mb, Precision::FP32, K, 1);
+        Tensor B = make_dev(mb, Precision::FP16, N, K);
+        Tensor C = make_dev(mb, Precision::FP32, N, 1);
+        std::vector<float> a(K, 0.0f), bf(N * K), ref(N);
+        for (int k = 0; k < K; k += 7) a[k] = (k & 1) ? -0.25f : 0.5f;
+        fill_rand(bf.data(), N * K);
+        memcpy(A.data, a.data(), K * sizeof(float));
+        __fp16* bh = (__fp16*)B.data;
+        for (int i = 0; i < N * K; ++i) bh[i] = (__fp16)bf[i];
+        metal_matmul(mb, A, B, C, {}, OpType::GEMV_SPARSE_A);
+        for (int n = 0; n < N; ++n) {
+            double sum = 0.0;
+            for (int k = 0; k < K; ++k) sum += a[k] * (float)bh[n * K + k];
+            ref[n] = (float)sum;
+        }
+        CHECK(close((const float*)C.data, ref.data(), N, 1e-3f, 2e-2f),
+              "GEMV_SPARSE_A dense Metal fallback");
     }
 
     // ---- GEMV large K (K > threadgroup A-staging cap, like down_proj) ----
