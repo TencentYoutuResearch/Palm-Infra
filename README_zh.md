@@ -52,6 +52,7 @@ SSD 读取量，但隐藏了更多 I/O 延迟。相同 16 GiB 默认配置在严
 | Qwen3.5-122B-A10B MoE | CPU W4，支持 SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16、W8、W4、混合 W4 |
 | Youtu-LLM-2B | FP16、W8、W4、混合 W4 |
+| RWKV7 | FP16、W8、混合 W4；循环式 CPU prefill/decode |
 
 当前测试最充分的运行路径是 `w4g128`：它占用内存最少，且具有 mollm 中最快的 decode 速度。若纯 W4 的质量不足，可使用 `w4mixg128`，它会保留部分敏感 tensor 为 W8。
 
@@ -70,6 +71,7 @@ SSD 读取量，但隐藏了更多 I/O 延迟。相同 16 GiB 默认配置在严
 | Qwen3.5-0.8B | **757.74** / **123.68** | 664.54 / 97.87 | mollm 的 prefill 和 decode 均更快 |
 | Youtu-LLM-2B | **335.44** / **51.32** | 258.13 / 46.73 | mollm 的 prefill 和 decode 均更快 |
 | Qwen3.5-4B | 135.00 / **25.22** | **144.30** / 22.14 | llama prefill 更快，mollm decode 更快 |
+| RWKV7-1.5B | **430.51** / **70.09** | 395.83 / 57.18 | mollm 的 prefill 和 decode 均更快 |
 
 ### W8
 
@@ -78,6 +80,7 @@ SSD 读取量，但隐藏了更多 I/O 延迟。相同 16 GiB 默认配置在严
 | Qwen3.5-0.8B | 671.73 / **217.69** | **782.16** / 167.63 | llama prefill 更快，mollm decode 更快 |
 | Youtu-LLM-2B | 253.05 / **89.53** | **263.95** / 86.58 | prefill 接近，mollm decode 略快 |
 | Qwen3.5-4B | 118.55 / **46.64** | **135.58** / 40.50 | llama prefill 更快，mollm decode 更快 |
+| RWKV7-1.5B | 274.16 / **121.34** | **377.64** / 96.50 | llama prefill 更快，mollm decode 更快 |
 
 ### W4 / MoE W4
 
@@ -86,6 +89,7 @@ SSD 读取量，但隐藏了更多 I/O 延迟。相同 16 GiB 默认配置在严
 | Qwen3.5-0.8B W4 | 678.41 / **259.43** | **775.95** / 190.89 | llama prefill 更快，mollm decode 更快 |
 | Youtu-LLM-2B W4 | 248.08 / **115.64** | **265.58** / 97.15 | llama prefill 更快，mollm decode 更快 |
 | Qwen3.5-4B W4 | 115.37 / **55.94** | **140.51** / 44.25 | llama prefill 更快，mollm decode 更快 |
+| RWKV7-1.5B 混合 W4 | 274.25 / **129.12** | **366.76** / 110.68 | llama prefill 更快，mollm decode 更快 |
 | Qwen3.6-35B-A3B W4 | **139.63** / **65.32** | 116.93 / 43.73 | mollm prefill 1.19×，decode 1.49× |
 | Qwen3-30B-A3B W4 | **143.50** / **63.85** | 110.34 / 60.77 | mollm prefill 1.30×，decode 1.05× |
 | Qwen3.5-122B-A10B W4（SSD offload） | **37.99** / **13.54** † | OOM | 可运行于 48GB Mac |
@@ -94,6 +98,8 @@ SSD 读取量，但隐藏了更多 I/O 延迟。相同 16 GiB 默认配置在严
 ChatML prompt（16 个 prompt token、生成 128 个 token、`warmup=1`）的五进程中位数。
 两者均使用 16 GiB 的 SSD-backed expert RAM cache、默认的共享 cache / 跨层预取策略和
 锁定的稠密 mmap 权重。llama.cpp 的 CPU 基线无法装入 48GB RAM。
+
+RWKV7 的 FP16 和混合 W4 行使用默认 sparse-A 策略；W8 使用默认 q8-dot dense GEMV 路径。
 
 总体而言，mollm 的 decode 在 W4 包上尤其有竞争力；稠密模型的 prefill 仍是主要优化方向。
 

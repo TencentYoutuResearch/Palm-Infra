@@ -1,7 +1,7 @@
-<svg width="1180" height="976" viewBox="0 0 1180 976" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+<svg width="1180" height="1120" viewBox="0 0 1180 1120" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
   <title id="title">mollm throughput comparison</title>
-  <desc id="desc">Horizontal bar charts comparing mollm and llama.cpp FP16, W8, and W4 prompt prefill and decode throughput on Apple M5 Pro with four threads, including a 122B SSD-offload result.</desc>
-  <rect width="1180" height="976" fill="#ffffff"/>
+  <desc id="desc">Horizontal bar charts comparing mollm and llama.cpp FP16, W8, and W4 prompt prefill and decode throughput on Apple M5 Pro with four threads, including RWKV7 and a 122B SSD-offload result.</desc>
+  <rect width="1180" height="1120" fill="#ffffff"/>
   <style>
     .title { font: 700 26px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #101828; }
     .subtitle { font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #667085; }
@@ -28,132 +28,109 @@
   <text x="200" y="114" class="panel">Prompt / prefill pp256 tokens/s</text>
   <text x="700" y="114" class="panel">Decode tg64 tokens/s</text>
   <line x1="40" y1="128" x2="1140" y2="128" class="rule"/>
-  <line x1="200" y1="134" x2="200" y2="286" class="grid"/>
-  <line x1="305" y1="134" x2="305" y2="286" class="grid"/>
-  <line x1="410" y1="134" x2="410" y2="286" class="grid"/>
-  <line x1="515" y1="134" x2="515" y2="286" class="grid"/>
-  <line x1="620" y1="134" x2="620" y2="286" class="grid"/>
-  <line x1="700" y1="134" x2="700" y2="286" class="grid"/>
-  <line x1="805" y1="134" x2="805" y2="286" class="grid"/>
-  <line x1="910" y1="134" x2="910" y2="286" class="grid"/>
-  <line x1="1015" y1="134" x2="1015" y2="286" class="grid"/>
-  <line x1="1120" y1="134" x2="1120" y2="286" class="grid"/>
+  <line x1="200" y1="134" x2="200" y2="332" class="grid"/><line x1="305" y1="134" x2="305" y2="332" class="grid"/><line x1="410" y1="134" x2="410" y2="332" class="grid"/><line x1="515" y1="134" x2="515" y2="332" class="grid"/><line x1="620" y1="134" x2="620" y2="332" class="grid"/>
+  <line x1="700" y1="134" x2="700" y2="332" class="grid"/><line x1="805" y1="134" x2="805" y2="332" class="grid"/><line x1="910" y1="134" x2="910" y2="332" class="grid"/><line x1="1015" y1="134" x2="1015" y2="332" class="grid"/><line x1="1120" y1="134" x2="1120" y2="332" class="grid"/>
 
   <text x="40" y="161" class="label">Qwen3.5-0.8B</text>
   <rect x="200" y="140" width="397.8" height="13" rx="2" class="mollm"/><text x="605" y="151" class="value">757.74</text>
   <rect x="200" y="158" width="348.9" height="13" rx="2" class="llama"/><text x="555" y="169" class="value">664.54</text>
   <rect x="700" y="140" width="185.5" height="13" rx="2" class="mollm"/><text x="892" y="151" class="value">123.68</text>
   <rect x="700" y="158" width="146.8" height="13" rx="2" class="llama"/><text x="853" y="169" class="value">97.87</text>
-
   <text x="40" y="207" class="label">Youtu-LLM-2B</text>
   <rect x="200" y="186" width="176.1" height="13" rx="2" class="mollm"/><text x="383" y="197" class="value">335.44</text>
   <rect x="200" y="204" width="135.5" height="13" rx="2" class="llama"/><text x="342" y="215" class="value">258.13</text>
   <rect x="700" y="186" width="77.0" height="13" rx="2" class="mollm"/><text x="784" y="197" class="value">51.32</text>
   <rect x="700" y="204" width="70.1" height="13" rx="2" class="llama"/><text x="777" y="215" class="value">46.73</text>
-
   <text x="40" y="253" class="label">Qwen3.5-4B</text>
   <rect x="200" y="232" width="70.9" height="13" rx="2" class="mollm"/><text x="278" y="243" class="value">135.00</text>
   <rect x="200" y="250" width="75.8" height="13" rx="2" class="llama"/><text x="283" y="261" class="value">144.30</text>
   <rect x="700" y="232" width="37.8" height="13" rx="2" class="mollm"/><text x="745" y="243" class="value">25.22</text>
   <rect x="700" y="250" width="33.2" height="13" rx="2" class="llama"/><text x="741" y="261" class="value">22.14</text>
+  <text x="40" y="299" class="label">RWKV7-1.5B</text>
+  <rect x="200" y="278" width="226.0" height="13" rx="2" class="mollm"/><text x="433" y="289" class="value">430.51</text>
+  <rect x="200" y="296" width="207.8" height="13" rx="2" class="llama"/><text x="415" y="307" class="value">395.83</text>
+  <rect x="700" y="278" width="105.1" height="13" rx="2" class="mollm"/><text x="812" y="289" class="value">70.09</text>
+  <rect x="700" y="296" width="85.8" height="13" rx="2" class="llama"/><text x="793" y="307" class="value">57.18</text>
+  <line x1="200" y1="332" x2="620" y2="332" class="axis"/>
+  <text x="196" y="350" class="tick">0</text><text x="296" y="350" class="tick">200</text><text x="401" y="350" class="tick">400</text><text x="506" y="350" class="tick">600</text><text x="611" y="350" class="tick">800</text>
+  <line x1="700" y1="332" x2="1120" y2="332" class="axis"/>
+  <text x="696" y="350" class="tick">0</text><text x="799" y="350" class="tick">70</text><text x="901" y="350" class="tick">140</text><text x="1009" y="350" class="tick">210</text><text x="1111" y="350" class="tick">280</text>
 
-  <line x1="200" y1="286" x2="620" y2="286" class="axis"/>
-  <text x="196" y="304" class="tick">0</text><text x="296" y="304" class="tick">200</text><text x="401" y="304" class="tick">400</text><text x="506" y="304" class="tick">600</text><text x="611" y="304" class="tick">800</text>
-  <line x1="700" y1="286" x2="1120" y2="286" class="axis"/>
-  <text x="696" y="304" class="tick">0</text><text x="799" y="304" class="tick">70</text><text x="901" y="304" class="tick">140</text><text x="1009" y="304" class="tick">210</text><text x="1111" y="304" class="tick">280</text>
+  <text x="40" y="400" class="section">W8</text>
+  <text x="200" y="400" class="panel">Prompt / prefill pp256 tokens/s</text>
+  <text x="700" y="400" class="panel">Decode tg64 tokens/s</text>
+  <line x1="40" y1="414" x2="1140" y2="414" class="rule"/>
+  <line x1="200" y1="420" x2="200" y2="618" class="grid"/><line x1="305" y1="420" x2="305" y2="618" class="grid"/><line x1="410" y1="420" x2="410" y2="618" class="grid"/><line x1="515" y1="420" x2="515" y2="618" class="grid"/><line x1="620" y1="420" x2="620" y2="618" class="grid"/>
+  <line x1="700" y1="420" x2="700" y2="618" class="grid"/><line x1="805" y1="420" x2="805" y2="618" class="grid"/><line x1="910" y1="420" x2="910" y2="618" class="grid"/><line x1="1015" y1="420" x2="1015" y2="618" class="grid"/><line x1="1120" y1="420" x2="1120" y2="618" class="grid"/>
+  <text x="40" y="447" class="label">Qwen3.5-0.8B</text>
+  <rect x="200" y="426" width="352.7" height="13" rx="2" class="mollm"/><text x="559" y="437" class="value">671.73</text>
+  <rect x="200" y="444" width="410.6" height="13" rx="2" class="llama"/><text x="617" y="455" class="value">782.16</text>
+  <rect x="700" y="426" width="326.5" height="13" rx="2" class="mollm"/><text x="1033" y="437" class="value">217.69</text>
+  <rect x="700" y="444" width="251.4" height="13" rx="2" class="llama"/><text x="958" y="455" class="value">167.63</text>
+  <text x="40" y="493" class="label">Youtu-LLM-2B</text>
+  <rect x="200" y="472" width="132.9" height="13" rx="2" class="mollm"/><text x="340" y="483" class="value">253.05</text>
+  <rect x="200" y="490" width="138.6" height="13" rx="2" class="llama"/><text x="346" y="501" class="value">263.95</text>
+  <rect x="700" y="472" width="134.3" height="13" rx="2" class="mollm"/><text x="842" y="483" class="value">89.53</text>
+  <rect x="700" y="490" width="129.9" height="13" rx="2" class="llama"/><text x="837" y="501" class="value">86.58</text>
+  <text x="40" y="539" class="label">Qwen3.5-4B</text>
+  <rect x="200" y="518" width="62.2" height="13" rx="2" class="mollm"/><text x="270" y="529" class="value">118.55</text>
+  <rect x="200" y="536" width="71.2" height="13" rx="2" class="llama"/><text x="279" y="547" class="value">135.58</text>
+  <rect x="700" y="518" width="70.0" height="13" rx="2" class="mollm"/><text x="778" y="529" class="value">46.64</text>
+  <rect x="700" y="536" width="60.8" height="13" rx="2" class="llama"/><text x="768" y="547" class="value">40.50</text>
+  <text x="40" y="585" class="label">RWKV7-1.5B</text>
+  <rect x="200" y="564" width="143.9" height="13" rx="2" class="mollm"/><text x="351" y="575" class="value">274.16</text>
+  <rect x="200" y="582" width="198.3" height="13" rx="2" class="llama"/><text x="406" y="593" class="value">377.64</text>
+  <rect x="700" y="564" width="182.0" height="13" rx="2" class="mollm"/><text x="889" y="575" class="value">121.34</text>
+  <rect x="700" y="582" width="144.8" height="13" rx="2" class="llama"/><text x="852" y="593" class="value">96.50</text>
+  <line x1="200" y1="618" x2="620" y2="618" class="axis"/>
+  <text x="196" y="636" class="tick">0</text><text x="296" y="636" class="tick">200</text><text x="401" y="636" class="tick">400</text><text x="506" y="636" class="tick">600</text><text x="611" y="636" class="tick">800</text>
+  <line x1="700" y1="618" x2="1120" y2="618" class="axis"/>
+  <text x="696" y="636" class="tick">0</text><text x="799" y="636" class="tick">70</text><text x="901" y="636" class="tick">140</text><text x="1009" y="636" class="tick">210</text><text x="1111" y="636" class="tick">280</text>
 
-  <text x="40" y="354" class="section">W8</text>
-  <text x="200" y="354" class="panel">Prompt / prefill pp256 tokens/s</text>
-  <text x="700" y="354" class="panel">Decode tg64 tokens/s</text>
-  <line x1="40" y1="368" x2="1140" y2="368" class="rule"/>
-  <line x1="200" y1="374" x2="200" y2="526" class="grid"/>
-  <line x1="305" y1="374" x2="305" y2="526" class="grid"/>
-  <line x1="410" y1="374" x2="410" y2="526" class="grid"/>
-  <line x1="515" y1="374" x2="515" y2="526" class="grid"/>
-  <line x1="620" y1="374" x2="620" y2="526" class="grid"/>
-  <line x1="700" y1="374" x2="700" y2="526" class="grid"/>
-  <line x1="805" y1="374" x2="805" y2="526" class="grid"/>
-  <line x1="910" y1="374" x2="910" y2="526" class="grid"/>
-  <line x1="1015" y1="374" x2="1015" y2="526" class="grid"/>
-  <line x1="1120" y1="374" x2="1120" y2="526" class="grid"/>
-
-  <text x="40" y="401" class="label">Qwen3.5-0.8B</text>
-  <rect x="200" y="380" width="352.7" height="13" rx="2" class="mollm"/><text x="559" y="391" class="value">671.73</text>
-  <rect x="200" y="398" width="410.6" height="13" rx="2" class="llama"/><text x="617" y="409" class="value">782.16</text>
-  <rect x="700" y="380" width="326.5" height="13" rx="2" class="mollm"/><text x="1033" y="391" class="value">217.69</text>
-  <rect x="700" y="398" width="251.4" height="13" rx="2" class="llama"/><text x="958" y="409" class="value">167.63</text>
-
-  <text x="40" y="447" class="label">Youtu-LLM-2B</text>
-  <rect x="200" y="426" width="132.9" height="13" rx="2" class="mollm"/><text x="340" y="437" class="value">253.05</text>
-  <rect x="200" y="444" width="138.6" height="13" rx="2" class="llama"/><text x="346" y="455" class="value">263.95</text>
-  <rect x="700" y="426" width="134.3" height="13" rx="2" class="mollm"/><text x="842" y="437" class="value">89.53</text>
-  <rect x="700" y="444" width="129.9" height="13" rx="2" class="llama"/><text x="837" y="455" class="value">86.58</text>
-
-  <text x="40" y="493" class="label">Qwen3.5-4B</text>
-  <rect x="200" y="472" width="62.2" height="13" rx="2" class="mollm"/><text x="270" y="483" class="value">118.55</text>
-  <rect x="200" y="490" width="71.2" height="13" rx="2" class="llama"/><text x="279" y="501" class="value">135.58</text>
-  <rect x="700" y="472" width="70.0" height="13" rx="2" class="mollm"/><text x="778" y="483" class="value">46.64</text>
-  <rect x="700" y="490" width="60.8" height="13" rx="2" class="llama"/><text x="768" y="501" class="value">40.50</text>
-
-  <line x1="200" y1="526" x2="620" y2="526" class="axis"/>
-  <text x="196" y="544" class="tick">0</text><text x="296" y="544" class="tick">200</text><text x="401" y="544" class="tick">400</text><text x="506" y="544" class="tick">600</text><text x="611" y="544" class="tick">800</text>
-  <line x1="700" y1="526" x2="1120" y2="526" class="axis"/>
-  <text x="696" y="544" class="tick">0</text><text x="799" y="544" class="tick">70</text><text x="901" y="544" class="tick">140</text><text x="1009" y="544" class="tick">210</text><text x="1111" y="544" class="tick">280</text>
-
-  <text x="40" y="604" class="section">W4</text>
-  <text x="200" y="604" class="panel">Prompt / prefill pp256 tokens/s</text>
-  <text x="700" y="604" class="panel">Decode tg64 tokens/s</text>
-  <line x1="40" y1="618" x2="1140" y2="618" class="rule"/>
-  <line x1="200" y1="624" x2="200" y2="914" class="grid"/>
-  <line x1="305" y1="624" x2="305" y2="914" class="grid"/>
-  <line x1="410" y1="624" x2="410" y2="914" class="grid"/>
-  <line x1="515" y1="624" x2="515" y2="914" class="grid"/>
-  <line x1="620" y1="624" x2="620" y2="914" class="grid"/>
-  <line x1="700" y1="624" x2="700" y2="914" class="grid"/>
-  <line x1="805" y1="624" x2="805" y2="914" class="grid"/>
-  <line x1="910" y1="624" x2="910" y2="914" class="grid"/>
-  <line x1="1015" y1="624" x2="1015" y2="914" class="grid"/>
-  <line x1="1120" y1="624" x2="1120" y2="914" class="grid"/>
-
-  <text x="40" y="651" class="label">Qwen3.5-0.8B</text>
-  <rect x="200" y="630" width="356.2" height="13" rx="2" class="mollm"/><text x="563" y="641" class="value">678.41</text>
-  <rect x="200" y="648" width="407.4" height="13" rx="2" class="llama"/><text x="614" y="659" class="value">775.95</text>
-  <rect x="700" y="630" width="389.1" height="13" rx="2" class="mollm"/><text x="1096" y="641" class="value">259.43</text>
-  <rect x="700" y="648" width="286.3" height="13" rx="2" class="llama"/><text x="993" y="659" class="value">190.89</text>
-
-  <text x="40" y="697" class="label">Youtu-LLM-2B</text>
-  <rect x="200" y="676" width="130.2" height="13" rx="2" class="mollm"/><text x="338" y="687" class="value">248.08</text>
-  <rect x="200" y="694" width="139.4" height="13" rx="2" class="llama"/><text x="347" y="705" class="value">265.58</text>
-  <rect x="700" y="676" width="173.5" height="13" rx="2" class="mollm"/><text x="881" y="687" class="value">115.64</text>
-  <rect x="700" y="694" width="145.7" height="13" rx="2" class="llama"/><text x="853" y="705" class="value">97.15</text>
-
-  <text x="40" y="743" class="label">Qwen3.5-4B</text>
-  <rect x="200" y="722" width="60.6" height="13" rx="2" class="mollm"/><text x="268" y="733" class="value">115.37</text>
-  <rect x="200" y="740" width="73.8" height="13" rx="2" class="llama"/><text x="281" y="751" class="value">140.51</text>
-  <rect x="700" y="722" width="83.9" height="13" rx="2" class="mollm"/><text x="791" y="733" class="value">55.94</text>
-  <rect x="700" y="740" width="66.4" height="13" rx="2" class="llama"/><text x="774" y="751" class="value">44.25</text>
-
-  <text x="40" y="789" class="label">Qwen3.6-35B-A3B</text>
-  <rect x="200" y="768" width="73.3" height="13" rx="2" class="mollm"/><text x="281" y="779" class="value">139.63</text>
-  <rect x="200" y="786" width="61.4" height="13" rx="2" class="llama"/><text x="269" y="797" class="value">116.93</text>
-  <rect x="700" y="768" width="98.0" height="13" rx="2" class="mollm"/><text x="806" y="779" class="value">65.32</text>
-  <rect x="700" y="786" width="65.6" height="13" rx="2" class="llama"/><text x="773" y="797" class="value">43.73</text>
-
-  <text x="40" y="835" class="label">Qwen3-30B-A3B</text>
-  <rect x="200" y="814" width="75.3" height="13" rx="2" class="mollm"/><text x="283" y="825" class="value">143.50</text>
-  <rect x="200" y="832" width="57.9" height="13" rx="2" class="llama"/><text x="266" y="843" class="value">110.34</text>
-  <rect x="700" y="814" width="95.8" height="13" rx="2" class="mollm"/><text x="804" y="825" class="value">63.85</text>
-  <rect x="700" y="832" width="91.2" height="13" rx="2" class="llama"/><text x="799" y="843" class="value">60.77</text>
-
-  <text x="40" y="881" class="label">Qwen3.5-122B SSD</text>
-  <rect x="200" y="860" width="19.9" height="13" rx="2" class="mollm"/><text x="227" y="871" class="value">37.99</text>
-  <text x="200" y="889" class="value">0 (OOM)</text>
-  <rect x="700" y="860" width="20.3" height="13" rx="2" class="mollm"/><text x="728" y="871" class="value">13.54</text>
-  <text x="700" y="889" class="value">0 (OOM)</text>
-
-  <line x1="200" y1="914" x2="620" y2="914" class="axis"/>
-  <text x="196" y="932" class="tick">0</text><text x="296" y="932" class="tick">200</text><text x="401" y="932" class="tick">400</text><text x="506" y="932" class="tick">600</text><text x="611" y="932" class="tick">800</text>
-  <line x1="700" y1="914" x2="1120" y2="914" class="axis"/>
-  <text x="696" y="932" class="tick">0</text><text x="799" y="932" class="tick">70</text><text x="901" y="932" class="tick">140</text><text x="1009" y="932" class="tick">210</text><text x="1111" y="932" class="tick">280</text>
-  <text x="40" y="964" class="subtitle">122B prefill uses the standard median; decode uses a 16-token prompt / 128-token output interactive measurement.</text>
+  <text x="40" y="686" class="section">W4</text>
+  <text x="200" y="686" class="panel">Prompt / prefill pp256 tokens/s</text>
+  <text x="700" y="686" class="panel">Decode tg64 tokens/s</text>
+  <line x1="40" y1="700" x2="1140" y2="700" class="rule"/>
+  <line x1="200" y1="706" x2="200" y2="1042" class="grid"/><line x1="305" y1="706" x2="305" y2="1042" class="grid"/><line x1="410" y1="706" x2="410" y2="1042" class="grid"/><line x1="515" y1="706" x2="515" y2="1042" class="grid"/><line x1="620" y1="706" x2="620" y2="1042" class="grid"/>
+  <line x1="700" y1="706" x2="700" y2="1042" class="grid"/><line x1="805" y1="706" x2="805" y2="1042" class="grid"/><line x1="910" y1="706" x2="910" y2="1042" class="grid"/><line x1="1015" y1="706" x2="1015" y2="1042" class="grid"/><line x1="1120" y1="706" x2="1120" y2="1042" class="grid"/>
+  <text x="40" y="733" class="label">Qwen3.5-0.8B</text>
+  <rect x="200" y="712" width="356.2" height="13" rx="2" class="mollm"/><text x="563" y="723" class="value">678.41</text>
+  <rect x="200" y="730" width="407.4" height="13" rx="2" class="llama"/><text x="614" y="741" class="value">775.95</text>
+  <rect x="700" y="712" width="389.1" height="13" rx="2" class="mollm"/><text x="1096" y="723" class="value">259.43</text>
+  <rect x="700" y="730" width="286.3" height="13" rx="2" class="llama"/><text x="993" y="741" class="value">190.89</text>
+  <text x="40" y="779" class="label">Youtu-LLM-2B</text>
+  <rect x="200" y="758" width="130.2" height="13" rx="2" class="mollm"/><text x="338" y="769" class="value">248.08</text>
+  <rect x="200" y="776" width="139.4" height="13" rx="2" class="llama"/><text x="347" y="787" class="value">265.58</text>
+  <rect x="700" y="758" width="173.5" height="13" rx="2" class="mollm"/><text x="881" y="769" class="value">115.64</text>
+  <rect x="700" y="776" width="145.7" height="13" rx="2" class="llama"/><text x="853" y="787" class="value">97.15</text>
+  <text x="40" y="825" class="label">Qwen3.5-4B</text>
+  <rect x="200" y="804" width="60.6" height="13" rx="2" class="mollm"/><text x="268" y="815" class="value">115.37</text>
+  <rect x="200" y="822" width="73.8" height="13" rx="2" class="llama"/><text x="281" y="833" class="value">140.51</text>
+  <rect x="700" y="804" width="83.9" height="13" rx="2" class="mollm"/><text x="791" y="815" class="value">55.94</text>
+  <rect x="700" y="822" width="66.4" height="13" rx="2" class="llama"/><text x="774" y="833" class="value">44.25</text>
+  <text x="40" y="871" class="label">RWKV7-1.5B mixed</text>
+  <rect x="200" y="850" width="144.0" height="13" rx="2" class="mollm"/><text x="351" y="861" class="value">274.25</text>
+  <rect x="200" y="868" width="192.5" height="13" rx="2" class="llama"/><text x="400" y="879" class="value">366.76</text>
+  <rect x="700" y="850" width="193.7" height="13" rx="2" class="mollm"/><text x="901" y="861" class="value">129.12</text>
+  <rect x="700" y="868" width="166.0" height="13" rx="2" class="llama"/><text x="873" y="879" class="value">110.68</text>
+  <text x="40" y="917" class="label">Qwen3.6-35B-A3B</text>
+  <rect x="200" y="896" width="73.3" height="13" rx="2" class="mollm"/><text x="281" y="907" class="value">139.63</text>
+  <rect x="200" y="914" width="61.4" height="13" rx="2" class="llama"/><text x="269" y="925" class="value">116.93</text>
+  <rect x="700" y="896" width="98.0" height="13" rx="2" class="mollm"/><text x="806" y="907" class="value">65.32</text>
+  <rect x="700" y="914" width="65.6" height="13" rx="2" class="llama"/><text x="773" y="925" class="value">43.73</text>
+  <text x="40" y="963" class="label">Qwen3-30B-A3B</text>
+  <rect x="200" y="942" width="75.3" height="13" rx="2" class="mollm"/><text x="283" y="953" class="value">143.50</text>
+  <rect x="200" y="960" width="57.9" height="13" rx="2" class="llama"/><text x="266" y="971" class="value">110.34</text>
+  <rect x="700" y="942" width="95.8" height="13" rx="2" class="mollm"/><text x="804" y="953" class="value">63.85</text>
+  <rect x="700" y="960" width="91.2" height="13" rx="2" class="llama"/><text x="799" y="971" class="value">60.77</text>
+  <text x="40" y="1009" class="label">Qwen3.5-122B SSD</text>
+  <rect x="200" y="988" width="19.9" height="13" rx="2" class="mollm"/><text x="227" y="999" class="value">37.99</text>
+  <text x="200" y="1017" class="value">0 (OOM)</text>
+  <rect x="700" y="988" width="20.3" height="13" rx="2" class="mollm"/><text x="728" y="999" class="value">13.54</text>
+  <text x="700" y="1017" class="value">0 (OOM)</text>
+  <line x1="200" y1="1042" x2="620" y2="1042" class="axis"/>
+  <text x="196" y="1060" class="tick">0</text><text x="296" y="1060" class="tick">200</text><text x="401" y="1060" class="tick">400</text><text x="506" y="1060" class="tick">600</text><text x="611" y="1060" class="tick">800</text>
+  <line x1="700" y1="1042" x2="1120" y2="1042" class="axis"/>
+  <text x="696" y="1060" class="tick">0</text><text x="799" y="1060" class="tick">70</text><text x="901" y="1060" class="tick">140</text><text x="1009" y="1060" class="tick">210</text><text x="1111" y="1060" class="tick">280</text>
+  <text x="40" y="1098" class="subtitle">122B prefill uses the standard median; decode uses a 16-token prompt / 128-token output interactive measurement.</text>
 </svg>

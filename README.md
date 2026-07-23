@@ -91,6 +91,7 @@ On Apple, mollm uses Accelerate SGEMM for eligible large FP16 prefill GEMMs.
 | Qwen3.5-0.8B | **757.74** / **123.68** | 664.54 / 97.87 | mollm faster prefill and decode |
 | Youtu-LLM-2B | **335.44** / **51.32** | 258.13 / 46.73 | mollm faster prefill and decode |
 | Qwen3.5-4B | 135.00 / **25.22** | **144.30** / 22.14 | llama faster prefill, mollm faster decode |
+| RWKV7-1.5B | **430.51** / **70.09** | 395.83 / 57.18 | mollm faster prefill and decode |
 
 ### W8
 
@@ -99,6 +100,7 @@ On Apple, mollm uses Accelerate SGEMM for eligible large FP16 prefill GEMMs.
 | Qwen3.5-0.8B | 671.73 / **217.69** | **782.16** / 167.63 | llama faster prefill, mollm faster decode |
 | Youtu-LLM-2B | 253.05 / **89.53** | **263.95** / 86.58 | close prefill, mollm slightly faster decode |
 | Qwen3.5-4B | 118.55 / **46.64** | **135.58** / 40.50 | llama faster prefill, mollm faster decode |
+| RWKV7-1.5B | 274.16 / **121.34** | **377.64** / 96.50 | llama faster prefill, mollm faster decode |
 
 ### W4
 
@@ -107,29 +109,10 @@ On Apple, mollm uses Accelerate SGEMM for eligible large FP16 prefill GEMMs.
 | Qwen3.5-0.8B | 678.41 / **259.43** | **775.95** / 190.89 | llama faster prefill, mollm faster decode |
 | Youtu-LLM-2B | 248.08 / **115.64** | **265.58** / 97.15 | llama faster prefill, mollm faster decode |
 | Qwen3.5-4B | 115.37 / **55.94** | **140.51** / 44.25 | llama faster prefill, mollm faster decode |
+| RWKV7-1.5B mixed W4 | 274.25 / **129.12** | **366.76** / 110.68 | llama faster prefill, mollm faster decode |
 
-### RWKV7 1.5B
-
-RWKV7 uses the same Apple M5 Pro CPU protocol described above. `base` is the
-regular FFN-down GEMV graph; `sparseA` replaces that edge with a decode-oriented
-operator that skips exact zeros produced by `ReLU²`. Prefill falls back to the
-regular GEMM. The llama.cpp rows use build `5c7c22c3e` with
-`GGML_BLAS=ON`, `GGML_METAL=OFF`, and `GGML_CPU_REPACK=ON`.
-
-| Precision | mollm base pp/tg | mollm sparseA pp/tg | llama.cpp pp/tg |
-|---|---:|---:|---:|
-| FP16 / F16 | 427.49 / 68.00 | **430.51 / 70.09** | 395.83 / 57.18 |
-| W8PC / Q8_0 | 274.16 / **121.34** | 287.10 / 117.90 | **377.64** / 96.50 |
-| W4 mixed / Q4_0 | 267.48 / 127.75 | 274.25 / **129.12** | **366.76** / 110.68 |
-
-The mixed W4 package keeps `lm_head` and the small attention `w/a/v/g`
-low-rank matrices in W8G128; large attention and FFN matrices use W4G128, and
-the embedding remains FP16. Observed FFN `ReLU²` nonzero density ranges from
-about 1.7% to 24.5%. FP16 uses sparseA broadly. W4 enables it only for the
-first six layers below a 3% density threshold. The W8 sparse kernel is
-implemented and tested, but the default policy falls back to the faster dense
-q8-dot GEMV; its two columns therefore mainly show run-to-run system variance,
-not a retained sparseA speedup.
+RWKV7 FP16 and mixed-W4 rows use its default sparse-A policy; W8 uses the
+default q8-dot dense GEMV path.
 
 ### MoE W4
 
@@ -258,14 +241,6 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
 
 # Mixed W4 quality package.
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm w4mixg128
-```
-
-RWKV7 checkpoints use the dedicated `.pth` converter:
-
-```bash
-python3 models/rwkv7.py model.pth rwkv7_fp16.mollm --quant fp16 --tokenizer rwkv_vocab_v20230424.txt
-python3 models/rwkv7.py model.pth rwkv7_w8pc.mollm --quant w8pc --tokenizer rwkv_vocab_v20230424.txt
-python3 models/rwkv7.py model.pth rwkv7_w4mixg128.mollm --quant w4mixg128 --tokenizer rwkv_vocab_v20230424.txt
 ```
 
 MoE example:
