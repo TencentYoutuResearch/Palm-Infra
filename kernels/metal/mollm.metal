@@ -1725,7 +1725,7 @@ kernel void sdpa_append_f32_to_f16(
 // Lanes cooperate: the QK dot for each key is a simd_sum over head_dim; each
 // lane then owns a strided subset of the v_head_dim output accumulator. Single-
 // pass online softmax. Fallback when the tensor FA path (sdpa_prefill_fa2_f32)
-// is unavailable, or forced via MOLLM_METAL_SDPA_SIMPLE=1.
+// is unavailable.
 // grid: threadgroups = ceil(num_heads*src_seqlen / (TG/32)); TG=128 (4 groups).
 // ---------------------------------------------------------------------------
 kernel void sdpa_prefill_f32(

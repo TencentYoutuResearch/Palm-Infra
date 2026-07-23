@@ -51,6 +51,7 @@ set(SOURCES
     kernels/threading.cpp
     # engine
     engine/engine.cpp
+    engine/sampler.cpp
     engine/tokenizer.cpp
 )
 

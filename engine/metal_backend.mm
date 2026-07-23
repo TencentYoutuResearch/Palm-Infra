@@ -232,20 +232,17 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
 
         // Enable the tensor-API GEMM only if the kernel was compiled (metallib
         // built with -DMOLLM_METAL_TENSOR) AND the GPU is M5/A19+ (MTLGPUFamily
-        // Metal4), and the pipeline actually loads. Overridable via env.
+        // Metal4), and the pipeline actually loads.
 #ifdef MOLLM_METAL_TENSOR
-        if (!getenv("MOLLM_METAL_NO_TENSOR")) {
-            bool fam = false;
-            if (@available(macOS 15.0, *)) {
-                fam = [impl_->device supportsFamily:MTLGPUFamilyMetal4];
-            }
-            // Metal 4 tensor-API GEMM is correct (parity-tested) and ~2.3x faster
-            // than the simdgroup path (prefill 940 vs 403 t/s). Enabled by default
-            // on M5/A19+; disable with MOLLM_METAL_NO_TENSOR_GEMM for A/B testing.
-            if (fam && !getenv("MOLLM_METAL_NO_TENSOR_GEMM") &&
-                impl_->pipeline("gemm_tensor_f32a_f16b_f32c") != nil) {
-                impl_->has_tensor = true;
-            }
+        bool fam = false;
+        if (@available(macOS 15.0, *)) {
+            fam = [impl_->device supportsFamily:MTLGPUFamilyMetal4];
+        }
+        // Metal 4 tensor-API GEMM is correct (parity-tested) and ~2.3x faster
+        // than the simdgroup path (prefill 940 vs 403 t/s). Enable it whenever
+        // the device and compiled pipeline support it.
+        if (fam && impl_->pipeline("gemm_tensor_f32a_f16b_f32c") != nil) {
+            impl_->has_tensor = true;
         }
         if (getenv("MOLLM_METAL_DEBUG"))
             fprintf(stderr, "MetalBackend: tensor GEMM %s\n",
@@ -789,16 +786,9 @@ void MetalBackend::dispatch(const GraphNode& node,
         if (p.M == 1) {
             // GEMV v2: each threadgroup owns NR0=2 output rows; NSG simdgroups
             // split K and reduce via shmem, so large-K matmuls (down_proj K=9728)
-            // get up to 4x32 lanes. MOLLM_METAL_GEMV_OLD=1 -> old kernel.
-            static const bool gemv_old = (getenv("MOLLM_METAL_GEMV_OLD") != nullptr);
-            // NR0 = output rows per threadgroup (activation reuse). Default 2;
-            // tune via MOLLM_METAL_GEMV_NR0 (1..8).
-            static const int NR0 = []{
-                const char* e = getenv("MOLLM_METAL_GEMV_NR0");
-                int v = e ? atoi(e) : 2;
-                if (v < 1) v = 1; if (v > 8) v = 8;
-                return v;
-            }();
+            // get up to 4x32 lanes.
+            constexpr bool gemv_old = false;
+            constexpr int NR0 = 2;
             // Bind weight at BYTE offset (64-bit) to avoid uint32 element-offset
             // overflow for late weights in the 8.8GB region (esp. lm_head).
             MatmulParams pv = p; pv.b_offset = 0;
@@ -811,11 +801,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                 [enc setComputePipelineState:gemv2_ps];
                 // NSG cap: number of simdgroups splitting K. 8 is the M5 sweet
                 // spot (large-K down_proj K=9728 / o_proj K=4096 get more lanes;
-                // plateaus past 8, tapers at 16). Tunable via env.
-                static const int NSG_CAP = []{
-                    const char* e = getenv("MOLLM_METAL_GEMV_NSG_CAP");
-                    int v = e ? atoi(e) : 8; if (v < 1) v = 1; if (v > 32) v = 32; return v;
-                }();
+                // plateaus past 8, tapers at 16).
+                constexpr int NSG_CAP = 8;
                 int nsg = std::min(NSG_CAP, (p.K + 127) / 128);
                 if (nsg < 1) nsg = 1;
                 [enc setThreadgroupMemoryLength:(NSUInteger)(NR0 * 32 * sizeof(float)) atIndex:0];
@@ -1002,8 +989,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             // simdgroup (tested 64x32 -> 219 t/s, 32x64 acc[8] -> 226 t/s, TK=32
             // -> 357) all LOWER perf by reducing resident threadgroup count.
             // Apple GPUs favor many small threadgroups over deep register
-            // blocking (opposite of NVIDIA). Those variants kept behind
-            // MOLLM_METAL_GEMM64 / MOLLM_METAL_GEMMN64 for experimentation.
+            // blocking (opposite of NVIDIA).
             // Weight bound at 64-bit byte offset, b_offset=0.
             MatmulParams pt = p; pt.b_offset = 0;
 #ifdef MOLLM_METAL_TENSOR
@@ -1026,30 +1012,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
             } else
 #endif
-            if (getenv("MOLLM_METAL_GEMMN64")) {
-                id<MTLComputePipelineState> ps = impl_->pipeline("gemm_tiledN64_f32a_f16b_f32c");
-                [enc setComputePipelineState:ps];
-                [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-                [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
-                [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
-                [enc setBytes:&pt length:sizeof(pt) atIndex:3];
-                [enc setThreadgroupMemoryLength:(32*8 + 64*8)*2 atIndex:0];
-                MTLSize tgc = MTLSizeMake(((NSUInteger)p.N + 63)/64,
-                                          ((NSUInteger)p.M + 31)/32, 1);
-                [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
-            } else if (getenv("MOLLM_METAL_GEMM64")) {
-                id<MTLComputePipelineState> ps = impl_->pipeline("gemm_tiled64_f32a_f16b_f32c");
-                [enc setComputePipelineState:ps];
-                [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-                [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
-                [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
-                [enc setBytes:&pt length:sizeof(pt) atIndex:3];
-                [enc setThreadgroupMemoryLength:768*sizeof(float) atIndex:0];  // staging
-                [enc setThreadgroupMemoryLength:256*sizeof(float) atIndex:1];  // store scratch
-                MTLSize tgc = MTLSizeMake(((NSUInteger)p.N + 31)/32,
-                                          ((NSUInteger)p.M + 63)/64, 1);
-                [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
-            } else {
+            {
                 id<MTLComputePipelineState> ps = impl_->pipeline("gemm_tiled_f32a_f16b_f32c");
                 [enc setComputePipelineState:ps];
                 [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
@@ -1414,9 +1377,8 @@ void MetalBackend::dispatch(const GraphNode& node,
         // Prefill SDPA routing:
         //   default -> sdpa_prefill_fa2_f32 (flash attention: query-split,
         //              direct-global K/V MMA, threadgroup-O elementwise rescale).
-        //   MOLLM_METAL_SDPA_SIMPLE=1 -> per-query online-softmax sdpa_prefill_f32.
         // fa2 requires dk/dv %8, <=256 (C=64 & PV8 divisible by NSG=4 always hold).
-        static const bool use_simple = (getenv("MOLLM_METAL_SDPA_SIMPLE") != nullptr);
+        constexpr bool use_simple = false;
         const int FA2_NSG = 4, FA2_Q = 8;
         // fa2 declares function constants without defaults, so it can ONLY be built
         // via the specialized (pipeline_fa2) path — never the plain name-keyed
@@ -1550,8 +1512,8 @@ void MetalBackend::dispatch(const GraphNode& node,
         // 3-D Tensor shape (see wrap_weight_int4_g128).
         // Decode uses selected-expert tensor MMA by default on Metal 4 GPUs.
         // Prefill stays on the CPU hybrid path until expert-grouped M tiles are
-        // available; disable GPU decode for diagnostics with MOLLM_METAL_MOE_CPU.
-        bool gpu_w4 = !getenv("MOLLM_METAL_MOE_CPU") && impl_->has_tensor &&
+        // available.
+        bool gpu_w4 = impl_->has_tensor &&
             !has_shared && router_score_func == 1 && inputs.size() > 8 &&
             inputs[1]->prec == Precision::FP16 && inputs[2]->prec == Precision::INT4 &&
             inputs[3]->prec == Precision::INT4 && top_k <= 16 && n_group <= 16 &&

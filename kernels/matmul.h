@@ -1,20 +1,43 @@
 #pragma once
 
+#include "kernels/activations.h" // for Activation enum
 #include "kernels/tensor.h"
-#include "kernels/activations.h"  // for Activation enum
+
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 class ThreadPool;
 
 // Runtime-configurable matmul parameters (for benchmarking).
 struct MatmulConfig {
-    int k_block = 2048;          // 0 = disable K-blocking (sweep: 512→2048 = +4-8%)
-    int gemv_chunk_size = 64;   // chunk size for M==1 or N==1 shapes
-    bool use_interleave_pack = true;  // B interleaved packing for FP16
-    bool use_fp16_accumulate = true;  // FP16 accumulate (2x throughput, may lose precision)
+    int k_block = 2048;              // 0 = disable K-blocking (sweep: 512→2048 = +4-8%)
+    int gemv_chunk_size = 64;        // chunk size for M==1 or N==1 shapes
+    bool use_interleave_pack = true; // B interleaved packing for FP16
+    bool use_fp16_accumulate =
+        true; // FP16 accumulate (2x throughput, may lose precision)
 };
 
 extern MatmulConfig g_matmul_config;
-extern bool g_mollm_force_fp32_acc;  // debug: force FP32 accumulation
+extern bool g_mollm_force_fp32_acc; // debug: force FP32 accumulation
+
+// Engine-lifetime buffers that own load-time matmul repacks. The key is the
+// package/file weight path plus a layout suffix where one source weight needs
+// multiple layouts.
+using PackedWeightMap = std::unordered_map<std::string, std::vector<uint8_t>>;
+
+// Whether this build can consume the packed INT4 Q4-dot/BG128 layouts emitted
+// by the converter.
+bool matmul_int4_q4dot_kernel_available();
+
+// Prepare load-time layouts consumed by the CPU matmul kernels. `weight_data`
+// must point at the source row-major (or prepacked INT4) bytes for `weight`.
+// Embedding tables pass false for `pack_fp16` because lookup requires their
+// original row-major layout.
+void prepare_matmul_weight(Tensor& weight, const std::string& key,
+                           const void* weight_data,
+                           PackedWeightMap& packed_weights,
+                           bool pack_fp16 = true);
 
 extern "C" {
 int mollm_matmul_shape_profile_enabled();
@@ -43,8 +66,7 @@ void mollm_print_matmul_shape_profile(const char* title, int top_n);
 
 void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         ThreadPool* thread_pool = nullptr,
-                        Activation act = Activation::NONE,
-                        int act_n_begin = 0,
+                        Activation act = Activation::NONE, int act_n_begin = 0,
                         int act_n_len = -1);
 
 void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
@@ -57,19 +79,23 @@ void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
 // Returns newly allocated buffer (caller owns, must delete[]).
 // K_weight is the stride between consecutive k rows in B_original
 // (typically == K for row-major).
-__fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K, int K_weight);
+__fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K,
+                                int K_weight);
 
 // Pack full int8 B [N, K] row-major -> interleaved [N/8, K, 8] layout.
 // Same layout as FP16 B packing, but with int8 elements. Padding rows are zero.
-int8_t* pack_b_interleaved_int8_full(const int8_t* B_original, int N, int K, int K_weight);
+int8_t* pack_b_interleaved_int8_full(const int8_t* B_original, int N, int K,
+                                     int K_weight);
 
 // Pack full int8 B [N, K] row-major -> Q8-dot layout [N/8, K/32, 8, 32].
 // Padding output rows and K tail are zero.
-int8_t* pack_b_q8dot_int8_full(const int8_t* B_original, int N, int K, int K_weight);
+int8_t* pack_b_q8dot_int8_full(const int8_t* B_original, int N, int K,
+                               int K_weight);
 
 // Pack full int4 B [N, ceil(K/2)] row-major -> Q4-dot layout
 // [N/8, K/32, 8, 16 packed bytes]. Padding output rows and K tail are zero.
-uint8_t* pack_b_q4dot_int4_full(const uint8_t* B_original, int N, int K, int K_weight);
+uint8_t* pack_b_q4dot_int4_full(const uint8_t* B_original, int N, int K,
+                                int K_weight);
 
 // Pack Q4-dot B plus W4G128 scales -> [N/8, K/128] blocks.
 // Each block stores float scales[8] then q4dot q[4][8][16].

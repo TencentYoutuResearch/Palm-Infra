@@ -151,9 +151,119 @@ def _mix(g: GraphBuilder, x: int, sx: int, mix: int) -> int:
 
 def _lora(g: GraphBuilder, x: int, w1: int, w2: int, activation=None) -> int:
     y = g.matmul(x, w1)
-    if activation == "tanh": y = g.tanh(y)
-    elif activation == "sigmoid_exact": y = g.sigmoid_exact(y)
+    if activation == "tanh":
+        y = g.tanh(y)
+    elif activation == "sigmoid_exact":
+        y = g.sigmoid_exact(y)
     return g.matmul(y, w2)
+
+
+def _build_attention_block(g: GraphBuilder, root: str, weights: dict[str, np.ndarray],
+                           layer: int, x: int, state: int, att_shift: int,
+                           v_first, hidden: int, heads: int, head_size: int,
+                           seq_len: int, quant: str) -> tuple[int, int]:
+    block = f"blocks_{layer}"
+    attention = f"{block}_att"
+
+    def scalar(name: str) -> int:
+        return _scalar_weight(g, root, f"{attention}_{name}", (hidden,))
+
+    def linear(name: str, source: int) -> int:
+        array = weights[f"blocks.{layer}.att.{name}.weight"]
+        weight = _weight(g, root, f"{attention}_{name}_weight",
+                         tuple(array.shape), quant=quant)
+        return g.matmul(source, weight)
+
+    # .pth LoRA matrices are [hidden, rank] / [rank, hidden], unlike Linear weights.
+    def lora(name: str, source: int, activation=None) -> int:
+        first = weights[f"blocks.{layer}.att.{name}1"]
+        second = weights[f"blocks.{layer}.att.{name}2"]
+        w1 = _weight(g, root, f"{attention}_{name}1", tuple(first.shape[::-1]),
+                     quant=quant)
+        w2 = _weight(g, root, f"{attention}_{name}2", tuple(second.shape[::-1]),
+                     quant=quant)
+        return _lora(g, source, w1, w2, activation)
+
+    ln_weight = _scalar_weight(g, root, f"{block}_ln1_weight", (hidden,))
+    ln_bias = _scalar_weight(g, root, f"{block}_ln1_bias", (hidden,))
+    normalized = g.layer_norm(x, ln_weight, ln_bias)
+    shifted = g.rwkv_token_shift(normalized, att_shift, hidden, seq_len)
+
+    mix_weights = [scalar(name) for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g")]
+    xr, xw, xk, xv, xa, xg = (_mix(g, normalized, shifted, mix) for mix in mix_weights)
+    receptance = linear("receptance", xr)
+    key = linear("key", xk)
+    value = linear("value", xv)
+
+    w_delta = lora("w", xw, "tanh")
+    a_delta = lora("a", xa)
+    gate = lora("g", xg, "sigmoid_exact")
+    decay = g.exp_exact(g.scalar_mul(g.sigmoid_exact(g.add(w_delta, scalar("w0"))), -0.606531))
+    alpha = g.sigmoid_exact(g.add(a_delta, scalar("a0")))
+    normalized_key = g.rwkv_l2_norm(g.mul(key, scalar("k_k")), heads, head_size, 1e-6)
+    rwkv_key = g.mul(
+        key,
+        g.scalar_add(g.mul(g.scalar_add(alpha, -1.0), scalar("k_a")), 1.0),
+    )
+
+    if layer == 0:
+        v_first = value
+        rwkv_value = value
+    else:
+        v_delta = lora("v", xv)
+        value_mix = g.sigmoid_exact(g.add(v_delta, scalar("v0")))
+        rwkv_value = g.add(
+            value,
+            g.mul(g.add(v_first, g.scalar_mul(value, -1.0)), value_mix),
+        )
+
+    raw = g.rwkv7_core(
+        receptance,
+        decay,
+        rwkv_key,
+        rwkv_value,
+        g.scalar_mul(normalized_key, -1.0),
+        g.mul(normalized_key, alpha),
+        state,
+        heads,
+        head_size,
+        seq_len,
+    )
+    attention_out = g.rwkv_post(
+        raw,
+        receptance,
+        rwkv_key,
+        rwkv_value,
+        scalar("r_k"),
+        scalar("ln_x_weight"),
+        scalar("ln_x_bias"),
+        gate,
+        heads,
+        head_size,
+    )
+    output_array = weights[f"blocks.{layer}.att.output.weight"]
+    output_weight = _weight(g, root, f"{attention}_output_weight",
+                            tuple(output_array.shape), quant=quant)
+    return g.add(x, g.matmul(attention_out, output_weight)), v_first
+
+
+def _build_ffn_block(g: GraphBuilder, root: str, weights: dict[str, np.ndarray],
+                     layer: int, x: int, ffn_shift: int, hidden: int,
+                     seq_len: int, quant: str) -> int:
+    block = f"blocks_{layer}"
+    ffn = f"{block}_ffn"
+    ln_weight = _scalar_weight(g, root, f"{block}_ln2_weight", (hidden,))
+    ln_bias = _scalar_weight(g, root, f"{block}_ln2_bias", (hidden,))
+    normalized = g.layer_norm(x, ln_weight, ln_bias)
+    shifted = g.rwkv_token_shift(normalized, ffn_shift, hidden, seq_len)
+    mixed_key = _mix(g, normalized, shifted, _scalar_weight(g, root, f"{ffn}_x_k", (hidden,)))
+
+    key_array = weights[f"blocks.{layer}.ffn.key.weight"]
+    value_array = weights[f"blocks.{layer}.ffn.value.weight"]
+    key_weight = _weight(g, root, f"{ffn}_key_weight", tuple(key_array.shape), quant=quant)
+    value_weight = _weight(g, root, f"{ffn}_value_weight", tuple(value_array.shape), quant=quant)
+    key = g.matmul(mixed_key, key_weight, activation=Activation.RELU_SQUARED)
+    return g.add(x, g.gemv_sparse_a(key, value_weight))
 
 
 def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool,
@@ -167,83 +277,71 @@ def build_graph(root: str, w: dict[str, np.ndarray], seq_len: int, prefill: bool
              _matrix_precision(quant, "lm_head", hidden))
     dyn = (DimExpr.const(), DimExpr.seq(), DimExpr.const(), DimExpr.const()) if prefill else None
     x = g.input("hidden", (hidden, seq_len), dynamic=dyn)
-    states=[]
+    states = []
     for i in range(layers):
         # Match llama.cpp and the reference recurrence: WKV state remains FP32.
         # This also avoids a full matrix conversion around every token.
-        states.append((g.input(f"rwkv_state{i}", (hs, hs, heads), Precision.FP32),
-                       g.input(f"rwkv_att_shift{i}", (hidden,), Precision.FP16),
-                       g.input(f"rwkv_ffn_shift{i}", (hidden,), Precision.FP16)))
+        states.append((
+            g.input(f"rwkv_state{i}", (hs, hs, heads), Precision.FP32),
+            g.input(f"rwkv_att_shift{i}", (hidden,), Precision.FP16),
+            g.input(f"rwkv_ffn_shift{i}", (hidden,), Precision.FP16),
+        ))
 
     v_first = None
     for i in range(layers):
-        p=f"blocks_{i}"; a=f"{p}_att"; f=f"{p}_ffn"; state, ashift, fshift=states[i]
-        ln1w=_scalar_weight(g,root,f"{p}_ln1_weight",(hidden,)); ln1b=_scalar_weight(g,root,f"{p}_ln1_bias",(hidden,))
-        xn=g.layer_norm(x,ln1w,ln1b)
-        sx=g.rwkv_token_shift(xn,ashift,hidden,seq_len)
-        def av(n): return _scalar_weight(g,root,f"{a}_{n}",(hidden,))
-        mix_weights=[av(n) for n in ("x_r","x_w","x_k","x_v","x_a","x_g")]
-        xr,xw,xk,xv,xa,xg=(_mix(g,xn,sx,m) for m in mix_weights)
-        def lin(n, source):
-            arr=w[f"blocks.{i}.att.{n}.weight"]
-            return g.matmul(source,_weight(g,root,f"{a}_{n}_weight",tuple(arr.shape),quant=quant))
-        r=lin("receptance",xr); k=lin("key",xk); v=lin("value",xv)
-        # pth LoRA matrices are [hidden, rank] / [rank, hidden], unlike Linear weights.
-        def lora(n, source, activation=None):
-            w1=w[f"blocks.{i}.att.{n}1"]; w2=w[f"blocks.{i}.att.{n}2"]
-            return _lora(g,source,_weight(g,root,f"{a}_{n}1",tuple(w1.shape[::-1]),quant=quant),
-                         _weight(g,root,f"{a}_{n}2",tuple(w2.shape[::-1]),quant=quant),activation)
-        wd=lora("w",xw,"tanh"); ad=lora("a",xa); gd=lora("g",xg,"sigmoid_exact")
-        decay=g.exp_exact(g.scalar_mul(g.sigmoid_exact(g.add(wd,av("w0"))),-0.606531))
-        alpha=g.sigmoid_exact(g.add(ad,av("a0")))
-        kk=g.rwkv_l2_norm(g.mul(k,av("k_k")),heads,hs,1e-6)
-        kval=g.mul(k,g.scalar_add(g.mul(g.scalar_add(alpha,-1.0),av("k_a")),1.0))
-        if i == 0:
-            v_first=v; vval=v
-        else:
-            vd=lora("v",xv)
-            vmix=g.sigmoid_exact(g.add(vd,av("v0")))
-            vval=g.add(v,g.mul(g.add(v_first,g.scalar_mul(v,-1.0)),vmix))
-        raw=g.rwkv7_core(r,decay,kval,vval,g.scalar_mul(kk,-1.0),
-                         g.mul(kk,alpha),state,heads,hs,seq_len)
-        att=g.rwkv_post(raw,r,kval,vval,av("r_k"),av("ln_x_weight"),
-                        av("ln_x_bias"),gd,heads,hs)
-        outw=_weight(g,root,f"{a}_output_weight",tuple(w[f"blocks.{i}.att.output.weight"].shape),quant=quant)
-        x=g.add(x,g.matmul(att,outw))
-        ln2w=_scalar_weight(g,root,f"{p}_ln2_weight",(hidden,)); ln2b=_scalar_weight(g,root,f"{p}_ln2_bias",(hidden,))
-        xn=g.layer_norm(x,ln2w,ln2b); sx=g.rwkv_token_shift(xn,fshift,hidden,seq_len)
-        xk=_mix(g,xn,sx,_scalar_weight(g,root,f"{f}_x_k",(hidden,)))
-        kw=w[f"blocks.{i}.ffn.key.weight"]; vw=w[f"blocks.{i}.ffn.value.weight"]
-        key=g.matmul(xk,_weight(g,root,f"{f}_key_weight",tuple(kw.shape),quant=quant),
-                     activation=Activation.RELU_SQUARED)
-        x=g.add(x,g.gemv_sparse_a(key,_weight(g,root,f"{f}_value_weight",tuple(vw.shape),quant=quant)))
-    x=g.layer_norm(x,_scalar_weight(g,root,"final_norm_w",(hidden,)),_scalar_weight(g,root,"final_norm_b",(hidden,)))
+        state, att_shift, ffn_shift = states[i]
+        x, v_first = _build_attention_block(
+            g, root, w, i, x, state, att_shift, v_first, hidden, heads, hs, seq_len, quant,
+        )
+        x = _build_ffn_block(g, root, w, i, x, ffn_shift, hidden, seq_len, quant)
+    x = g.layer_norm(
+        x,
+        _scalar_weight(g, root, "final_norm_w", (hidden,)),
+        _scalar_weight(g, root, "final_norm_b", (hidden,)),
+    )
     return g
 
 
 def convert_rwkv7(checkpoint: str, output_path: str, prefill_seq_len: int = 256,
                   tokenizer_path: str = "", quant: str = "fp16") -> None:
-    path=Path(checkpoint); w=_torch_load(path)
+    path = Path(checkpoint)
+    weights = _torch_load(path)
     quant = _canonical_quant(quant)
-    layers,vocab,hidden,heads,hs=_info(w)
-    tmp=tempfile.mkdtemp(prefix="mollm_rwkv7_")
+    layers, vocab, hidden, heads, head_size = _info(weights)
+    metadata = {
+        "model_name": path.stem,
+        "architecture": "rwkv7",
+        "num_layers": layers,
+        "hidden_size": hidden,
+        "num_heads": heads,
+        "head_dim": head_size,
+        "vocab_size": vocab,
+        "prefill_seq_len": prefill_seq_len,
+        "quantization": quant,
+        "rwkv_chat_template": "rwkv_legacy",
+        "experimental": True,
+    }
+    tmp = tempfile.mkdtemp(prefix="mollm_rwkv7_")
     try:
-        export_weights(w,tmp,quant)
-        pre=build_graph(".",w,prefill_seq_len,True,quant); dec=build_graph(".",w,1,False,quant)
-        save_package(output_path,pre,dec,tmp,{"model_name":path.stem,"architecture":"rwkv7",
-            "num_layers":layers,"hidden_size":hidden,"num_heads":heads,"head_dim":hs,
-            "vocab_size":vocab,"prefill_seq_len":prefill_seq_len,"quantization":quant,
-            "rwkv_chat_template":"rwkv_legacy",
-            "experimental":True},tokenizer_path=tokenizer_path)
+        export_weights(weights, tmp, quant)
+        prefill_graph = build_graph(".", weights, prefill_seq_len, True, quant)
+        decode_graph = build_graph(".", weights, 1, False, quant)
+        save_package(output_path, prefill_graph, decode_graph, tmp, metadata,
+                     tokenizer_path=tokenizer_path)
     finally:
         shutil.rmtree(tmp)
 
 
 if __name__ == "__main__":
     import argparse
-    parser=argparse.ArgumentParser(description="convert an RWKV v7 .pth checkpoint")
-    parser.add_argument("checkpoint"); parser.add_argument("output")
-    parser.add_argument("--prefill-seq-len",type=int,default=256); parser.add_argument("--tokenizer",default="")
-    parser.add_argument("--quant",default="fp16",choices=("fp16","w8","w8pc","w4","w4mixg128"))
-    args=parser.parse_args()
-    convert_rwkv7(args.checkpoint,args.output,args.prefill_seq_len,args.tokenizer,args.quant)
+
+    parser = argparse.ArgumentParser(description="convert an RWKV v7 .pth checkpoint")
+    parser.add_argument("checkpoint")
+    parser.add_argument("output")
+    parser.add_argument("--prefill-seq-len", type=int, default=256)
+    parser.add_argument("--tokenizer", default="")
+    parser.add_argument("--quant", default="fp16",
+                        choices=("fp16", "w8", "w8pc", "w4", "w4mixg128"))
+    args = parser.parse_args()
+    convert_rwkv7(args.checkpoint, args.output, args.prefill_seq_len,
+                  args.tokenizer, args.quant)

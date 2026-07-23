@@ -261,7 +261,7 @@ private:
     // Temp files extracted from the package (cleaned up in destructor).
     std::vector<std::string> temp_files_;
 
-    // Load-time interleaved-packed FP16 weights (path → packed buffer)
+    // Load-time matmul layouts (path/layout suffix → packed buffer).
     std::unordered_map<std::string, std::vector<uint8_t>> packed_weights_;
 
     // Engine-owned contiguous copy returned by prefill_hidden/decode_hidden.
@@ -294,9 +294,6 @@ private:
         Tensor* rwkv_state = nullptr;
         Tensor* rwkv_att_shift = nullptr;
         Tensor* rwkv_ffn_shift = nullptr;
-        int rwkv_head_size = 0;
-        int rwkv_num_heads = 0;
-        int rwkv_hidden_size = 0;
 
         bool is_linear_attn = false;
     };

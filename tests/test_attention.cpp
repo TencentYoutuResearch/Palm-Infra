@@ -10,13 +10,6 @@ static int failures = 0;
 
 static void fill_rand(float* d, int n) { for(int i=0;i<n;i++) d[i]=(float)rand()/RAND_MAX-0.5f; }
 
-static bool check_approx(const float* a, const float* b, int n, float tol) {
-    for(int i=0;i<n;i++) if(fabsf(a[i]-b[i])>tol) {
-        fprintf(stderr,"  mismatch[%d]: %f vs %f\n",i,a[i],b[i]); return false;
-    }
-    return true;
-}
-
 // Build reference: concat K/V, compute SDPA naively
 static void ref_sdpa(const float* Q, const float* K_cache, const float* V_cache,
                      const float* K_cur, const float* V_cur, float* out,

@@ -50,11 +50,9 @@ static constexpr uint32_t GRAPH_VERSION = 3;  // v3: added per-node dynamic[4]
 
 static bool read_u32(FILE* f, uint32_t* v) { return fread(v, 4, 1, f) == 1; }
 static bool read_i64(FILE* f, int64_t* v)  { return fread(v, 8, 1, f) == 1; }
-static bool read_f32(FILE* f, float* v)    { return fread(v, 4, 1, f) == 1; }
 
 static bool write_u32(FILE* f, uint32_t v) { return fwrite(&v, 4, 1, f) == 1; }
 static bool write_i64(FILE* f, int64_t v)  { return fwrite(&v, 8, 1, f) == 1; }
-static bool write_f32(FILE* f, float v)    { return fwrite(&v, 4, 1, f) == 1; }
 
 static bool read_vec_u32(FILE* f, std::vector<uint32_t>& v, uint32_t count) {
     v.resize(count);

@@ -48,10 +48,6 @@ static bool check_approx(const float* got, const float* ref, int n, float tol = 
 
 int main() {
     srand(42);
-    setenv("MOLLM_W4_PACKED_BG128", "1", 1);
-    setenv("MOLLM_W4_GEMM_2D", "1", 1);
-    setenv("MOLLM_W4_GEMM_N_BLOCK", "8", 1);
-    setenv("MOLLM_SPARSE_A_FORCE", "1", 1);
 
     // ---- small matmul: 4x4 * 4x4 = 4x4 ----
     {

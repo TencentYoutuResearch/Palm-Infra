@@ -73,8 +73,6 @@ class OpType(IntEnum):
     RWKV_TOKEN_SHIFT = 151
     RWKV_MIX       = 152
     RWKV_L2_NORM   = 153
-    RWKV_GROUP_NORM = 154
-    RWKV_BONUS     = 155
     RWKV_POST      = 157
 
 class Precision(IntEnum):
@@ -255,8 +253,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.QUANTIZE_KV, OpType.DEQUANTIZE_KV,
               OpType.SHORTCONV,
               OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT, OpType.RWKV_MIX,
-              OpType.RWKV_L2_NORM, OpType.RWKV_GROUP_NORM, OpType.RWKV_BONUS,
-              OpType.RWKV_POST,
+              OpType.RWKV_L2_NORM, OpType.RWKV_POST,
               OpType.MOE):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
@@ -738,19 +735,6 @@ class GraphBuilder:
                          prec=Precision.FP32, i32=[num_heads, head_size],
                          f32=[eps])
 
-    def rwkv_group_norm(self, x: int, weight: int, bias: int,
-                        num_heads: int, head_size: int,
-                        eps: float = 64e-5) -> int:
-        return self._add(OpType.RWKV_GROUP_NORM, [x, weight, bias],
-                         self._nodes[x].out_shape, prec=Precision.FP32,
-                         i32=[num_heads, head_size], f32=[eps])
-
-    def rwkv_bonus(self, r: int, k: int, v: int, r_k: int,
-                   num_heads: int, head_size: int) -> int:
-        return self._add(OpType.RWKV_BONUS, [r, k, v, r_k],
-                         self._nodes[r].out_shape, prec=Precision.FP32,
-                         i32=[num_heads, head_size])
-
     def rwkv_post(self, raw: int, r: int, k: int, v: int, r_k: int,
                   weight: int, bias: int, gate: int,
                   num_heads: int, head_size: int,
@@ -768,21 +752,6 @@ class GraphBuilder:
         return self._add(OpType.RWKV7, [r, decay, k, v, a, b, state],
                          self._nodes[r].out_shape, prec=Precision.FP32,
                          i32=[num_heads, head_size, seq_len, 0, 0])
-
-    def rwkv7(self, r: int, w_delta: int, k: int, v: int, a_delta: int,
-              gate_delta: int, v_delta: int, v_first: int, w0: int, a0: int,
-              v0: int, k_k: int, k_a: int, r_k: int, norm_w: int, norm_b: int,
-              state: int,
-              num_heads: int, head_size: int, seq_len: int,
-              group_norm_eps: float = 64e-5, first_layer: bool = False) -> int:
-        """Fused RWKV-7 WKV recurrence and post-recurrence group norm."""
-        return self._add(OpType.RWKV7,
-                         [r, w_delta, k, v, a_delta, gate_delta, v_delta,
-                          v_first, w0, a0, v0, k_k, k_a, r_k, norm_w, norm_b,
-                          state],
-                         self._nodes[r].out_shape, prec=Precision.FP32,
-                         i32=[num_heads, head_size, seq_len, 0, int(first_layer)],
-                         f32=[group_norm_eps])
 
     def gated_deltanet(self, qkv_conv: int, a_out: int, b_out: int, z_out: int,
                        A_log: int, dt_bias: int, norm_weight: int, gdn_state: int,
