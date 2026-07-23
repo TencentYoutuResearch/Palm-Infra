@@ -273,6 +273,37 @@ int main() {
               "global pool evicts one layer-zero LRU entry");
     }
 
+    // Cross-layer prediction feedback trims only a consistently inaccurate
+    // tail rank. Use a zero-entry prefetch window so this test exercises the
+    // policy without generating irrelevant I/O.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 16, 1), "open adaptive-prediction cache");
+        check(cache.add_source(spec("adaptive_gate", 0)) &&
+              cache.add_source(spec("adaptive_down", 6 * sizeof(uint16_t))),
+              "add adaptive-prediction sources");
+        const MoeSsdTensorSource* gate = cache.find_source("adaptive_gate");
+        const MoeSsdTensorSource* down = cache.find_source("adaptive_down");
+        for (int sample = 0; sample < 128; ++sample) {
+            cache.begin_forward_pass();
+            check(cache.prefetch_many(gate, down, {0, 1}, {1.0f, 0.5f}, 0),
+                  "record adaptive prediction");
+            check(cache.request_many(gate, down, {0}),
+                  "evaluate adaptive prediction");
+        }
+        check(cache.recommended_prefetch_count(2) == 1,
+              "adaptive policy removes inaccurate tail rank");
+        const auto stats = cache.stats();
+        check(stats.cross_layer_rank_attempts.size() == 2 &&
+              stats.cross_layer_rank_attempts[0] == 128 &&
+              stats.cross_layer_rank_hits[0] == 128 &&
+              stats.cross_layer_rank_hits[1] == 0,
+              "adaptive policy reports per-rank accuracy");
+        cache.reset_stats();
+        check(cache.recommended_prefetch_count(2) == 1,
+              "statistics reset preserves learned prefetch policy");
+    }
+
     std::remove(path.c_str());
     if (failures == 0) std::printf("All MoE SSD cache tests passed!\n");
     return failures == 0 ? 0 : 1;

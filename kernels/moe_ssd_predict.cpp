@@ -75,7 +75,10 @@ bool schedule_moe_cross_layer_prefetch(
                     const float best = std::max(weights.front(), 1e-12f);
                     for (float& weight : weights) weight /= best;
                 }
-                cache->prefetch_many(next_gate_up, next_down, experts, weights);
+                const size_t prefetch_count =
+                    cache->recommended_prefetch_count(experts.size());
+                cache->prefetch_many(next_gate_up, next_down, experts, weights,
+                                     prefetch_count);
             }
         });
 }

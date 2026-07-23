@@ -78,6 +78,8 @@ public:
         uint64_t cross_layer_used = 0;
         uint64_t cross_layer_rejected = 0;
         size_t resident_bytes = 0;
+        std::vector<uint64_t> cross_layer_rank_attempts;
+        std::vector<uint64_t> cross_layer_rank_hits;
     };
 
     MoeSsdCache();
@@ -120,7 +122,12 @@ public:
     bool prefetch_many(const MoeSsdTensorSource* gate_up,
                        const MoeSsdTensorSource* down,
                        const std::vector<int>& experts,
-                       const std::vector<float>& confidence = {});
+                       const std::vector<float>& confidence = {},
+                       size_t prefetch_count = static_cast<size_t>(-1));
+
+    // Drop consistently low-value tail ranks once enough real-route feedback
+    // has accumulated. The full prediction is still recorded for adaptation.
+    size_t recommended_prefetch_count(size_t predicted_count) const;
 
     // Queue a tiny gate-prediction task on an otherwise-idle SSD worker. The
     // queue is bounded so stale predictions never accumulate behind decode.
@@ -160,6 +167,10 @@ private:
         int num_experts = 0;
         size_t pair_bytes = 0;
     };
+    struct PredictionRecord {
+        uint64_t forward_epoch = 0;
+        std::vector<int> experts;
+    };
     // One job reads a physically contiguous run of the same component
     // (gate data/scales or down data/scales) for adjacent expert ids. Keeping
     // components separate exposes a deep queue even for a single decode token.
@@ -177,7 +188,8 @@ private:
                            const MoeSsdTensorSource* down,
                            const std::vector<int>& experts,
                            bool speculative,
-                           const std::vector<float>& confidence = {});
+                           const std::vector<float>& confidence = {},
+                           size_t request_count = static_cast<size_t>(-1));
     Entry* find_entry_locked(const MoeSsdTensorSource* gate_up,
                              const MoeSsdTensorSource* down, int expert);
     const Entry* find_entry_locked(const MoeSsdTensorSource* gate_up,
@@ -221,6 +233,10 @@ private:
     uint64_t cross_layer_experts_ = 0;
     uint64_t cross_layer_used_ = 0;
     uint64_t cross_layer_rejected_ = 0;
+    std::vector<uint64_t> cross_layer_rank_attempts_;
+    std::vector<uint64_t> cross_layer_rank_hits_;
+    std::vector<uint64_t> prediction_policy_attempts_;
+    std::vector<uint64_t> prediction_policy_hits_;
     mutable std::mutex mutex_;
     std::condition_variable io_cv_;
     std::condition_variable cross_layer_cv_;
@@ -250,4 +266,5 @@ private:
     // while one MoE layer only needs to inspect its own small route window.
     std::unordered_map<int, std::vector<Entry*>> layer_entries_;
     std::unordered_map<int, size_t> layer_resident_bytes_;
+    std::unordered_map<int, PredictionRecord> pending_predictions_;
 };

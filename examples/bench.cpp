@@ -144,6 +144,15 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                     (unsigned long long)ssd.cross_layer_experts,
                     (unsigned long long)ssd.cross_layer_used,
                     (unsigned long long)ssd.cross_layer_rejected);
+        std::printf("moe_ssd_cross_layer_rank_accuracy=");
+        for (size_t rank = 0; rank < ssd.cross_layer_rank_attempts.size(); ++rank) {
+            if (rank != 0) std::printf(",");
+            const uint64_t attempts = ssd.cross_layer_rank_attempts[rank];
+            const uint64_t hits = ssd.cross_layer_rank_hits[rank];
+            std::printf("%.3f", attempts == 0 ? 0.0
+                                               : static_cast<double>(hits) / attempts);
+        }
+        std::printf("\n");
     }
     {
         auto pre = engine.prefill_pool_stats();

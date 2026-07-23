@@ -133,6 +133,10 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         clock_ = hits_ = misses_ = evictions_ = bytes_read_ = 0;
         cross_layer_tasks_count_ = cross_layer_dropped_ = 0;
         cross_layer_experts_ = cross_layer_used_ = cross_layer_rejected_ = 0;
+        cross_layer_rank_attempts_.clear();
+        cross_layer_rank_hits_.clear();
+        prediction_policy_attempts_.clear();
+        prediction_policy_hits_.clear();
         sources_.clear();
         layers_.clear();
         layer_layouts_.clear();
@@ -141,6 +145,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         entry_locations_.clear();
         layer_entries_.clear();
         layer_resident_bytes_.clear();
+        pending_predictions_.clear();
     }
     io_workers_.reserve((size_t)io_workers);
     for (int i = 0; i < io_workers; i++) {
@@ -523,15 +528,18 @@ bool MoeSsdCache::request_many(const MoeSsdTensorSource* gate_up,
 bool MoeSsdCache::prefetch_many(const MoeSsdTensorSource* gate_up,
                                 const MoeSsdTensorSource* down,
                                 const std::vector<int>& experts,
-                                const std::vector<float>& confidence) {
-    return request_many_impl(gate_up, down, experts, true, confidence);
+                                const std::vector<float>& confidence,
+                                size_t prefetch_count) {
+    return request_many_impl(gate_up, down, experts, true, confidence,
+                             prefetch_count);
 }
 
 bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                                     const MoeSsdTensorSource* down,
                                     const std::vector<int>& experts,
                                     bool speculative,
-                                    const std::vector<float>& confidence) {
+                                    const std::vector<float>& confidence,
+                                    size_t request_count) {
     if (!gate_up || !down || !valid_pair(gate_up, down, 0)) {
         std::fprintf(stderr, "MoE SSD: invalid expert pair request\n");
         return false;
@@ -542,7 +550,38 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!speculative) active_layer_ = gate_up->spec.layer;
-        for (size_t index = 0; index < experts.size(); ++index) {
+        if (speculative) {
+            pending_predictions_[gate_up->spec.layer] =
+                PredictionRecord{forward_epoch_, experts};
+        } else {
+            const auto prediction = pending_predictions_.find(gate_up->spec.layer);
+            if (prediction != pending_predictions_.end() &&
+                prediction->second.forward_epoch == forward_epoch_) {
+                const std::vector<int>& predicted = prediction->second.experts;
+                if (cross_layer_rank_attempts_.size() < predicted.size()) {
+                    cross_layer_rank_attempts_.resize(predicted.size());
+                    cross_layer_rank_hits_.resize(predicted.size());
+                }
+                if (prediction_policy_attempts_.size() < predicted.size()) {
+                    prediction_policy_attempts_.resize(predicted.size());
+                    prediction_policy_hits_.resize(predicted.size());
+                }
+                for (size_t rank = 0; rank < predicted.size(); ++rank) {
+                    ++cross_layer_rank_attempts_[rank];
+                    ++prediction_policy_attempts_[rank];
+                    const bool matched =
+                        std::find(experts.begin(), experts.end(),
+                                  predicted[rank]) != experts.end();
+                    if (matched) {
+                        ++cross_layer_rank_hits_[rank];
+                        ++prediction_policy_hits_[rank];
+                    }
+                }
+                pending_predictions_.erase(prediction);
+            }
+        }
+        const size_t count = std::min(experts.size(), request_count);
+        for (size_t index = 0; index < count; ++index) {
             const int expert = experts[index];
             const float prediction_confidence =
                 speculative && index < confidence.size()
@@ -588,6 +627,28 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
             ",\"queued\":" + std::to_string(queued_entries.size()) + "}");
     }
     return true;
+}
+
+size_t MoeSsdCache::recommended_prefetch_count(size_t predicted_count) const {
+    if (predicted_count == 0) return 0;
+    std::lock_guard<std::mutex> lock(mutex_);
+    constexpr uint64_t kMinimumSamples = 128;
+    constexpr double kMinimumHitRate = 0.60;
+    const size_t minimum = std::max<size_t>(1, predicted_count / 2);
+    size_t count = predicted_count;
+    while (count > minimum) {
+        const size_t rank = count - 1;
+        if (rank >= prediction_policy_attempts_.size() ||
+            prediction_policy_attempts_[rank] < kMinimumSamples) {
+            break;
+        }
+        const double hit_rate =
+            static_cast<double>(prediction_policy_hits_[rank]) /
+            static_cast<double>(prediction_policy_attempts_[rank]);
+        if (hit_rate >= kMinimumHitRate) break;
+        --count;
+    }
+    return count;
 }
 
 bool MoeSsdCache::submit_cross_layer_task(std::function<void()> task) {
@@ -742,9 +803,20 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
 
 MoeSsdCache::Stats MoeSsdCache::stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return {hits_, misses_, evictions_, bytes_read_, cross_layer_tasks_count_,
-            cross_layer_dropped_, cross_layer_experts_, cross_layer_used_,
-            cross_layer_rejected_, resident_bytes_};
+    Stats result;
+    result.hits = hits_;
+    result.misses = misses_;
+    result.evictions = evictions_;
+    result.bytes_read = bytes_read_;
+    result.cross_layer_tasks = cross_layer_tasks_count_;
+    result.cross_layer_dropped = cross_layer_dropped_;
+    result.cross_layer_experts = cross_layer_experts_;
+    result.cross_layer_used = cross_layer_used_;
+    result.cross_layer_rejected = cross_layer_rejected_;
+    result.resident_bytes = resident_bytes_;
+    result.cross_layer_rank_attempts = cross_layer_rank_attempts_;
+    result.cross_layer_rank_hits = cross_layer_rank_hits_;
+    return result;
 }
 
 void MoeSsdCache::reset_stats() {
@@ -758,4 +830,7 @@ void MoeSsdCache::reset_stats() {
     cross_layer_experts_ = 0;
     cross_layer_used_ = 0;
     cross_layer_rejected_ = 0;
+    cross_layer_rank_attempts_.clear();
+    cross_layer_rank_hits_.clear();
+    pending_predictions_.clear();
 }
