@@ -78,6 +78,14 @@ int main() {
         EngineConfig cfg;
         cfg.package_path = "/tmp/nonexistent.mollm";
         CHECK(!e.load(cfg), "load fails on missing package");
+        CHECK(e.config().package_path.empty(),
+              "failed load rolls engine config back to empty state");
+        CHECK(e.package_metadata().empty(),
+              "failed load leaves no package metadata");
+        CHECK(e.prefill_pool_stats().active == 0 &&
+                  e.decode_pool_stats().active == 0,
+              "failed load leaves graph pools empty");
+        CHECK(!e.load(cfg), "engine remains reusable after failed load");
 
         // test that prefill/decode don't crash on empty graph
         e.reset();

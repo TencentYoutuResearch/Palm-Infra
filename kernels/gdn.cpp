@@ -65,7 +65,6 @@ static void fused_gdn_head(
     bool use_l2norm, float rms_eps, float l2norm_eps, float scale)
 {
     int qkv_dim   = num_heads * k_dim;       // key_dim (q/k are key_heads * k_dim)
-    int qkv_total = qkv_dim * 2 + num_v_heads * v_dim;  // key_dim*2 + value_dim
     int z_dim     = num_v_heads * v_dim;
     int state_size = k_dim * v_dim;
     int repeat    = num_v_heads / num_heads;  // 1 for 0.8B, 2 for 4B

@@ -106,6 +106,10 @@ bool valid_header(const MappedFile::Header& header, size_t file_size) {
         header.precision > 3) {
         return false;
     }
+    for (uint32_t dim = 0; dim < header.ndim; ++dim) {
+        if (header.shape[dim] == 0)
+            return false;
+    }
     if (!range_within_file(header.data_offset, header.data_size, file_size) ||
         !range_within_file(header.scales_offset, header.scales_size,
                            file_size)) {
@@ -117,6 +121,15 @@ bool valid_header(const MappedFile::Header& header, size_t file_size) {
          header.scales_offset < sizeof(MappedFile::Header))) {
         return false;
     }
+    if (header.data_size != 0 && header.scales_size != 0) {
+        const uint64_t data_end = header.data_offset + header.data_size;
+        const uint64_t scales_end =
+            header.scales_offset + header.scales_size;
+        if (header.data_offset < scales_end &&
+            header.scales_offset < data_end) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -125,6 +138,19 @@ bool valid_header(const MappedFile::Header& header, size_t file_size) {
 // ---------------------------------------------------------------------------
 // MappedFile
 // ---------------------------------------------------------------------------
+
+bool MappedFile::parse_header(const void* bytes, size_t size, Header& header) {
+    header = {};
+    if (!bytes || size < sizeof(Header))
+        return false;
+
+    std::memcpy(&header, bytes, sizeof(Header));
+    if (header.magic != MAGIC || !valid_header(header, size)) {
+        header = {};
+        return false;
+    }
+    return true;
+}
 
 MappedFile::MappedFile(MappedFile&& other) noexcept
     : mapped_(other.mapped_), file_size_(other.file_size_),
@@ -157,28 +183,10 @@ bool MappedFile::open(const char* path) {
         return false;
     }
 
-    if (size < sizeof(Header)) {
-        fprintf(stderr, "MappedFile: %s too small (%zu < %zu)\n",
-                path, size, sizeof(Header));
-        unmap_file(ptr, size);
-        return false;
-    }
-
-    // copy header from mmap'd region
-    memcpy(&header_, ptr, sizeof(Header));
-
-    if (header_.magic != MAGIC) {
-        fprintf(stderr, "MappedFile: %s bad magic 0x%08x (expected 0x%08x)\n",
-                path, header_.magic, MAGIC);
-        unmap_file(ptr, size);
-        return false;
-    }
-
-    if (!valid_header(header_, size)) {
+    if (!parse_header(ptr, size, header_)) {
         fprintf(stderr, "MappedFile: %s has an invalid header or range\n",
                 path);
         unmap_file(ptr, size);
-        header_ = {};
         return false;
     }
 

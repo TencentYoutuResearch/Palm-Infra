@@ -28,6 +28,59 @@ static constexpr uint64_t MAX_GRAPH_SIZE = 1ull * 1024 * 1024 * 1024;
 
 namespace {
 
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd = -1) : fd_(fd) {}
+    ~ScopedFd() {
+        if (fd_ >= 0)
+            close(fd_);
+    }
+
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+
+    int get() const { return fd_; }
+
+    bool close_now() {
+        if (fd_ < 0)
+            return true;
+        const int fd = fd_;
+        fd_ = -1;
+        return close(fd) == 0;
+    }
+
+private:
+    int fd_;
+};
+
+class ScopedMapping {
+public:
+    ScopedMapping(void* address, size_t size)
+        : address_(address), size_(size) {}
+    ~ScopedMapping() {
+        if (address_)
+            munmap(address_, size_);
+    }
+
+    ScopedMapping(const ScopedMapping&) = delete;
+    ScopedMapping& operator=(const ScopedMapping&) = delete;
+
+    const uint8_t* bytes() const {
+        return static_cast<const uint8_t*>(address_);
+    }
+
+    void* release() {
+        void* address = address_;
+        address_ = nullptr;
+        size_ = 0;
+        return address;
+    }
+
+private:
+    void* address_ = nullptr;
+    size_t size_ = 0;
+};
+
 struct PackageHeaderInfo {
     uint64_t meta_off = 0, meta_len = 0;
     uint64_t tok_off = 0, tok_len = 0;
@@ -90,8 +143,8 @@ bool extract_temp_section(int source_fd, const uint8_t* mapped,
         return true;
 
     char path[] = "/tmp/mollm_pkg_XXXXXX";
-    int output_fd = mkstemp(path);
-    if (output_fd < 0) {
+    ScopedFd output(mkstemp(path));
+    if (output.get() < 0) {
         fprintf(stderr, "Engine: failed to create temporary %s: %s\n", label,
                 strerror(errno));
         return false;
@@ -112,10 +165,10 @@ bool extract_temp_section(int source_fd, const uint8_t* mapped,
             source = buffer.data();
         }
         if (ok)
-            ok = write_exact(output_fd, source, chunk, label);
+            ok = write_exact(output.get(), source, chunk, label);
         done += chunk;
     }
-    if (close(output_fd) != 0)
+    if (!output.close_now())
         ok = false;
     if (!ok) {
         std::remove(path);
@@ -245,43 +298,41 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
 
 bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                              std::string& dc_path, std::string& tok_path) {
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
+    ScopedFd package_file(open(path.c_str(), O_RDONLY));
+    if (package_file.get() < 0) {
         fprintf(stderr, "Engine: failed to open package %s\n", path.c_str());
         return false;
     }
     struct stat st;
-    if (fstat(fd, &st) != 0) {
-        close(fd);
+    if (fstat(package_file.get(), &st) != 0) {
         return false;
     }
     if (st.st_size < 0 ||
         static_cast<uint64_t>(st.st_size) >
             static_cast<uint64_t>(SIZE_MAX)) {
         fprintf(stderr, "Engine: package size is unsupported\n");
-        close(fd);
         return false;
     }
     size_t file_size = st.st_size;
 
     uint8_t header[128];
-    if (!read_exact_at(fd, 0, header, sizeof(header), "package header")) {
-        close(fd);
+    if (!read_exact_at(package_file.get(), 0, header, sizeof(header),
+                       "package header")) {
         return false;
     }
 
     PackageHeaderInfo ph;
     if (!parse_package_header(header, file_size, ph)) {
-        close(fd);
         return false;
     }
 
+    int prefill_seq_len = 256;
     auto parse_metadata = [&](const std::string& meta_str) -> bool {
         try {
             auto meta = json::parse(meta_str);
             if (meta.contains("prefill_seq_len")) {
-                package_prefill_seq_len_ = meta["prefill_seq_len"].get<int>();
-                if (package_prefill_seq_len_ <= 0) {
+                prefill_seq_len = meta["prefill_seq_len"].get<int>();
+                if (prefill_seq_len <= 0) {
                     fprintf(stderr,
                             "Engine: package prefill_seq_len must be positive\n");
                     return false;
@@ -461,13 +512,11 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
 
     if (cfg_.weight_loading == WeightLoadingMode::RESIDENT) {
         std::string meta_str(static_cast<size_t>(ph.meta_len), '\0');
-        if (!read_exact_at(fd, ph.meta_off, meta_str.data(), meta_str.size(),
-                           "package metadata")) {
-            close(fd);
+        if (!read_exact_at(package_file.get(), ph.meta_off, meta_str.data(),
+                           meta_str.size(), "package metadata")) {
             return false;
         }
         if (!parse_metadata(meta_str)) {
-            close(fd);
             return false;
         }
 
@@ -478,14 +527,12 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                     "Engine: failed to allocate %.1f MB for resident package "
                     "weights; try --mmap\n",
                     ph.w_len / 1e6);
-            close(fd);
             return false;
         }
         if (ph.w_len > 0 &&
-            !read_exact_at(fd, ph.w_off, package_weights_storage_.data(),
-                           package_weights_storage_.size(),
-                           "package weights")) {
-            close(fd);
+            !read_exact_at(package_file.get(), ph.w_off,
+                           package_weights_storage_.data(),
+                           package_weights_storage_.size(), "package weights")) {
             return false;
         }
         package_weights_base_ = package_weights_storage_.empty()
@@ -494,13 +541,16 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
         package_weights_size_ = package_weights_storage_.size();
         package_weights_resident_ = true;
 
-        bool ok = extract_temp_section(fd, nullptr, ph.pf_off, ph.pf_len,
-                                       "prefill graph", pf_path, temp_files_) &&
-                  extract_temp_section(fd, nullptr, ph.dc_off, ph.dc_len,
-                                       "decode graph", dc_path, temp_files_) &&
-                  extract_temp_section(fd, nullptr, ph.tok_off, ph.tok_len,
-                                       "tokenizer", tok_path, temp_files_);
-        close(fd);
+        bool ok =
+            extract_temp_section(package_file.get(), nullptr, ph.pf_off,
+                                 ph.pf_len, "prefill graph", pf_path,
+                                 temp_files_) &&
+            extract_temp_section(package_file.get(), nullptr, ph.dc_off,
+                                 ph.dc_len, "decode graph", dc_path,
+                                 temp_files_) &&
+            extract_temp_section(package_file.get(), nullptr, ph.tok_off,
+                                 ph.tok_len, "tokenizer", tok_path,
+                                 temp_files_);
         if (!ok)
             return false;
 
@@ -508,22 +558,23 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 "Engine: loaded package %s (%.1f MB, %zu weights, "
                 "prefill_seq=%d, weights=resident)\n",
                 path.c_str(), file_size / 1e6, package_weight_map_.size(),
-                package_prefill_seq_len_);
+                prefill_seq_len);
         return true;
     }
 
-    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
+    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE,
+                        package_file.get(), 0);
+    package_file.close_now();
     if (mapped == MAP_FAILED) {
         fprintf(stderr, "Engine: mmap failed for %s\n", path.c_str());
         return false;
     }
-    const uint8_t* base = static_cast<const uint8_t*>(mapped);
+    ScopedMapping mapping(mapped, file_size);
+    const uint8_t* base = mapping.bytes();
 
     std::string meta_str(reinterpret_cast<const char*>(base + ph.meta_off),
                          static_cast<size_t>(ph.meta_len));
     if (!parse_metadata(meta_str)) {
-        munmap(mapped, file_size);
         return false;
     }
 
@@ -533,11 +584,10 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                               dc_path, temp_files_) ||
         !extract_temp_section(-1, base, ph.tok_off, ph.tok_len, "tokenizer",
                               tok_path, temp_files_)) {
-        munmap(mapped, file_size);
         return false;
     }
 
-    package_mmap_ = mapped;
+    package_mmap_ = mapping.release();
     package_mmap_size_ = file_size;
     package_weights_base_ = base + ph.w_off;
     package_weights_size_ = static_cast<size_t>(ph.w_len);
@@ -547,6 +597,6 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
             "Engine: loaded package %s (%.1f MB, %zu weights, prefill_seq=%d, "
             "weights=mmap)\n",
             path.c_str(), file_size / 1e6, package_weight_map_.size(),
-            package_prefill_seq_len_);
+            prefill_seq_len);
     return true;
 }

@@ -58,6 +58,10 @@ public:
 
     static_assert(sizeof(Header) == 88, "Header size must be 88 bytes");
 
+    /// Parse and validate a weight blob already resident in memory. This is
+    /// shared by standalone mapped files and weights embedded in a package.
+    static bool parse_header(const void* bytes, size_t size, Header& header);
+
     MappedFile() = default;
 
     ~MappedFile() { close(); }

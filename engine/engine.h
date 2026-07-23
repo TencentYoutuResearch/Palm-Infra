@@ -239,8 +239,6 @@ private:
     std::vector<std::pair<void*, size_t>> locked_dense_ranges_;
     // Optional demand-paged storage for routed MoE experts.
     std::unique_ptr<MoeSsdCache> moe_ssd_cache_;
-    // prefill_seq_len from package metadata
-    int package_prefill_seq_len_ = 256;
     // Full package-level metadata JSON fields (model_name, architecture,
     // quantization, num_layers, hidden_size, num_heads, n_ctx, vocab_size,
     // prefill_seq_len, ...). Populated in load_package(); exposed via
@@ -302,6 +300,10 @@ private:
     Tensor run_graph(Graph& graph, ExecContext& exec_ctx,
                      const Tensor& hidden, const Tensor& mask,
                      const Tensor& cos, const Tensor& sin);
+
+    /// Transactional public-load implementation and shared teardown path.
+    bool load_impl(const EngineConfig& cfg);
+    void clear_model_state();
 
     /// Load a single graph and set up its CONSTANT nodes from shared weights.
     bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path);

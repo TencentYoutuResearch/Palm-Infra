@@ -71,7 +71,7 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
 void print_common_usage(const char* program_name, const char* extra_usage = nullptr);
 EngineConfig make_engine_config(const CliCommonOptions& opts);
 bool load_runtime(const CliCommonOptions& opts, Tokenizer& tokenizer,
-                  LLMEngine& engine, int& prefill_seq_len, std::string& error);
+                  LLMEngine& engine, std::string& error);
 std::string decode_piece(const Tokenizer& tokenizer, int token_id);
 GenerationMetrics compute_generation_metrics(size_t prompt_tokens,
                                              const GenerationResult& result);

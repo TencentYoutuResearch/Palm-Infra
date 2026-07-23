@@ -64,9 +64,11 @@ set(SOURCES
     # engine
     engine/engine.cpp
     engine/input_prep.cpp
+    engine/model_loader.cpp
     engine/package.cpp
     engine/sampler.cpp
     engine/tokenizer.cpp
+    engine/weight_metadata.cpp
 )
 
 set(PUBLIC_ENGINE_HEADERS
@@ -275,6 +277,7 @@ if(MOLLM_BUILD_EXAMPLE)
 endif()
 
 add_executable(mollm-quantize tools/quantize_weight.cpp)
+target_include_directories(mollm-quantize PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mollm-quantize PRIVATE Threads::Threads)
 
 # Backwards-compatible build target name used in older docs/scripts. The
@@ -302,6 +305,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_tensor        tests/test_tensor.cpp)
     add_mollm_test(test_buffer_pool   tests/test_buffer_pool.cpp)
     add_mollm_test(test_mmap_file     tests/test_mmap_file.cpp)
+    add_mollm_test(test_weight_metadata tests/test_weight_metadata.cpp)
     add_mollm_test(test_graph         tests/test_graph.cpp)
     add_mollm_test(test_io            tests/test_io.cpp)
     add_mollm_test(test_execute       tests/test_execute.cpp)

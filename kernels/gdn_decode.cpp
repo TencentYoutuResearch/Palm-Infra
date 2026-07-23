@@ -33,7 +33,6 @@ void kernel_gdn_decode_neon(const OpParams& params,
     float* out_data         = outputs[0]->ptr<float>();
 
     int qkv_dim   = num_heads * k_head_dim;
-    int z_dim     = num_v_heads * v_head_dim;
     int state_sz  = k_head_dim * v_head_dim;
     int repeat    = num_v_heads / num_heads;
 

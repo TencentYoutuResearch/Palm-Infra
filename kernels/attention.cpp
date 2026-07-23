@@ -1002,7 +1002,6 @@ void kernel_sdpa(const OpParams& params,
         const CacheMetadata* meta = cache_meta(K_cache->data);
         past_seqlen = (int)meta->current_seq_len;
         size_t cache_es = K_cache->element_size();  // 2 for FP16, 4 for FP32
-        size_t cur_es  = K_cur.element_size();      // always 4 (FP32)
         const void* k_cache_data = cache_data(K_cache->data);
         const void* v_cache_data = V_cache ? cache_data(V_cache->data) : nullptr;
 

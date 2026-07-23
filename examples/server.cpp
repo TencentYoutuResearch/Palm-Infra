@@ -376,9 +376,8 @@ int main(int argc, char **argv) {
         return 1;
     Tokenizer tokenizer;
     LLMEngine engine;
-    int prefill = 0;
     std::string error;
-    if (!load_runtime(opts.runtime, tokenizer, engine, prefill, error)) {
+    if (!load_runtime(opts.runtime, tokenizer, engine, error)) {
         std::fprintf(stderr, "server: %s\n", error.c_str());
         return 1;
     }

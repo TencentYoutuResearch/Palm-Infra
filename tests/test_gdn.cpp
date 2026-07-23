@@ -50,7 +50,6 @@ static void ref_fused_gdn(
 {
     if (num_v_heads < 0) num_v_heads = num_heads;
     int qkv_dim   = num_heads * k_dim;
-    int qkv_total = qkv_dim * 2 + num_v_heads * v_dim;
     int z_dim     = num_v_heads * v_dim;
     int state_size = k_dim * v_dim;
     int repeat = num_v_heads / num_heads;

@@ -71,6 +71,7 @@ struct Q4GemvScratch {
 inline void matmul_apply_activation(float* C, int M, int N, int ldc,
                                     int m_begin, int m_end, Activation act,
                                     int act_n_begin, int act_n_len) {
+    (void)M;
     if (act == Activation::NONE || act_n_len == 0)
         return;
 

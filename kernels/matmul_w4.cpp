@@ -878,6 +878,7 @@ static void matmul_int4_scalar_range(const float* A, const uint8_t* B,
                                      int m_begin, int m_end, int n_begin,
                                      int n_end) {
     (void)M;
+    (void)N;
     if (group_size <= 0)
         group_size = K;
     if (groups_per_row <= 0)

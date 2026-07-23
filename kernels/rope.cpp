@@ -8,9 +8,9 @@
 // scalar RoPE
 // ---------------------------------------------------------------------------
 
-static void rope_scalar(const float* x, const float* cos, const float* sin,
-                        float* out, int D, int N, int rope_dim, bool interleave,
-                        int ldx, int ldo, int ldc, int lds) {
+[[maybe_unused]] static void rope_scalar(
+    const float* x, const float* cos, const float* sin, float* out, int D,
+    int N, int rope_dim, bool interleave, int ldx, int ldo, int ldc, int lds) {
     int half = rope_dim / 2;
 
     for (int n = 0; n < N; n++) {

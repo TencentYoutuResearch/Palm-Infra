@@ -4,6 +4,7 @@
 #include <cstring>
 #include <limits>
 #include <utility>   // std::move
+#include <vector>
 
 static int failures = 0;
 
@@ -48,6 +49,49 @@ static bool write_header_only(const char* path,
 int main() {
     // ---- Header size ----
     CHECK(sizeof(MappedFile::Header) == 88, "Header is 88 bytes");
+
+    // ---- in-memory package blob parsing ----
+    {
+        std::vector<uint8_t> blob(sizeof(MappedFile::Header) + 4, 0);
+        MappedFile::Header source = {};
+        source.magic = MappedFile::MAGIC;
+        source.ndim = 1;
+        source.precision = static_cast<uint32_t>(Precision::FP16);
+        source.shape[0] = 2;
+        source.data_offset = sizeof(MappedFile::Header);
+        source.data_size = 4;
+        std::memcpy(blob.data(), &source, sizeof(source));
+
+        MappedFile::Header parsed;
+        CHECK(MappedFile::parse_header(blob.data(), blob.size(), parsed),
+              "parse valid in-memory weight blob");
+        CHECK(parsed.data_offset == sizeof(MappedFile::Header) &&
+                  parsed.data_size == 4,
+              "in-memory weight header fields");
+        CHECK(!MappedFile::parse_header(blob.data(),
+                                        sizeof(MappedFile::Header) - 1, parsed),
+              "reject truncated in-memory weight header");
+
+        source.data_size = 5;
+        std::memcpy(blob.data(), &source, sizeof(source));
+        CHECK(!MappedFile::parse_header(blob.data(), blob.size(), parsed),
+              "reject out-of-range in-memory weight data");
+
+        source.data_size = 2;
+        source.scales_offset = sizeof(MappedFile::Header) + 1;
+        source.scales_size = 2;
+        std::memcpy(blob.data(), &source, sizeof(source));
+        CHECK(!MappedFile::parse_header(blob.data(), blob.size(), parsed),
+              "reject overlapping in-memory data and scales");
+
+        source.data_size = 4;
+        source.scales_offset = 0;
+        source.scales_size = 0;
+        source.shape[0] = 0;
+        std::memcpy(blob.data(), &source, sizeof(source));
+        CHECK(!MappedFile::parse_header(blob.data(), blob.size(), parsed),
+              "reject zero-sized active dimension");
+    }
 
     // ---- open / close ----
     {

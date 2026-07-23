@@ -310,10 +310,9 @@ int main(int argc, char** argv) {
 
     Tokenizer tokenizer;
     LLMEngine engine;
-    int prefill_seq_len = 0;
 
     auto load_start = std::chrono::steady_clock::now();
-    if (!load_runtime(opts, tokenizer, engine, prefill_seq_len, error)) {
+    if (!load_runtime(opts, tokenizer, engine, error)) {
         std::fprintf(stderr, "bench: %s\n", error.c_str());
         return 1;
     }

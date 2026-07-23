@@ -46,9 +46,9 @@ LocalActivationRange local_activation_range(int global_begin,
 // Weight file stores row-major [N, K]: data[n*K + k] = W[n, k].
 // Tensor access: B.at<float>(n, k) = data[n*K + k].
 // C[m,n] = sum_k A[k + m*lda] * B[n*K_weight + k] = A[m,:] @ W[n,:].
-static void matmul_fp32_scalar_range(const float* A, const float* B, float* C,
-                                     int M, int N, int K, int lda, int K_weight,
-                                     int ldc, int m_begin, int m_end) {
+[[maybe_unused]] static void matmul_fp32_scalar_range(
+    const float* A, const float* B, float* C, int M, int N, int K, int lda,
+    int K_weight, int ldc, int m_begin, int m_end) {
     (void)M;
     for (int m = m_begin; m < m_end; m++) {
         float* c_row = C + m * ldc;
@@ -883,6 +883,7 @@ static void matmul_fp16_range(const float* A, const __fp16* B, float* C, int M,
 static void matmul_fp32_range_n(const float* A, const float* B, float* C, int M,
                                 int N, int K, int lda, int K_weight, int ldc,
                                 int n_begin, int n_end) {
+    (void)N;
 #if HAS_NEON
     // Decompose into the existing 8x8 NEON kernel by limiting N range.
     // We pass the full M range but only the [n_begin, n_end) columns of C.

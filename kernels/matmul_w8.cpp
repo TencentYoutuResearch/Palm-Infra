@@ -12,6 +12,7 @@ static void matmul_int8_scalar_range(const float* A, const int8_t* B,
                                      int m_begin, int m_end, int n_begin,
                                      int n_end, bool b_interleaved = false) {
     (void)M;
+    (void)N;
     if (group_size <= 0)
         group_size = K;
     if (groups_per_row <= 0)
@@ -47,6 +48,7 @@ static void matmul_int8_q8dot_scalar_range(
     int N, int K, int K_weight, int ldc, int m_begin, int m_end, int n_begin,
     int n_end, bool b_interleaved) {
     (void)M;
+    (void)N;
     int blocks_per_row = (K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK;
     for (int m = m_begin; m < m_end; m++) {
         const int8_t* qa_row = qA + (size_t)m * K;
@@ -128,6 +130,7 @@ static void matmul_int8_neon_4x8_range(const float* A, const int8_t* B_packed,
                                        int groups_per_row, float* C, int M,
                                        int N, int K, int lda, int ldc,
                                        int m_begin, int m_end) {
+    (void)M;
     if (group_size <= 0)
         group_size = K;
 
@@ -267,6 +270,7 @@ static void matmul_int8_q8dot_neon_4x8_range(
     const int8_t* qA, const float* a_scales, const int8_t* B_packed,
     const float* scales, int group_size, int groups_per_row, float* C, int M,
     int N, int K, int ldc, int m_begin, int m_end) {
+    (void)M;
     if (group_size <= 0)
         group_size = K;
     int blocks_per_row = (K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK;
@@ -485,6 +489,7 @@ static void matmul_int8_q8dot_neon_4x8_repacked_range(
     const float* scales, int group_size, int groups_per_row, float* C, int M,
     int N, int K, int K_padded, int ldc, int m_begin, int m_end, int n_begin,
     int n_end) {
+    (void)M;
     (void)N;
     if (group_size <= 0)
         group_size = K;

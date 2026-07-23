@@ -279,8 +279,7 @@ private:
 };
 
 bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
-                       const std::string& prompt, int /*prefill_seq_len*/,
-                       int max_new_tokens) {
+                       const std::string& prompt, int max_new_tokens) {
     std::vector<int> prompt_ids = tokenizer.apply_chat(prompt);
     if (prompt_ids.empty()) {
         std::fprintf(stderr, "[error] prompt is empty after tokenization\n");
@@ -399,8 +398,7 @@ int main(int argc, char** argv) {
 
     Tokenizer tokenizer;
     LLMEngine engine;
-    int prefill_seq_len = 0;
-    if (!load_runtime(opts, tokenizer, engine, prefill_seq_len, error)) {
+    if (!load_runtime(opts, tokenizer, engine, error)) {
         std::fprintf(stderr, "chat: %s\n", error.c_str());
         return 1;
     }
@@ -429,7 +427,7 @@ int main(int argc, char** argv) {
     }
     if (!prompt_text.empty()) {
         return run_prompt_single(engine, tokenizer, prompt_text,
-                                  prefill_seq_len, opts.max_new_tokens)
+                                  opts.max_new_tokens)
                    ? 0
                    : 1;
     }

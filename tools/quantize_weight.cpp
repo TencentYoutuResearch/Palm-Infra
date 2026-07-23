@@ -1,3 +1,6 @@
+#include "graph/mmap_file.h"
+#include "kernels/tensor.h"
+
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -13,32 +16,7 @@
 
 namespace {
 
-constexpr uint32_t WEIGHT_MAGIC = 0x50414D58; // "XMAP"
-constexpr uint32_t FLAG_INT4_Q4DOT = 1u << 0;
-constexpr uint32_t FLAG_INT4_BG128 = 1u << 1;
 constexpr int INT4_BG128_BLOCK_BYTES = 544;
-
-enum class Precision : uint32_t {
-    FP32 = 0,
-    FP16 = 1,
-    INT8 = 2,
-    INT4 = 3,
-};
-
-struct Header {
-    uint32_t magic;
-    uint32_t flags;
-    uint32_t ndim;
-    uint32_t precision;
-    uint64_t shape[4];
-    uint64_t data_offset;
-    uint64_t data_size;
-    uint64_t scales_offset;
-    uint64_t scales_size;
-    uint32_t group_size;
-    uint32_t num_groups;
-};
-static_assert(sizeof(Header) == 88, "Header size must match .weights format");
 
 float half_to_float(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
@@ -116,8 +94,8 @@ void write_weight_file(const std::string& path,
                        uint32_t flags,
                        int group_size,
                        int num_groups) {
-    Header hdr = {};
-    hdr.magic = WEIGHT_MAGIC;
+    MappedFile::Header hdr = {};
+    hdr.magic = MappedFile::MAGIC;
     hdr.flags = flags;
     hdr.ndim = 2;
     hdr.precision = (uint32_t)precision;
@@ -125,9 +103,9 @@ void write_weight_file(const std::string& path,
     hdr.shape[1] = (uint64_t)k;
     hdr.shape[2] = 1;
     hdr.shape[3] = 1;
-    hdr.data_offset = sizeof(Header);
+    hdr.data_offset = sizeof(MappedFile::Header);
     hdr.data_size = data.size();
-    hdr.scales_offset = sizeof(Header) + data.size();
+    hdr.scales_offset = sizeof(MappedFile::Header) + data.size();
     hdr.scales_size = scales.size() * sizeof(float);
     hdr.group_size = (uint32_t)group_size;
     hdr.num_groups = (uint32_t)num_groups;
@@ -221,13 +199,13 @@ void quantize_w4(const uint8_t* raw, const std::string& dtype,
             throw std::runtime_error("q4dot W4 requires K multiple of 32");
         }
         out.assign((size_t)(n_padded / 8) * k_blocks * 8 * 16, 0);
-        flags = FLAG_INT4_Q4DOT;
+        flags = MappedFile::FLAG_INT4_Q4DOT;
     } else if (bg128) {
         if (group_size != 128 || k % 128 != 0) {
             throw std::runtime_error("BG128 W4 requires group_size=128 and K multiple of 128");
         }
         out.assign((size_t)(n_padded / 8) * groups_per_row * INT4_BG128_BLOCK_BYTES, 0);
-        flags = FLAG_INT4_BG128;
+        flags = MappedFile::FLAG_INT4_BG128;
     } else {
         out.assign((size_t)n * row_stride, 0);
     }

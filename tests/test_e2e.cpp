@@ -12,8 +12,6 @@ static int failures = 0;
 // HF reference values for Qwen3.5-0.8B, dtype=float16.
 static const int REF_DECODE_SEQ[] = {271, 9419, 11, 1814, 0};
 static const int REF_DECODE_LEN = 5;
-static const int REF_PREFILL_ARGMAX[] = {11, 271, 0};
-static const int REF_PREFILL_N = 3;
 
 // PPL reference: 256 tokens from calibration_data_v5_rc.txt
 // HF Qwen3.5-0.8B prefill: CE=2.1405, PPL=8.50
@@ -124,6 +122,26 @@ int main(int argc, char** argv) {
         eng.release_prefill_buffers();
         CHECK(eng.prefill_pool_stats().active == 0,
               "release_prefill_buffers releases reusable prefill workspace");
+
+        const std::string old_tokenizer_path = eng.config().tokenizer_path;
+        struct stat tokenizer_stat{};
+        CHECK(!old_tokenizer_path.empty() &&
+                  stat(old_tokenizer_path.c_str(), &tokenizer_stat) == 0,
+              "loaded package tokenizer temp file exists");
+
+        EngineConfig missing_cfg = cfg;
+        missing_cfg.package_path = "/tmp/mollm_missing_reload_test.mollm";
+        CHECK(!eng.load(missing_cfg),
+              "failed reload rolls back a previously loaded engine");
+        CHECK(eng.config().package_path.empty() &&
+                  eng.package_metadata().empty(),
+              "failed reload leaves engine empty");
+        CHECK(stat(old_tokenizer_path.c_str(), &tokenizer_stat) != 0,
+              "reload removes prior package temp files");
+        CHECK(eng.load(cfg), "engine reloads package after failed reload");
+        int reloaded_token = eng.prefill({ids[0]});
+        CHECK(reloaded_token >= 0,
+              "reloaded engine completes real model inference");
     }
     // ---- Test 2: Prefill graph (T=4) + decode ----
     printf("\n=== Test 2: Prefill graph (T=4) + decode ===\n");
@@ -170,20 +188,20 @@ int main(int argc, char** argv) {
         // ---- (a) Prefill path: all 256 tokens at once ----
         float prefill_ppl = -1.f;
         {
-            LLMEngine eng;
-            EngineConfig cfg;
-            cfg.package_path = qwen35_package;
-            cfg.n_ctx = 512;
-            cfg.rope_dim = 64;
-            cfg.rope_theta = 1600000.f;
+            LLMEngine prefill_engine;
+            EngineConfig prefill_cfg;
+            prefill_cfg.package_path = qwen35_package;
+            prefill_cfg.n_ctx = 512;
+            prefill_cfg.rope_dim = 64;
+            prefill_cfg.rope_theta = 1600000.f;
 
-            ok = eng.load(cfg);
+            ok = prefill_engine.load(prefill_cfg);
             CHECK(ok, "prefill engine load");
-            if (ok) CHECK(eng.prefill_pool_stats().active == 0,
+            if (ok) CHECK(prefill_engine.prefill_pool_stats().active == 0,
                           "prefill engine load has no active graph-pool cache");
 
             if (ok) {
-                prefill_ppl = compute_ppl(eng, ppl_ids);
+                prefill_ppl = compute_ppl(prefill_engine, ppl_ids);
                 printf("  Prefill PPL: %.4f (HF ref: %.2f)\n", prefill_ppl, REF_PPL);
                 CHECK(std::fabs(prefill_ppl - REF_PPL) < PPL_TOLERANCE,
                       "prefill PPL matches HF reference");
@@ -194,23 +212,25 @@ int main(int argc, char** argv) {
         //         then 255 decode steps ----
         float decode_ppl = -1.f;
         {
-            LLMEngine eng;
-            EngineConfig cfg;
-            cfg.package_path = qwen35_package;
-            cfg.use_decode_as_prefill = true;  // load decode graph as prefill
-            cfg.n_ctx = 512;
-            cfg.rope_dim = 64;
-            cfg.rope_theta = 1600000.f;
+            LLMEngine decode_engine;
+            EngineConfig decode_cfg;
+            decode_cfg.package_path = qwen35_package;
+            decode_cfg.use_decode_as_prefill = true;
+            decode_cfg.n_ctx = 512;
+            decode_cfg.rope_dim = 64;
+            decode_cfg.rope_theta = 1600000.f;
 
-            ok = eng.load(cfg);
+            ok = decode_engine.load(decode_cfg);
             CHECK(ok, "decode engine load");
-            if (ok) CHECK(eng.prefill_pool_stats().active == 0,
+            if (ok) CHECK(decode_engine.prefill_pool_stats().active == 0,
                           "decode engine load has no active graph-pool cache");
 
             if (ok) {
                 // Step 0: prefill token[0]
-                Tensor hidden = eng.prefill_hidden({ppl_ids[0]});
-                size_t prefill_workspace = eng.prefill_pool_stats().active;
+                Tensor hidden =
+                    decode_engine.prefill_hidden({ppl_ids[0]});
+                size_t prefill_workspace =
+                    decode_engine.prefill_pool_stats().active;
 
                 float total_ce = 0.f;
                 int n_steps = PPL_REF_N - 1;  // 255 steps
@@ -231,7 +251,8 @@ int main(int argc, char** argv) {
                     lh.data = static_cast<char*>(hidden.data) + lp * hd * sizeof(float);
                     lh.compute_strides();
 
-                    std::vector<float> logits = eng.run_lmhead_raw(lh, 1);
+                    std::vector<float> logits =
+                        decode_engine.run_lmhead_raw(lh, 1);
                     int vs = (int)logits.size();
 
                     float mx = logits[0];
@@ -242,14 +263,16 @@ int main(int argc, char** argv) {
                     total_ce += -std::log(prob);
 
                     // Next token
-                    hidden = eng.decode_hidden(target);
-                    size_t active = eng.decode_pool_stats().active;
+                    hidden = decode_engine.decode_hidden(target);
+                    size_t active =
+                        decode_engine.decode_pool_stats().active;
                     if (!have_decode_workspace) {
                         decode_workspace = active;
                         have_decode_workspace = true;
                     }
                     decode_pool_ok = decode_pool_ok
-                        && eng.prefill_pool_stats().active == prefill_workspace
+                        && decode_engine.prefill_pool_stats().active ==
+                               prefill_workspace
                         && active == decode_workspace;
 
                     if ((step + 1) % 64 == 0)
@@ -420,24 +443,24 @@ int main(int argc, char** argv) {
         };
 
         for (auto& spec : specs) {
-            LLMEngine eng;
-            EngineConfig cfg;
-            cfg.package_path = qwen35_package;
-            cfg.n_ctx = 512;
-            cfg.rope_dim = 64;
-            cfg.rope_theta = 1600000.f;
+            LLMEngine chunk_engine;
+            EngineConfig chunk_cfg;
+            chunk_cfg.package_path = qwen35_package;
+            chunk_cfg.n_ctx = 512;
+            chunk_cfg.rope_dim = 64;
+            chunk_cfg.rope_theta = 1600000.f;
 
             // Build a label like "chunked PPL matches HF: 2 chunks of 128"
             char label[128];
             std::snprintf(label, sizeof(label), "chunked PPL matches HF: %s", spec.name);
 
-            ok = eng.load(cfg);
+            ok = chunk_engine.load(chunk_cfg);
             if (!ok) {
                 printf("  skip %s: load failed\n", spec.name);
                 CHECK(false, label);
                 continue;
             }
-            CHECK(eng.prefill_pool_stats().active == 0,
+            CHECK(chunk_engine.prefill_pool_stats().active == 0,
                   "chunked engine load has no active graph-pool cache");
 
             // Prefill chunk by chunk, accumulate logits for all positions.
@@ -448,8 +471,8 @@ int main(int argc, char** argv) {
                 int chunk = std::min(spec.chunk_size, PPL_REF_N - offset);
                 std::vector<int> chunk_ids(ppl_ids.begin() + offset,
                                            ppl_ids.begin() + offset + chunk);
-                Tensor hidden = eng.prefill_hidden(chunk_ids);
-                CHECK(eng.prefill_pool_stats().active > 0,
+                Tensor hidden = chunk_engine.prefill_hidden(chunk_ids);
+                CHECK(chunk_engine.prefill_pool_stats().active > 0,
                       "chunked prefill_hidden keeps bounded reusable prefill workspace");
                 if (!hidden.data) {
                     printf("  %s: prefill_hidden failed at offset %d\n",
@@ -458,7 +481,8 @@ int main(int argc, char** argv) {
                     break;
                 }
                 // Extract logits for this chunk's positions
-                std::vector<float> logits = eng.run_lmhead_raw(hidden, chunk, true);
+                std::vector<float> logits =
+                    chunk_engine.run_lmhead_raw(hidden, chunk, true);
                 all_logits.insert(all_logits.end(), logits.begin(), logits.end());
                 offset += chunk;
             }

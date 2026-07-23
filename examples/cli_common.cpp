@@ -279,7 +279,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
 }
 
 bool load_runtime(const CliCommonOptions& opts, Tokenizer& tokenizer,
-                  LLMEngine& engine, int& prefill_seq_len, std::string& error) {
+                  LLMEngine& engine, std::string& error) {
     EngineConfig cfg = make_engine_config(opts);
 
     if (!engine.load(cfg)) {
@@ -301,7 +301,6 @@ bool load_runtime(const CliCommonOptions& opts, Tokenizer& tokenizer,
         rwkv_template->second == "rwkv_legacy") {
         tokenizer.set_rwkv_legacy_chat_template(true);
     }
-    prefill_seq_len = 256;  // TODO: expose from engine
     return true;
 }
 

@@ -10,9 +10,9 @@
 // scalar RMSNorm
 // ---------------------------------------------------------------------------
 
-static void rms_norm_scalar(const float* x, const float* weight,
-                            float* out, int D, int N,
-                            float eps, int ldx, int ldo) {
+[[maybe_unused]] static void rms_norm_scalar(
+    const float* x, const float* weight, float* out, int D, int N, float eps,
+    int ldx, int ldo) {
     for (int n = 0; n < N; n++) {
         const float* x_row = x + n * ldx;
         float*       o_row = out + n * ldo;
