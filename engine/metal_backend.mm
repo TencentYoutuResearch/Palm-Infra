@@ -1038,11 +1038,56 @@ void MetalBackend::dispatch(const GraphNode& node,
                 assert(false && "W8 GEMM needs tensor path");
             }
         } else if (B.prec == Precision::INT4) {
-            // W4A8 prefill GEMM: quantize A per-token to int8, unpack per-group
-            // int4 weights at staging, int8 MMA, per-group dequant. Requires the
-            // tensor path; no fp16 fallback (int4 not consumable otherwise).
+            // W4 prefill GEMM. W4A16 keeps activations in FP32 and unpacks
+            // weights to half while staging for better numerical parity.
+            // W4A8 quantizes activations and remains the throughput baseline.
 #ifdef MOLLM_METAL_TENSOR
             if (impl_->has_tensor) {
+                // W4A16 is both faster and more accurate on the Metal 4 tensor
+                // path: Qwen3.5-4B pp256 improved from ~404 to ~910 t/s and
+                // Youtu-2B from ~980 to ~3055 t/s. It also halves the absolute
+                // CE delta versus CPU on Qwen3.6-35B-A3B. Keep W4A8 as an
+                // explicit diagnostic fallback for older tuning comparisons.
+                static const bool w4a16 =
+                    std::getenv("MOLLM_METAL_W4A8") == nullptr;
+                if (w4a16) {
+                    MatmulW8Params w{};
+                    w.M = p.M; w.N = p.N; w.K = p.K;
+                    w.a_offset = 0; w.c_offset = eoffset(C);
+                    w.a_row_stride = p.a_row_stride;
+                    w.c_row_stride = p.c_row_stride;
+                    w.activation = p.activation;
+                    w.act_n_begin = p.act_n_begin;
+                    w.act_n_len = p.act_n_len;
+                    w.group_size = (int)B.group_size;
+                    w.groups_per_row = (int)B.groups_per_row;
+                    size_t scales_boff = (size_t)p.N * (p.K / 2);
+                    id<MTLComputePipelineState> ps =
+                        impl_->pipeline("gemm_tensor_w4_f32a_i4b_f32c");
+                    [enc setComputePipelineState:ps];
+                    [enc setBuffer:buf_of(&A) offset:A.device_offset atIndex:0];
+                    [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                    [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
+                    [enc setBytes:&w length:sizeof(w) atIndex:3];
+                    [enc setBuffer:buf_of(&B) offset:scales_boff atIndex:4];
+                    [enc setThreadgroupMemoryLength:64*32*sizeof(uint16_t)
+                                            atIndex:0];
+                    MTLSize tgc =
+                        MTLSizeMake(((NSUInteger)p.M + 127)/128,
+                                    ((NSUInteger)p.N + 63)/64, 1);
+                    [enc dispatchThreadgroups:tgc
+                        threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+                    if (w.activation != 0 && w.act_n_len != 0) {
+                        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        id<MTLComputePipelineState> aps =
+                            impl_->pipeline("matmul_w8_activation_range_f32");
+                        [enc setComputePipelineState:aps];
+                        [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
+                        [enc setBytes:&w length:sizeof(w) atIndex:3];
+                        grid1d(p.M * p.N);
+                    }
+                    break;
+                }
                 size_t a_i8_bytes = (size_t)p.M * (size_t)p.K;
                 size_t sa_bytes   = (size_t)p.M * sizeof(float);
                 void* a_i8_h = impl_->pool->acquire(a_i8_bytes);

@@ -163,6 +163,78 @@ kernel void gemm_tensor_w8_f32a_i8b_f32c(
     cT.store(tD.slice(ra, rb));
 }
 
+// W4A16 GEMM: unpack per-group int4 weights to half while staging, then use
+// the same FP32-activation tensor MMA path as W8A16. Unlike W4A8 this avoids
+// per-token int8 activation quantization, improving prefill numerical parity.
+kernel void gemm_tensor_w4_f32a_i4b_f32c(
+    device const float*    A      [[buffer(0)]],
+    device const uint8_t*  B      [[buffer(1)]],
+    device float*          C      [[buffer(2)]],
+    device const float*    SCALES [[buffer(4)]],
+    constant MatmulW8Params& p    [[buffer(3)]],
+    threadgroup half*      shmem  [[threadgroup(0)]],
+    uint3  tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 64, NRB = 128, NK = 32, NUM_THREADS = 128;
+    const int M = p.M, N = p.N, K = p.K;
+    const int gpr = p.groups_per_row, gs = p.group_size;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup half* sa = shmem;
+    auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
+    device const float* ptrA = A + p.a_offset;
+    auto tB = tensor((device float*)ptrA, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, p.a_row_stride}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+    auto cT =
+        mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    const int UNROLL = 16;
+    const int A_WORK = NRA * (NK / UNROLL);
+    const ulong row_bytes = (ulong)K / 2;
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        for (int work = tiitg; work < A_WORK; work += NUM_THREADS) {
+            int nl = work / (NK / UNROLL), sub = work % (NK / UNROLL);
+            int kbase = sub * UNROLL, gn = ra + nl, gk0 = loop_k + kbase;
+            threadgroup half* dst = sa + nl*NK + kbase;
+            if (gn < N) {
+                device const uint8_t* wr =
+                    B + (ulong)gn * row_bytes + (ulong)(gk0 / 2);
+                device const float* sr =
+                    SCALES + (ulong)gn * (ulong)gpr;
+                #pragma unroll
+                for (int i = 0; i < UNROLL; i += 2) {
+                    int k = gk0 + i;
+                    uint8_t packed = (k < K) ? wr[i / 2] : 0;
+                    int lo = packed & 0x0f; if (lo >= 8) lo -= 16;
+                    int hi = packed >> 4;   if (hi >= 8) hi -= 16;
+                    dst[i] = (k < K)
+                        ? (half)((float)lo * sr[k / gs]) : (half)0;
+                    dst[i + 1] = (k + 1 < K)
+                        ? (half)((float)hi * sr[(k + 1) / gs]) : (half)0;
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i) dst[i] = (half)0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, rb);
+        mm.run(mB, mA, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float* dstC = C + p.c_offset;
+    auto tD =
+        tensor(dstC, dextents<int32_t,2>(N, M),
+               array<int,2>({1, p.c_row_stride}));
+    cT.store(tD.slice(ra, rb));
+}
+
 // Post-pass for tensor W8 GEMM, whose cooperative tensor store cannot apply a
 // per-column fused activation. Operates in place on row-strided C.
 kernel void matmul_w8_activation_range_f32(
