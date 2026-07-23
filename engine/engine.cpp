@@ -38,6 +38,14 @@ int metal_ssd_prefill_min_tokens() {
     return threshold;
 }
 
+bool metal_ssd_reload_weights() {
+    static bool enabled = [] {
+        const char* value = std::getenv("MOLLM_METAL_SSD_RELOAD_WEIGHTS");
+        return value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 void release_pool_tensor(BufferPool& pool, Tensor& t) {
     if (t.data && t.mem_type == MemoryType::POOLED && t.nbytes() > 0) {
         if (t.owner_id != 0 && t.owner_id != pool.id()) {
@@ -581,10 +589,15 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
     bool short_ssd_cpu_prefill = false;
 #ifdef MOLLM_METAL
-    short_ssd_cpu_prefill =
+    const bool is_ssd_metal =
         moe_ssd_cache_ && metal_backend_ &&
-        saved_prefill_backend == metal_backend_.get() &&
-        n < metal_ssd_prefill_min_tokens();
+        saved_prefill_backend == metal_backend_.get();
+    const bool metal_weights_ready =
+        is_ssd_metal && as_metal(metal_backend_)->has_weight_copies();
+    short_ssd_cpu_prefill =
+        is_ssd_metal &&
+        (n < metal_ssd_prefill_min_tokens() ||
+         (!metal_weights_ready && !metal_ssd_reload_weights()));
     if (short_ssd_cpu_prefill) {
         // Small-M GPU kernels plus one GPU→CPU synchronization per MoE layer
         // lose to the CPU path. Drop dense Metal copies before CPU work so UMA
@@ -661,10 +674,15 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
     bool short_ssd_cpu_prefill = false;
 #ifdef MOLLM_METAL
-    short_ssd_cpu_prefill =
+    const bool is_ssd_metal =
         moe_ssd_cache_ && metal_backend_ &&
-        saved_prefill_backend == metal_backend_.get() &&
-        n < metal_ssd_prefill_min_tokens();
+        saved_prefill_backend == metal_backend_.get();
+    const bool metal_weights_ready =
+        is_ssd_metal && as_metal(metal_backend_)->has_weight_copies();
+    short_ssd_cpu_prefill =
+        is_ssd_metal &&
+        (n < metal_ssd_prefill_min_tokens() ||
+         (!metal_weights_ready && !metal_ssd_reload_weights()));
     if (short_ssd_cpu_prefill) {
         release_metal_prefill_weights();
         release_graph_temporaries(graph_prefill_, saved_prefill_backend);
