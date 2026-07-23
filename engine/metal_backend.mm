@@ -47,9 +47,12 @@ struct MetalBackend::Impl {
     id<MTLBuffer>            weight_buffer = nil;
     void*                    weight_base   = nullptr;
     size_t                   weight_size   = 0;
+    bool                     copy_weights = false;
 
     // persistent device buffers owned by the backend (KV cache)
     std::vector<id<MTLBuffer>> persistent;
+    std::unordered_map<const void*, id<MTLBuffer>> copied_weights;
+    std::unordered_map<const void*, id<MTLBuffer>> decoded_q4_weights;
 
     // reusable per-key boundary input buffers (hidden/mask/cos/sin), keyed by
     // graph INPUT node name; grown on demand.
@@ -269,6 +272,8 @@ MetalBackend::~MetalBackend() {
         dump_profile();  // report per-op GPU time table if MOLLM_METAL_PROFILE
         impl_->pipelines.clear();
         impl_->spec_pipelines.clear();
+        impl_->copied_weights.clear();
+        impl_->decoded_q4_weights.clear();
         impl_->persistent.clear();
         impl_->weight_buffer = nil;
         impl_->pool.reset();
@@ -361,8 +366,34 @@ bool MetalBackend::register_weight_region(void* base, size_t size) {
     return true;
 }
 
+void MetalBackend::enable_weight_copy_mode() {
+    impl_->copy_weights = true;
+}
+
 void MetalBackend::wrap_weight(Tensor& t) {
-    if (!impl_->weight_buffer || !t.data) return;
+    if (!t.data) return;
+    if (!impl_->weight_buffer) {
+        if (!impl_->copy_weights) return;
+        // INT4 g128 is decoded after quant metadata is configured. INT8 needs
+        // its scale storage co-located and is not yet supported by the hybrid
+        // path. FP16/FP32 constants can be copied immediately.
+        if (t.prec == Precision::FP16 || t.prec == Precision::FP32) {
+            void* src = t.data;
+            size_t bytes = t.nbytes();
+            auto found = impl_->copied_weights.find(src);
+            if (found != impl_->copied_weights.end()) {
+                t.device_data = (__bridge void*)found->second;
+                t.device_offset = 0;
+                t.data = [found->second contents];
+            } else {
+                alloc_persistent(t, bytes);
+                std::memcpy(t.data, src, bytes);
+                impl_->copied_weights[src] =
+                    (__bridge id<MTLBuffer>)t.device_data;
+            }
+        }
+        return;
+    }
     char* base = (char*)impl_->weight_base;
     char* ptr  = (char*)t.data;
     if (ptr < base || ptr >= base + impl_->weight_size) {
@@ -405,6 +436,12 @@ void MetalBackend::wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128) {
     const int gpr = (int)t.groups_per_row;         // K/128
     const size_t nib_bytes = (size_t)N * (K / 2);
     const size_t sc_bytes  = (size_t)N * gpr * sizeof(float);
+    auto cached = impl_->decoded_q4_weights.find(t.q4_g128_data);
+    if (cached != impl_->decoded_q4_weights.end()) {
+        t.device_data = (__bridge void*)cached->second;
+        t.device_offset = 0;
+        return;
+    }
     @autoreleasepool {
         id<MTLBuffer> b = [impl_->device newBufferWithLength:nib_bytes + sc_bytes
                                                      options:MTLResourceStorageModeShared];
@@ -429,6 +466,7 @@ void MetalBackend::wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128) {
         }
         t.device_data = (__bridge void*)b;
         t.device_offset = 0;
+        impl_->decoded_q4_weights[t.q4_g128_data] = b;
         // Keep t.scales pointing at the package's CPU layout. Metal binds the
         // co-located decoded scales by byte offset, while hybrid/CPU kernels
         // still need the original BG128 tensor metadata.
@@ -504,6 +542,23 @@ void MetalBackend::begin_graph() {
     // "Points of Interest" track (Apple's NVTX analogue) alongside the Metal
     // System Trace GPU timeline.
     os_signpost_interval_begin(impl_->sp(), OS_SIGNPOST_ID_EXCLUSIVE, "graph");
+}
+
+void MetalBackend::synchronize_for_host_read() {
+    if (impl_->enc) {
+        [impl_->enc endEncoding];
+        impl_->enc = nil;
+    }
+    if (impl_->cmd) {
+        [impl_->cmd commit];
+        [impl_->cmd waitUntilCompleted];
+        if (impl_->cmd.status == MTLCommandBufferStatusError) {
+            NSError* e = impl_->cmd.error;
+            fprintf(stderr, "MetalBackend: host-read sync failed: %s\n",
+                    e ? e.localizedDescription.UTF8String : "?");
+        }
+        impl_->cmd = nil;
+    }
 }
 
 // Debug: commit + wait after each op so intermediate device buffers are

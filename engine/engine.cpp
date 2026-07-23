@@ -468,7 +468,8 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
         // Boundary inputs are produced on the host (embed/rope/mask); upload
         // their bytes into a device buffer so GPU kernels can read them.
         // Cache/state INPUTs are already device-resident (allocate_caches).
-        if (metal_backend_ && is_boundary && t->data) {
+        if (metal_backend_ && exec_ctx.backend == metal_backend_.get() &&
+            is_boundary && t->data) {
             as_metal(metal_backend_)
                 ->upload_input(*t, name, t->data, t->nbytes());
         }
@@ -478,12 +479,12 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
     }
 
 #ifdef MOLLM_METAL
-    if (metal_backend_)
+    if (metal_backend_ && exec_ctx.backend == metal_backend_.get())
         metal_backend_->begin_graph();
 #endif
     execute_graph(exec_ctx);
 #ifdef MOLLM_METAL
-    if (metal_backend_)
+    if (metal_backend_ && exec_ctx.backend == metal_backend_.get())
         metal_backend_->end_graph();
 #endif
 

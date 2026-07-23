@@ -43,6 +43,7 @@ public:
     void* alloc_output(Tensor& out, size_t nbytes, BufferPool* pool) override;
     void  free_output(Tensor& t, BufferPool* pool) override;
     bool  is_device_resident() const override { return true; }
+    void  synchronize_for_host_read() override;
 
     void begin_graph() override;
     void end_graph() override;
@@ -57,6 +58,11 @@ public:
     /// the mmap (newBufferWithBytesNoCopy). Individual weight tensors then carry
     /// device_offset = (weight ptr - base). Returns false if wrapping failed.
     bool register_weight_region(void* base, size_t size);
+
+    /// Enable per-weight copies for hybrid SSD-MoE. The package remains mmap'd
+    /// so expert aggregates stay unmaterialized; dense constants are copied
+    /// into individual Shared Metal buffers by wrap_weight().
+    void enable_weight_copy_mode();
 
     /// After register_weight_region, point a weight/constant tensor at the
     /// shared weight buffer with the correct device_offset (from t.data).

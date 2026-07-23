@@ -401,9 +401,11 @@ void execute_graph(ExecContext& ctx) {
         // vector to the real router from the next MoE layer on an idle SSD
         // worker, so its speculative reads can overlap this layer and the next
         // attention block. The next layer always recomputes its exact route.
-        if (ctx.moe_cross_layer_prefetch && !device_resident &&
+        if (ctx.moe_cross_layer_prefetch &&
             node.op_type == OpType::MOE && inputs.size() >= 4 && inputs[0] &&
             inputs[0]->shape[1] == 1) {
+            if (device_resident)
+                ctx.backend->synchronize_for_host_read();
             const auto next_it = std::find_if(nodes.begin() + static_cast<ptrdiff_t>(i + 1),
                                               nodes.end(),
                                               [](const auto& candidate) {

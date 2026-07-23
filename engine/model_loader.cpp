@@ -313,7 +313,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             // load-time repacking rewrites t.data to an out-of-region buffer).
             // INT4 g128 weights need a second pass after quant metadata is set
             // (see finalize_metal_weight) to decode the packed block layout.
-            if (metal_backend_)
+            if (metal_backend_ && exec_ctx.backend == metal_backend_.get())
                 as_metal(metal_backend_)->wrap_weight(t);
 #endif
         };
@@ -323,7 +323,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         // are populated, decode the CPU Q4B8G128Block layout into a Metal raw
         // nibble+scale device buffer. No-op for non-INT4 weights.
         auto finalize_metal_weight = [&]() {
-            if (metal_backend_) {
+            if (metal_backend_ && exec_ctx.backend == metal_backend_.get()) {
                 bool is_aggregate_expert =
                     wref.find("_experts_") != std::string::npos;
                 as_metal(metal_backend_)
@@ -645,10 +645,6 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     mollm_trace::start(cfg_.trace_path);
     mollm_trace::set_thread_name("main");
     if (cfg_.moe_ssd_cache_bytes != 0) {
-        if (cfg_.device != Device::CPU) {
-            fprintf(stderr, "Engine: MoE SSD offload is currently CPU-only\n");
-            return false;
-        }
         // Expert tensors must remain unmaterialized; resident package loading
         // would copy the complete aggregate tensors before the cache can help.
         cfg_.weight_loading = WeightLoadingMode::MMAP;
@@ -674,12 +670,20 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             cfg_.device = Device::CPU;
         } else {
             exec_ctx_prefill_.backend = metal_backend_.get();
-            exec_ctx_decode_.backend = metal_backend_.get();
+            // SSD expert compute remains much faster when decode stays wholly
+            // on CPU: alternating a GPU dense segment with every CPU expert
+            // layer throttles the routed matmuls on UMA. Keep Metal for the
+            // large prefill matrices and use the established CPU SSD pipeline
+            // (including cross-layer prefetch) for token generation.
+            exec_ctx_decode_.backend = cfg_.moe_ssd_cache_bytes != 0
+                ? static_cast<Backend*>(&cpu_backend_)
+                : metal_backend_.get();
             // The Metal backend wraps the weight region via
             // newBufferWithBytesNoCopy. mmap'd file-backed pages are NOT
             // reliably GPU-accessible that way (the GPU reads zeros), so force
             // RESIDENT weights when Metal is active.
-            if (cfg_.weight_loading == WeightLoadingMode::MMAP) {
+            if (cfg_.weight_loading == WeightLoadingMode::MMAP &&
+                cfg_.moe_ssd_cache_bytes == 0) {
                 fprintf(stderr,
                         "Engine: Metal backend requires resident weights; "
                         "ignoring --mmap\n");
@@ -722,12 +726,19 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     // Wrap the whole package weight region as one zero-copy MTLBuffer so each
     // weight tensor can alias it via device_offset (set in setup_weight).
     if (metal_backend_ && package_weights_base_ && package_weights_size_) {
-        if (!as_metal(metal_backend_)
-                 ->register_weight_region(
-                     const_cast<uint8_t*>(package_weights_base_),
-                     package_weights_size_)) {
+        if (moe_ssd_cache_) {
+            as_metal(metal_backend_)->enable_weight_copy_mode();
             fprintf(stderr,
-                    "Engine: failed to register weight region with Metal\n");
+                    "Engine: Metal/SSD hybrid uses Metal prefill and CPU "
+                    "decode; experts remain mmap-backed\n");
+        } else {
+            if (!as_metal(metal_backend_)
+                     ->register_weight_region(
+                         const_cast<uint8_t*>(package_weights_base_),
+                         package_weights_size_)) {
+                fprintf(stderr,
+                        "Engine: failed to register weight region with Metal\n");
+            }
         }
     }
 #endif

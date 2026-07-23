@@ -81,6 +81,11 @@ public:
     /// op type instead of host-pointer equality.
     virtual bool is_device_resident() const { return false; }
 
+    /// Make preceding device writes visible through Tensor::data for a
+    /// host-side consumer such as SSD route prediction. CPU is already
+    /// coherent; device backends may submit and wait for queued work.
+    virtual void synchronize_for_host_read() {}
+
     /// Called by run_graph() before/after a full execute_graph() pass so a
     /// device backend can open/commit a command buffer around the whole graph.
     virtual void begin_graph() {}
