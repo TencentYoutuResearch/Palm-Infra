@@ -1283,6 +1283,7 @@ void MetalBackend::dispatch(const GraphNode& node,
 
     case OpType::SIGMOID:
     case OpType::SIGMOID_EXACT:
+    case OpType::GELU:
     case OpType::TANH:
     case OpType::EXP:
     case OpType::EXP_EXACT:
@@ -1297,6 +1298,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.a_offset = eoffset(X);
         p.out_offset = eoffset(O);
         const char* kernel =
+            (op == OpType::GELU) ? "gelu_f32" :
             (op == OpType::TANH) ? "tanh_f32" :
             (op == OpType::EXP || op == OpType::EXP_EXACT) ? "exp_f32" :
             (op == OpType::SOFTPLUS) ? "softplus_f32" : "sigmoid_f32";

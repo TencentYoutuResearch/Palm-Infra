@@ -410,7 +410,7 @@ int main() {
     }
 
     // ---- Remaining scalar activations (including recurrent exact variants) --
-    for (OpType op : {OpType::TANH, OpType::EXP, OpType::EXP_EXACT,
+    for (OpType op : {OpType::GELU, OpType::TANH, OpType::EXP, OpType::EXP_EXACT,
                       OpType::SIGMOID_EXACT, OpType::SOFTPLUS}) {
         int D = 37, rows = 3;
         Tensor X = make_dev(mb, Precision::FP32, D, rows);
@@ -422,7 +422,11 @@ int main() {
         metal_op(mb, op, {&X}, O);
         for (int i = 0; i < D * rows; ++i) {
             float v = x[i];
-            if (op == OpType::TANH)
+            if (op == OpType::GELU) {
+                float inner =
+                    0.7978845608f * (v + 0.044715f * v * v * v);
+                ref[i] = 0.5f * v * (1.0f + std::tanh(inner));
+            } else if (op == OpType::TANH)
                 ref[i] = std::tanh(v);
             else if (op == OpType::EXP || op == OpType::EXP_EXACT)
                 ref[i] = std::exp(v);

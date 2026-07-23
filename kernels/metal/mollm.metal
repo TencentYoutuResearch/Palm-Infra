@@ -1401,6 +1401,19 @@ kernel void sigmoid_f32(
     O[p.out_offset + gid] = 1.0f / (1.0f + exp(-v));
 }
 
+kernel void gelu_f32(
+    device const float* X [[buffer(0)]], device float* O [[buffer(2)]],
+    constant EwiseParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.n) return;
+    uint col = gid % (uint)p.shape0, row = gid / (uint)p.shape0;
+    float v = X[p.a_offset + row * (uint)p.a_row_stride + col];
+    float inner = 0.7978845608f * (v + 0.044715f * v * v * v);
+    O[p.out_offset + row * (uint)p.out_row_stride + col] =
+        0.5f * v * (1.0f + precise::tanh(inner));
+}
+
 kernel void tanh_f32(
     device const float* X [[buffer(0)]], device float* O [[buffer(2)]],
     constant EwiseParams& p [[buffer(3)]],

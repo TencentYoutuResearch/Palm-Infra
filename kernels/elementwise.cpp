@@ -426,6 +426,30 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
+    case OpType::GELU:
+        // Match the fused MATMUL GELU convention used by both backends.
+        if (inputs.size() >= 1 && inputs[0] && output) {
+            const Tensor& src = *inputs[0];
+            const char* base = static_cast<const char*>(src.data);
+            StrideIter it = compute_stride_iter(src);
+            float* dst = output->ptr<float>();
+            for (int i3 = 0; i3 < it.d3; ++i3)
+                for (int i2 = 0; i2 < it.d2; ++i2)
+                    for (int i1 = 0; i1 < it.d1; ++i1) {
+                        const float* row = reinterpret_cast<const float*>(
+                            base + i3 * it.s3 + i2 * it.s2 + i1 * it.s1);
+                        for (int i = 0; i < it.n_inner; ++i) {
+                            const float v = row[i];
+                            const float inner =
+                                0.7978845608f *
+                                (v + 0.044715f * v * v * v);
+                            *dst++ =
+                                0.5f * v * (1.0f + std::tanh(inner));
+                        }
+                    }
+        }
+        break;
+
     case OpType::TANH:
         if (inputs.size() >= 1 && inputs[0] && output) {
             const Tensor& src = *inputs[0];

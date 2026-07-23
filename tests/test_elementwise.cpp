@@ -88,6 +88,14 @@ void test_unary(ThreadPool& pool) {
     run(
         OpType::SILU, [](float x) { return x / (1.f + std::exp(-x)); }, 0.02f,
         "SILU");
+    run(
+        OpType::GELU,
+        [](float x) {
+            float inner =
+                0.7978845608f * (x + 0.044715f * x * x * x);
+            return 0.5f * x * (1.f + std::tanh(inner));
+        },
+        1e-6f, "GELU");
     run(OpType::TANH, [](float x) { return std::tanh(x); }, 1e-6f, "TANH");
     run(
         OpType::SIGMOID, [](float x) { return 1.f / (1.f + std::exp(-x)); },

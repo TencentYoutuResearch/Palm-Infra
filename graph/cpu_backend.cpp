@@ -141,6 +141,7 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::ADD:
     case OpType::MUL:
     case OpType::SILU:
+    case OpType::GELU:
     case OpType::TANH:
     case OpType::SWIGLU:
     case OpType::SIGMOID:
