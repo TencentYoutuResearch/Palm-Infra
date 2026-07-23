@@ -168,6 +168,10 @@ struct EwiseParams {
     uint  a_offset;
     uint  b_offset;
     uint  out_offset;
+    int   shape[4];
+    int   a_stride[4];
+    int   b_stride[4];   // zero on broadcast dimensions
+    int   out_stride[4];
 };
 
 // Fused SwiGLU over a merged [2I, rows] tensor (gate = row[0..I), up = row[I..2I)).
@@ -178,6 +182,66 @@ struct SwigluParams {
     uint  merged_offset;     // element offset into merged buffer
     uint  out_offset;        // element offset into output buffer
     int   merged_row_stride; // elements between rows (tokens) in merged (= 2I)
+};
+
+struct RwkvTokenShiftParams {
+    int hidden;
+    int seq;
+    int real;
+    int state_fp16;
+    uint x_offset;
+    uint state_offset;
+    uint out_offset;
+};
+
+struct RwkvMixParams {
+    int hidden;
+    int total;
+    uint x_offset;
+    uint shift_offset;
+    uint mix_offset;
+    uint out_offset;
+};
+
+struct RwkvL2NormParams {
+    int heads;
+    int head_size;
+    int groups;             // tokens * heads
+    uint x_offset;
+    uint out_offset;
+    float eps;
+};
+
+struct RwkvPostParams {
+    int heads;
+    int head_size;
+    int groups;
+    uint raw_offset;
+    uint r_offset;
+    uint k_offset;
+    uint v_offset;
+    uint rk_offset;
+    uint weight_offset;
+    uint bias_offset;
+    uint gate_offset;
+    uint out_offset;
+    float eps;
+};
+
+struct Rwkv7Params {
+    int heads;
+    int head_size;
+    int seq;
+    int real;
+    int state_fp16;
+    uint r_offset;
+    uint decay_offset;
+    uint k_offset;
+    uint v_offset;
+    uint a_offset;
+    uint b_offset;
+    uint state_offset;
+    uint out_offset;
 };
 
 // Fused routed-expert MoE using decoded row-major W4-G128 expert weights.

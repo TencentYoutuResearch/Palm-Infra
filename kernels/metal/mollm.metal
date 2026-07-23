@@ -408,6 +408,11 @@ inline float apply_activation(float v, int act) {
     if (act == 1) {  // SILU: x * sigmoid(x)
         return v / (1.0f + exp(-v));
     }
+    if (act == 2) {  // GELU tanh approximation
+        float inner = 0.7978845608f * (v + 0.044715f * v * v * v);
+        return 0.5f * v * (1.0f + precise::tanh(inner));
+    }
+    if (act == 3) return max(v, 0.0f);
     if (act == 4) {
         float y = max(v, 0.0f);
         return y * y;
@@ -1329,11 +1334,21 @@ kernel void add_f32(
     uint  gid                    [[thread_position_in_grid]])
 {
     if (int(gid) >= p.n) return;
-    uint col = gid % (uint)p.shape0, row = gid / (uint)p.shape0;
-    float a = A[p.a_offset + row * (uint)p.a_row_stride + col];
-    float b = p.broadcast_b ? B[p.b_offset]
-                            : B[p.b_offset + row * (uint)p.b_row_stride + col];
-    O[p.out_offset + row * (uint)p.out_row_stride + col] = a + b;
+    uint q = gid;
+    uint i0 = q % (uint)p.shape[0]; q /= (uint)p.shape[0];
+    uint i1 = q % (uint)p.shape[1]; q /= (uint)p.shape[1];
+    uint i2 = q % (uint)p.shape[2]; q /= (uint)p.shape[2];
+    uint i3 = q;
+    uint ai = p.a_offset + i0*(uint)p.a_stride[0] +
+              i1*(uint)p.a_stride[1] + i2*(uint)p.a_stride[2] +
+              i3*(uint)p.a_stride[3];
+    uint bi = p.b_offset + i0*(uint)p.b_stride[0] +
+              i1*(uint)p.b_stride[1] + i2*(uint)p.b_stride[2] +
+              i3*(uint)p.b_stride[3];
+    uint oi = p.out_offset + i0*(uint)p.out_stride[0] +
+              i1*(uint)p.out_stride[1] + i2*(uint)p.out_stride[2] +
+              i3*(uint)p.out_stride[3];
+    O[oi] = A[ai] + B[bi];
 }
 
 // Elementwise multiply (contiguous), with scalar-b broadcast.
@@ -1345,11 +1360,21 @@ kernel void mul_f32(
     uint  gid                    [[thread_position_in_grid]])
 {
     if (int(gid) >= p.n) return;
-    uint col = gid % (uint)p.shape0, row = gid / (uint)p.shape0;
-    float a = A[p.a_offset + row * (uint)p.a_row_stride + col];
-    float b = p.broadcast_b ? B[p.b_offset]
-                            : B[p.b_offset + row * (uint)p.b_row_stride + col];
-    O[p.out_offset + row * (uint)p.out_row_stride + col] = a * b;
+    uint q = gid;
+    uint i0 = q % (uint)p.shape[0]; q /= (uint)p.shape[0];
+    uint i1 = q % (uint)p.shape[1]; q /= (uint)p.shape[1];
+    uint i2 = q % (uint)p.shape[2]; q /= (uint)p.shape[2];
+    uint i3 = q;
+    uint ai = p.a_offset + i0*(uint)p.a_stride[0] +
+              i1*(uint)p.a_stride[1] + i2*(uint)p.a_stride[2] +
+              i3*(uint)p.a_stride[3];
+    uint bi = p.b_offset + i0*(uint)p.b_stride[0] +
+              i1*(uint)p.b_stride[1] + i2*(uint)p.b_stride[2] +
+              i3*(uint)p.b_stride[3];
+    uint oi = p.out_offset + i0*(uint)p.out_stride[0] +
+              i1*(uint)p.out_stride[1] + i2*(uint)p.out_stride[2] +
+              i3*(uint)p.out_stride[3];
+    O[oi] = A[ai] * B[bi];
 }
 
 // SILU: x * sigmoid(x) (contiguous).
@@ -1410,6 +1435,203 @@ kernel void softplus_f32(
               (v < -20.0f ? precise::exp(v) :
                             precise::log(1.0f + precise::exp(v)));
     O[p.out_offset + row * (uint)p.out_row_stride + col] = y;
+}
+
+// RWKV previous-token shift. Each thread owns one hidden channel and walks the
+// sequence serially, which preserves the recurrent state update order.
+kernel void rwkv_token_shift_f32(
+    device const float* X       [[buffer(0)]],
+    device void* STATE          [[buffer(1)]],
+    device float* O             [[buffer(2)]],
+    constant RwkvTokenShiftParams& p [[buffer(3)]],
+    uint d                      [[thread_position_in_grid]])
+{
+    if (int(d) >= p.hidden) return;
+    float previous = p.state_fp16
+        ? float(((device half*)STATE)[p.state_offset + d])
+        : ((device float*)STATE)[p.state_offset + d];
+    for (int t = 0; t < p.real; ++t) {
+        uint i = (uint)t * (uint)p.hidden + d;
+        float current = X[p.x_offset + i];
+        O[p.out_offset + i] = previous - current;
+        // Persistent shift state is FP16 in RWKV packages. Match repeated
+        // decode exactly by applying the FP16 round-trip after every token,
+        // not only when the whole prefill sequence finishes.
+        previous = p.state_fp16 ? float(half(current)) : current;
+    }
+    for (int t = p.real; t < p.seq; ++t)
+        O[p.out_offset + (uint)t * (uint)p.hidden + d] = 0.0f;
+    if (p.state_fp16)
+        ((device half*)STATE)[p.state_offset + d] = half(previous);
+    else
+        ((device float*)STATE)[p.state_offset + d] = previous;
+}
+
+kernel void rwkv_mix_f32(
+    device const float* X       [[buffer(0)]],
+    device const float* SHIFT   [[buffer(1)]],
+    device float* O             [[buffer(2)]],
+    constant RwkvMixParams& p   [[buffer(3)]],
+    device const float* MIX     [[buffer(4)]],
+    uint gid                    [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.total) return;
+    uint d = gid % (uint)p.hidden;
+    O[p.out_offset + gid] =
+        X[p.x_offset + gid] +
+        SHIFT[p.shift_offset + gid] * MIX[p.mix_offset + d];
+}
+
+// One threadgroup per (token, head), normalizing the head vector by its L2
+// magnitude. This mirrors the CPU definition 1 / (sqrt(sum_sq) + eps).
+kernel void rwkv_l2_norm_f32(
+    device const float* X          [[buffer(0)]],
+    device float* O                [[buffer(2)]],
+    constant RwkvL2NormParams& p   [[buffer(3)]],
+    uint group                     [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]])
+{
+    if (int(group) >= p.groups) return;
+    uint base = group * (uint)p.head_size;
+    float partial = 0.0f;
+    for (int i = int(tid); i < p.head_size; i += 256) {
+        float v = X[p.x_offset + base + (uint)i];
+        partial += v * v;
+    }
+    partial = simd_sum(partial);
+    threadgroup float sh[8];
+    uint lane = tid & 31u, sg = tid >> 5;
+    if (lane == 0) sh[sg] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = simd_sum(lane < 8 ? sh[lane] : 0.0f);
+    float scale = 1.0f / (precise::sqrt(sum) + p.eps);
+    for (int i = int(tid); i < p.head_size; i += 256)
+        O[p.out_offset + base + (uint)i] =
+            X[p.x_offset + base + (uint)i] * scale;
+}
+
+// Fused per-head GroupNorm + RWKV bonus + gate. One threadgroup owns one
+// (token, head) vector.
+kernel void rwkv_post_f32(
+    device const float* RAW       [[buffer(0)]],
+    device const float* R         [[buffer(1)]],
+    device float* O               [[buffer(2)]],
+    constant RwkvPostParams& p    [[buffer(3)]],
+    device const float* K         [[buffer(4)]],
+    device const float* V         [[buffer(5)]],
+    device const float* RK        [[buffer(6)]],
+    device const float* W         [[buffer(7)]],
+    device const float* BIAS      [[buffer(8)]],
+    device const float* GATE      [[buffer(9)]],
+    uint group                     [[threadgroup_position_in_grid]],
+    uint tid                       [[thread_position_in_threadgroup]])
+{
+    if (int(group) >= p.groups) return;
+    uint h = group % (uint)p.heads;
+    uint base = group * (uint)p.head_size;
+    uint wb = h * (uint)p.head_size;
+    uint lane = tid & 31u, sg = tid >> 5;
+    threadgroup float sum_sh[8];
+    threadgroup float bonus_sh[8];
+
+    float sum = 0.0f, bonus = 0.0f;
+    for (int j = int(tid); j < p.head_size; j += 256) {
+        uint i = base + (uint)j;
+        sum += RAW[p.raw_offset + i];
+        bonus += R[p.r_offset + i] * K[p.k_offset + i] *
+                 RK[p.rk_offset + wb + (uint)j];
+    }
+    sum = simd_sum(sum);
+    bonus = simd_sum(bonus);
+    if (lane == 0) {
+        sum_sh[sg] = sum;
+        bonus_sh[sg] = bonus;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = simd_sum(lane < 8 ? sum_sh[lane] : 0.0f) /
+                 float(p.head_size);
+    float bonus_total = simd_sum(lane < 8 ? bonus_sh[lane] : 0.0f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float variance = 0.0f;
+    for (int j = int(tid); j < p.head_size; j += 256) {
+        float z = RAW[p.raw_offset + base + (uint)j] - mean;
+        variance += z * z;
+    }
+    variance = simd_sum(variance);
+    if (lane == 0) sum_sh[sg] = variance;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    variance = simd_sum(lane < 8 ? sum_sh[lane] : 0.0f) /
+               float(p.head_size);
+    float inv = rsqrt(variance + p.eps);
+
+    for (int j = int(tid); j < p.head_size; j += 256) {
+        uint i = base + (uint)j;
+        uint wi = wb + (uint)j;
+        float normalized =
+            (RAW[p.raw_offset + i] - mean) * inv * W[p.weight_offset + wi] +
+            BIAS[p.bias_offset + wi];
+        O[p.out_offset + i] =
+            (normalized + bonus_total * V[p.v_offset + i]) *
+            GATE[p.gate_offset + i];
+    }
+}
+
+// RWKV-7 recurrence. One threadgroup owns one head and one thread owns one
+// state-matrix row. Tokens remain serial within the kernel, while all rows and
+// heads update in parallel.
+kernel void rwkv7_f32(
+    device const float* R          [[buffer(0)]],
+    device const float* DECAY      [[buffer(1)]],
+    device float* O                [[buffer(2)]],
+    constant Rwkv7Params& p        [[buffer(3)]],
+    device const float* K          [[buffer(4)]],
+    device const float* V          [[buffer(5)]],
+    device const float* A          [[buffer(6)]],
+    device const float* B          [[buffer(7)]],
+    device void* STATE             [[buffer(8)]],
+    uint head                      [[threadgroup_position_in_grid]],
+    uint row                       [[thread_position_in_threadgroup]])
+{
+    if (int(head) >= p.heads || int(row) >= p.head_size) return;
+    uint hidden = (uint)p.heads * (uint)p.head_size;
+    uint state_head =
+        p.state_offset + head * (uint)p.head_size * (uint)p.head_size;
+    uint state_row = state_head + row * (uint)p.head_size;
+
+    for (int t = 0; t < p.real; ++t) {
+        uint base = (uint)t * hidden + head * (uint)p.head_size;
+        float state_a = 0.0f;
+        for (int j = 0; j < p.head_size; ++j) {
+            float state_value = p.state_fp16
+                ? float(((device half*)STATE)[state_row + (uint)j])
+                : ((device float*)STATE)[state_row + (uint)j];
+            state_a += state_value * A[p.a_offset + base + (uint)j];
+        }
+
+        float result = 0.0f;
+        float value = V[p.v_offset + base + row];
+        for (int j = 0; j < p.head_size; ++j) {
+            uint sj = state_row + (uint)j;
+            float state_value = p.state_fp16
+                ? float(((device half*)STATE)[sj])
+                : ((device float*)STATE)[sj];
+            state_value =
+                state_value * DECAY[p.decay_offset + base + (uint)j] +
+                value * K[p.k_offset + base + (uint)j] +
+                state_a * B[p.b_offset + base + (uint)j];
+            if (p.state_fp16)
+                ((device half*)STATE)[sj] = half(state_value);
+            else
+                ((device float*)STATE)[sj] = state_value;
+            result += state_value * R[p.r_offset + base + (uint)j];
+        }
+        O[p.out_offset + base + row] = result;
+    }
+    for (int t = p.real; t < p.seq; ++t) {
+        uint base = (uint)t * hidden + head * (uint)p.head_size;
+        O[p.out_offset + base + row] = 0.0f;
+    }
 }
 
 // Fused SwiGLU: reads gate/up halves from a single merged [2I, rows] buffer

@@ -3,6 +3,7 @@
 
 #include "kernels/tensor.h"
 #include "kernels/matmul.h"
+#include "kernels/rwkv.h"
 #include "engine/metal_backend.h"
 #include "graph/graph.h"
 #include <cmath>
@@ -162,6 +163,31 @@ int main() {
               "GEMM partial fused SiLU gate=[0,16), up unchanged");
     }
 
+    // ---- GEMM fused ReLU-squared (RWKV channel-mix) ------------------------
+    {
+        int M = 3, K = 64, N = 31;
+        Tensor A = make_dev(mb, Precision::FP32, K, M);
+        Tensor B = make_dev(mb, Precision::FP16, N, K);
+        Tensor C = make_dev(mb, Precision::FP32, N, M);
+        std::vector<float> a(M * K), bf(N * K), ref(M * N);
+        fill_rand(a.data(), (int)a.size());
+        fill_rand(bf.data(), (int)bf.size());
+        memcpy(A.data, a.data(), a.size() * sizeof(float));
+        __fp16* bh = (__fp16*)B.data;
+        for (int i = 0; i < N * K; ++i) bh[i] = (__fp16)bf[i];
+        metal_matmul(mb, A, B, C, {4, 0, -1});
+        for (int m = 0; m < M; ++m)
+            for (int n = 0; n < N; ++n) {
+                double sum = 0.0;
+                for (int k = 0; k < K; ++k)
+                    sum += a[m * K + k] * (float)bh[n * K + k];
+                float y = std::max(0.0f, (float)sum);
+                ref[m * N + n] = y * y;
+            }
+        CHECK(close((const float*)C.data, ref.data(), M * N, 1e-3f, 2e-2f),
+              "GEMM fused ReLU-squared");
+    }
+
     // ---- GEMM larger, tile-aligned (exercises fast simdgroup_store path) ----
     // and an unaligned case (partial edge tiles).
     for (int ci = 0; ci < 2; ci++) {
@@ -294,6 +320,32 @@ int main() {
         std::vector<float> ref(n);
         for (int i=0;i<n;i++) ref[i]=a[i]+b[i];
         CHECK(close((const float*)O.data, ref.data(), n, 1e-5f, 1e-5f), "ADD n=512");
+    }
+
+    // ---- ADD/MUL full broadcasting: [D,S,H] with [D,1,H] ------------------
+    for (OpType op : {OpType::ADD, OpType::MUL}) {
+        int D = 17, S = 5, H = 3;
+        Tensor A = make_dev3(mb, Precision::FP32, D, S, H);
+        Tensor B = make_dev3(mb, Precision::FP32, D, 1, H);
+        Tensor O = make_dev3(mb, Precision::FP32, D, S, H);
+        std::vector<float> a(D * S * H), b(D * H), ref(D * S * H);
+        fill_rand(a.data(), (int)a.size());
+        fill_rand(b.data(), (int)b.size());
+        memcpy(A.data, a.data(), a.size() * sizeof(float));
+        memcpy(B.data, b.data(), b.size() * sizeof(float));
+        for (int h = 0; h < H; ++h)
+            for (int s = 0; s < S; ++s)
+                for (int d = 0; d < D; ++d) {
+                    int oi = (h * S + s) * D + d;
+                    float bv = b[h * D + d];
+                    ref[oi] = op == OpType::ADD ? a[oi] + bv : a[oi] * bv;
+                }
+        metal_op(mb, op, {&A, &B}, O);
+        char label[80];
+        snprintf(label, sizeof(label), "%s broadcast [17,5,3] with [17,1,3]",
+                 op_type_name(op));
+        CHECK(close((const float*)O.data, ref.data(), D * S * H,
+                    1e-6f, 1e-6f), label);
     }
 
     // ---- MUL (elementwise) ----
@@ -610,6 +662,206 @@ int main() {
         }
         CHECK(close((const float*)O.data, ref.data(), D * rows, 2e-4f, 2e-3f),
               "LAYER_NORM D=127 rows=5");
+    }
+
+    // ---- RWKV_TOKEN_SHIFT: FP16 persistent state, real<padded sequence ----
+    {
+        int hidden = 67, seq = 5, real = 3;
+        Tensor X = make_dev(mb, Precision::FP32, hidden, seq);
+        Tensor STATE = make_dev(mb, Precision::FP16, hidden, 1);
+        Tensor O = make_dev(mb, Precision::FP32, hidden, seq);
+        std::vector<float> x(hidden * seq), state(hidden), ref(hidden * seq, 0);
+        fill_rand(x.data(), (int)x.size());
+        fill_rand(state.data(), hidden);
+        memcpy(X.data, x.data(), x.size() * sizeof(float));
+        __fp16* state_h = (__fp16*)STATE.data;
+        for (int d = 0; d < hidden; ++d) state_h[d] = (__fp16)state[d];
+        std::vector<float> rounded_state(hidden);
+        for (int d = 0; d < hidden; ++d) rounded_state[d] = (float)state_h[d];
+        for (int t = 0; t < real; ++t)
+            for (int d = 0; d < hidden; ++d)
+                ref[t * hidden + d] =
+                    (t == 0 ? rounded_state[d]
+                            : (float)(__fp16)x[(t - 1) * hidden + d]) -
+                    x[t * hidden + d];
+        metal_op(mb, OpType::RWKV_TOKEN_SHIFT, {&X, &STATE}, O,
+                 {hidden, seq, real});
+        bool state_ok = true;
+        for (int d = 0; d < hidden; ++d)
+            state_ok &= std::fabs((float)state_h[d] -
+                                  (float)(__fp16)x[(real - 1) * hidden + d]) <
+                        1e-6f;
+        CHECK(close((const float*)O.data, ref.data(), hidden * seq,
+                    1e-5f, 1e-5f) && state_ok,
+              "RWKV_TOKEN_SHIFT FP16 state hidden=67 real=3 seq=5");
+    }
+
+    // ---- RWKV_MIX: per-channel mix broadcast across tokens ----------------
+    {
+        int hidden = 65, tokens = 4;
+        Tensor X = make_dev(mb, Precision::FP32, hidden, tokens);
+        Tensor S = make_dev(mb, Precision::FP32, hidden, tokens);
+        Tensor M = make_dev(mb, Precision::FP32, hidden, 1);
+        Tensor O = make_dev(mb, Precision::FP32, hidden, tokens);
+        std::vector<float> x(hidden * tokens), s(hidden * tokens), m(hidden);
+        std::vector<float> ref(hidden * tokens);
+        fill_rand(x.data(), (int)x.size());
+        fill_rand(s.data(), (int)s.size());
+        fill_rand(m.data(), hidden);
+        memcpy(X.data, x.data(), x.size() * sizeof(float));
+        memcpy(S.data, s.data(), s.size() * sizeof(float));
+        memcpy(M.data, m.data(), m.size() * sizeof(float));
+        for (int t = 0; t < tokens; ++t)
+            for (int d = 0; d < hidden; ++d)
+                ref[t * hidden + d] =
+                    x[t * hidden + d] + s[t * hidden + d] * m[d];
+        metal_op(mb, OpType::RWKV_MIX, {&X, &S, &M}, O);
+        CHECK(close((const float*)O.data, ref.data(), hidden * tokens,
+                    1e-6f, 1e-6f),
+              "RWKV_MIX hidden=65 tokens=4");
+    }
+
+    // ---- RWKV_L2_NORM: normalize each token/head independently ------------
+    {
+        int heads = 3, head_size = 64, tokens = 4;
+        int hidden = heads * head_size;
+        Tensor X = make_dev(mb, Precision::FP32, hidden, tokens);
+        Tensor O = make_dev(mb, Precision::FP32, hidden, tokens);
+        std::vector<float> x(hidden * tokens), ref(hidden * tokens);
+        fill_rand(x.data(), (int)x.size());
+        memcpy(X.data, x.data(), x.size() * sizeof(float));
+        const float eps = 1e-6f;
+        for (int t = 0; t < tokens; ++t)
+            for (int h = 0; h < heads; ++h) {
+                int base = t * hidden + h * head_size;
+                double sum = 0.0;
+                for (int d = 0; d < head_size; ++d)
+                    sum += (double)x[base + d] * x[base + d];
+                float scale = 1.0f / (std::sqrt((float)sum) + eps);
+                for (int d = 0; d < head_size; ++d)
+                    ref[base + d] = x[base + d] * scale;
+            }
+        metal_op(mb, OpType::RWKV_L2_NORM, {&X}, O,
+                 {heads, head_size}, {eps});
+        CHECK(close((const float*)O.data, ref.data(), hidden * tokens,
+                    2e-6f, 2e-5f),
+              "RWKV_L2_NORM heads=3 head_size=64 tokens=4");
+    }
+
+    // ---- RWKV_POST: group norm + receptance/key bonus + gate ---------------
+    {
+        int heads = 3, head_size = 64, tokens = 2;
+        int hidden = heads * head_size, total = hidden * tokens;
+        Tensor RAW = make_dev(mb, Precision::FP32, hidden, tokens);
+        Tensor R = make_dev(mb, Precision::FP32, hidden, tokens);
+        Tensor K = make_dev(mb, Precision::FP32, hidden, tokens);
+        Tensor V = make_dev(mb, Precision::FP32, hidden, tokens);
+        Tensor RK = make_dev(mb, Precision::FP32, hidden, 1);
+        Tensor W = make_dev(mb, Precision::FP32, hidden, 1);
+        Tensor B = make_dev(mb, Precision::FP32, hidden, 1);
+        Tensor G = make_dev(mb, Precision::FP32, hidden, tokens);
+        Tensor O = make_dev(mb, Precision::FP32, hidden, tokens);
+        std::vector<float> raw(total), r(total), k(total), v(total), gate(total);
+        std::vector<float> rk(hidden), w(hidden), b(hidden), ref(total);
+        for (auto* vec : {&raw, &r, &k, &v, &gate, &rk, &w, &b})
+            fill_rand(vec->data(), (int)vec->size());
+        memcpy(RAW.data, raw.data(), raw.size() * sizeof(float));
+        memcpy(R.data, r.data(), r.size() * sizeof(float));
+        memcpy(K.data, k.data(), k.size() * sizeof(float));
+        memcpy(V.data, v.data(), v.size() * sizeof(float));
+        memcpy(RK.data, rk.data(), rk.size() * sizeof(float));
+        memcpy(W.data, w.data(), w.size() * sizeof(float));
+        memcpy(B.data, b.data(), b.size() * sizeof(float));
+        memcpy(G.data, gate.data(), gate.size() * sizeof(float));
+        const float eps = 64e-5f;
+        for (int t = 0; t < tokens; ++t)
+            for (int h = 0; h < heads; ++h) {
+                int base = t * hidden + h * head_size;
+                int wb = h * head_size;
+                double mean = 0.0, bonus = 0.0;
+                for (int d = 0; d < head_size; ++d) {
+                    mean += raw[base + d];
+                    bonus += r[base + d] * k[base + d] * rk[wb + d];
+                }
+                mean /= head_size;
+                double variance = 0.0;
+                for (int d = 0; d < head_size; ++d) {
+                    double z = raw[base + d] - mean;
+                    variance += z * z;
+                }
+                variance /= head_size;
+                float inv = 1.0f / std::sqrt((float)variance + eps);
+                for (int d = 0; d < head_size; ++d) {
+                    float norm = (raw[base + d] - (float)mean) * inv *
+                                     w[wb + d] +
+                                 b[wb + d];
+                    ref[base + d] =
+                        (norm + (float)bonus * v[base + d]) * gate[base + d];
+                }
+            }
+        metal_op(mb, OpType::RWKV_POST,
+                 {&RAW, &R, &K, &V, &RK, &W, &B, &G}, O,
+                 {heads, head_size}, {eps});
+        CHECK(close((const float*)O.data, ref.data(), total, 2e-5f, 3e-4f),
+              "RWKV_POST heads=3 head_size=64 tokens=2");
+    }
+
+    // ---- RWKV7 recurrence: output and persistent FP32 state parity --------
+    {
+        int heads = 2, head_size = 16, seq = 4, real = 3;
+        int hidden = heads * head_size, total = hidden * seq;
+        int state_n = heads * head_size * head_size;
+        Tensor R = make_dev(mb, Precision::FP32, hidden, seq);
+        Tensor D = make_dev(mb, Precision::FP32, hidden, seq);
+        Tensor K = make_dev(mb, Precision::FP32, hidden, seq);
+        Tensor V = make_dev(mb, Precision::FP32, hidden, seq);
+        Tensor A = make_dev(mb, Precision::FP32, hidden, seq);
+        Tensor B = make_dev(mb, Precision::FP32, hidden, seq);
+        Tensor STATE = make_dev(mb, Precision::FP32, state_n, 1);
+        Tensor O = make_dev(mb, Precision::FP32, hidden, seq);
+        std::vector<float> r(total), decay(total), k(total), v(total), a(total),
+            b(total), initial_state(state_n), ref_state(state_n), ref(total);
+        for (auto* vec : {&r, &k, &v, &a, &b, &initial_state})
+            fill_rand(vec->data(), (int)vec->size());
+        for (int i = 0; i < total; ++i)
+            decay[i] = 0.9f + 0.09f * (float)(i % 11) / 10.0f;
+        memcpy(R.data, r.data(), r.size() * sizeof(float));
+        memcpy(D.data, decay.data(), decay.size() * sizeof(float));
+        memcpy(K.data, k.data(), k.size() * sizeof(float));
+        memcpy(V.data, v.data(), v.size() * sizeof(float));
+        memcpy(A.data, a.data(), a.size() * sizeof(float));
+        memcpy(B.data, b.data(), b.size() * sizeof(float));
+        memcpy(STATE.data, initial_state.data(),
+               initial_state.size() * sizeof(float));
+
+        ref_state = initial_state;
+        Tensor r_h = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                    hidden, seq, 1, 1, r.data());
+        Tensor d_h = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                    hidden, seq, 1, 1, decay.data());
+        Tensor k_h = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                    hidden, seq, 1, 1, k.data());
+        Tensor v_h = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                    hidden, seq, 1, 1, v.data());
+        Tensor a_h = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                    hidden, seq, 1, 1, a.data());
+        Tensor b_h = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                    hidden, seq, 1, 1, b.data());
+        Tensor s_h = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                    state_n, 1, 1, 1, ref_state.data());
+        Tensor o_h = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                    hidden, seq, 1, 1, ref.data());
+        OpParams cpu_params;
+        cpu_params.i32 = {heads, head_size, seq, real};
+        kernel_rwkv7(cpu_params, {&r_h, &d_h, &k_h, &v_h, &a_h, &b_h, &s_h},
+                     o_h, nullptr);
+
+        metal_op(mb, OpType::RWKV7, {&R, &D, &K, &V, &A, &B, &STATE}, O,
+                 {heads, head_size, seq, real});
+        CHECK(close((const float*)O.data, ref.data(), total, 2e-5f, 3e-4f) &&
+                  close((const float*)STATE.data, ref_state.data(), state_n,
+                        2e-5f, 3e-4f),
+              "RWKV7 heads=2 head_size=16 real=3 seq=4 state parity");
     }
 
     // ---- ROPE (interleave=false), layout [head_dim, seq, heads] ----

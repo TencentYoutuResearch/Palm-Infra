@@ -6,6 +6,7 @@
 
 #include "engine/engine.h"
 
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -22,6 +23,9 @@ int main() {
     cfg.package_path = package;
     cfg.num_threads = 4;
     cfg.temperature = 0.f;
+    const char* device = std::getenv("MOLLM_RWKV_DEVICE");
+    if (device && std::strcmp(device, "metal") == 0)
+        cfg.device = Device::METAL;
     if (!engine.load(cfg)) {
         std::fprintf(stderr, "FAIL: could not load RWKV package\n");
         return 1;

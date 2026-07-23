@@ -725,7 +725,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.c_row_stride = estride(C, 1);       // elements between rows of C (>= N)
         // fused activation: params.i32[0]=Activation (0 NONE, 1 SILU).
         int act = params.i32.size()>0 ? params.i32[0] : 0;
-        p.activation = (act == 1) ? 1 : 0;
+        p.activation = (act >= 0 && act <= 4) ? act : 0;
         p.act_n_begin = params.i32.size()>1 ? params.i32[1] : 0;
         p.act_n_len = params.i32.size()>2 ? params.i32[2] : -1;
 
@@ -1167,6 +1167,14 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.a_offset = eoffset(A);
         p.b_offset = eoffset(B);
         p.out_offset = eoffset(O);
+        for (int d = 0; d < 4; ++d) {
+            p.shape[d] = (int)O.shape[d];
+            p.a_stride[d] = A.shape[d] == 1 && O.shape[d] != 1
+                ? 0 : estride(A, d);
+            p.b_stride[d] = B.shape[d] == 1 && O.shape[d] != 1
+                ? 0 : estride(B, d);
+            p.out_stride[d] = estride(O, d);
+        }
         id<MTLComputePipelineState> ps =
             impl_->pipeline(op==OpType::ADD ? "add_f32" : "mul_f32");
         [enc setComputePipelineState:ps];
@@ -1219,6 +1227,157 @@ void MetalBackend::dispatch(const GraphNode& node,
         [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         dispatch_1d(ps, p.n);
+        break;
+    }
+
+    case OpType::RWKV_TOKEN_SHIFT: {
+        const Tensor& X = *inputs[0];
+        const Tensor& STATE = *inputs[1];
+        Tensor& O = *output;
+        RwkvTokenShiftParams p{};
+        p.hidden = params.i32.size() > 0 ? params.i32[0] : (int)X.shape[0];
+        p.seq = params.i32.size() > 1 ? params.i32[1] : (int)X.shape[1];
+        p.real = params.i32.size() > 2 ? params.i32[2] : p.seq;
+        if (p.real <= 0 || p.real > p.seq) p.real = p.seq;
+        p.state_fp16 = STATE.prec == Precision::FP16;
+        p.x_offset = eoffset(X);
+        p.state_offset = eoffset(STATE);
+        p.out_offset = eoffset(O);
+        id<MTLComputePipelineState> ps =
+            impl_->pipeline("rwkv_token_shift_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&STATE) offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        dispatch_1d(ps, p.hidden);
+        break;
+    }
+
+    case OpType::RWKV_MIX: {
+        const Tensor& X = *inputs[0];
+        const Tensor& SHIFT = *inputs[1];
+        const Tensor& MIX = *inputs[2];
+        Tensor& O = *output;
+        RwkvMixParams p{};
+        p.hidden = (int)MIX.nelements();
+        p.total = (int)X.nelements();
+        p.x_offset = eoffset(X);
+        p.shift_offset = eoffset(SHIFT);
+        p.mix_offset = eoffset(MIX);
+        p.out_offset = eoffset(O);
+        id<MTLComputePipelineState> ps = impl_->pipeline("rwkv_mix_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&SHIFT) offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc setBuffer:buf_of(&MIX) offset:0 atIndex:4];
+        dispatch_1d(ps, p.total);
+        break;
+    }
+
+    case OpType::RWKV_L2_NORM: {
+        const Tensor& X = *inputs[0];
+        Tensor& O = *output;
+        RwkvL2NormParams p{};
+        p.heads = params.i32.size() > 0 ? params.i32[0] : 0;
+        p.head_size = params.i32.size() > 1 ? params.i32[1] : 0;
+        p.groups = p.head_size > 0
+            ? (int)(X.nelements() / p.head_size) : 0;
+        p.x_offset = eoffset(X);
+        p.out_offset = eoffset(O);
+        p.eps = params.f32.size() > 0 ? params.f32[0] : 1e-12f;
+        id<MTLComputePipelineState> ps =
+            impl_->pipeline("rwkv_l2_norm_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        break;
+    }
+
+    case OpType::RWKV_POST: {
+        const Tensor& RAW = *inputs[0];
+        const Tensor& R = *inputs[1];
+        const Tensor& K = *inputs[2];
+        const Tensor& V = *inputs[3];
+        const Tensor& RK = *inputs[4];
+        const Tensor& W = *inputs[5];
+        const Tensor& BIAS = *inputs[6];
+        const Tensor& GATE = *inputs[7];
+        Tensor& O = *output;
+        RwkvPostParams p{};
+        p.heads = params.i32.size() > 0 ? params.i32[0] : 0;
+        p.head_size = params.i32.size() > 1 ? params.i32[1] : 0;
+        p.groups = p.head_size > 0
+            ? (int)(RAW.nelements() / p.head_size) : 0;
+        p.raw_offset = eoffset(RAW);
+        p.r_offset = eoffset(R);
+        p.k_offset = eoffset(K);
+        p.v_offset = eoffset(V);
+        p.rk_offset = eoffset(RK);
+        p.weight_offset = eoffset(W);
+        p.bias_offset = eoffset(BIAS);
+        p.gate_offset = eoffset(GATE);
+        p.out_offset = eoffset(O);
+        p.eps = params.f32.size() > 0 ? params.f32[0] : 64e-5f;
+        id<MTLComputePipelineState> ps = impl_->pipeline("rwkv_post_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&RAW) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&R) offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc setBuffer:buf_of(&K) offset:0 atIndex:4];
+        [enc setBuffer:buf_of(&V) offset:0 atIndex:5];
+        [enc setBuffer:buf_of(&RK) offset:0 atIndex:6];
+        [enc setBuffer:buf_of(&W) offset:0 atIndex:7];
+        [enc setBuffer:buf_of(&BIAS) offset:0 atIndex:8];
+        [enc setBuffer:buf_of(&GATE) offset:0 atIndex:9];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.groups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        break;
+    }
+
+    case OpType::RWKV7: {
+        const Tensor& R = *inputs[0];
+        const Tensor& DECAY = *inputs[1];
+        const Tensor& K = *inputs[2];
+        const Tensor& V = *inputs[3];
+        const Tensor& A = *inputs[4];
+        const Tensor& B = *inputs[5];
+        const Tensor& STATE = *inputs[6];
+        Tensor& O = *output;
+        Rwkv7Params p{};
+        p.heads = params.i32.size() > 0 ? params.i32[0] : 0;
+        p.head_size = params.i32.size() > 1 ? params.i32[1] : 0;
+        p.seq = params.i32.size() > 2 ? params.i32[2] : (int)R.shape[1];
+        p.real = params.i32.size() > 3 ? params.i32[3] : p.seq;
+        if (p.real <= 0 || p.real > p.seq) p.real = p.seq;
+        p.state_fp16 = STATE.prec == Precision::FP16;
+        p.r_offset = eoffset(R);
+        p.decay_offset = eoffset(DECAY);
+        p.k_offset = eoffset(K);
+        p.v_offset = eoffset(V);
+        p.a_offset = eoffset(A);
+        p.b_offset = eoffset(B);
+        p.state_offset = eoffset(STATE);
+        p.out_offset = eoffset(O);
+        id<MTLComputePipelineState> ps = impl_->pipeline("rwkv7_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&R) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&DECAY) offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc setBuffer:buf_of(&K) offset:0 atIndex:4];
+        [enc setBuffer:buf_of(&V) offset:0 atIndex:5];
+        [enc setBuffer:buf_of(&A) offset:0 atIndex:6];
+        [enc setBuffer:buf_of(&B) offset:0 atIndex:7];
+        [enc setBuffer:buf_of(&STATE) offset:0 atIndex:8];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake((NSUInteger)p.head_size, 1, 1)];
         break;
     }
 

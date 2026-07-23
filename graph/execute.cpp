@@ -451,11 +451,20 @@ void execute_graph(ExecContext& ctx) {
         static const bool dump_nodes_enabled = getenv("MOLLM_DUMP_NODES") != nullptr;
         if (dump_nodes_enabled && out.data && out.prec == Precision::FP32) {
             const float* d = (const float*)out.data;
-            fprintf(stderr, "NODE %u op=%d shape=%lld,%lld,%lld,%lld  %.5f %.5f %.5f\n",
+            double sum = 0.0, sum_sq = 0.0;
+            float max_abs = 0.0f;
+            for (int64_t j = 0; j < out.nelements(); ++j) {
+                sum += d[j];
+                sum_sq += (double)d[j] * d[j];
+                max_abs = std::max(max_abs, std::fabs(d[j]));
+            }
+            fprintf(stderr, "NODE %u op=%d shape=%lld,%lld,%lld,%lld  "
+                    "%.5f %.5f %.5f sum=%.9g sq=%.9g max=%.9g\n",
                     node.id, (int)node.op_type,
                     (long long)out.shape[0], (long long)out.shape[1],
                     (long long)out.shape[2], (long long)out.shape[3],
-                    d[0], out.nelements()>1?d[1]:0, out.nelements()>2?d[2]:0);
+                    d[0], out.nelements()>1?d[1]:0, out.nelements()>2?d[2]:0,
+                    sum, sum_sq, max_abs);
         }
         // Release completed tensors. Classify borrowed views before mutating
         // any producer in this release batch; a producer and its view can have
