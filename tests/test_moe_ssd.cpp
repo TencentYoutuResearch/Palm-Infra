@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,23 @@ int main() {
     {
         std::ofstream out(path, std::ios::binary);
         out.write(reinterpret_cast<const char*>(contents), sizeof(contents));
+    }
+
+    // Reject corrupt package metadata during registration, before an I/O
+    // worker can turn it into a short read or an overflowing allocation.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 16), "open metadata-validation cache");
+        auto past_end = spec("past_end", sizeof(contents));
+        check(!cache.add_source(past_end), "reject expert data beyond package");
+        check(cache.find_source("past_end") == nullptr,
+              "rejected source is not registered");
+
+        auto overflowing = spec("overflowing", 0);
+        overflowing.data_bytes = std::numeric_limits<uint64_t>::max();
+        check(!cache.add_source(overflowing), "reject overflowing expert extent");
+        check(cache.find_source("overflowing") == nullptr,
+              "overflowing source is not registered");
     }
 
     {
@@ -152,6 +170,39 @@ int main() {
         MoeSsdCache::Stats stats = cache.stats();
         check(stats.misses == 3, "deferred requests issue one read each");
         check(stats.evictions == 2, "one-entry cache evicts between deferred requests");
+    }
+
+    // A transient pread failure must not poison an expert entry permanently.
+    // Restore the backing file and verify that the next acquire removes the
+    // failed entry, queues a fresh read, and succeeds.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 8, 1), "open retry cache");
+        check(cache.add_source(spec("retry_gate", 0)), "add retry gate source");
+        check(cache.add_source(spec("retry_down", 6 * sizeof(uint16_t))),
+              "add retry down source");
+        const MoeSsdTensorSource* gate = cache.find_source("retry_gate");
+        const MoeSsdTensorSource* down = cache.find_source("retry_down");
+
+        {
+            std::ofstream empty(path, std::ios::binary | std::ios::trunc);
+        }
+        Tensor gu, dw;
+        check(!cache.acquire(gate, down, 0, gu, dw),
+              "first acquire observes truncated-file read failure");
+        check(!cache.contains(gate, down, 0),
+              "failed entry is not reported as cached");
+
+        {
+            std::ofstream restored(path, std::ios::binary | std::ios::trunc);
+            restored.write(reinterpret_cast<const char*>(contents),
+                           sizeof(contents));
+        }
+        check(cache.acquire(gate, down, 0, gu, dw),
+              "second acquire retries transient read failure");
+        check(static_cast<const uint16_t*>(gu.data)[0] == 0x3c00 &&
+                  static_cast<const uint16_t*>(dw.data)[1] == 0x4800,
+              "retried expert bytes match");
     }
 
     // Shallow-favoring layout retains one streamable slot in every layer,

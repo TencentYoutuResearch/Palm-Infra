@@ -41,6 +41,7 @@ set(SOURCES
     graph/execute.cpp
     # kernels
     kernels/matmul.cpp
+    kernels/matmul_dense.cpp
     kernels/matmul_pack.cpp
     kernels/matmul_profile.cpp
     kernels/matmul_quant.cpp
@@ -58,16 +59,19 @@ set(SOURCES
     kernels/gdn_prefill.cpp
     kernels/moe.cpp
     kernels/moe_ssd.cpp
+    kernels/moe_ssd_io.cpp
     kernels/trace.cpp
     kernels/rwkv.cpp
     kernels/threading.cpp
     # engine
+    engine/byte_ranges.cpp
     engine/engine.cpp
     engine/input_prep.cpp
     engine/model_loader.cpp
     engine/package.cpp
     engine/sampler.cpp
     engine/tokenizer.cpp
+    engine/tokenizer_rwkv.cpp
     engine/weight_metadata.cpp
 )
 
@@ -303,6 +307,7 @@ if(MOLLM_BUILD_TESTS)
     endfunction()
 
     add_mollm_test(test_tensor        tests/test_tensor.cpp)
+    add_mollm_test(test_byte_ranges   tests/test_byte_ranges.cpp)
     add_mollm_test(test_buffer_pool   tests/test_buffer_pool.cpp)
     add_mollm_test(test_mmap_file     tests/test_mmap_file.cpp)
     add_mollm_test(test_weight_metadata tests/test_weight_metadata.cpp)

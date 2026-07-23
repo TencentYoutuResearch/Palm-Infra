@@ -1,4 +1,5 @@
 #include "engine/engine.h"
+#include "engine/byte_ranges.h"
 #include "engine/weight_metadata.h"
 
 #include "kernels/matmul.h"
@@ -165,26 +166,14 @@ size_t LLMEngine::warmup_package_weights() {
     const uint8_t* p = package_weights_base_;
     const size_t len = package_weights_size_;
 
-    std::vector<std::pair<uint64_t, uint64_t>> skipped = moe_ssd_expert_ranges_;
-    std::sort(skipped.begin(), skipped.end());
-    std::vector<std::pair<uint64_t, uint64_t>> merged;
-    for (const auto& range : skipped) {
-        if (range.second == 0 || range.first >= len)
-            continue;
-        const uint64_t end =
-            std::min<uint64_t>(len, range.first + range.second);
-        if (merged.empty() || range.first > merged.back().second) {
-            merged.push_back({range.first, end});
-        } else {
-            merged.back().second = std::max(merged.back().second, end);
-        }
-    }
+    const auto expert_ranges =
+        mollm::detail::normalize_byte_ranges(moe_ssd_expert_ranges_, len);
 
 #if defined(MADV_WILLNEED)
     // Preserve the eager readahead behaviour for ordinary mmap packages. In
     // SSD mode it would pull aggregate expert tensors into the kernel cache,
     // so dense-only warmup below intentionally relies on page touches alone.
-    if (merged.empty()) {
+    if (expert_ranges.empty()) {
         uintptr_t start = reinterpret_cast<uintptr_t>(package_weights_base_);
         uintptr_t aligned_start = (start / page_size) * page_size;
         size_t prefix = static_cast<size_t>(start - aligned_start);
@@ -193,25 +182,16 @@ size_t LLMEngine::warmup_package_weights() {
     }
 #endif
 
-    auto is_expert_offset = [&](size_t offset) {
-        for (const auto& range : merged) {
-            if (offset < range.first)
-                return false;
-            if (offset < range.second)
-                return true;
-        }
-        return false;
-    };
-
     uint8_t sink = 0;
     size_t warmed = 0;
     for (size_t off = 0; off < len; off += page_size) {
-        if (is_expert_offset(off))
+        if (mollm::detail::range_contains(expert_ranges, off))
             continue;
         sink ^= p[off];
         warmed += page_size;
     }
-    if (len > 0 && !is_expert_offset(len - 1)) {
+    if (len > 0 &&
+        !mollm::detail::range_contains(expert_ranges, len - 1)) {
         sink ^= p[len - 1];
         warmed = std::min(len, warmed + 1);
     }
@@ -234,20 +214,8 @@ size_t LLMEngine::lock_dense_package_weights() {
     const size_t page_size =
         system_page > 0 ? static_cast<size_t>(system_page) : 4096;
 
-    std::vector<std::pair<uint64_t, uint64_t>> skipped = moe_ssd_expert_ranges_;
-    std::sort(skipped.begin(), skipped.end());
-    std::vector<std::pair<uint64_t, uint64_t>> merged;
-    for (const auto& range : skipped) {
-        if (range.second == 0 || range.first >= len)
-            continue;
-        const uint64_t end =
-            std::min<uint64_t>(len, range.first + range.second);
-        if (merged.empty() || range.first > merged.back().second) {
-            merged.push_back({range.first, end});
-        } else {
-            merged.back().second = std::max(merged.back().second, end);
-        }
-    }
+    const auto expert_ranges =
+        mollm::detail::normalize_byte_ranges(moe_ssd_expert_ranges_, len);
 
     auto lock_range = [&](uint64_t begin, uint64_t end) -> bool {
         if (begin >= end)
@@ -267,12 +235,12 @@ size_t LLMEngine::lock_dense_package_weights() {
 
     uint64_t cursor = 0;
     bool complete = true;
-    for (const auto& range : merged) {
-        if (!lock_range(cursor, range.first)) {
+    for (const auto& range : expert_ranges) {
+        if (!lock_range(cursor, range.begin)) {
             complete = false;
             break;
         }
-        cursor = std::max(cursor, range.second);
+        cursor = std::max(cursor, range.end);
     }
     if (complete)
         complete = lock_range(cursor, len);

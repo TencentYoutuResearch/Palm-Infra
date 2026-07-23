@@ -104,6 +104,24 @@ int main() {
         ran_any = true;
     }
 
+    // A damaged Python literal ending in a bare backslash used to advance the
+    // parser past the string before dereferencing it.
+    {
+        const char* path = "/tmp/mollm_rwkv_vocab_trailing_slash.txt";
+        {
+            std::ofstream f(path);
+            f << "0 b'abc\\ 4\n";
+        }
+        Tokenizer tok;
+        CHECK(tok.load(path), "RWKV trailing-slash literal loads safely");
+        check_ids(tok.encode("abc\\"), {0},
+                  "RWKV trailing slash is preserved");
+        CHECK(tok.decode(std::vector<int>{0}) == "abc\\",
+              "RWKV trailing-slash literal decodes safely");
+        std::remove(path);
+        ran_any = true;
+    }
+
     {
         Tokenizer tok;
         const char* fixture = std::getenv("MOLLM_RWKV_TOKENIZER");

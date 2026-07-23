@@ -1,4 +1,5 @@
 #include "kernels/moe_ssd.h"
+#include "kernels/moe_ssd_internal.h"
 
 #include "graph/mmap_file.h"
 #include "kernels/trace.h"
@@ -7,50 +8,59 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <utility>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
-// pread() overwrites every byte in a component. std::vector::resize() clears
-// these multi-megabyte buffers first, making request_many CPU-bound as the
-// cache grows. Allocate them uninitialized instead.
-struct MoeSsdCache::ByteBuffer {
-    std::unique_ptr<uint8_t[]> storage;
-    size_t length = 0;
+namespace {
 
-    void resize(size_t bytes) {
-        if (bytes == length) return;
-        storage.reset(bytes == 0 ? nullptr : new uint8_t[bytes]);
-        length = bytes;
+bool component_range_fits(uint64_t offset, uint64_t bytes_per_expert,
+                          int num_experts, uint64_t file_size) {
+    if (bytes_per_expert == 0)
+        return true;
+    const uint64_t count = static_cast<uint64_t>(num_experts);
+    if (count > std::numeric_limits<uint64_t>::max() / bytes_per_expert)
+        return false;
+    const uint64_t total = count * bytes_per_expert;
+    return offset <= file_size && total <= file_size - offset;
+}
+
+bool source_bytes(const MoeSsdTensorSpec& spec, size_t& bytes) {
+    if (spec.data_bytes > std::numeric_limits<size_t>::max() ||
+        spec.scales_bytes > std::numeric_limits<size_t>::max()) {
+        return false;
     }
-    bool empty() const { return length == 0; }
-    size_t size() const { return length; }
-    uint8_t* data() { return storage.get(); }
-    const uint8_t* data() const { return storage.get(); }
-};
+    const size_t data = static_cast<size_t>(spec.data_bytes);
+    const size_t scales = static_cast<size_t>(spec.scales_bytes);
+    if (scales > std::numeric_limits<size_t>::max() - data)
+        return false;
+    bytes = data + scales;
+    return true;
+}
 
-struct MoeSsdCache::Entry {
-    const MoeSsdTensorSource* gate_up = nullptr;
-    const MoeSsdTensorSource* down = nullptr;
-    int expert = -1;
-    uint64_t used_at = 0;
-    bool loading = false;
-    bool ready = false;
-    bool failed = false;
-    int pending_reads = 0;
-    bool fresh_miss = false;  // first acquire after a queued miss is not a hit
-    bool speculative = false;
-    uint64_t forward_epoch = 0;
-    ByteBuffer gate_up_data;
-    ByteBuffer gate_up_scales;
-    ByteBuffer down_data;
-    ByteBuffer down_scales;
-
-    size_t bytes() const {
-        return gate_up_data.size() + gate_up_scales.size() +
-               down_data.size() + down_scales.size();
+bool expert_pair_bytes(const MoeSsdTensorSource* gate_up,
+                       const MoeSsdTensorSource* down, size_t& bytes) {
+    size_t gate_up_bytes = 0;
+    size_t down_bytes = 0;
+    if (!source_bytes(gate_up->spec, gate_up_bytes) ||
+        !source_bytes(down->spec, down_bytes) ||
+        down_bytes > std::numeric_limits<size_t>::max() - gate_up_bytes) {
+        return false;
     }
-};
+    bytes = gate_up_bytes + down_bytes;
+    return true;
+}
+
+size_t saturating_multiply(size_t value, size_t count) {
+    if (value != 0 && count > std::numeric_limits<size_t>::max() / value)
+        return std::numeric_limits<size_t>::max();
+    return value * count;
+}
+
+}  // namespace
 
 MoeSsdCache::MoeSsdCache() = default;
 
@@ -90,6 +100,13 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
                      package_path.c_str(), std::strerror(errno));
         return false;
     }
+    struct stat file_stat {};
+    if (fstat(fd, &file_stat) != 0 || file_stat.st_size < 0) {
+        std::fprintf(stderr, "MoE SSD: failed to stat %s: %s\n",
+                     package_path.c_str(), std::strerror(errno));
+        close(fd);
+        return false;
+    }
 #if defined(__APPLE__)
     // The application cache below is the residency policy for routed
     // experts.  Letting pread() also populate the kernel file cache would
@@ -106,6 +123,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
     {
         std::lock_guard<std::mutex> lock(mutex_);
         fd_ = fd;
+        file_size_ = static_cast<uint64_t>(file_stat.st_size);
         io_workers_count_ = io_workers;
         next_trace_id_ = 1;
         capacity_bytes_ = capacity_bytes;
@@ -133,10 +151,22 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
 }
 
 bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (fd_ < 0 || spec.weight_ref.empty() || spec.layer < 0 ||
         spec.num_experts <= 0 || spec.rows <= 0 || spec.cols <= 0 ||
         spec.data_bytes == 0) {
         std::fprintf(stderr, "MoE SSD: invalid expert storage metadata for %s\n",
+                     spec.weight_ref.c_str());
+        return false;
+    }
+    size_t bytes = 0;
+    if (!source_bytes(spec, bytes) ||
+        !component_range_fits(spec.data_offset, spec.data_bytes,
+                              spec.num_experts, file_size_) ||
+        !component_range_fits(spec.scales_offset, spec.scales_bytes,
+                              spec.num_experts, file_size_)) {
+        std::fprintf(stderr,
+                     "MoE SSD: expert storage range is invalid for %s\n",
                      spec.weight_ref.c_str());
         return false;
     }
@@ -152,10 +182,14 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
                      spec.weight_ref.c_str());
         return false;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
     LayerLayout& layout = layer_layouts_[spec.layer];
     if (layout.num_experts != 0 && layout.num_experts != spec.num_experts) {
         std::fprintf(stderr, "MoE SSD: inconsistent expert count in layer %d\n", spec.layer);
+        return false;
+    }
+    if (bytes > std::numeric_limits<size_t>::max() - layout.pair_bytes) {
+        std::fprintf(stderr, "MoE SSD: expert pair size overflows for layer %d\n",
+                     spec.layer);
         return false;
     }
     MoeSsdTensorSource source;
@@ -169,8 +203,7 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
     }
     layers_.insert(spec.layer);
     layout.num_experts = spec.num_experts;
-    layout.pair_bytes += static_cast<size_t>(spec.data_bytes) +
-                         static_cast<size_t>(spec.scales_bytes);
+    layout.pair_bytes += bytes;
     return true;
 }
 
@@ -216,7 +249,8 @@ bool MoeSsdCache::configure_shallow_favoring(int shallow_layers) {
     for (size_t i = 0; i < shallow_count && remaining != 0; ++i) {
         const int layer = ordered_layers[i];
         const LayerLayout& layout = layer_layouts_.at(layer);
-        const size_t full_layer_bytes = layout.pair_bytes * static_cast<size_t>(layout.num_experts);
+        const size_t full_layer_bytes = saturating_multiply(
+            layout.pair_bytes, static_cast<size_t>(layout.num_experts));
         const size_t already = layer_capacity_bytes_[layer];
         const size_t additional = full_layer_bytes > already ? full_layer_bytes - already : 0;
         const size_t granted = std::min(remaining, additional);
@@ -295,13 +329,48 @@ MoeSsdCache::Entry* MoeSsdCache::find_entry_locked(
     return nullptr;
 }
 
+std::unique_ptr<MoeSsdCache::Entry> MoeSsdCache::remove_entry_locked(
+    Entry* entry, bool count_eviction) {
+    if (!entry || entry->is_loading())
+        return nullptr;
+
+    const auto location = entry_locations_.find(entry);
+    if (location == entry_locations_.end())
+        return nullptr;
+
+    const int layer = entry->gate_up->spec.layer;
+    const auto layer_entries = layer_entries_.find(layer);
+    const auto layer_resident = layer_resident_bytes_.find(layer);
+    if (layer_entries == layer_entries_.end() ||
+        layer_resident == layer_resident_bytes_.end()) {
+        return nullptr;
+    }
+    const auto in_layer =
+        std::find(layer_entries->second.begin(), layer_entries->second.end(),
+                  entry);
+    const size_t bytes = entry->bytes();
+    if (in_layer == layer_entries->second.end() ||
+        layer_resident->second < bytes || resident_bytes_ < bytes) {
+        return nullptr;
+    }
+
+    std::unique_ptr<Entry> removed = std::move(*location->second);
+    entries_.erase(location->second);
+    entry_locations_.erase(location);
+    layer_entries->second.erase(in_layer);
+    layer_resident->second -= bytes;
+    resident_bytes_ -= bytes;
+    if (count_eviction)
+        ++evictions_;
+    return removed;
+}
+
 MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     const MoeSsdTensorSource* gate_up, const MoeSsdTensorSource* down, int expert,
     bool speculative) {
-    const size_t required = static_cast<size_t>(gate_up->spec.data_bytes) +
-                            static_cast<size_t>(gate_up->spec.scales_bytes) +
-                            static_cast<size_t>(down->spec.data_bytes) +
-                            static_cast<size_t>(down->spec.scales_bytes);
+    size_t required = 0;
+    if (!expert_pair_bytes(gate_up, down, required))
+        return nullptr;
     const size_t layer_capacity = layer_capacity_bytes_locked(gate_up->spec.layer);
     const size_t capacity = global_capacity_pool_ ? capacity_bytes_ : layer_capacity;
     if (required > capacity) {
@@ -315,11 +384,14 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     size_t& layer_resident = layer_resident_bytes_[layer];
     std::vector<Entry*>& layer_entries = layer_entries_[layer];
     std::unique_ptr<Entry> recycled;
-    while ((global_capacity_pool_ ? resident_bytes_ : layer_resident) + required > capacity) {
+    while (true) {
+        const size_t used = global_capacity_pool_ ? resident_bytes_ : layer_resident;
+        if (used <= capacity && required <= capacity - used)
+            break;
         Entry* victim_entry = nullptr;
         if (global_capacity_pool_) {
             for (const auto& entry : entries_) {
-                if (entry->loading) continue;
+                if (entry->is_loading()) continue;
                 if (!victim_entry || global_victim_before_locked(entry.get(), victim_entry)) {
                     victim_entry = entry.get();
                 }
@@ -327,31 +399,22 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
         } else {
             auto victim = std::min_element(layer_entries.begin(), layer_entries.end(),
                 [](const Entry* a, const Entry* b) {
-                    if (a->loading != b->loading) return !a->loading;
+                    if (a->is_loading() != b->is_loading())
+                        return !a->is_loading();
                     return a->used_at < b->used_at;
                 });
             if (victim != layer_entries.end()) victim_entry = *victim;
         }
-        if (!victim_entry || victim_entry->loading) {
+        if (!victim_entry || victim_entry->is_loading()) {
             // The asynchronous request window for this layer is full. The
             // caller can let workers finish and retry later.
             return nullptr;
         }
-        const int victim_layer = victim_entry->gate_up->spec.layer;
-        layer_resident_bytes_[victim_layer] -= victim_entry->bytes();
-        resident_bytes_ -= victim_entry->bytes();
-        auto location = entry_locations_.find(victim_entry);
-        if (location == entry_locations_.end()) return nullptr;
-        if (!recycled) recycled = std::move(*location->second);
-        entries_.erase(location->second);
-        entry_locations_.erase(location);
-        auto victim_entries = layer_entries_.find(victim_layer);
-        if (victim_entries != layer_entries_.end()) {
-            auto victim = std::find(victim_entries->second.begin(), victim_entries->second.end(),
-                                    victim_entry);
-            if (victim != victim_entries->second.end()) victim_entries->second.erase(victim);
-        }
-        ++evictions_;
+        auto removed = remove_entry_locked(victim_entry, true);
+        if (!removed)
+            return nullptr;
+        if (!recycled)
+            recycled = std::move(removed);
     }
 
     auto entry = recycled ? std::move(recycled) : std::make_unique<Entry>();
@@ -359,9 +422,7 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     entry->down = down;
     entry->expert = expert;
     entry->used_at = ++clock_;
-    entry->loading = true;
-    entry->ready = false;
-    entry->failed = false;
+    entry->state = Entry::State::Loading;
     entry->pending_reads = 0;
     entry->fresh_miss = true;
     entry->speculative = speculative;
@@ -397,202 +458,6 @@ bool MoeSsdCache::global_victim_before_locked(const Entry* candidate,
     const int current_rank = rank(current);
     if (candidate_rank != current_rank) return candidate_rank < current_rank;
     return candidate->used_at < current->used_at;
-}
-
-bool MoeSsdCache::read_exact(uint64_t offset, void* dst, size_t bytes) const {
-    uint8_t* out = static_cast<uint8_t*>(dst);
-    size_t done = 0;
-    while (done < bytes) {
-        ssize_t n = pread(fd_, out + done, bytes - done,
-                          static_cast<off_t>(offset + done));
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            std::fprintf(stderr, "MoE SSD: pread failed at offset %llu: %s\n",
-                         (unsigned long long)(offset + done),
-                         n == 0 ? "unexpected EOF" : std::strerror(errno));
-            return false;
-        }
-        done += static_cast<size_t>(n);
-    }
-    return true;
-}
-
-const MoeSsdCache::ByteBuffer& MoeSsdCache::component_buffer(const Entry& entry,
-                                                              uint8_t component) {
-    switch (component) {
-    case 0: return entry.gate_up_data;
-    case 1: return entry.gate_up_scales;
-    case 2: return entry.down_data;
-    default: return entry.down_scales;
-    }
-}
-
-MoeSsdCache::ByteBuffer& MoeSsdCache::component_buffer(Entry& entry, uint8_t component) {
-    return const_cast<MoeSsdCache::ByteBuffer&>(component_buffer(
-        static_cast<const Entry&>(entry), component));
-}
-
-uint64_t MoeSsdCache::component_offset(const Entry& entry, uint8_t component) {
-    const uint64_t expert = static_cast<uint64_t>(entry.expert);
-    switch (component) {
-    case 0:
-        return entry.gate_up->spec.data_offset + expert * entry.gate_up->spec.data_bytes;
-    case 1:
-        return entry.gate_up->spec.scales_offset + expert * entry.gate_up->spec.scales_bytes;
-    case 2:
-        return entry.down->spec.data_offset + expert * entry.down->spec.data_bytes;
-    default:
-        return entry.down->spec.scales_offset + expert * entry.down->spec.scales_bytes;
-    }
-}
-
-void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
-                                              bool low_priority) {
-    if (entries.empty()) return;
-    std::vector<Entry*> sorted = entries;
-    std::sort(sorted.begin(), sorted.end(),
-              [](const Entry* a, const Entry* b) { return a->expert < b->expert; });
-
-    // Four independent file regions make up one expert pair. Keep enough
-    // component jobs in flight to fill the I/O workers, but queue only a
-    // small expert batch at a time so the first pairs become ready while the
-    // main thread is already computing them. A single all-expert batch made
-    // every pair wait behind the final down/scales reads and lost that overlap.
-    const size_t batch_entries = std::max<size_t>(1, (size_t)io_workers_count_ / 4);
-    for (size_t batch_begin = 0; batch_begin < sorted.size(); batch_begin += batch_entries) {
-        const size_t batch_end = std::min(sorted.size(), batch_begin + batch_entries);
-        // Group only truly adjacent expert ids. Their slices are contiguous in
-        // the package, so one larger pread can feed every entry in the run.
-        for (uint8_t component = 0; component < 4; component++) {
-            size_t begin = batch_begin;
-            while (begin < batch_end) {
-                if (component_buffer(*sorted[begin], component).empty()) {
-                    ++begin;
-                    continue;
-                }
-                size_t end = begin + 1;
-                while (end < batch_end &&
-                       !component_buffer(*sorted[end], component).empty() &&
-                       sorted[end]->expert == sorted[end - 1]->expert + 1) {
-                    ++end;
-                }
-                IoJob job;
-                job.component = component;
-                job.trace_id = next_trace_id_++;
-                job.speculative = low_priority;
-                job.entries.assign(sorted.begin() + static_cast<ptrdiff_t>(begin),
-                                   sorted.begin() + static_cast<ptrdiff_t>(end));
-                for (Entry* entry : job.entries) ++entry->pending_reads;
-                if (mollm_trace::enabled()) {
-                    const Entry& first = *job.entries.front();
-                    mollm_trace::record_flow(
-                        "ssd.io", "queued_read", mollm_trace::now_ns(), job.trace_id, true,
-                        "{\"layer\":" + std::to_string(first.gate_up->spec.layer) +
-                        ",\"first_expert\":" + std::to_string(first.expert) +
-                        ",\"experts\":" + std::to_string(job.entries.size()) + "}");
-                }
-                if (low_priority) low_priority_io_jobs_.push_back(std::move(job));
-                else io_jobs_.push_back(std::move(job));
-                begin = end;
-            }
-        }
-    }
-}
-
-bool MoeSsdCache::read_job(const IoJob& job) {
-    if (job.entries.empty()) return false;
-    const size_t bytes_per_entry = component_buffer(*job.entries.front(), job.component).size();
-    if (bytes_per_entry == 0) return true;
-    const uint64_t offset = component_offset(*job.entries.front(), job.component);
-    if (job.entries.size() == 1) {
-        ByteBuffer& dst = component_buffer(*job.entries.front(), job.component);
-        return read_exact(offset, dst.data(), dst.size());
-    }
-
-    const size_t merged_bytes = bytes_per_entry * job.entries.size();
-    std::unique_ptr<uint8_t[]> merged(new uint8_t[merged_bytes]);
-    if (!read_exact(offset, merged.get(), merged_bytes)) return false;
-    for (size_t i = 0; i < job.entries.size(); i++) {
-        ByteBuffer& dst = component_buffer(*job.entries[i], job.component);
-        std::memcpy(dst.data(), merged.get() + i * bytes_per_entry, bytes_per_entry);
-    }
-    return true;
-}
-
-void MoeSsdCache::io_worker_main(int worker_index) {
-    if (mollm_trace::enabled()) {
-        const std::string name = "ssd-io-" + std::to_string(worker_index);
-        mollm_trace::set_thread_name(name.c_str());
-    }
-    for (;;) {
-        IoJob job;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            io_cv_.wait(lock, [&] {
-                return stop_io_ || !io_jobs_.empty() || !low_priority_io_jobs_.empty();
-            });
-            if (stop_io_ && io_jobs_.empty() && low_priority_io_jobs_.empty()) return;
-            if (!io_jobs_.empty()) {
-                job = std::move(io_jobs_.front());
-                io_jobs_.pop_front();
-            } else {
-                job = std::move(low_priority_io_jobs_.front());
-                low_priority_io_jobs_.pop_front();
-            }
-        }
-        std::string trace_args;
-        if (mollm_trace::enabled() && !job.entries.empty()) {
-            const Entry& first = *job.entries.front();
-            const char* component = job.component == 0 ? "gate_data"
-                                  : job.component == 1 ? "gate_scales"
-                                  : job.component == 2 ? "down_data" : "down_scales";
-            trace_args = "{\"layer\":" + std::to_string(first.gate_up->spec.layer) +
-                         ",\"first_expert\":" + std::to_string(first.expert) +
-                         ",\"experts\":" + std::to_string(job.entries.size()) +
-                         ",\"component\":\"" + component + "\""
-                         ",\"kind\":\"" + (job.speculative ? "prefetch" : "route") + "\"}";
-        }
-        bool ok = false;
-        {
-            mollm_trace::ScopedEvent trace_event(
-                "ssd.io", job.speculative ? "pread.prefetch" : "pread.route", trace_args,
-                job.speculative ? "yellow" : "good");
-            ok = read_job(job);
-        }
-        if (job.trace_id != 0) {
-            mollm_trace::record_flow("ssd.io", "queued_read", mollm_trace::now_ns(),
-                                     job.trace_id, false, trace_args);
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (Entry* entry : job.entries) {
-                if (entry->pending_reads > 0) --entry->pending_reads;
-                if (!ok) entry->failed = true;
-                if (entry->pending_reads == 0) {
-                    entry->loading = false;
-                    entry->ready = !entry->failed;
-                    if (entry->ready) bytes_read_ += entry->bytes();
-                }
-            }
-        }
-        ready_cv_.notify_all();
-    }
-}
-
-void MoeSsdCache::cross_layer_worker_main() {
-    if (mollm_trace::enabled()) mollm_trace::set_thread_name("ssd-predict");
-    for (;;) {
-        std::function<void()> task;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cross_layer_cv_.wait(lock, [&] { return stop_io_ || !cross_layer_tasks_.empty(); });
-            if (stop_io_) return;
-            task = std::move(cross_layer_tasks_.front());
-            cross_layer_tasks_.pop_front();
-        }
-        mollm_trace::ScopedEvent trace_event("ssd.predict", "cross_layer_gate");
-        task();
-    }
 }
 
 Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
@@ -644,6 +509,10 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
             if (expert < 0 || expert >= gate_up->spec.num_experts || seen[(size_t)expert]) continue;
             seen[(size_t)expert] = 1;
             Entry* entry = find_entry_locked(gate_up, down, expert);
+            if (entry && entry->state == Entry::State::Failed) {
+                if (remove_entry_locked(entry, false))
+                    entry = nullptr;
+            }
             if (entry) {
                 entry->used_at = ++clock_;
                 entry->forward_epoch = forward_epoch_;
@@ -690,10 +559,9 @@ bool MoeSsdCache::can_prefetch_pairs(const MoeSsdTensorSource* gate_up,
                                      const MoeSsdTensorSource* down,
                                      size_t pairs) const {
     if (!valid_pair(gate_up, down, 0) || pairs == 0) return false;
-    const size_t pair_bytes = static_cast<size_t>(gate_up->spec.data_bytes) +
-                              static_cast<size_t>(gate_up->spec.scales_bytes) +
-                              static_cast<size_t>(down->spec.data_bytes) +
-                              static_cast<size_t>(down->spec.scales_bytes);
+    size_t pair_bytes = 0;
+    if (!expert_pair_bytes(gate_up, down, pair_bytes))
+        return false;
     std::lock_guard<std::mutex> lock(mutex_);
     const size_t capacity = global_capacity_pool_ ? capacity_bytes_
                                                    : layer_capacity_bytes_locked(gate_up->spec.layer);
@@ -725,7 +593,8 @@ size_t MoeSsdCache::resident_count(const MoeSsdTensorSource* gate_up,
         seen[(size_t)expert] = 1;
         for (const Entry* entry : layer->second) {
             if (entry->gate_up == gate_up && entry->down == down && entry->expert == expert) {
-                ++count;
+                if (!entry->is_failed())
+                    ++count;
                 break;
             }
         }
@@ -742,7 +611,7 @@ bool MoeSsdCache::contains(const MoeSsdTensorSource* gate_up,
     if (layer == layer_entries_.end()) return false;
     for (const Entry* entry : layer->second) {
         if (entry->gate_up == gate_up && entry->down == down && entry->expert == expert) {
-            return true;
+            return !entry->is_failed();
         }
     }
     return false;
@@ -761,17 +630,8 @@ bool MoeSsdCache::release(const MoeSsdTensorSource* gate_up,
         // release() is called only after routed compute has finished. Do not
         // invalidate an in-flight asynchronous read if a caller violates that
         // lifetime contract.
-        if (entry->loading) return false;
-        const size_t bytes = entry->bytes();
-        resident_bytes_ -= bytes;
-        layer_resident_bytes_[gate_up->spec.layer] -= bytes;
-        auto location = entry_locations_.find(entry);
-        if (location == entry_locations_.end()) return false;
-        entries_.erase(location->second);
-        entry_locations_.erase(location);
-        layer->second.erase(it);
-        ++evictions_;
-        return true;
+        if (entry->is_loading()) return false;
+        return remove_entry_locked(entry, true) != nullptr;
     }
     return false;
 }
@@ -787,10 +647,9 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
     }
     const uint64_t trace_start = mollm_trace::now_ns();
     std::unique_lock<std::mutex> lock(mutex_);
-    const size_t required = static_cast<size_t>(gate_up->spec.data_bytes) +
-                            static_cast<size_t>(gate_up->spec.scales_bytes) +
-                            static_cast<size_t>(down->spec.data_bytes) +
-                            static_cast<size_t>(down->spec.scales_bytes);
+    size_t required = 0;
+    if (!expert_pair_bytes(gate_up, down, required))
+        return false;
     const size_t capacity = global_capacity_pool_ ? capacity_bytes_
                                                    : layer_capacity_bytes_locked(gate_up->spec.layer);
     if (required > capacity) {
@@ -801,6 +660,10 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
     }
     if (global_capacity_pool_) active_layer_ = gate_up->spec.layer;
     Entry* entry = find_entry_locked(gate_up, down, expert);
+    if (entry && entry->state == Entry::State::Failed) {
+        if (remove_entry_locked(entry, false))
+            entry = nullptr;
+    }
     while (!entry) {
         entry = reserve_entry_locked(gate_up, down, expert);
         if (entry) {
@@ -816,8 +679,8 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
         ready_cv_.wait(lock);
         entry = find_entry_locked(gate_up, down, expert);
     }
-    ready_cv_.wait(lock, [&] { return entry && !entry->loading; });
-    if (!entry || !entry->ready || entry->failed) {
+    ready_cv_.wait(lock, [&] { return entry && !entry->is_loading(); });
+    if (!entry || !entry->is_ready()) {
         std::fprintf(stderr, "MoE SSD: failed to load expert %d\n", expert);
         return false;
     }

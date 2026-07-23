@@ -159,6 +159,8 @@ private:
     Entry* reserve_entry_locked(const MoeSsdTensorSource* gate_up,
                                 const MoeSsdTensorSource* down, int expert,
                                 bool speculative = false);
+    std::unique_ptr<Entry> remove_entry_locked(Entry* entry,
+                                               bool count_eviction);
     size_t layer_capacity_bytes_locked(int layer) const;
     bool global_victim_before_locked(const Entry* candidate, const Entry* current) const;
     static ByteBuffer& component_buffer(Entry& entry, uint8_t component);
@@ -176,6 +178,7 @@ private:
                               const uint8_t* scales);
 
     int fd_ = -1;
+    uint64_t file_size_ = 0;
     int io_workers_count_ = 0;
     uint64_t next_trace_id_ = 1;
     size_t capacity_bytes_ = 0;
