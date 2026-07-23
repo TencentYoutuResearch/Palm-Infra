@@ -67,6 +67,18 @@ bool schedule_moe_cross_layer_prefetch(
 
 class MoeSsdCache {
 public:
+    struct LayerStats {
+        int layer = -1;
+        uint64_t demand_acquires = 0;
+        uint64_t demand_hits = 0;
+        uint64_t demand_misses = 0;
+        uint64_t acquire_wait_ns = 0;
+        uint64_t prediction_attempts = 0;
+        uint64_t prediction_matches = 0;
+        uint64_t unused_prefetch_evictions = 0;
+        uint64_t short_term_reloads = 0;
+    };
+
     struct Stats {
         uint64_t hits = 0;
         uint64_t misses = 0;
@@ -80,6 +92,7 @@ public:
         size_t resident_bytes = 0;
         std::vector<uint64_t> cross_layer_rank_attempts;
         std::vector<uint64_t> cross_layer_rank_hits;
+        std::vector<LayerStats> layers;
     };
 
     MoeSsdCache();
@@ -170,6 +183,16 @@ private:
     struct PredictionRecord {
         uint64_t forward_epoch = 0;
         std::vector<int> experts;
+    };
+    struct LayerCounters {
+        uint64_t demand_acquires = 0;
+        uint64_t demand_hits = 0;
+        uint64_t demand_misses = 0;
+        uint64_t acquire_wait_ns = 0;
+        uint64_t prediction_attempts = 0;
+        uint64_t prediction_matches = 0;
+        uint64_t unused_prefetch_evictions = 0;
+        uint64_t short_term_reloads = 0;
     };
     // One job reads a physically contiguous run of the same component
     // (gate data/scales or down data/scales) for adjacent expert ids. Keeping
@@ -267,4 +290,6 @@ private:
     std::unordered_map<int, std::vector<Entry*>> layer_entries_;
     std::unordered_map<int, size_t> layer_resident_bytes_;
     std::unordered_map<int, PredictionRecord> pending_predictions_;
+    std::unordered_map<int, LayerCounters> layer_stats_;
+    std::unordered_map<uint64_t, uint64_t> last_evicted_epoch_;
 };

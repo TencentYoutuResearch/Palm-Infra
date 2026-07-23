@@ -153,6 +153,45 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                                                : static_cast<double>(hits) / attempts);
         }
         std::printf("\n");
+        uint64_t total_wait_ns = 0;
+        uint64_t total_prediction_attempts = 0;
+        uint64_t total_prediction_matches = 0;
+        uint64_t total_unused_prefetch_evictions = 0;
+        uint64_t total_short_term_reloads = 0;
+        for (const auto& layer : ssd.layers) {
+            total_wait_ns += layer.acquire_wait_ns;
+            total_prediction_attempts += layer.prediction_attempts;
+            total_prediction_matches += layer.prediction_matches;
+            total_unused_prefetch_evictions += layer.unused_prefetch_evictions;
+            total_short_term_reloads += layer.short_term_reloads;
+        }
+        std::printf(
+            "moe_ssd_layer_summary_wait_ms=%.3f prediction_accuracy=%.3f "
+            "unused_prefetch_evictions=%llu short_term_reloads=%llu\n",
+            total_wait_ns / 1e6,
+            total_prediction_attempts == 0
+                ? 0.0
+                : static_cast<double>(total_prediction_matches) /
+                      total_prediction_attempts,
+            (unsigned long long)total_unused_prefetch_evictions,
+            (unsigned long long)total_short_term_reloads);
+        std::printf("moe_ssd_layer_stats=");
+        for (size_t index = 0; index < ssd.layers.size(); ++index) {
+            if (index != 0) std::printf(";");
+            const auto& layer = ssd.layers[index];
+            std::printf(
+                "%d:%llu:%llu:%llu:%.3f:%llu:%llu:%llu:%llu",
+                layer.layer,
+                (unsigned long long)layer.demand_acquires,
+                (unsigned long long)layer.demand_hits,
+                (unsigned long long)layer.demand_misses,
+                layer.acquire_wait_ns / 1e6,
+                (unsigned long long)layer.prediction_attempts,
+                (unsigned long long)layer.prediction_matches,
+                (unsigned long long)layer.unused_prefetch_evictions,
+                (unsigned long long)layer.short_term_reloads);
+        }
+        std::printf("\n");
     }
     {
         auto pre = engine.prefill_pool_stats();

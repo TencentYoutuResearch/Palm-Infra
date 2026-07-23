@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -302,6 +303,41 @@ int main() {
         cache.reset_stats();
         check(cache.recommended_prefetch_count(2) == 1,
               "statistics reset preserves learned prefetch policy");
+    }
+
+    // Track cache pollution separately from useful demand residency, and flag
+    // an expert which has to be reloaded immediately after eviction.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 16, 1), "open cache-statistics cache");
+        check(cache.add_source(spec("stats_gate", 0)) &&
+              cache.add_source(spec("stats_down", 6 * sizeof(uint16_t))),
+              "add cache-statistics sources");
+        check(cache.set_global_capacity_pool(true),
+              "enable cache-statistics global pool");
+        const MoeSsdTensorSource* gate = cache.find_source("stats_gate");
+        const MoeSsdTensorSource* down = cache.find_source("stats_down");
+        check(cache.prefetch_many(gate, down, {0}, {1.0f}),
+              "queue unused speculative expert");
+        for (int spin = 0; spin < 100 && cache.stats().bytes_read < 8; ++spin)
+            std::this_thread::yield();
+
+        Tensor gu, dw;
+        check(cache.acquire(gate, down, 1, gu, dw),
+              "fill cache beside speculative expert");
+        cache.begin_forward_pass();
+        check(cache.acquire(gate, down, 2, gu, dw),
+              "evict stale unused speculation");
+        check(cache.acquire(gate, down, 0, gu, dw),
+              "reload recently evicted expert");
+        const auto stats = cache.stats();
+        check(!stats.layers.empty() &&
+              stats.layers[0].unused_prefetch_evictions >= 1,
+              "unused speculative eviction is counted");
+        check(stats.layers[0].short_term_reloads >= 1,
+              "short-term reload is counted");
+        check(stats.layers[0].demand_acquires == 3,
+              "per-layer demand acquisitions are counted");
     }
 
     std::remove(path.c_str());

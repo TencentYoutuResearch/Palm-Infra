@@ -5,6 +5,7 @@
 #include "kernels/trace.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -146,6 +147,8 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         layer_entries_.clear();
         layer_resident_bytes_.clear();
         pending_predictions_.clear();
+        layer_stats_.clear();
+        last_evicted_epoch_.clear();
     }
     io_workers_.reserve((size_t)io_workers);
     for (int i = 0; i < io_workers; i++) {
@@ -377,8 +380,16 @@ std::unique_ptr<MoeSsdCache::Entry> MoeSsdCache::remove_entry_locked(
     layer_entries->second.erase(in_layer);
     layer_resident->second -= bytes;
     resident_bytes_ -= bytes;
-    if (count_eviction)
+    if (count_eviction) {
         ++evictions_;
+        LayerCounters& counters = layer_stats_[layer];
+        if (entry->speculative)
+            ++counters.unused_prefetch_evictions;
+        const uint64_t key =
+            (static_cast<uint64_t>(static_cast<uint32_t>(layer)) << 32) |
+            static_cast<uint32_t>(entry->expert);
+        last_evicted_epoch_[key] = forward_epoch_;
+    }
     return removed;
 }
 
@@ -398,6 +409,16 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     }
 
     const int layer = gate_up->spec.layer;
+    const uint64_t eviction_key =
+        (static_cast<uint64_t>(static_cast<uint32_t>(layer)) << 32) |
+        static_cast<uint32_t>(expert);
+    const auto last_evicted = last_evicted_epoch_.find(eviction_key);
+    if (last_evicted != last_evicted_epoch_.end() &&
+        forward_epoch_ >= last_evicted->second &&
+        forward_epoch_ - last_evicted->second <= 1) {
+        ++layer_stats_[layer].short_term_reloads;
+        last_evicted_epoch_.erase(last_evicted);
+    }
     size_t& layer_resident = layer_resident_bytes_[layer];
     std::vector<Entry*>& layer_entries = layer_entries_[layer];
     std::unique_ptr<Entry> recycled;
@@ -576,6 +597,10 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                         ++cross_layer_rank_hits_[rank];
                         ++prediction_policy_hits_[rank];
                     }
+                    LayerCounters& layer_counters =
+                        layer_stats_[gate_up->spec.layer];
+                    ++layer_counters.prediction_attempts;
+                    if (matched) ++layer_counters.prediction_matches;
                 }
                 pending_predictions_.erase(prediction);
             }
@@ -739,6 +764,15 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
         return false;
     }
     const uint64_t trace_start = mollm_trace::now_ns();
+    using SteadyClock = std::chrono::steady_clock;
+    SteadyClock::time_point wait_start;
+    bool waited = false;
+    auto begin_wait = [&] {
+        if (!waited) {
+            wait_start = SteadyClock::now();
+            waited = true;
+        }
+    };
     std::unique_lock<std::mutex> lock(mutex_);
     size_t required = 0;
     if (!expert_pair_bytes(gate_up, down, required))
@@ -769,14 +803,17 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
         }
         // All slots are loading. Let one complete, then evict it if needed
         // and submit this deferred expert.
+        begin_wait();
         ready_cv_.wait(lock);
         entry = find_entry_locked(gate_up, down, expert);
     }
+    if (entry && entry->is_loading()) begin_wait();
     ready_cv_.wait(lock, [&] { return entry && !entry->is_loading(); });
     if (!entry || !entry->is_ready()) {
         std::fprintf(stderr, "MoE SSD: failed to load expert %d\n", expert);
         return false;
     }
+    const bool fresh_miss = entry->fresh_miss;
     entry->used_at = ++clock_;
     entry->forward_epoch = forward_epoch_;
     if (entry->speculative) {
@@ -785,13 +822,23 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
     }
     entry->prediction_epoch = 0;
     entry->prediction_confidence = 0.0f;
-    if (entry->fresh_miss) {
+    if (fresh_miss) {
         entry->fresh_miss = false;
     } else {
         ++hits_;
     }
     gate_up_out = make_tensor(*gate_up, entry->gate_up_data.data(), entry->gate_up_scales.data());
     down_out = make_tensor(*down, entry->down_data.data(), entry->down_scales.data());
+    LayerCounters& layer_counters = layer_stats_[gate_up->spec.layer];
+    ++layer_counters.demand_acquires;
+    if (fresh_miss) ++layer_counters.demand_misses;
+    else ++layer_counters.demand_hits;
+    if (waited) {
+        layer_counters.acquire_wait_ns +=
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    SteadyClock::now() - wait_start).count());
+    }
     if (trace_start != 0) {
         mollm_trace::record_duration(
             "ssd", "acquire", trace_start, mollm_trace::now_ns(),
@@ -816,6 +863,24 @@ MoeSsdCache::Stats MoeSsdCache::stats() const {
     result.resident_bytes = resident_bytes_;
     result.cross_layer_rank_attempts = cross_layer_rank_attempts_;
     result.cross_layer_rank_hits = cross_layer_rank_hits_;
+    result.layers.reserve(layer_stats_.size());
+    for (const auto& [layer, counters] : layer_stats_) {
+        result.layers.push_back({
+            layer,
+            counters.demand_acquires,
+            counters.demand_hits,
+            counters.demand_misses,
+            counters.acquire_wait_ns,
+            counters.prediction_attempts,
+            counters.prediction_matches,
+            counters.unused_prefetch_evictions,
+            counters.short_term_reloads,
+        });
+    }
+    std::sort(result.layers.begin(), result.layers.end(),
+              [](const LayerStats& lhs, const LayerStats& rhs) {
+                  return lhs.layer < rhs.layer;
+              });
     return result;
 }
 
@@ -833,4 +898,6 @@ void MoeSsdCache::reset_stats() {
     cross_layer_rank_attempts_.clear();
     cross_layer_rank_hits_.clear();
     pending_predictions_.clear();
+    layer_stats_.clear();
+    last_evicted_epoch_.clear();
 }
