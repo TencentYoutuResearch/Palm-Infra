@@ -259,7 +259,15 @@ int main() {
         Tensor gu, dw;
         check(cache.acquire(g0, d0, 0, gu, dw) && cache.acquire(g0, d0, 1, gu, dw) &&
               cache.acquire(g0, d0, 2, gu, dw), "finish layer-zero global reads");
-        check(cache.request_many(g1, d1, {0}), "borrow global cache for layer one");
+        check(cache.prefetch_many(g1, d1, {0}, {1.0f}),
+              "submit cache-aware speculative request");
+        check(!cache.contains(g1, d1, 0),
+              "speculation does not evict current demand entries");
+        check(cache.stats().cross_layer_rejected == 1,
+              "rejected speculation is accounted");
+        cache.begin_forward_pass();
+        check(cache.prefetch_many(g1, d1, {0}, {1.0f}),
+              "borrow stale global space for predicted layer");
         check(cache.contains(g1, d1, 0), "global pool admits the next layer");
         check(cache.resident_count(g0, d0, {0, 1, 2}) == 2,
               "global pool evicts one layer-zero LRU entry");

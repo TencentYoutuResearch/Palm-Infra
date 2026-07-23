@@ -29,6 +29,7 @@ struct CliCommonOptions {
     // SSD expert offload benefits from keeping the always-used dense weights
     // resident. Users on constrained systems can opt out explicitly.
     bool lock_dense_weights = true;
+    bool lock_expert_cache = kDefaultLockMoeSsdCache;
     int ssd_cache_mb = 0;        // >0: page routed MoE experts from package
     int ssd_io_workers = 8;      // dedicated pread workers for MoE SSD cache
     bool ssd_cross_layer_prefetch = true;   // next-layer predictor (with global pool)

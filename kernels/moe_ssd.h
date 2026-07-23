@@ -76,6 +76,7 @@ public:
         uint64_t cross_layer_dropped = 0;
         uint64_t cross_layer_experts = 0;
         uint64_t cross_layer_used = 0;
+        uint64_t cross_layer_rejected = 0;
         size_t resident_bytes = 0;
     };
 
@@ -85,7 +86,8 @@ public:
     MoeSsdCache& operator=(const MoeSsdCache&) = delete;
 
     bool open(const std::string& package_path, size_t capacity_bytes,
-              int io_workers = 8, bool enable_cross_layer_worker = false);
+              int io_workers = 8, bool enable_cross_layer_worker = false,
+              bool lock_expert_pages = false);
     bool add_source(const MoeSsdTensorSpec& spec);
     // Switch from isolated per-layer quotas to one shared capacity pool.
     // Call before any expert I/O.
@@ -117,7 +119,8 @@ public:
     // Speculative reads are only serviced after real router requests.
     bool prefetch_many(const MoeSsdTensorSource* gate_up,
                        const MoeSsdTensorSource* down,
-                       const std::vector<int>& experts);
+                       const std::vector<int>& experts,
+                       const std::vector<float>& confidence = {});
 
     // Queue a tiny gate-prediction task on an otherwise-idle SSD worker. The
     // queue is bounded so stale predictions never accumulate behind decode.
@@ -173,7 +176,8 @@ private:
     bool request_many_impl(const MoeSsdTensorSource* gate_up,
                            const MoeSsdTensorSource* down,
                            const std::vector<int>& experts,
-                           bool speculative);
+                           bool speculative,
+                           const std::vector<float>& confidence = {});
     Entry* find_entry_locked(const MoeSsdTensorSource* gate_up,
                              const MoeSsdTensorSource* down, int expert);
     const Entry* find_entry_locked(const MoeSsdTensorSource* gate_up,
@@ -181,7 +185,8 @@ private:
                                    int expert) const;
     Entry* reserve_entry_locked(const MoeSsdTensorSource* gate_up,
                                 const MoeSsdTensorSource* down, int expert,
-                                bool speculative = false);
+                                bool speculative = false,
+                                float prediction_confidence = 0.0f);
     std::unique_ptr<Entry> remove_entry_locked(Entry* entry,
                                                bool count_eviction);
     size_t layer_capacity_bytes_locked(int layer) const;
@@ -215,11 +220,13 @@ private:
     uint64_t cross_layer_dropped_ = 0;
     uint64_t cross_layer_experts_ = 0;
     uint64_t cross_layer_used_ = 0;
+    uint64_t cross_layer_rejected_ = 0;
     mutable std::mutex mutex_;
     std::condition_variable io_cv_;
     std::condition_variable cross_layer_cv_;
     std::condition_variable ready_cv_;
     bool stop_io_ = false;
+    bool lock_expert_pages_ = false;
     std::deque<IoJob> io_jobs_;
     std::deque<IoJob> low_priority_io_jobs_;
     std::deque<std::function<void()>> cross_layer_tasks_;

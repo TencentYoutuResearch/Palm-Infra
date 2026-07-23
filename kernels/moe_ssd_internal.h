@@ -5,17 +5,36 @@
 #include <cstdint>
 #include <memory>
 
+#include <sys/mman.h>
+
 // pread() overwrites every byte in a component. std::vector::resize() clears
 // these multi-megabyte buffers first, making request_many CPU-bound as the
 // cache grows. Allocate them uninitialized instead.
 struct MoeSsdCache::ByteBuffer {
     std::unique_ptr<uint8_t[]> storage;
     size_t length = 0;
+    bool locked = false;
+
+    ~ByteBuffer() {
+        unlock();
+    }
 
     void resize(size_t bytes) {
         if (bytes == length) return;
+        unlock();
         storage.reset(bytes == 0 ? nullptr : new uint8_t[bytes]);
         length = bytes;
+    }
+    bool lock() {
+        if (locked || length == 0) return true;
+        locked = mlock(storage.get(), length) == 0;
+        return locked;
+    }
+    void unlock() {
+        if (locked) {
+            munlock(storage.get(), length);
+            locked = false;
+        }
     }
     bool empty() const { return length == 0; }
     size_t size() const { return length; }
@@ -40,6 +59,8 @@ struct MoeSsdCache::Entry {
     bool fresh_miss = false;  // first acquire after a queued miss is not a hit
     bool speculative = false;
     uint64_t forward_epoch = 0;
+    uint64_t prediction_epoch = 0;
+    float prediction_confidence = 0.0f;
     ByteBuffer gate_up_data;
     ByteBuffer gate_up_scales;
     ByteBuffer down_data;

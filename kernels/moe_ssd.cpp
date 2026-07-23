@@ -89,7 +89,8 @@ void MoeSsdCache::stop_io_workers() {
 }
 
 bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
-                       int io_workers, bool enable_cross_layer_worker) {
+                       int io_workers, bool enable_cross_layer_worker,
+                       bool lock_expert_pages) {
     if (capacity_bytes == 0 || io_workers < 1) {
         std::fprintf(stderr, "MoE SSD: cache capacity and I/O worker count must be non-zero\n");
         return false;
@@ -127,10 +128,11 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         io_workers_count_ = io_workers;
         next_trace_id_ = 1;
         capacity_bytes_ = capacity_bytes;
+        lock_expert_pages_ = lock_expert_pages;
         resident_bytes_ = 0;
         clock_ = hits_ = misses_ = evictions_ = bytes_read_ = 0;
         cross_layer_tasks_count_ = cross_layer_dropped_ = 0;
-        cross_layer_experts_ = cross_layer_used_ = 0;
+        cross_layer_experts_ = cross_layer_used_ = cross_layer_rejected_ = 0;
         sources_.clear();
         layers_.clear();
         layer_layouts_.clear();
@@ -331,7 +333,8 @@ const MoeSsdCache::Entry* MoeSsdCache::find_entry_locked(
     auto layer = layer_entries_.find(gate_up->spec.layer);
     if (layer == layer_entries_.end()) return nullptr;
     for (const Entry* entry : layer->second) {
-        if (entry->gate_up == gate_up && entry->down == down && entry->expert == expert) {
+        if (entry->gate_up == gate_up && entry->down == down &&
+            entry->expert == expert) {
             return entry;
         }
     }
@@ -376,7 +379,7 @@ std::unique_ptr<MoeSsdCache::Entry> MoeSsdCache::remove_entry_locked(
 
 MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     const MoeSsdTensorSource* gate_up, const MoeSsdTensorSource* down, int expert,
-    bool speculative) {
+    bool speculative, float prediction_confidence) {
     size_t required = 0;
     if (!expert_pair_bytes(gate_up, down, required))
         return nullptr;
@@ -419,6 +422,20 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
             // caller can let workers finish and retry later.
             return nullptr;
         }
+        if (speculative) {
+            const int victim_layer = victim_entry->gate_up->spec.layer;
+            const bool stale = victim_entry->forward_epoch != forward_epoch_;
+            const bool left = active_layer_ >= 0 && victim_layer < active_layer_;
+            const bool weaker_prediction =
+                victim_entry->speculative &&
+                victim_entry->prediction_epoch == forward_epoch_ &&
+                victim_entry->prediction_confidence < prediction_confidence;
+            // Advisory reads must not evict a demand-loaded entry which may
+            // still be useful later in this forward pass. They may consume
+            // stale/left-layer space or replace a weaker prediction.
+            if (!stale && !left && !weaker_prediction)
+                return nullptr;
+        }
         auto removed = remove_entry_locked(victim_entry, true);
         if (!removed)
             return nullptr;
@@ -436,6 +453,8 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     entry->fresh_miss = true;
     entry->speculative = speculative;
     entry->forward_epoch = forward_epoch_;
+    entry->prediction_epoch = speculative ? forward_epoch_ : 0;
+    entry->prediction_confidence = speculative ? prediction_confidence : 0.0f;
     entry->gate_up_data.resize(static_cast<size_t>(gate_up->spec.data_bytes));
     entry->gate_up_scales.resize(static_cast<size_t>(gate_up->spec.scales_bytes));
     entry->down_data.resize(static_cast<size_t>(down->spec.data_bytes));
@@ -466,6 +485,13 @@ bool MoeSsdCache::global_victim_before_locked(const Entry* candidate,
     const int candidate_rank = rank(candidate);
     const int current_rank = rank(current);
     if (candidate_rank != current_rank) return candidate_rank < current_rank;
+    const bool candidate_predicted = candidate->prediction_epoch == forward_epoch_;
+    const bool current_predicted = current->prediction_epoch == forward_epoch_;
+    if (candidate_predicted != current_predicted) return !candidate_predicted;
+    if (candidate_predicted &&
+        candidate->prediction_confidence != current->prediction_confidence) {
+        return candidate->prediction_confidence < current->prediction_confidence;
+    }
     return candidate->used_at < current->used_at;
 }
 
@@ -496,14 +522,16 @@ bool MoeSsdCache::request_many(const MoeSsdTensorSource* gate_up,
 
 bool MoeSsdCache::prefetch_many(const MoeSsdTensorSource* gate_up,
                                 const MoeSsdTensorSource* down,
-                                const std::vector<int>& experts) {
-    return request_many_impl(gate_up, down, experts, true);
+                                const std::vector<int>& experts,
+                                const std::vector<float>& confidence) {
+    return request_many_impl(gate_up, down, experts, true, confidence);
 }
 
 bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                                     const MoeSsdTensorSource* down,
                                     const std::vector<int>& experts,
-                                    bool speculative) {
+                                    bool speculative,
+                                    const std::vector<float>& confidence) {
     if (!gate_up || !down || !valid_pair(gate_up, down, 0)) {
         std::fprintf(stderr, "MoE SSD: invalid expert pair request\n");
         return false;
@@ -514,7 +542,11 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!speculative) active_layer_ = gate_up->spec.layer;
-        for (int expert : experts) {
+        for (size_t index = 0; index < experts.size(); ++index) {
+            const int expert = experts[index];
+            const float prediction_confidence =
+                speculative && index < confidence.size()
+                    ? std::max(0.0f, confidence[index]) : 0.0f;
             if (expert < 0 || expert >= gate_up->spec.num_experts || seen[(size_t)expert]) continue;
             seen[(size_t)expert] = 1;
             Entry* entry = find_entry_locked(gate_up, down, expert);
@@ -525,12 +557,21 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
             if (entry) {
                 entry->used_at = ++clock_;
                 entry->forward_epoch = forward_epoch_;
+                if (speculative) {
+                    entry->prediction_epoch = forward_epoch_;
+                    entry->prediction_confidence =
+                        std::max(entry->prediction_confidence, prediction_confidence);
+                }
                 continue;
             }
-            entry = reserve_entry_locked(gate_up, down, expert, speculative);
+            entry = reserve_entry_locked(gate_up, down, expert, speculative,
+                                         prediction_confidence);
             // Do not reserve beyond the per-layer byte budget. acquire() will
             // submit this expert later after an in-flight slot becomes ready.
-            if (!entry) continue;
+            if (!entry) {
+                if (speculative) ++cross_layer_rejected_;
+                continue;
+            }
             if (speculative) ++cross_layer_experts_;
             else ++misses_;
             queued_entries.push_back(entry);
@@ -681,6 +722,8 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
         ++cross_layer_used_;
         entry->speculative = false;
     }
+    entry->prediction_epoch = 0;
+    entry->prediction_confidence = 0.0f;
     if (entry->fresh_miss) {
         entry->fresh_miss = false;
     } else {
@@ -700,7 +743,8 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
 MoeSsdCache::Stats MoeSsdCache::stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return {hits_, misses_, evictions_, bytes_read_, cross_layer_tasks_count_,
-            cross_layer_dropped_, cross_layer_experts_, cross_layer_used_, resident_bytes_};
+            cross_layer_dropped_, cross_layer_experts_, cross_layer_used_,
+            cross_layer_rejected_, resident_bytes_};
 }
 
 void MoeSsdCache::reset_stats() {
@@ -713,4 +757,5 @@ void MoeSsdCache::reset_stats() {
     cross_layer_dropped_ = 0;
     cross_layer_experts_ = 0;
     cross_layer_used_ = 0;
+    cross_layer_rejected_ = 0;
 }

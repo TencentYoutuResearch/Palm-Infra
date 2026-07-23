@@ -126,7 +126,7 @@
   <text x="40" y="1009" class="label">Qwen3.5-122B SSD</text>
   <rect x="200" y="988" width="19.9" height="13" rx="2" class="mollm"/><text x="227" y="999" class="value">37.99</text>
   <text x="200" y="1017" class="value">0 (OOM)</text>
-  <rect x="700" y="988" width="20.3" height="13" rx="2" class="mollm"/><text x="728" y="999" class="value">13.54</text>
+  <rect x="700" y="988" width="19.1" height="13" rx="2" class="mollm"/><text x="727" y="999" class="value">12.70</text>
   <text x="700" y="1017" class="value">0 (OOM)</text>
   <line x1="200" y1="1042" x2="620" y2="1042" class="axis"/>
   <text x="196" y="1060" class="tick">0</text><text x="296" y="1060" class="tick">200</text><text x="401" y="1060" class="tick">400</text><text x="506" y="1060" class="tick">600</text><text x="611" y="1060" class="tick">800</text>

@@ -161,6 +161,10 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.lock_dense_weights = true;
         } else if (arg == "--no-lock-dense-weights") {
             opts.lock_dense_weights = false;
+        } else if (arg == "--lock-expert-cache") {
+            opts.lock_expert_cache = true;
+        } else if (arg == "--no-lock-expert-cache") {
+            opts.lock_expert_cache = false;
         } else if (arg == "--warmup") {
             if (!require_value(argc, argv, i, "--warmup", value, error)) return false;
             if (!parse_int(value, opts.warmup) || opts.warmup < 0) {
@@ -240,6 +244,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
     std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
     std::printf("  --no-lock-dense-weights Keep dense mmap weights pageable\n");
+    std::printf("  --lock-expert-cache     Pin the expert RAM cache (default on macOS)\n");
+    std::printf("  --no-lock-expert-cache  Allow the OS to compress/page expert cache entries\n");
     std::printf("  --no-load-warmup        Skip mmap page-in warmup\n");
     std::printf("  --warmup <int>            Default: 1 (used by benchmark)\n");
     std::printf("  --temperature <float>     Default: 0.6 (0 = greedy)\n");
@@ -275,6 +281,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.moe_ssd_global_cache = opts.ssd_global_cache;
     cfg.trace_path = opts.trace_path;
     cfg.lock_dense_weights = opts.lock_dense_weights;
+    cfg.lock_moe_ssd_cache = opts.lock_expert_cache;
     return cfg;
 }
 

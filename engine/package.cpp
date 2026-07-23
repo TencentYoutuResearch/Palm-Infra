@@ -371,8 +371,13 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 if (!cache->open(path, cfg_.moe_ssd_cache_bytes,
                                  cfg_.moe_ssd_io_workers,
                                  cfg_.moe_ssd_global_cache &&
-                                     cfg_.moe_ssd_cross_layer_prefetch))
+                                     cfg_.moe_ssd_cross_layer_prefetch,
+                                 cfg_.lock_moe_ssd_cache))
                     return false;
+                if (cfg_.lock_moe_ssd_cache) {
+                    std::fprintf(stderr,
+                                 "Engine: expert RAM cache pages will be locked on demand\n");
+                }
                 size_t source_count = 0;
                 for (const auto& layer : (*storage_it)["layers"]) {
                     if (!layer.is_object()) {

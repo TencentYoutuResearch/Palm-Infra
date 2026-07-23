@@ -32,13 +32,24 @@ pairs from the package with asynchronous `pread` workers. A RAM cache holds
 recently used SSD-backed expert pairs and is bounded by `--ssd-cache-mb`, so
 this is a real SSD-offload path rather than a resident 122B model.
 
+On macOS, the expert RAM cache is pinned by default. Without pinning, the VM
+compressor can repeatedly compress cold anonymous expert buffers and later
+decompress them inside matmul, making a larger cache slower despite its higher
+hit rate. Use `--no-lock-expert-cache` only when system memory headroom matters
+more than stable decode throughput; cache sizes should still leave room for
+dense weights, KV cache, and other applications.
+
 Real chat prompt, 4 CPU threads, 16 prompt tokens, 128 generated tokens,
-`warmup=1`, locked dense weights, and 5 independent process runs (median):
+`warmup=1`, and 5 independent process runs (median):
 
 | 16 GiB cache policy | Decode | Expert-cache hit rate | SSD reads |
 |---|---:|---:|---:|
 | Legacy equal per-layer cache, no prediction | 10.89 t/s | 74.5% | 69.4 GB |
-| **Default shared cache + cross-layer prefetch** | **13.54 t/s** | **89.3%** | 75.7 GB |
+| **Default shared cache + cross-layer prefetch** | **12.70 t/s** | **89.3%** | 75.7 GB |
+
+The default row was rerun with both dense weights and the expert cache locked.
+The legacy row is the previously published baseline with dense weights locked
+but without expert-cache pinning.
 
 The default keeps one global RAM pool instead of fixed per-layer quotas. Its
 Least-Stale eviction policy protects current/future-layer experts, while a
@@ -48,6 +59,21 @@ to improve interactive decode. The strict `pp256 + tg64`, `warmup=3`
 five-process median for the same 16 GiB default is 37.99 pp / 8.46 tg; its
 decode starts from a much longer 256-token context than the interactive
 measurement above.
+
+Cache-size sweep on the current default policy, using the real prompt
+“给我讲一个故事”, greedy decoding, 16 prompt tokens, 256 generated tokens,
+`warmup=0`, and 3 independent process runs (median):
+
+| Expert RAM cache | Decode | Peak RSS | Expert-cache hit rate | SSD reads |
+|---:|---:|---:|---:|---:|
+| 1 GiB | 9.32 t/s | 5.83 GB | 0.0% | 618.2 GB |
+| **10 GiB** | **12.44 t/s** | 14.97 GB | 85.5% | 221.3 GB |
+| 16 GiB | 11.84 t/s | 21.07 GB | 90.0% | 152.0 GB |
+
+The 10 GiB configuration is the throughput/memory sweet spot in this sweep.
+At 16 GiB, much of the I/O avoided by the higher hit rate was already hidden
+behind compute, so it does not improve end-to-end throughput. These rows use a
+different, longer protocol than the 128-token cache-policy comparison above.
 
 Planned work includes cache-aware prefetch admission and predicting / prefetching
 routed experts during the attention phase, before the MoE layer needs them.
@@ -120,13 +146,15 @@ keeps dense q4-dot GEMV by default.
 |---|---:|---:|---|
 | Qwen3.6-35B-A3B | **139.63** / **65.32** | 116.93 / 43.73 | mollm 1.19x prefill, 1.49x decode |
 | Qwen3-30B-A3B | **143.50** / **63.85** | 110.34 / 60.77 | mollm 1.30x prefill, 1.05x decode |
-| Qwen3.5-122B-A10B (SSD offload) | **37.99** / **13.54** † | OOM | runs on a 48GB Mac |
+| Qwen3.5-122B-A10B (SSD offload) | **37.99** / **12.70** † | OOM | runs on a 48GB Mac |
 
-† Prefill is the five-process standard `pp256 + tg64`, `warmup=3` median.
-Decode is the five-process median on a real ChatML prompt (16 prompt tokens,
-128 generated tokens, `warmup=1`). Both use a 16 GiB RAM cache for SSD-backed
-experts, the default shared-cache/cross-layer-prefetch policy, and locked dense
-mmap weights. llama.cpp's CPU baseline could not fit in 48GB RAM.
+† Prefill is the previously published five-process standard `pp256 + tg64`,
+`warmup=3` median. Decode is the current five-process median on a real ChatML
+prompt (16 prompt tokens, 128 generated tokens, `warmup=1`). Both use a 16 GiB
+RAM cache for SSD-backed experts and the default shared-cache /
+cross-layer-prefetch policy. The current decode run locks both dense mmap
+weights and the expert cache. llama.cpp's CPU baseline could not fit in 48GB
+RAM.
 
 Overall: mollm decode is already strong, especially with W4 packages. Prefill is
 still the main optimization target on dense models.

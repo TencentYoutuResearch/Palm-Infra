@@ -73,6 +73,12 @@ enum class Device {
     METAL,
 };
 
+#if defined(__APPLE__)
+inline constexpr bool kDefaultLockMoeSsdCache = true;
+#else
+inline constexpr bool kDefaultLockMoeSsdCache = false;
+#endif
+
 struct EngineConfig {
     std::string package_path;         // .mollm single-file package (required)
     Device device = Device::CPU;      // compute backend (METAL requires MOLLM_METAL)
@@ -96,6 +102,9 @@ struct EngineConfig {
     // Wire dense mmap pages so a large expert cache cannot evict them.
     // Ignored unless SSD offload uses mmap weights.
     bool lock_dense_weights = true;
+    // Expert buffers are anonymous memory. On macOS, wiring them prevents the
+    // VM compressor from turning old cache hits into expensive decompressions.
+    bool lock_moe_ssd_cache = kDefaultLockMoeSsdCache;
     // Optional Chrome Trace / Perfetto JSON path. Empty disables tracing.
     std::string trace_path;
 

@@ -4,6 +4,7 @@
 #include "kernels/moe_routing.h"
 #include "kernels/trace.h"
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -70,7 +71,11 @@ bool schedule_moe_cross_layer_prefetch(
                     : nullptr;
             if (mollm::detail::select_moe_routes(
                     logits.data(), 1, bias, routing, experts, weights)) {
-                cache->prefetch_many(next_gate_up, next_down, experts);
+                if (!weights.empty()) {
+                    const float best = std::max(weights.front(), 1e-12f);
+                    for (float& weight : weights) weight /= best;
+                }
+                cache->prefetch_many(next_gate_up, next_down, experts, weights);
             }
         });
 }

@@ -3,6 +3,7 @@
 #include "kernels/trace.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -115,12 +116,23 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
 
 bool MoeSsdCache::read_job(const IoJob& job) {
     if (job.entries.empty()) return false;
+    auto lock_buffer = [&](ByteBuffer& buffer) {
+        if (!lock_expert_pages_ || buffer.lock()) return;
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            std::fprintf(stderr,
+                         "MoE SSD: warning: could not lock expert cache pages: %s\n",
+                         std::strerror(errno));
+        }
+    };
     const size_t bytes_per_entry = component_buffer(*job.entries.front(), job.component).size();
     if (bytes_per_entry == 0) return true;
     const uint64_t offset = component_offset(*job.entries.front(), job.component);
     if (job.entries.size() == 1) {
         ByteBuffer& dst = component_buffer(*job.entries.front(), job.component);
-        return read_exact(offset, dst.data(), dst.size());
+        if (!read_exact(offset, dst.data(), dst.size())) return false;
+        lock_buffer(dst);
+        return true;
     }
 
     const size_t merged_bytes = bytes_per_entry * job.entries.size();
@@ -129,6 +141,7 @@ bool MoeSsdCache::read_job(const IoJob& job) {
     for (size_t i = 0; i < job.entries.size(); i++) {
         ByteBuffer& dst = component_buffer(*job.entries[i], job.component);
         std::memcpy(dst.data(), merged.get() + i * bytes_per_entry, bytes_per_entry);
+        lock_buffer(dst);
     }
     return true;
 }
