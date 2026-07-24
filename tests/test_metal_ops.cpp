@@ -1089,6 +1089,8 @@ int main() {
     run_sdpa_cfg(1, 127, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=127", 3e-2f);
     run_sdpa_cfg(1, 255, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=255", 3e-2f);
     run_sdpa_cfg(1, 511, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=511", 3e-2f);
+    run_sdpa_cfg(1, 767, 192, 128, 16, 16, 1024, "SDPA multipart decode dk=192 dv=128 past=767", 3e-2f);
+    run_sdpa_cfg(1, 1023, 192, 128, 16, 16, 1024, "SDPA multipart decode dk=192 dv=128 past=1023", 3e-2f);
 
     // ---- W8A8 prefill GEMM (int8 activations x int8 per-channel weights) ----
     // Guards the int8xint8->int32 tensor path, whose cooperative-tensor layout

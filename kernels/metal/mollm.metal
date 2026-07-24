@@ -2597,6 +2597,161 @@ kernel void sdpa_decode_192_128_f32(
 }
 
 // ---------------------------------------------------------------------------
+// Long-context companion to sdpa_decode_192_128_f32.  Thirty-two independent
+// workgroups per head split the KV blocks and write online-softmax partials;
+// sdpa_decode_192_128_reduce_f32 combines them.  This exposes enough parallelism
+// once a single 8-SIMD-group workgroup has multiple KV tiles per SIMD group.
+// ---------------------------------------------------------------------------
+kernel void sdpa_decode_192_128_partial_f32(
+    device const float*   Q       [[buffer(0)]],
+    device const half*    KC      [[buffer(1)]],
+    device const half*    VC      [[buffer(2)]],
+    device const float*   MASK    [[buffer(5)]],
+    device float*         PARTIAL [[buffer(7)]],
+    constant SdpaParams&  p       [[buffer(3)]],
+    constant int&         nparts  [[buffer(6)]],
+    uint2  tg                     [[threadgroup_position_in_grid]],
+    ushort lane                   [[thread_index_in_simdgroup]])
+{
+    constexpr short DK = 192;
+    constexpr short DV = 128;
+    constexpr short C = 32;
+    constexpr short NL = 16;
+
+    const short tx = lane & 15;
+    const short ty = lane >> 4;
+    const int part = int(tg.x);
+    const int h = int(tg.y);
+    const int heads_per_group = p.num_heads / p.num_kv_heads;
+    const int kv_h = h / heads_per_group;
+    const int key_limit = min(p.dst_seqlen, p.causal ? p.past_seqlen + 1 : p.dst_seqlen);
+
+    device const float4* q4 =
+        (device const float4*)(Q + p.q_offset + (uint)h * p.q_stride_head);
+    device const half* Kh = KC + p.k_cache_offset
+        + (uint)kv_h * ((uint)DK * (uint)p.max_seq_len);
+    device const half* Vh = VC + p.v_cache_offset
+        + (uint)kv_h * ((uint)DV * (uint)p.max_seq_len);
+
+    threadgroup float scores[C];
+    float4 out0 = 0.0f;
+    float4 out1 = 0.0f;
+    float M = -INFINITY;
+    float S = 0.0f;
+
+    for (int ic = part * C; ic < key_limit; ic += nparts * C) {
+        float mqk[C / 2];
+        #pragma unroll
+        for (short cc = 0; cc < C / 2; ++cc) {
+            const int key = ic + 2 * cc + ty;
+            float dotqk = 0.0f;
+            if (key < key_limit) {
+                device const half4* k4 =
+                    (device const half4*)(Kh + (uint)key * (uint)DK);
+                #pragma unroll
+                for (short ii = 0; ii < DK / 4 / NL; ++ii) {
+                    const short d4 = ii * NL + tx;
+                    dotqk += dot(q4[d4], float4(k4[d4]));
+                }
+            }
+            dotqk += simd_shuffle_down(dotqk, 8);
+            dotqk += simd_shuffle_down(dotqk, 4);
+            dotqk += simd_shuffle_down(dotqk, 2);
+            dotqk += simd_shuffle_down(dotqk, 1);
+            mqk[cc] = dotqk;
+        }
+
+        const int key = ic + 2 * tx + ty;
+        float score = key < key_limit
+            ? simd_shuffle(mqk[tx], NL * ty) * p.scale
+            : -INFINITY;
+        if (p.has_mask && key < key_limit)
+            score += MASK[p.mask_offset + (uint)key];
+
+        const float Mnew = simd_max(max(M, score));
+        const float corr = exp(M - Mnew);
+        const float weight = exp(score - Mnew);
+        S = S * corr + simd_sum(weight);
+        M = Mnew;
+        scores[lane] = weight;
+        if (ty == 0) {
+            out0 *= corr;
+            out1 *= corr;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float4 lo0 = 0.0f;
+        float4 lo1 = 0.0f;
+        #pragma unroll
+        for (short cc = 0; cc < C / 2; ++cc) {
+            const int vkey = ic + 2 * cc + ty;
+            if (vkey < key_limit) {
+                device const half4* v4 =
+                    (device const half4*)(Vh + (uint)vkey * (uint)DV);
+                const float w = scores[2 * cc + ty];
+                lo0 += float4(v4[tx]) * w;
+                lo1 += float4(v4[NL + tx]) * w;
+            }
+        }
+        lo0.x += simd_shuffle_down(lo0.x, 16);
+        lo0.y += simd_shuffle_down(lo0.y, 16);
+        lo0.z += simd_shuffle_down(lo0.z, 16);
+        lo0.w += simd_shuffle_down(lo0.w, 16);
+        lo1.x += simd_shuffle_down(lo1.x, 16);
+        lo1.y += simd_shuffle_down(lo1.y, 16);
+        lo1.z += simd_shuffle_down(lo1.z, 16);
+        lo1.w += simd_shuffle_down(lo1.w, 16);
+        if (ty == 0) {
+            out0 += lo0;
+            out1 += lo1;
+        }
+    }
+
+    const uint base = ((uint)h * (uint)nparts + (uint)part) * (DV + 2);
+    if (ty == 0) {
+        device float4* po = (device float4*)(PARTIAL + base);
+        po[tx] = out0;
+        po[NL + tx] = out1;
+    }
+    if (lane == 0) {
+        PARTIAL[base + DV] = M;
+        PARTIAL[base + DV + 1] = S;
+    }
+}
+
+kernel void sdpa_decode_192_128_reduce_f32(
+    device const float*   PARTIAL [[buffer(7)]],
+    device float*         O       [[buffer(4)]],
+    constant SdpaParams&  p       [[buffer(3)]],
+    constant int&         nparts  [[buffer(6)]],
+    uint   h                      [[threadgroup_position_in_grid]],
+    ushort lane                   [[thread_index_in_simdgroup]])
+{
+    constexpr short DV = 128;
+    const uint stride = DV + 2;
+    const float mlane = lane < nparts
+        ? PARTIAL[((uint)h * (uint)nparts + lane) * stride + DV]
+        : -INFINITY;
+    const float Mf = simd_max(mlane);
+    const float slane = lane < nparts
+        ? PARTIAL[((uint)h * (uint)nparts + lane) * stride + DV + 1]
+            * exp(mlane - Mf)
+        : 0.0f;
+    const float inv = 1.0f / simd_sum(slane);
+
+    device float4* out4 =
+        (device float4*)(O + p.o_offset + h * p.o_stride_head);
+    const short d4 = lane;
+    float4 acc = 0.0f;
+    for (int part = 0; part < nparts; ++part) {
+        const uint base = ((uint)h * (uint)nparts + (uint)part) * stride;
+        const float mp = PARTIAL[base + DV];
+        acc += ((device const float4*)(PARTIAL + base))[d4] * exp(mp - Mf);
+    }
+    out4[d4] = acc * inv;
+}
+
+// ---------------------------------------------------------------------------
 // SDPA decode (src_seqlen == 1): one THREADGROUP per head, TG threads split the
 // key loop for GPU parallelism (the per-thread sdpa_f32 above uses only
 // num_heads threads for decode, starving the GPU as context grows).

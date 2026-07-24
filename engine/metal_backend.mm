@@ -1813,7 +1813,9 @@ void MetalBackend::dispatch(const GraphNode& node,
 
         const bool decode_192_128 = decode_path && head_dim == 192 && v_head_dim == 128
             && std::getenv("MOLLM_METAL_SDPA_DECODE_GENERIC") == nullptr;
-        const char* kname = decode_192_128 ? "sdpa_decode_192_128_f32"
+        const bool decode_192_128_multi = decode_192_128 && dst_seqlen >= 768;
+        const char* kname = decode_192_128_multi ? "sdpa_decode_192_128_partial_f32"
+                           : decode_192_128 ? "sdpa_decode_192_128_f32"
                            : decode_path ? "sdpa_decode_f32"
                            : "sdpa_prefill_f32";
         // fa2 uses its dk/dv-specialized pipeline; all other paths use name-keyed.
@@ -1826,7 +1828,27 @@ void MetalBackend::dispatch(const GraphNode& node,
         // Buffer index 5 (mask) must always be bound; use Q as a dummy if no mask.
         [enc setBuffer:(mask?buf_of(mask):buf_of(&Q)) offset:0 atIndex:5];
         [enc setBytes:&sp length:sizeof(sp) atIndex:3];
-        if (decode_path) {
+        if (decode_192_128_multi) {
+            constexpr int nparts = 32;
+            const size_t partial_bytes =
+                (size_t)num_heads * nparts * (128 + 2) * sizeof(float);
+            void* partial_h = impl_->pool->acquire(partial_bytes);
+            id<MTLBuffer> partial = (__bridge id<MTLBuffer>)partial_h;
+            impl_->pending_free.push_back({partial_h, partial_bytes});
+            [enc setBuffer:partial offset:0 atIndex:7];
+            [enc setBytes:&nparts length:sizeof(nparts) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(nparts,(NSUInteger)num_heads,1)
+                threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:
+                impl_->pipeline("sdpa_decode_192_128_reduce_f32")];
+            [enc setBuffer:partial offset:0 atIndex:7];
+            [enc setBuffer:buf_of(&out) offset:0 atIndex:4];
+            [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+            [enc setBytes:&nparts length:sizeof(nparts) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_heads,1,1)
+                threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        } else if (decode_path) {
             // The fused 192/128 path uses eight SIMD groups; the generic path
             // uses 256 threads to split the score and output loops.
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_heads,1,1)
