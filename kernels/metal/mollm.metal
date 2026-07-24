@@ -995,16 +995,24 @@ kernel void gemv_w4_f32a_i4b_f32c(
         for (int g=group_lane; g<gpr; g+=4) {
             const int k0=g*128+lane_in_group*16;
             const int kb=g*64+lane_in_group*8;
-            float av[16];
-            for (short i=0;i<16;++i) av[i]=a[k0+(int)i];
+            const float4 av0=*((device const float4*)(a+k0));
+            const float4 av1=*((device const float4*)(a+k0+4));
+            const float4 av2=*((device const float4*)(a+k0+8));
+            const float4 av3=*((device const float4*)(a+k0+12));
+            const float4 ae0=float4(av0.xz,av1.xz);
+            const float4 ao0=float4(av0.yw,av1.yw);
+            const float4 ae1=float4(av2.xz,av3.xz);
+            const float4 ao1=float4(av2.yw,av3.yw);
             for (short r=0;r<NR0;++r) {
-                float dot=0.0f;
-                for (short i=0;i<8;++i) {
-                    const int byte=(int)bx[r][kb+(int)i];
-                    const int lo=((byte&15)^8)-8, hi=(((byte>>4)&15)^8)-8;
-                    dot += av[2*i]*(float)lo + av[2*i+1]*(float)hi;
-                }
-                sumf[r] += dot*sc[r][g];
+                const uchar4 q0=*((device const uchar4*)(bx[r]+kb));
+                const uchar4 q1=*((device const uchar4*)(bx[r]+kb+4));
+                const int4 lo0=int4((q0&uchar4(15))^uchar4(8))-8;
+                const int4 hi0=int4(((q0>>4)&uchar4(15))^uchar4(8))-8;
+                const int4 lo1=int4((q1&uchar4(15))^uchar4(8))-8;
+                const int4 hi1=int4(((q1>>4)&uchar4(15))^uchar4(8))-8;
+                const float dotv=dot(ae0,float4(lo0))+dot(ao0,float4(hi0))+
+                                 dot(ae1,float4(lo1))+dot(ao1,float4(hi1));
+                sumf[r] += dotv*sc[r][g];
             }
         }
     } else {
