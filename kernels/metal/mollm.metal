@@ -210,8 +210,8 @@ kernel void gemm_tensor_w4_f32a_i4b_f32c(
                 for (int i = 0; i < UNROLL; i += 2) {
                     int k = gk0 + i;
                     uint8_t packed = (k < K) ? wr[i / 2] : 0;
-                    int lo = packed & 0x0f; if (lo >= 8) lo -= 16;
-                    int hi = packed >> 4;   if (hi >= 8) hi -= 16;
+                    int lo = (packed & 0x0f) - 8;
+                    int hi = (packed >> 4) - 8;
                     dst[i] = (k < K)
                         ? (half)((float)lo * sr[k / gs]) : (half)0;
                     dst[i + 1] = (k + 1 < K)
@@ -385,8 +385,8 @@ kernel void gemm_w4a8_i8a_i4b_f32c(
                     #pragma unroll
                     for (int i = 0; i < UNROLL; i += 2) {
                         uint8_t byte = ((gk0 + i) < K) ? wr[i/2] : 0;
-                        int lo = byte & 0x0F; if (lo >= 8) lo -= 16;
-                        int hi = (byte >> 4) & 0x0F; if (hi >= 8) hi -= 16;
+                        int lo = (byte & 0x0F) - 8;
+                        int hi = (byte >> 4) - 8;
                         dst[i]   = (int8_t)(((gk0 + i)   < K) ? lo : 0);
                         dst[i+1] = (int8_t)(((gk0 + i+1) < K) ? hi : 0);
                     }
@@ -1003,15 +1003,19 @@ kernel void gemv_w4_f32a_i4b_f32c(
             const float4 ao0=float4(av0.yw,av1.yw);
             const float4 ae1=float4(av2.xz,av3.xz);
             const float4 ao1=float4(av2.yw,av3.yw);
+            const float activation_sum=
+                dot(av0,float4(1.0f))+dot(av1,float4(1.0f))+
+                dot(av2,float4(1.0f))+dot(av3,float4(1.0f));
             for (short r=0;r<NR0;++r) {
                 const uchar4 q0=*((device const uchar4*)(bx[r]+kb));
                 const uchar4 q1=*((device const uchar4*)(bx[r]+kb+4));
-                const int4 lo0=int4((q0&uchar4(15))^uchar4(8))-8;
-                const int4 hi0=int4(((q0>>4)&uchar4(15))^uchar4(8))-8;
-                const int4 lo1=int4((q1&uchar4(15))^uchar4(8))-8;
-                const int4 hi1=int4(((q1>>4)&uchar4(15))^uchar4(8))-8;
+                const int4 lo0=int4(q0&uchar4(15));
+                const int4 hi0=int4(q0>>4);
+                const int4 lo1=int4(q1&uchar4(15));
+                const int4 hi1=int4(q1>>4);
                 const float dotv=dot(ae0,float4(lo0))+dot(ao0,float4(hi0))+
-                                 dot(ae1,float4(lo1))+dot(ao1,float4(hi1));
+                                 dot(ae1,float4(lo1))+dot(ao1,float4(hi1))-
+                                 8.0f*activation_sum;
                 sumf[r] += dotv*sc[r][g];
             }
         }
@@ -1023,7 +1027,7 @@ kernel void gemv_w4_f32a_i4b_f32c(
             int g = kb / (gs / 2);
             for (short r=0;r<NR0;++r) {
                 int byte = (int)bx[r][kb];
-                int lo = ((byte&15)^8)-8, hi=(((byte>>4)&15)^8)-8;
+                int lo = (byte&15)-8, hi=((byte>>4)&15)-8;
                 sumf[r] += (ae*(float)lo + ao*(float)hi)*sc[r][g];
             }
         }

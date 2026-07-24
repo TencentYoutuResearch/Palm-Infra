@@ -485,6 +485,10 @@ void MetalBackend::wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128) {
     // interleaved per 128-K block). The Metal W4A8 kernels want a simple raw
     // [N,K/2] nibble array + [N,gpr] fp32 scales, so decode once at load time
     // into a dedicated device buffer: [ nibbles (N*K/2) | scales (N*gpr f32) ].
+    // The package stores signed int4 in two's-complement nibble form. XOR the
+    // sign bit while copying to make the Metal-only buffer offset-binary
+    // (q + 8); this lets hot kernels decode with a subtract instead of a
+    // per-vector sign-bit XOR. CPU/native-BG128 storage remains unchanged.
     // device_offset stays 0 (nibbles at start); scales live at byte N*(K/2),
     // which the W4 dispatch binds directly (co-located, no weight_base math).
     if (!(t.prec == Precision::INT4 && t.is_q4_g128_packed && t.q4_g128_data)) return;
@@ -536,9 +540,16 @@ void MetalBackend::wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128) {
             for (int g = 0; g < gpr; g++) {
                 const Q4B8G128Block& blk = blocks[(size_t)nt * gpr + g];
                 sc[(size_t)n * gpr + g] = blk.scales[c];
-                for (int qgi = 0; qgi < 4; qgi++)
-                    std::memcpy(nrow + (size_t)(g * 128 + qgi * 32) / 2,
-                                blk.q[qgi][c], 16);
+                for (int qgi = 0; qgi < 4; qgi++) {
+                    uint8_t* dst =
+                        nrow + (size_t)(g * 128 + qgi * 32) / 2;
+                    const uint64_t* src64 =
+                        reinterpret_cast<const uint64_t*>(blk.q[qgi][c]);
+                    uint64_t* dst64 = reinterpret_cast<uint64_t*>(dst);
+                    constexpr uint64_t sign_bits = 0x8888888888888888ull;
+                    dst64[0] = src64[0] ^ sign_bits;
+                    dst64[1] = src64[1] ^ sign_bits;
+                }
             }
         }
         t.device_data = (__bridge void*)b;
