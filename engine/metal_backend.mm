@@ -245,15 +245,28 @@ int gemv_nsg_cap() {
 int gemv_w4_nr0() {
     static const int nr0 = [] {
         const char* value = std::getenv("MOLLM_METAL_GEMV_W4_NR");
-        // Two output rows share each activation load. A corrected W4-specific
-        // A/B on M5 Pro measured ~48 t/s for NR2 versus ~35 t/s for NR1.
+        // Four output rows amortize each activation load. Paired with two SIMD
+        // groups, this mirrors the row/K parallelism used by llama.cpp Q4_0
+        // and wins across the Qwen3.5-4B and Youtu-2B decode workloads.
+        if (!value) return 4;
+        const int parsed = std::atoi(value);
+        return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
+                   ? parsed
+                   : 4;
+    }();
+    return nr0;
+}
+
+int gemv_w4_nsg_cap() {
+    static const int cap = [] {
+        const char* value = std::getenv("MOLLM_METAL_GEMV_W4_NSG");
         if (!value) return 2;
         const int parsed = std::atoi(value);
         return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
                    ? parsed
                    : 2;
     }();
-    return nr0;
+    return cap;
 }
 
 } // namespace
@@ -891,7 +904,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             size_t scales_boff = (size_t)p.N * (p.K / 2);
             const int NR0 = gemv_w4_nr0();
             const int NSG =
-                std::min(gemv_nsg_cap(), (p.K / 2 + 63) / 64);
+                std::min(gemv_w4_nsg_cap(), (p.K / 2 + 63) / 64);
             id<MTLComputePipelineState> ps = impl_->pipeline_gemv_w4(NR0);
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
