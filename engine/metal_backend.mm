@@ -251,13 +251,18 @@ int gemv_w4_nr0(int n, int k) {
         if (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
             return parsed;
     }
-    // The block-oriented G128 kernel keeps 16 activations plus one accumulator
-    // per output row live in each lane. NR2 gives better occupancy than NR4/8
-    // across both dense and MLA projection shapes while retaining activation
-    // reuse. Row parallelism comes from independent SIMD groups/threadgroups.
-    (void)n;
-    (void)k;
-    return 2;
+    // Youtu's decode projections benefit from the extra row parallelism of
+    // NR1. Keep NR2 elsewhere: globally using NR1 regresses the primary
+    // Qwen3.5-4B decode workload.
+    const bool youtu_decode_shape =
+        (n == 12288 && k == 2048) ||
+        (n == 2048  && k == 6144) ||
+        (n == 3072  && k == 1536) ||
+        (n == 2048  && k == 2048) ||
+        (n == 1536  && k == 2048) ||
+        (n == 4096  && k == 512)  ||
+        (n == 576   && k == 2048);
+    return youtu_decode_shape ? 1 : 2;
 }
 
 int gemv_w4_nsg_cap() {
@@ -275,7 +280,7 @@ int gemv_w4_nsg_cap() {
 int metal_cmd_chunk_ops() {
     static const int chunk = [] {
         const char* value = std::getenv("MOLLM_METAL_CMD_CHUNK");
-        if (!value) return 128;
+        if (!value) return 96;
         return std::max(0, std::atoi(value));
     }();
     return chunk;

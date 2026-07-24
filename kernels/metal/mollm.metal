@@ -2487,7 +2487,7 @@ kernel void sdpa_decode_192_128_f32(
     threadgroup float state_m[NSG];
     threadgroup float state_s[NSG];
 
-    // Both SIMD groups cooperate on staging Q and clearing the accumulators.
+    // SIMD groups cooperate on staging Q and clearing the accumulators.
     const short ti = sg * 32 + lane;
     if (ti < DK / 4) {
         device const float4* srcq = (device const float4*)q;
@@ -2500,10 +2500,10 @@ kernel void sdpa_decode_192_128_f32(
     float S = 0.0f;
 
     for (int ic = int(sg) * C; ic < key_limit; ic += NSG * C) {
-        // Every lane computes one feature stripe for all 16 keys of its
-        // parity.  Reducing each value within the 16-lane subgroup produces
-        // the complete dot; lane tx then selects key (2*tx + ty).
-        float mqk[C / 2];
+        // Lanes [0,15] and [16,31] handle the even and odd keys respectively.
+        // Mask the other half to zero before each full-SIMD reduction. This
+        // retains two-key parallelism without relying on unsupported 16-lane
+        // subgroup shuffle semantics.
         #pragma unroll
         for (short cc = 0; cc < C / 2; ++cc) {
             const int kcc = ic + 2 * cc + ty;
@@ -2517,15 +2517,17 @@ kernel void sdpa_decode_192_128_f32(
                     dotqk += dot(q4[d4], float4(k4[d4]));
                 }
             }
-            dotqk += simd_shuffle_down(dotqk, 8);
-            dotqk += simd_shuffle_down(dotqk, 4);
-            dotqk += simd_shuffle_down(dotqk, 2);
-            dotqk += simd_shuffle_down(dotqk, 1);
-            mqk[cc] = dotqk;
+            const float even_sum = simd_sum(ty == 0 ? dotqk : 0.0f);
+            const float odd_sum  = simd_sum(ty == 1 ? dotqk : 0.0f);
+            if (lane == 0)
+                scores[sg * C + 2 * cc] = even_sum;
+            if (lane == 16)
+                scores[sg * C + 2 * cc + 1] = odd_sum;
         }
-        const int key = ic + 2 * tx + ty;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const int key = ic + lane;
         float score_for_lane = key < key_limit
-            ? simd_shuffle(mqk[tx], NL * ty) * p.scale
+            ? scores[sg * C + lane] * p.scale
             : -INFINITY;
         if (p.has_mask && key < key_limit)
             score_for_lane += MASK[p.mask_offset + (uint)key];
@@ -2640,7 +2642,6 @@ kernel void sdpa_decode_192_128_partial_f32(
     float S = 0.0f;
 
     for (int ic = part * C; ic < key_limit; ic += nparts * C) {
-        float mqk[C / 2];
         #pragma unroll
         for (short cc = 0; cc < C / 2; ++cc) {
             const int key = ic + 2 * cc + ty;
@@ -2654,16 +2655,17 @@ kernel void sdpa_decode_192_128_partial_f32(
                     dotqk += dot(q4[d4], float4(k4[d4]));
                 }
             }
-            dotqk += simd_shuffle_down(dotqk, 8);
-            dotqk += simd_shuffle_down(dotqk, 4);
-            dotqk += simd_shuffle_down(dotqk, 2);
-            dotqk += simd_shuffle_down(dotqk, 1);
-            mqk[cc] = dotqk;
+            const float even_sum = simd_sum(ty == 0 ? dotqk : 0.0f);
+            const float odd_sum  = simd_sum(ty == 1 ? dotqk : 0.0f);
+            if (lane == 0)
+                scores[2 * cc] = even_sum;
+            if (lane == 16)
+                scores[2 * cc + 1] = odd_sum;
         }
-
-        const int key = ic + 2 * tx + ty;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const int key = ic + lane;
         float score = key < key_limit
-            ? simd_shuffle(mqk[tx], NL * ty) * p.scale
+            ? scores[lane] * p.scale
             : -INFINITY;
         if (p.has_mask && key < key_limit)
             score += MASK[p.mask_offset + (uint)key];

@@ -1080,17 +1080,17 @@ int main() {
     run_sdpa128(128, 0, "SDPA prefill hd=128 S=128 past=0");
     run_sdpa128(256, 0, "SDPA prefill hd=128 S=256 past=0");
     run_sdpa128(70, 13, "SDPA prefill hd=128 S=70 past=13"); // ragged Q tile + C cross + past
-    run_sdpa_cfg(1, 0,   192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=0",   3e-2f);
-    run_sdpa_cfg(1, 31,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=31",  3e-2f);
-    run_sdpa_cfg(1, 32,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=32",  3e-2f);
-    run_sdpa_cfg(1, 62,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=62",  3e-2f);
-    run_sdpa_cfg(1, 63,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=63",  3e-2f);
-    run_sdpa_cfg(1, 64,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=64",  3e-2f);
-    run_sdpa_cfg(1, 127, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=127", 3e-2f);
-    run_sdpa_cfg(1, 255, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=255", 3e-2f);
-    run_sdpa_cfg(1, 511, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=511", 3e-2f);
-    run_sdpa_cfg(1, 767, 192, 128, 16, 16, 1024, "SDPA multipart decode dk=192 dv=128 past=767", 3e-2f);
-    run_sdpa_cfg(1, 1023, 192, 128, 16, 16, 1024, "SDPA multipart decode dk=192 dv=128 past=1023", 3e-2f);
+    run_sdpa_cfg(1, 0,   192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=0",   3e-3f);
+    run_sdpa_cfg(1, 31,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=31",  3e-3f);
+    run_sdpa_cfg(1, 32,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=32",  3e-3f);
+    run_sdpa_cfg(1, 62,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=62",  3e-3f);
+    run_sdpa_cfg(1, 63,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=63",  3e-3f);
+    run_sdpa_cfg(1, 64,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=64",  3e-3f);
+    run_sdpa_cfg(1, 127, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=127", 3e-3f);
+    run_sdpa_cfg(1, 255, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=255", 3e-3f);
+    run_sdpa_cfg(1, 511, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=511", 3e-3f);
+    run_sdpa_cfg(1, 767, 192, 128, 16, 16, 1024, "SDPA multipart decode dk=192 dv=128 past=767", 3e-3f);
+    run_sdpa_cfg(1, 1023, 192, 128, 16, 16, 1024, "SDPA multipart decode dk=192 dv=128 past=1023", 3e-3f);
 
     // ---- W8A8 prefill GEMM (int8 activations x int8 per-channel weights) ----
     // Guards the int8xint8->int32 tensor path, whose cooperative-tensor layout
@@ -1221,36 +1221,29 @@ int main() {
 
             metal_matmul(mb, A, B, C);
 
-            // Prefill uses W4A8 (per-token int8 A); decode keeps FP32 A and
-            // exercises the multi-SIMD-group row-parallel GEMV.
+            // The default W4A16 prefill path and the decode GEMV both consume
+            // FP32 activations. Compare against the exact dequantized W4
+            // product; using the old W4A8 approximation here hid systematic
+            // prefill drift behind a loose tolerance.
             std::vector<float> ref(M*N);
             for (int m = 0; m < M; m++) {
-                float mx=0; for (int k=0;k<K;k++) mx=std::max(mx,std::fabs(a[k+m*K]));
-                float sa=mx/127.0f, inv=mx>0?127.0f/mx:0;
                 for (int n = 0; n < N; n++) {
                     double acc=0.0;
                     for (int g=0; g<GPR; g++) {
-                        if (M == 1) {
-                            double d=0.0;
-                            for (int k=g*GS;k<(g+1)*GS;k++)
-                                d += (double)a[k] * (double)wq[n*K+k];
-                            acc += d * sw[n*GPR+g];
-                        } else {
-                            long d=0;
-                            for (int k=g*GS;k<(g+1)*GS;k++){
-                                int qa=std::max(-127,std::min(127,(int)std::lround(a[k+m*K]*inv)));
-                                d += (long)qa * (long)wq[n*K+k]; }
-                            acc += (double)d * sw[n*GPR+g];
-                        }
+                        double d=0.0;
+                        for (int k=g*GS;k<(g+1)*GS;k++)
+                            d += (double)a[m*K+k] * (double)wq[n*K+k];
+                        acc += d * sw[n*GPR+g];
                     }
-                    ref[m*N+n]=(float)(M == 1 ? acc : acc*sa);
+                    ref[m*N+n]=(float)acc;
                 }
             }
             char label[64];
             snprintf(label, sizeof(label), "W4%s M=%d K=%d N=%d",
-                     M == 1 ? " GEMV" : "A8 GEMM", M, K, N);
+                     M == 1 ? " GEMV" : "A16 GEMM", M, K, N);
             CHECK(close((const float*)C.data, ref.data(), M*N,
-                        M == 1 ? 1e-4f : 2e-3f, 3e-2f), label);
+                        M == 1 ? 1e-4f : 2e-3f,
+                        M == 1 ? 3e-2f : 5e-3f), label);
         }
     }
 
