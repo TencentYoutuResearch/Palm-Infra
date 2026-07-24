@@ -94,6 +94,8 @@ struct MetalBackend::Impl {
     // current command buffer / encoder for one graph run
     id<MTLCommandBuffer>        cmd = nil;
     id<MTLComputeCommandEncoder> enc = nil;
+    int                         ops_in_cmd = 0;
+    bool                        chunk_graph = false;
 
     bool ok = false;
 
@@ -268,6 +270,15 @@ int gemv_w4_nsg_cap() {
                    : 2;
     }();
     return cap;
+}
+
+int metal_cmd_chunk_ops() {
+    static const int chunk = [] {
+        const char* value = std::getenv("MOLLM_METAL_CMD_CHUNK");
+        if (!value) return 128;
+        return std::max(0, std::atoi(value));
+    }();
+    return chunk;
 }
 
 } // namespace
@@ -626,6 +637,8 @@ void MetalBackend::begin_graph() {
     impl_->cmd.label = @"mollm graph";
     impl_->enc = [impl_->cmd computeCommandEncoder];
     impl_->enc.label = @"mollm compute";
+    impl_->ops_in_cmd = 0;
+    impl_->chunk_graph = false;
     // os_signpost interval for the whole graph run — visible in Instruments'
     // "Points of Interest" track (Apple's NVTX analogue) alongside the Metal
     // System Trace GPU timeline.
@@ -870,6 +883,10 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.activation = (act >= 0 && act <= 4) ? act : 0;
         p.act_n_begin = params.i32.size()>1 ? params.i32[1] : 0;
         p.act_n_len = params.i32.size()>2 ? params.i32[2] : -1;
+        // Decode graphs use M=1 throughout. Enable prefix submission only
+        // after observing that invariant; large-M prefill benefits from one
+        // command buffer and does not need CPU/GPU encoding overlap.
+        if (p.M == 1) impl_->chunk_graph = true;
 
         if (p.M == 1 && B.prec == Precision::INT8) {
             profile_label = "MATMUL_W8_GEMV";
@@ -2108,5 +2125,20 @@ void MetalBackend::dispatch(const GraphNode& node,
         impl_->enc = [impl_->cmd computeCommandEncoder];
     } else {
         sync_point();  // no-op unless MOLLM_METAL_SYNC_EACH (per-op debug flush)
+        const int chunk_ops = metal_cmd_chunk_ops();
+        if (impl_->chunk_graph && chunk_ops > 0 &&
+            !getenv("MOLLM_METAL_SYNC_EACH") &&
+            !getenv("MOLLM_METAL_GPU_TIME") &&
+            ++impl_->ops_in_cmd >= chunk_ops) {
+            // Submit a prefix without waiting. Command buffers from one queue
+            // execute in order, so later graph nodes retain their dependencies
+            // while CPU encoding overlaps execution of the submitted prefix.
+            [impl_->enc endEncoding];
+            impl_->enc = nil;
+            [impl_->cmd commit];
+            impl_->cmd = [impl_->queue commandBuffer];
+            impl_->enc = [impl_->cmd computeCommandEncoder];
+            impl_->ops_in_cmd = 0;
+        }
     }
 }
