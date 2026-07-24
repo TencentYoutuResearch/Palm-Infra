@@ -985,20 +985,26 @@ kernel void gemv_w4_f32a_i4b_f32c(
     }
     float sumf[NR0MAX]; for (short r=0;r<NR0;++r) sumf[r]=0.0f;
 
-    if (gs == 128 && (p.K == 2048 || p.K == 6144)) {
-        // G128 fast path: a group is 64 packed bytes. Each lane consumes two
-        // bytes (four K values) per group, reusing one scale load and exposing
-        // two independent dot products to the compiler.
-        for (int g=0; g<gpr; ++g) {
-            const int kb0=g*64+(int)lane, kb1=kb0+32;
-            const float2 av0=*((device const float2*)(a+2*kb0));
-            const float2 av1=*((device const float2*)(a+2*kb1));
+    if (gs == 128) {
+        // Block-oriented G128 path. Eight lanes cooperate on one quantization
+        // group, so a SIMD group covers four independent groups at once. Each
+        // lane keeps a contiguous 16-value activation slice in registers and
+        // reuses it across the output-row tile.
+        const int group_lane = (int)lane >> 3;
+        const int lane_in_group = (int)lane & 7;
+        for (int g=group_lane; g<gpr; g+=4) {
+            const int k0=g*128+lane_in_group*16;
+            const int kb=g*64+lane_in_group*8;
+            float av[16];
+            for (short i=0;i<16;++i) av[i]=a[k0+(int)i];
             for (short r=0;r<NR0;++r) {
-                const int b0=(int)bx[r][kb0], b1=(int)bx[r][kb1];
-                const int w00=((b0&15)^8)-8, w01=(((b0>>4)&15)^8)-8;
-                const int w10=((b1&15)^8)-8, w11=(((b1>>4)&15)^8)-8;
-                sumf[r] += (av0.x*(float)w00 + av0.y*(float)w01 +
-                            av1.x*(float)w10 + av1.y*(float)w11) * sc[r][g];
+                float dot=0.0f;
+                for (short i=0;i<8;++i) {
+                    const int byte=(int)bx[r][kb+(int)i];
+                    const int lo=((byte&15)^8)-8, hi=(((byte>>4)&15)^8)-8;
+                    dot += av[2*i]*(float)lo + av[2*i+1]*(float)hi;
+                }
+                sumf[r] += dot*sc[r][g];
             }
         }
     } else {
