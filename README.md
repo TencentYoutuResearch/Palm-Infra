@@ -24,7 +24,7 @@ The current focus is fast local inference on Apple Silicon and other modern ARM
 CPUs. FP16 uses NEON FP16FML kernels; quantized CPU models use weight-only int8
 or int4 kernels optimized for ARM dot-product instructions.
 
-## Now it runs a 122B model on a 48GB Mac
+## Now it runs a 122B model on a 48GB Mac (Or even 16GB)
 
 `mollm` can run Qwen3.5-122B-A10B W4 on a 48GB Apple Silicon Mac by keeping
 dense weights in RAM and fetching only routed MoE experts from SSD. In the
