@@ -992,8 +992,11 @@ kernel void gemv_w4_f32a_i4b_f32c(
         int g = kb / (gs / 2);
         for (short r=0;r<NR0;++r) {
             uint8_t byte = bx[r][kb];
-            int lo = byte & 0x0F; if (lo >= 8) lo -= 16;
-            int hi = (byte >> 4) & 0x0F; if (hi >= 8) hi -= 16;
+            // Branch-free signed-nibble expansion. This maps 0..15 to
+            // 0..7,-8..-1 and avoids two per-byte comparisons/selects in the
+            // hottest decode loop.
+            int lo = ((int(byte)       & 0x0F) ^ 8) - 8;
+            int hi = (((int(byte) >> 4) & 0x0F) ^ 8) - 8;
             sumf[r] += (ae * (float)lo + ao * (float)hi) * sc[r][g];
         }
     }
