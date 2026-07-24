@@ -206,16 +206,32 @@ kernel void gemm_tensor_w4_f32a_i4b_f32c(
                     B + (ulong)gn * row_bytes + (ulong)(gk0 / 2);
                 device const float* sr =
                     SCALES + (ulong)gn * (ulong)gpr;
-                #pragma unroll
-                for (int i = 0; i < UNROLL; i += 2) {
-                    int k = gk0 + i;
-                    uint8_t packed = (k < K) ? wr[i / 2] : 0;
-                    int lo = (packed & 0x0f) - 8;
-                    int hi = (packed >> 4) - 8;
-                    dst[i] = (k < K)
-                        ? (half)((float)lo * sr[k / gs]) : (half)0;
-                    dst[i + 1] = (k + 1 < K)
-                        ? (half)((float)hi * sr[(k + 1) / gs]) : (half)0;
+                if (gk0 + UNROLL <= K && gs >= UNROLL &&
+                    (gk0 % gs) + UNROLL <= gs) {
+                    // Common G128 path: one scale and two coalesced 32-bit
+                    // loads cover all sixteen weights staged by this thread.
+                    device const uint* wr32 = (device const uint*)wr;
+                    const uint p0 = wr32[0], p1 = wr32[1];
+                    const float sc = sr[gk0 / gs];
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; i += 2) {
+                        const uint pack = i < 8 ? p0 : p1;
+                        const uint packed = (pack >> (4 * (i & 7))) & 0xff;
+                        dst[i] = (half)((float)(int(packed & 0x0f) - 8) * sc);
+                        dst[i + 1] = (half)((float)(int(packed >> 4) - 8) * sc);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; i += 2) {
+                        int k = gk0 + i;
+                        uint8_t packed = (k < K) ? wr[i / 2] : 0;
+                        int lo = (packed & 0x0f) - 8;
+                        int hi = (packed >> 4) - 8;
+                        dst[i] = (k < K)
+                            ? (half)((float)lo * sr[k / gs]) : (half)0;
+                        dst[i + 1] = (k + 1 < K)
+                            ? (half)((float)hi * sr[(k + 1) / gs]) : (half)0;
+                    }
                 }
             } else {
                 #pragma unroll
