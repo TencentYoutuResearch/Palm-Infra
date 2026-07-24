@@ -249,11 +249,13 @@ int gemv_w4_nr0(int n, int k) {
         if (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
             return parsed;
     }
-    // Very wide projection matrices have enough row parallelism to amortize
-    // eight rows per activation load; narrower projections retain NR4 to keep
-    // register pressure and tail work down.
-    if (n >= 12000 && k >= 1024) return 8;
-    return 4;
+    // The block-oriented G128 kernel keeps 16 activations plus one accumulator
+    // per output row live in each lane. NR2 gives better occupancy than NR4/8
+    // across both dense and MLA projection shapes while retaining activation
+    // reuse. Row parallelism comes from independent SIMD groups/threadgroups.
+    (void)n;
+    (void)k;
+    return 2;
 }
 
 int gemv_w4_nsg_cap() {
