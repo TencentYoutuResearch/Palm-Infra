@@ -976,22 +976,23 @@ int main() {
     // Layout: Q [head_dim, S, num_heads], K/V_cur [head_dim, S, num_kv], cache
     // is a Shared buffer with a 64-byte metadata header then FP16 data laid out
     // [kv_head, position, feature].
-    auto run_sdpa_cfg = [&](int S, int past, int hd, int num_heads, int num_kv,
-                            int max_seq, const char* label) {
+    auto run_sdpa_cfg = [&](int S, int past, int hd, int vd, int num_heads, int num_kv,
+                            int max_seq, const char* label, float atol = 2e-2f) {
         int hpg = num_heads / num_kv;
         float scale = 1.0f / std::sqrt((float)hd);
 
         Tensor Q  = make_dev3(mb, Precision::FP32, hd, S, num_heads);
         Tensor Kc = make_dev3(mb, Precision::FP32, hd, S, num_kv);
-        Tensor Vc = make_dev3(mb, Precision::FP32, hd, S, num_kv);
-        Tensor O  = make_dev3(mb, Precision::FP32, hd, S, num_heads);
+        Tensor Vc = make_dev3(mb, Precision::FP32, vd, S, num_kv);
+        Tensor O  = make_dev3(mb, Precision::FP32, vd, S, num_heads);
 
         // KV caches: 64B header + FP16 data [num_kv, max_seq, hd].
-        size_t cache_bytes = 64 + (size_t)num_kv * max_seq * hd * 2;
+        size_t k_cache_bytes = 64 + (size_t)num_kv * max_seq * hd * 2;
+        size_t v_cache_bytes = 64 + (size_t)num_kv * max_seq * vd * 2;
         Tensor Kcache = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, 1,1,1,1, nullptr);
         Tensor Vcache = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, 1,1,1,1, nullptr);
-        mb.alloc_persistent(Kcache, cache_bytes);
-        mb.alloc_persistent(Vcache, cache_bytes);
+        mb.alloc_persistent(Kcache, k_cache_bytes);
+        mb.alloc_persistent(Vcache, v_cache_bytes);
         // metadata: current_seq_len=past, max_seq_len=max_seq
         auto set_meta = [&](Tensor& c){
             uint64_t* m = (uint64_t*)c.data;
@@ -1000,7 +1001,7 @@ int main() {
         };
         set_meta(Kcache); set_meta(Vcache);
 
-        std::vector<float> q(hd*S*num_heads), kc(hd*S*num_kv), vc(hd*S*num_kv);
+        std::vector<float> q(hd*S*num_heads), kc(hd*S*num_kv), vc(vd*S*num_kv);
         fill_rand(q.data(), q.size()); fill_rand(kc.data(), kc.size()); fill_rand(vc.data(), vc.size());
         memcpy(Q.data, q.data(), q.size()*4);
         memcpy(Kc.data, kc.data(), kc.size()*4);
@@ -1008,18 +1009,20 @@ int main() {
 
         // Pre-fill the cache "past" region with FP16 data we control, so the
         // reference and GPU see identical past K/V.
-        std::vector<float> pastK((size_t)num_kv*past*hd), pastV((size_t)num_kv*past*hd);
+        std::vector<float> pastK((size_t)num_kv*past*hd), pastV((size_t)num_kv*past*vd);
         fill_rand(pastK.data(), pastK.size()); fill_rand(pastV.data(), pastV.size());
         __fp16* Kd = (__fp16*)((char*)Kcache.data + 64);
         __fp16* Vd = (__fp16*)((char*)Vcache.data + 64);
         for (int g=0; g<num_kv; g++)
             for (int j=0;j<past;j++)
-                for (int d=0; d<hd; d++){
+                for (int d=0; d<hd; d++)
                     Kd[g*max_seq*hd + j*hd + d] = (__fp16)pastK[g*past*hd + j*hd + d];
-                    Vd[g*max_seq*hd + j*hd + d] = (__fp16)pastV[g*past*hd + j*hd + d];
-                }
+        for (int g=0; g<num_kv; g++)
+            for (int j=0;j<past;j++)
+                for (int d=0; d<vd; d++)
+                    Vd[g*max_seq*vd + j*vd + d] = (__fp16)pastV[g*past*vd + j*vd + d];
 
-        std::vector<int> i32 = {2 /*kv_cache*/, 1 /*causal*/, num_heads, num_kv, hd, hd};
+        std::vector<int> i32 = {2 /*kv_cache*/, 1 /*causal*/, num_heads, num_kv, hd, vd};
         std::vector<float> f32 = {scale};
         std::vector<const Tensor*> ins = {&Q,&Kc,&Vc,nullptr,&Kcache,&Vcache};
         metal_op(mb, OpType::SDPA, ins, O, i32, f32);
@@ -1033,7 +1036,7 @@ int main() {
             int s = j - past;
             return (float)(__fp16)cur_data[d + s*width + g*S*width]; // cur layout [hd,S,num_kv]
         };
-        std::vector<float> ref(hd*S*num_heads);
+        std::vector<float> ref(vd*S*num_heads);
         for (int h=0; h<num_heads; h++){
             int g = h/hpg;
             for (int s=0;s<S;s++){
@@ -1046,17 +1049,17 @@ int main() {
                     sc[j]=(float)(dot*scale); if(sc[j]>mx)mx=sc[j];
                 }
                 double den=0; for(int j=0;j<limit;j++){sc[j]=std::exp(sc[j]-mx); den+=sc[j];}
-                for (int d=0; d<hd; d++){
-                    double o=0; for(int j=0;j<limit;j++) o+=sc[j]*kv_at(pastV,vc,g,j,d,hd);
-                    ref[h*(hd*S)+s*hd+d]=(float)(o/den);
+                for (int d=0; d<vd; d++){
+                    double o=0; for(int j=0;j<limit;j++) o+=sc[j]*kv_at(pastV,vc,g,j,d,vd);
+                    ref[h*(vd*S)+s*vd+d]=(float)(o/den);
                 }
             }
         }
-        CHECK(close((const float*)O.data, ref.data(), hd*S*num_heads, 2e-2f, 3e-2f), label);
+        CHECK(close((const float*)O.data, ref.data(), vd*S*num_heads, atol, 3e-2f), label);
     };
     // hd=32 harness (PV=PAD(32,64)=64) — original coverage.
     auto run_sdpa = [&](int S, int past, const char* label) {
-        run_sdpa_cfg(S, past, 32, 4, 2, 256, label);
+        run_sdpa_cfg(S, past, 32, 32, 4, 2, 256, label);
     };
     run_sdpa(1, 5, "SDPA decode S=1 past=5");
     run_sdpa(1, 100, "SDPA decode S=1 past=100");
@@ -1070,13 +1073,22 @@ int main() {
 
     // Production config: dk=dv=128, GQA 8/2 (exercises PV=128, NO=PV8/NSG=4 PV MMA).
     auto run_sdpa128 = [&](int S, int past, const char* label) {
-        run_sdpa_cfg(S, past, 128, 8, 2, 512, label);
+        run_sdpa_cfg(S, past, 128, 128, 8, 2, 512, label);
     };
     run_sdpa128(1, 7, "SDPA decode hd=128 S=1 past=7");
     run_sdpa128(16, 0, "SDPA prefill hd=128 S=16 past=0");
     run_sdpa128(128, 0, "SDPA prefill hd=128 S=128 past=0");
     run_sdpa128(256, 0, "SDPA prefill hd=128 S=256 past=0");
     run_sdpa128(70, 13, "SDPA prefill hd=128 S=70 past=13"); // ragged Q tile + C cross + past
+    run_sdpa_cfg(1, 0,   192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=0",   3e-2f);
+    run_sdpa_cfg(1, 31,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=31",  3e-2f);
+    run_sdpa_cfg(1, 32,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=32",  3e-2f);
+    run_sdpa_cfg(1, 62,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=62",  3e-2f);
+    run_sdpa_cfg(1, 63,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=63",  3e-2f);
+    run_sdpa_cfg(1, 64,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=64",  3e-2f);
+    run_sdpa_cfg(1, 127, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=127", 3e-2f);
+    run_sdpa_cfg(1, 255, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=255", 3e-2f);
+    run_sdpa_cfg(1, 511, 192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=511", 3e-2f);
 
     // ---- W8A8 prefill GEMM (int8 activations x int8 per-channel weights) ----
     // Guards the int8xint8->int32 tensor path, whose cooperative-tensor layout

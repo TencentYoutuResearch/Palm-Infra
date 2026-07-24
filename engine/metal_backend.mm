@@ -1811,7 +1811,11 @@ void MetalBackend::dispatch(const GraphNode& node,
         if (fa2_pre) fa2_ps = impl_->pipeline_fa2(head_dim, v_head_dim);
         bool fa2_ok = (fa2_ps != nil);
 
-        const char* kname = decode_path ? "sdpa_decode_f32" : "sdpa_prefill_f32";
+        const bool decode_192_128 = decode_path && head_dim == 192 && v_head_dim == 128
+            && std::getenv("MOLLM_METAL_SDPA_DECODE_GENERIC") == nullptr;
+        const char* kname = decode_192_128 ? "sdpa_decode_192_128_f32"
+                           : decode_path ? "sdpa_decode_f32"
+                           : "sdpa_prefill_f32";
         // fa2 uses its dk/dv-specialized pipeline; all other paths use name-keyed.
         id<MTLComputePipelineState> ps = fa2_ok ? fa2_ps : impl_->pipeline(kname);
         [enc setComputePipelineState:ps];
@@ -1823,7 +1827,8 @@ void MetalBackend::dispatch(const GraphNode& node,
         [enc setBuffer:(mask?buf_of(mask):buf_of(&Q)) offset:0 atIndex:5];
         [enc setBytes:&sp length:sizeof(sp) atIndex:3];
         if (decode_path) {
-            // One threadgroup (256 threads) per head; threads split the keys.
+            // The fused 192/128 path uses eight SIMD groups; the generic path
+            // uses 256 threads to split the score and output loops.
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_heads,1,1)
                 threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         } else if (fa2_ok) {

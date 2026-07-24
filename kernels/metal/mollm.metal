@@ -2425,6 +2425,162 @@ kernel void sdpa_prefill_fa2_f32(
 }
 
 // ---------------------------------------------------------------------------
+// SDPA decode fast path for MLA-expanded heads (DK=192, DV=128).
+//
+// Eight SIMD groups split the KV cache into 32-row tiles.  Each group computes
+// QK, online softmax, and P*V in one pass, keeping its 128-wide output
+// accumulator in threadgroup memory.  The online-softmax states are merged
+// once at the end.  This avoids the generic decode kernel's full score buffer,
+// three global passes over the sequence, and threadgroup-wide barriers between
+// those passes.
+//
+// grid: threadgroups = num_heads, threads/tg = 256 (8 SIMD groups).
+// ---------------------------------------------------------------------------
+kernel void sdpa_decode_192_128_f32(
+    device const float*   Q       [[buffer(0)]],
+    device const half*    KC      [[buffer(1)]],
+    device const half*    VC      [[buffer(2)]],
+    device float*         O       [[buffer(4)]],
+    device const float*   MASK    [[buffer(5)]],
+    constant SdpaParams&  p       [[buffer(3)]],
+    uint   h                      [[threadgroup_position_in_grid]],
+    ushort lane                   [[thread_index_in_simdgroup]],
+    ushort sg                     [[simdgroup_index_in_threadgroup]])
+{
+    constexpr short DK = 192;
+    constexpr short DV = 128;
+    constexpr short C = 32;
+    constexpr short NL = 16;  // lanes collaborating on one KV row
+    constexpr short NSG = 8;
+
+    const short tx = lane & 15;
+    const short ty = lane >> 4;
+    const int heads_per_group = p.num_heads / p.num_kv_heads;
+    const int kv_h = int(h) / heads_per_group;
+    const int key_limit = min(p.dst_seqlen, p.causal ? p.past_seqlen + 1 : p.dst_seqlen);
+
+    device const float* q = Q + p.q_offset + h * p.q_stride_head;
+    device const half* Kh = KC + p.k_cache_offset
+        + (uint)kv_h * ((uint)DK * (uint)p.max_seq_len);
+    device const half* Vh = VC + p.v_cache_offset
+        + (uint)kv_h * ((uint)DV * (uint)p.max_seq_len);
+
+    threadgroup float4 q4[DK / 4];
+    threadgroup float scores[NSG * C];
+    threadgroup float4 og[NSG * (DV / 4)];
+    threadgroup float state_m[NSG];
+    threadgroup float state_s[NSG];
+
+    // Both SIMD groups cooperate on staging Q and clearing the accumulators.
+    const short ti = sg * 32 + lane;
+    if (ti < DK / 4) {
+        device const float4* srcq = (device const float4*)q;
+        q4[ti] = srcq[ti];
+    }
+    for (short i = ti; i < NSG * (DV / 4); i += NSG * 32) og[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float M = -INFINITY;
+    float S = 0.0f;
+
+    for (int ic = int(sg) * C; ic < key_limit; ic += NSG * C) {
+        // Every lane computes one feature stripe for all 16 keys of its
+        // parity.  Reducing each value within the 16-lane subgroup produces
+        // the complete dot; lane tx then selects key (2*tx + ty).
+        float mqk[C / 2];
+        #pragma unroll
+        for (short cc = 0; cc < C / 2; ++cc) {
+            const int kcc = ic + 2 * cc + ty;
+            float dotqk = 0.0f;
+            if (kcc < key_limit) {
+                device const half4* k4 =
+                    (device const half4*)(Kh + (uint)kcc * (uint)DK);
+                #pragma unroll
+                for (short ii = 0; ii < DK / 4 / NL; ++ii) {
+                    const short d4 = ii * NL + tx;
+                    dotqk += dot(q4[d4], float4(k4[d4]));
+                }
+            }
+            dotqk += simd_shuffle_down(dotqk, 8);
+            dotqk += simd_shuffle_down(dotqk, 4);
+            dotqk += simd_shuffle_down(dotqk, 2);
+            dotqk += simd_shuffle_down(dotqk, 1);
+            mqk[cc] = dotqk;
+        }
+        const int key = ic + 2 * tx + ty;
+        float score_for_lane = key < key_limit
+            ? simd_shuffle(mqk[tx], NL * ty) * p.scale
+            : -INFINITY;
+        if (p.has_mask && key < key_limit)
+            score_for_lane += MASK[p.mask_offset + (uint)key];
+
+        const float Mnew = simd_max(max(M, score_for_lane));
+        const float corr = exp(M - Mnew);
+        const float weight = exp(score_for_lane - Mnew);
+        S = S * corr + simd_sum(weight);
+        M = Mnew;
+        scores[sg * C + lane] = weight;
+
+        // Scale the prior online-softmax accumulator before adding this tile.
+        if (ty == 0) {
+            og[sg * (DV / 4) + tx] *= corr;
+            og[sg * (DV / 4) + NL + tx] *= corr;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float4 lo0 = 0.0f;
+        float4 lo1 = 0.0f;
+        #pragma unroll
+        for (short cc = 0; cc < C / 2; ++cc) {
+            const int vkey = ic + 2 * cc + ty;
+            if (vkey < key_limit) {
+                device const half4* v4 =
+                    (device const half4*)(Vh + (uint)vkey * (uint)DV);
+                const float w = scores[sg * C + 2 * cc + ty];
+                lo0 += float4(v4[tx]) * w;
+                lo1 += float4(v4[NL + tx]) * w;
+            }
+        }
+        lo0.x += simd_shuffle_down(lo0.x, 16);
+        lo0.y += simd_shuffle_down(lo0.y, 16);
+        lo0.z += simd_shuffle_down(lo0.z, 16);
+        lo0.w += simd_shuffle_down(lo0.w, 16);
+        lo1.x += simd_shuffle_down(lo1.x, 16);
+        lo1.y += simd_shuffle_down(lo1.y, 16);
+        lo1.z += simd_shuffle_down(lo1.z, 16);
+        lo1.w += simd_shuffle_down(lo1.w, 16);
+        if (ty == 0) {
+            og[sg * (DV / 4) + tx] += lo0;
+            og[sg * (DV / 4) + NL + tx] += lo1;
+        }
+    }
+
+    if (lane == 0) {
+        state_m[sg] = M;
+        state_s[sg] = S;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Merge all independent online-softmax states and store the result.
+    if (sg == 0) {
+        const float mlane = lane < NSG ? state_m[lane] : -INFINITY;
+        const float Mf = simd_max(mlane);
+        const float alane = lane < NSG ? exp(state_m[lane] - Mf) : 0.0f;
+        const float denom = simd_sum(lane < NSG ? state_s[lane] * alane : 0.0f);
+        const float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
+        device float4* out4 = (device float4*)(
+            O + p.o_offset + h * p.o_stride_head);
+        for (short d4 = lane; d4 < DV / 4; d4 += 32) {
+            float4 acc = 0.0f;
+            #pragma unroll
+            for (short s = 0; s < NSG; ++s)
+                acc += og[s * (DV / 4) + d4] * exp(state_m[s] - Mf);
+            out4[d4] = acc * inv;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SDPA decode (src_seqlen == 1): one THREADGROUP per head, TG threads split the
 // key loop for GPU parallelism (the per-thread sdpa_f32 above uses only
 // num_heads threads for decode, starving the GPU as context grows).
