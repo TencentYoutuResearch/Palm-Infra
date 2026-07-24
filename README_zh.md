@@ -20,50 +20,27 @@ mobile-oriented LLM inference engine.
 ## 现在，48GB Mac 也能运行 122B 模型
 
 `mollm` 可以在 48GB Apple Silicon Mac 上运行 W4 量化的
-Qwen3.5-122B-A10B：始终需要的稠密权重锁定在 RAM 中，仅通过异步
-`pread` worker 从包文件读取被路由到的 MoE expert pair。RAM cache 保存近期
-使用过的、由 SSD 提供的 expert pair，并受 `--ssd-cache-mb` 限制；因此这是
-真正的 SSD offload 路径，而非完整常驻的 122B 模型。
+Qwen3.5-122B-A10B：稠密权重保留在 RAM 中，仅从 SSD 读取被路由到的 MoE
+expert。在当前 256-token cache sweep 中，通过有界的 16 GiB 共享 expert
+cache 和跨层预取，decode 达到 13.50 t/s。
 
-macOS 默认锁定 expert RAM cache。若不锁定，系统可能反复压缩冷的匿名 expert
-buffer，并在 matmul 中重新解压，导致更大的 cache 即使命中率更高也反而更慢。
-只有在系统内存余量比稳定 decode 吞吐更重要时，才建议使用
-`--no-lock-expert-cache`；设置 cache 大小时仍需为稠密权重、KV cache 和其他应用
-保留空间。
+cache 容量可配置，并不要求把模型完整常驻内存。在下面的真实 prompt sweep
+中，1 GiB expert cache 配置的峰值 RSS 仅 5.90 GiB；增大 cache 可以用更多内存
+换取更少的 SSD 读取和更高吞吐。
 
-以下为真实 chat prompt、4 CPU 线程、16 个 prompt token、生成 128 个 token、
-`warmup=1`，且 5 个独立进程取中位数的数据：
-
-| 16 GiB cache 策略 | Decode | Expert-cache 命中率 | SSD 读取量 |
-|---|---:|---:|---:|
-| 旧的逐层均分 cache、无预测 | 10.89 t/s | 74.5% | 69.4 GB |
-| **默认共享 cache + 跨层预取** | **12.70 t/s** | **89.3%** | 75.7 GB |
-
-默认策略一行在稠密权重与 expert cache 均锁定的条件下重新测试；旧策略一行是
-此前发布的历史基线，当时只锁定了稠密权重，尚未锁定 expert cache。
-
-默认策略使用一个全局 RAM 池，取代固定的逐层配额。Least-Stale eviction 会保护
-本轮与未来层的 expert；下一层 router 预测会提前提交低优先级读取。预测会略微增加
-SSD 读取量，但隐藏了更多 I/O 延迟。相同 16 GiB 默认配置在严格的
-`pp256 + tg64`、`warmup=3` 协议下，五个独立进程的中位数为 37.99 pp / 8.46 tg；
-它的 decode 起始上下文比上面的交互式测量长得多（256 token）。
-
-当前默认策略下的 cache 容量对比使用真实 prompt“给我讲一个故事”、greedy
-生成、16 个 prompt token、生成 256 个 token、`warmup=0`，并取 3 个独立进程
-的中位数：
-
-| Expert RAM cache | Decode | Peak RSS | Expert-cache 命中率 | SSD 读取量 |
+| Expert RAM cache | Decode | Peak RSS | Cache 命中率 | SSD 读取量 |
 |---:|---:|---:|---:|---:|
-| 1 GiB | 9.32 t/s | 5.83 GB | 0.0% | 618.2 GB |
-| **10 GiB** | **12.44 t/s** | 14.97 GB | 85.5% | 221.3 GB |
-| 16 GiB | 11.84 t/s | 21.07 GB | 90.0% | 152.0 GB |
+| **1 GiB** | 9.84 t/s | **5.90 GiB** | 0.0% | 587.1 GB |
+| **10 GiB** | 13.21 t/s | 14.69 GiB | 83.3% | 206.1 GB |
+| **16 GiB** | **13.50 t/s** | 20.61 GiB | **88.6%** | **141.4 GB** |
 
-本轮测试中，10 GiB 是吞吐与内存占用的甜点。到 16 GiB 时，更高命中率所省掉的
-大量 I/O 原本已被计算 overlap 隐藏，因此没有转化为端到端吞吐。该表使用的
-长文本协议与上面的 128-token cache 策略对比不同，不应直接横向比较数值。
+该 sweep 使用 16-token 真实 prompt、生成 256 tokens、greedy decoding、
+`warmup=0`，每档 cache 取三个独立进程的中位数，并于 2026-07-24 重新运行。
+10 GiB 以约少 5.9 GiB 的峰值 RSS 保留了大部分 16 GiB 吞吐；1 GiB 则展示了
+低内存运行能力。
 
-后续会做 cache-aware 的预取准入策略，并尝试在 MoE 层实际需要 expert 前、
-于 attention 阶段预测和预取路由 expert。
+cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
+[122B MoE SSD offload](docs/ssd-offload.md)。
 
 ## 已支持的模型
 
@@ -81,69 +58,12 @@ SSD 读取量，但隐藏了更多 I/O 延迟。相同 16 GiB 默认配置在严
 
 ## 性能
 
-![吞吐量对比](assets/performance_throughput.svg)
+除非另有说明，Apple M5 Pro 数据使用 4 CPU 线程、`pp256 + tg64`、
+`warmup=3` 和独立进程中位数。
 
-除非另有说明，下列数据使用 Apple M5 Pro、4 线程、`pp256 + tg64`、`warmup=3`，5 个独立进程取中位数。`pp` 是 prompt/prefill token/s，`tg` 是生成/decode token/s。122B 行（†）使用真实 prompt 的 SSD-offload 交互测量；其严格 `pp256 + tg64` 中位数见上文。
+![CPU 吞吐量对比](assets/performance_cpu.svg)
 
-### FP16
-
-在 Apple 平台上，mollm 会对满足条件的大型 FP16 prefill GEMM 使用 Accelerate SGEMM。
-
-| 模型 | mollm pp/tg | llama.cpp pp/tg | 结果 |
-|---|---:|---:|---|
-| Qwen3.5-0.8B | **757.74** / **123.68** | 664.54 / 97.87 | mollm 的 prefill 和 decode 均更快 |
-| Youtu-LLM-2B | **335.44** / **51.32** | 258.13 / 46.73 | mollm 的 prefill 和 decode 均更快 |
-| Qwen3.5-4B | 135.00 / **25.22** | **144.30** / 22.14 | llama prefill 更快，mollm decode 更快 |
-| RWKV7-1.5B | **430.51** / **70.09** | 395.83 / 57.18 | mollm 的 prefill 和 decode 均更快 |
-
-### W8
-
-| 模型 | mollm W8 pp/tg | llama.cpp Q8_0 pp/tg | 结果 |
-|---|---:|---:|---|
-| Qwen3.5-0.8B | 671.73 / **217.69** | **782.16** / 167.63 | llama prefill 更快，mollm decode 更快 |
-| Youtu-LLM-2B | 253.05 / **89.53** | **263.95** / 86.58 | prefill 接近，mollm decode 略快 |
-| Qwen3.5-4B | 118.55 / **46.64** | **135.58** / 40.50 | llama prefill 更快，mollm decode 更快 |
-| RWKV7-1.5B | 274.16 / **121.34** | **377.64** / 96.50 | llama prefill 更快，mollm decode 更快 |
-
-### W4 / MoE W4
-
-| 模型 | mollm pp/tg | llama.cpp pp/tg | 结果 |
-|---|---:|---:|---|
-| Qwen3.5-0.8B W4 | 678.41 / **259.43** | **775.95** / 190.89 | llama prefill 更快，mollm decode 更快 |
-| Youtu-LLM-2B W4 | 248.08 / **115.64** | **265.58** / 97.15 | llama prefill 更快，mollm decode 更快 |
-| Qwen3.5-4B W4 | 115.37 / **55.94** | **140.51** / 44.25 | llama prefill 更快，mollm decode 更快 |
-| RWKV7-1.5B 混合 W4 | 274.25 / **129.12** | **366.76** / 110.68 | llama prefill 更快，mollm decode 更快 |
-| Qwen3.6-35B-A3B W4 | **139.63** / **65.32** | 116.93 / 43.73 | mollm prefill 1.19×，decode 1.49× |
-| Qwen3-30B-A3B W4 | **143.50** / **63.85** | 110.34 / 60.77 | mollm prefill 1.30×，decode 1.05× |
-| Qwen3.5-122B-A10B W4（SSD offload） | **37.99** / **12.70** † | OOM | 可运行于 48GB Mac |
-
-† Prefill 为此前发布的标准 `pp256 + tg64`、`warmup=3` 五进程中位数。Decode
-为当前真实 ChatML prompt（16 个 prompt token、生成 128 个 token、`warmup=1`）
-的五进程中位数。两者均使用 16 GiB 的 SSD-backed expert RAM cache 和默认的
-共享 cache / 跨层预取策略；当前 decode 测试同时锁定稠密 mmap 权重与 expert
-cache。llama.cpp 的 CPU 基线无法装入 48GB RAM。
-
-RWKV7 的 FP16 和混合 W4 行使用默认 sparse-A 策略；W8 使用默认 q8-dot dense GEMV 路径。
-
-总体而言，mollm 的 decode 在 W4 包上尤其有竞争力；稠密模型的 prefill 仍是主要优化方向。
-
-## 分析 SSD I/O overlap
-
-`mollm_chat` 与 `mollm_bench` 都支持 `--trace <path.json>`，会在进程退出时写出
-Chrome Trace / Perfetto 时间线。将 JSON 导入 [Perfetto](https://ui.perfetto.dev/)，即可查看
-prefill/decode、逐层 MoE routing 和 expert compute、cache 的 `request_many` / `acquire`，
-以及各 SSD I/O worker 合并后的 `pread` 操作。flow arrow 会连接排队的读取任务与完成它的
-worker，因此很容易发现 I/O overlap 不足或队列深度不够的问题。
-
-```bash
-./build/mollm_bench \
-    --package /path/to/qwen35_122b_a10b_w4g128_ssd.mollm \
-    --ssd-cache-mb 16384 --ssd-io-workers 8 --threads 4 \
-    --prompt "讲一个短故事" --max-new-tokens 128 --warmup 1 \
-    --trace /tmp/mollm_122b_trace.json
-```
-
-![Chrome Trace / Perfetto 中的 decode、MoE 执行和 SSD I/O worker](assets/ssd_io_trace.png)
+[测试协议、完整 CPU/Metal 性能表、长上下文 scaling 与正确性门禁](docs/performance.md)
 
 ## 快速开始
 

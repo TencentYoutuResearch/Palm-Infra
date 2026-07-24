@@ -26,57 +26,29 @@ or int4 kernels optimized for ARM dot-product instructions.
 
 ## Now it runs a 122B model on a 48GB Mac
 
-`mollm` runs Qwen3.5-122B-A10B W4 on a 48GB Apple Silicon Mac by keeping the
-always-used dense weights locked in RAM and fetching only routed MoE expert
-pairs from the package with asynchronous `pread` workers. A RAM cache holds
-recently used SSD-backed expert pairs and is bounded by `--ssd-cache-mb`, so
-this is a real SSD-offload path rather than a resident 122B model.
+`mollm` can run Qwen3.5-122B-A10B W4 on a 48GB Apple Silicon Mac by keeping
+dense weights in RAM and fetching only routed MoE experts from SSD. In the
+current 256-token cache sweep, a bounded, shared 16 GiB expert cache and
+cross-layer prefetching provide 13.50 t/s interactive decode.
 
-On macOS, the expert RAM cache is pinned by default. Without pinning, the VM
-compressor can repeatedly compress cold anonymous expert buffers and later
-decompress them inside matmul, making a larger cache slower despite its higher
-hit rate. Use `--no-lock-expert-cache` only when system memory headroom matters
-more than stable decode throughput; cache sizes should still leave room for
-dense weights, KV cache, and other applications.
+The cache is configurable rather than tied to a resident copy of the model. In
+the following real-prompt sweep, the 1 GiB expert-cache configuration runs with
+only 5.90 GiB peak RSS; larger caches trade memory for fewer SSD reads and
+higher throughput.
 
-Real chat prompt, 4 CPU threads, 16 prompt tokens, 128 generated tokens,
-`warmup=1`, and 5 independent process runs (median):
-
-| 16 GiB cache policy | Decode | Expert-cache hit rate | SSD reads |
-|---|---:|---:|---:|
-| Legacy equal per-layer cache, no prediction | 10.89 t/s | 74.5% | 69.4 GB |
-| **Default shared cache + cross-layer prefetch** | **12.70 t/s** | **89.3%** | 75.7 GB |
-
-The default row was rerun with both dense weights and the expert cache locked.
-The legacy row is the previously published baseline with dense weights locked
-but without expert-cache pinning.
-
-The default keeps one global RAM pool instead of fixed per-layer quotas. Its
-Least-Stale eviction policy protects current/future-layer experts, while a
-next-layer router prediction issues low-priority reads ahead of time. The
-prediction consumes slightly more SSD bandwidth but hides enough I/O latency
-to improve interactive decode. The strict `pp256 + tg64`, `warmup=3`
-five-process median for the same 16 GiB default is 37.99 pp / 8.46 tg; its
-decode starts from a much longer 256-token context than the interactive
-measurement above.
-
-Cache-size sweep on the current default policy, using the real prompt
-“给我讲一个故事”, greedy decoding, 16 prompt tokens, 256 generated tokens,
-`warmup=0`, and 3 independent process runs (median):
-
-| Expert RAM cache | Decode | Peak RSS | Expert-cache hit rate | SSD reads |
+| Expert RAM cache | Decode | Peak RSS | Cache hit rate | SSD reads |
 |---:|---:|---:|---:|---:|
-| 1 GiB | 9.32 t/s | 5.83 GB | 0.0% | 618.2 GB |
-| **10 GiB** | **12.44 t/s** | 14.97 GB | 85.5% | 221.3 GB |
-| 16 GiB | 11.84 t/s | 21.07 GB | 90.0% | 152.0 GB |
+| **1 GiB** | 9.84 t/s | **5.90 GiB** | 0.0% | 587.1 GB |
+| **10 GiB** | 13.21 t/s | 14.69 GiB | 83.3% | 206.1 GB |
+| **16 GiB** | **13.50 t/s** | 20.61 GiB | **88.6%** | **141.4 GB** |
 
-The 10 GiB configuration is the throughput/memory sweet spot in this sweep.
-At 16 GiB, much of the I/O avoided by the higher hit rate was already hidden
-behind compute, so it does not improve end-to-end throughput. These rows use a
-different, longer protocol than the 128-token cache-policy comparison above.
+This sweep uses a 16-token real prompt, 256 generated tokens, greedy decoding,
+`warmup=0`, and three independent process runs per cache size. The rows were
+rerun on 2026-07-24. 10 GiB retains most of the 16 GiB throughput with about
+5.9 GiB less peak RSS; 1 GiB demonstrates the low-memory operating point.
 
-Planned work includes cache-aware prefetch admission and predicting / prefetching
-routed experts during the attention phase, before the MoE layer needs them.
+See [Running 122B MoE models with SSD offload](docs/ssd-offload.md) for cache
+policy, memory/throughput sweeps, I/O behavior, and Perfetto tracing.
 
 ## What Works
 
@@ -96,88 +68,12 @@ in W8 when pure W4 loses too much quality.
 
 ## Performance
 
-![Throughput comparison](assets/performance_throughput.svg)
+Apple M5 Pro results use four CPU threads, `pp256 + tg64`, `warmup=3`, and
+independent-process medians unless noted.
 
-The chart compares FP16, W8, and W4 throughput. Protocol unless noted: Apple M5
-Pro, 4 threads, `pp256 + tg64`, `warmup=3`, 5 independent runs, median
-throughput. `pp` is prompt/prefill tokens per second; `tg` is generated/decode
-tokens per second. The 122B row (†) is an interactive real-prompt SSD-offload
-measurement; its strict `pp256 + tg64` median is given above. Packages are
-loaded into resident memory by default; mmap loading remains available with
-`--mmap` for A/B testing. If mmap page warmup is used, benchmark output reports
-it separately as `load_warmup_ms`, outside the measured prefill/decode timings.
-Higher numbers are bolded in the tables below.
+![CPU throughput comparison](assets/performance_cpu.svg)
 
-### FP16
-
-On Apple, mollm uses Accelerate SGEMM for eligible large FP16 prefill GEMMs.
-
-| Model | mollm pp/tg | llama.cpp pp/tg | Result |
-|---|---:|---:|---|
-| Qwen3.5-0.8B | **757.74** / **123.68** | 664.54 / 97.87 | mollm faster prefill and decode |
-| Youtu-LLM-2B | **335.44** / **51.32** | 258.13 / 46.73 | mollm faster prefill and decode |
-| Qwen3.5-4B | 135.00 / **25.22** | **144.30** / 22.14 | llama faster prefill, mollm faster decode |
-| RWKV7-1.5B | **418.95** / **72.36** | 395.83 / 57.18 | mollm faster prefill and decode |
-
-### W8
-
-| Model | mollm W8 pp/tg | llama.cpp Q8_0 pp/tg | Result |
-|---|---:|---:|---|
-| Qwen3.5-0.8B | 671.73 / **217.69** | **782.16** / 167.63 | llama faster prefill, mollm faster decode |
-| Youtu-LLM-2B | 253.05 / **89.53** | **263.95** / 86.58 | close prefill, mollm slightly faster decode |
-| Qwen3.5-4B | 118.55 / **46.64** | **135.58** / 40.50 | llama faster prefill, mollm faster decode |
-| RWKV7-1.5B | 320.75 / **118.00** | **377.64** / 96.50 | llama faster prefill, mollm faster decode |
-
-### W4
-
-| Model | mollm W4 pp/tg | llama.cpp Q4_0 pp/tg | Result |
-|---|---:|---:|---|
-| Qwen3.5-0.8B | 678.41 / **259.43** | **775.95** / 190.89 | llama faster prefill, mollm faster decode |
-| Youtu-LLM-2B | 248.08 / **115.64** | **265.58** / 97.15 | llama faster prefill, mollm faster decode |
-| Qwen3.5-4B | 115.37 / **55.94** | **140.51** / 44.25 | llama faster prefill, mollm faster decode |
-| RWKV7-1.5B mixed W4 | 308.33 / **135.85** | **366.76** / 110.68 | llama faster prefill, mollm faster decode |
-
-RWKV7 uses sparse-A FFN GEMV where it improves endpoint performance; mixed W4
-keeps dense q4-dot GEMV by default.
-
-### MoE W4
-
-| Model | mollm W4 pp/tg | llama.cpp Q4_0 pp/tg | Result |
-|---|---:|---:|---|
-| Qwen3.6-35B-A3B | **139.63** / **65.32** | 116.93 / 43.73 | mollm 1.19x prefill, 1.49x decode |
-| Qwen3-30B-A3B | **143.50** / **63.85** | 110.34 / 60.77 | mollm 1.30x prefill, 1.05x decode |
-| Qwen3.5-122B-A10B (SSD offload) | **37.99** / **12.70** † | OOM | runs on a 48GB Mac |
-
-† Prefill is the previously published five-process standard `pp256 + tg64`,
-`warmup=3` median. Decode is the current five-process median on a real ChatML
-prompt (16 prompt tokens, 128 generated tokens, `warmup=1`). Both use a 16 GiB
-RAM cache for SSD-backed experts and the default shared-cache /
-cross-layer-prefetch policy. The current decode run locks both dense mmap
-weights and the expert cache. llama.cpp's CPU baseline could not fit in 48GB
-RAM.
-
-Overall: mollm decode is already strong, especially with W4 packages. Prefill is
-still the main optimization target on dense models.
-
-## Profile SSD I/O overlap
-
-Both `mollm_chat` and `mollm_bench` accept `--trace <path.json>` and write a
-Chrome Trace / Perfetto timeline when the process exits. Load the JSON into
-[Perfetto](https://ui.perfetto.dev/) to inspect prefill/decode, per-layer MoE
-routing and expert compute, cache `request_many` / `acquire`, and each SSD I/O
-worker's merged `pread` operations. Flow arrows connect queued reads to the
-worker that completes them, making missed overlap and shallow I/O queues easy
-to spot.
-
-```bash
-./build/mollm_bench \
-  --package /path/to/qwen35_122b_a10b_w4g128_ssd.mollm \
-  --ssd-cache-mb 16384 --ssd-io-workers 8 --threads 4 \
-  --prompt "Give me a short story" --max-new-tokens 128 --warmup 1 \
-  --trace /tmp/mollm_122b_trace.json
-```
-
-![Chrome Trace / Perfetto view of decode, MoE execution, and SSD I/O workers](assets/ssd_io_trace.png)
+[Protocol, complete CPU and Metal tables, context scaling, and correctness gates](docs/performance.md)
 
 ## Why Decode Is Fast
 

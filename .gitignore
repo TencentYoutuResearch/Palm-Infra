@@ -23,8 +23,8 @@ tmp/build_asan/
 tmp/
 *.json
 
-# docs/ — local-only (architecture notes, optimization logs, state tracking)
-docs/
+# Internal-only architecture notes, optimization logs, and state tracking.
+docs_internal/
 docs_local_backup/
 
 calibration_data_v5_rc.txt

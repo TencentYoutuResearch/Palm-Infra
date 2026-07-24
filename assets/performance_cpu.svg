@@ -1,6 +1,6 @@
 <svg width="1180" height="1120" viewBox="0 0 1180 1120" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
-  <title id="title">mollm throughput comparison</title>
-  <desc id="desc">Horizontal bar charts comparing mollm and llama.cpp FP16, W8, and W4 prompt prefill and decode throughput on Apple M5 Pro with four threads, including RWKV7 and a 122B SSD-offload result.</desc>
+  <title id="title">mollm CPU throughput comparison</title>
+  <desc id="desc">Horizontal bar charts comparing mollm and llama.cpp CPU FP16, W8, and W4 prompt prefill and decode throughput on Apple M5 Pro with four threads, including RWKV7 and a 122B SSD-offload cache-sweep result.</desc>
   <rect width="1180" height="1120" fill="#ffffff"/>
   <style>
     .title { font: 700 26px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #101828; }
@@ -17,8 +17,8 @@
     .rule { stroke: #eef2f6; stroke-width: 1; }
   </style>
 
-  <text x="40" y="44" class="title">Throughput comparison</text>
-  <text x="40" y="69" class="subtitle">Apple M5 Pro, 4 threads, pp256 + tg64, median of 5 runs. 122B decode is a real short-prompt SSD-offload result.</text>
+  <text x="40" y="44" class="title">CPU throughput comparison</text>
+  <text x="40" y="69" class="subtitle">Apple M5 Pro, 4 threads, pp256 + tg64, median of 5 runs. 122B decode is a 3-run real-prompt SSD-offload result.</text>
   <rect x="850" y="34" width="16" height="10" rx="2" class="mollm"/>
   <text x="874" y="44" class="label">mollm</text>
   <rect x="940" y="34" width="16" height="10" rx="2" class="llama"/>
@@ -126,11 +126,11 @@
   <text x="40" y="1009" class="label">Qwen3.5-122B SSD</text>
   <rect x="200" y="988" width="19.9" height="13" rx="2" class="mollm"/><text x="227" y="999" class="value">37.99</text>
   <text x="200" y="1017" class="value">0 (OOM)</text>
-  <rect x="700" y="988" width="19.1" height="13" rx="2" class="mollm"/><text x="727" y="999" class="value">12.70</text>
+  <rect x="700" y="988" width="20.3" height="13" rx="2" class="mollm"/><text x="728" y="999" class="value">13.50</text>
   <text x="700" y="1017" class="value">0 (OOM)</text>
   <line x1="200" y1="1042" x2="620" y2="1042" class="axis"/>
   <text x="196" y="1060" class="tick">0</text><text x="296" y="1060" class="tick">200</text><text x="401" y="1060" class="tick">400</text><text x="506" y="1060" class="tick">600</text><text x="611" y="1060" class="tick">800</text>
   <line x1="700" y1="1042" x2="1120" y2="1042" class="axis"/>
   <text x="696" y="1060" class="tick">0</text><text x="799" y="1060" class="tick">70</text><text x="901" y="1060" class="tick">140</text><text x="1009" y="1060" class="tick">210</text><text x="1111" y="1060" class="tick">280</text>
-  <text x="40" y="1098" class="subtitle">122B prefill uses the standard median; decode uses a 16-token prompt / 128-token output interactive measurement.</text>
+  <text x="40" y="1098" class="subtitle">122B prefill uses the standard median; decode uses a 16-token prompt / 256-token output, 16 GiB cache, 3-run median.</text>
 </svg>
