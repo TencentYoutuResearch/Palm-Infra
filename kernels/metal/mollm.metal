@@ -986,12 +986,15 @@ kernel void gemv_w4_f32a_i4b_f32c(
     for (int kb = (int)sgitg*NW + (int)lane; kb < (int)row_bytes; kb += NW*(int)nsg) {
         int ke = kb*2;            // even k
         float ae = a[ke], ao = a[ke+1];
-        int ge = ke / gs, go = (ke+1) / gs;
+        // INT4 packs two adjacent K values and supported group sizes are even,
+        // so both nibbles share one scale. Keep the scale load outside the two
+        // products instead of doing two dynamic divisions/lookups.
+        int g = kb / (gs / 2);
         for (short r=0;r<NR0;++r) {
             uint8_t byte = bx[r][kb];
             int lo = byte & 0x0F; if (lo >= 8) lo -= 16;
             int hi = (byte >> 4) & 0x0F; if (hi >= 8) hi -= 16;
-            sumf[r] += ae * (float)lo * sc[r][ge] + ao * (float)hi * sc[r][go];
+            sumf[r] += (ae * (float)lo + ao * (float)hi) * sc[r][g];
         }
     }
 

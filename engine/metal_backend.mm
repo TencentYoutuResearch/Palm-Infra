@@ -74,7 +74,9 @@ struct MetalBackend::Impl {
     // commits+waits each op separately and attributes the command buffer's GPU
     // time to the op type. Reported (and reset) via dump_profile().
     struct OpStat { double gpu_ms = 0.0; uint64_t calls = 0; };
-    std::map<int, OpStat> op_stats;  // OpType -> stat
+    // MATMUL is split by concrete kernel path so decode profiles distinguish
+    // quantized/FP16 GEMV from prefill tensor GEMM.
+    std::map<std::string, OpStat> op_stats;
     bool profile = false;
 
     // True iff the tensor-API GEMM kernel is compiled AND the GPU supports the
@@ -243,15 +245,13 @@ int gemv_nsg_cap() {
 int gemv_w4_nr0() {
     static const int nr0 = [] {
         const char* value = std::getenv("MOLLM_METAL_GEMV_W4_NR");
-        // One output row per threadgroup wins on M5 Pro. W4 unpacking and
-        // per-group scale state make multi-row reuse register-heavy: strict
-        // Qwen3.5-4B medians were 48.01 t/s (NR1), 47.02 (NR2), and 46.64
-        // (NR4). Keep an override for other GPU families.
-        if (!value) return 1;
+        // Two output rows share each activation load. A corrected W4-specific
+        // A/B on M5 Pro measured ~48 t/s for NR2 versus ~35 t/s for NR1.
+        if (!value) return 2;
         const int parsed = std::atoi(value);
         return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
                    ? parsed
-                   : 1;
+                   : 2;
     }();
     return nr0;
 }
@@ -638,28 +638,26 @@ void MetalBackend::sync_point() {
     impl_->enc = [impl_->cmd computeCommandEncoder];
 }
 
-static const char* op_name(int op) {
-    return op_type_name(static_cast<OpType>(op));
-}
-
 void MetalBackend::dump_profile() {
     if (!impl_->profile || impl_->op_stats.empty()) return;
     double total = 0.0;
     for (auto& kv : impl_->op_stats) total += kv.second.gpu_ms;
     fprintf(stderr, "\n=== Metal per-op GPU time (MOLLM_METAL_PROFILE) ===\n");
-    fprintf(stderr, "%-14s %10s %8s %10s %6s\n", "op", "gpu_ms", "calls", "us/call", "%%");
+    fprintf(stderr, "%-32s %10s %8s %10s %6s\n",
+            "op", "gpu_ms", "calls", "us/call", "%%");
     // Sort by total gpu_ms descending for readability.
-    std::vector<std::pair<int, Impl::OpStat>> rows(impl_->op_stats.begin(), impl_->op_stats.end());
+    std::vector<std::pair<std::string, Impl::OpStat>> rows(
+        impl_->op_stats.begin(), impl_->op_stats.end());
     std::sort(rows.begin(), rows.end(),
               [](auto& a, auto& b){ return a.second.gpu_ms > b.second.gpu_ms; });
     for (auto& r : rows) {
         double per_call_us = r.second.calls ? (r.second.gpu_ms * 1000.0 / r.second.calls) : 0.0;
-        fprintf(stderr, "%-14s %10.3f %8llu %10.2f %6.1f\n",
-                op_name(r.first), r.second.gpu_ms,
+        fprintf(stderr, "%-32s %10.3f %8llu %10.2f %6.1f\n",
+                r.first.c_str(), r.second.gpu_ms,
                 (unsigned long long)r.second.calls, per_call_us,
                 total > 0 ? 100.0 * r.second.gpu_ms / total : 0.0);
     }
-    fprintf(stderr, "%-14s %10.3f\n", "TOTAL", total);
+    fprintf(stderr, "%-32s %10.3f\n", "TOTAL", total);
     impl_->op_stats.clear();
 }
 
@@ -699,6 +697,7 @@ void MetalBackend::dispatch(const GraphNode& node,
     id<MTLComputeCommandEncoder> enc = impl_->enc;
     const OpParams& params = node.params;
     const OpType op = node.op_type;
+    std::string profile_label = op_type_name(op);
 
     auto dispatch_1d = [&](id<MTLComputePipelineState> ps, int n) {
         [enc setComputePipelineState:ps];
@@ -848,6 +847,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.act_n_len = params.i32.size()>2 ? params.i32[2] : -1;
 
         if (p.M == 1 && B.prec == Precision::INT8) {
+            profile_label = "MATMUL_W8_GEMV";
             // W8 decode: int8 weight x float activation, per-group weight scale.
             // Weight int8 + fp32 scales both live in the weight region; bind each
             // at its byte offset (scales offset relative to weight_base).
@@ -860,7 +860,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.group_size = (int)B.group_size;
             w.groups_per_row = (int)B.groups_per_row;
             size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
-            const int NR0 = gemv_w4_nr0();
+            const int NR0 = 2;
             const int NSG = std::min(gemv_nsg_cap(), (p.K + 127) / 128);
             id<MTLComputePipelineState> ps = impl_->pipeline("gemv_w8_f32a_i8b_f32c");
             [enc setComputePipelineState:ps];
@@ -876,6 +876,8 @@ void MetalBackend::dispatch(const GraphNode& node,
             break;
         }
         if (p.M == 1 && B.prec == Precision::INT4) {
+            profile_label = "W4_GEMV[N=" + std::to_string(p.N) +
+                            ",K=" + std::to_string(p.K) + "]";
             // W4 decode: per-group symmetric int4 weight x float activation.
             MatmulW8Params w{};
             w.M = p.M; w.N = p.N; w.K = p.K;
@@ -887,11 +889,10 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.groups_per_row = (int)B.groups_per_row;
             // Decoded W4 buffer layout: [ nibbles (N*K/2) | scales (N*gpr f32) ].
             size_t scales_boff = (size_t)p.N * (p.K / 2);
-            const int NR0 = 2;
+            const int NR0 = gemv_w4_nr0();
             const int NSG =
                 std::min(gemv_nsg_cap(), (p.K / 2 + 63) / 64);
-            id<MTLComputePipelineState> ps =
-                impl_->pipeline_gemv_w4(NR0);
+            id<MTLComputePipelineState> ps = impl_->pipeline_gemv_w4(NR0);
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
             [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
@@ -905,6 +906,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             break;
         }
         if (p.M == 1) {
+            profile_label = "MATMUL_FP16_GEMV";
             // GEMV v2: each threadgroup owns NR0=2 output rows; NSG simdgroups
             // split K and reduce via shmem, so large-K matmuls (down_proj K=9728)
             // get up to 4x32 lanes.
@@ -948,6 +950,7 @@ void MetalBackend::dispatch(const GraphNode& node,
 #ifdef MOLLM_METAL_TENSOR
             static const bool w8a8 = (getenv("MOLLM_METAL_W8A8") != nullptr);
             if (impl_->has_tensor && w8a8 && B.groups_per_row == 1) {
+                profile_label = "MATMUL_W8A8_GEMM";
                 // --- W8A8: quantize A -> int8 scratch, then int8 MMA ----------
                 size_t a_i8_bytes = (size_t)p.M * (size_t)p.K;      // [M,K] contiguous
                 size_t sa_bytes   = (size_t)p.M * sizeof(float);    // scale_a[M]
@@ -1002,6 +1005,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 break;
             }
             if (impl_->has_tensor) {
+                profile_label = "MATMUL_W8A16_GEMM";
                 MatmulW8Params w{};
                 w.M = p.M; w.N = p.N; w.K = p.K;
                 w.a_offset = 0; w.c_offset = eoffset(C);
@@ -1051,6 +1055,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 static const bool w4a16 =
                     std::getenv("MOLLM_METAL_W4A8") == nullptr;
                 if (w4a16) {
+                    profile_label = "MATMUL_W4A16_GEMM";
                     MatmulW8Params w{};
                     w.M = p.M; w.N = p.N; w.K = p.K;
                     w.a_offset = 0; w.c_offset = eoffset(C);
@@ -1089,6 +1094,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     break;
                 }
                 size_t a_i8_bytes = (size_t)p.M * (size_t)p.K;
+                profile_label = "MATMUL_W4A8_GEMM";
                 size_t sa_bytes   = (size_t)p.M * sizeof(float);
                 void* a_i8_h = impl_->pool->acquire(a_i8_bytes);
                 void* sa_h   = impl_->pool->acquire(sa_bytes);
@@ -1161,6 +1167,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             MatmulParams pt = p; pt.b_offset = 0;
 #ifdef MOLLM_METAL_TENSOR
             if (impl_->has_tensor) {
+                profile_label = "MATMUL_FP16_TENSOR";
                 // Metal 4 tensor-API GEMM (fast path on M5/A19+): weights staged in
                 // a 64-row tile, activations as a device tensor, NK=32.
                 // grid: tgpig.y = N/64, tgpig.x = M/128.
@@ -1180,6 +1187,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             } else
 #endif
             {
+                profile_label = "MATMUL_FP16_TILED";
                 id<MTLComputePipelineState> ps = impl_->pipeline("gemm_tiled_f32a_f16b_f32c");
                 [enc setComputePipelineState:ps];
                 [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
@@ -1194,6 +1202,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
             }
         } else {
+            profile_label = "MATMUL_FP16_FUSED";
             // Fused-activation GEMM (rare in dense graph): vectorized scalar path.
             id<MTLComputePipelineState> ps = impl_->pipeline("gemm_f32a_f16b_f32c");
             MatmulParams pg = p; pg.b_offset = 0;  // bind B at byte offset (no uint32 overflow)
@@ -2062,7 +2071,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             [impl_->cmd commit];
             [impl_->cmd waitUntilCompleted];
             double gpu_ms = (impl_->cmd.GPUEndTime - impl_->cmd.GPUStartTime) * 1000.0;
-            auto& st = impl_->op_stats[(int)op];
+            auto& st = impl_->op_stats[profile_label];
             st.gpu_ms += gpu_ms;
             st.calls  += 1;
             impl_->cmd = nil;
