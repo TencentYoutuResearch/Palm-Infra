@@ -985,22 +985,33 @@ kernel void gemv_w4_f32a_i4b_f32c(
     }
     float sumf[NR0MAX]; for (short r=0;r<NR0;++r) sumf[r]=0.0f;
 
-    // Each lane strides over BYTES (2 K each); weight scale applied per group.
-    for (int kb = (int)lane; kb < (int)row_bytes; kb += NW) {
-        int ke = kb*2;            // even k
-        float ae = a[ke], ao = a[ke+1];
-        // INT4 packs two adjacent K values and supported group sizes are even,
-        // so both nibbles share one scale. Keep the scale load outside the two
-        // products instead of doing two dynamic divisions/lookups.
-        int g = kb / (gs / 2);
-        for (short r=0;r<NR0;++r) {
-            uint8_t byte = bx[r][kb];
-            // Branch-free signed-nibble expansion. This maps 0..15 to
-            // 0..7,-8..-1 and avoids two per-byte comparisons/selects in the
-            // hottest decode loop.
-            int lo = ((int(byte)       & 0x0F) ^ 8) - 8;
-            int hi = (((int(byte) >> 4) & 0x0F) ^ 8) - 8;
-            sumf[r] += (ae * (float)lo + ao * (float)hi) * sc[r][g];
+    if (gs == 128 && (p.K == 2048 || p.K == 6144)) {
+        // G128 fast path: a group is 64 packed bytes. Each lane consumes two
+        // bytes (four K values) per group, reusing one scale load and exposing
+        // two independent dot products to the compiler.
+        for (int g=0; g<gpr; ++g) {
+            const int kb0=g*64+(int)lane, kb1=kb0+32;
+            const float2 av0=*((device const float2*)(a+2*kb0));
+            const float2 av1=*((device const float2*)(a+2*kb1));
+            for (short r=0;r<NR0;++r) {
+                const int b0=(int)bx[r][kb0], b1=(int)bx[r][kb1];
+                const int w00=((b0&15)^8)-8, w01=(((b0>>4)&15)^8)-8;
+                const int w10=((b1&15)^8)-8, w11=(((b1>>4)&15)^8)-8;
+                sumf[r] += (av0.x*(float)w00 + av0.y*(float)w01 +
+                            av1.x*(float)w10 + av1.y*(float)w11) * sc[r][g];
+            }
+        }
+    } else {
+        // Generic even-sized groups.
+        for (int kb = (int)lane; kb < (int)row_bytes; kb += NW) {
+            int ke = kb*2;
+            float ae = a[ke], ao = a[ke+1];
+            int g = kb / (gs / 2);
+            for (short r=0;r<NR0;++r) {
+                int byte = (int)bx[r][kb];
+                int lo = ((byte&15)^8)-8, hi=(((byte>>4)&15)^8)-8;
+                sumf[r] += (ae*(float)lo + ao*(float)hi)*sc[r][g];
+            }
         }
     }
 
