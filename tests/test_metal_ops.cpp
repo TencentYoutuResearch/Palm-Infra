@@ -1152,10 +1152,10 @@ int main() {
     // registered weight region so wrap_weight's decode path is exercised.
     {
         struct alignas(16) Q4B8G128Block { float scales[8]; uint8_t q[4][8][16]; };
-        for (int ci = 0; ci < 2 && mb.has_tensor_path(); ci++) {
-            int M = ci==0 ? 40 : 128;
-            int K = ci==0 ? 256 : 512;      // multiple of 128
-            int N = ci==0 ? 48  : 80;
+        for (int ci = 0; ci < 3 && mb.has_tensor_path(); ci++) {
+            int M = ci==0 ? 40 : (ci==1 ? 128 : 1);
+            int K = ci==0 ? 256 : (ci==1 ? 512 : 2048);
+            int N = ci==0 ? 48  : (ci==1 ? 80 : 264);
             int GS = 128, GPR = K / GS;
 
             std::vector<float> a(M*K); fill_rand(a.data(), M*K);
@@ -1207,24 +1207,36 @@ int main() {
 
             metal_matmul(mb, A, B, C);
 
-            // reference: per-token int8 quant of A, per-group int4 dot, dequant.
+            // Prefill uses W4A8 (per-token int8 A); decode keeps FP32 A and
+            // exercises the multi-SIMD-group row-parallel GEMV.
             std::vector<float> ref(M*N);
             for (int m = 0; m < M; m++) {
                 float mx=0; for (int k=0;k<K;k++) mx=std::max(mx,std::fabs(a[k+m*K]));
                 float sa=mx/127.0f, inv=mx>0?127.0f/mx:0;
                 for (int n = 0; n < N; n++) {
-                    double acc=0;
-                    for (int g=0; g<GPR; g++){ long d=0;
-                        for (int k=g*GS;k<(g+1)*GS;k++){
-                            int qa=std::max(-127,std::min(127,(int)std::lround(a[k+m*K]*inv)));
-                            d += (long)qa * (long)wq[n*K+k]; }
-                        acc += (double)d * sw[n*GPR+g]; }
-                    ref[m*N+n]=(float)(acc*sa);
+                    double acc=0.0;
+                    for (int g=0; g<GPR; g++) {
+                        if (M == 1) {
+                            double d=0.0;
+                            for (int k=g*GS;k<(g+1)*GS;k++)
+                                d += (double)a[k] * (double)wq[n*K+k];
+                            acc += d * sw[n*GPR+g];
+                        } else {
+                            long d=0;
+                            for (int k=g*GS;k<(g+1)*GS;k++){
+                                int qa=std::max(-127,std::min(127,(int)std::lround(a[k+m*K]*inv)));
+                                d += (long)qa * (long)wq[n*K+k]; }
+                            acc += (double)d * sw[n*GPR+g];
+                        }
+                    }
+                    ref[m*N+n]=(float)(M == 1 ? acc : acc*sa);
                 }
             }
             char label[64];
-            snprintf(label, sizeof(label), "W4A8 GEMM M=%d K=%d N=%d", M, K, N);
-            CHECK(close((const float*)C.data, ref.data(), M*N, 2e-3f, 3e-2f), label);
+            snprintf(label, sizeof(label), "W4%s M=%d K=%d N=%d",
+                     M == 1 ? " GEMV" : "A8 GEMM", M, K, N);
+            CHECK(close((const float*)C.data, ref.data(), M*N,
+                        M == 1 ? 1e-4f : 2e-3f, 3e-2f), label);
         }
     }
 

@@ -970,7 +970,10 @@ kernel void gemv_w4_f32a_i4b_f32c(
         FC_GEMV_W4_HAS_NR0 ? (short)FC_GEMV_W4_NR0 : (short)2;
     const short NR0MAX = 8, NW = 32;
     device const float* a = A + p.a_offset;
-    const int r0 = (int)tgx * NR0;
+    // Match llama.cpp's row-parallel scheduling: every SIMD group owns an
+    // independent NR0-row tile and scans the full K dimension. This avoids
+    // cross-SIMD reductions/barriers and exposes NSG*NR0 rows per threadgroup.
+    const int r0 = ((int)tgx * (int)nsg + (int)sgitg) * NR0;
     const int gpr = p.groups_per_row, gs = p.group_size;
     const uint row_bytes = (uint)p.K / 2;   // K/2 bytes per weight row
 
@@ -983,7 +986,7 @@ kernel void gemv_w4_f32a_i4b_f32c(
     float sumf[NR0MAX]; for (short r=0;r<NR0;++r) sumf[r]=0.0f;
 
     // Each lane strides over BYTES (2 K each); weight scale applied per group.
-    for (int kb = (int)sgitg*NW + (int)lane; kb < (int)row_bytes; kb += NW*(int)nsg) {
+    for (int kb = (int)lane; kb < (int)row_bytes; kb += NW) {
         int ke = kb*2;            // even k
         float ae = a[ke], ao = a[ke+1];
         // INT4 packs two adjacent K values and supported group sizes are even,
@@ -1001,16 +1004,10 @@ kernel void gemv_w4_f32a_i4b_f32c(
         }
     }
 
-    for (short r=0;r<NR0;++r){ if(sgitg==0) shmem[r*NW+lane]=0.0f; sumf[r]=simd_sum(sumf[r]); }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (short r=0;r<NR0;++r) if(lane==0) shmem[r*NW+sgitg]=sumf[r];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sgitg==0) {
-        for (short r=0;r<NR0;++r){
-            float tot = simd_sum(shmem[r*NW+lane]);
-            if (lane==0 && r0+r < p.N) C[p.c_offset + r0+r] = apply_activation_at(
-                tot, p.activation, r0+r, p.act_n_begin, p.act_n_len);
-        }
+    for (short r=0;r<NR0;++r) {
+        float tot = simd_sum(sumf[r]);
+        if (lane==0 && r0+r < p.N) C[p.c_offset + r0+r] = apply_activation_at(
+            tot, p.activation, r0+r, p.act_n_begin, p.act_n_len);
     }
 }
 

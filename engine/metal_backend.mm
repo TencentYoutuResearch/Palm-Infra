@@ -912,9 +912,12 @@ void MetalBackend::dispatch(const GraphNode& node,
             [enc setBuffer:buf_of(&B) offset:scales_boff atIndex:4];
             [enc setBytes:&w length:sizeof(w) atIndex:3];
             [enc setThreadgroupMemoryLength:(NSUInteger)(NR0*32*sizeof(float)) atIndex:0];
-            NSUInteger tgc = ((NSUInteger)p.N + NR0 - 1)/NR0;
+            NSUInteger rows_per_tg = (NSUInteger)NR0 *
+                                     (NSUInteger)std::max(1,NSG);
+            NSUInteger tgc = ((NSUInteger)p.N + rows_per_tg - 1)/rows_per_tg;
             [enc dispatchThreadgroups:MTLSizeMake(tgc,1,1)
-                threadsPerThreadgroup:MTLSizeMake(32,(NSUInteger)std::max(1,NSG),1)];
+                threadsPerThreadgroup:
+                    MTLSizeMake(32*(NSUInteger)std::max(1,NSG),1,1)];
             break;
         }
         if (p.M == 1) {
