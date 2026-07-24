@@ -89,9 +89,15 @@ void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
     const int8_t* b4 =
         w4 ? reinterpret_cast<const int8_t*>(B.sparse_data) : nullptr;
     const int gpr = (int)B.groups_per_row;
+    // `nonzero` is thread_local so repeated decode calls can reuse its
+    // capacity.  Do not access that TLS variable from worker threads: each
+    // worker would see its own empty vector.  Capture the main thread's
+    // immutable storage explicitly for the duration of this dispatch.
+    const int* active_indices = nonzero.data();
+    const int active_count = (int)nonzero.size();
     auto for_each_active = [&](auto&& fn) {
-        for (int k : nonzero)
-            fn(k);
+        for (int i = 0; i < active_count; ++i)
+            fn(active_indices[i]);
     };
 
     auto run_range = [&](int n_begin, int n_end) {
@@ -103,6 +109,17 @@ void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
             float16x8_t acc[4] = {
                 vdupq_n_f16((__fp16)0), vdupq_n_f16((__fp16)0),
                 vdupq_n_f16((__fp16)0), vdupq_n_f16((__fp16)0)};
+            // FP16 value projections have thousands of active inputs.  Half
+            // accumulation is not accurate enough across that many terms and
+            // caused the sparse RWKV decode graph to diverge badly from its
+            // dense/prefill counterpart.  Keep four independent FP32 chains
+            // to hide FMA latency without sacrificing accumulation precision.
+            float32x4_t acc32_lo[4] = {
+                vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+                vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
+            float32x4_t acc32_hi[4] = {
+                vdupq_n_f32(0.0f), vdupq_n_f32(0.0f),
+                vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
             int slot = 0;
             int last_group = -1;
             float16x8_t scale = vdupq_n_f16((__fp16)0);
@@ -110,6 +127,12 @@ void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
                 float16x8_t weight;
                 if (fp16) {
                     weight = vld1q_f16(tile16 + (size_t)k * 8);
+                    acc32_lo[slot] =
+                        vfmaq_n_f32(acc32_lo[slot],
+                                    vcvt_f32_f16(vget_low_f16(weight)), a[k]);
+                    acc32_hi[slot] =
+                        vfmaq_n_f32(acc32_hi[slot],
+                                    vcvt_f32_f16(vget_high_f16(weight)), a[k]);
                 } else {
                     int group = std::min(k / (int)B.group_size, gpr - 1);
                     if (group != last_group) {
@@ -140,15 +163,27 @@ void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
                     weight =
                         vcvtq_f16_s16(vmovl_s8(vld1_s8(tile8 + (size_t)k * 8)));
                     weight = vmulq_f16(weight, scale);
+                    acc[slot] = vfmaq_n_f16(acc[slot], weight, (__fp16)a[k]);
                 }
-                acc[slot] = vfmaq_n_f16(acc[slot], weight, (__fp16)a[k]);
                 slot = (slot + 1) & 3;
             });
-            float16x8_t total =
-                vaddq_f16(vaddq_f16(acc[0], acc[1]), vaddq_f16(acc[2], acc[3]));
             float tmp[8];
-            vst1q_f32(tmp, vcvt_f32_f16(vget_low_f16(total)));
-            vst1q_f32(tmp + 4, vcvt_f32_f16(vget_high_f16(total)));
+            if (fp16) {
+                float32x4_t total_lo =
+                    vaddq_f32(vaddq_f32(acc32_lo[0], acc32_lo[1]),
+                              vaddq_f32(acc32_lo[2], acc32_lo[3]));
+                float32x4_t total_hi =
+                    vaddq_f32(vaddq_f32(acc32_hi[0], acc32_hi[1]),
+                              vaddq_f32(acc32_hi[2], acc32_hi[3]));
+                vst1q_f32(tmp, total_lo);
+                vst1q_f32(tmp + 4, total_hi);
+            } else {
+                float16x8_t total =
+                    vaddq_f16(vaddq_f16(acc[0], acc[1]),
+                              vaddq_f16(acc[2], acc[3]));
+                vst1q_f32(tmp, vcvt_f32_f16(vget_low_f16(total)));
+                vst1q_f32(tmp + 4, vcvt_f32_f16(vget_high_f16(total)));
+            }
             for (int j = 0; j < valid; ++j)
                 c[n + j] = tmp[j];
         }

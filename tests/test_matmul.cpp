@@ -946,6 +946,35 @@ int main() {
         delete[] q4dot; delete[] bg; delete[] q4s;
     }
 
+    // Production-scale FP16 sparse accumulation: RWKV FFN value projections
+    // have thousands of inputs and roughly half survive ReLU-squared.
+    {
+        constexpr int K = 8192, N = 256;
+        std::vector<float> a(K, 0.f), w(N*K), ref(N), out(N);
+        for (int k = 0; k < K; k += 2)
+            a[k] = 0.001f * float((k * 17) % 101);
+        std::vector<__fp16> h(N*K);
+        for (int n = 0; n < N; ++n) {
+            for (int k = 0; k < K; ++k) {
+                h[n*K+k] = (__fp16)(0.0002f * float((n*13+k*7)%63-31));
+                w[n*K+k] = (float)h[n*K+k];
+            }
+        }
+        ref_matmul(a.data(), w.data(), ref.data(), 1, N, K);
+        __fp16* hp = pack_b_interleaved_full(h.data(), N, K, K);
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  K, 1, 1, 1, a.data());
+        Tensor B = Tensor::create(Precision::FP16, MemoryType::EXTERNAL,
+                                  N, K, 1, 1, hp);
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  N, 1, 1, 1, out.data());
+        ThreadPool pool(4);
+        kernel_gemv_sparse_a(A, B, C, &pool);
+        CHECK(check_approx(out.data(), ref.data(), N, 1e-4f),
+              "sparse-A FP16 GEMV production K");
+        delete[] hp;
+    }
+
     if (failures == 0) {
         printf("\nAll matmul tests passed!\n");
     } else {
