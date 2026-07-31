@@ -389,13 +389,17 @@ decode-state updates. RWKV7 token shift, channel mixing, normalization, WKV7
 recurrence, post-processing, batched projections, and sparse-activation FFN
 also run natively, with persistent FP16 or FP32 recurrent state. Qwen3.5's
 single-image vision tower uses the same native matmul, LayerNorm, RoPE, SDPA,
-GELU, and layout paths. This keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7,
-and Qwen3.5 vision graphs on CUDA without CPU operator fallback. Operators not
-yet implemented
-natively synchronize and use the CPU reference dispatcher over the managed
-buffers. Set `MOLLM_CUDA_PROFILE=1` to print native/fallback operator counts.
-Several specialized model families still fall back, so this is not yet a
-performance-complete CUDA backend.
+GELU, and layout paths. Resident Qwen3-style MoE graphs support softmax,
+sigmoid, grouped and correction-bias routing plus optional shared experts.
+Aggregate W4G32/W4G128 expert tensors remain packed on the GPU and are decoded
+inside the selected-expert kernels instead of being expanded into model-sized
+FP16 copies. This keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7, Qwen3.5
+vision, and resident Qwen3-style MoE graphs on CUDA without CPU operator
+fallback. Hash-routed and SSD-offloaded MoE variants are not native yet.
+Other operators not yet implemented natively synchronize and use the CPU
+reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to
+print native/fallback operator counts. Several specialized model families
+still fall back, so this is not yet a performance-complete CUDA backend.
 
 ## Local HTTP server
 

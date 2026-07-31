@@ -1,5 +1,6 @@
 #include "engine/cuda_backend.h"
 #include "engine/engine.h"
+#include "kernels/moe.h"
 #include "kernels/quant_layouts.h"
 
 #include <algorithm>
@@ -732,6 +733,266 @@ bool test_strided_layout_ops(CudaBackend& backend) {
         close_enough(actual, expected, 0.0f);
 }
 
+bool test_moe_fp16_shared(CudaBackend& backend) {
+    constexpr int hidden_size = 8;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 2;
+    constexpr int intermediate_size = 5;
+    constexpr int shared_intermediate_size = 6;
+    constexpr int tokens = 3;
+    auto fill = [](size_t index, int offset) {
+        return static_cast<float>(
+            static_cast<int>((index + offset) % 19) - 9) / 23.0f;
+    };
+
+    std::vector<float> hidden(hidden_size * tokens);
+    std::vector<float> router_f32(num_experts * hidden_size);
+    std::vector<float> gate_up_f32(
+        num_experts * 2 * intermediate_size * hidden_size);
+    std::vector<float> down_f32(
+        num_experts * hidden_size * intermediate_size);
+    std::vector<float> shared_gate_f32(
+        shared_intermediate_size * hidden_size);
+    std::vector<float> shared_up_f32(
+        shared_intermediate_size * hidden_size);
+    std::vector<float> shared_down_f32(
+        hidden_size * shared_intermediate_size);
+    std::vector<float> shared_scale_f32(hidden_size);
+    std::vector<float> router_bias(num_experts);
+    for (size_t i = 0; i < hidden.size(); ++i) hidden[i] = fill(i, 1);
+    for (size_t i = 0; i < router_f32.size(); ++i)
+        router_f32[i] = fill(i, 3);
+    for (size_t i = 0; i < gate_up_f32.size(); ++i)
+        gate_up_f32[i] = fill(i, 5);
+    for (size_t i = 0; i < down_f32.size(); ++i)
+        down_f32[i] = fill(i, 7);
+    for (size_t i = 0; i < shared_gate_f32.size(); ++i)
+        shared_gate_f32[i] = fill(i, 9);
+    for (size_t i = 0; i < shared_up_f32.size(); ++i)
+        shared_up_f32[i] = fill(i, 11);
+    for (size_t i = 0; i < shared_down_f32.size(); ++i)
+        shared_down_f32[i] = fill(i, 13);
+    for (size_t i = 0; i < shared_scale_f32.size(); ++i)
+        shared_scale_f32[i] = fill(i, 15);
+    router_bias = {0.03f, -0.07f, 0.11f, -0.02f};
+
+    auto to_fp16 = [](const std::vector<float>& source) {
+        std::vector<mollm::cpu::fp16_t> result(source.size());
+        for (size_t i = 0; i < source.size(); ++i)
+            result[i] = static_cast<mollm::cpu::fp16_t>(source[i]);
+        return result;
+    };
+    auto router_data = to_fp16(router_f32);
+    auto gate_up_data = to_fp16(gate_up_f32);
+    auto down_data = to_fp16(down_f32);
+    auto shared_gate_data = to_fp16(shared_gate_f32);
+    auto shared_up_data = to_fp16(shared_up_f32);
+    auto shared_down_data = to_fp16(shared_down_f32);
+    auto shared_scale_data = to_fp16(shared_scale_f32);
+
+    Tensor hidden_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        hidden.data());
+    Tensor router = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, num_experts, hidden_size,
+        1, 1, router_data.data());
+    Tensor gate_up = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL,
+        num_experts * 2 * intermediate_size, hidden_size, 1, 1,
+        gate_up_data.data());
+    Tensor down = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL,
+        num_experts * hidden_size, intermediate_size, 1, 1,
+        down_data.data());
+    Tensor shared_gate = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, shared_intermediate_size,
+        hidden_size, 1, 1, shared_gate_data.data());
+    Tensor shared_up = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, shared_intermediate_size,
+        hidden_size, 1, 1, shared_up_data.data());
+    Tensor shared_down = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, hidden_size,
+        shared_intermediate_size, 1, 1, shared_down_data.data());
+    Tensor shared_scale = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, 1, hidden_size, 1, 1,
+        shared_scale_data.data());
+    Tensor bias = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, num_experts, 1, 1, 1,
+        router_bias.data());
+    std::vector<const Tensor*> inputs = {
+        &hidden_host, &router, &gate_up, &down, &shared_gate, &shared_up,
+        &shared_down, &shared_scale, &bias,
+    };
+    std::vector<float> expected(hidden_size * tokens);
+    Tensor expected_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        expected.data());
+    if (!kernel_qwen3_moe(
+            inputs, expected_tensor, nullptr, hidden_size, num_experts,
+            top_k, intermediate_size, shared_intermediate_size, 1, true,
+            true, 2, 1, 0.75f, true, 8))
+        return false;
+
+    backend.wrap_weight(router);
+    backend.wrap_weight(gate_up);
+    backend.wrap_weight(down);
+    backend.wrap_weight(shared_gate);
+    backend.wrap_weight(shared_up);
+    backend.wrap_weight(shared_down);
+    backend.wrap_weight(shared_scale);
+    backend.wrap_weight(bias);
+    Tensor hidden_device = device_tensor(backend, hidden_size, tokens);
+    Tensor output_device = device_tensor(backend, hidden_size, tokens);
+    std::memcpy(hidden_device.data, hidden.data(), hidden_device.nbytes());
+    inputs = {
+        &hidden_device, &router, &gate_up, &down, &shared_gate, &shared_up,
+        &shared_down, &shared_scale, &bias,
+    };
+    GraphNode node;
+    node.op_type = OpType::MOE;
+    node.params.i32 = {
+        hidden_size, num_experts, top_k, intermediate_size,
+        shared_intermediate_size, 1, 1, 1, 2, 1, 1, 8, -1, -1,
+    };
+    node.params.f32 = {0.75f, 0.0f};
+    // A host fallback must fail after this point; success proves the CUDA path
+    // handled every routed and shared-expert stage.
+    router.data = gate_up.data = down.data = nullptr;
+    shared_gate.data = shared_up.data = shared_down.data = nullptr;
+    shared_scale.data = bias.data = nullptr;
+    backend.clear_dispatch_error();
+    backend.dispatch(node, inputs, &output_device, nullptr);
+    backend.end_graph();
+    std::vector<float> actual(expected.size());
+    std::memcpy(actual.data(), output_device.data, output_device.nbytes());
+    return !backend.dispatch_failed() &&
+        close_enough(actual, expected, 2.5e-2f);
+}
+
+template <int group_size, typename Block>
+bool test_moe_packed(CudaBackend& backend) {
+    static_assert(group_size == 32 || group_size == 128);
+    constexpr int hidden_size = group_size;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 2;
+    constexpr int intermediate_size = group_size;
+    constexpr int tokens = 2;
+    const int gate_up_rows = num_experts * 2 * intermediate_size;
+    const int down_rows = num_experts * hidden_size;
+    auto make_blocks = [](int rows, int width, int seed) {
+        std::vector<Block> blocks(
+            static_cast<size_t>(rows / 8) * (width / group_size));
+        const int groups = width / group_size;
+        for (int row_block = 0; row_block < rows / 8; ++row_block) {
+            for (int group = 0; group < groups; ++group) {
+                auto& block = blocks[
+                    static_cast<size_t>(row_block) * groups + group];
+                for (int lane = 0; lane < 8; ++lane) {
+                    block.scales[lane] = 0.0125f * (1 + (lane % 3));
+                    for (int inner = 0; inner < group_size; inner += 2) {
+                        const int row = row_block * 8 + lane;
+                        const int low = (row + group + inner + seed) % 15 - 7;
+                        const int high =
+                            (row + group + inner + seed + 3) % 15 - 7;
+                        const uint8_t packed = static_cast<uint8_t>(
+                            (low & 0xf) | ((high & 0xf) << 4));
+                        if constexpr (group_size == 32) {
+                            block.q[lane][inner / 2] = packed;
+                        } else {
+                            const int subgroup = inner / 32;
+                            const int subgroup_inner = inner % 32;
+                            block.q[subgroup][lane][subgroup_inner / 2] =
+                                packed;
+                        }
+                    }
+                }
+            }
+        }
+        return blocks;
+    };
+    auto gate_up_blocks = make_blocks(gate_up_rows, hidden_size, 2);
+    auto down_blocks = make_blocks(down_rows, intermediate_size, 7);
+    std::vector<float> hidden(hidden_size * tokens);
+    std::vector<float> router_f32(num_experts * hidden_size);
+    for (size_t i = 0; i < hidden.size(); ++i)
+        hidden[i] = static_cast<float>(static_cast<int>(i % 17) - 8) / 31.0f;
+    for (size_t i = 0; i < router_f32.size(); ++i)
+        router_f32[i] =
+            static_cast<float>(static_cast<int>(i % 13) - 6) / 29.0f;
+    std::vector<mollm::cpu::fp16_t> router_data(router_f32.size());
+    for (size_t i = 0; i < router_f32.size(); ++i)
+        router_data[i] =
+            static_cast<mollm::cpu::fp16_t>(router_f32[i]);
+
+    Tensor hidden_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        hidden.data());
+    Tensor router = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, num_experts, hidden_size,
+        1, 1, router_data.data());
+    Tensor gate_up = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL, gate_up_rows, hidden_size,
+        1, 1, gate_up_blocks.data());
+    if constexpr (group_size == 32) {
+        gate_up.q4_g32_data = gate_up_blocks.data();
+        gate_up.is_q4_g32_packed = true;
+    } else {
+        gate_up.q4_g128_data = gate_up_blocks.data();
+        gate_up.is_q4_g128_packed = true;
+    }
+    gate_up.group_size = group_size;
+    gate_up.groups_per_row = 1;
+    Tensor down = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL, down_rows,
+        intermediate_size, 1, 1, down_blocks.data());
+    if constexpr (group_size == 32) {
+        down.q4_g32_data = down_blocks.data();
+        down.is_q4_g32_packed = true;
+    } else {
+        down.q4_g128_data = down_blocks.data();
+        down.is_q4_g128_packed = true;
+    }
+    down.group_size = group_size;
+    down.groups_per_row = 1;
+    std::vector<const Tensor*> inputs = {
+        &hidden_host, &router, &gate_up, &down,
+    };
+    std::vector<float> expected(hidden_size * tokens);
+    Tensor expected_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        expected.data());
+    if (!kernel_qwen3_moe(
+            inputs, expected_tensor, nullptr, hidden_size, num_experts,
+            top_k, intermediate_size, 0, 0, true, false, 2, 1))
+        return false;
+    if (std::none_of(expected.begin(), expected.end(),
+                     [](float value) { return std::fabs(value) > 1e-6f; }))
+        return false;
+
+    backend.wrap_weight(router);
+    backend.wrap_weight_int4(gate_up, true);
+    backend.wrap_weight_int4(down, true);
+    Tensor hidden_device = device_tensor(backend, hidden_size, tokens);
+    Tensor output_device = device_tensor(backend, hidden_size, tokens);
+    std::memcpy(hidden_device.data, hidden.data(), hidden_device.nbytes());
+    inputs = {&hidden_device, &router, &gate_up, &down};
+    GraphNode node;
+    node.op_type = OpType::MOE;
+    node.params.i32 = {
+        hidden_size, num_experts, top_k, intermediate_size, 0,
+        0, 1, 0, 2, 1, 0, -1, -1, -1,
+    };
+    node.params.f32 = {1.0f, 0.0f};
+    router.data = gate_up.data = down.data = nullptr;
+    backend.clear_dispatch_error();
+    backend.dispatch(node, inputs, &output_device, nullptr);
+    backend.end_graph();
+    std::vector<float> actual(expected.size());
+    std::memcpy(actual.data(), output_device.data, output_device.nbytes());
+    return !backend.dispatch_failed() &&
+        close_enough(actual, expected, 3.0e-2f);
+}
+
 }  // namespace
 
 int main() {
@@ -846,7 +1107,26 @@ int main() {
         !close_enough(actual, expected, 1.5e-2f))
         return 1;
 
-    std::printf("CUDA device-resident ops, RWKV matrix variants, strided "
+    {
+        CudaBackend moe_backend;
+        if (!moe_backend.available() ||
+            !test_moe_fp16_shared(moe_backend))
+            return 1;
+    }
+    {
+        CudaBackend moe_backend;
+        if (!moe_backend.available() ||
+            !test_moe_packed<32, Q4B8G32Block>(moe_backend))
+            return 1;
+    }
+    {
+        CudaBackend moe_backend;
+        if (!moe_backend.available() ||
+            !test_moe_packed<128, Q4B8G128Block>(moe_backend))
+            return 1;
+    }
+
+    std::printf("CUDA device-resident ops, RWKV and MoE variants, strided "
                 "views, FP16, W8, W4G32 and W4G128 matmul tests passed\n");
     return 0;
 }

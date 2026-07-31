@@ -529,6 +529,292 @@ __global__ void rwkv7_cuda(
     }
 }
 
+__device__ int moe_signed_nibble(uint8_t value) {
+    const int nibble = value & 0x0f;
+    return nibble >= 8 ? nibble - 16 : nibble;
+}
+
+__device__ float moe_weight_value_cuda(
+    const void* data, bool dense_fp32, int layout, int row, int column,
+    int width) {
+    if (layout == 0) {
+        const size_t index = static_cast<size_t>(row) * width + column;
+        return dense_fp32
+            ? static_cast<const float*>(data)[index]
+            : __half2float(static_cast<const __half*>(data)[index]);
+    }
+    if (layout == 1) {
+        const int groups = width / 32;
+        const auto& block = static_cast<const Q4B8G32Block*>(data)[
+            static_cast<size_t>(row / 8) * groups + column / 32];
+        const int lane = row & 7;
+        const int inner = column & 31;
+        const uint8_t packed = block.q[lane][inner / 2];
+        return static_cast<float>(moe_signed_nibble(
+                   inner & 1 ? packed >> 4 : packed)) *
+            block.scales[lane];
+    }
+    const int groups = width / 128;
+    const auto& block = static_cast<const Q4B8G128Block*>(data)[
+        static_cast<size_t>(row / 8) * groups + column / 128];
+    const int lane = row & 7;
+    const int inner = column & 127;
+    const int subgroup = inner / 32;
+    const int subgroup_inner = inner & 31;
+    const uint8_t packed = block.q[subgroup][lane][subgroup_inner / 2];
+    return static_cast<float>(moe_signed_nibble(
+               subgroup_inner & 1 ? packed >> 4 : packed)) *
+        block.scales[lane];
+}
+
+__device__ float moe_router_score_cuda(float value, int score_function) {
+    if (score_function == 1)
+        return 1.0f / (1.0f + expf(-value));
+    if (score_function == 2) {
+        const float softplus = value > 0.0f
+            ? value + log1pf(expf(-value)) : log1pf(expf(value));
+        return sqrtf(softplus);
+    }
+    return value;
+}
+
+__global__ void moe_select_routes_cuda(
+    const float* logits, const float* bias, int* route_indices,
+    float* route_weights, int tokens, int num_experts, int top_k,
+    int score_function, bool normalize_topk, int num_groups,
+    int topk_groups, float scaling_factor) {
+    constexpr int maximum_top_k = 64;
+    constexpr int maximum_groups = 64;
+    const int token = blockIdx.x;
+    if (token >= tokens || threadIdx.x != 0 || top_k > maximum_top_k ||
+        num_groups > maximum_groups)
+        return;
+    const float* token_logits = logits +
+        static_cast<size_t>(token) * num_experts;
+    float selected_values[maximum_top_k];
+    int selected_indices[maximum_top_k];
+    unsigned char keep_group[maximum_groups];
+    for (int index = 0; index < top_k; ++index) {
+        selected_values[index] = -FLT_MAX;
+        selected_indices[index] = 0;
+    }
+    for (int group = 0; group < num_groups; ++group)
+        keep_group[group] = 1;
+
+    const int experts_per_group = num_experts / num_groups;
+    if (score_function != 0 && num_groups > 1 && experts_per_group > 0 &&
+        topk_groups < num_groups) {
+        float selected_group_scores[maximum_groups];
+        int selected_groups[maximum_groups];
+        for (int index = 0; index < topk_groups; ++index) {
+            selected_group_scores[index] = -FLT_MAX;
+            selected_groups[index] = 0;
+        }
+        for (int group = 0; group < num_groups; ++group) {
+            float best0 = -FLT_MAX;
+            float best1 = -FLT_MAX;
+            const int begin = group * experts_per_group;
+            const int end = group == num_groups - 1
+                ? num_experts : begin + experts_per_group;
+            for (int expert = begin; expert < end; ++expert) {
+                float choice = moe_router_score_cuda(
+                    token_logits[expert], score_function);
+                if (bias && score_function != 0)
+                    choice += bias[expert];
+                if (choice > best0) {
+                    best1 = best0;
+                    best0 = choice;
+                } else if (choice > best1) {
+                    best1 = choice;
+                }
+            }
+            const float group_score = best1 > -FLT_MAX
+                ? best0 + best1 : best0;
+            for (int index = 0; index < topk_groups; ++index) {
+                if (group_score > selected_group_scores[index]) {
+                    for (int shift = topk_groups - 1; shift > index;
+                         --shift) {
+                        selected_group_scores[shift] =
+                            selected_group_scores[shift - 1];
+                        selected_groups[shift] = selected_groups[shift - 1];
+                    }
+                    selected_group_scores[index] = group_score;
+                    selected_groups[index] = group;
+                    break;
+                }
+            }
+        }
+        for (int group = 0; group < num_groups; ++group)
+            keep_group[group] = 0;
+        for (int index = 0; index < topk_groups; ++index)
+            keep_group[selected_groups[index]] = 1;
+    }
+
+    for (int expert = 0; expert < num_experts; ++expert) {
+        const int group = experts_per_group > 0
+            ? min(expert / experts_per_group, num_groups - 1) : 0;
+        if (!keep_group[group])
+            continue;
+        const float score = moe_router_score_cuda(
+            token_logits[expert], score_function);
+        const float choice = score_function == 0
+            ? token_logits[expert] : score + (bias ? bias[expert] : 0.0f);
+        for (int index = 0; index < top_k; ++index) {
+            if (choice > selected_values[index]) {
+                for (int shift = top_k - 1; shift > index; --shift) {
+                    selected_values[shift] = selected_values[shift - 1];
+                    selected_indices[shift] = selected_indices[shift - 1];
+                }
+                selected_values[index] = choice;
+                selected_indices[index] = expert;
+                break;
+            }
+        }
+    }
+
+    float sum = 0.0f;
+    if (score_function == 0) {
+        const float maximum = selected_values[0];
+        for (int index = 0; index < top_k; ++index) {
+            selected_values[index] = expf(selected_values[index] - maximum);
+            sum += selected_values[index];
+        }
+        const float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (int index = 0; index < top_k; ++index)
+            selected_values[index] *= inverse;
+    } else {
+        for (int index = 0; index < top_k; ++index) {
+            selected_values[index] = moe_router_score_cuda(
+                token_logits[selected_indices[index]], score_function);
+            sum += selected_values[index];
+        }
+        const float multiplier = normalize_topk && sum > 0.0f
+            ? scaling_factor / sum : scaling_factor;
+        for (int index = 0; index < top_k; ++index)
+            selected_values[index] *= multiplier;
+    }
+
+    // The CPU reference accumulates experts in ascending expert-id order.
+    // Preserve that FP32 summation order after score-based selection.
+    for (int index = 1; index < top_k; ++index) {
+        int selected_index = selected_indices[index];
+        float selected_weight = selected_values[index];
+        int position = index;
+        while (position > 0 &&
+               selected_indices[position - 1] > selected_index) {
+            selected_indices[position] = selected_indices[position - 1];
+            selected_values[position] = selected_values[position - 1];
+            --position;
+        }
+        selected_indices[position] = selected_index;
+        selected_values[position] = selected_weight;
+    }
+    for (int index = 0; index < top_k; ++index) {
+        const size_t output_index =
+            static_cast<size_t>(token) * top_k + index;
+        route_indices[output_index] = selected_indices[index];
+        route_weights[output_index] = selected_values[index];
+    }
+}
+
+__global__ void moe_gate_up_cuda(
+    const float* hidden, size_t hidden_stride, const int* route_indices,
+    const void* gate_up, bool gate_up_fp32, int gate_up_layout,
+    float* intermediate, int tokens, int top_k, int hidden_size,
+    int intermediate_size, float swiglu_limit) {
+    const size_t count = static_cast<size_t>(tokens) * top_k *
+        intermediate_size;
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    const int dimension = index % intermediate_size;
+    const int route = index / intermediate_size;
+    const int token = route / top_k;
+    const int expert = route_indices[route];
+    const float* input = hidden + static_cast<size_t>(token) * hidden_stride;
+    const int gate_row = expert * 2 * intermediate_size + dimension;
+    const int up_row = gate_row + intermediate_size;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (int inner = 0; inner < hidden_size; ++inner) {
+        const float value = input[inner];
+        gate += value * moe_weight_value_cuda(
+            gate_up, gate_up_fp32, gate_up_layout, gate_row, inner,
+            hidden_size);
+        up += value * moe_weight_value_cuda(
+            gate_up, gate_up_fp32, gate_up_layout, up_row, inner,
+            hidden_size);
+    }
+    if (swiglu_limit > 0.0f) {
+        gate = fminf(gate, swiglu_limit);
+        up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+    }
+    intermediate[index] = gate / (1.0f + expf(-gate)) * up;
+}
+
+__global__ void moe_down_cuda(
+    const int* route_indices, const float* route_weights,
+    const float* intermediate, const void* down, bool down_fp32,
+    int down_layout, float* output, size_t output_stride, int tokens,
+    int top_k, int hidden_size, int intermediate_size) {
+    const size_t count = static_cast<size_t>(tokens) * hidden_size;
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    const int dimension = index % hidden_size;
+    const int token = index / hidden_size;
+    float result = 0.0f;
+    for (int route_index = 0; route_index < top_k; ++route_index) {
+        const int route = token * top_k + route_index;
+        const int expert = route_indices[route];
+        const int row = expert * hidden_size + dimension;
+        float contribution = 0.0f;
+        for (int inner = 0; inner < intermediate_size; ++inner)
+            contribution += intermediate[
+                static_cast<size_t>(route) * intermediate_size + inner] *
+                moe_weight_value_cuda(
+                    down, down_fp32, down_layout, row, inner,
+                    intermediate_size);
+        result += route_weights[route] * contribution;
+    }
+    output[static_cast<size_t>(token) * output_stride + dimension] = result;
+}
+
+__global__ void moe_swiglu_cuda(
+    const float* gate, const float* up, float* output, size_t count,
+    float swiglu_limit) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    float gate_value = gate[index];
+    float up_value = up[index];
+    if (swiglu_limit > 0.0f) {
+        gate_value = fminf(gate_value, swiglu_limit);
+        up_value = fminf(fmaxf(up_value, -swiglu_limit), swiglu_limit);
+    }
+    output[index] = gate_value / (1.0f + expf(-gate_value)) * up_value;
+}
+
+__global__ void moe_add_shared_cuda(
+    float* output, size_t output_stride, const float* shared,
+    const float* shared_scale, int tokens, int hidden_size,
+    bool has_scale) {
+    const size_t count = static_cast<size_t>(tokens) * hidden_size;
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    const int dimension = index % hidden_size;
+    const int token = index / hidden_size;
+    const float scale = has_scale
+        ? 1.0f / (1.0f + expf(-shared_scale[token])) : 1.0f;
+    output[static_cast<size_t>(token) * output_stride + dimension] +=
+        shared[index] * scale;
+}
+
 __global__ void contiguous_cuda(
     const float* input, float* output, size_t count,
     int64_t d0, int64_t d1, int64_t d2,
@@ -936,11 +1222,18 @@ int signed_nibble(uint8_t value) {
 }  // namespace
 
 struct CudaBackend::Impl {
+    enum class WeightLayout : uint8_t {
+        Dense = 0,
+        Q4Bg32,
+        Q4Bg128,
+    };
+
     struct DeviceWeight {
         void* data = nullptr;
         cudaDataType type = CUDA_R_16F;
         int n = 0;
         int k = 0;
+        WeightLayout layout = WeightLayout::Dense;
     };
 
     struct BoundaryBuffer {
@@ -1044,6 +1337,12 @@ struct CudaBackend::Impl {
         return true;
     }
 
+    void* scratch(const char* name, size_t requested) {
+        auto& buffer = boundary_buffers[name];
+        return reserve(buffer.data, buffer.capacity, requested)
+            ? buffer.data : nullptr;
+    }
+
     const DeviceWeight* find_weight(const Tensor& tensor) const {
         if (!tensor.device_data)
             return nullptr;
@@ -1053,7 +1352,8 @@ struct CudaBackend::Impl {
 
     bool upload_weight(Tensor& tensor, const void* cache_key,
                        const void* source, size_t bytes, cudaDataType type,
-                       int n, int k) {
+                       int n, int k,
+                       WeightLayout layout = WeightLayout::Dense) {
         if (!cache_key || !source || bytes == 0)
             return false;
         auto found = weights.find(cache_key);
@@ -1070,7 +1370,7 @@ struct CudaBackend::Impl {
             }
             device_allocations.push_back(device);
             found = weights.emplace(
-                cache_key, DeviceWeight{device, type, n, k}).first;
+                cache_key, DeviceWeight{device, type, n, k, layout}).first;
             weights_by_device.emplace(device, &found->second);
         }
         tensor.device_data = found->second.data;
@@ -1085,7 +1385,8 @@ struct CudaBackend::Impl {
                            int act_len) {
         const DeviceWeight* prepared = find_weight(weight);
         if (!prepared || prepared->n != n || prepared->k != k || !device_a ||
-            !device_c || ldc != n)
+            !device_c || ldc != n ||
+            prepared->layout != WeightLayout::Dense)
             return false;
 
         const size_t a_elements = static_cast<size_t>(m) * lda;
@@ -1257,11 +1558,31 @@ void CudaBackend::wrap_weight(Tensor& tensor) {
 
 void CudaBackend::wrap_weight_int4(Tensor& tensor,
                                    bool keep_native_experts) {
-    if (!available() || keep_native_experts || tensor.shape[0] <= 0 ||
+    if (!available() || tensor.shape[0] <= 0 ||
         tensor.shape[1] <= 0)
         return;
     const int n = static_cast<int>(tensor.shape[0]);
     const int k = static_cast<int>(tensor.shape[1]);
+    if (keep_native_experts) {
+        if (tensor.prec != Precision::INT4 || n % 8 != 0)
+            return;
+        if (tensor.is_q4_g32_packed && tensor.q4_g32_data &&
+            k % 32 == 0) {
+            const size_t bytes = static_cast<size_t>(n / 8) * (k / 32) *
+                sizeof(Q4B8G32Block);
+            impl_->upload_weight(
+                tensor, tensor.q4_g32_data, tensor.q4_g32_data, bytes,
+                CUDA_R_8I, n, k, Impl::WeightLayout::Q4Bg32);
+        } else if (tensor.is_q4_g128_packed && tensor.q4_g128_data &&
+                   k % 128 == 0) {
+            const size_t bytes = static_cast<size_t>(n / 8) * (k / 128) *
+                sizeof(Q4B8G128Block);
+            impl_->upload_weight(
+                tensor, tensor.q4_g128_data, tensor.q4_g128_data, bytes,
+                CUDA_R_8I, n, k, Impl::WeightLayout::Q4Bg128);
+        }
+        return;
+    }
     std::vector<__half> dequantized(static_cast<size_t>(n) * k);
 
     if (tensor.prec == Precision::INT8) {
@@ -2105,6 +2426,249 @@ void CudaBackend::dispatch(const GraphNode& node,
                 heads, head_size, sequence_length, real_length,
                 inputs[6]->prec == Precision::FP16);
             if (!report_cuda(cudaGetLastError(), "rwkv7_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if (node.op_type == OpType::MOE && inputs.size() >= 4 && inputs[0] &&
+        inputs[1] && inputs[2] && inputs[3] && output) {
+        const int hidden_size = graph_params::get_i32(
+            node.params, 0, static_cast<int>(output->shape[0]));
+        const int num_experts = graph_params::get_i32(node.params, 1, 0);
+        const int top_k = graph_params::get_i32(node.params, 2, 0);
+        const int intermediate_size =
+            graph_params::get_i32(node.params, 3, 0);
+        const int shared_intermediate_size =
+            graph_params::get_i32(node.params, 4, intermediate_size);
+        const int score_function =
+            graph_params::get_i32(node.params, 5, 0);
+        const bool normalize_topk =
+            graph_params::get_i32(node.params, 6, 1) != 0;
+        const bool has_shared =
+            graph_params::get_i32(node.params, 7, 1) != 0;
+        const int num_groups = std::max(
+            1, graph_params::get_i32(node.params, 8, 1));
+        int topk_groups = graph_params::get_i32(
+            node.params, 9, num_groups);
+        if (topk_groups <= 0 || topk_groups > num_groups)
+            topk_groups = num_groups;
+        const bool shared_has_gate =
+            graph_params::get_i32(node.params, 10, 1) != 0;
+        const int router_bias_input = graph_params::get_i32(
+            node.params, 11, has_shared ? 8 : -1);
+        const int token_ids_input =
+            graph_params::get_i32(node.params, 12, -1);
+        const int hash_table_input =
+            graph_params::get_i32(node.params, 13, -1);
+        const float routed_scaling_factor =
+            graph_params::get_f32(node.params, 0, 1.0f);
+        const float swiglu_limit =
+            graph_params::get_f32(node.params, 1, 0.0f);
+        const int tokens = static_cast<int>(inputs[0]->shape[1]);
+
+        const auto* router = impl_->find_weight(*inputs[1]);
+        const auto* gate_up = impl_->find_weight(*inputs[2]);
+        const auto* down = impl_->find_weight(*inputs[3]);
+        const Tensor* router_bias =
+            router_bias_input >= 0 &&
+                    static_cast<size_t>(router_bias_input) < inputs.size()
+                ? inputs[router_bias_input]
+                : nullptr;
+        const bool hash_routing =
+            token_ids_input >= 0 && hash_table_input >= 0;
+        bool valid = fp32_contiguous(*inputs[0]) &&
+            fp32_contiguous(*output) && router && gate_up && down &&
+            hidden_size > 0 && num_experts > 0 && num_experts >= top_k &&
+            top_k > 0 && top_k <= 64 && intermediate_size > 0 &&
+            num_groups <= 64 && tokens > 0 && score_function >= 0 &&
+            score_function <= 2 && !hash_routing &&
+            inputs[0]->shape[0] == hidden_size &&
+            output->shape[0] == hidden_size && output->shape[1] == tokens &&
+            router->n == num_experts && router->k == hidden_size &&
+            router->layout == Impl::WeightLayout::Dense &&
+            gate_up->n == num_experts * 2 * intermediate_size &&
+            gate_up->k == hidden_size &&
+            down->n == num_experts * hidden_size &&
+            down->k == intermediate_size;
+        if (router_bias) {
+            valid = valid && router_bias->prec == Precision::FP32 &&
+                router_bias->nelements() >= num_experts &&
+                device_pointer_const<float>(*router_bias);
+        }
+
+        const Tensor* shared_gate = nullptr;
+        const Tensor* shared_up = nullptr;
+        const Tensor* shared_down = nullptr;
+        const Tensor* shared_scale_weight = nullptr;
+        if (has_shared) {
+            valid = valid && shared_intermediate_size > 0 &&
+                inputs.size() >= 7 && inputs[4] && inputs[5] && inputs[6];
+            if (valid) {
+                shared_gate = inputs[4];
+                shared_up = inputs[5];
+                shared_down = inputs[6];
+                const auto* prepared_gate = impl_->find_weight(*shared_gate);
+                const auto* prepared_up = impl_->find_weight(*shared_up);
+                const auto* prepared_down = impl_->find_weight(*shared_down);
+                valid = prepared_gate && prepared_up && prepared_down &&
+                    prepared_gate->layout == Impl::WeightLayout::Dense &&
+                    prepared_up->layout == Impl::WeightLayout::Dense &&
+                    prepared_down->layout == Impl::WeightLayout::Dense &&
+                    prepared_gate->n == shared_intermediate_size &&
+                    prepared_gate->k == hidden_size &&
+                    prepared_up->n == shared_intermediate_size &&
+                    prepared_up->k == hidden_size &&
+                    prepared_down->n == hidden_size &&
+                    prepared_down->k == shared_intermediate_size;
+                if (shared_has_gate) {
+                    valid = valid && inputs.size() >= 8 && inputs[7];
+                    if (valid) {
+                        shared_scale_weight = inputs[7];
+                        const auto* prepared_scale =
+                            impl_->find_weight(*shared_scale_weight);
+                        valid = prepared_scale &&
+                            prepared_scale->layout ==
+                                Impl::WeightLayout::Dense &&
+                            prepared_scale->n == 1 &&
+                            prepared_scale->k == hidden_size;
+                    }
+                }
+            }
+        }
+
+        const float* hidden = device_pointer_const<float>(*inputs[0]);
+        float* destination = device_pointer<float>(*output);
+        valid = valid && hidden && destination;
+        if (valid) {
+            const size_t route_count =
+                static_cast<size_t>(tokens) * top_k;
+            auto* logits = static_cast<float*>(impl_->scratch(
+                "moe_logits", static_cast<size_t>(tokens) * num_experts *
+                    sizeof(float)));
+            auto* route_indices = static_cast<int*>(impl_->scratch(
+                "moe_route_indices", route_count * sizeof(int)));
+            auto* route_weights = static_cast<float*>(impl_->scratch(
+                "moe_route_weights", route_count * sizeof(float)));
+            auto* routed_intermediate = static_cast<float*>(impl_->scratch(
+                "moe_routed_intermediate",
+                route_count * intermediate_size * sizeof(float)));
+            valid = logits && route_indices && route_weights &&
+                routed_intermediate &&
+                impl_->run_matmul_device(
+                    hidden,
+                    static_cast<int>(inputs[0]->stride[1] / sizeof(float)),
+                    *inputs[1], logits, num_experts, tokens, num_experts,
+                    hidden_size, Activation::NONE, 0, -1);
+            if (valid) {
+                moe_select_routes_cuda<<<tokens, 1>>>(
+                    logits,
+                    router_bias
+                        ? device_pointer_const<float>(*router_bias) : nullptr,
+                    route_indices, route_weights, tokens, num_experts, top_k,
+                    score_function, normalize_topk, num_groups, topk_groups,
+                    routed_scaling_factor);
+                const size_t intermediate_count =
+                    route_count * intermediate_size;
+                moe_gate_up_cuda<<<
+                    static_cast<unsigned>((intermediate_count + threads - 1) /
+                                          threads), threads>>>(
+                    hidden,
+                    inputs[0]->stride[1] / sizeof(float), route_indices,
+                    gate_up->data, gate_up->type == CUDA_R_32F,
+                    static_cast<int>(gate_up->layout), routed_intermediate,
+                    tokens, top_k, hidden_size, intermediate_size,
+                    swiglu_limit);
+                const size_t output_count =
+                    static_cast<size_t>(tokens) * hidden_size;
+                moe_down_cuda<<<
+                    static_cast<unsigned>((output_count + threads - 1) /
+                                          threads), threads>>>(
+                    route_indices, route_weights, routed_intermediate,
+                    down->data, down->type == CUDA_R_32F,
+                    static_cast<int>(down->layout), destination,
+                    output->stride[1] / sizeof(float), tokens, top_k,
+                    hidden_size, intermediate_size);
+                valid = report_cuda(cudaGetLastError(), "CUDA MOE routed");
+            }
+
+            if (valid && has_shared) {
+                const size_t shared_count =
+                    static_cast<size_t>(tokens) * shared_intermediate_size;
+                auto* shared_gate_output = static_cast<float*>(impl_->scratch(
+                    "moe_shared_gate", shared_count * sizeof(float)));
+                auto* shared_up_output = static_cast<float*>(impl_->scratch(
+                    "moe_shared_up", shared_count * sizeof(float)));
+                auto* shared_intermediate = static_cast<float*>(
+                    impl_->scratch("moe_shared_intermediate",
+                                   shared_count * sizeof(float)));
+                auto* shared_output = static_cast<float*>(impl_->scratch(
+                    "moe_shared_output",
+                    static_cast<size_t>(tokens) * hidden_size *
+                        sizeof(float)));
+                auto* shared_scale = shared_has_gate
+                    ? static_cast<float*>(impl_->scratch(
+                          "moe_shared_scale",
+                          static_cast<size_t>(tokens) * sizeof(float)))
+                    : nullptr;
+                valid = shared_gate_output && shared_up_output &&
+                    shared_intermediate && shared_output &&
+                    (!shared_has_gate || shared_scale) &&
+                    impl_->run_matmul_device(
+                        hidden,
+                        static_cast<int>(inputs[0]->stride[1] /
+                                         sizeof(float)),
+                        *shared_gate, shared_gate_output,
+                        shared_intermediate_size, tokens,
+                        shared_intermediate_size, hidden_size,
+                        Activation::NONE, 0, -1) &&
+                    impl_->run_matmul_device(
+                        hidden,
+                        static_cast<int>(inputs[0]->stride[1] /
+                                         sizeof(float)),
+                        *shared_up, shared_up_output,
+                        shared_intermediate_size, tokens,
+                        shared_intermediate_size, hidden_size,
+                        Activation::NONE, 0, -1);
+                if (valid) {
+                    moe_swiglu_cuda<<<
+                        static_cast<unsigned>((shared_count + threads - 1) /
+                                              threads), threads>>>(
+                        shared_gate_output, shared_up_output,
+                        shared_intermediate, shared_count, swiglu_limit);
+                    valid = report_cuda(
+                        cudaGetLastError(), "CUDA MOE shared SwiGLU") &&
+                        impl_->run_matmul_device(
+                            shared_intermediate, shared_intermediate_size,
+                            *shared_down, shared_output, hidden_size, tokens,
+                            hidden_size, shared_intermediate_size,
+                            Activation::NONE, 0, -1);
+                }
+                if (valid && shared_has_gate) {
+                    valid = impl_->run_matmul_device(
+                        hidden,
+                        static_cast<int>(inputs[0]->stride[1] /
+                                         sizeof(float)),
+                        *shared_scale_weight, shared_scale, 1, tokens, 1,
+                        hidden_size, Activation::NONE, 0, -1);
+                }
+                if (valid) {
+                    const size_t output_count =
+                        static_cast<size_t>(tokens) * hidden_size;
+                    moe_add_shared_cuda<<<
+                        static_cast<unsigned>((output_count + threads - 1) /
+                                              threads), threads>>>(
+                        destination, output->stride[1] / sizeof(float),
+                        shared_output, shared_scale, tokens, hidden_size,
+                        shared_has_gate);
+                    valid = report_cuda(
+                        cudaGetLastError(), "CUDA MOE shared output");
+                }
+            }
+            if (!valid) {
                 impl_->failed = true;
                 return;
             }
