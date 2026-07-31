@@ -30,15 +30,29 @@ def assert_has_int8_weight(package: Path) -> None:
     raise AssertionError("tiny W8 package contains no INT8 weight")
 
 
-def build_qwen3_fixture(model_dir: Path) -> None:
+def assert_has_bg128_weight(package: Path) -> None:
+    data = package.read_bytes()
+    meta_offset, meta_length = struct.unpack_from("<QQ", data, 8)
+    weights_offset, _ = struct.unpack_from("<QQ", data, 88)
+    metadata = json.loads(data[meta_offset:meta_offset + meta_length])
+    for relative_offset, size in metadata["weights"].values():
+        if size < 88:
+            continue
+        flags, _, precision = struct.unpack_from(
+            "<III", data, weights_offset + relative_offset + 4)
+        if precision == 3 and flags & (1 << 1):
+            return
+    raise AssertionError("tiny W4G128 package contains no BG128 weight")
+
+
+def build_qwen3_fixture(model_dir: Path, hidden: int = 32) -> None:
     import numpy as np
 
-    hidden = 32
     heads = 4
-    head_dim = 8
+    head_dim = hidden // heads
     kv_heads = 1
-    intermediate = 64
-    moe_intermediate = 32
+    intermediate = 2 * hidden
+    moe_intermediate = hidden
     experts = 4
     vocab = 32
     rng = np.random.default_rng(20260731)
@@ -540,12 +554,16 @@ def main() -> int:
         qwen3_dir = temp_dir / "qwen3_moe"
         qwen3_dir.mkdir()
         build_qwen3_fixture(qwen3_dir)
+        qwen3_g128_dir = temp_dir / "qwen3_moe_g128"
+        qwen3_g128_dir.mkdir()
+        build_qwen3_fixture(qwen3_g128_dir, hidden=128)
         qwen35_dir = temp_dir / "qwen35_moe"
         qwen35_dir.mkdir()
         build_qwen35_fixture(qwen35_dir)
         qwen3_package = temp_dir / "tiny_qwen3_moe_w4g32.mollm"
         qwen35_package = temp_dir / "tiny_qwen35_moe_w4g32.mollm"
         qwen3_w8_package = temp_dir / "tiny_qwen3_moe_w8g32.mollm"
+        qwen3_w4g128_package = temp_dir / "tiny_qwen3_moe_w4g128.mollm"
         hash_weights_dir = temp_dir / "hash_weights"
         hash_weights_dir.mkdir()
         hash_package = temp_dir / "tiny_hash_moe_native.mollm"
@@ -556,20 +574,24 @@ def main() -> int:
         for model_dir, package, quant in (
                 (qwen3_dir, qwen3_package, "w4g32"),
                 (qwen35_dir, qwen35_package, "w4g32"),
-                (qwen3_dir, qwen3_w8_package, "w8g32")):
+                (qwen3_dir, qwen3_w8_package, "w8g32"),
+                (qwen3_g128_dir, qwen3_w4g128_package, "w4g128")):
             subprocess.run(
                 [sys.executable, str(converter), str(model_dir), str(package),
                  quant], check=True, env=environment,
                 cwd=str(converter.parent.parent))
             if quant == "w4g32":
                 assert_has_bg32_weight(package)
+            elif quant == "w4g128":
+                assert_has_bg128_weight(package)
             else:
                 assert_has_int8_weight(package)
         runner_environment = environment.copy()
         runner_environment["MOLLM_CUDA_PROFILE"] = "1"
         completed = subprocess.run(
             [str(runner), str(qwen3_package), str(qwen35_package),
-             str(qwen3_w8_package), str(hash_package)],
+             str(qwen3_w8_package), str(qwen3_w4g128_package),
+             str(hash_package)],
             check=False, env=runner_environment, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(completed.stdout, end="")

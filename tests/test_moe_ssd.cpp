@@ -71,7 +71,7 @@ int main() {
     // a source without a duplicate scale sidecar and expose a tensor that
     // dispatches through the embedded-scale kernels.
     const std::string bg128_path = "/tmp/mollm_test_moe_ssd_bg128.bin";
-    if (matmul_int4_q4dot_kernel_available()) {
+    {
         constexpr size_t block_bytes = 544;
         std::vector<uint8_t> bg128_contents(2 * block_bytes);
         {

@@ -78,7 +78,7 @@ Apple M5 Pro 上当前的纯 CPU 实验结果：
 | Qwen3 dense text models | FP16、W8、W4 |
 | Qwen3-30B-A3B MoE | 仅文本 W4 路径 |
 | Qwen3.6-35B-A3B MoE | 仅文本 W4 路径 |
-| Qwen3.5-122B-A10B MoE | CPU W4，支持 SSD expert offload |
+| Qwen3.5-122B-A10B MoE | CPU 与实验性 CUDA W4，支持 SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16、W8、W4、混合 W4；实验性单图视觉输入 |
 | Youtu-LLM-2B | FP16、W8、W4、混合 W4 |
 | RWKV7 | 官方 `.pth` 转换；FP16、W8、混合 W4；循环式 CPU/CUDA prefill/decode |

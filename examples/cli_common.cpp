@@ -299,7 +299,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
     std::printf("  --device <cpu|metal|cuda> Compute backend (GPU backends require their build option)\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
-    std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache; pins dense weights by default\n");
+    std::printf("  --ssd-cache-mb <int>    Host MoE SSD cache; pins dense weights by default\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --ssd-cross-layer-prefetch  Next-layer gate prefetch (default with global cache)\n");
     std::printf("  --no-ssd-cross-layer-prefetch  Disable next-layer gate prefetch\n");

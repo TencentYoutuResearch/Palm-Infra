@@ -61,7 +61,7 @@ void print_usage(const char* argv0) {
                 default_worker_threads());
     std::printf("  --device <cpu|metal|cuda>  Compute backend (default: cpu)\n");
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
-    std::printf("  --ssd-cache-mb <int>  CPU MoE SSD cache capacity\n");
+    std::printf("  --ssd-cache-mb <int>  Host MoE SSD cache capacity\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --metal-ssd-full      Experimental full-Metal SSD decode\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");

@@ -490,8 +490,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                               spec.cols % 128 == 0) ||
                              ((spec.flags & MappedFile::FLAG_INT4_BG32) != 0 &&
                               spec.group_size == 32 &&
-                              spec.cols % 32 == 0)) &&
-                            matmul_int4_q4dot_kernel_available();
+                              spec.cols % 32 == 0));
                         spec.scales_offset =
                             !uses_embedded_scales && scales_bytes
                                 ? ph.w_off + weight_offset + scales_offset

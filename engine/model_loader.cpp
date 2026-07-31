@@ -973,7 +973,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                     fprintf(
                         stderr,
                         "Engine: CUDA SSD expert streaming enabled; selected "
-                        "MXFP4 experts use compact device scratch\n");
+                        "quantized experts use compact device scratch\n");
                 } else {
                     fprintf(
                         stderr,

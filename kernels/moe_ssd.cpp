@@ -215,8 +215,7 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
         (((spec.flags & MappedFile::FLAG_INT4_BG128) != 0 &&
           spec.group_size == 128 && spec.cols % 128 == 0) ||
          ((spec.flags & MappedFile::FLAG_INT4_BG32) != 0 &&
-          spec.group_size == 32 && spec.cols % 32 == 0)) &&
-        matmul_int4_q4dot_kernel_available();
+          spec.group_size == 32 && spec.cols % 32 == 0));
     if ((spec.precision == Precision::INT8 ||
          spec.precision == Precision::INT4 ||
          spec.precision == Precision::MXFP4) &&
