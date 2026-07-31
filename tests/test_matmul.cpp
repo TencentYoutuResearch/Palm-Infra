@@ -8,6 +8,11 @@
 #include <cstring>
 #include <vector>
 
+extern "C" {
+long long mollm_q8_quant_a_calls();
+void mollm_reset_pack_counters();
+}
+
 static int failures = 0;
 
 #define CHECK(cond, msg) do { \
@@ -1432,14 +1437,33 @@ int main() {
         uint8_t* q4_vnni = nullptr;
         PreparedWeight prepared;
         if (mollm::cpu::capabilities().x86_avx512_vnni) {
+            B.is_q4_g32_packed = true;
+            Tensor load_prepared = B;
+            PackedWeightMap packed_weights;
+            PreparedWeightMap prepared_weights;
+            prepare_matmul_weight(
+                load_prepared, "test_x86_w4_activation_weight", q4_g32,
+                packed_weights, prepared_weights, false, false);
+            const bool q8_activations =
+                mollm::cpu::capabilities().x86_w4_q8_activations;
+            CHECK((load_prepared.prepared_weight != nullptr) == q8_activations,
+                  "INT4 BG32 load-time sidecar follows activation policy");
+
             q4_vnni = pack_b_q4_vnni_full(q4_g32, N, K);
             const size_t vnni_bytes = pack_b_q4_vnni_bytes(N, K);
             prepared.layout(WeightLayout::X86_VNNI_Q4_G32)
                 .assign(q4_vnni, q4_vnni + vnni_bytes);
             B.prepared_weight = &prepared;
+            mollm_reset_pack_counters();
             kernel_matmul_fp32(A, B, C);
-            CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
-                  "INT4 Q8-dot GEMM BG32 x86 VNNI reference");
+            const long long q8_quant_calls = mollm_q8_quant_a_calls();
+            CHECK(q8_activations ? q8_quant_calls > 0 : q8_quant_calls == 0,
+                  "INT4 BG32 x86 activation policy selects expected path");
+            CHECK(check_approx(c_data.data(), ref_c.data(), M * N,
+                               q8_activations ? 2e-2f : 1e-4f),
+                  q8_activations
+                      ? "INT4 W4A8 GEMM BG32 x86 VNNI reference"
+                      : "INT4 weight-only GEMM BG32 x86 reference");
         }
 
         Tensor B_direct = Tensor::create(Precision::INT4, MemoryType::EXTERNAL,

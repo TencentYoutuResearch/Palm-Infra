@@ -64,6 +64,10 @@ X86Dispatch detect_dispatch() {
         !cap_at_avx2 &&
         (!requested || std::strcmp(requested, "auto") == 0 ||
          std::strcmp(requested, "avx512") == 0);
+    const char* w4_activation =
+        std::getenv("MOLLM_X86_W4_ACTIVATION");
+    const bool request_w4_q8 =
+        w4_activation && std::strcmp(w4_activation, "q8") == 0;
 
     if (!force_scalar && allow_avx512 && has_avx512 && has_fma) {
         dispatch.caps.x86_avx2 = has_avx2;
@@ -72,15 +76,17 @@ X86Dispatch detect_dispatch() {
         dispatch.caps.x86_avx512 = true;
         dispatch.caps.x86_avx512_vnni =
             has_avx512_bw && has_avx512_vl && has_avx512_vnni;
+        dispatch.caps.x86_w4_q8_activations =
+            dispatch.caps.x86_avx512_vnni && request_w4_q8;
         dispatch.caps.x86_isa = X86Isa::AVX512;
         dispatch.name = "x86-avx512";
         dispatch.fp32 = x86::matmul_fp32_avx512_range;
         if (has_f16c)
             dispatch.fp16 = x86::matmul_fp16_avx512_range;
         dispatch.int4 = x86::matmul_int4_bg_avx512_range;
-        if (dispatch.caps.x86_avx512_vnni)
+        if (dispatch.caps.x86_w4_q8_activations)
             dispatch.int4_vnni = x86::matmul_int4_bg32_vnni_range;
-        if (dispatch.caps.x86_avx512_vnni)
+        if (dispatch.caps.x86_w4_q8_activations)
             dispatch.quantize_vnni = x86::quantize_q8_vnni_range;
         dispatch.int8 = x86::matmul_int8_avx512_range;
         return dispatch;

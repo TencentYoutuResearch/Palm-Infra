@@ -435,6 +435,17 @@ static BenchResult run_bench(const BenchConfig& cfg) {
             B.sparse_data = b_int4_sparse_data;
         }
     }
+    PackedWeightMap benchmark_packed_weights;
+    PreparedWeightMap benchmark_prepared_weights;
+    if (is_int4 && B.is_q4_g32_packed &&
+        mollm::cpu::capabilities().x86_w4_q8_activations) {
+        // Mirror engine load-time preparation so this benchmark measures the
+        // production VNNI W4A8 path when it is explicitly selected.
+        prepare_matmul_weight(
+            B, "bench_int4_weight", B.q4_g32_data,
+            benchmark_packed_weights, benchmark_prepared_weights,
+            false, false);
+    }
     Tensor C = Tensor::create(Precision::FP32, MemoryType::OWNED, N, M, 1, 1, c_data);
 
     ThreadPool pool(cfg.num_threads);
@@ -511,6 +522,12 @@ int main(int argc, char** argv) {
                     cfg.use_int4 ? "INT4" :
                     cfg.use_int8 ? "INT8" :
                     cfg.use_fp16 ? "FP16" : "FP32");
+        if (cfg.use_int4) {
+            std::printf(
+                "  w4_activation=%s\n",
+                mollm::cpu::capabilities().x86_w4_q8_activations
+                    ? "q8" : "fp32");
+        }
     }
     std::printf("  warmup=%d repeat=%d\n", cfg.warmup, cfg.repeat);
     if (cfg.sparse_a) std::printf("  sparse_a=1 density=%d%%\n", cfg.density_pct);

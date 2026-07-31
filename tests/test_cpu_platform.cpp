@@ -36,6 +36,11 @@ int main() {
         std::fprintf(stderr, "AVX-512 VNNI selected without AVX-512\n");
         return 1;
     }
+    if (caps.x86_w4_q8_activations && !caps.x86_avx512_vnni) {
+        std::fprintf(stderr,
+                     "W4 Q8 activations selected without AVX-512 VNNI\n");
+        return 1;
+    }
 
     const char* requested = std::getenv("MOLLM_X86_ISA");
     if ((std::getenv("MOLLM_X86_DISABLE_AVX2") ||
@@ -47,6 +52,21 @@ int main() {
     if (requested && std::strcmp(requested, "avx2") == 0 &&
         caps.x86_avx512) {
         std::fprintf(stderr, "AVX2 cap incorrectly selected AVX-512\n");
+        return 1;
+    }
+    const char* w4_activation =
+        std::getenv("MOLLM_X86_W4_ACTIVATION");
+    const bool requested_w4_q8 =
+        w4_activation && std::strcmp(w4_activation, "q8") == 0;
+    if (!requested_w4_q8 && caps.x86_w4_q8_activations) {
+        std::fprintf(stderr,
+                     "W4 Q8 activations enabled without explicit opt-in\n");
+        return 1;
+    }
+    if (requested_w4_q8 && caps.x86_avx512_vnni &&
+        !caps.x86_w4_q8_activations) {
+        std::fprintf(stderr,
+                     "W4 Q8 opt-in ignored on selected AVX-512 VNNI\n");
         return 1;
     }
     const char* arm_requested = std::getenv("MOLLM_ARM_ISA");

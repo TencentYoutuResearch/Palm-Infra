@@ -16,9 +16,9 @@ mobile-oriented LLM inference engine.
 ```
 
 `mollm` is a small C++ LLM runtime for ARM and x86 CPUs, with experimental
-Apple Metal support. It converts supported Hugging Face model directories into
-one `.mollm` file containing the graph, weights, tokenizer, and chat template,
-then runs that package directly.
+Apple Metal support. It converts supported Hugging Face model directories and
+native checkpoints such as RWKV7 `.pth` into one `.mollm` file containing the
+graph, weights, tokenizer, and chat template, then runs that package directly.
 
 The current focus is fast local inference on Apple Silicon and other modern ARM
 CPUs. FP16 uses NEON FP16FML kernels; quantized CPU models use weight-only int8
@@ -29,6 +29,11 @@ widest supported tier without exposing newer instructions to older CPUs.
 Set `MOLLM_X86_ISA=scalar|avx2|avx512|auto` to cap the selected tier for
 testing or machine-specific tuning. The legacy
 `MOLLM_X86_DISABLE_AVX2=1` scalar override remains supported.
+Packed W4 uses FP32 activations by default, preserving weight-only
+quantization semantics across the scalar, AVX2, and AVX-512 providers. On
+AVX-512 VNNI hosts, `MOLLM_X86_W4_ACTIVATION=q8` explicitly enables the
+faster, approximate W4A8 prefill path; it adds one Q8 activation scale per 32
+values and can change model outputs.
 
 ## Now it runs a 122B model on a 48GB Mac (Or even 16GB)
 

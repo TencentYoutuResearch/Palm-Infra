@@ -13,9 +13,14 @@ mobile-oriented LLM inference engine.
 |_| |_| |_|\___/|_|_|_| |_| |_|
 ```
 
-`mollm` 是面向 ARM 和 x86 CPU 的轻量 C++ LLM 推理引擎，并提供实验性的 Apple Metal 支持。它将已支持的 Hugging Face 模型目录转换成单个 `.mollm` 文件，其中包含计算图、权重、tokenizer 与对话模板，并可直接运行。
+`mollm` 是面向 ARM 和 x86 CPU 的轻量 C++ LLM 推理引擎，并提供实验性的 Apple Metal 支持。它将已支持的 Hugging Face 模型目录和 RWKV7 `.pth` 等原生 checkpoint 转换成单个 `.mollm` 文件，其中包含计算图、权重、tokenizer 与对话模板，并可直接运行。
 
 项目当前聚焦 Apple Silicon 和其他现代 ARM 处理器上的高性能本地推理：FP16 使用 NEON FP16FML kernel；CPU 量化模型使用针对 ARM dot-product 指令优化的 weight-only int8/int4 kernel。Linux x86_64 将 scalar、AVX2/FMA/F16C 与 AVX-512 provider 编译为相互隔离的单元，覆盖 FP32、FP16、W8 以及 packed W4G32/W4G128 matmul；启动时通过 CPUID 选择当前 CPU 支持的最宽指令集，旧 CPU 不会执行新指令。设置 `MOLLM_X86_ISA=scalar|avx2|avx512|auto` 可以限制分派层级，便于正确性验证或针对具体机器调优；原有的 `MOLLM_X86_DISABLE_AVX2=1` scalar override 仍然可用。
+
+packed W4 默认保留 FP32 activation，因此 scalar、AVX2 和 AVX-512 都保持
+weight-only 量化语义。在支持 AVX-512 VNNI 的机器上，可以显式设置
+`MOLLM_X86_W4_ACTIVATION=q8` 启用更快但近似的 W4A8 prefill 路径；它每
+32 个 activation 使用一个 Q8 scale，可能改变模型输出。
 
 ## 现在，48GB Mac 也能运行 122B 模型
 

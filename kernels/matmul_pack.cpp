@@ -251,7 +251,7 @@ void maybe_pack_int4_weight(Tensor& weight, const std::string& key,
                             const void* weight_data,
                             PackedWeightMap& packed_weights,
                             PreparedWeightMap& prepared_weights) {
-    if (mollm::cpu::capabilities().x86_avx512_vnni &&
+    if (mollm::cpu::capabilities().x86_w4_q8_activations &&
         is_2d_linear_weight(weight) && weight.prec == Precision::INT4 &&
         weight.is_q4_g32_packed && weight_data && weight.group_size == 32 &&
         weight.shape[1] > 0 && (weight.shape[1] % 32) == 0 &&

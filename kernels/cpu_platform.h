@@ -61,6 +61,10 @@ struct Capabilities {
     bool x86_f16c = false;
     bool x86_avx512 = false;
     bool x86_avx512_vnni = false;
+    // Effective W4 activation policy. Unlike x86_avx512_vnni, this is not a
+    // hardware capability: it is true only when the approximate Q8 activation
+    // path was explicitly requested and can be executed by the selected ISA.
+    bool x86_w4_q8_activations = false;
     X86Isa x86_isa = X86Isa::SCALAR;
 };
 

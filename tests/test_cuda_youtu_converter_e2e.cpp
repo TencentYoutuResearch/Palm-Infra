@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -119,8 +120,9 @@ bool run(const char* package, Device device, InferenceResult& result) {
 }
 
 bool close_enough(const std::vector<float>& actual,
-                  const std::vector<float>& expected, float tolerance,
-                  const char* label, bool require_same_top1 = false) {
+                  const std::vector<float>& expected, float max_tolerance,
+                  float rms_tolerance, const char* label,
+                  bool require_same_top1 = false) {
     if (actual.size() != expected.size() || actual.empty())
         return false;
     float maximum = 0.0f;
@@ -137,20 +139,23 @@ bool close_enough(const std::vector<float>& actual,
     const auto expected_top1 = static_cast<size_t>(
         std::max_element(expected.begin(), expected.end()) - expected.begin());
     std::printf(
-        "tiny Youtu %s CPU/CUDA max abs error: %.7f, RMS: %.7g",
+        "Youtu %s CPU/CUDA max abs error: %.7f, RMS: %.7g",
         label, maximum, rms);
     if (require_same_top1)
         std::printf(", top1: %zu/%zu", actual_top1, expected_top1);
     std::printf("\n");
-    return maximum <= tolerance &&
+    return maximum <= max_tolerance && rms <= rms_tolerance &&
         (!require_same_top1 || actual_top1 == expected_top1);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: %s <youtu.mollm>\n", argv[0]);
+    const bool real_model =
+        argc == 3 && std::strcmp(argv[2], "--real-model") == 0;
+    if (argc < 2 || argc > 3 || (argc == 3 && !real_model)) {
+        std::fprintf(
+            stderr, "usage: %s <youtu.mollm> [--real-model]\n", argv[0]);
         return 2;
     }
 
@@ -172,23 +177,33 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const float hidden_max_tolerance = real_model ? 2.5e-2f : 2e-3f;
+    const float hidden_rms_tolerance = real_model ? 5e-3f : 2e-3f;
+    const float logits_max_tolerance = real_model ? 8e-2f : 2e-4f;
+    const float logits_rms_tolerance = real_model ? 2e-2f : 2e-4f;
     bool valid = close_enough(
-        cuda.prefill_hidden, cpu.prefill_hidden, 2e-3f,
+        cuda.prefill_hidden, cpu.prefill_hidden,
+        hidden_max_tolerance, hidden_rms_tolerance,
         "prefill hidden");
     valid &= close_enough(
-        cuda.prefill_logits, cpu.prefill_logits, 2e-4f,
+        cuda.prefill_logits, cpu.prefill_logits,
+        logits_max_tolerance, logits_rms_tolerance,
         "prefill logits", true);
     valid &= close_enough(
-        cuda.first_decode_hidden, cpu.first_decode_hidden, 2e-3f,
+        cuda.first_decode_hidden, cpu.first_decode_hidden,
+        hidden_max_tolerance, hidden_rms_tolerance,
         "first decode hidden");
     valid &= close_enough(
-        cuda.first_decode_logits, cpu.first_decode_logits, 2e-4f,
+        cuda.first_decode_logits, cpu.first_decode_logits,
+        logits_max_tolerance, logits_rms_tolerance,
         "first decode logits", true);
     valid &= close_enough(
-        cuda.second_decode_hidden, cpu.second_decode_hidden, 2e-3f,
+        cuda.second_decode_hidden, cpu.second_decode_hidden,
+        hidden_max_tolerance, hidden_rms_tolerance,
         "second decode hidden");
     valid &= close_enough(
-        cuda.second_decode_logits, cpu.second_decode_logits, 2e-4f,
+        cuda.second_decode_logits, cpu.second_decode_logits,
+        logits_max_tolerance, logits_rms_tolerance,
         "second decode logits", true);
     if (!valid)
         return 1;

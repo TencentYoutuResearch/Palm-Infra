@@ -425,6 +425,16 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_elementwise   tests/test_elementwise.cpp)
     add_mollm_test(test_layout        tests/test_layout.cpp)
     add_mollm_test(test_matmul        tests/test_matmul.cpp)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        # CPU dispatch is cached once per process, so exercise the approximate
+        # W4A8 opt-in in separate test processes from the exact default.
+        add_test(NAME test_cpu_platform_x86_w4_q8 COMMAND test_cpu_platform)
+        add_test(NAME test_matmul_x86_w4_q8 COMMAND test_matmul)
+        set_tests_properties(
+            test_cpu_platform_x86_w4_q8 test_matmul_x86_w4_q8
+            PROPERTIES ENVIRONMENT "MOLLM_X86_W4_ACTIVATION=q8"
+                       LABELS "x86;w4-q8")
+    endif()
     add_mollm_test(test_moe_routing  tests/test_moe_routing.cpp)
     add_mollm_test(test_moe           tests/test_moe.cpp)
     add_mollm_test(test_moe_ssd       tests/test_moe_ssd.cpp)

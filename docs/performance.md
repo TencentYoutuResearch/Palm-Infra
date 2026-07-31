@@ -12,6 +12,12 @@ selected tier; `MOLLM_X86_DISABLE_AVX2=1` remains a compatible scalar override.
 This keeps AVX instructions out of the baseline object code and allows all
 three paths to be tested from one binary.
 
+W4 inference uses exact FP32 activations by default. The optional
+`MOLLM_X86_W4_ACTIVATION=q8` policy enables an approximate AVX-512 VNNI W4A8
+path for `M >= 4` W4G32 matmuls. It quantizes each 32-value activation group,
+so it is a performance/accuracy choice rather than another ISA tier. Decode
+GEMV (`M=1`) remains weight-only under either policy.
+
 The table below uses an AMD Ryzen 9 9950X, eight threads, `M=1`, `K=2048`,
 `N=6144`, five warmups, 30 measured iterations, and average throughput.
 
@@ -32,6 +38,20 @@ A Qwen3.5-0.8B W4G32 `pp256 + tg64` run at 16 threads reaches
 greedy generation check produced byte-identical text across scalar, AVX2, and
 AVX-512. These are development measurements rather than a cross-runtime
 comparison.
+
+The activation-policy cost was measured separately on Youtu-LLM-2B W4G32,
+also on the Ryzen 9 9950X with 16 threads and `pp256 + tg64`. This is a single
+development run per policy:
+
+| W4 activation policy | Prefill | Decode | CPU sidecar |
+|---|---:|---:|---:|
+| FP32 (default, weight-only) | 209.3 tok/s | 48.7 tok/s | 0 MB |
+| Q8 (explicit VNNI opt-in) | 586.0 tok/s | 48.7 tok/s | 849.35 MB |
+
+The Q8 policy makes prefill 2.80x faster in this run, while decode is unchanged
+because it uses `M=1`. The default favors numerical semantics and avoids the
+additional VNNI weight sidecar; deployments can opt into Q8 when prefill
+throughput is more important.
 
 ### Apple Silicon
 
