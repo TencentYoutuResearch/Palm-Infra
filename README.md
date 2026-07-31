@@ -377,13 +377,15 @@ cmake --build build_cuda -j
 The CUDA backend is still a correctness-first implementation. Graph outputs
 and persistent state use device-addressable managed storage, FP16/FP32 linear
 layers run through cuBLAS, and package-native W4G32/W4G128 weights are
-dequantized to FP16 device weights at load time. RMSNorm, dense elementwise
-operations, common activations, SwiGLU, zero-copy views, and the decode lm_head
-also stay on CUDA. Operators not yet implemented natively synchronize and use
-the CPU reference dispatcher over the managed buffers. Set
-`MOLLM_CUDA_PROFILE=1` to print native/fallback operator counts. Attention,
-RoPE, and some strided layout paths still fall back, so this is not yet a
-performance-complete CUDA backend.
+dequantized to FP16 device weights at load time. RMSNorm and fused norm paths,
+dense elementwise operations, common activations, SwiGLU, RoPE, strided layout
+materialization, FP32 cached SDPA, zero-copy views, and the decode lm_head also
+stay on CUDA. Operators not yet implemented natively synchronize and use the
+CPU reference dispatcher over the managed buffers. Set
+`MOLLM_CUDA_PROFILE=1` to print native/fallback operator counts. Recurrent
+Gated DeltaNet/short-convolution operators and several specialized model
+families still fall back, so this is not yet a performance-complete CUDA
+backend.
 
 ## Local HTTP server
 

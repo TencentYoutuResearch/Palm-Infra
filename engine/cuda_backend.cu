@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 
 #include "engine/cuda_backend.h"
+#include "engine/engine.h"
 
 #include "kernels/activations.h"
 #include "kernels/quant_layouts.h"
@@ -9,6 +10,7 @@
 #include <cublas_v2.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -96,6 +98,29 @@ __global__ void sigmoid_mul_cuda(const float* value, const float* gate,
         output[index] = value[index] / (1.0f + expf(-gate[index]));
 }
 
+__global__ void sigmoid_mul_strided_cuda(
+    const float* value, const float* gate, float* output, size_t count,
+    int64_t d0, int64_t d1, int64_t d2,
+    size_t value_s0, size_t value_s1, size_t value_s2, size_t value_s3,
+    size_t gate_s0, size_t gate_s1, size_t gate_s2, size_t gate_s3) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    size_t remaining = index;
+    const size_t i0 = remaining % static_cast<size_t>(d0);
+    remaining /= static_cast<size_t>(d0);
+    const size_t i1 = remaining % static_cast<size_t>(d1);
+    remaining /= static_cast<size_t>(d1);
+    const size_t i2 = remaining % static_cast<size_t>(d2);
+    const size_t i3 = remaining / static_cast<size_t>(d2);
+    const float v = value[i0 * value_s0 + i1 * value_s1 + i2 * value_s2 +
+                          i3 * value_s3];
+    const float g = gate[i0 * gate_s0 + i1 * gate_s1 + i2 * gate_s2 +
+                         i3 * gate_s3];
+    output[index] = v / (1.0f + expf(-g));
+}
+
 __global__ void unary_cuda(const float* input, float* output, size_t count,
                            int operation) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -160,6 +185,248 @@ __global__ void rms_norm_cuda(const float* input, const float* weight,
             source[column] * inverse * weight[column];
 }
 
+__global__ void add_rms_norm_cuda(
+    float* residual, const float* update, const float* weight, float* output,
+    int width, int rows, size_t residual_row_stride,
+    size_t update_row_stride, size_t output_row_stride, float epsilon) {
+    const int row = blockIdx.x;
+    if (row >= rows)
+        return;
+    float sum = 0.0f;
+    float* residual_row = residual + static_cast<size_t>(row) *
+        residual_row_stride;
+    const float* update_row = update + static_cast<size_t>(row) *
+        update_row_stride;
+    for (int column = threadIdx.x; column < width; column += blockDim.x) {
+        const float value = residual_row[column] + update_row[column];
+        residual_row[column] = value;
+        sum += value * value;
+    }
+    __shared__ float reduction[256];
+    reduction[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inverse = rsqrtf(reduction[0] / width + epsilon);
+    float* output_row = output + static_cast<size_t>(row) *
+        output_row_stride;
+    for (int column = threadIdx.x; column < width; column += blockDim.x)
+        output_row[column] = residual_row[column] * inverse * weight[column];
+}
+
+__global__ void contiguous_cuda(
+    const float* input, float* output, size_t count,
+    int64_t d0, int64_t d1, int64_t d2,
+    size_t s0, size_t s1, size_t s2, size_t s3) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    size_t remaining = index;
+    const size_t i0 = remaining % static_cast<size_t>(d0);
+    remaining /= static_cast<size_t>(d0);
+    const size_t i1 = remaining % static_cast<size_t>(d1);
+    remaining /= static_cast<size_t>(d1);
+    const size_t i2 = remaining % static_cast<size_t>(d2);
+    const size_t i3 = remaining / static_cast<size_t>(d2);
+    output[index] = input[i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3];
+}
+
+__global__ void rope_cuda(
+    const float* input, const float* cosine, const float* sine,
+    float* output, int feature_dim, int sequence_length, int channels,
+    int shape2, int rope_dim, bool interleave,
+    size_t x_s0, size_t x_s1, size_t x_s2, size_t x_s3,
+    size_t c_s0, size_t c_s1, size_t s_s0, size_t s_s1,
+    size_t o_s0, size_t o_s1, size_t o_s2, size_t o_s3) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    const size_t count = static_cast<size_t>(feature_dim) *
+        sequence_length * channels;
+    if (index >= count)
+        return;
+    size_t remaining = index;
+    const int dimension = static_cast<int>(remaining % feature_dim);
+    remaining /= feature_dim;
+    const int position = static_cast<int>(remaining % sequence_length);
+    const int channel = static_cast<int>(remaining / sequence_length);
+    const int channel2 = channel % shape2;
+    const int channel3 = channel / shape2;
+    const size_t input_base = static_cast<size_t>(position) * x_s1 +
+        static_cast<size_t>(channel2) * x_s2 +
+        static_cast<size_t>(channel3) * x_s3;
+    const size_t output_index = static_cast<size_t>(dimension) * o_s0 +
+        static_cast<size_t>(position) * o_s1 +
+        static_cast<size_t>(channel2) * o_s2 +
+        static_cast<size_t>(channel3) * o_s3;
+    if (dimension >= rope_dim) {
+        output[output_index] =
+            input[input_base + static_cast<size_t>(dimension) * x_s0];
+        return;
+    }
+
+    const int half = rope_dim / 2;
+    const int pair = interleave ? dimension / 2 : dimension % half;
+    const int first = interleave ? pair * 2 : pair;
+    const int second = interleave ? first + 1 : pair + half;
+    const float x0 = input[input_base + static_cast<size_t>(first) * x_s0];
+    const float x1 = input[input_base + static_cast<size_t>(second) * x_s0];
+    const float c = cosine[static_cast<size_t>(position) * c_s1 +
+                           static_cast<size_t>(pair) * c_s0];
+    const float s = sine[static_cast<size_t>(position) * s_s1 +
+                         static_cast<size_t>(pair) * s_s0];
+    const bool first_component = interleave
+        ? (dimension & 1) == 0 : dimension < half;
+    output[output_index] = first_component
+        ? x0 * c - x1 * s : x0 * s + x1 * c;
+}
+
+__global__ void append_kv_cuda(
+    const float* key, const float* value, float* key_cache,
+    float* value_cache, int num_kv_heads, int current_length,
+    int past_length, int max_length, int key_dim, int value_dim,
+    size_t key_position_stride, size_t key_head_stride,
+    size_t value_position_stride, size_t value_head_stride) {
+    const int maximum_dim = max(key_dim, value_dim);
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    const size_t count = static_cast<size_t>(num_kv_heads) *
+        current_length * maximum_dim;
+    if (index >= count)
+        return;
+    size_t remaining = index;
+    const int dimension = static_cast<int>(remaining % maximum_dim);
+    remaining /= maximum_dim;
+    const int position = static_cast<int>(remaining % current_length);
+    const int head = static_cast<int>(remaining / current_length);
+    if (dimension < key_dim) {
+        key_cache[(static_cast<size_t>(head) * max_length + past_length +
+                   position) * key_dim + dimension] =
+            key[static_cast<size_t>(head) * key_head_stride +
+                static_cast<size_t>(position) * key_position_stride +
+                dimension];
+    }
+    if (dimension < value_dim) {
+        value_cache[(static_cast<size_t>(head) * max_length + past_length +
+                     position) * value_dim + dimension] =
+            value[static_cast<size_t>(head) * value_head_stride +
+                  static_cast<size_t>(position) * value_position_stride +
+                  dimension];
+    }
+}
+
+__global__ void sdpa_scores_cuda(
+    const float* query, const float* key, float* scores,
+    const float* mask, int num_heads, int num_kv_heads,
+    int query_length, int key_length, int past_length, int key_dim,
+    int key_capacity, bool cached, bool causal, float scale,
+    size_t query_feature_stride, size_t query_position_stride,
+    size_t query_head_stride, size_t key_feature_stride,
+    size_t key_position_stride, size_t key_head_stride,
+    size_t mask_column_stride, size_t mask_row_stride) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    const size_t count = static_cast<size_t>(num_heads) * query_length *
+        key_length;
+    if (index >= count)
+        return;
+    size_t remaining = index;
+    const int key_position = static_cast<int>(remaining % key_length);
+    remaining /= key_length;
+    const int query_position = static_cast<int>(remaining % query_length);
+    const int head = static_cast<int>(remaining / query_length);
+    const int key_head = head / (num_heads / num_kv_heads);
+    const float* query_row = query +
+        static_cast<size_t>(head) * query_head_stride +
+        static_cast<size_t>(query_position) * query_position_stride;
+    const float* key_row = cached
+        ? key + (static_cast<size_t>(key_head) * key_capacity +
+                 key_position) * key_dim
+        : key + static_cast<size_t>(key_head) * key_head_stride +
+            static_cast<size_t>(key_position) * key_position_stride;
+    float dot = 0.0f;
+    for (int dimension = 0; dimension < key_dim; ++dimension)
+        dot += query_row[static_cast<size_t>(dimension) *
+                         query_feature_stride] *
+            key_row[static_cast<size_t>(dimension) * key_feature_stride];
+    float score = dot * scale;
+    if (mask) {
+        score += mask[static_cast<size_t>(query_position) * mask_row_stride +
+                      static_cast<size_t>(key_position) *
+                          mask_column_stride];
+    } else if (causal && key_position > past_length + query_position) {
+        score = -FLT_MAX;
+    }
+    scores[index] = score;
+}
+
+__global__ void sdpa_output_cuda(
+    const float* scores, const float* value, float* output,
+    int num_heads, int num_kv_heads, int query_length, int key_length,
+    int value_dim, int value_capacity, bool cached,
+    size_t value_feature_stride, size_t value_position_stride,
+    size_t value_head_stride, size_t output_feature_stride,
+    size_t output_position_stride, size_t output_head_stride) {
+    const int row = blockIdx.x;
+    const int head = row / query_length;
+    const int query_position = row % query_length;
+    if (head >= num_heads)
+        return;
+    const int key_head = head / (num_heads / num_kv_heads);
+    const float* score_row = scores + static_cast<size_t>(row) * key_length;
+    __shared__ float reduction[256];
+    float local_maximum = -FLT_MAX;
+    for (int position = threadIdx.x; position < key_length;
+         position += blockDim.x)
+        local_maximum = fmaxf(local_maximum, score_row[position]);
+    reduction[threadIdx.x] = local_maximum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            reduction[threadIdx.x] = fmaxf(
+                reduction[threadIdx.x], reduction[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float maximum = reduction[0];
+    float local_sum = 0.0f;
+    for (int position = threadIdx.x; position < key_length;
+         position += blockDim.x)
+        local_sum += expf(score_row[position] - maximum);
+    reduction[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inverse_sum = reduction[0] > 0.0f
+        ? 1.0f / reduction[0] : 0.0f;
+    for (int dimension = threadIdx.x; dimension < value_dim;
+         dimension += blockDim.x) {
+        float result = 0.0f;
+        for (int position = 0; position < key_length; ++position) {
+            const float probability =
+                expf(score_row[position] - maximum) * inverse_sum;
+            const float* value_row = cached
+                ? value + (static_cast<size_t>(key_head) * value_capacity +
+                           position) * value_dim
+                : value + static_cast<size_t>(key_head) * value_head_stride +
+                    static_cast<size_t>(position) * value_position_stride;
+            result += probability *
+                value_row[static_cast<size_t>(dimension) *
+                          value_feature_stride];
+        }
+        output[static_cast<size_t>(head) * output_head_stride +
+               static_cast<size_t>(query_position) *
+                   output_position_stride +
+               static_cast<size_t>(dimension) * output_feature_stride] =
+            result;
+    }
+}
+
 int signed_nibble(uint8_t value) {
     const int nibble = value & 0x0f;
     return nibble >= 8 ? nibble - 16 : nibble;
@@ -199,6 +466,10 @@ struct CudaBackend::Impl {
     size_t activation_fp16_bytes = 0;
     void* output = nullptr;
     size_t output_bytes = 0;
+    void* attention_scores = nullptr;
+    size_t attention_scores_bytes = 0;
+    void* norm_scratch = nullptr;
+    size_t norm_scratch_bytes = 0;
 
     ~Impl() {
         if (cublas)
@@ -216,6 +487,10 @@ struct CudaBackend::Impl {
             cudaFree(activation_fp16);
         if (output)
             cudaFree(output);
+        if (attention_scores)
+            cudaFree(attention_scores);
+        if (norm_scratch)
+            cudaFree(norm_scratch);
         if (std::getenv("MOLLM_CUDA_PROFILE")) {
             std::fprintf(stderr, "\nCudaBackend operator coverage:\n");
             for (const auto& entry : native_ops)
@@ -399,6 +674,13 @@ const T* device_pointer_const(const Tensor& tensor) {
 
 bool fp32_contiguous(const Tensor& tensor) {
     return tensor.prec == Precision::FP32 && tensor.is_contiguous();
+}
+
+bool same_shape(const Tensor& lhs, const Tensor& rhs) {
+    for (int dimension = 0; dimension < 4; ++dimension)
+        if (lhs.shape[dimension] != rhs.shape[dimension])
+            return false;
+    return true;
 }
 
 }  // namespace
@@ -652,6 +934,229 @@ void CudaBackend::dispatch(const GraphNode& node,
         return;
     }
 
+    if ((node.op_type == OpType::CONTIGUOUS ||
+         node.op_type == OpType::RESHAPE) &&
+        !inputs.empty() && inputs[0] && output &&
+        inputs[0]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32 && output->is_contiguous()) {
+        const Tensor& source = *inputs[0];
+        const float* input = device_pointer_const<float>(source);
+        float* destination = device_pointer<float>(*output);
+        const size_t count = static_cast<size_t>(output->nelements());
+        if (input && destination && source.nelements() == output->nelements()) {
+            contiguous_cuda<<<static_cast<unsigned>((count + threads - 1) /
+                                                    threads), threads>>>(
+                input, destination, count, source.shape[0], source.shape[1],
+                source.shape[2], source.stride[0] / sizeof(float),
+                source.stride[1] / sizeof(float),
+                source.stride[2] / sizeof(float),
+                source.stride[3] / sizeof(float));
+            if (!report_cuda(cudaGetLastError(), "contiguous_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if (node.op_type == OpType::ROTARY_EMBED && inputs.size() >= 3 &&
+        inputs[0] && inputs[1] && inputs[2] && output &&
+        inputs[0]->prec == Precision::FP32 &&
+        inputs[1]->prec == Precision::FP32 &&
+        inputs[2]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32) {
+        const Tensor& source = *inputs[0];
+        const Tensor& cosine = *inputs[1];
+        const Tensor& sine = *inputs[2];
+        const float* input = device_pointer_const<float>(source);
+        const float* cos_data = device_pointer_const<float>(cosine);
+        const float* sin_data = device_pointer_const<float>(sine);
+        float* destination = device_pointer<float>(*output);
+        const int feature_dim = static_cast<int>(source.shape[0]);
+        const int sequence_length = static_cast<int>(source.shape[1]);
+        const int channels = static_cast<int>(source.shape[2] * source.shape[3]);
+        const int rope_dim = graph_params::get_i32(node.params, 0, 64);
+        const bool interleave =
+            graph_params::get_i32(node.params, 1, 1) != 0;
+        const size_t count = static_cast<size_t>(source.nelements());
+        if (input && cos_data && sin_data && destination &&
+            rope_dim > 0 && rope_dim <= feature_dim && rope_dim % 2 == 0 &&
+            cosine.shape[0] >= rope_dim / 2 &&
+            sine.shape[0] >= rope_dim / 2) {
+            rope_cuda<<<static_cast<unsigned>((count + threads - 1) /
+                                              threads), threads>>>(
+                input, cos_data, sin_data, destination, feature_dim,
+                sequence_length, channels, static_cast<int>(source.shape[2]),
+                rope_dim, interleave,
+                source.stride[0] / sizeof(float),
+                source.stride[1] / sizeof(float),
+                source.stride[2] / sizeof(float),
+                source.stride[3] / sizeof(float),
+                cosine.stride[0] / sizeof(float),
+                cosine.stride[1] / sizeof(float),
+                sine.stride[0] / sizeof(float),
+                sine.stride[1] / sizeof(float),
+                output->stride[0] / sizeof(float),
+                output->stride[1] / sizeof(float),
+                output->stride[2] / sizeof(float),
+                output->stride[3] / sizeof(float));
+            if (!report_cuda(cudaGetLastError(), "rope_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if ((node.op_type == OpType::SDPA ||
+         node.op_type == OpType::SDPA_MLA) &&
+        inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] &&
+        output && inputs[0]->prec == Precision::FP32 &&
+        inputs[1]->prec == Precision::FP32 &&
+        inputs[2]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32) {
+        const Tensor& query = *inputs[0];
+        const Tensor& current_key = *inputs[1];
+        const Tensor& current_value = *inputs[2];
+        const Tensor* mask = inputs.size() > 3 && inputs[3] &&
+                inputs[3]->data && inputs[3]->nelements() > 0
+            ? inputs[3] : nullptr;
+        const Tensor* key_cache = inputs.size() > 4 && inputs[4] &&
+                inputs[4]->data
+            ? inputs[4] : nullptr;
+        const Tensor* value_cache = inputs.size() > 5 && inputs[5] &&
+                inputs[5]->data
+            ? inputs[5] : nullptr;
+        const int cache_mode = graph_params::get_i32(node.params, 0, 2);
+        const bool causal = graph_params::get_i32(node.params, 1, 1) != 0;
+        const int num_heads = graph_params::get_i32(
+            node.params, 2, static_cast<int>(query.shape[2]));
+        const int num_kv_heads = graph_params::get_i32(
+            node.params, 3, static_cast<int>(current_key.shape[2]));
+        const int key_dim = graph_params::get_i32(
+            node.params, 4, static_cast<int>(query.shape[0]));
+        const int value_dim = graph_params::get_i32(
+            node.params, 5, static_cast<int>(current_value.shape[0]));
+        float scale = graph_params::get_f32(node.params, 0, 0.0f);
+        if (scale == 0.0f)
+            scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
+        const int query_length = static_cast<int>(query.shape[1]);
+        const int current_length = static_cast<int>(current_key.shape[1]);
+        int past_length = 0;
+        int key_capacity = current_length;
+        bool cached = false;
+        const float* key_data = device_pointer_const<float>(current_key);
+        const float* value_data = device_pointer_const<float>(current_value);
+        float* key_cache_data = nullptr;
+        float* value_cache_data = nullptr;
+        if (cache_mode == 2 && key_cache && value_cache &&
+            key_cache->prec == Precision::FP32 &&
+            value_cache->prec == Precision::FP32 &&
+            key_cache->device_data && value_cache->device_data) {
+            const auto* metadata = cache_meta(
+                static_cast<const uint8_t*>(key_cache->data) +
+                key_cache->device_offset);
+            past_length = static_cast<int>(metadata->current_seq_len);
+            key_capacity = static_cast<int>(metadata->max_seq_len);
+            key_cache_data = reinterpret_cast<float*>(
+                static_cast<uint8_t*>(key_cache->device_data) +
+                key_cache->device_offset + CacheMetadata::SIZE);
+            value_cache_data = reinterpret_cast<float*>(
+                static_cast<uint8_t*>(value_cache->device_data) +
+                value_cache->device_offset + CacheMetadata::SIZE);
+            cached = true;
+        }
+        const int key_length = past_length + current_length;
+        const float* query_data = device_pointer_const<float>(query);
+        float* output_data = device_pointer<float>(*output);
+        const float* mask_data = mask
+            ? device_pointer_const<float>(*mask) : nullptr;
+        const bool valid = query_data && key_data && value_data &&
+            output_data && num_heads > 0 && num_kv_heads > 0 &&
+            num_heads % num_kv_heads == 0 && query_length > 0 &&
+            current_length > 0 && key_dim > 0 && value_dim > 0 &&
+            query.shape[0] >= key_dim && current_key.shape[0] >= key_dim &&
+            current_value.shape[0] >= value_dim &&
+            output->shape[0] >= value_dim &&
+            (cache_mode == 0 || cached) &&
+            (!cached || (key_cache_data && value_cache_data &&
+                         key_length <= key_capacity)) &&
+            (!mask || mask_data);
+        if (valid) {
+            if (cached) {
+                const int maximum_dim = std::max(key_dim, value_dim);
+                const size_t append_count =
+                    static_cast<size_t>(num_kv_heads) * current_length *
+                    maximum_dim;
+                append_kv_cuda<<<
+                    static_cast<unsigned>((append_count + threads - 1) /
+                                          threads), threads>>>(
+                    key_data, value_data, key_cache_data, value_cache_data,
+                    num_kv_heads, current_length, past_length, key_capacity,
+                    key_dim, value_dim,
+                    current_key.stride[1] / sizeof(float),
+                    current_key.stride[2] / sizeof(float),
+                    current_value.stride[1] / sizeof(float),
+                    current_value.stride[2] / sizeof(float));
+                if (!report_cuda(cudaGetLastError(), "append_kv_cuda")) {
+                    impl_->failed = true;
+                    return;
+                }
+                key_data = key_cache_data;
+                value_data = value_cache_data;
+            }
+            const size_t score_count = static_cast<size_t>(num_heads) *
+                query_length * key_length;
+            const size_t score_bytes = score_count * sizeof(float);
+            if (!impl_->reserve(impl_->attention_scores,
+                                impl_->attention_scores_bytes,
+                                score_bytes)) {
+                impl_->failed = true;
+                return;
+            }
+            auto* scores = static_cast<float*>(impl_->attention_scores);
+            sdpa_scores_cuda<<<
+                static_cast<unsigned>((score_count + threads - 1) / threads),
+                threads>>>(
+                query_data, key_data, scores, mask_data, num_heads,
+                num_kv_heads, query_length, key_length, past_length, key_dim,
+                key_capacity, cached, causal, scale,
+                query.stride[0] / sizeof(float),
+                query.stride[1] / sizeof(float),
+                query.stride[2] / sizeof(float),
+                cached ? 1 : current_key.stride[0] / sizeof(float),
+                cached ? static_cast<size_t>(key_dim)
+                       : current_key.stride[1] / sizeof(float),
+                cached ? static_cast<size_t>(key_capacity) * key_dim
+                       : current_key.stride[2] / sizeof(float),
+                mask ? mask->stride[0] / sizeof(float) : 0,
+                mask ? mask->stride[1] / sizeof(float) : 0);
+            if (!report_cuda(cudaGetLastError(), "sdpa_scores_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            sdpa_output_cuda<<<num_heads * query_length, threads>>>(
+                scores, value_data, output_data, num_heads, num_kv_heads,
+                query_length, key_length, value_dim, key_capacity, cached,
+                cached ? 1 : current_value.stride[0] / sizeof(float),
+                cached ? static_cast<size_t>(value_dim)
+                       : current_value.stride[1] / sizeof(float),
+                cached ? static_cast<size_t>(key_capacity) * value_dim
+                       : current_value.stride[2] / sizeof(float),
+                output->stride[0] / sizeof(float),
+                output->stride[1] / sizeof(float),
+                output->stride[2] / sizeof(float));
+            if (!report_cuda(cudaGetLastError(), "sdpa_output_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
     if (node.op_type == OpType::MATMUL && inputs.size() >= 2 && inputs[0] &&
         inputs[1] && output && inputs[0]->prec == Precision::FP32 &&
         output->prec == Precision::FP32 &&
@@ -684,6 +1189,105 @@ void CudaBackend::dispatch(const GraphNode& node,
         }
         impl_->failed = true;
         return;
+    }
+
+    if (node.op_type == OpType::RMS_NORM_ROPE && inputs.size() >= 4 &&
+        inputs[0] && inputs[1] && inputs[2] && inputs[3] && output &&
+        fp32_contiguous(*inputs[0]) && fp32_contiguous(*inputs[1]) &&
+        inputs[2]->prec == Precision::FP32 &&
+        inputs[3]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32) {
+        const Tensor& source = *inputs[0];
+        const Tensor& weight = *inputs[1];
+        const Tensor& cosine = *inputs[2];
+        const Tensor& sine = *inputs[3];
+        const float* source_data = device_pointer_const<float>(source);
+        const float* weight_data = device_pointer_const<float>(weight);
+        const float* cosine_data = device_pointer_const<float>(cosine);
+        const float* sine_data = device_pointer_const<float>(sine);
+        float* destination = device_pointer<float>(*output);
+        const int width = static_cast<int>(source.shape[0]);
+        const int sequence_length = static_cast<int>(output->shape[1]);
+        const int channels =
+            static_cast<int>(output->shape[2] * output->shape[3]);
+        const int rows = width > 0
+            ? static_cast<int>(source.nelements() / width) : 0;
+        const int rope_dim = graph_params::get_i32(node.params, 0, width);
+        const bool interleave =
+            graph_params::get_i32(node.params, 1, 1) != 0;
+        const size_t count = static_cast<size_t>(source.nelements());
+        const size_t scratch_bytes = count * sizeof(float);
+        if (source_data && weight_data && cosine_data && sine_data &&
+            destination && width > 0 && rows > 0 && rope_dim > 0 &&
+            rope_dim <= width && rope_dim % 2 == 0 &&
+            rows == sequence_length * channels &&
+            cosine.shape[0] >= rope_dim / 2 &&
+            sine.shape[0] >= rope_dim / 2 &&
+            impl_->reserve(impl_->norm_scratch,
+                           impl_->norm_scratch_bytes, scratch_bytes)) {
+            auto* normalized = static_cast<float*>(impl_->norm_scratch);
+            rms_norm_cuda<<<rows, threads>>>(
+                source_data, weight_data, normalized, width, rows,
+                graph_params::get_f32(node.params, 0, 1e-6f));
+            rope_cuda<<<static_cast<unsigned>((count + threads - 1) /
+                                              threads), threads>>>(
+                normalized, cosine_data, sine_data, destination, width,
+                sequence_length, channels, static_cast<int>(output->shape[2]),
+                rope_dim, interleave, 1, static_cast<size_t>(width),
+                static_cast<size_t>(width) * sequence_length,
+                static_cast<size_t>(width) * sequence_length *
+                    output->shape[2],
+                cosine.stride[0] / sizeof(float),
+                cosine.stride[1] / sizeof(float),
+                sine.stride[0] / sizeof(float),
+                sine.stride[1] / sizeof(float),
+                output->stride[0] / sizeof(float),
+                output->stride[1] / sizeof(float),
+                output->stride[2] / sizeof(float),
+                output->stride[3] / sizeof(float));
+            if (!report_cuda(cudaGetLastError(), "rms_norm_rope_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if (node.op_type == OpType::ADD_RMS_NORM && inputs.size() >= 3 &&
+        inputs[0] && inputs[1] && inputs[2] && output &&
+        inputs[0]->prec == Precision::FP32 &&
+        inputs[1]->prec == Precision::FP32 &&
+        fp32_contiguous(*inputs[2]) && output->prec == Precision::FP32 &&
+        inputs[0]->stride[0] == sizeof(float) &&
+        inputs[1]->stride[0] == sizeof(float) &&
+        output->stride[0] == sizeof(float) &&
+        inputs[0]->shape[2] == 1 && inputs[0]->shape[3] == 1 &&
+        inputs[1]->shape[2] == 1 && inputs[1]->shape[3] == 1 &&
+        output->shape[2] == 1 && output->shape[3] == 1 &&
+        inputs[0]->nelements() == inputs[1]->nelements() &&
+        inputs[0]->nelements() == output->nelements()) {
+        float* residual = device_pointer<float>(*inputs[0]);
+        const float* update = device_pointer_const<float>(*inputs[1]);
+        const float* weight = device_pointer_const<float>(*inputs[2]);
+        float* destination = device_pointer<float>(*output);
+        const int width = static_cast<int>(inputs[0]->shape[0]);
+        const int rows = static_cast<int>(inputs[0]->shape[1]);
+        if (residual && update && weight && destination && width > 0 &&
+            rows > 0) {
+            add_rms_norm_cuda<<<rows, threads>>>(
+                residual, update, weight, destination, width, rows,
+                inputs[0]->stride[1] / sizeof(float),
+                inputs[1]->stride[1] / sizeof(float),
+                output->stride[1] / sizeof(float),
+                graph_params::get_f32(node.params, 0, 1e-6f));
+            if (!report_cuda(cudaGetLastError(), "add_rms_norm_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
     }
 
     if (node.op_type == OpType::RMS_NORM && inputs.size() >= 2 &&
@@ -732,17 +1336,35 @@ void CudaBackend::dispatch(const GraphNode& node,
     }
 
     if (node.op_type == OpType::SIGMOID_MUL && inputs.size() >= 2 &&
-        inputs[0] && inputs[1] && output && fp32_contiguous(*inputs[0]) &&
-        fp32_contiguous(*inputs[1]) && fp32_contiguous(*output) &&
-        inputs[0]->nelements() == inputs[1]->nelements()) {
+        inputs[0] && inputs[1] && output &&
+        inputs[0]->prec == Precision::FP32 &&
+        inputs[1]->prec == Precision::FP32 && fp32_contiguous(*output) &&
+        same_shape(*inputs[0], *inputs[1]) &&
+        inputs[0]->nelements() == output->nelements()) {
         const float* value = device_pointer_const<float>(*inputs[0]);
         const float* gate = device_pointer_const<float>(*inputs[1]);
         float* destination = device_pointer<float>(*output);
         const size_t count = static_cast<size_t>(output->nelements());
         if (value && gate && destination) {
-            sigmoid_mul_cuda<<<static_cast<unsigned>((count + threads - 1) /
-                                                     threads), threads>>>(
-                value, gate, destination, count);
+            if (inputs[0]->is_contiguous() && inputs[1]->is_contiguous()) {
+                sigmoid_mul_cuda<<<
+                    static_cast<unsigned>((count + threads - 1) / threads),
+                    threads>>>(value, gate, destination, count);
+            } else {
+                sigmoid_mul_strided_cuda<<<
+                    static_cast<unsigned>((count + threads - 1) / threads),
+                    threads>>>(
+                    value, gate, destination, count, inputs[0]->shape[0],
+                    inputs[0]->shape[1], inputs[0]->shape[2],
+                    inputs[0]->stride[0] / sizeof(float),
+                    inputs[0]->stride[1] / sizeof(float),
+                    inputs[0]->stride[2] / sizeof(float),
+                    inputs[0]->stride[3] / sizeof(float),
+                    inputs[1]->stride[0] / sizeof(float),
+                    inputs[1]->stride[1] / sizeof(float),
+                    inputs[1]->stride[2] / sizeof(float),
+                    inputs[1]->stride[3] / sizeof(float));
+            }
             if (!report_cuda(cudaGetLastError(), "sigmoid_mul_cuda")) {
                 impl_->failed = true;
                 return;

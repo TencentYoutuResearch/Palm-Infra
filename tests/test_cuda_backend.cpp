@@ -1,6 +1,8 @@
 #include "engine/cuda_backend.h"
+#include "engine/engine.h"
 #include "kernels/quant_layouts.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -50,9 +52,10 @@ bool dispatch_matmul(CudaBackend& backend, Tensor& weight,
     return !backend.dispatch_failed();
 }
 
-Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1) {
+Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1,
+                     int64_t d2 = 1, int64_t d3 = 1) {
     Tensor tensor = Tensor::create(Precision::FP32, MemoryType::NONE,
-                                   d0, d1);
+                                   d0, d1, d2, d3);
     if (!backend.alloc_output(tensor, tensor.nbytes(), nullptr))
         std::fprintf(stderr, "CUDA managed allocation failed\n");
     return tensor;
@@ -168,6 +171,293 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
         close_enough(actual, view_expected, 2e-6f);
 }
 
+bool test_layout_rope_and_sdpa(CudaBackend& backend) {
+    backend.clear_dispatch_error();
+    Tensor rope_storage = device_tensor(backend, 10, 2);
+    for (int i = 0; i < 20; ++i)
+        rope_storage.ptr<float>()[i] = (i - 8) / 17.0f;
+    Tensor rope_input;
+    GraphNode slice;
+    slice.op_type = OpType::SLICE;
+    slice.params.i32 = {0, 1, 8};
+    backend.dispatch(slice, {&rope_storage}, &rope_input, nullptr);
+    Tensor cosine = device_tensor(backend, 4, 2);
+    Tensor sine = device_tensor(backend, 4, 2);
+    for (int i = 0; i < 8; ++i) {
+        cosine.ptr<float>()[i] = std::cos((i + 1) * 0.13f);
+        sine.ptr<float>()[i] = std::sin((i + 1) * 0.13f);
+    }
+    Tensor rope_output = device_tensor(backend, 8, 2);
+    GraphNode rope;
+    rope.op_type = OpType::ROTARY_EMBED;
+    rope.params.i32 = {8, 0};
+    backend.dispatch(rope, {&rope_input, &cosine, &sine},
+                     &rope_output, nullptr);
+    backend.end_graph();
+    std::vector<float> expected(16);
+    for (int row = 0; row < 2; ++row)
+        for (int pair = 0; pair < 4; ++pair) {
+            const float x0 = rope_storage.ptr<float>()[row * 10 + pair + 1];
+            const float x1 =
+                rope_storage.ptr<float>()[row * 10 + pair + 5];
+            const float c = cosine.ptr<float>()[row * 4 + pair];
+            const float s = sine.ptr<float>()[row * 4 + pair];
+            expected[row * 8 + pair] = x0 * c - x1 * s;
+            expected[row * 8 + pair + 4] = x0 * s + x1 * c;
+        }
+    std::vector<float> actual(expected.size());
+    std::memcpy(actual.data(), rope_output.data, rope_output.nbytes());
+    if (backend.dispatch_failed() || !close_enough(actual, expected, 2e-6f))
+        return false;
+
+    Tensor contiguous = device_tensor(backend, 8, 2);
+    GraphNode contiguous_node;
+    contiguous_node.op_type = OpType::CONTIGUOUS;
+    backend.dispatch(contiguous_node, {&rope_input}, &contiguous, nullptr);
+    backend.end_graph();
+    for (int row = 0; row < 2; ++row)
+        for (int column = 0; column < 8; ++column)
+            expected[row * 8 + column] =
+                rope_storage.ptr<float>()[row * 10 + column + 1];
+    std::memcpy(actual.data(), contiguous.data, contiguous.nbytes());
+    if (backend.dispatch_failed() || !close_enough(actual, expected, 0.0f))
+        return false;
+
+    constexpr int norm_width = 8;
+    constexpr int norm_rows = 2;
+    Tensor residual = device_tensor(backend, norm_width, norm_rows);
+    Tensor update = device_tensor(backend, norm_width, norm_rows);
+    Tensor add_norm_output = device_tensor(backend, norm_width, norm_rows);
+    std::vector<float> norm_weight(norm_width);
+    std::vector<float> residual_expected(norm_width * norm_rows);
+    std::vector<float> add_norm_expected(norm_width * norm_rows);
+    for (int column = 0; column < norm_width; ++column)
+        norm_weight[column] = 0.8f + column * 0.02f;
+    for (int i = 0; i < norm_width * norm_rows; ++i) {
+        residual.ptr<float>()[i] = (i - 6) / 9.0f;
+        update.ptr<float>()[i] = (4 - i) / 13.0f;
+        residual_expected[i] =
+            residual.ptr<float>()[i] + update.ptr<float>()[i];
+    }
+    for (int row = 0; row < norm_rows; ++row) {
+        float sum = 0.0f;
+        for (int column = 0; column < norm_width; ++column) {
+            const float value = residual_expected[row * norm_width + column];
+            sum += value * value;
+        }
+        const float inverse = 1.0f /
+            std::sqrt(sum / norm_width + 1e-6f);
+        for (int column = 0; column < norm_width; ++column)
+            add_norm_expected[row * norm_width + column] =
+                residual_expected[row * norm_width + column] * inverse *
+                norm_weight[column];
+    }
+    Tensor norm_scale = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, norm_width, 1, 1, 1,
+        norm_weight.data());
+    backend.wrap_weight(norm_scale);
+    GraphNode add_norm;
+    add_norm.op_type = OpType::ADD_RMS_NORM;
+    backend.dispatch(add_norm, {&residual, &update, &norm_scale},
+                     &add_norm_output, nullptr);
+    backend.end_graph();
+    actual.resize(add_norm_expected.size());
+    std::memcpy(actual.data(), add_norm_output.data,
+                add_norm_output.nbytes());
+    std::vector<float> residual_actual(residual_expected.size());
+    std::memcpy(residual_actual.data(), residual.data, residual.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, add_norm_expected, 2e-5f) ||
+        !close_enough(residual_actual, residual_expected, 2e-6f))
+        return false;
+
+    constexpr int rope_sequence = 2;
+    constexpr int rope_heads = 3;
+    Tensor flat_norm_input =
+        device_tensor(backend, norm_width, rope_sequence * rope_heads);
+    for (int64_t i = 0; i < flat_norm_input.nelements(); ++i)
+        flat_norm_input.ptr<float>()[i] =
+            (static_cast<int>(i % 17) - 8) / 15.0f;
+    Tensor fused_rope_output =
+        device_tensor(backend, norm_width, rope_sequence, rope_heads);
+    GraphNode fused_rope;
+    fused_rope.op_type = OpType::RMS_NORM_ROPE;
+    fused_rope.params.i32 = {norm_width, 1};
+    backend.dispatch(fused_rope,
+                     {&flat_norm_input, &norm_scale, &cosine, &sine},
+                     &fused_rope_output, nullptr);
+    backend.end_graph();
+    expected.assign(static_cast<size_t>(norm_width) * rope_sequence *
+                        rope_heads,
+                    0.0f);
+    for (int head = 0; head < rope_heads; ++head)
+        for (int position = 0; position < rope_sequence; ++position) {
+            const int row = head * rope_sequence + position;
+            float sum = 0.0f;
+            for (int dimension = 0; dimension < norm_width; ++dimension) {
+                const float value =
+                    flat_norm_input.ptr<float>()[row * norm_width + dimension];
+                sum += value * value;
+            }
+            const float inverse = 1.0f /
+                std::sqrt(sum / norm_width + 1e-6f);
+            for (int pair = 0; pair < norm_width / 2; ++pair) {
+                const float x0 = flat_norm_input.ptr<float>()[
+                    row * norm_width + pair * 2] * inverse *
+                    norm_weight[pair * 2];
+                const float x1 = flat_norm_input.ptr<float>()[
+                    row * norm_width + pair * 2 + 1] * inverse *
+                    norm_weight[pair * 2 + 1];
+                const float c = cosine.ptr<float>()[position * 4 + pair];
+                const float s = sine.ptr<float>()[position * 4 + pair];
+                expected[row * norm_width + pair * 2] = x0 * c - x1 * s;
+                expected[row * norm_width + pair * 2 + 1] = x0 * s + x1 * c;
+            }
+        }
+    actual.resize(expected.size());
+    std::memcpy(actual.data(), fused_rope_output.data,
+                fused_rope_output.nbytes());
+    if (backend.dispatch_failed() || !close_enough(actual, expected, 3e-5f))
+        return false;
+
+    constexpr int heads = 4;
+    constexpr int kv_heads = 2;
+    constexpr int key_dim = 4;
+    constexpr int value_dim = 3;
+    constexpr int query_length = 2;
+    constexpr int current_length = 2;
+    constexpr int past_length = 1;
+    constexpr int capacity = 4;
+    Tensor query = device_tensor(backend, key_dim, query_length, heads);
+    Tensor key = device_tensor(backend, key_dim, current_length, kv_heads);
+    Tensor value =
+        device_tensor(backend, value_dim, current_length, kv_heads);
+    for (int64_t i = 0; i < query.nelements(); ++i)
+        query.ptr<float>()[i] = (static_cast<int>(i % 13) - 6) / 11.0f;
+    for (int64_t i = 0; i < key.nelements(); ++i)
+        key.ptr<float>()[i] = (static_cast<int>(i % 9) - 4) / 7.0f;
+    for (int64_t i = 0; i < value.nelements(); ++i)
+        value.ptr<float>()[i] = (static_cast<int>(i % 7) - 3) / 5.0f;
+
+    const size_t key_cache_bytes = CacheMetadata::SIZE +
+        static_cast<size_t>(kv_heads) * capacity * key_dim * sizeof(float);
+    const size_t value_cache_bytes = CacheMetadata::SIZE +
+        static_cast<size_t>(kv_heads) * capacity * value_dim * sizeof(float);
+    Tensor key_cache = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, key_cache_bytes / sizeof(float));
+    Tensor value_cache = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        value_cache_bytes / sizeof(float));
+    backend.alloc_persistent(key_cache, key_cache_bytes);
+    backend.alloc_persistent(value_cache, value_cache_bytes);
+    auto* key_metadata = cache_meta(key_cache.data);
+    key_metadata->current_seq_len = past_length;
+    key_metadata->max_seq_len = capacity;
+    key_metadata->num_kv_heads = kv_heads;
+    key_metadata->head_dim = key_dim;
+    auto* value_metadata = cache_meta(value_cache.data);
+    value_metadata->current_seq_len = past_length;
+    value_metadata->max_seq_len = capacity;
+    value_metadata->num_kv_heads = kv_heads;
+    value_metadata->v_head_dim = value_dim;
+    auto* cached_key = static_cast<float*>(cache_data(key_cache.data));
+    auto* cached_value = static_cast<float*>(cache_data(value_cache.data));
+    std::vector<float> initial_key(
+        static_cast<size_t>(kv_heads) * capacity * key_dim, 0.0f);
+    std::vector<float> initial_value(
+        static_cast<size_t>(kv_heads) * capacity * value_dim, 0.0f);
+    for (int head = 0; head < kv_heads; ++head) {
+        for (int dimension = 0; dimension < key_dim; ++dimension)
+            initial_key[(head * capacity) * key_dim + dimension] =
+                (head * key_dim + dimension - 3) / 8.0f;
+        for (int dimension = 0; dimension < value_dim; ++dimension)
+            initial_value[(head * capacity) * value_dim + dimension] =
+                (head * value_dim + dimension - 2) / 6.0f;
+    }
+    std::memcpy(cached_key, initial_key.data(),
+                initial_key.size() * sizeof(float));
+    std::memcpy(cached_value, initial_value.data(),
+                initial_value.size() * sizeof(float));
+
+    Tensor attention_output =
+        device_tensor(backend, value_dim, query_length, heads);
+    GraphNode sdpa;
+    sdpa.op_type = OpType::SDPA;
+    sdpa.params.i32 = {2, 1, heads, kv_heads, key_dim, value_dim};
+    const float scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
+    sdpa.params.f32 = {scale};
+    std::vector<const Tensor*> attention_inputs = {
+        &query, &key, &value, nullptr, &key_cache, &value_cache};
+    backend.dispatch(sdpa, attention_inputs, &attention_output, nullptr);
+    backend.end_graph();
+
+    expected.assign(static_cast<size_t>(heads) * query_length * value_dim,
+                    0.0f);
+    const int heads_per_group = heads / kv_heads;
+    const int total_length = past_length + current_length;
+    for (int head = 0; head < heads; ++head) {
+        const int key_head = head / heads_per_group;
+        for (int position = 0; position < query_length; ++position) {
+            float scores[total_length];
+            float maximum = -INFINITY;
+            for (int key_position = 0; key_position < total_length;
+                 ++key_position) {
+                float score = 0.0f;
+                for (int dimension = 0; dimension < key_dim; ++dimension) {
+                    const float key_value = key_position < past_length
+                        ? initial_key[(key_head * capacity + key_position) *
+                                      key_dim + dimension]
+                        : key.ptr<float>()[
+                              (key_head * current_length + key_position -
+                               past_length) * key_dim + dimension];
+                    score += query.ptr<float>()[
+                                 (head * query_length + position) * key_dim +
+                                 dimension] * key_value;
+                }
+                score *= scale;
+                if (key_position > past_length + position)
+                    score = -INFINITY;
+                scores[key_position] = score;
+                maximum = std::max(maximum, score);
+            }
+            float sum = 0.0f;
+            for (float& score : scores) {
+                score = std::exp(score - maximum);
+                sum += score;
+            }
+            for (int key_position = 0; key_position < total_length;
+                 ++key_position) {
+                for (int dimension = 0; dimension < value_dim; ++dimension) {
+                    const float current = key_position < past_length
+                        ? initial_value[
+                              (key_head * capacity + key_position) *
+                                  value_dim + dimension]
+                        : value.ptr<float>()[
+                              (key_head * current_length + key_position -
+                               past_length) * value_dim + dimension];
+                    expected[(head * query_length + position) * value_dim +
+                             dimension] += scores[key_position] / sum * current;
+                }
+            }
+        }
+    }
+    actual.resize(expected.size());
+    std::memcpy(actual.data(), attention_output.data,
+                attention_output.nbytes());
+    if (backend.dispatch_failed() || !close_enough(actual, expected, 3e-5f))
+        return false;
+    for (int head = 0; head < kv_heads; ++head)
+        for (int position = 0; position < current_length; ++position)
+            for (int dimension = 0; dimension < key_dim; ++dimension)
+                if (std::fabs(cached_key[
+                        (head * capacity + past_length + position) * key_dim +
+                        dimension] - key.ptr<float>()[
+                            (head * current_length + position) * key_dim +
+                            dimension]) > 1e-6f)
+                    return false;
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -204,6 +494,8 @@ int main() {
     if (!backend.is_device_resident() ||
         !test_device_resident_ops(backend, fp16, activation, expected,
                                   m, n, k))
+        return 1;
+    if (!test_layout_rope_and_sdpa(backend))
         return 1;
 
     Q4B8G32Block block{};
