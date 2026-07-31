@@ -153,21 +153,34 @@ bool compare_package(const char* package, const char* architecture,
     }
     std::snprintf(prefill_label, sizeof(prefill_label), "%s SSD prefill", label);
     std::snprintf(decode_label, sizeof(decode_label), "%s SSD decode", label);
+    if (!close_enough(
+            streamed_prefill, cpu_prefill, 4e-2f, prefill_label) ||
+        !close_enough(streamed_decode, cpu_decode, 4e-2f, decode_label))
+        return false;
+    std::snprintf(
+        prefill_label, sizeof(prefill_label), "%s resident/SSD prefill",
+        label);
+    std::snprintf(
+        decode_label, sizeof(decode_label), "%s resident/SSD decode",
+        label);
     return close_enough(
-               streamed_prefill, cpu_prefill, 4e-2f, prefill_label) &&
-        close_enough(streamed_decode, cpu_decode, 4e-2f, decode_label);
+               streamed_prefill, cuda_prefill, 5e-3f, prefill_label) &&
+        close_enough(
+               streamed_decode, cuda_decode, 5e-3f, decode_label);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 6) {
+    if (argc != 8) {
         std::fprintf(
             stderr,
             "usage: %s <qwen3-moe-w4g32.mollm> "
             "<qwen3.5-moe-w4g32.mollm> <qwen3-moe-w8g32.mollm> "
             "<qwen3-moe-w4g128.mollm> "
-            "<deepseek-v4-fp8-mxfp4.mollm>\n",
+            "<deepseek-v4-fp8-mxfp4.mollm> "
+            "<qwen3-moe-fp16.mollm> "
+            "<deepseek-v4-fp32-routed.mollm>\n",
             argv[0]);
         return 2;
     }
@@ -187,7 +200,19 @@ int main(int argc, char** argv) {
         !compare_package(
             argv[5], "deepseek-v4",
             "DeepSeek attention/hash/HC/grouped FP8+MXFP4",
-            2048, 4096, true, true))
+            2048, 4096, true, true) ||
+        !compare_package(
+            argv[6], "qwen3-moe", "Qwen3-MoE FP16 SSD scratch",
+            8192) ||
+        !compare_package(
+            argv[6], "qwen3-moe", "Qwen3-MoE FP16 device cache",
+            8192, 16384) ||
+        !compare_package(
+            argv[7], "deepseek-v4", "DeepSeek FP32 SSD scratch",
+            32768) ||
+        !compare_package(
+            argv[7], "deepseek-v4", "DeepSeek FP32 device cache",
+            32768, 32768))
         return 1;
     std::printf("Tiny CUDA MoE E2E tests passed\n");
     return 0;

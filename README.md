@@ -428,12 +428,13 @@ operator fallback. DeepSeek-V4's FP32 Hyper-Connection stages, learned KV
 compressor and indexer, sparse attention, checkpoint-native dense and grouped
 FP8 projections, and resident FP8/MXFP4 hash-routed MoE operator are native.
 For SSD-offloaded MoE packages, routing is computed on CUDA and only the
-selected quantized expert pairs are copied from the host LRU cache or reused
+selected expert pairs are copied from the host LRU cache or reused
 directly from the optional bounded device LRU described above.
 W8 row-major, package-native W4 BG32/BG128, and DeepSeek MXFP4 experts are
-supported without CPU operator fallback. This path is correctness-first and
-currently uses synchronous route and expert transfers;
-FP16/FP32 SSD experts retain their existing CPU/Metal behavior.
+supported without CPU operator fallback. FP16 and FP32 SSD experts use the
+same bounded device cache and compact miss scratch as quantized experts.
+This path is correctness-first and currently uses synchronous route and expert
+transfers.
 Other operators not yet implemented natively synchronize and use the CPU
 reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to
 print native/fallback operator counts. Several specialized model families

@@ -1017,7 +1017,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                     fprintf(
                         stderr,
                         "Engine: CUDA SSD expert streaming enabled; selected "
-                        "quantized experts use direct device pointers with "
+                        "experts use direct device pointers with "
                         "compact miss scratch\n");
                 } else {
                     fprintf(

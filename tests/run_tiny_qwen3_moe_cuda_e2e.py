@@ -213,7 +213,7 @@ def build_qwen35_fixture(model_dir: Path) -> None:
 
 
 def build_hash_package(weights_dir: Path, package: Path,
-                       models_dir: Path) -> None:
+                       models_dir: Path, fp32_experts: bool = False) -> None:
     """Build a tiny DeepSeek graph that exercises the complete CUDA path."""
     import numpy as np
 
@@ -330,12 +330,26 @@ def build_hash_package(weights_dir: Path, package: Path,
             precision=Precision.FP8_E4M3, logical_shape=(rows, width),
             flags=WEIGHT_FLAG_FP8_BLOCK128, scale_dtype=np.uint8)
 
-    write_mxfp4(
-        "layer_0_experts_gate_up.weights",
-        experts * 2 * intermediate, hidden, 20260803)
-    write_mxfp4(
-        "layer_0_experts_down.weights",
-        experts * hidden, intermediate, 20260804)
+    if fp32_experts:
+        _write_weight_file(
+            str(weights_dir / "layer_0_experts_gate_up.weights"),
+            rng.uniform(
+                -0.08, 0.08,
+                (experts * 2 * intermediate, hidden)).astype(np.float32),
+            precision=Precision.FP32)
+        _write_weight_file(
+            str(weights_dir / "layer_0_experts_down.weights"),
+            rng.uniform(
+                -0.08, 0.08,
+                (experts * hidden, intermediate)).astype(np.float32),
+            precision=Precision.FP32)
+    else:
+        write_mxfp4(
+            "layer_0_experts_gate_up.weights",
+            experts * 2 * intermediate, hidden, 20260803)
+        write_mxfp4(
+            "layer_0_experts_down.weights",
+            experts * hidden, intermediate, 20260804)
     write_fp8(
         "layer_0_shared_experts_gate.weights",
         shared_intermediate, hidden, 20260805)
@@ -464,10 +478,12 @@ def build_hash_package(weights_dir: Path, package: Path,
             "./layer_0_router.weights", (experts, hidden), Precision.FP16)
         gate_up = g.weight(
             "./layer_0_experts_gate_up.weights",
-            (experts * 2 * intermediate, hidden), Precision.MXFP4)
+            (experts * 2 * intermediate, hidden),
+            Precision.FP32 if fp32_experts else Precision.MXFP4)
         down = g.weight(
             "./layer_0_experts_down.weights",
-            (experts * hidden, intermediate), Precision.MXFP4)
+            (experts * hidden, intermediate),
+            Precision.FP32 if fp32_experts else Precision.MXFP4)
         shared_gate = g.weight(
             "./layer_0_shared_experts_gate.weights",
             (shared_intermediate, hidden), Precision.FP8_E4M3)
@@ -515,7 +531,9 @@ def build_hash_package(weights_dir: Path, package: Path,
             "vocab_size": vocab,
             "num_experts": experts,
             "prefill_seq_len": 4,
-            "quantization": "native-fp8-mxfp4",
+            "quantization": (
+                "fp32-routed-fp8-shared"
+                if fp32_experts else "native-fp8-mxfp4"),
             "moe_expert_storage": {
                 "version": 1,
                 "layout": "aggregate_rows_v1",
@@ -564,10 +582,17 @@ def main() -> int:
         qwen35_package = temp_dir / "tiny_qwen35_moe_w4g32.mollm"
         qwen3_w8_package = temp_dir / "tiny_qwen3_moe_w8g32.mollm"
         qwen3_w4g128_package = temp_dir / "tiny_qwen3_moe_w4g128.mollm"
+        qwen3_fp16_package = temp_dir / "tiny_qwen3_moe_fp16.mollm"
         hash_weights_dir = temp_dir / "hash_weights"
         hash_weights_dir.mkdir()
         hash_package = temp_dir / "tiny_hash_moe_native.mollm"
         build_hash_package(hash_weights_dir, hash_package, converter.parent)
+        fp32_hash_weights_dir = temp_dir / "fp32_hash_weights"
+        fp32_hash_weights_dir.mkdir()
+        fp32_hash_package = temp_dir / "tiny_hash_moe_fp32.mollm"
+        build_hash_package(
+            fp32_hash_weights_dir, fp32_hash_package, converter.parent,
+            fp32_experts=True)
         environment = os.environ.copy()
         environment["MOLLM_QUANT_HELPER"] = str(quantizer)
         environment["MOLLM_QUANT_THREADS"] = "1"
@@ -575,7 +600,8 @@ def main() -> int:
                 (qwen3_dir, qwen3_package, "w4g32"),
                 (qwen35_dir, qwen35_package, "w4g32"),
                 (qwen3_dir, qwen3_w8_package, "w8g32"),
-                (qwen3_g128_dir, qwen3_w4g128_package, "w4g128")):
+                (qwen3_g128_dir, qwen3_w4g128_package, "w4g128"),
+                (qwen3_dir, qwen3_fp16_package, "fp16")):
             subprocess.run(
                 [sys.executable, str(converter), str(model_dir), str(package),
                  quant], check=True, env=environment,
@@ -584,14 +610,15 @@ def main() -> int:
                 assert_has_bg32_weight(package)
             elif quant == "w4g128":
                 assert_has_bg128_weight(package)
-            else:
+            elif quant == "w8g32":
                 assert_has_int8_weight(package)
         runner_environment = environment.copy()
         runner_environment["MOLLM_CUDA_PROFILE"] = "1"
         completed = subprocess.run(
             [str(runner), str(qwen3_package), str(qwen35_package),
              str(qwen3_w8_package), str(qwen3_w4g128_package),
-             str(hash_package)],
+             str(hash_package), str(qwen3_fp16_package),
+             str(fp32_hash_package)],
             check=False, env=runner_environment, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(completed.stdout, end="")

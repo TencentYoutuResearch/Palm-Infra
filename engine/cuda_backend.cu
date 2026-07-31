@@ -4835,6 +4835,9 @@ void CudaBackend::dispatch(const GraphNode& node,
             if (!source)
                 return -1;
             const auto& spec = source->spec;
+            if (spec.precision == Precision::FP16 ||
+                spec.precision == Precision::FP32)
+                return static_cast<int>(Impl::WeightLayout::Dense);
             if (spec.precision == Precision::INT8)
                 return static_cast<int>(Impl::WeightLayout::Q8RowMajor);
             if (spec.precision == Precision::INT4) {
@@ -4855,6 +4858,16 @@ void CudaBackend::dispatch(const GraphNode& node,
                 return false;
             const auto& spec = source->spec;
             const int layout = streamed_weight_layout(source);
+            if (layout == static_cast<int>(Impl::WeightLayout::Dense)) {
+                const uint64_t element_bytes =
+                    spec.precision == Precision::FP32 ? 4 : 2;
+                return (spec.precision == Precision::FP16 ||
+                        spec.precision == Precision::FP32) &&
+                    spec.flags == 0 && spec.group_size == 0 &&
+                    spec.groups_per_row == 0 && spec.scales_bytes == 0 &&
+                    spec.data_bytes ==
+                        static_cast<uint64_t>(rows) * cols * element_bytes;
+            }
             if (layout == static_cast<int>(
                               Impl::WeightLayout::Q8RowMajor)) {
                 return spec.group_size > 0 && spec.groups_per_row > 0 &&
@@ -5024,6 +5037,14 @@ void CudaBackend::dispatch(const GraphNode& node,
             int down_groups_per_row = down
                 ? down->groups_per_row
                 : (down_source ? down_source->spec.groups_per_row : 0);
+            const bool gate_up_dense_fp32 = gate_up
+                ? gate_up->type == CUDA_R_32F
+                : gate_up_source &&
+                    gate_up_source->spec.precision == Precision::FP32;
+            const bool down_dense_fp32 = down
+                ? down->type == CUDA_R_32F
+                : down_source &&
+                    down_source->spec.precision == Precision::FP32;
             const void* const* gate_up_expert_data = nullptr;
             const void* const* gate_up_expert_scales = nullptr;
             const void* const* down_expert_data = nullptr;
@@ -5371,7 +5392,7 @@ void CudaBackend::dispatch(const GraphNode& node,
                         threads>>>(
                         routed_hidden, routed_hidden_stride, route_indices,
                         route_weights, gate_up_data, gate_up_expert_data,
-                        gate_up && gate_up->type == CUDA_R_32F,
+                        gate_up_dense_fp32,
                         gate_up_layout, gate_up_scales,
                         gate_up_expert_scales,
                         gate_up_group_size, gate_up_groups_per_row,
@@ -5402,7 +5423,7 @@ void CudaBackend::dispatch(const GraphNode& node,
                         threads>>>(
                         route_indices, route_weights, down_activation,
                         down_data, down_expert_data,
-                        down && down->type == CUDA_R_32F,
+                        down_dense_fp32,
                         down_layout, down_scales, down_expert_scales,
                         down_group_size, down_groups_per_row,
                         down_e8m0_scales, destination,
