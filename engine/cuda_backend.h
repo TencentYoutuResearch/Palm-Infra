@@ -5,8 +5,9 @@
 #include <memory>
 
 // CUDA backend with device-resident graph storage. CUDA owns prepared linear
-// weights and cudaMalloc-backed intermediate buffers; persistent cache/state
-// remains managed where engine-side metadata/reset access is required.
+// weights and cudaMalloc-backed intermediate/persistent buffers. KV cache
+// payloads and recurrent state stay device-only; only the 64-byte KV metadata
+// prefix has a host mirror maintained through explicit backend transfers.
 // Operators not yet implemented natively use an explicit D2H -> CPU reference
 // -> H2D bridge, providing an incremental migration path without making every
 // graph allocation host-addressable.
@@ -36,6 +37,8 @@ public:
     bool copy_from_host(const void* source, Tensor& destination,
                         size_t nbytes,
                         size_t destination_offset = 0) override;
+    bool zero_tensor(Tensor& tensor, size_t nbytes,
+                     size_t destination_offset = 0) override;
     bool round_to_bf16(Tensor& tensor) override;
     void synchronize_for_host_read() override;
     void begin_graph() override;
@@ -49,7 +52,10 @@ public:
     void wrap_weight_int4(Tensor& tensor,
                           bool keep_native_experts = false) override;
     bool wants_cpu_weight_sidecars() const override { return false; }
-    void alloc_persistent(Tensor& tensor, size_t nbytes) override;
+    void alloc_persistent(
+        Tensor& tensor, size_t nbytes,
+        PersistentHostAccess host_access = PersistentHostAccess::FULL,
+        size_t host_prefix_bytes = 0) override;
     void upload_input(Tensor& tensor, const std::string& key,
                       const void* host_src, size_t nbytes) override;
     bool configure_moe_device_cache(size_t capacity_bytes) override;

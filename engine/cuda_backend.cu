@@ -2592,6 +2592,19 @@ struct CudaBackend::Impl {
         size_t capacity = 0;
     };
 
+    struct PersistentHostMirror {
+        explicit PersistentHostMirror(size_t bytes)
+            : size(bytes), words((bytes + sizeof(uint64_t) - 1) /
+                                 sizeof(uint64_t)) {}
+
+        uint8_t* data() {
+            return reinterpret_cast<uint8_t*>(words.data());
+        }
+
+        size_t size = 0;
+        std::vector<uint64_t> words;
+    };
+
     struct MoeDeviceCacheEntry {
         const MoeSsdTensorSource* gate_up = nullptr;
         const MoeSsdTensorSource* down = nullptr;
@@ -2618,6 +2631,7 @@ struct CudaBackend::Impl {
     std::unordered_map<void*, size_t> pooled_sizes;
     std::multimap<size_t, void*> free_pooled;
     std::vector<void*> managed_allocations;
+    std::unordered_map<void*, PersistentHostMirror> persistent_host_mirrors;
     std::unordered_map<std::string, BoundaryBuffer> boundary_buffers;
     std::vector<MoeDeviceCacheEntry> moe_device_cache;
     DeviceMoeCacheStats moe_device_cache_stats;
@@ -3493,6 +3507,54 @@ bool CudaBackend::copy_from_host(const void* source, Tensor& destination,
         impl_->failed = true;
         return false;
     }
+    const auto mirror = impl_->persistent_host_mirrors.find(
+        destination.device_data);
+    const size_t absolute_offset =
+        destination.device_offset + destination_offset;
+    if (mirror != impl_->persistent_host_mirrors.end() &&
+        absolute_offset < mirror->second.size) {
+        const size_t mirror_bytes = std::min(
+            nbytes, mirror->second.size - absolute_offset);
+        std::memcpy(
+            mirror->second.data() + absolute_offset, source, mirror_bytes);
+    }
+    return true;
+}
+
+bool CudaBackend::zero_tensor(Tensor& tensor, size_t nbytes,
+                              size_t destination_offset) {
+    if (destination_offset > tensor.view_span_bytes() ||
+        nbytes > tensor.view_span_bytes() - destination_offset) {
+        impl_->failed = true;
+        return false;
+    }
+    auto* device = device_pointer<uint8_t>(tensor);
+    if (!device) {
+        if (!tensor.data) {
+            impl_->failed = true;
+            return false;
+        }
+        std::memset(
+            static_cast<uint8_t*>(tensor.data) + destination_offset,
+            0, nbytes);
+        return true;
+    }
+    if (!report_cuda(
+            cudaMemset(device + destination_offset, 0, nbytes),
+            "cudaMemset tensor")) {
+        impl_->failed = true;
+        return false;
+    }
+    const auto mirror = impl_->persistent_host_mirrors.find(
+        tensor.device_data);
+    const size_t absolute_offset = tensor.device_offset + destination_offset;
+    if (mirror != impl_->persistent_host_mirrors.end() &&
+        absolute_offset < mirror->second.size) {
+        const size_t mirror_bytes = std::min(
+            nbytes, mirror->second.size - absolute_offset);
+        std::memset(
+            mirror->second.data() + absolute_offset, 0, mirror_bytes);
+    }
     return true;
 }
 
@@ -3525,17 +3587,46 @@ void CudaBackend::begin_graph() {}
 
 void CudaBackend::end_graph() { synchronize_for_host_read(); }
 
-void CudaBackend::alloc_persistent(Tensor& tensor, size_t nbytes) {
+void CudaBackend::alloc_persistent(
+    Tensor& tensor, size_t nbytes, PersistentHostAccess host_access,
+    size_t host_prefix_bytes) {
     void* storage = nullptr;
     if (!available() || nbytes == 0 ||
-        !report_cuda(cudaMallocManaged(&storage, nbytes),
-                     "cudaMallocManaged persistent")) {
+        (host_access == PersistentHostAccess::MIRRORED_PREFIX &&
+         (host_prefix_bytes == 0 || host_prefix_bytes > nbytes))) {
         impl_->failed = true;
         return;
     }
-    impl_->managed_allocations.push_back(storage);
-    std::memset(storage, 0, nbytes);
-    tensor.data = storage;
+    if (host_access == PersistentHostAccess::FULL) {
+        if (!report_cuda(cudaMallocManaged(&storage, nbytes),
+                         "cudaMallocManaged host-coherent persistent")) {
+            impl_->failed = true;
+            return;
+        }
+        impl_->managed_allocations.push_back(storage);
+        std::memset(storage, 0, nbytes);
+        tensor.data = storage;
+    } else {
+        if (!report_cuda(cudaMalloc(&storage, nbytes),
+                         "cudaMalloc persistent") ||
+            !report_cuda(cudaMemset(storage, 0, nbytes),
+                         "cudaMemset persistent")) {
+            if (storage)
+                cudaFree(storage);
+            impl_->failed = true;
+            return;
+        }
+        impl_->device_allocations.push_back(storage);
+        if (host_access == PersistentHostAccess::MIRRORED_PREFIX) {
+            auto [entry, inserted] =
+                impl_->persistent_host_mirrors.emplace(
+                    storage, Impl::PersistentHostMirror(host_prefix_bytes));
+            (void)inserted;
+            tensor.data = entry->second.data();
+        } else {
+            tensor.data = storage;
+        }
+    }
     tensor.device_data = storage;
     tensor.device_offset = 0;
     tensor.mem_type = MemoryType::EXTERNAL;

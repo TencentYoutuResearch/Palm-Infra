@@ -1118,6 +1118,53 @@ bool test_explicit_cpu_fallback_bridge(CudaBackend& backend) {
     return stateful_valid;
 }
 
+bool test_persistent_storage_modes(CudaBackend& backend) {
+    Tensor mirrored = Tensor::create(
+        Precision::INT32, MemoryType::NONE, 32);
+    backend.alloc_persistent(
+        mirrored, mirrored.nbytes(),
+        PersistentHostAccess::MIRRORED_PREFIX, 4 * sizeof(int32_t));
+    if (!mirrored.data || !mirrored.device_data ||
+        mirrored.data == mirrored.device_data)
+        return false;
+    const int32_t metadata[4] = {7, 11, 13, 17};
+    if (!backend.copy_from_host(
+            metadata, mirrored, sizeof(metadata)) ||
+        std::memcmp(mirrored.data, metadata, sizeof(metadata)) != 0 ||
+        !backend.zero_tensor(
+            mirrored, 2 * sizeof(int32_t), sizeof(int32_t)))
+        return false;
+    const int32_t expected_metadata[4] = {7, 0, 0, 17};
+    int32_t mirrored_device[4] = {};
+    if (std::memcmp(
+            mirrored.data, expected_metadata,
+            sizeof(expected_metadata)) != 0 ||
+        !backend.copy_to_host(
+            mirrored, mirrored_device, sizeof(mirrored_device)) ||
+        std::memcmp(
+            mirrored_device, expected_metadata,
+            sizeof(expected_metadata)) != 0)
+        return false;
+
+    Tensor device_only = Tensor::create(
+        Precision::INT32, MemoryType::NONE, 8);
+    backend.alloc_persistent(
+        device_only, device_only.nbytes(), PersistentHostAccess::NONE);
+    const int32_t values[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    int32_t actual[8] = {};
+    if (!device_only.data || !device_only.device_data ||
+        device_only.data != device_only.device_data ||
+        !backend.copy_from_host(
+            values, device_only, sizeof(values)) ||
+        !backend.zero_tensor(
+            device_only, 3 * sizeof(int32_t), 2 * sizeof(int32_t)) ||
+        !backend.copy_to_host(
+            device_only, actual, sizeof(actual)))
+        return false;
+    const int32_t expected[8] = {1, 2, 0, 0, 0, 6, 7, 8};
+    return std::memcmp(actual, expected, sizeof(expected)) == 0;
+}
+
 bool test_rwkv_matrix_ops(CudaBackend& backend) {
     constexpr int m = 2;
     constexpr int n = 5;
@@ -2748,6 +2795,8 @@ int main() {
             !test_explicit_cpu_fallback_bridge(fallback_backend))
             return 1;
     }
+    if (!test_persistent_storage_modes(backend))
+        return 1;
     if (!test_rwkv_matrix_ops(backend))
         return 1;
     if (backend.kv_cache_precision(Precision::FP16) != Precision::FP16 ||

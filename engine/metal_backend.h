@@ -85,10 +85,13 @@ public:
                           bool keep_native_experts = false) override;
 
     /// Allocate a device-resident buffer of nbytes and point t at it (used for
-    /// KV cache and boundary buffers). Sets t.device_data / t.device_offset and
-    /// t.data = [buffer contents] (Shared storage, host-visible). Persistent
-    /// buffers allocated here are owned for the lifetime of the backend.
-    void alloc_persistent(Tensor& t, size_t nbytes) override;
+    /// KV cache and recurrent state). Metal Shared storage satisfies every
+    /// requested host-access mode, so t.data remains directly host-visible.
+    /// Persistent buffers are owned for the lifetime of the backend.
+    void alloc_persistent(
+        Tensor& t, size_t nbytes,
+        PersistentHostAccess host_access = PersistentHostAccess::FULL,
+        size_t host_prefix_bytes = 0) override;
 
     /// Upload host bytes into a REUSABLE device buffer identified by `key`
     /// (e.g. graph INPUT node name like "hidden"/"cos"). The buffer is owned by

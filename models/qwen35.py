@@ -459,9 +459,9 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
         else:
             # GDN recurrent state: [v_dim, k_dim, num_value_heads] FP32
             gs = g.input(f'gdn_state{i}', (linear_v_dim, linear_k_dim, linear_num_v_heads), prec=Precision.FP32)
-            # Conv state: [qkv_total, conv_kernel-1] FP16
+            # Conv state is updated by the FP32 ShortConv kernels.
             qkv_total = linear_num_heads * linear_k_dim * 2 + linear_num_v_heads * linear_v_dim
-            gc = g.input(f'gdn_conv{i}', (qkv_total, conv_kernel - 1), prec=Precision.FP16)
+            gc = g.input(f'gdn_conv{i}', (qkv_total, conv_kernel - 1), prec=Precision.FP32)
             cache_inputs.append(('gdn', gs, gc))
 
     input_norm_weights = [

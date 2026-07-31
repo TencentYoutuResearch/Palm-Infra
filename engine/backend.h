@@ -119,6 +119,20 @@ public:
         return true;
     }
 
+    /// Zero a byte range in tensor storage. Device backends override this to
+    /// avoid making persistent state host-addressable solely for reset.
+    virtual bool zero_tensor(Tensor& tensor, size_t nbytes,
+                             size_t destination_offset = 0) {
+        if (!tensor.data ||
+            destination_offset > tensor.view_span_bytes() ||
+            nbytes > tensor.view_span_bytes() - destination_offset)
+            return false;
+        std::memset(
+            static_cast<uint8_t*>(tensor.data) + destination_offset,
+            0, nbytes);
+        return true;
+    }
+
     /// Apply an FP32 -> BF16-rounded FP32 activation boundary in place.
     /// CPUBackend inherits the host implementation; device backends launch
     /// their own kernel so the executor never dereferences device memory.

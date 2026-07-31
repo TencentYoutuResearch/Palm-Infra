@@ -119,7 +119,14 @@ bool run(const char* package, const char* expected_architecture, Device device,
                     stats.direct_expert_bytes));
         }
     }
-    return true;
+    engine.reset();
+    std::vector<float> reset_prefill;
+    std::vector<float> reset_decode;
+    return engine.past_len() == 0 &&
+        copy_finite(engine.prefill_hidden({1, 2, 3}), reset_prefill) &&
+        copy_finite(engine.decode_hidden(4), reset_decode) &&
+        reset_prefill == prefill && reset_decode == decode &&
+        engine.past_len() == 4;
 }
 
 bool close_enough(const std::vector<float>& actual,

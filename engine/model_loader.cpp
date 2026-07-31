@@ -603,7 +603,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
 // allocate_caches — allocate KV cache buffers with metadata header
 // ---------------------------------------------------------------------------
 
-void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
+bool LLMEngine::allocate_caches(Graph& g, int n_ctx) {
     // Find persistent INPUT nodes and initialise their tensor shapes.
     // All recurrent state follows this path: KV cache, GDN state, and RWKV
     // state.
@@ -654,6 +654,12 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             break;
         case PersistentInputKind::GDN_CONV:
             cache.gdn_conv = &tensor;
+            // Serialized Qwen3.5 graphs historically label the convolution
+            // state FP16, but every CPU/Metal/CUDA short-convolution kernel
+            // reads and updates it as float. Make the physical contract
+            // explicit before sizing backend storage.
+            tensor.prec = Precision::FP32;
+            tensor.compute_strides();
             cache.gdn_conv_groups = (int)node.out_shape[0];
             cache.gdn_conv_kernel = (int)node.out_shape[1] + 1;
             break;
@@ -675,18 +681,26 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
 
     // Allocate cache/state data buffers from engine-owned persistent storage
     // (once, at load time). Graph runtime pools are execution-temporary only.
-    // Allocate a persistent buffer for a cache tensor. Accelerators provide a
-    // host-visible mirror when metadata is maintained by the engine.
-    auto alloc_cache_buf = [&](Tensor* t, size_t total) -> void* {
+    // CUDA keeps only the KV metadata prefix mirrored on the host; recurrent
+    // state is device-only. Metal Shared storage satisfies all three modes.
+    Backend* storage_backend = accelerator_backend_
+        ? static_cast<Backend*>(accelerator_backend_.get())
+        : exec_ctx_prefill_.backend;
+    if (!storage_backend)
+        return false;
+    auto alloc_cache_buf = [&](
+        Tensor* t, size_t total, PersistentHostAccess host_access,
+        size_t host_prefix_bytes = 0) -> bool {
         if (accelerator_backend_) {
-            accelerator_backend_->alloc_persistent(*t, total);
-            return t->data;
+            accelerator_backend_->alloc_persistent(
+                *t, total, host_access, host_prefix_bytes);
+            return t->data && t->device_data;
         }
         void* buf = persistent_pool_.acquire(total);
         t->data = buf;
         t->owner_id = persistent_pool_.id();
         t->storage_id = persistent_pool_.storage_id(buf);
-        return buf;
+        return buf != nullptr;
     };
 
     for (auto& cp : caches_) {
@@ -698,18 +712,23 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             size_t data_bytes = (size_t)hd * n_ctx * nkv * es;
             size_t total = CacheMetadata::SIZE + data_bytes;
 
-            void* buf = alloc_cache_buf(cp.k, total);
-            std::memset(buf, 0, CacheMetadata::SIZE);
-
-            auto* meta = cache_meta(buf);
-            meta->current_seq_len = 0;
-            meta->max_seq_len = (uint64_t)n_ctx;
-            meta->num_kv_heads = (uint64_t)nkv;
-            meta->head_dim = (uint64_t)hd;
-
             cp.k->mem_type = MemoryType::POOLED;
             cp.k->shape[0] = (int64_t)total / (int64_t)es;
+            cp.k->shape[1] = 1;
+            cp.k->shape[2] = 1;
+            cp.k->shape[3] = 1;
             cp.k->compute_strides();
+            if (!alloc_cache_buf(
+                    cp.k, total, PersistentHostAccess::MIRRORED_PREFIX,
+                    CacheMetadata::SIZE))
+                return false;
+            CacheMetadata metadata;
+            metadata.max_seq_len = static_cast<uint64_t>(n_ctx);
+            metadata.num_kv_heads = static_cast<uint64_t>(nkv);
+            metadata.head_dim = static_cast<uint64_t>(hd);
+            if (!storage_backend->copy_from_host(
+                    &metadata, *cp.k, sizeof(metadata)))
+                return false;
         }
         if (cp.v) {
             int vd = cp.v_head_dim;
@@ -718,18 +737,23 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             size_t data_bytes = (size_t)vd * n_ctx * nkv * es;
             size_t total = CacheMetadata::SIZE + data_bytes;
 
-            void* buf = alloc_cache_buf(cp.v, total);
-            std::memset(buf, 0, CacheMetadata::SIZE);
-
-            auto* meta = cache_meta(buf);
-            meta->current_seq_len = 0;
-            meta->max_seq_len = (uint64_t)n_ctx;
-            meta->num_kv_heads = (uint64_t)nkv;
-            meta->v_head_dim = (uint64_t)vd;
-
             cp.v->mem_type = MemoryType::POOLED;
             cp.v->shape[0] = (int64_t)total / (int64_t)es;
+            cp.v->shape[1] = 1;
+            cp.v->shape[2] = 1;
+            cp.v->shape[3] = 1;
             cp.v->compute_strides();
+            if (!alloc_cache_buf(
+                    cp.v, total, PersistentHostAccess::MIRRORED_PREFIX,
+                    CacheMetadata::SIZE))
+                return false;
+            CacheMetadata metadata;
+            metadata.max_seq_len = static_cast<uint64_t>(n_ctx);
+            metadata.num_kv_heads = static_cast<uint64_t>(nkv);
+            metadata.v_head_dim = static_cast<uint64_t>(vd);
+            if (!storage_backend->copy_from_host(
+                    &metadata, *cp.v, sizeof(metadata)))
+                return false;
         }
 
         // GDN recurrent state: [v_dim, k_dim, num_heads] FP32
@@ -737,43 +761,51 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         if (cp.gdn_state) {
             size_t data_bytes = (size_t)cp.gdn_v_dim * cp.gdn_k_dim *
                                 cp.gdn_num_heads * sizeof(float);
-            void* buf = alloc_cache_buf(cp.gdn_state,
-                                        data_bytes); // Metal: sets device_data
-            std::memset(buf, 0, data_bytes);
             cp.gdn_state->mem_type = MemoryType::POOLED;
             cp.gdn_state->shape[0] = (int64_t)cp.gdn_v_dim;
             cp.gdn_state->shape[1] = (int64_t)cp.gdn_k_dim;
             cp.gdn_state->shape[2] = (int64_t)cp.gdn_num_heads;
             cp.gdn_state->shape[3] = 1;
             cp.gdn_state->compute_strides();
+            if (!alloc_cache_buf(
+                    cp.gdn_state, data_bytes,
+                    PersistentHostAccess::NONE) ||
+                !storage_backend->zero_tensor(*cp.gdn_state, data_bytes))
+                return false;
         }
         // GDN conv state: [groups, kernel-1] FP32
         if (cp.gdn_conv) {
             int kernel_m1 = cp.gdn_conv_kernel - 1;
             size_t data_bytes =
                 (size_t)cp.gdn_conv_groups * kernel_m1 * sizeof(float);
-            void* buf = alloc_cache_buf(cp.gdn_conv,
-                                        data_bytes); // Metal: sets device_data
-            std::memset(buf, 0, data_bytes);
             cp.gdn_conv->mem_type = MemoryType::POOLED;
             cp.gdn_conv->shape[0] = (int64_t)cp.gdn_conv_groups;
             cp.gdn_conv->shape[1] = (int64_t)kernel_m1;
             cp.gdn_conv->shape[2] = 1;
             cp.gdn_conv->shape[3] = 1;
             cp.gdn_conv->compute_strides();
+            if (!alloc_cache_buf(
+                    cp.gdn_conv, data_bytes,
+                    PersistentHostAccess::NONE) ||
+                !storage_backend->zero_tensor(*cp.gdn_conv, data_bytes))
+                return false;
         }
         if (cp.rwkv_state) {
             size_t bytes = cp.rwkv_state->nbytes();
-            void* buf = alloc_cache_buf(cp.rwkv_state, bytes);
-            std::memset(buf, 0, bytes);
             cp.rwkv_state->mem_type = MemoryType::POOLED;
+            if (!alloc_cache_buf(
+                    cp.rwkv_state, bytes, PersistentHostAccess::NONE) ||
+                !storage_backend->zero_tensor(*cp.rwkv_state, bytes))
+                return false;
         }
         for (Tensor* shift : {cp.rwkv_att_shift, cp.rwkv_ffn_shift})
             if (shift) {
                 size_t bytes = shift->nbytes();
-                void* buf = alloc_cache_buf(shift, bytes);
-                std::memset(buf, 0, bytes);
                 shift->mem_type = MemoryType::POOLED;
+                if (!alloc_cache_buf(
+                        shift, bytes, PersistentHostAccess::NONE) ||
+                    !storage_backend->zero_tensor(*shift, bytes))
+                    return false;
             }
     }
     for (const auto& entry : auxiliary_states_) {
@@ -781,10 +813,13 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         if (!state || state->data)
             continue;
         const size_t bytes = state->nbytes();
-        void* buffer = alloc_cache_buf(state, bytes);
-        std::memset(buffer, 0, bytes);
         state->mem_type = MemoryType::POOLED;
+        if (!alloc_cache_buf(
+                state, bytes, PersistentHostAccess::NONE) ||
+            !storage_backend->zero_tensor(*state, bytes))
+            return false;
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,7 +1110,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     cfg_.rope_dim = get_meta_int("rope_dim", cfg_.rope_dim);
     cfg_.rope_theta = get_meta_float("rope_theta", cfg_.rope_theta);
 
-    allocate_caches(graph_prefill_, cfg.n_ctx);
+    if (!allocate_caches(graph_prefill_, cfg.n_ctx)) {
+        fprintf(stderr, "Engine: failed to allocate persistent state\n");
+        return false;
+    }
 
     // Load decode graph (reuses shared weights via weight_map_)
     if (!load_graph(graph_decode_, exec_ctx_decode_, dc_path.c_str())) {

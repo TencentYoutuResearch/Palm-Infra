@@ -1398,7 +1398,11 @@ void MetalBackend::wrap_weight_int4(Tensor& t, bool keep_native_experts) {
     }
 }
 
-void MetalBackend::alloc_persistent(Tensor& t, size_t nbytes) {
+void MetalBackend::alloc_persistent(
+    Tensor& t, size_t nbytes, PersistentHostAccess host_access,
+    size_t host_prefix_bytes) {
+    (void)host_access;
+    (void)host_prefix_bytes;
     @autoreleasepool {
         id<MTLBuffer> b = [impl_->device newBufferWithLength:nbytes
                                                      options:MTLResourceStorageModeShared];

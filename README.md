@@ -398,9 +398,10 @@ device scratch for the current forward pass.
 The CUDA backend is still a correctness-first implementation. Graph
 intermediates use pooled device-only `cudaMalloc` storage; host readback,
 debugging, and the generic CPU fallback cross an explicit transfer boundary
-instead of relying on Unified Memory migration. Persistent cache and recurrent
-state remain managed where the engine still updates host-side metadata or
-reset state. FP16/FP32 linear layers run through cuBLAS, and ordinary
+instead of relying on Unified Memory migration. Persistent KV payloads and
+recurrent state are device-only as well; the engine updates and resets them
+through backend operations, while only each KV cache's 64-byte metadata header
+has a synchronized host mirror. FP16/FP32 linear layers run through cuBLAS, and ordinary
 package-native W8, W4G32, and W4G128 weights remain quantized in device
 storage. Single-token decode reads those layouts directly in specialized GEMV
 kernels; multi-token prefill dequantizes one matrix at a time into reusable

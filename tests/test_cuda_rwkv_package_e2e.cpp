@@ -45,8 +45,17 @@ bool run(const char* package, Device device, std::vector<float>& prefill,
     if (!copy_finite(engine.decode_hidden(4), first_decode) ||
         engine.past_len() != 4)
         return false;
-    return copy_finite(engine.decode_hidden(5), second_decode) &&
-        engine.past_len() == 5;
+    if (!copy_finite(engine.decode_hidden(5), second_decode) ||
+        engine.past_len() != 5)
+        return false;
+    engine.reset();
+    std::vector<float> reset_prefill;
+    std::vector<float> reset_decode;
+    return engine.past_len() == 0 &&
+        copy_finite(engine.prefill_hidden({1, 2, 3}), reset_prefill) &&
+        copy_finite(engine.decode_hidden(4), reset_decode) &&
+        reset_prefill == prefill && reset_decode == first_decode &&
+        engine.past_len() == 4;
 }
 
 bool close_enough(const std::vector<float>& actual,

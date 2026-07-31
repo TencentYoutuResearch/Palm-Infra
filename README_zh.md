@@ -304,9 +304,10 @@ device，不再在加载时永久展开成 FP16。单 token decode 由专用 GEM
 scratch 后调用 cuBLAS，因此不会额外保留一份模型大小的 FP16 权重。
 graph intermediate 采用可复用的 device-only `cudaMalloc` 存储；host readback、
 调试以及 generic CPU fallback 都通过显式传输边界完成，不再依赖 Unified
-Memory 的隐式迁移。仍需由 engine 在 host 侧更新 metadata 或执行 reset 的
-持久 cache/recurrent state 暂时继续使用 managed storage。未原生实现的算子会
-显式执行 D2H、CPU reference、H2D bridge。
+Memory 的隐式迁移。持久 KV payload 与 recurrent state 同样使用 device-only
+存储，由 engine 通过 backend API 更新与 reset；每个 KV cache 只有 64-byte
+metadata header 保留同步的 host mirror。未原生实现的算子会显式执行 D2H、
+CPU reference、H2D bridge。
 标准 attention 的 KV cache 在 CUDA 上保留 package 声明的 FP16 格式，仅在
 append 时转换 FP32 K/V projection，attention 累加仍使用 FP32；
 `mollm_bench` 会通过 `kv_cache_mb` 报告实际分配量。

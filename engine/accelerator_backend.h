@@ -34,6 +34,18 @@ struct DeviceMoeCacheStats {
     size_t fallback_scratch_bytes = 0;
 };
 
+enum class PersistentHostAccess {
+    // The complete allocation must remain directly host-addressable. This is
+    // useful for low-level tooling and backends whose native storage is shared.
+    FULL,
+    // Only a leading metadata prefix is read on the host. Callers must update
+    // it through Backend transfer/zero methods so the device copy stays in
+    // sync. The prefix size is passed to alloc_persistent().
+    MIRRORED_PREFIX,
+    // The host never dereferences this allocation.
+    NONE,
+};
+
 // Common lifecycle for graph-resident accelerator backends. LLMEngine only
 // talks to this interface; Metal, CUDA and future device backends own their
 // resource representation and transfer policy behind it.
@@ -56,7 +68,10 @@ public:
     virtual bool wants_cpu_weight_sidecars() const { return true; }
 
     // Persistent state and reusable graph-boundary transfers.
-    virtual void alloc_persistent(Tensor& tensor, size_t nbytes) = 0;
+    virtual void alloc_persistent(
+        Tensor& tensor, size_t nbytes,
+        PersistentHostAccess host_access = PersistentHostAccess::FULL,
+        size_t host_prefix_bytes = 0) = 0;
     virtual void upload_input(Tensor& tensor, const std::string& key,
                               const void* host_src, size_t nbytes) = 0;
 

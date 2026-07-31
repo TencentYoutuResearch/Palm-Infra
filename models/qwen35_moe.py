@@ -444,7 +444,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                          (linear_v_dim, linear_k_dim, linear_num_v_heads),
                          prec=Precision.FP32)
             qkv_total = linear_num_heads * linear_k_dim * 2 + linear_num_v_heads * linear_v_dim
-            gc = g.input(f"gdn_conv{i}", (qkv_total, conv_kernel - 1), prec=Precision.FP16)
+            gc = g.input(f"gdn_conv{i}", (qkv_total, conv_kernel - 1), prec=Precision.FP32)
             cache_inputs.append(("gdn", gs, gc))
 
     x = hidden

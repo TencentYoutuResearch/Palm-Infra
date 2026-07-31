@@ -5,6 +5,7 @@
 #include "kernels/trace.h"
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -211,6 +212,27 @@ void LLMEngine::reset_profiles() {
     reset_profile_stats(exec_ctx_decode_);
 }
 
+Backend* LLMEngine::persistent_backend() const {
+    return accelerator_backend_
+        ? static_cast<Backend*>(accelerator_backend_.get())
+        : exec_ctx_prefill_.backend;
+}
+
+bool LLMEngine::set_cache_lengths(uint64_t length) {
+    Backend* backend = persistent_backend();
+    if (!backend)
+        return false;
+    for (auto& cache : caches_) {
+        for (Tensor* tensor : {cache.k, cache.v}) {
+            if (tensor && !backend->copy_from_host(
+                    &length, *tensor, sizeof(length),
+                    offsetof(CacheMetadata, current_seq_len)))
+                return false;
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // reset
 // ---------------------------------------------------------------------------
@@ -230,35 +252,37 @@ void LLMEngine::reset() {
     // GDN state: zero the entire recurrent state buffer (it's small, ~256KB
     // per layer, and GDN reads stale state without causal mask protection).
     // GDN conv state: also zero (short conv uses conv_state for continuity).
+    Backend* backend = persistent_backend();
+    bool storage_reset = backend ? set_cache_lengths(0)
+                                 : caches_.empty() && auxiliary_states_.empty();
     for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = 0;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = 0;
         if (cp.gdn_state) {
             size_t sz = (size_t)cp.gdn_v_dim * cp.gdn_k_dim * cp.gdn_num_heads *
                         sizeof(float);
-            std::memset(cp.gdn_state->data, 0, sz);
+            if (!backend || !backend->zero_tensor(*cp.gdn_state, sz))
+                storage_reset = false;
         }
         if (cp.gdn_conv) {
             size_t sz = (size_t)cp.gdn_conv_groups * (cp.gdn_conv_kernel - 1) *
                         sizeof(float);
-            std::memset(cp.gdn_conv->data, 0, sz);
+            if (!backend || !backend->zero_tensor(*cp.gdn_conv, sz))
+                storage_reset = false;
         }
-        if (cp.rwkv_state)
-            std::memset(cp.rwkv_state->data, 0, cp.rwkv_state->nbytes());
-        if (cp.rwkv_att_shift)
-            std::memset(cp.rwkv_att_shift->data, 0,
-                        cp.rwkv_att_shift->nbytes());
-        if (cp.rwkv_ffn_shift)
-            std::memset(cp.rwkv_ffn_shift->data, 0,
-                        cp.rwkv_ffn_shift->nbytes());
+        for (Tensor* state : {
+                 cp.rwkv_state, cp.rwkv_att_shift, cp.rwkv_ffn_shift}) {
+            if (state &&
+                (!backend || !backend->zero_tensor(*state, state->nbytes())))
+                storage_reset = false;
+        }
     }
     for (const auto& entry : auxiliary_states_) {
         Tensor* state = entry.second;
-        if (state && state->data)
-            std::memset(state->data, 0, state->nbytes());
+        if (state && state->data &&
+            (!backend || !backend->zero_tensor(*state, state->nbytes())))
+            storage_reset = false;
     }
+    if (!storage_reset)
+        std::fprintf(stderr, "Engine: failed to reset persistent state\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -859,12 +883,15 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
 
     // n_real_tokens injection is done by inject_runtime_shapes() above.
 
-    // Set cache metadata
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    // Set cache metadata through the persistent-storage backend so device-only
+    // caches do not need a host-addressable payload.
+    if (!set_cache_lengths(static_cast<uint64_t>(past_len_))) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        exec_ctx_prefill_.backend = saved_prefill_backend;
+        return Tensor();
     }
 
     mollm_set_matmul_profile_phase("prefill_graph");
@@ -888,15 +915,11 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
     if (copied.data) {
-        past_len_ += n;
-        for (auto& cp : caches_) {
-            if (cp.k)
-                cache_meta(cp.k->data)->current_seq_len =
-                    (uint64_t)past_len_;
-            if (cp.v)
-                cache_meta(cp.v->data)->current_seq_len =
-                    (uint64_t)past_len_;
-        }
+        const int next_past = past_len_ + n;
+        if (set_cache_lengths(static_cast<uint64_t>(next_past)))
+            past_len_ = next_past;
+        else
+            copied = Tensor();
     }
 
     finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
@@ -984,11 +1007,12 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     // n_real_tokens injection is now done by inject_runtime_shapes() above.
 
     // Set cache metadata so SDPA knows the existing context length.
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past;
+    if (!set_cache_lengths(static_cast<uint64_t>(past))) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        return -1;
     }
 
     mollm_set_matmul_profile_phase("prefill_graph");
@@ -1010,15 +1034,16 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
         return -1;
     }
 
-    past_len_ = past + n;
-
-    // Update cache metadata for decode (past + current prefill tokens)
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    const int next_past = past + n;
+    if (!set_cache_lengths(static_cast<uint64_t>(next_past))) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
+        return -1;
     }
+    past_len_ = next_past;
 
     // Cache migration (prefill→decode graph) is done once at load time.
     // Both graphs share the same physical cache buffers.
@@ -1075,15 +1100,16 @@ int LLMEngine::decode(int token_id) {
         return -1;
     }
 
-    past_len_++;
-
-    // Update cache metadata
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    const int next_past = past_len_ + 1;
+    if (!set_cache_lengths(static_cast<uint64_t>(next_past))) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        finish_graph_temporaries(graph_decode_, exec_ctx_decode_);
+        return -1;
     }
+    past_len_ = next_past;
 
     mollm_set_matmul_profile_phase("decode_lmhead");
     sampler_.accept(token_id);
@@ -1139,15 +1165,11 @@ Tensor LLMEngine::decode_hidden(int token_id) {
     release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
     if (copied.data) {
-        past_len_++;
-        for (auto& cp : caches_) {
-            if (cp.k)
-                cache_meta(cp.k->data)->current_seq_len =
-                    (uint64_t)past_len_;
-            if (cp.v)
-                cache_meta(cp.v->data)->current_seq_len =
-                    (uint64_t)past_len_;
-        }
+        const int next_past = past_len_ + 1;
+        if (set_cache_lengths(static_cast<uint64_t>(next_past)))
+            past_len_ = next_past;
+        else
+            copied = Tensor();
     }
 
     finish_graph_temporaries(graph_decode_, exec_ctx_decode_);
