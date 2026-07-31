@@ -267,6 +267,7 @@ public:
 
 private:
     void prepare_accelerator_prefill_weights();
+    void release_vision_buffers();
 
     EngineConfig cfg_;
     Sampler sampler_;

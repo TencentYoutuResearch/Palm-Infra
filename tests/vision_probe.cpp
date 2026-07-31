@@ -2,7 +2,9 @@
 #include "kernels/matmul.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -57,6 +59,11 @@ int main(int argc, char** argv) {
     cfg.package_path = argv[1];
     cfg.weight_loading = WeightLoadingMode::MMAP;
     cfg.num_threads = 4;
+    const char* device = std::getenv("MOLLM_VISION_DEVICE");
+    if (device && std::strcmp(device, "metal") == 0)
+        cfg.device = Device::METAL;
+    else if (device && std::strcmp(device, "cuda") == 0)
+        cfg.device = Device::CUDA;
     LLMEngine engine;
     if (!engine.load(cfg))
         return 1;
@@ -64,14 +71,40 @@ int main(int argc, char** argv) {
 
     VisionEmbedding output;
     std::string error;
-    const bool encoded =
-        read_input(argv[2], grid_t, grid_h, grid_w, pixels)
+    const bool patches = read_input(
+        argv[2], grid_t, grid_h, grid_w, pixels);
+    int repeats = 1;
+    if (const char* value = std::getenv("MOLLM_VISION_REPEAT")) {
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed > 0 && parsed <= 100)
+            repeats = static_cast<int>(parsed);
+    }
+    for (int iteration = 0; iteration < repeats; ++iteration) {
+        const bool encoded = patches
             ? engine.encode_vision_patches(
                   pixels, grid_t, grid_h, grid_w, output, &error)
             : engine.encode_image_file(argv[2], output, &error);
-    if (!encoded) {
-        std::fprintf(stderr, "vision encode failed: %s\n", error.c_str());
-        return 1;
+        if (!encoded) {
+            std::fprintf(stderr, "vision encode failed: %s\n", error.c_str());
+            return 1;
+        }
+    }
+    int next_token = -1;
+    if (std::getenv("MOLLM_VISION_PREFILL")) {
+        const auto found = engine.package_metadata().find("image_token_id");
+        if (found == engine.package_metadata().end()) {
+            std::fprintf(stderr, "vision package has no image_token_id\n");
+            return 1;
+        }
+        const int image_token_id = std::stoi(found->second);
+        std::vector<int> tokens(
+            static_cast<size_t>(output.tokens), image_token_id);
+        next_token = engine.prefill_with_image(
+            tokens, image_token_id, output, &error);
+        if (next_token < 0) {
+            std::fprintf(stderr, "vision prefill failed: %s\n", error.c_str());
+            return 1;
+        }
     }
     if (!write_output(argv[3], output)) {
         std::fprintf(stderr, "failed to write %s\n", argv[3]);
@@ -79,5 +112,7 @@ int main(int argc, char** argv) {
     }
     std::printf("vision_tokens=%d hidden=%d\n",
                 output.tokens, output.hidden_size);
+    if (next_token >= 0)
+        std::printf("next_token=%d\n", next_token);
     return 0;
 }

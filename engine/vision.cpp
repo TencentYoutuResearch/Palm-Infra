@@ -698,6 +698,12 @@ bool LLMEngine::encode_vision_patches(
             input = cos;
         else if (name == "vision_sin")
             input = sin;
+        if (accelerator_backend_ &&
+            exec_ctx_vision_.backend == accelerator_backend_.get() &&
+            input.data) {
+            accelerator_backend_->upload_input(
+                input, "vision_" + name, input.data, input.nbytes());
+        }
     }
 
     exec_ctx_vision_.runtime_seq_len = patch_count;
@@ -705,15 +711,29 @@ bool LLMEngine::encode_vision_patches(
     exec_ctx_vision_.static_padded = false;
     exec_ctx_vision_.padded_seq_len = -1;
     inject_runtime_shapes(exec_ctx_vision_);
+    if (accelerator_backend_ &&
+        exec_ctx_vision_.backend == accelerator_backend_.get())
+        accelerator_backend_->begin_graph();
     execute_graph(exec_ctx_vision_);
-    if (graph_vision_.graph_outputs.size() != 1)
+    if (accelerator_backend_ &&
+        exec_ctx_vision_.backend == accelerator_backend_.get())
+        accelerator_backend_->end_graph();
+    if (exec_ctx_vision_.execution_failed) {
+        release_vision_buffers();
+        return fail(error, "vision graph execution failed");
+    }
+    if (graph_vision_.graph_outputs.size() != 1) {
+        release_vision_buffers();
         return fail(error, "vision graph must have exactly one output");
+    }
     const Tensor& result = graph_vision_.runtime.tensors[
         graph_vision_.graph_outputs[0]];
     const int output_tokens = patch_count / (merge * merge);
     if (!result.data || result.prec != Precision::FP32 ||
-        result.shape[0] <= 0 || result.shape[1] != output_tokens)
+        result.shape[0] <= 0 || result.shape[1] != output_tokens) {
+        release_vision_buffers();
         return fail(error, "vision graph produced an invalid output");
+    }
 
     output.tokens = output_tokens;
     output.hidden_size = static_cast<int>(result.shape[0]);
@@ -725,22 +745,10 @@ bool LLMEngine::encode_vision_patches(
     std::memcpy(output.values.data(), result.data,
                 output.values.size() * sizeof(float));
     // Vision runs once per attached image. Its SDPA graph conservatively keeps
-    // intermediates alive through the call, so release that temporary working
-    // set immediately instead of retaining hundreds of MB during text decode.
-    graph_vision_.runtime.pool.clear();
-    for (const auto& node : graph_vision_.nodes) {
-        if (node.op_type == OpType::INPUT ||
-            node.op_type == OpType::CONSTANT)
-            continue;
-        Tensor& tensor = graph_vision_.runtime.tensors[node.id];
-        tensor.data = nullptr;
-        tensor.device_data = nullptr;
-        tensor.device_offset = 0;
-        tensor.mem_type = MemoryType::NONE;
-        tensor.owner_id = 0;
-        tensor.storage_id = 0;
-    }
-    exec_ctx_vision_.workspace_shape_valid = false;
+    // intermediates alive through the call, so return both CPU pool storage
+    // and accelerator allocations immediately instead of retaining hundreds
+    // of MB during text decode.
+    release_vision_buffers();
     if (error) error->clear();
     return true;
 }

@@ -449,8 +449,10 @@ if(MOLLM_BUILD_TESTS)
         add_mollm_test(test_cuda_backend tests/test_cuda_backend.cpp)
         add_mollm_test(test_cuda_recurrent tests/test_cuda_recurrent.cpp)
         add_mollm_test(test_cuda_rwkv tests/test_cuda_rwkv.cpp)
+        add_mollm_test(test_cuda_vision_e2e tests/test_cuda_vision_e2e.cpp)
         set_tests_properties(
             test_cuda_backend test_cuda_recurrent test_cuda_rwkv
+            test_cuda_vision_e2e
             PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)

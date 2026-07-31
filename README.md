@@ -311,7 +311,7 @@ One-shot deterministic smoke test:
     --temperature 0
 ```
 
-Experimental Qwen3.5 single-image chat (macOS, CPU vision encoder):
+Experimental Qwen3.5 single-image chat (macOS image-file decoding):
 
 ```bash
 ./build_i8mm/mollm_chat \
@@ -323,11 +323,14 @@ Experimental Qwen3.5 single-image chat (macOS, CPU vision encoder):
 
 The converter packages the checkpoint's FP16 vision tower alongside the
 quantized text model. The first implementation supports one static image in
-single-shot chat; multi-image/video input, server integration, and Metal vision
-execution are not enabled yet. Images default to a 262,144-pixel resize budget
-(roughly 512x512); use `--image-max-pixels` to trade speed for detail, up to
-1,048,576 pixels. Use converter option `--text-only` when the vision tower is
-not needed, avoiding its package and resident-memory overhead.
+single-shot chat. With `--device cuda`, both the vision encoder and subsequent
+text graph stay on CUDA; image-file decoding itself is currently macOS-only.
+Linux callers can use the preprocessed `encode_vision_patches` API directly.
+Multi-image/video input, server integration, and Metal vision execution are not
+enabled yet. Images default to a 262,144-pixel resize budget (roughly 512x512);
+use `--image-max-pixels` to trade speed for detail, up to 1,048,576 pixels. Use
+converter option `--text-only` when the vision tower is not needed, avoiding
+its package and resident-memory overhead.
 
 Sampled generation:
 
@@ -384,9 +387,11 @@ and the decode lm_head also stay on CUDA. Qwen3.5's recurrent Gated DeltaNet
 and short-convolution paths are native as well, including persistent
 decode-state updates. RWKV7 token shift, channel mixing, normalization, WKV7
 recurrence, post-processing, batched projections, and sparse-activation FFN
-also run natively, with persistent FP16 or FP32 recurrent state. This keeps
-the dense Qwen3, Qwen3.5, Youtu MLA, and RWKV7 text graphs on CUDA without CPU
-operator fallback. Operators not yet implemented
+also run natively, with persistent FP16 or FP32 recurrent state. Qwen3.5's
+single-image vision tower uses the same native matmul, LayerNorm, RoPE, SDPA,
+GELU, and layout paths. This keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7,
+and Qwen3.5 vision graphs on CUDA without CPU operator fallback. Operators not
+yet implemented
 natively synchronize and use the CPU reference dispatcher over the managed
 buffers. Set `MOLLM_CUDA_PROFILE=1` to print native/fallback operator counts.
 Several specialized model families still fall back, so this is not yet a

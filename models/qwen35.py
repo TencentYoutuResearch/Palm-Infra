@@ -833,8 +833,18 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int | None = No
     if g_vision is not None:
         vc = cfg["vision_config"]
         processor_path = model_dir / "preprocessor_config.json"
-        with open(processor_path) as f:
-            processor_cfg = json.load(f)
+        processor_size = {
+            "shortest_edge": 256 * 256,
+            "longest_edge": 4096 * 4096,
+        }
+        if processor_path.exists():
+            with open(processor_path) as f:
+                processor_cfg = json.load(f)
+            processor_size.update(processor_cfg.get("size", {}))
+        else:
+            print(
+                "  Warning: preprocessor_config.json is missing; using "
+                "the runtime vision pixel-budget defaults")
         metadata.update({
             "vision": True,
             "image_token_id": cfg["image_token_id"],
@@ -851,8 +861,8 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int | None = No
             "mrope_section_t": tc["rope_parameters"]["mrope_section"][0],
             "mrope_section_h": tc["rope_parameters"]["mrope_section"][1],
             "mrope_section_w": tc["rope_parameters"]["mrope_section"][2],
-            "vision_min_pixels": processor_cfg["size"]["shortest_edge"],
-            "vision_max_pixels": processor_cfg["size"]["longest_edge"],
+            "vision_min_pixels": int(processor_size["shortest_edge"]),
+            "vision_max_pixels": int(processor_size["longest_edge"]),
         })
     save_package(output_path, g_prefill, g_decode, weights_dir, metadata,
                  tokenizer_path=str(model_dir / "tokenizer.json"),
