@@ -200,7 +200,7 @@ def build_qwen35_fixture(model_dir: Path) -> None:
 
 def build_hash_package(weights_dir: Path, package: Path,
                        models_dir: Path) -> None:
-    """Build a minimal package that exercises engine token/hash plumbing."""
+    """Build a tiny DeepSeek graph that exercises the complete CUDA path."""
     import numpy as np
 
     sys.path.insert(0, str(models_dir))
@@ -222,6 +222,9 @@ def build_hash_package(weights_dir: Path, package: Path,
     hc_mult = 3
     wide = hidden * hc_mult
     hc_mix = (2 + hc_mult) * hc_mult
+    dsv_head_dim = hidden
+    dsv_ratio = 4
+    dsv_projected = 2 * dsv_head_dim
     rng = np.random.default_rng(20260802)
 
     def matrix(rows: int, cols: int) -> object:
@@ -231,6 +234,8 @@ def build_hash_package(weights_dir: Path, package: Path,
         "embed_tokens.weights": matrix(vocab, hidden),
         "lm_head.weights": matrix(vocab, hidden),
         "layer_0_router.weights": matrix(experts, hidden),
+        "dsv_index_weights.weights": np.zeros(
+            (1, hidden), dtype=np.float16),
     }
     fp32_weights = {
         "hc_fn.weights": rng.uniform(
@@ -244,6 +249,29 @@ def build_hash_package(weights_dir: Path, package: Path,
         "hc_head_scale.weights": np.array([0.9], dtype=np.float32),
         "hc_head_base.weights": rng.uniform(
             -0.1, 0.1, hc_mult).astype(np.float32),
+        "dsv_sink.weights": np.array([-0.125], dtype=np.float32),
+        "dsv_compressor_wkv.weights": rng.uniform(
+            -0.08, 0.08,
+            (dsv_projected, hidden)).astype(np.float32),
+        "dsv_compressor_wgate.weights": rng.uniform(
+            -0.04, 0.04,
+            (dsv_projected, hidden)).astype(np.float32),
+        "dsv_compressor_ape.weights": rng.uniform(
+            -0.03, 0.03,
+            (dsv_ratio, dsv_projected)).astype(np.float32),
+        "dsv_compressor_norm.weights": np.ones(
+            dsv_head_dim, dtype=np.float32),
+        "dsv_index_wkv.weights": rng.uniform(
+            -0.08, 0.08,
+            (dsv_projected, hidden)).astype(np.float32),
+        "dsv_index_wgate.weights": rng.uniform(
+            -0.04, 0.04,
+            (dsv_projected, hidden)).astype(np.float32),
+        "dsv_index_ape.weights": rng.uniform(
+            -0.03, 0.03,
+            (dsv_ratio, dsv_projected)).astype(np.float32),
+        "dsv_index_norm.weights": np.ones(
+            dsv_head_dim, dtype=np.float32),
     }
     # Physical source layout is [vocab, top_k], while mollm tensor shape is
     # [top_k, vocab] because dimension zero is the contiguous dimension.
@@ -305,9 +333,15 @@ def build_hash_package(weights_dir: Path, package: Path,
         hidden, shared_intermediate, 20260807)
     write_fp8(
         "layer_0_grouped.weights", hidden, hidden // 4, 20260808)
+    write_fp8(
+        "dsv_index_wq_b.weights", dsv_head_dim, hidden, 20260809)
     for name, values in fp32_weights.items():
+        logical_shape = None
+        if name.endswith("_ape.weights"):
+            logical_shape = (dsv_projected, dsv_ratio)
         _write_weight_file(
-            str(weights_dir / name), values, precision=Precision.FP32)
+            str(weights_dir / name), values, precision=Precision.FP32,
+            logical_shape=logical_shape)
     _write_weight_file(
         str(weights_dir / "layer_0_token_hash.weights"), hash_values,
         precision=Precision.INT32, logical_shape=(top_k, vocab))
@@ -316,7 +350,7 @@ def build_hash_package(weights_dir: Path, package: Path,
         g = GraphBuilder()
         g.set_model_config(
             hidden_size=hidden, num_layers=1, vocab_size=vocab,
-            model_type="qwen3_moe", rope_dim=0, rope_theta=10000.0)
+            model_type="deepseek_v4", rope_dim=0, rope_theta=10000.0)
         g.weight("./embed_tokens.weights", (vocab, hidden), Precision.FP16)
         g.weight("./lm_head.weights", (vocab, hidden), Precision.FP16)
         hidden_input = g.input(
@@ -325,11 +359,82 @@ def build_hash_package(weights_dir: Path, package: Path,
         token_ids = g.input(
             "token_ids", (seq_len,), Precision.INT32,
             dynamic=(DimExpr.seq(),) if dynamic else None)
+        position = g.input("position", (1,), Precision.INT32)
+        n_tokens = g.input("n_tokens", (1,), Precision.INT32)
+
+        window_cache = g.input(
+            "aux_state0", (dsv_head_dim, 3), Precision.FP32)
+        compressor_kv_state = g.input(
+            "aux_state1", (dsv_projected, 2 * dsv_ratio),
+            Precision.FP32)
+        compressor_score_state = g.input(
+            "aux_state2", (dsv_projected, 2 * dsv_ratio),
+            Precision.FP32)
+        compressed_cache = g.input(
+            "aux_state3", (dsv_head_dim, 2), Precision.FP32)
+        index_kv_state = g.input(
+            "aux_state4", (dsv_projected, 2 * dsv_ratio),
+            Precision.FP32)
+        index_score_state = g.input(
+            "aux_state5", (dsv_projected, 2 * dsv_ratio),
+            Precision.FP32)
+        index_cache = g.input(
+            "aux_state6", (dsv_head_dim, 2), Precision.FP32)
+        compressor_wkv = g.weight(
+            "./dsv_compressor_wkv.weights",
+            (dsv_projected, hidden), Precision.FP32)
+        compressor_wgate = g.weight(
+            "./dsv_compressor_wgate.weights",
+            (dsv_projected, hidden), Precision.FP32)
+        compressor_ape = g.weight(
+            "./dsv_compressor_ape.weights",
+            (dsv_projected, dsv_ratio), Precision.FP32)
+        compressor_norm = g.weight(
+            "./dsv_compressor_norm.weights",
+            (dsv_head_dim,), Precision.FP32)
+        compressor_dependency = g.dsv4_compressor(
+            hidden_input, compressor_wkv, compressor_wgate,
+            compressor_ape, compressor_norm, compressor_kv_state,
+            compressor_score_state, compressed_cache, position, n_tokens,
+            hidden, dsv_head_dim, dsv_ratio, True, False, 0, 0,
+            1e-6, 10000.0, 1.0, 32.0, 1.0)
+        index_wq_b = g.weight(
+            "./dsv_index_wq_b.weights",
+            (dsv_head_dim, hidden), Precision.FP8_E4M3)
+        index_weights = g.weight(
+            "./dsv_index_weights.weights", (1, hidden), Precision.FP16)
+        index_wkv = g.weight(
+            "./dsv_index_wkv.weights",
+            (dsv_projected, hidden), Precision.FP32)
+        index_wgate = g.weight(
+            "./dsv_index_wgate.weights",
+            (dsv_projected, hidden), Precision.FP32)
+        index_ape = g.weight(
+            "./dsv_index_ape.weights",
+            (dsv_projected, dsv_ratio), Precision.FP32)
+        index_norm = g.weight(
+            "./dsv_index_norm.weights", (dsv_head_dim,), Precision.FP32)
+        compressed_indices = g.dsv4_indexer(
+            hidden_input, hidden_input, index_wq_b, index_weights,
+            index_wkv, index_wgate, index_ape, index_norm,
+            index_kv_state, index_score_state, index_cache,
+            position, n_tokens, hidden, hidden, 1, dsv_head_dim, top_k,
+            dsv_ratio, True, True, 0, 0,
+            1e-6, 10000.0, 1.0, 32.0, 1.0)
+        attended = g.dsv4_sparse_attention(
+            hidden_input, hidden_input, g.weight(
+                "./dsv_sink.weights", (1,), Precision.FP32),
+            window_cache, position, n_tokens, 1, dsv_head_dim, 3,
+            dsv_ratio, top_k, 0, 0, dsv_head_dim ** -0.5, 1e-6,
+            10000.0, 1.0, 32.0, 1.0,
+            compressed_cache=compressed_cache,
+            compressed_indices=compressed_indices,
+            dependencies=[compressor_dependency])
         grouped_weight = g.weight(
             "./layer_0_grouped.weights", (hidden, hidden // 4),
             Precision.FP8_E4M3)
         projected_hidden = g.dsv4_grouped_linear(
-            hidden_input, grouped_weight, 4)
+            attended, grouped_weight, 4)
         hc_fn = g.weight(
             "./hc_fn.weights", (hc_mix, wide), Precision.FP32)
         hc_scale = g.weight(
@@ -387,9 +492,12 @@ def build_hash_package(weights_dir: Path, package: Path,
         str(package), graph(4, True), graph(1, False), str(weights_dir),
         {
             "model_name": "tiny-hash-moe",
-            "architecture": "qwen3-moe",
+            "architecture": "deepseek-v4",
             "num_layers": 1,
             "hidden_size": hidden,
+            "num_heads": 1,
+            "head_dim": dsv_head_dim,
+            "n_ctx": 8,
             "vocab_size": vocab,
             "prefill_seq_len": 4,
             "quantization": "native-fp8-mxfp4",

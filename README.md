@@ -99,7 +99,7 @@ amortized logical-expert-byte definition as the 122B table above.
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4; experimental single-image vision |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
 | RWKV7 | Official `.pth` conversion; FP16, W8, mixed W4; recurrent CPU/CUDA prefill and decode |
-| DeepSeek-V4-Flash | Experimental CPU inference with native FP8/MXFP4 and SSD expert offload |
+| DeepSeek-V4-Flash | Experimental resident CPU/CUDA inference with native FP8/MXFP4; CPU SSD expert offload |
 
 The most tested runtime path today is `w4g128`: it has the lowest memory use and
 the fastest decode speed in mollm. All config-based converters also accept
@@ -401,14 +401,12 @@ Checkpoint-native FP8 E4M3 block-128 dense/shared-expert weights and resident
 MXFP4 E2M1/E8M0 group-32 routed experts likewise stay byte-packed on the GPU.
 Their CUDA paths reproduce the checkpoint's FP8 activation quantization and
 the BF16 boundaries around MXFP4 MoE gate/up, routed scaling, and down output.
-This
-keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7, Qwen3.5 vision, Qwen3-MoE,
-and Qwen3.5-MoE graphs on CUDA without CPU operator fallback. DeepSeek-V4's
-FP32 Hyper-Connection stages, checkpoint-native dense and grouped FP8
-projections, and resident FP8/MXFP4 hash-routed MoE operator are native, but
-its complete graph remains CPU-only because the compressor, indexer, and
-sparse-attention stages are still incomplete. SSD-offloaded MoE variants also
-remain CPU-only.
+This keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7, Qwen3.5 vision,
+Qwen3-MoE, Qwen3.5-MoE, and resident DeepSeek-V4 graphs on CUDA without CPU
+operator fallback. DeepSeek-V4's FP32 Hyper-Connection stages, learned KV
+compressor and indexer, sparse attention, checkpoint-native dense and grouped
+FP8 projections, and resident FP8/MXFP4 hash-routed MoE operator are native.
+SSD-offloaded MoE variants remain CPU-only.
 Other operators not yet implemented natively synchronize and use the CPU
 reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to
 print native/fallback operator counts. Several specialized model families

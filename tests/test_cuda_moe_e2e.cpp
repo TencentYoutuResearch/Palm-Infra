@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
             stderr,
             "usage: %s <qwen3-moe-w4g32.mollm> "
             "<qwen3.5-moe-w4g32.mollm> <qwen3-moe-w8g32.mollm> "
-            "<hash-moe-fp8-mxfp4.mollm>\n",
+            "<deepseek-v4-fp8-mxfp4.mollm>\n",
             argv[0]);
         return 2;
     }
@@ -99,7 +99,8 @@ int main(int argc, char** argv) {
             argv[2], "qwen3.5-moe", "Qwen3.5-MoE W4") ||
         !compare_package(argv[3], "qwen3-moe", "Qwen3-MoE W8") ||
         !compare_package(
-            argv[4], "qwen3-moe", "hash/HC/grouped FP8+MXFP4"))
+            argv[4], "deepseek-v4",
+            "DeepSeek attention/hash/HC/grouped FP8+MXFP4"))
         return 1;
     std::printf("Tiny CUDA MoE E2E tests passed\n");
     return 0;

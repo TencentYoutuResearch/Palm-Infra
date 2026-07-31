@@ -931,12 +931,15 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             return false;
         }
 
-        // DeepSeek-V4's CUDA path now covers resident FP8/MXFP4 weights,
-        // Hyper-Connection, MoE, and its grouped output projection. The
-        // compressor, indexer, and sparse-attention stages remain CPU-only, so
-        // keep the complete graph on one backend until those stateful stages
-        // are native as well.
-        if (cfg_.device != Device::CPU) {
+        // Resident DeepSeek-V4 graphs are fully device-resident on CUDA.
+        // Metal and SSD-streamed experts still use the established CPU path;
+        // CUDA expert streaming needs a separate device-cache policy before
+        // it can avoid copying aggregate tensors into VRAM.
+        const bool unsupported_accelerator =
+            cfg_.device == Device::METAL ||
+            (cfg_.device == Device::CUDA &&
+             cfg_.moe_ssd_cache_bytes != 0);
+        if (unsupported_accelerator) {
             if (cfg_.metal_ssd_full) {
                 fprintf(stderr,
                         "Engine: DeepSeek-V4 does not yet support "
@@ -944,8 +947,9 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 return false;
             }
             fprintf(stderr,
-                    "Engine: DeepSeek-V4 currently uses the CPU backend; "
-                    "ignoring accelerator device request\n");
+                    "Engine: DeepSeek-V4 uses the CPU backend for Metal or "
+                    "SSD-offloaded experts; ignoring accelerator device "
+                    "request\n");
             accelerator_backend_.reset();
             cfg_.device = Device::CPU;
             exec_ctx_prefill_.backend = &cpu_backend_;

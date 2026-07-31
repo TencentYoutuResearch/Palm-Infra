@@ -81,8 +81,8 @@ Apple M5 Pro 上当前的纯 CPU 实验结果：
 | Qwen3.5-122B-A10B MoE | CPU W4，支持 SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16、W8、W4、混合 W4；实验性单图视觉输入 |
 | Youtu-LLM-2B | FP16、W8、W4、混合 W4 |
-| RWKV7 | FP16、W8、混合 W4；循环式 CPU prefill/decode |
-| DeepSeek-V4-Flash | 实验性纯 CPU 推理，支持原生 FP8/MXFP4 与 SSD expert offload |
+| RWKV7 | 官方 `.pth` 转换；FP16、W8、混合 W4；循环式 CPU/CUDA prefill/decode |
+| DeepSeek-V4-Flash | 实验性 resident CPU/CUDA 推理，支持原生 FP8/MXFP4；SSD expert offload 走 CPU |
 
 当前测试最充分的运行路径是 `w4g128`：它占用内存最少，且具有 mollm 中最快的
 decode 速度。所有基于 `config.json` 的 converter 也支持 `w4g32` 和

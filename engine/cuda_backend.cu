@@ -278,6 +278,619 @@ __global__ void dsv4_grouped_fp8_linear_cuda(
     output[static_cast<size_t>(token) * output_stride + row] = sum;
 }
 
+__device__ float dsv4_yarn_frequency_cuda(
+    int pair, int rope_dim, float theta, int original_context,
+    float factor, float beta_fast, float beta_slow) {
+    constexpr float pi = 3.14159265358979323846f;
+    float frequency = 1.0f / powf(
+        theta, 2.0f * static_cast<float>(pair) /
+                   static_cast<float>(rope_dim));
+    if (original_context <= 0 || factor <= 1.0f)
+        return frequency;
+    const float fast_dim = static_cast<float>(rope_dim) *
+        logf(static_cast<float>(original_context) /
+             (beta_fast * 2.0f * pi)) /
+        (2.0f * logf(theta));
+    const float slow_dim = static_cast<float>(rope_dim) *
+        logf(static_cast<float>(original_context) /
+             (beta_slow * 2.0f * pi)) /
+        (2.0f * logf(theta));
+    const int low = max(0, static_cast<int>(floorf(fast_dim)));
+    const int high = min(
+        rope_dim - 1, static_cast<int>(ceilf(slow_dim)));
+    const float denominator = high == low
+        ? 0.001f : static_cast<float>(high - low);
+    const float ramp = fminf(1.0f, fmaxf(
+        0.0f, (static_cast<float>(pair) - low) / denominator));
+    const float smooth = 1.0f - ramp;
+    return frequency / factor * (1.0f - smooth) + frequency * smooth;
+}
+
+__device__ void dsv4_apply_rope_cuda(
+    float* values, int width, int position, int rope_dim, float theta,
+    int original_context, float factor, float beta_fast, float beta_slow) {
+    if (rope_dim <= 0 || rope_dim > width || (rope_dim & 1))
+        return;
+    float* rotary = values + width - rope_dim;
+    for (int pair = 0; pair < rope_dim / 2; ++pair) {
+        const float angle = static_cast<float>(position) *
+            dsv4_yarn_frequency_cuda(
+                pair, rope_dim, theta, original_context, factor,
+                beta_fast, beta_slow);
+        float sine = 0.0f;
+        float cosine = 0.0f;
+        sincosf(angle, &sine, &cosine);
+        const float real = rotary[pair * 2];
+        const float imaginary = rotary[pair * 2 + 1];
+        rotary[pair * 2] = real * cosine - imaginary * sine;
+        rotary[pair * 2 + 1] = real * sine + imaginary * cosine;
+    }
+}
+
+__device__ void dsv4_hadamard_rotate_cuda(float* values, int width) {
+    if (!values || width <= 0 || (width & (width - 1)) != 0)
+        return;
+    for (int span = 1; span < width; span *= 2) {
+        for (int base = 0; base < width; base += span * 2) {
+            for (int offset = 0; offset < span; ++offset) {
+                const float left = values[base + offset];
+                const float right = values[base + span + offset];
+                values[base + offset] = left + right;
+                values[base + span + offset] = left - right;
+            }
+        }
+    }
+    const float scale = rsqrtf(static_cast<float>(width));
+    for (int index = 0; index < width; ++index)
+        values[index] *= scale;
+}
+
+__device__ float dsv4_nearest_e2m1_cuda(float value) {
+    constexpr float magnitudes[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float sign = signbit(value) ? -1.0f : 1.0f;
+    const float magnitude = fabsf(value);
+    float nearest = magnitudes[0];
+    float distance = fabsf(magnitude - nearest);
+    int nearest_code = 0;
+    for (int code = 1; code < 8; ++code) {
+        const float candidate_distance =
+            fabsf(magnitude - magnitudes[code]);
+        if (candidate_distance < distance ||
+            (candidate_distance == distance && (code & 1) == 0 &&
+             (nearest_code & 1) != 0)) {
+            distance = candidate_distance;
+            nearest = magnitudes[code];
+            nearest_code = code;
+        }
+    }
+    return sign * nearest;
+}
+
+__device__ void dsv4_fp4_simulate_cuda(
+    float* values, int width, int group_size) {
+    if (!values || width <= 0 || group_size <= 0 ||
+        width % group_size != 0)
+        return;
+    for (int begin = 0; begin < width; begin += group_size) {
+        float maximum = 0.0f;
+        for (int index = 0; index < group_size; ++index)
+            maximum = fmaxf(maximum, fabsf(values[begin + index]));
+        maximum = fmaxf(maximum, 6.0f * ldexpf(1.0f, -126));
+        const float scale = exp2f(ceilf(log2f(maximum / 6.0f)));
+        for (int index = 0; index < group_size; ++index) {
+            const float normalized = fminf(
+                6.0f, fmaxf(-6.0f, values[begin + index] / scale));
+            values[begin + index] =
+                dsv4_nearest_e2m1_cuda(normalized) * scale;
+        }
+    }
+}
+
+__device__ void dsv4_fp8_simulate_cuda(
+    float* values, int width, int group_size) {
+    if (!values || width <= 0 || group_size <= 0 ||
+        width % group_size != 0)
+        return;
+    for (int begin = 0; begin < width; begin += group_size) {
+        float maximum = 0.0f;
+        for (int index = 0; index < group_size; ++index)
+            maximum = fmaxf(maximum, fabsf(values[begin + index]));
+        maximum = fmaxf(maximum, 1.0e-4f);
+        const float scale = exp2f(ceilf(log2f(maximum / 448.0f)));
+        for (int index = 0; index < group_size; ++index) {
+            const float normalized = fminf(
+                448.0f,
+                fmaxf(-448.0f, values[begin + index] / scale));
+            values[begin + index] = cuda_decode_fp8_e4m3fn(
+                cuda_encode_fp8_e4m3fn(normalized)) * scale;
+        }
+    }
+}
+
+__global__ void dsv4_compressor_state_cuda(
+    const float* kv_values, const float* gate_values, const float* ape,
+    const float* norm, float* kv_state, float* score_state, float* cache,
+    const int32_t* start_position, const int32_t* real_tokens,
+    float* compressed, float* emitted_output, int sequence,
+    int head_dim, int ratio, bool overlap, bool rotate,
+    int cache_capacity, int rope_dim, int original_context, float norm_eps,
+    float rope_theta, float rope_factor, float beta_fast, float beta_slow) {
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    const int start_pos = start_position ? start_position[0] : 0;
+    const int tokens = real_tokens
+        ? min(sequence, max(real_tokens[0], 0)) : sequence;
+    const int coff = overlap ? 2 : 1;
+    const int projected = coff * head_dim;
+    const int state_rows = coff * ratio;
+    if (start_pos < 0 || tokens <= 0) {
+        emitted_output[0] = -1.0f;
+        return;
+    }
+    if (start_pos == 0) {
+        for (int index = 0; index < projected * state_rows; ++index) {
+            kv_state[index] = 0.0f;
+            score_state[index] = -INFINITY;
+        }
+        for (int index = 0; index < head_dim * cache_capacity; ++index)
+            cache[index] = 0.0f;
+    }
+    int emitted = 0;
+    for (int token = 0; token < tokens; ++token) {
+        const int position = start_pos + token;
+        const int within = position % ratio;
+        const int destination_row = overlap ? ratio + within : within;
+        const float* token_kv =
+            kv_values + static_cast<size_t>(token) * projected;
+        const float* token_gate =
+            gate_values + static_cast<size_t>(token) * projected;
+        const float* position_ape =
+            ape + static_cast<size_t>(within) * projected;
+        float* state_kv =
+            kv_state + static_cast<size_t>(destination_row) * projected;
+        float* state_score =
+            score_state + static_cast<size_t>(destination_row) * projected;
+        for (int dim = 0; dim < projected; ++dim) {
+            state_kv[dim] = token_kv[dim];
+            state_score[dim] = token_gate[dim] + position_ape[dim];
+        }
+        if ((position + 1) % ratio != 0)
+            continue;
+        const int cache_index = position / ratio;
+        if (cache_index < 0 || cache_index >= cache_capacity) {
+            emitted_output[0] = -1.0f;
+            return;
+        }
+        const int row_count = overlap ? ratio * 2 : ratio;
+        for (int dim = 0; dim < head_dim; ++dim) {
+            float maximum = -INFINITY;
+            for (int row = 0; row < row_count; ++row) {
+                const int source_dim = overlap && row >= ratio
+                    ? head_dim + dim : dim;
+                maximum = fmaxf(
+                    maximum,
+                    score_state[static_cast<size_t>(row) * projected +
+                                source_dim]);
+            }
+            float denominator = 0.0f;
+            float numerator = 0.0f;
+            for (int row = 0; row < row_count; ++row) {
+                const int source_dim = overlap && row >= ratio
+                    ? head_dim + dim : dim;
+                const size_t index =
+                    static_cast<size_t>(row) * projected + source_dim;
+                const float probability = expf(score_state[index] - maximum);
+                denominator += probability;
+                numerator += probability * kv_state[index];
+            }
+            compressed[dim] = cuda_round_to_bf16(
+                denominator > 0.0f ? numerator / denominator : 0.0f);
+        }
+        float mean_square = 0.0f;
+        for (int dim = 0; dim < head_dim; ++dim)
+            mean_square += compressed[dim] * compressed[dim];
+        mean_square /= static_cast<float>(head_dim);
+        const float inverse = rsqrtf(mean_square + norm_eps);
+        for (int dim = 0; dim < head_dim; ++dim)
+            compressed[dim] = cuda_round_to_bf16(
+                compressed[dim] * inverse * norm[dim]);
+        const int compressed_position = position + 1 - ratio;
+        dsv4_apply_rope_cuda(
+            compressed, head_dim, compressed_position, rope_dim, rope_theta,
+            original_context, rope_factor, beta_fast, beta_slow);
+        for (int dim = 0; dim < head_dim; ++dim)
+            compressed[dim] = cuda_round_to_bf16(compressed[dim]);
+        if (rotate) {
+            dsv4_hadamard_rotate_cuda(compressed, head_dim);
+            for (int dim = 0; dim < head_dim; ++dim)
+                compressed[dim] = cuda_round_to_bf16(compressed[dim]);
+            dsv4_fp4_simulate_cuda(compressed, head_dim, 32);
+        } else {
+            const int non_rotary = head_dim - rope_dim;
+            if (non_rotary > 0)
+                dsv4_fp8_simulate_cuda(compressed, non_rotary, 64);
+        }
+        for (int dim = 0; dim < head_dim; ++dim)
+            cache[static_cast<size_t>(cache_index) * head_dim + dim] =
+                compressed[dim];
+        ++emitted;
+        if (overlap) {
+            const int half = ratio * projected;
+            for (int index = 0; index < half; ++index) {
+                kv_state[index] = kv_state[half + index];
+                score_state[index] = score_state[half + index];
+                score_state[half + index] = -INFINITY;
+            }
+        }
+    }
+    emitted_output[0] = static_cast<float>(emitted);
+}
+
+__global__ void dsv4_indexer_prepare_cuda(
+    float* query, float* head_weights, const int32_t* start_position,
+    const int32_t* real_tokens, int sequence, int num_heads, int head_dim,
+    int rope_dim, int original_context, float rope_theta,
+    float rope_factor, float beta_fast, float beta_slow) {
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    const int start_pos = start_position ? start_position[0] : 0;
+    const int tokens = real_tokens
+        ? min(sequence, max(real_tokens[0], 0)) : sequence;
+    if (start_pos < 0 || tokens <= 0)
+        return;
+    const int query_width = num_heads * head_dim;
+    const float weight_scale = 1.0f /
+        sqrtf(static_cast<float>(head_dim * num_heads));
+    for (int token = 0; token < tokens; ++token) {
+        float* token_query =
+            query + static_cast<size_t>(token) * query_width;
+        float* token_weights =
+            head_weights + static_cast<size_t>(token) * num_heads;
+        for (int index = 0; index < query_width; ++index)
+            token_query[index] = cuda_round_to_bf16(token_query[index]);
+        for (int head = 0; head < num_heads; ++head) {
+            token_weights[head] = cuda_round_to_bf16(
+                cuda_round_to_bf16(token_weights[head]) * weight_scale);
+            float* head_query =
+                token_query + static_cast<size_t>(head) * head_dim;
+            dsv4_apply_rope_cuda(
+                head_query, head_dim, start_pos + token, rope_dim,
+                rope_theta, original_context, rope_factor, beta_fast,
+                beta_slow);
+            for (int dimension = 0; dimension < head_dim; ++dimension)
+                head_query[dimension] =
+                    cuda_round_to_bf16(head_query[dimension]);
+            dsv4_hadamard_rotate_cuda(head_query, head_dim);
+            for (int dimension = 0; dimension < head_dim; ++dimension)
+                head_query[dimension] =
+                    cuda_round_to_bf16(head_query[dimension]);
+            dsv4_fp4_simulate_cuda(head_query, head_dim, 32);
+        }
+    }
+}
+
+__global__ void dsv4_indexer_scores_cuda(
+    const float* query, const float* head_weights, const float* cache,
+    const int32_t* start_position, const int32_t* real_tokens,
+    float* scores, int sequence, int num_heads, int head_dim, int ratio,
+    int cache_capacity) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    const size_t count = static_cast<size_t>(sequence) * cache_capacity;
+    if (index >= count)
+        return;
+    const int token = static_cast<int>(index / cache_capacity);
+    const int cache_index = static_cast<int>(index % cache_capacity);
+    const int start_pos = start_position ? start_position[0] : 0;
+    const int tokens = real_tokens
+        ? min(sequence, max(real_tokens[0], 0)) : sequence;
+    const int available = token < tokens && start_pos >= 0
+        ? min(cache_capacity, (start_pos + token + 1) / ratio) : 0;
+    if (cache_index >= available) {
+        scores[index] = -INFINITY;
+        return;
+    }
+    const int query_width = num_heads * head_dim;
+    const float* token_query =
+        query + static_cast<size_t>(token) * query_width;
+    const float* token_weights =
+        head_weights + static_cast<size_t>(token) * num_heads;
+    const float* key =
+        cache + static_cast<size_t>(cache_index) * head_dim;
+    float score = 0.0f;
+    for (int head = 0; head < num_heads; ++head) {
+        float dot = 0.0f;
+        const float* head_query =
+            token_query + static_cast<size_t>(head) * head_dim;
+        for (int dimension = 0; dimension < head_dim; ++dimension)
+            dot += head_query[dimension] * key[dimension];
+        dot = cuda_round_to_bf16(dot);
+        score += cuda_round_to_bf16(
+            fmaxf(dot, 0.0f) * token_weights[head]);
+    }
+    scores[index] = cuda_round_to_bf16(score);
+}
+
+__global__ void dsv4_indexer_select_cuda(
+    float* scores, const int32_t* start_position,
+    const int32_t* real_tokens, int32_t* indices, int sequence,
+    int ratio, int cache_capacity, int top_k) {
+    const int token = static_cast<int>(blockIdx.x);
+    if (token >= sequence || threadIdx.x != 0)
+        return;
+    const int start_pos = start_position ? start_position[0] : 0;
+    const int tokens = real_tokens
+        ? min(sequence, max(real_tokens[0], 0)) : sequence;
+    if (token >= tokens || start_pos < 0)
+        return;
+    const int available = min(
+        cache_capacity, (start_pos + token + 1) / ratio);
+    const int selected = min(top_k, available);
+    float* token_scores =
+        scores + static_cast<size_t>(token) * cache_capacity;
+    int32_t* token_indices =
+        indices + static_cast<size_t>(token) * top_k;
+    for (int rank = 0; rank < selected; ++rank) {
+        int best = -1;
+        float best_score = -INFINITY;
+        for (int candidate = 0; candidate < available; ++candidate) {
+            const float candidate_score = token_scores[candidate];
+            if (isnan(candidate_score))
+                continue;
+            if (best < 0 || candidate_score > best_score) {
+                best = candidate;
+                best_score = candidate_score;
+            }
+        }
+        if (best < 0)
+            break;
+        token_indices[rank] = best;
+        token_scores[best] = NAN;
+    }
+}
+
+__global__ void dsv4_sparse_prepare_cuda(
+    const float* query_input, const float* kv_input,
+    const int32_t* start_position, const int32_t* real_tokens,
+    float* query, float* kv, int sequence, int num_heads, int head_dim,
+    int rope_dim, int original_context, float query_norm_eps,
+    float rope_theta, float rope_factor, float beta_fast, float beta_slow) {
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    const int start_pos = start_position ? start_position[0] : 0;
+    const int tokens = real_tokens
+        ? min(sequence, max(real_tokens[0], 0)) : sequence;
+    if (start_pos < 0 || tokens <= 0)
+        return;
+    const int query_width = num_heads * head_dim;
+    for (int token = 0; token < tokens; ++token) {
+        const int position = start_pos + token;
+        float* token_kv = kv + static_cast<size_t>(token) * head_dim;
+        const float* source_kv =
+            kv_input + static_cast<size_t>(token) * head_dim;
+        for (int dimension = 0; dimension < head_dim; ++dimension)
+            token_kv[dimension] = source_kv[dimension];
+        dsv4_apply_rope_cuda(
+            token_kv, head_dim, position, rope_dim, rope_theta,
+            original_context, rope_factor, beta_fast, beta_slow);
+        for (int dimension = 0; dimension < head_dim; ++dimension)
+            token_kv[dimension] = cuda_round_to_bf16(token_kv[dimension]);
+        dsv4_fp8_simulate_cuda(
+            token_kv, head_dim - rope_dim, 64);
+
+        float* token_query =
+            query + static_cast<size_t>(token) * query_width;
+        const float* source_query =
+            query_input + static_cast<size_t>(token) * query_width;
+        for (int index = 0; index < query_width; ++index)
+            token_query[index] = source_query[index];
+        for (int head = 0; head < num_heads; ++head) {
+            float* head_query =
+                token_query + static_cast<size_t>(head) * head_dim;
+            float square_sum = 0.0f;
+            for (int dimension = 0; dimension < head_dim; ++dimension) {
+                square_sum += cuda_round_to_bf16(
+                    head_query[dimension] * head_query[dimension]);
+            }
+            const float mean = cuda_round_to_bf16(
+                square_sum / static_cast<float>(head_dim));
+            const float variance = cuda_round_to_bf16(
+                mean + query_norm_eps);
+            const float inverse = cuda_round_to_bf16(
+                1.0f / sqrtf(variance));
+            for (int dimension = 0; dimension < head_dim; ++dimension) {
+                head_query[dimension] = cuda_round_to_bf16(
+                    head_query[dimension] * inverse);
+            }
+            dsv4_apply_rope_cuda(
+                head_query, head_dim, position, rope_dim, rope_theta,
+                original_context, rope_factor, beta_fast, beta_slow);
+            for (int dimension = 0; dimension < head_dim; ++dimension)
+                head_query[dimension] =
+                    cuda_round_to_bf16(head_query[dimension]);
+        }
+    }
+}
+
+__device__ float dsv4_sparse_dot_cuda(
+    const float* query, const float* key, int head_dim) {
+    float sum = 0.0f;
+    for (int dimension = 0; dimension < head_dim; ++dimension)
+        sum += query[dimension] * key[dimension];
+    return sum;
+}
+
+__global__ void dsv4_sparse_attention_cuda(
+    const float* query, const float* current_kv, const float* sink,
+    const float* window, const float* compressed,
+    const int32_t* selected, const int32_t* start_position,
+    const int32_t* real_tokens, float* output, int sequence,
+    int num_heads, int head_dim, int window_size, int compress_ratio,
+    int compressed_capacity, int selected_width, float softmax_scale,
+    int rope_dim, int original_context, float rope_theta,
+    float rope_factor, float beta_fast, float beta_slow) {
+    const int task = static_cast<int>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    const int tasks = sequence * num_heads;
+    if (task >= tasks)
+        return;
+    const int token = task / num_heads;
+    const int head = task % num_heads;
+    const int start_pos = start_position ? start_position[0] : 0;
+    const int tokens = real_tokens
+        ? min(sequence, max(real_tokens[0], 0)) : sequence;
+    if (start_pos < 0 || token >= tokens)
+        return;
+    const int position = start_pos + token;
+    const int first_position = max(0, position - window_size + 1);
+    const int query_width = num_heads * head_dim;
+    const float* head_query =
+        query + static_cast<size_t>(token) * query_width +
+        static_cast<size_t>(head) * head_dim;
+    float maximum = -INFINITY;
+    for (int key_position = first_position; key_position <= position;
+         ++key_position) {
+        const float* key = key_position >= start_pos
+            ? current_kv +
+                static_cast<size_t>(key_position - start_pos) * head_dim
+            : window +
+                static_cast<size_t>(key_position % window_size) * head_dim;
+        maximum = fmaxf(
+            maximum,
+            dsv4_sparse_dot_cuda(head_query, key, head_dim) *
+                softmax_scale);
+    }
+    if (compress_ratio > 0 && compressed) {
+        if (selected) {
+            const int32_t* token_indices =
+                selected + static_cast<size_t>(token) * selected_width;
+            for (int rank = 0; rank < selected_width; ++rank) {
+                const int cache_index = token_indices[rank];
+                if (cache_index < 0 || cache_index >= compressed_capacity)
+                    continue;
+                const float* key = compressed +
+                    static_cast<size_t>(cache_index) * head_dim;
+                maximum = fmaxf(
+                    maximum,
+                    dsv4_sparse_dot_cuda(head_query, key, head_dim) *
+                        softmax_scale);
+            }
+        } else {
+            const int available = min(
+                compressed_capacity, (position + 1) / compress_ratio);
+            for (int cache_index = 0; cache_index < available;
+                 ++cache_index) {
+                const float* key = compressed +
+                    static_cast<size_t>(cache_index) * head_dim;
+                maximum = fmaxf(
+                    maximum,
+                    dsv4_sparse_dot_cuda(head_query, key, head_dim) *
+                        softmax_scale);
+            }
+        }
+    }
+
+    float* head_output =
+        output + static_cast<size_t>(token) * query_width +
+        static_cast<size_t>(head) * head_dim;
+    float denominator = expf(sink[head] - maximum);
+    for (int key_position = first_position; key_position <= position;
+         ++key_position) {
+        const float* key = key_position >= start_pos
+            ? current_kv +
+                static_cast<size_t>(key_position - start_pos) * head_dim
+            : window +
+                static_cast<size_t>(key_position % window_size) * head_dim;
+        const float probability = expf(
+            dsv4_sparse_dot_cuda(head_query, key, head_dim) *
+                softmax_scale - maximum);
+        denominator += probability;
+        const float value_probability = cuda_round_to_bf16(probability);
+        for (int dimension = 0; dimension < head_dim; ++dimension)
+            head_output[dimension] += value_probability * key[dimension];
+    }
+    if (compress_ratio > 0 && compressed) {
+        if (selected) {
+            const int32_t* token_indices =
+                selected + static_cast<size_t>(token) * selected_width;
+            for (int rank = 0; rank < selected_width; ++rank) {
+                const int cache_index = token_indices[rank];
+                if (cache_index < 0 || cache_index >= compressed_capacity)
+                    continue;
+                const float* key = compressed +
+                    static_cast<size_t>(cache_index) * head_dim;
+                const float probability = expf(
+                    dsv4_sparse_dot_cuda(head_query, key, head_dim) *
+                        softmax_scale - maximum);
+                denominator += probability;
+                const float value_probability =
+                    cuda_round_to_bf16(probability);
+                for (int dimension = 0; dimension < head_dim; ++dimension)
+                    head_output[dimension] +=
+                        value_probability * key[dimension];
+            }
+        } else {
+            const int available = min(
+                compressed_capacity, (position + 1) / compress_ratio);
+            for (int cache_index = 0; cache_index < available;
+                 ++cache_index) {
+                const float* key = compressed +
+                    static_cast<size_t>(cache_index) * head_dim;
+                const float probability = expf(
+                    dsv4_sparse_dot_cuda(head_query, key, head_dim) *
+                        softmax_scale - maximum);
+                denominator += probability;
+                const float value_probability =
+                    cuda_round_to_bf16(probability);
+                for (int dimension = 0; dimension < head_dim; ++dimension)
+                    head_output[dimension] +=
+                        value_probability * key[dimension];
+            }
+        }
+    }
+    if (denominator > 0.0f) {
+        const float inverse = 1.0f / denominator;
+        for (int dimension = 0; dimension < head_dim; ++dimension)
+            head_output[dimension] *= inverse;
+    }
+    for (int dimension = 0; dimension < head_dim; ++dimension)
+        head_output[dimension] = cuda_round_to_bf16(
+            head_output[dimension]);
+    dsv4_apply_rope_cuda(
+        head_output, head_dim, -position, rope_dim, rope_theta,
+        original_context, rope_factor, beta_fast, beta_slow);
+    for (int dimension = 0; dimension < head_dim; ++dimension)
+        head_output[dimension] = cuda_round_to_bf16(
+            head_output[dimension]);
+}
+
+__global__ void dsv4_sparse_update_window_cuda(
+    const float* current_kv, const int32_t* start_position,
+    const int32_t* real_tokens, float* window, int sequence,
+    int head_dim, int window_size) {
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    const int start_pos = start_position ? start_position[0] : 0;
+    const int tokens = real_tokens
+        ? min(sequence, max(real_tokens[0], 0)) : sequence;
+    if (start_pos < 0 || tokens <= 0)
+        return;
+    if (start_pos == 0) {
+        for (int index = 0; index < head_dim * window_size; ++index)
+            window[index] = 0.0f;
+    }
+    for (int token = 0; token < tokens; ++token) {
+        const int position = start_pos + token;
+        float* destination = window +
+            static_cast<size_t>(position % window_size) * head_dim;
+        const float* source =
+            current_kv + static_cast<size_t>(token) * head_dim;
+        for (int dimension = 0; dimension < head_dim; ++dimension)
+            destination[dimension] = source[dimension];
+    }
+}
+
 __global__ void binary_cuda(const float* lhs, const float* rhs, float* output,
                             size_t count, bool multiply) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -3240,6 +3853,409 @@ void CudaBackend::dispatch(const GraphNode& node,
                 output->stride[1] / sizeof(float), count, hidden_size,
                 hc_mult);
             if (!report_cuda(cudaGetLastError(), "hc_post_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    auto run_dsv4_compressor = [&](
+            const GraphNode& compressor_node,
+            const std::vector<const Tensor*>& compressor_inputs,
+            Tensor* compressor_output) {
+        if (compressor_inputs.size() < 10 || !compressor_output)
+            return false;
+        for (int index = 0; index < 10; ++index)
+            if (!compressor_inputs[index])
+                return false;
+        const int hidden_size = graph_params::get_i32(
+            compressor_node.params, 0, 4096);
+        const int head_dim = graph_params::get_i32(
+            compressor_node.params, 1, 512);
+        const int ratio = graph_params::get_i32(
+            compressor_node.params, 2, 4);
+        const bool overlap = graph_params::get_i32(
+            compressor_node.params, 3, 1) != 0;
+        const bool rotate = graph_params::get_i32(
+            compressor_node.params, 4, 0) != 0;
+        const int rope_dim = graph_params::get_i32(
+            compressor_node.params, 5, 64);
+        const int original_context = graph_params::get_i32(
+            compressor_node.params, 6, 65536);
+        const int sequence = static_cast<int>(
+            compressor_inputs[0]->shape[1]);
+        const int coff = overlap ? 2 : 1;
+        const int projected = coff * head_dim;
+        const int state_rows = coff * ratio;
+        const int cache_capacity = static_cast<int>(
+            compressor_inputs[7]->shape[1]);
+        const auto* wkv = impl_->find_weight(*compressor_inputs[1]);
+        const auto* wgate = impl_->find_weight(*compressor_inputs[2]);
+        const auto* ape = impl_->find_weight(*compressor_inputs[3]);
+        const auto* norm = impl_->find_weight(*compressor_inputs[4]);
+        auto fp32_weight = [](const Impl::DeviceWeight* weight,
+                              int n, int k) {
+            return weight && weight->layout == Impl::WeightLayout::Dense &&
+                weight->type == CUDA_R_32F && weight->n == n &&
+                weight->k == k && weight->data;
+        };
+        bool valid = hidden_size > 0 && head_dim > 0 && ratio > 0 &&
+            sequence > 0 && projected > 0 && state_rows > 0 &&
+            cache_capacity > 0 && rope_dim >= 0 && rope_dim <= head_dim &&
+            compressor_inputs[0]->shape[0] == hidden_size &&
+            compressor_inputs[0]->shape[2] == 1 &&
+            compressor_inputs[0]->shape[3] == 1 &&
+            fp32_contiguous(*compressor_inputs[0]) &&
+            fp32_weight(wkv, projected, hidden_size) &&
+            fp32_weight(wgate, projected, hidden_size) &&
+            fp32_weight(ape, projected, ratio) &&
+            fp32_weight(norm, head_dim, 1) &&
+            compressor_inputs[5]->shape[0] == projected &&
+            compressor_inputs[5]->shape[1] == state_rows &&
+            compressor_inputs[6]->shape[0] == projected &&
+            compressor_inputs[6]->shape[1] == state_rows &&
+            compressor_inputs[7]->shape[0] == head_dim &&
+            fp32_contiguous(*compressor_inputs[5]) &&
+            fp32_contiguous(*compressor_inputs[6]) &&
+            fp32_contiguous(*compressor_inputs[7]) &&
+            compressor_inputs[8]->prec == Precision::INT32 &&
+            compressor_inputs[8]->nelements() >= 1 &&
+            compressor_inputs[8]->is_contiguous() &&
+            compressor_inputs[9]->prec == Precision::INT32 &&
+            compressor_inputs[9]->nelements() >= 1 &&
+            compressor_inputs[9]->is_contiguous() &&
+            fp32_contiguous(*compressor_output) &&
+            compressor_output->nelements() >= 1;
+        const float* hidden =
+            device_pointer_const<float>(*compressor_inputs[0]);
+        float* kv_state = device_pointer<float>(*compressor_inputs[5]);
+        float* score_state =
+            device_pointer<float>(*compressor_inputs[6]);
+        float* cache = device_pointer<float>(*compressor_inputs[7]);
+        const int32_t* start_position =
+            device_pointer_const<int32_t>(*compressor_inputs[8]);
+        const int32_t* real_tokens =
+            device_pointer_const<int32_t>(*compressor_inputs[9]);
+        float* emitted = device_pointer<float>(*compressor_output);
+        auto* kv_values = static_cast<float*>(impl_->scratch(
+            "dsv4_compressor_kv",
+            static_cast<size_t>(sequence) * projected * sizeof(float)));
+        auto* gate_values = static_cast<float*>(impl_->scratch(
+            "dsv4_compressor_gate",
+            static_cast<size_t>(sequence) * projected * sizeof(float)));
+        auto* compressed = static_cast<float*>(impl_->scratch(
+            "dsv4_compressor_vector",
+            static_cast<size_t>(head_dim) * sizeof(float)));
+        valid = valid && hidden && kv_state && score_state && cache &&
+            start_position && real_tokens && emitted && kv_values &&
+            gate_values && compressed;
+        if (valid &&
+            impl_->run_matmul_device(
+                hidden,
+                compressor_inputs[0]->stride[1] / sizeof(float),
+                *compressor_inputs[1], kv_values, projected, sequence,
+                projected, hidden_size, Activation::NONE, 0, 0) &&
+            impl_->run_matmul_device(
+                hidden,
+                compressor_inputs[0]->stride[1] / sizeof(float),
+                *compressor_inputs[2], gate_values, projected, sequence,
+                projected, hidden_size, Activation::NONE, 0, 0)) {
+            dsv4_compressor_state_cuda<<<1, 1>>>(
+                kv_values, gate_values,
+                static_cast<const float*>(ape->data),
+                static_cast<const float*>(norm->data), kv_state,
+                score_state, cache, start_position, real_tokens,
+                compressed, emitted, sequence, head_dim, ratio, overlap,
+                rotate, cache_capacity, rope_dim, original_context,
+                graph_params::get_f32(
+                    compressor_node.params, 0, 1e-6f),
+                graph_params::get_f32(
+                    compressor_node.params, 1, 160000.0f),
+                graph_params::get_f32(
+                    compressor_node.params, 2, 16.0f),
+                graph_params::get_f32(
+                    compressor_node.params, 3, 32.0f),
+                graph_params::get_f32(
+                    compressor_node.params, 4, 1.0f));
+            if (!report_cuda(
+                    cudaGetLastError(), "dsv4_compressor_state_cuda")) {
+                impl_->failed = true;
+                return false;
+            }
+            return true;
+        }
+        return false;
+    };
+
+    if (node.op_type == OpType::DSV4_COMPRESSOR &&
+        run_dsv4_compressor(node, inputs, output)) {
+        record_native();
+        return;
+    }
+
+    if (node.op_type == OpType::DSV4_INDEXER && inputs.size() >= 13 &&
+        inputs[0] && inputs[1] && inputs[2] && inputs[3] && inputs[4] &&
+        inputs[5] && inputs[6] && inputs[7] && inputs[8] && inputs[9] &&
+        inputs[10] && inputs[11] && inputs[12] && output) {
+        const int hidden_size = graph_params::get_i32(
+            node.params, 0, 4096);
+        const int q_lora_rank = graph_params::get_i32(
+            node.params, 1, 1024);
+        const int num_heads = graph_params::get_i32(
+            node.params, 2, 64);
+        const int head_dim = graph_params::get_i32(
+            node.params, 3, 128);
+        const int top_k = graph_params::get_i32(node.params, 4, 512);
+        const int ratio = graph_params::get_i32(node.params, 5, 4);
+        const bool overlap =
+            graph_params::get_i32(node.params, 6, 1) != 0;
+        const bool rotate =
+            graph_params::get_i32(node.params, 7, 1) != 0;
+        const int rope_dim = graph_params::get_i32(
+            node.params, 8, 64);
+        const int original_context = graph_params::get_i32(
+            node.params, 9, 65536);
+        const int sequence = static_cast<int>(inputs[0]->shape[1]);
+        const int query_width = num_heads * head_dim;
+        const int cache_capacity = static_cast<int>(inputs[10]->shape[1]);
+        const auto* wq_b = impl_->find_weight(*inputs[2]);
+        const auto* weights_projection = impl_->find_weight(*inputs[3]);
+        bool valid = hidden_size > 0 && q_lora_rank > 0 &&
+            num_heads > 0 && head_dim > 0 && top_k > 0 && ratio > 0 &&
+            sequence > 0 && query_width > 0 && cache_capacity > 0 &&
+            rope_dim >= 0 && rope_dim <= head_dim &&
+            inputs[0]->shape[0] == hidden_size &&
+            inputs[0]->shape[1] == sequence &&
+            inputs[1]->shape[0] == q_lora_rank &&
+            inputs[1]->shape[1] == sequence &&
+            fp32_contiguous(*inputs[0]) && fp32_contiguous(*inputs[1]) &&
+            wq_b && wq_b->n == query_width && wq_b->k == q_lora_rank &&
+            weights_projection && weights_projection->n == num_heads &&
+            weights_projection->k == hidden_size &&
+            inputs[10]->shape[0] == head_dim &&
+            fp32_contiguous(*inputs[10]) &&
+            inputs[11]->prec == Precision::INT32 &&
+            inputs[11]->nelements() >= 1 && inputs[11]->is_contiguous() &&
+            inputs[12]->prec == Precision::INT32 &&
+            inputs[12]->nelements() >= 1 && inputs[12]->is_contiguous() &&
+            output->prec == Precision::INT32 && output->is_contiguous() &&
+            output->shape[0] == top_k && output->shape[1] == sequence;
+        const float* hidden = device_pointer_const<float>(*inputs[0]);
+        const float* q_lora = device_pointer_const<float>(*inputs[1]);
+        const int32_t* start_position =
+            device_pointer_const<int32_t>(*inputs[11]);
+        const int32_t* real_tokens =
+            device_pointer_const<int32_t>(*inputs[12]);
+        const float* cache = device_pointer_const<float>(*inputs[10]);
+        int32_t* destination = device_pointer<int32_t>(*output);
+        auto* query = static_cast<float*>(impl_->scratch(
+            "dsv4_indexer_query",
+            static_cast<size_t>(sequence) * query_width * sizeof(float)));
+        auto* head_weights = static_cast<float*>(impl_->scratch(
+            "dsv4_indexer_head_weights",
+            static_cast<size_t>(sequence) * num_heads * sizeof(float)));
+        auto* scores = static_cast<float*>(impl_->scratch(
+            "dsv4_indexer_scores",
+            static_cast<size_t>(sequence) * cache_capacity *
+                sizeof(float)));
+        auto* emitted = static_cast<float*>(impl_->scratch(
+            "dsv4_indexer_emitted", sizeof(float)));
+        valid = valid && hidden && q_lora && start_position && real_tokens &&
+            cache && destination && query && head_weights && scores &&
+            emitted;
+        if (valid &&
+            impl_->run_matmul_device(
+                q_lora, inputs[1]->stride[1] / sizeof(float), *inputs[2],
+                query, query_width, sequence, query_width, q_lora_rank,
+                Activation::NONE, 0, 0) &&
+            impl_->run_matmul_device(
+                hidden, inputs[0]->stride[1] / sizeof(float), *inputs[3],
+                head_weights, num_heads, sequence, num_heads, hidden_size,
+                Activation::NONE, 0, 0) &&
+            report_cuda(
+                cudaMemset(destination, 0xff, output->nbytes()),
+                "cudaMemset DSV4 indexer output")) {
+            dsv4_indexer_prepare_cuda<<<1, 1>>>(
+                query, head_weights, start_position, real_tokens, sequence,
+                num_heads, head_dim, rope_dim, original_context,
+                graph_params::get_f32(node.params, 1, 160000.0f),
+                graph_params::get_f32(node.params, 2, 16.0f),
+                graph_params::get_f32(node.params, 3, 32.0f),
+                graph_params::get_f32(node.params, 4, 1.0f));
+            if (!report_cuda(
+                    cudaGetLastError(), "dsv4_indexer_prepare_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            GraphNode compressor_node;
+            compressor_node.op_type = OpType::DSV4_COMPRESSOR;
+            compressor_node.params.i32 = {
+                hidden_size, head_dim, ratio, overlap ? 1 : 0,
+                rotate ? 1 : 0, rope_dim, original_context};
+            compressor_node.params.f32 = node.params.f32;
+            std::vector<const Tensor*> compressor_inputs = {
+                inputs[0], inputs[4], inputs[5], inputs[6], inputs[7],
+                inputs[8], inputs[9], inputs[10], inputs[11], inputs[12]};
+            Tensor compressor_output = Tensor::create(
+                Precision::FP32, MemoryType::NONE, 1, 1, 1, 1);
+            compressor_output.device_data = emitted;
+            if (!run_dsv4_compressor(
+                    compressor_node, compressor_inputs,
+                    &compressor_output)) {
+                if (impl_->failed)
+                    return;
+            } else {
+                const size_t score_count =
+                    static_cast<size_t>(sequence) * cache_capacity;
+                dsv4_indexer_scores_cuda<<<
+                    static_cast<unsigned>(
+                        (score_count + threads - 1) / threads),
+                    threads>>>(
+                    query, head_weights, cache, start_position, real_tokens,
+                    scores, sequence, num_heads, head_dim, ratio,
+                    cache_capacity);
+                dsv4_indexer_select_cuda<<<sequence, 1>>>(
+                    scores, start_position, real_tokens, destination,
+                    sequence, ratio, cache_capacity, top_k);
+                if (!report_cuda(
+                        cudaGetLastError(), "DSV4 indexer score/select")) {
+                    impl_->failed = true;
+                    return;
+                }
+                record_native();
+                return;
+            }
+        }
+    }
+
+    if (node.op_type == OpType::DSV4_SPARSE_ATTN && inputs.size() >= 6 &&
+        inputs[0] && inputs[1] && inputs[2] && inputs[3] && inputs[4] &&
+        inputs[5] && output) {
+        const int num_heads = graph_params::get_i32(
+            node.params, 0, 64);
+        const int head_dim = graph_params::get_i32(
+            node.params, 1, 512);
+        const int window_size = graph_params::get_i32(
+            node.params, 2, 128);
+        const int compress_ratio = graph_params::get_i32(
+            node.params, 3, 0);
+        const int rope_dim = graph_params::get_i32(
+            node.params, 5, 64);
+        const int original_context = graph_params::get_i32(
+            node.params, 6, 65536);
+        const int cache_input = graph_params::get_i32(
+            node.params, 7, -1);
+        const int indices_input = graph_params::get_i32(
+            node.params, 8, -1);
+        const int sequence = static_cast<int>(inputs[0]->shape[1]);
+        const int query_width = num_heads * head_dim;
+        const Tensor* compressed_cache =
+            cache_input >= 0 && cache_input < static_cast<int>(inputs.size())
+                ? inputs[cache_input] : nullptr;
+        const Tensor* compressed_indices =
+            indices_input >= 0 &&
+                    indices_input < static_cast<int>(inputs.size())
+                ? inputs[indices_input] : nullptr;
+        int compressed_capacity = compressed_cache
+            ? static_cast<int>(compressed_cache->shape[1]) : 0;
+        int selected_width = compressed_indices
+            ? static_cast<int>(compressed_indices->shape[0]) : 0;
+        bool valid = num_heads > 0 && head_dim > 0 && window_size > 0 &&
+            sequence > 0 && query_width > 0 && rope_dim >= 0 &&
+            rope_dim <= head_dim && inputs[0]->shape[0] == query_width &&
+            inputs[1]->shape[0] == head_dim &&
+            inputs[1]->shape[1] == sequence &&
+            fp32_contiguous(*inputs[0]) && fp32_contiguous(*inputs[1]) &&
+            inputs[2]->prec == Precision::FP32 &&
+            inputs[2]->nelements() >= static_cast<size_t>(num_heads) &&
+            inputs[2]->is_contiguous() &&
+            inputs[3]->shape[0] == head_dim &&
+            inputs[3]->shape[1] == window_size &&
+            fp32_contiguous(*inputs[3]) &&
+            inputs[4]->prec == Precision::INT32 &&
+            inputs[4]->nelements() >= 1 && inputs[4]->is_contiguous() &&
+            inputs[5]->prec == Precision::INT32 &&
+            inputs[5]->nelements() >= 1 && inputs[5]->is_contiguous() &&
+            output->shape[0] == query_width &&
+            output->shape[1] == sequence && fp32_contiguous(*output);
+        if (compress_ratio > 0) {
+            valid = valid && compressed_cache &&
+                compressed_capacity > 0 &&
+                compressed_cache->shape[0] == head_dim &&
+                fp32_contiguous(*compressed_cache);
+            if (compressed_indices) {
+                valid = valid && selected_width > 0 &&
+                    compressed_indices->prec == Precision::INT32 &&
+                    compressed_indices->shape[1] == sequence &&
+                    compressed_indices->is_contiguous();
+            }
+        }
+        const float* query_input =
+            device_pointer_const<float>(*inputs[0]);
+        const float* kv_input = device_pointer_const<float>(*inputs[1]);
+        const float* sink = device_pointer_const<float>(*inputs[2]);
+        float* window = device_pointer<float>(*inputs[3]);
+        const int32_t* start_position =
+            device_pointer_const<int32_t>(*inputs[4]);
+        const int32_t* real_tokens =
+            device_pointer_const<int32_t>(*inputs[5]);
+        const float* compressed = compressed_cache
+            ? device_pointer_const<float>(*compressed_cache) : nullptr;
+        const int32_t* selected = compressed_indices
+            ? device_pointer_const<int32_t>(*compressed_indices) : nullptr;
+        float* destination = device_pointer<float>(*output);
+        auto* rotated_query = static_cast<float*>(impl_->scratch(
+            "dsv4_sparse_query",
+            static_cast<size_t>(sequence) * query_width * sizeof(float)));
+        auto* rotated_kv = static_cast<float*>(impl_->scratch(
+            "dsv4_sparse_kv",
+            static_cast<size_t>(sequence) * head_dim * sizeof(float)));
+        valid = valid && query_input && kv_input && sink && window &&
+            start_position && real_tokens && destination && rotated_query &&
+            rotated_kv && (compress_ratio <= 0 || compressed) &&
+            (!compressed_indices || selected);
+        if (valid && report_cuda(
+                cudaMemset(destination, 0, output->nbytes()),
+                "cudaMemset DSV4 sparse output")) {
+            dsv4_sparse_prepare_cuda<<<1, 1>>>(
+                query_input, kv_input, start_position, real_tokens,
+                rotated_query, rotated_kv, sequence, num_heads, head_dim,
+                rope_dim, original_context,
+                graph_params::get_f32(node.params, 1, 1e-6f),
+                graph_params::get_f32(node.params, 2, 160000.0f),
+                graph_params::get_f32(node.params, 3, 16.0f),
+                graph_params::get_f32(node.params, 4, 32.0f),
+                graph_params::get_f32(node.params, 5, 1.0f));
+            if (!report_cuda(
+                    cudaGetLastError(), "dsv4_sparse_prepare_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            float softmax_scale = graph_params::get_f32(
+                node.params, 0, 0.0f);
+            if (softmax_scale <= 0.0f)
+                softmax_scale = 1.0f /
+                    std::sqrt(static_cast<float>(head_dim));
+            const int tasks = sequence * num_heads;
+            dsv4_sparse_attention_cuda<<<
+                static_cast<unsigned>((tasks + threads - 1) / threads),
+                threads>>>(
+                rotated_query, rotated_kv, sink, window, compressed,
+                selected, start_position, real_tokens, destination,
+                sequence, num_heads, head_dim, window_size, compress_ratio,
+                compressed_capacity, selected_width, softmax_scale,
+                rope_dim, original_context,
+                graph_params::get_f32(node.params, 2, 160000.0f),
+                graph_params::get_f32(node.params, 3, 16.0f),
+                graph_params::get_f32(node.params, 4, 32.0f),
+                graph_params::get_f32(node.params, 5, 1.0f));
+            dsv4_sparse_update_window_cuda<<<1, 1>>>(
+                rotated_kv, start_position, real_tokens, window, sequence,
+                head_dim, window_size);
+            if (!report_cuda(
+                    cudaGetLastError(), "DSV4 sparse attention/update")) {
                 impl_->failed = true;
                 return;
             }

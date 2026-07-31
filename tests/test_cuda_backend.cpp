@@ -45,6 +45,9 @@ bool dispatch_matmul(CudaBackend& backend, Tensor& weight,
                      std::vector<float>& output, int m, int n, int k);
 Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1,
                      int64_t d2 = 1, int64_t d3 = 1);
+Tensor device_tensor(CudaBackend& backend, Precision precision,
+                     int64_t d0, int64_t d1 = 1, int64_t d2 = 1,
+                     int64_t d3 = 1);
 
 bool test_microscaled_matmul(CudaBackend& backend) {
     constexpr int m = 3;
@@ -237,6 +240,620 @@ bool test_dsv4_grouped_fp8_linear(CudaBackend& backend) {
         close_enough(actual, expected, 1.0e-4f);
 }
 
+bool test_dsv4_compressor(CudaBackend& backend) {
+    constexpr int hidden_size = 8;
+    constexpr int head_dim = 128;
+    constexpr int ratio = 4;
+    constexpr int tokens = 8;
+    constexpr int projected = 2 * head_dim;
+    constexpr int state_rows = 2 * ratio;
+    constexpr int capacity = 4;
+    std::vector<float> hidden(static_cast<size_t>(tokens) * hidden_size);
+    for (int token = 0; token < tokens; ++token)
+        for (int dimension = 0; dimension < hidden_size; ++dimension)
+            hidden[static_cast<size_t>(token) * hidden_size + dimension] =
+                static_cast<float>((token + 1) * (dimension % 3 + 1)) /
+                16.0f;
+    std::vector<float> wkv(static_cast<size_t>(projected) * hidden_size);
+    std::vector<float> wgate(wkv.size());
+    for (int row = 0; row < projected; ++row) {
+        wkv[static_cast<size_t>(row) * hidden_size + row % hidden_size] =
+            static_cast<float>(row % 5 + 1) / 8.0f;
+        wgate[static_cast<size_t>(row) * hidden_size +
+              (row * 3 + 1) % hidden_size] =
+            static_cast<float>(static_cast<int>(row % 7) - 3) / 32.0f;
+    }
+    std::vector<float> ape(static_cast<size_t>(ratio) * projected);
+    for (size_t index = 0; index < ape.size(); ++index)
+        ape[index] = static_cast<float>(
+            static_cast<int>((index * 5 + index / projected) % 9) - 4) /
+            64.0f;
+    std::vector<float> norm(head_dim);
+    for (int dimension = 0; dimension < head_dim; ++dimension)
+        norm[dimension] = 0.75f + static_cast<float>(dimension % 5) / 16.0f;
+
+    Tensor hidden_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens,
+        1, 1, hidden.data());
+    Tensor wkv_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, projected, hidden_size,
+        1, 1, wkv.data());
+    Tensor wgate_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, projected, hidden_size,
+        1, 1, wgate.data());
+    Tensor ape_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, projected, ratio,
+        1, 1, ape.data());
+    Tensor norm_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, head_dim, 1,
+        1, 1, norm.data());
+    std::vector<float> expected_kv(
+        static_cast<size_t>(projected) * state_rows);
+    std::vector<float> expected_score(expected_kv.size());
+    std::vector<float> expected_cache(
+        static_cast<size_t>(head_dim) * capacity);
+    Tensor expected_kv_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, projected, state_rows,
+        1, 1, expected_kv.data());
+    Tensor expected_score_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, projected, state_rows,
+        1, 1, expected_score.data());
+    Tensor expected_cache_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, head_dim, capacity,
+        1, 1, expected_cache.data());
+    Dsv4CompressorConfig config;
+    config.hidden_size = hidden_size;
+    config.head_dim = head_dim;
+    config.ratio = ratio;
+    config.overlap = true;
+    config.rotate = false;
+    config.rope.rope_dim = 64;
+    config.rope.original_context = 64;
+    config.rope.theta = 10000.0f;
+    config.rope.factor = 2.0f;
+    config.rope.beta_fast = 32.0f;
+    config.rope.beta_slow = 1.0f;
+    if (kernel_dsv4_compressor(
+            hidden_host, wkv_tensor, wgate_tensor, ape_tensor, norm_tensor,
+            expected_kv_tensor, expected_score_tensor,
+            expected_cache_tensor, 0, config) != 2)
+        return false;
+
+    backend.wrap_weight(wkv_tensor);
+    backend.wrap_weight(wgate_tensor);
+    backend.wrap_weight(ape_tensor);
+    backend.wrap_weight(norm_tensor);
+    wkv_tensor.data = nullptr;
+    wgate_tensor.data = nullptr;
+    ape_tensor.data = nullptr;
+    norm_tensor.data = nullptr;
+
+    Tensor whole_hidden = device_tensor(backend, hidden_size, tokens);
+    Tensor whole_kv = device_tensor(backend, projected, state_rows);
+    Tensor whole_score = device_tensor(backend, projected, state_rows);
+    Tensor whole_cache = device_tensor(backend, head_dim, capacity);
+    Tensor whole_position = device_tensor(
+        backend, Precision::INT32, 1);
+    Tensor whole_tokens = device_tensor(backend, Precision::INT32, 1);
+    Tensor whole_emitted = device_tensor(backend, 1);
+    std::memcpy(whole_hidden.data, hidden.data(), whole_hidden.nbytes());
+    whole_position.ptr<int32_t>()[0] = 0;
+    whole_tokens.ptr<int32_t>()[0] = tokens;
+
+    GraphNode node;
+    node.op_type = OpType::DSV4_COMPRESSOR;
+    node.params.i32 = {
+        hidden_size, head_dim, ratio, 1, 0, 64, 64};
+    node.params.f32 = {1e-6f, 10000.0f, 2.0f, 32.0f, 1.0f};
+    backend.clear_dispatch_error();
+    backend.dispatch(
+        node,
+        {&whole_hidden, &wkv_tensor, &wgate_tensor, &ape_tensor,
+         &norm_tensor, &whole_kv, &whole_score, &whole_cache,
+         &whole_position, &whole_tokens},
+        &whole_emitted, nullptr);
+    backend.end_graph();
+    if (backend.dispatch_failed() || whole_emitted.ptr<float>()[0] != 2.0f)
+        return false;
+
+    Tensor split_kv = device_tensor(backend, projected, state_rows);
+    Tensor split_score = device_tensor(backend, projected, state_rows);
+    Tensor split_cache = device_tensor(backend, head_dim, capacity);
+    const int chunk_sizes[3] = {3, 2, 3};
+    const int chunk_positions[3] = {0, 3, 5};
+    const float expected_emitted[3] = {0.0f, 1.0f, 1.0f};
+    int source_token = 0;
+    for (int chunk = 0; chunk < 3; ++chunk) {
+        Tensor chunk_hidden = device_tensor(
+            backend, hidden_size, chunk_sizes[chunk]);
+        Tensor chunk_position = device_tensor(
+            backend, Precision::INT32, 1);
+        Tensor chunk_tokens = device_tensor(
+            backend, Precision::INT32, 1);
+        Tensor chunk_emitted = device_tensor(backend, 1);
+        std::memcpy(
+            chunk_hidden.data,
+            hidden.data() + static_cast<size_t>(source_token) * hidden_size,
+            chunk_hidden.nbytes());
+        chunk_position.ptr<int32_t>()[0] = chunk_positions[chunk];
+        chunk_tokens.ptr<int32_t>()[0] = chunk_sizes[chunk];
+        backend.clear_dispatch_error();
+        backend.dispatch(
+            node,
+            {&chunk_hidden, &wkv_tensor, &wgate_tensor, &ape_tensor,
+             &norm_tensor, &split_kv, &split_score, &split_cache,
+             &chunk_position, &chunk_tokens},
+            &chunk_emitted, nullptr);
+        backend.end_graph();
+        if (backend.dispatch_failed() ||
+            chunk_emitted.ptr<float>()[0] != expected_emitted[chunk])
+            return false;
+        source_token += chunk_sizes[chunk];
+    }
+
+    std::vector<float> whole_cache_values(expected_cache.size());
+    std::vector<float> split_cache_values(expected_cache.size());
+    std::vector<float> whole_kv_values(expected_kv.size());
+    std::vector<float> split_kv_values(expected_kv.size());
+    std::vector<float> whole_score_values(expected_score.size());
+    std::vector<float> split_score_values(expected_score.size());
+    std::memcpy(
+        whole_cache_values.data(), whole_cache.data, whole_cache.nbytes());
+    std::memcpy(
+        split_cache_values.data(), split_cache.data, split_cache.nbytes());
+    std::memcpy(whole_kv_values.data(), whole_kv.data, whole_kv.nbytes());
+    std::memcpy(split_kv_values.data(), split_kv.data, split_kv.nbytes());
+    std::memcpy(
+        whole_score_values.data(), whole_score.data, whole_score.nbytes());
+    std::memcpy(
+        split_score_values.data(), split_score.data, split_score.nbytes());
+    return close_enough(whole_cache_values, expected_cache, 2.0e-5f) &&
+        close_enough(split_cache_values, expected_cache, 2.0e-5f) &&
+        close_enough(split_cache_values, whole_cache_values, 0.0f) &&
+        close_enough(whole_kv_values, expected_kv, 2.0e-5f) &&
+        close_enough(split_kv_values, whole_kv_values, 0.0f) &&
+        close_enough(whole_score_values, expected_score, 2.0e-5f) &&
+        close_enough(split_score_values, whole_score_values, 0.0f);
+}
+
+bool test_dsv4_indexer(CudaBackend& backend) {
+    constexpr int hidden_size = 128;
+    constexpr int q_lora_rank = 128;
+    constexpr int num_heads = 2;
+    constexpr int head_dim = 32;
+    constexpr int query_width = num_heads * head_dim;
+    constexpr int top_k = 3;
+    constexpr int ratio = 4;
+    constexpr int tokens = 8;
+    constexpr int projected = 2 * head_dim;
+    constexpr int state_rows = 2 * ratio;
+    constexpr int capacity = 4;
+    std::vector<float> hidden(static_cast<size_t>(tokens) * hidden_size);
+    std::vector<float> q_lora(hidden.size());
+    for (size_t index = 0; index < hidden.size(); ++index) {
+        hidden[index] = static_cast<float>(
+            static_cast<int>((index * 7 + index / hidden_size) % 23) - 11) /
+            32.0f;
+        q_lora[index] = static_cast<float>(
+            static_cast<int>((index * 5 + 3) % 19) - 9) / 32.0f;
+    }
+    constexpr uint8_t fp8_codes[] = {
+        0x00, 0x28, 0x30, 0x38, 0x40, 0xa8, 0xb0, 0xb8, 0xc0};
+    std::vector<uint8_t> wq_b_values(
+        static_cast<size_t>(query_width) * q_lora_rank);
+    for (size_t index = 0; index < wq_b_values.size(); ++index)
+        wq_b_values[index] = fp8_codes[
+            (index * 11 + index / q_lora_rank) %
+            (sizeof(fp8_codes) / sizeof(fp8_codes[0]))];
+    uint8_t wq_b_scale[1] = {127};
+    std::vector<mollm::cpu::fp16_t> weights_projection(
+        static_cast<size_t>(num_heads) * hidden_size,
+        static_cast<mollm::cpu::fp16_t>(0.0f));
+    std::vector<float> compressor_wkv(
+        static_cast<size_t>(projected) * hidden_size);
+    std::vector<float> compressor_wgate(compressor_wkv.size());
+    for (int row = 0; row < projected; ++row) {
+        compressor_wkv[
+            static_cast<size_t>(row) * hidden_size + row % hidden_size] =
+            static_cast<float>(row % 5 + 1) / 8.0f;
+        compressor_wgate[
+            static_cast<size_t>(row) * hidden_size +
+            (row * 3 + 7) % hidden_size] =
+            static_cast<float>(static_cast<int>(row % 7) - 3) / 32.0f;
+    }
+    std::vector<float> compressor_ape(
+        static_cast<size_t>(ratio) * projected);
+    for (size_t index = 0; index < compressor_ape.size(); ++index)
+        compressor_ape[index] = static_cast<float>(
+            static_cast<int>((index * 3 + index / projected) % 7) - 3) /
+            64.0f;
+    std::vector<float> compressor_norm(head_dim, 1.0f);
+
+    Tensor hidden_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens,
+        1, 1, hidden.data());
+    Tensor q_lora_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, q_lora_rank, tokens,
+        1, 1, q_lora.data());
+    Tensor wq_b = Tensor::create(
+        Precision::FP8_E4M3, MemoryType::EXTERNAL,
+        query_width, q_lora_rank, 1, 1, wq_b_values.data());
+    wq_b.rowmajor_data = wq_b_values.data();
+    wq_b.e8m0_scales = wq_b_scale;
+    wq_b.group_size = 128;
+    wq_b.groups_per_row = 1;
+    wq_b.num_groups = 1;
+    wq_b.is_fp8_block128 = true;
+    Tensor weights_projection_tensor = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL,
+        num_heads, hidden_size, 1, 1, weights_projection.data());
+    Tensor compressor_wkv_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        projected, hidden_size, 1, 1, compressor_wkv.data());
+    Tensor compressor_wgate_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        projected, hidden_size, 1, 1, compressor_wgate.data());
+    Tensor compressor_ape_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        projected, ratio, 1, 1, compressor_ape.data());
+    Tensor compressor_norm_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        head_dim, 1, 1, 1, compressor_norm.data());
+    std::vector<float> expected_kv(
+        static_cast<size_t>(projected) * state_rows);
+    std::vector<float> expected_score(expected_kv.size());
+    std::vector<float> expected_cache(
+        static_cast<size_t>(head_dim) * capacity);
+    std::vector<int32_t> expected_indices(
+        static_cast<size_t>(tokens) * top_k);
+    Tensor expected_kv_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        projected, state_rows, 1, 1, expected_kv.data());
+    Tensor expected_score_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        projected, state_rows, 1, 1, expected_score.data());
+    Tensor expected_cache_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        head_dim, capacity, 1, 1, expected_cache.data());
+    Tensor expected_indices_tensor = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL,
+        top_k, tokens, 1, 1, expected_indices.data());
+    Dsv4IndexerConfig config;
+    config.hidden_size = hidden_size;
+    config.q_lora_rank = q_lora_rank;
+    config.num_heads = num_heads;
+    config.head_dim = head_dim;
+    config.top_k = top_k;
+    config.compressor.hidden_size = hidden_size;
+    config.compressor.head_dim = head_dim;
+    config.compressor.ratio = ratio;
+    config.compressor.overlap = true;
+    config.compressor.rotate = true;
+    config.compressor.rope.rope_dim = 0;
+    config.compressor.rope.original_context = 0;
+    config.compressor.rope.theta = 10000.0f;
+    config.compressor.rope.factor = 1.0f;
+    if (!kernel_dsv4_indexer(
+            hidden_host, q_lora_host, wq_b, weights_projection_tensor,
+            compressor_wkv_tensor, compressor_wgate_tensor,
+            compressor_ape_tensor, compressor_norm_tensor,
+            expected_kv_tensor, expected_score_tensor,
+            expected_cache_tensor, expected_indices_tensor, 0, config))
+        return false;
+    std::vector<int32_t> causal_expected(
+        static_cast<size_t>(tokens) * top_k, -1);
+    for (int token = ratio - 1; token < tokens; ++token) {
+        causal_expected[static_cast<size_t>(token) * top_k] = 0;
+        if (token >= ratio * 2 - 1)
+            causal_expected[static_cast<size_t>(token) * top_k + 1] = 1;
+    }
+    if (expected_indices != causal_expected)
+        return false;
+
+    backend.wrap_weight_int4(wq_b);
+    backend.wrap_weight(weights_projection_tensor);
+    backend.wrap_weight(compressor_wkv_tensor);
+    backend.wrap_weight(compressor_wgate_tensor);
+    backend.wrap_weight(compressor_ape_tensor);
+    backend.wrap_weight(compressor_norm_tensor);
+    wq_b.data = nullptr;
+    wq_b.rowmajor_data = nullptr;
+    wq_b.e8m0_scales = nullptr;
+    weights_projection_tensor.data = nullptr;
+    compressor_wkv_tensor.data = nullptr;
+    compressor_wgate_tensor.data = nullptr;
+    compressor_ape_tensor.data = nullptr;
+    compressor_norm_tensor.data = nullptr;
+
+    GraphNode node;
+    node.op_type = OpType::DSV4_INDEXER;
+    node.params.i32 = {
+        hidden_size, q_lora_rank, num_heads, head_dim, top_k,
+        ratio, 1, 1, 0, 0};
+    node.params.f32 = {1e-6f, 10000.0f, 1.0f, 32.0f, 1.0f};
+    auto run = [&](const float* hidden_source,
+                    const float* q_lora_source, int chunk_tokens,
+                    int position, Tensor& kv_state, Tensor& score_state,
+                    Tensor& cache, std::vector<int32_t>& indices) {
+        Tensor hidden_device = device_tensor(
+            backend, hidden_size, chunk_tokens);
+        Tensor q_lora_device = device_tensor(
+            backend, q_lora_rank, chunk_tokens);
+        Tensor position_device = device_tensor(
+            backend, Precision::INT32, 1);
+        Tensor tokens_device = device_tensor(
+            backend, Precision::INT32, 1);
+        Tensor output_device = device_tensor(
+            backend, Precision::INT32, top_k, chunk_tokens);
+        std::memcpy(
+            hidden_device.data, hidden_source, hidden_device.nbytes());
+        std::memcpy(
+            q_lora_device.data, q_lora_source, q_lora_device.nbytes());
+        position_device.ptr<int32_t>()[0] = position;
+        tokens_device.ptr<int32_t>()[0] = chunk_tokens;
+        backend.clear_dispatch_error();
+        backend.dispatch(
+            node,
+            {&hidden_device, &q_lora_device, &wq_b,
+             &weights_projection_tensor, &compressor_wkv_tensor,
+             &compressor_wgate_tensor, &compressor_ape_tensor,
+             &compressor_norm_tensor, &kv_state, &score_state, &cache,
+             &position_device, &tokens_device},
+            &output_device, nullptr);
+        backend.end_graph();
+        indices.resize(static_cast<size_t>(chunk_tokens) * top_k);
+        std::memcpy(
+            indices.data(), output_device.data, output_device.nbytes());
+        return !backend.dispatch_failed();
+    };
+
+    Tensor whole_kv = device_tensor(backend, projected, state_rows);
+    Tensor whole_score = device_tensor(backend, projected, state_rows);
+    Tensor whole_cache = device_tensor(backend, head_dim, capacity);
+    std::vector<int32_t> whole_indices;
+    if (!run(
+            hidden.data(), q_lora.data(), tokens, 0,
+            whole_kv, whole_score, whole_cache, whole_indices) ||
+        whole_indices != causal_expected)
+        return false;
+
+    Tensor split_kv = device_tensor(backend, projected, state_rows);
+    Tensor split_score = device_tensor(backend, projected, state_rows);
+    Tensor split_cache = device_tensor(backend, head_dim, capacity);
+    std::vector<int32_t> split_indices;
+    const int chunk_sizes[3] = {3, 2, 3};
+    const int chunk_positions[3] = {0, 3, 5};
+    int source_token = 0;
+    for (int chunk = 0; chunk < 3; ++chunk) {
+        std::vector<int32_t> chunk_indices;
+        if (!run(
+                hidden.data() +
+                    static_cast<size_t>(source_token) * hidden_size,
+                q_lora.data() +
+                    static_cast<size_t>(source_token) * q_lora_rank,
+                chunk_sizes[chunk], chunk_positions[chunk], split_kv,
+                split_score, split_cache, chunk_indices))
+            return false;
+        split_indices.insert(
+            split_indices.end(), chunk_indices.begin(), chunk_indices.end());
+        source_token += chunk_sizes[chunk];
+    }
+    std::vector<float> whole_cache_values(expected_cache.size());
+    std::vector<float> split_cache_values(expected_cache.size());
+    std::memcpy(
+        whole_cache_values.data(), whole_cache.data, whole_cache.nbytes());
+    std::memcpy(
+        split_cache_values.data(), split_cache.data, split_cache.nbytes());
+    return split_indices == causal_expected &&
+        close_enough(whole_cache_values, expected_cache, 2.0e-5f) &&
+        close_enough(split_cache_values, expected_cache, 2.0e-5f) &&
+        close_enough(split_cache_values, whole_cache_values, 0.0f);
+}
+
+bool test_dsv4_sparse_attention(CudaBackend& backend) {
+    constexpr int num_heads = 2;
+    constexpr int head_dim = 128;
+    constexpr int query_width = num_heads * head_dim;
+    constexpr int window_size = 3;
+    constexpr int ratio = 4;
+    constexpr int top_k = 2;
+    constexpr int tokens = 8;
+    constexpr int compressed_capacity = 4;
+    std::vector<float> query(static_cast<size_t>(tokens) * query_width);
+    std::vector<float> current_kv(static_cast<size_t>(tokens) * head_dim);
+    std::vector<float> compressed(
+        static_cast<size_t>(compressed_capacity) * head_dim);
+    for (size_t index = 0; index < query.size(); ++index)
+        query[index] = static_cast<float>(
+            static_cast<int>((index * 7 + index / query_width) % 29) - 14) /
+            32.0f;
+    for (size_t index = 0; index < current_kv.size(); ++index)
+        current_kv[index] = static_cast<float>(
+            static_cast<int>((index * 5 + index / head_dim) % 23) - 11) /
+            32.0f;
+    for (size_t index = 0; index < compressed.size(); ++index)
+        compressed[index] = static_cast<float>(
+            static_cast<int>((index * 3 + index / head_dim) % 19) - 9) /
+            16.0f;
+    float sink_values[num_heads] = {-0.25f, 0.125f};
+    std::vector<int32_t> selected(
+        static_cast<size_t>(tokens) * top_k, -1);
+    selected[3 * top_k] = 0;
+    selected[4 * top_k] = 0;
+    selected[5 * top_k] = 0;
+    selected[6 * top_k] = 0;
+    selected[7 * top_k] = 1;
+    selected[7 * top_k + 1] = 0;
+
+    Tensor query_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        query_width, tokens, 1, 1, query.data());
+    Tensor kv_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        head_dim, tokens, 1, 1, current_kv.data());
+    Tensor sink = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        num_heads, 1, 1, 1, sink_values);
+    Tensor compressed_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        head_dim, compressed_capacity, 1, 1, compressed.data());
+    Tensor selected_host = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL,
+        top_k, tokens, 1, 1, selected.data());
+    std::vector<float> expected_window(
+        static_cast<size_t>(window_size) * head_dim);
+    std::vector<float> expected_output(query.size());
+    Tensor expected_window_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        head_dim, window_size, 1, 1, expected_window.data());
+    Tensor expected_output_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        query_width, tokens, 1, 1, expected_output.data());
+    Dsv4SparseAttentionConfig config;
+    config.num_heads = num_heads;
+    config.head_dim = head_dim;
+    config.window_size = window_size;
+    config.compress_ratio = ratio;
+    config.compressed_top_k = top_k;
+    config.softmax_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    config.query_norm_eps = 1e-6f;
+    config.rope.rope_dim = 64;
+    config.rope.original_context = 64;
+    config.rope.theta = 10000.0f;
+    config.rope.factor = 2.0f;
+    config.rope.beta_fast = 32.0f;
+    config.rope.beta_slow = 1.0f;
+    if (!kernel_dsv4_sparse_attention(
+            query_host, kv_host, sink, expected_window_tensor,
+            &compressed_host, &selected_host, 0,
+            expected_output_tensor, config))
+        return false;
+
+    backend.wrap_weight(sink);
+    sink.data = nullptr;
+    Tensor compressed_device = device_tensor(
+        backend, head_dim, compressed_capacity);
+    std::memcpy(
+        compressed_device.data, compressed.data(),
+        compressed_device.nbytes());
+    GraphNode selected_node;
+    selected_node.op_type = OpType::DSV4_SPARSE_ATTN;
+    selected_node.params.i32 = {
+        num_heads, head_dim, window_size, ratio, top_k,
+        64, 64, 6, 7};
+    selected_node.params.f32 = {
+        config.softmax_scale, config.query_norm_eps, 10000.0f,
+        2.0f, 32.0f, 1.0f};
+    auto run = [&](
+            const GraphNode& node, const float* query_source,
+            const float* kv_source, const int32_t* selected_source,
+            int chunk_tokens, int position, Tensor& window,
+            std::vector<float>& result) {
+        Tensor query_device = device_tensor(
+            backend, query_width, chunk_tokens);
+        Tensor kv_device = device_tensor(backend, head_dim, chunk_tokens);
+        Tensor position_device = device_tensor(
+            backend, Precision::INT32, 1);
+        Tensor tokens_device = device_tensor(
+            backend, Precision::INT32, 1);
+        Tensor output_device = device_tensor(
+            backend, query_width, chunk_tokens);
+        std::memcpy(
+            query_device.data, query_source, query_device.nbytes());
+        std::memcpy(kv_device.data, kv_source, kv_device.nbytes());
+        position_device.ptr<int32_t>()[0] = position;
+        tokens_device.ptr<int32_t>()[0] = chunk_tokens;
+        std::vector<const Tensor*> sparse_inputs = {
+            &query_device, &kv_device, &sink, &window,
+            &position_device, &tokens_device, &compressed_device};
+        Tensor selected_device;
+        if (selected_source) {
+            selected_device = device_tensor(
+                backend, Precision::INT32, top_k, chunk_tokens);
+            std::memcpy(
+                selected_device.data, selected_source,
+                selected_device.nbytes());
+            sparse_inputs.push_back(&selected_device);
+        }
+        backend.clear_dispatch_error();
+        backend.dispatch(node, sparse_inputs, &output_device, nullptr);
+        backend.end_graph();
+        result.resize(static_cast<size_t>(chunk_tokens) * query_width);
+        std::memcpy(result.data(), output_device.data, output_device.nbytes());
+        return !backend.dispatch_failed();
+    };
+
+    Tensor whole_window = device_tensor(backend, head_dim, window_size);
+    std::vector<float> whole_output;
+    if (!run(
+            selected_node, query.data(), current_kv.data(), selected.data(),
+            tokens, 0, whole_window, whole_output) ||
+        !close_enough(whole_output, expected_output, 4.0e-3f))
+        return false;
+
+    Tensor split_window = device_tensor(backend, head_dim, window_size);
+    std::vector<float> split_output;
+    const int chunk_sizes[3] = {3, 2, 3};
+    const int chunk_positions[3] = {0, 3, 5};
+    int source_token = 0;
+    for (int chunk = 0; chunk < 3; ++chunk) {
+        std::vector<float> chunk_output;
+        if (!run(
+                selected_node,
+                query.data() +
+                    static_cast<size_t>(source_token) * query_width,
+                current_kv.data() +
+                    static_cast<size_t>(source_token) * head_dim,
+                selected.data() +
+                    static_cast<size_t>(source_token) * top_k,
+                chunk_sizes[chunk], chunk_positions[chunk], split_window,
+                chunk_output))
+            return false;
+        split_output.insert(
+            split_output.end(), chunk_output.begin(), chunk_output.end());
+        source_token += chunk_sizes[chunk];
+    }
+    std::vector<float> whole_window_values(expected_window.size());
+    std::vector<float> split_window_values(expected_window.size());
+    std::memcpy(
+        whole_window_values.data(), whole_window.data, whole_window.nbytes());
+    std::memcpy(
+        split_window_values.data(), split_window.data, split_window.nbytes());
+    if (!close_enough(split_output, whole_output, 0.0f) ||
+        !close_enough(whole_window_values, expected_window, 2.0e-5f) ||
+        !close_enough(split_window_values, whole_window_values, 0.0f))
+        return false;
+
+    // Non-indexed compression layers consume every causally available
+    // compressed vector rather than a top-k index tensor.
+    Dsv4SparseAttentionConfig all_config = config;
+    all_config.compress_ratio = 2;
+    std::vector<float> all_expected_window(expected_window.size());
+    std::vector<float> all_expected_output(expected_output.size());
+    Tensor all_expected_window_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        head_dim, window_size, 1, 1, all_expected_window.data());
+    Tensor all_expected_output_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        query_width, tokens, 1, 1, all_expected_output.data());
+    if (!kernel_dsv4_sparse_attention(
+            query_host, kv_host, Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL,
+                num_heads, 1, 1, 1, sink_values),
+            all_expected_window_tensor, &compressed_host, nullptr, 0,
+            all_expected_output_tensor, all_config))
+        return false;
+    GraphNode all_node = selected_node;
+    all_node.params.i32[3] = 2;
+    all_node.params.i32[8] = -1;
+    Tensor all_window = device_tensor(backend, head_dim, window_size);
+    std::vector<float> all_output;
+    return run(
+               all_node, query.data(), current_kv.data(), nullptr,
+               tokens, 0, all_window, all_output) &&
+        close_enough(all_output, all_expected_output, 4.0e-3f);
+}
+
 bool dispatch_matmul(CudaBackend& backend, Tensor& weight,
                      const std::vector<float>& activation,
                      std::vector<float>& output, int m, int n, int k) {
@@ -263,8 +880,8 @@ Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1,
 }
 
 Tensor device_tensor(CudaBackend& backend, Precision precision,
-                     int64_t d0, int64_t d1 = 1,
-                     int64_t d2 = 1, int64_t d3 = 1) {
+                     int64_t d0, int64_t d1,
+                     int64_t d2, int64_t d3) {
     Tensor tensor = Tensor::create(
         precision, MemoryType::NONE, d0, d1, d2, d3);
     if (!backend.alloc_output(tensor, tensor.nbytes(), nullptr))
@@ -1910,6 +2527,24 @@ int main() {
             !test_dsv4_grouped_fp8_linear(grouped_backend))
             return 1;
     }
+    {
+        CudaBackend compressor_backend;
+        if (!compressor_backend.available() ||
+            !test_dsv4_compressor(compressor_backend))
+            return 1;
+    }
+    {
+        CudaBackend indexer_backend;
+        if (!indexer_backend.available() ||
+            !test_dsv4_indexer(indexer_backend))
+            return 1;
+    }
+    {
+        CudaBackend sparse_backend;
+        if (!sparse_backend.available() ||
+            !test_dsv4_sparse_attention(sparse_backend))
+            return 1;
+    }
     if (!backend.is_device_resident() ||
         !test_device_resident_ops(backend, fp16, activation, expected,
                                   m, n, k))
@@ -2034,7 +2669,9 @@ int main() {
     }
 
     std::printf("CUDA device-resident ops, RWKV, Hyper-Connection, DeepSeek "
-                "grouped FP8 and standard/hash MoE variants, strided views, "
+                "compressor/indexer/sparse attention, grouped FP8 and "
+                "standard/hash MoE variants, "
+                "strided views, "
                 "FP16, FP8, MXFP4, W8, W4G32 and W4G128 matmul tests "
                 "passed\n");
     return 0;
