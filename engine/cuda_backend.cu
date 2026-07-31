@@ -24,6 +24,33 @@
 
 namespace {
 
+struct CudaTensorLayout {
+    int64_t shape[4];
+    size_t stride[4];
+};
+
+__device__ void logical_coordinates(size_t index,
+                                    const CudaTensorLayout& layout,
+                                    size_t coordinates[4]) {
+    for (int dimension = 0; dimension < 4; ++dimension) {
+        coordinates[dimension] =
+            index % static_cast<size_t>(layout.shape[dimension]);
+        index /= static_cast<size_t>(layout.shape[dimension]);
+    }
+}
+
+__device__ size_t layout_offset(const size_t coordinates[4],
+                                const CudaTensorLayout& layout,
+                                bool broadcast) {
+    size_t offset = 0;
+    for (int dimension = 0; dimension < 4; ++dimension) {
+        const size_t coordinate = broadcast && layout.shape[dimension] == 1
+            ? 0 : coordinates[dimension];
+        offset += coordinate * layout.stride[dimension];
+    }
+    return offset;
+}
+
 const char* cuda_error(cudaError_t error) {
     return cudaGetErrorString(error);
 }
@@ -90,6 +117,58 @@ __global__ void binary_cuda(const float* lhs, const float* rhs, float* output,
                                  : lhs[index] + rhs[index];
 }
 
+__global__ void binary_strided_cuda(
+    const float* lhs, const float* rhs, float* output, size_t count,
+    CudaTensorLayout lhs_layout, CudaTensorLayout rhs_layout,
+    CudaTensorLayout output_layout, bool multiply) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    size_t coordinates[4];
+    logical_coordinates(index, output_layout, coordinates);
+    const float lhs_value = lhs[layout_offset(
+        coordinates, lhs_layout, true)];
+    const float rhs_value = rhs[layout_offset(
+        coordinates, rhs_layout, true)];
+    output[layout_offset(coordinates, output_layout, false)] = multiply
+        ? lhs_value * rhs_value : lhs_value + rhs_value;
+}
+
+__global__ void tile_cuda(
+    const float* input, float* output, size_t count,
+    CudaTensorLayout input_layout, CudaTensorLayout output_layout) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    size_t coordinates[4];
+    logical_coordinates(index, output_layout, coordinates);
+    size_t input_coordinates[4];
+    for (int dimension = 0; dimension < 4; ++dimension)
+        input_coordinates[dimension] = coordinates[dimension] %
+            static_cast<size_t>(input_layout.shape[dimension]);
+    output[layout_offset(coordinates, output_layout, false)] =
+        input[layout_offset(input_coordinates, input_layout, false)];
+}
+
+__global__ void concat_cuda(
+    const float* input, float* output, size_t count,
+    CudaTensorLayout input_layout, CudaTensorLayout output_layout,
+    int concat_dimension, int64_t concat_offset) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    size_t coordinates[4];
+    logical_coordinates(index, input_layout, coordinates);
+    const size_t input_offset = layout_offset(
+        coordinates, input_layout, false);
+    coordinates[concat_dimension] += static_cast<size_t>(concat_offset);
+    output[layout_offset(coordinates, output_layout, false)] =
+        input[input_offset];
+}
+
 __global__ void sigmoid_mul_cuda(const float* value, const float* gate,
                                  float* output, size_t count) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -121,28 +200,45 @@ __global__ void sigmoid_mul_strided_cuda(
     output[index] = v / (1.0f + expf(-g));
 }
 
+__device__ float unary_cuda_value(float value, int operation) {
+    switch (operation) {
+    case 0: return value / (1.0f + expf(-value));
+    case 1: {
+        const float inner = 0.7978845608f *
+            (value + 0.044715f * value * value * value);
+        return 0.5f * value * (1.0f + tanhf(inner));
+    }
+    case 2: return tanhf(value);
+    case 3: return 1.0f / (1.0f + expf(-value));
+    case 4: return expf(value);
+    case 5:
+        return value > 20.0f ? value : log1pf(expf(value));
+    default: return value;
+    }
+}
+
 __global__ void unary_cuda(const float* input, float* output, size_t count,
                            int operation) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
         threadIdx.x;
+    if (index < count)
+        output[index] = unary_cuda_value(input[index], operation);
+}
+
+__global__ void unary_strided_cuda(
+    const float* input, float* output, size_t count,
+    CudaTensorLayout input_layout, CudaTensorLayout output_layout,
+    int operation) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
     if (index >= count)
         return;
-    const float value = input[index];
-    switch (operation) {
-    case 0: output[index] = value / (1.0f + expf(-value)); break;
-    case 1: {
-        const float inner = 0.7978845608f *
-            (value + 0.044715f * value * value * value);
-        output[index] = 0.5f * value * (1.0f + tanhf(inner));
-        break;
-    }
-    case 2: output[index] = tanhf(value); break;
-    case 3: output[index] = 1.0f / (1.0f + expf(-value)); break;
-    case 4: output[index] = expf(value); break;
-    case 5:
-        output[index] = value > 20.0f ? value : log1pf(expf(value));
-        break;
-    }
+    size_t coordinates[4];
+    logical_coordinates(index, output_layout, coordinates);
+    output[layout_offset(coordinates, output_layout, false)] =
+        unary_cuda_value(
+            input[layout_offset(coordinates, input_layout, false)],
+            operation);
 }
 
 __global__ void swiglu_cuda(const float* input, float* output,
@@ -161,12 +257,15 @@ __global__ void swiglu_cuda(const float* input, float* output,
 
 __global__ void rms_norm_cuda(const float* input, const float* weight,
                               float* output, int width, int rows,
+                              size_t input_row_stride,
+                              size_t output_row_stride,
                               float epsilon) {
     const int row = blockIdx.x;
     if (row >= rows)
         return;
     float sum = 0.0f;
-    const float* source = input + static_cast<size_t>(row) * width;
+    const float* source = input + static_cast<size_t>(row) *
+        input_row_stride;
     for (int column = threadIdx.x; column < width; column += blockDim.x) {
         const float value = source[column];
         sum += value * value;
@@ -181,7 +280,7 @@ __global__ void rms_norm_cuda(const float* input, const float* weight,
     }
     const float inverse = rsqrtf(reduction[0] / width + epsilon);
     for (int column = threadIdx.x; column < width; column += blockDim.x)
-        output[static_cast<size_t>(row) * width + column] =
+        output[static_cast<size_t>(row) * output_row_stride + column] =
             source[column] * inverse * weight[column];
 }
 
@@ -865,8 +964,26 @@ const T* device_pointer_const(const Tensor& tensor) {
         tensor.device_offset);
 }
 
+CudaTensorLayout cuda_layout(const Tensor& tensor) {
+    CudaTensorLayout layout{};
+    for (int dimension = 0; dimension < 4; ++dimension) {
+        layout.shape[dimension] = tensor.shape[dimension];
+        layout.stride[dimension] =
+            tensor.stride[dimension] / sizeof(float);
+    }
+    return layout;
+}
+
 bool fp32_contiguous(const Tensor& tensor) {
     return tensor.prec == Precision::FP32 && tensor.is_contiguous();
+}
+
+bool broadcasts_to(const Tensor& source, const Tensor& destination) {
+    for (int dimension = 0; dimension < 4; ++dimension)
+        if (source.shape[dimension] != 1 &&
+            source.shape[dimension] != destination.shape[dimension])
+            return false;
+    return true;
 }
 
 bool same_shape(const Tensor& lhs, const Tensor& rhs) {
@@ -1125,6 +1242,76 @@ void CudaBackend::dispatch(const GraphNode& node,
         output->shape[dimension] = size;
         record_native();
         return;
+    }
+
+    if (node.op_type == OpType::TILE && !inputs.empty() && inputs[0] &&
+        output && inputs[0]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32) {
+        const Tensor& source = *inputs[0];
+        const float* input = device_pointer_const<float>(source);
+        float* destination = device_pointer<float>(*output);
+        bool valid = input && destination && source.nelements() > 0 &&
+            output->nelements() > 0;
+        for (int dimension = 0; dimension < 4; ++dimension) {
+            const int repeat = graph_params::get_i32(
+                node.params, dimension, 1);
+            valid = valid && repeat > 0 &&
+                output->shape[dimension] ==
+                    source.shape[dimension] * repeat;
+        }
+        if (valid) {
+            const size_t count = static_cast<size_t>(output->nelements());
+            tile_cuda<<<static_cast<unsigned>((count + threads - 1) /
+                                              threads), threads>>>(
+                input, destination, count, cuda_layout(source),
+                cuda_layout(*output));
+            if (!report_cuda(cudaGetLastError(), "tile_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if (node.op_type == OpType::CONCAT && !inputs.empty() && output &&
+        output->prec == Precision::FP32) {
+        const int dimension = graph_params::get_i32(node.params, 0, 0);
+        float* destination = device_pointer<float>(*output);
+        int64_t concatenated = 0;
+        bool valid = destination && dimension >= 0 && dimension < 4;
+        for (const Tensor* source : inputs) {
+            valid = valid && source && source->prec == Precision::FP32 &&
+                device_pointer_const<float>(*source) &&
+                source->nelements() > 0;
+            if (!valid)
+                break;
+            for (int other = 0; other < 4; ++other)
+                if (other != dimension)
+                    valid = valid &&
+                        source->shape[other] == output->shape[other];
+            concatenated += source->shape[dimension];
+        }
+        valid = valid && concatenated == output->shape[dimension];
+        if (valid) {
+            int64_t offset = 0;
+            for (const Tensor* source : inputs) {
+                const size_t count =
+                    static_cast<size_t>(source->nelements());
+                concat_cuda<<<static_cast<unsigned>((count + threads - 1) /
+                                                    threads), threads>>>(
+                    device_pointer_const<float>(*source), destination, count,
+                    cuda_layout(*source), cuda_layout(*output), dimension,
+                    offset);
+                if (!report_cuda(cudaGetLastError(), "concat_cuda")) {
+                    impl_->failed = true;
+                    return;
+                }
+                offset += source->shape[dimension];
+            }
+            record_native();
+            return;
+        }
     }
 
     if ((node.op_type == OpType::CONTIGUOUS ||
@@ -1561,6 +1748,7 @@ void CudaBackend::dispatch(const GraphNode& node,
             auto* normalized = static_cast<float*>(impl_->norm_scratch);
             rms_norm_cuda<<<rows, threads>>>(
                 source_data, weight_data, normalized, width, rows,
+                static_cast<size_t>(width), static_cast<size_t>(width),
                 graph_params::get_f32(node.params, 0, 1e-6f));
             rope_cuda<<<static_cast<unsigned>((count + threads - 1) /
                                               threads), threads>>>(
@@ -1624,17 +1812,24 @@ void CudaBackend::dispatch(const GraphNode& node,
     }
 
     if (node.op_type == OpType::RMS_NORM && inputs.size() >= 2 &&
-        inputs[0] && inputs[1] && output && fp32_contiguous(*inputs[0]) &&
-        fp32_contiguous(*inputs[1]) && fp32_contiguous(*output)) {
+        inputs[0] && inputs[1] && output &&
+        inputs[0]->prec == Precision::FP32 &&
+        fp32_contiguous(*inputs[1]) && output->prec == Precision::FP32 &&
+        inputs[0]->shape[2] == 1 && inputs[0]->shape[3] == 1 &&
+        inputs[0]->stride[0] == sizeof(float) &&
+        output->stride[0] == sizeof(float) &&
+        same_shape(*inputs[0], *output)) {
         const float* source = device_pointer_const<float>(*inputs[0]);
         const float* weight = device_pointer_const<float>(*inputs[1]);
         float* destination = device_pointer<float>(*output);
         const int width = static_cast<int>(inputs[0]->shape[0]);
-        const int rows = width > 0
-            ? static_cast<int>(inputs[0]->nelements() / width) : 0;
-        if (source && weight && destination && rows > 0) {
+        const int rows = static_cast<int>(inputs[0]->shape[1]);
+        if (source && weight && destination && width > 0 && rows > 0 &&
+            inputs[1]->nelements() >= width) {
             rms_norm_cuda<<<rows, threads>>>(
                 source, weight, destination, width, rows,
+                inputs[0]->stride[1] / sizeof(float),
+                output->stride[1] / sizeof(float),
                 graph_params::get_f32(node.params, 0, 1e-6f));
             if (!report_cuda(cudaGetLastError(), "rms_norm_cuda")) {
                 impl_->failed = true;
@@ -1647,18 +1842,32 @@ void CudaBackend::dispatch(const GraphNode& node,
 
     if ((node.op_type == OpType::ADD || node.op_type == OpType::MUL) &&
         inputs.size() >= 2 && inputs[0] && inputs[1] && output &&
-        fp32_contiguous(*inputs[0]) && fp32_contiguous(*inputs[1]) &&
-        fp32_contiguous(*output) &&
-        inputs[0]->nelements() == inputs[1]->nelements()) {
+        inputs[0]->prec == Precision::FP32 &&
+        inputs[1]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32 &&
+        same_shape(*inputs[0], *output) &&
+        broadcasts_to(*inputs[1], *inputs[0])) {
         const float* lhs = device_pointer_const<float>(*inputs[0]);
         const float* rhs = device_pointer_const<float>(*inputs[1]);
         float* destination = device_pointer<float>(*output);
         const size_t count = static_cast<size_t>(output->nelements());
         if (lhs && rhs && destination) {
-            binary_cuda<<<static_cast<unsigned>((count + threads - 1) /
-                                                threads), threads>>>(
-                lhs, rhs, destination, count,
-                node.op_type == OpType::MUL);
+            if (fp32_contiguous(*inputs[0]) &&
+                fp32_contiguous(*inputs[1]) &&
+                fp32_contiguous(*output) &&
+                same_shape(*inputs[0], *inputs[1])) {
+                binary_cuda<<<static_cast<unsigned>((count + threads - 1) /
+                                                    threads), threads>>>(
+                    lhs, rhs, destination, count,
+                    node.op_type == OpType::MUL);
+            } else {
+                binary_strided_cuda<<<
+                    static_cast<unsigned>((count + threads - 1) / threads),
+                    threads>>>(
+                    lhs, rhs, destination, count, cuda_layout(*inputs[0]),
+                    cuda_layout(*inputs[1]), cuda_layout(*output),
+                    node.op_type == OpType::MUL);
+            }
             if (!report_cuda(cudaGetLastError(), "binary_cuda")) {
                 impl_->failed = true;
                 return;
@@ -1720,14 +1929,24 @@ void CudaBackend::dispatch(const GraphNode& node,
     default: break;
     }
     if (unary_operation >= 0 && !inputs.empty() && inputs[0] && output &&
-        fp32_contiguous(*inputs[0]) && fp32_contiguous(*output)) {
+        inputs[0]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32 &&
+        same_shape(*inputs[0], *output)) {
         const float* source = device_pointer_const<float>(*inputs[0]);
         float* destination = device_pointer<float>(*output);
         const size_t count = static_cast<size_t>(output->nelements());
         if (source && destination) {
-            unary_cuda<<<static_cast<unsigned>((count + threads - 1) /
-                                               threads), threads>>>(
-                source, destination, count, unary_operation);
+            if (fp32_contiguous(*inputs[0]) && fp32_contiguous(*output)) {
+                unary_cuda<<<static_cast<unsigned>((count + threads - 1) /
+                                                   threads), threads>>>(
+                    source, destination, count, unary_operation);
+            } else {
+                unary_strided_cuda<<<
+                    static_cast<unsigned>((count + threads - 1) / threads),
+                    threads>>>(
+                    source, destination, count, cuda_layout(*inputs[0]),
+                    cuda_layout(*output), unary_operation);
+            }
             if (!report_cuda(cudaGetLastError(), "unary_cuda")) {
                 impl_->failed = true;
                 return;

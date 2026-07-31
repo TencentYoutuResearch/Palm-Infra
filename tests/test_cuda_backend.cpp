@@ -458,6 +458,164 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     return true;
 }
 
+bool test_strided_layout_ops(CudaBackend& backend) {
+    backend.clear_dispatch_error();
+
+    constexpr int norm_parent_width = 10;
+    constexpr int norm_width = 8;
+    constexpr int rows = 3;
+    Tensor norm_parent = device_tensor(backend, norm_parent_width, rows);
+    for (int i = 0; i < norm_parent_width * rows; ++i)
+        norm_parent.ptr<float>()[i] = (i - 11) / 13.0f;
+    Tensor norm_input;
+    GraphNode slice;
+    slice.op_type = OpType::SLICE;
+    slice.params.i32 = {0, 1, norm_width};
+    backend.dispatch(slice, {&norm_parent}, &norm_input, nullptr);
+    std::vector<float> norm_weight(norm_width);
+    for (int i = 0; i < norm_width; ++i)
+        norm_weight[i] = 0.7f + i * 0.03f;
+    Tensor norm_scale = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, norm_width, 1, 1, 1,
+        norm_weight.data());
+    backend.wrap_weight(norm_scale);
+    Tensor norm_output = device_tensor(backend, norm_width, rows);
+    GraphNode rms;
+    rms.op_type = OpType::RMS_NORM;
+    backend.dispatch(rms, {&norm_input, &norm_scale}, &norm_output, nullptr);
+    backend.end_graph();
+    std::vector<float> expected(norm_width * rows);
+    for (int row = 0; row < rows; ++row) {
+        float sum = 0.0f;
+        for (int column = 0; column < norm_width; ++column) {
+            const float value = norm_parent.ptr<float>()[
+                row * norm_parent_width + column + 1];
+            sum += value * value;
+        }
+        const float inverse = 1.0f /
+            std::sqrt(sum / norm_width + 1e-6f);
+        for (int column = 0; column < norm_width; ++column)
+            expected[row * norm_width + column] =
+                norm_parent.ptr<float>()[
+                    row * norm_parent_width + column + 1] *
+                inverse * norm_weight[column];
+    }
+    std::vector<float> actual(expected.size());
+    std::memcpy(actual.data(), norm_output.data, norm_output.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, expected, 2e-5f))
+        return false;
+
+    constexpr int merged_width = 8;
+    constexpr int half = merged_width / 2;
+    Tensor merged = device_tensor(backend, merged_width, rows);
+    for (int i = 0; i < merged_width * rows; ++i)
+        merged.ptr<float>()[i] = (i - 9) / 11.0f;
+    Tensor gate;
+    Tensor up;
+    slice.params.i32 = {0, 0, half};
+    backend.dispatch(slice, {&merged}, &gate, nullptr);
+    slice.params.i32 = {0, half, half};
+    backend.dispatch(slice, {&merged}, &up, nullptr);
+    Tensor product = device_tensor(backend, half, rows);
+    GraphNode multiply;
+    multiply.op_type = OpType::MUL;
+    backend.dispatch(multiply, {&gate, &up}, &product, nullptr);
+    backend.end_graph();
+    expected.resize(half * rows);
+    for (int row = 0; row < rows; ++row)
+        for (int column = 0; column < half; ++column)
+            expected[row * half + column] =
+                merged.ptr<float>()[row * merged_width + column] *
+                merged.ptr<float>()[row * merged_width + half + column];
+    actual.resize(expected.size());
+    std::memcpy(actual.data(), product.data, product.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, expected, 0.0f))
+        return false;
+
+    Tensor factors = device_tensor(backend, half);
+    for (int column = 0; column < half; ++column)
+        factors.ptr<float>()[column] = 0.5f + column * 0.25f;
+    Tensor broadcast_product = device_tensor(backend, half, rows);
+    backend.dispatch(
+        multiply, {&gate, &factors}, &broadcast_product, nullptr);
+    backend.end_graph();
+    for (int row = 0; row < rows; ++row)
+        for (int column = 0; column < half; ++column)
+            expected[row * half + column] =
+                merged.ptr<float>()[row * merged_width + column] *
+                factors.ptr<float>()[column];
+    std::memcpy(actual.data(), broadcast_product.data,
+                broadcast_product.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, expected, 0.0f))
+        return false;
+
+    constexpr int tile_width = 3;
+    constexpr int tile_rows = 2;
+    constexpr int tile_heads = 4;
+    Tensor tile_input = device_tensor(backend, tile_width, tile_rows, 1);
+    for (int i = 0; i < tile_width * tile_rows; ++i)
+        tile_input.ptr<float>()[i] = (i - 2) / 7.0f;
+    Tensor tiled = device_tensor(
+        backend, tile_width, tile_rows, tile_heads);
+    GraphNode tile;
+    tile.op_type = OpType::TILE;
+    tile.params.i32 = {1, 1, tile_heads, 1};
+    backend.dispatch(tile, {&tile_input}, &tiled, nullptr);
+    backend.end_graph();
+    expected.resize(tile_width * tile_rows * tile_heads);
+    for (int head = 0; head < tile_heads; ++head)
+        for (int row = 0; row < tile_rows; ++row)
+            for (int column = 0; column < tile_width; ++column)
+                expected[(head * tile_rows + row) * tile_width + column] =
+                    tile_input.ptr<float>()[row * tile_width + column];
+    actual.resize(expected.size());
+    std::memcpy(actual.data(), tiled.data, tiled.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, expected, 0.0f))
+        return false;
+
+    constexpr int concat_width = 6;
+    constexpr int concat_heads = 2;
+    constexpr int concat_rows = 3;
+    Tensor concat_storage = device_tensor(
+        backend, concat_width, concat_heads, concat_rows);
+    for (int64_t i = 0; i < concat_storage.nelements(); ++i)
+        concat_storage.ptr<float>()[i] =
+            (static_cast<int>(i) - 15) / 17.0f;
+    Tensor permuted;
+    GraphNode permute;
+    permute.op_type = OpType::PERMUTE;
+    permute.params.i32 = {0, 2, 1, 3};
+    backend.dispatch(permute, {&concat_storage}, &permuted, nullptr);
+    Tensor first;
+    Tensor second;
+    slice.params.i32 = {0, 0, 2};
+    backend.dispatch(slice, {&permuted}, &first, nullptr);
+    slice.params.i32 = {0, 2, 4};
+    backend.dispatch(slice, {&permuted}, &second, nullptr);
+    Tensor concatenated = device_tensor(
+        backend, concat_width, concat_rows, concat_heads);
+    GraphNode concat;
+    concat.op_type = OpType::CONCAT;
+    concat.params.i32 = {0};
+    backend.dispatch(concat, {&first, &second}, &concatenated, nullptr);
+    backend.end_graph();
+    expected.resize(concatenated.nelements());
+    for (int head = 0; head < concat_heads; ++head)
+        for (int row = 0; row < concat_rows; ++row)
+            for (int column = 0; column < concat_width; ++column)
+                expected[(head * concat_rows + row) * concat_width +
+                         column] = concat_storage.ptr<float>()[
+                    (row * concat_heads + head) * concat_width + column];
+    actual.resize(expected.size());
+    std::memcpy(actual.data(), concatenated.data, concatenated.nbytes());
+    return !backend.dispatch_failed() &&
+        close_enough(actual, expected, 0.0f);
+}
+
 }  // namespace
 
 int main() {
@@ -497,6 +655,12 @@ int main() {
         return 1;
     if (!test_layout_rope_and_sdpa(backend))
         return 1;
+    {
+        CudaBackend layout_backend;
+        if (!layout_backend.available() ||
+            !test_strided_layout_ops(layout_backend))
+            return 1;
+    }
 
     Q4B8G32Block block{};
     std::vector<float> q4_weight(static_cast<size_t>(n) * k);
@@ -564,7 +728,7 @@ int main() {
         !close_enough(actual, expected, 1.5e-2f))
         return 1;
 
-    std::printf("CUDA device-resident ops, fallback views, FP16, W4G32 and "
+    std::printf("CUDA device-resident ops, strided views, FP16, W4G32 and "
                 "W4G128 matmul tests passed\n");
     return 0;
 }
