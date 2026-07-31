@@ -352,6 +352,9 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.static_padded = opts.static_padded;
     cfg.image_max_pixels = opts.image_max_pixels;
     cfg.device = opts.device;
+    cfg.device_fallback = opts.device == Device::CPU
+        ? DeviceFallbackPolicy::ALLOW_CPU
+        : DeviceFallbackPolicy::REQUIRE_REQUESTED;
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
     cfg.moe_device_cache_bytes =

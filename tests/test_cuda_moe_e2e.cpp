@@ -25,13 +25,16 @@ bool run(const char* package, const char* expected_architecture, Device device,
     EngineConfig config;
     config.package_path = package;
     config.device = device;
+    config.device_fallback = device == Device::CPU
+        ? DeviceFallbackPolicy::ALLOW_CPU
+        : DeviceFallbackPolicy::REQUIRE_REQUESTED;
     config.n_ctx = 8;
     config.num_threads = 1;
     config.weight_loading = WeightLoadingMode::MMAP;
     if (stream_cache_bytes != 0)
         config.moe_ssd_cache_bytes = stream_cache_bytes;
     config.moe_device_cache_bytes = device_cache_bytes;
-    if (!engine.load(config))
+    if (!engine.load(config) || engine.config().device != device)
         return false;
     if (device == Device::CUDA && engine.cpu_weight_sidecar_bytes() != 0)
         return false;

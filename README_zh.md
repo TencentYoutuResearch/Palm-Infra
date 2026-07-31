@@ -144,7 +144,8 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
 - macOS/Apple Silicon、ARM Linux 或 Linux x86_64
 - CMake 与 Ninja 或 Make
 - Python 3
-- 转换所需的 Python 包，主要是 `numpy` 与 `safetensors`
+- 转换所需的 Python 包，主要是 `numpy` 与 `safetensors`；RWKV7 `.pth`
+  转换还需要 `torch`
 
 推荐构建方式：
 
@@ -176,8 +177,10 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm w4mixg
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g32.mollm w4g32
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg32.mollm w4mixg32
 
-# RWKV7
-python3 models/rwkv7.py /path/to/rwkv7-g1h-1.5b.pth rwkv7_1.5b_w4mixg32.mollm --tokenizer /path/to/tokenizer.txt --quant w4mixg32
+# RWKV7：转换器读取官方 .pth，C++ runtime 随后加载生成的 .mollm 包。
+python3 models/rwkv7.py \
+    /path/to/rwkv7-g1h-1.5b.pth rwkv7_1.5b_w4mixg32.mollm \
+    --tokenizer /path/to/tokenizer.txt --quant w4mixg32
 ```
 
 MoE 示例：
@@ -200,6 +203,11 @@ python3 models/deepseek_v4.py \
     --package deepseek_v4_flash_native.mollm \
     --ssd-cache-mb 10240 --ssd-io-workers 8 --threads 6
 ```
+
+显式指定的 GPU 必须成功初始化；否则命令会直接报错退出，不会静默改用 CPU。
+库调用方可以保留默认的 CPU fallback，也可以将
+`EngineConfig::device_fallback` 设为
+`DeviceFallbackPolicy::REQUIRE_REQUESTED` 获得同样的严格行为。
 
 CUDA 下还可以显式启用有界的 device expert LRU。cache miss 时 expert pair
 从 host cache 复制到 GPU 一次，后续命中不会再读取 SSD 或进行 H2D 传输；当前

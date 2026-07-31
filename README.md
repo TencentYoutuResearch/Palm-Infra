@@ -194,7 +194,8 @@ Requirements:
 - macOS/Apple Silicon, ARM Linux, or Linux x86_64
 - CMake + Ninja or Make
 - Python 3
-- Python packages needed by conversion, especially `numpy` and `safetensors`
+- Python packages needed by conversion, especially `numpy` and `safetensors`;
+  RWKV7 `.pth` conversion additionally requires `torch`
 
 Recommended local build:
 
@@ -232,8 +233,11 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm w4mixg
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g32.mollm w4g32
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg32.mollm w4mixg32
 
-# RWKV7
-python3 models/rwkv7.py /path/to/rwkv7-g1h-1.5b.pth rwkv7_1.5b_w4mixg32.mollm --tokenizer /path/to/tokenizer.txt --quant w4mixg32
+# RWKV7: the converter reads the official .pth checkpoint; the C++ runtime
+# subsequently loads the generated .mollm package.
+python3 models/rwkv7.py \
+    /path/to/rwkv7-g1h-1.5b.pth rwkv7_1.5b_w4mixg32.mollm \
+    --tokenizer /path/to/tokenizer.txt --quant w4mixg32
 ```
 
 MoE example:
@@ -380,6 +384,12 @@ cmake -S . -B build_cuda -DCMAKE_BUILD_TYPE=Release -DMOLLM_CUDA=ON
 cmake --build build_cuda -j
 ./build_cuda/mollm_chat --device cuda --package model.mollm
 ```
+
+An explicitly selected GPU device is required to initialize successfully; the
+command exits with an error instead of silently running the model on CPU.
+Library callers can retain the default CPU fallback or set
+`EngineConfig::device_fallback` to
+`DeviceFallbackPolicy::REQUIRE_REQUESTED` for the same strict behaviour.
 
 SSD-offloaded quantized MoE packages can additionally retain recently routed
 expert pairs in a bounded CUDA cache:

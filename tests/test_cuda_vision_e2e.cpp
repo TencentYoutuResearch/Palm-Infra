@@ -32,6 +32,9 @@ bool run_model(const char* package, Device device, VisionResult& result,
     EngineConfig config;
     config.package_path = package;
     config.device = device;
+    config.device_fallback = device == Device::CPU
+        ? DeviceFallbackPolicy::ALLOW_CPU
+        : DeviceFallbackPolicy::REQUIRE_REQUESTED;
     config.weight_loading = WeightLoadingMode::MMAP;
     config.num_threads = 4;
     LLMEngine engine;

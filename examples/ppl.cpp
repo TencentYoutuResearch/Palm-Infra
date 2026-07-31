@@ -256,6 +256,9 @@ int main(int argc, char** argv) {
     cfg.metal_ssd_full = opts.metal_ssd_full;
     cfg.trace_path = opts.trace_path;
     cfg.device = opts.device;
+    cfg.device_fallback = opts.device == Device::CPU
+        ? DeviceFallbackPolicy::ALLOW_CPU
+        : DeviceFallbackPolicy::REQUIRE_REQUESTED;
     if (!engine.load(cfg)) {
         std::fprintf(stderr, "ppl: failed to load package\n");
         return 1;

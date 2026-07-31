@@ -1,4 +1,7 @@
 #include "engine/engine.h"
+#ifdef MOLLM_CUDA
+#include "engine/cuda_backend.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -65,6 +68,33 @@ std::vector<float> run_package(const char* path, const char* label,
         values, values + static_cast<size_t>(hidden.shape[0] * hidden.shape[1]));
 }
 
+void test_unavailable_cuda_policy(const char* path) {
+#ifdef MOLLM_CUDA
+    CudaBackend probe;
+    if (probe.available()) {
+        std::printf(
+            "  SKIP: CUDA fallback policy needs a host without an available GPU\n");
+        return;
+    }
+#endif
+
+    EngineConfig strict_config;
+    strict_config.package_path = path;
+    strict_config.device = Device::CUDA;
+    strict_config.device_fallback = DeviceFallbackPolicy::REQUIRE_REQUESTED;
+    LLMEngine strict_engine;
+    CHECK(!strict_engine.load(strict_config),
+          "strict CUDA request fails when CUDA is unavailable");
+
+    EngineConfig fallback_config = strict_config;
+    fallback_config.device_fallback = DeviceFallbackPolicy::ALLOW_CPU;
+    LLMEngine fallback_engine;
+    CHECK(fallback_engine.load(fallback_config),
+          "permissive CUDA request falls back when CUDA is unavailable");
+    CHECK(fallback_engine.config().device == Device::CPU,
+          "fallback reports CPU as the active device");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -92,6 +122,7 @@ int main(int argc, char** argv) {
     CHECK(max_error < 0.30f,
           "W4G32 package remains numerically bounded against FP16 reference");
     run_package(argv[3], "load tiny Qwen3.5 GDN package", "qwen3.5", true);
+    test_unavailable_cuda_policy(argv[1]);
     if (failures == 0)
         std::printf("Tiny CPU inference test passed\n");
     return failures == 0 ? 0 : 1;

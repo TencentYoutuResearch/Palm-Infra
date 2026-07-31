@@ -76,6 +76,15 @@ enum class Device {
     CUDA,
 };
 
+// Controls what happens when the requested accelerator was not compiled in,
+// cannot be initialized, or does not support the loaded model. Library users
+// retain the historical CPU fallback by default; command-line tools require an
+// explicitly selected accelerator so benchmarks cannot silently measure CPU.
+enum class DeviceFallbackPolicy {
+    ALLOW_CPU,
+    REQUIRE_REQUESTED,
+};
+
 #if defined(__APPLE__)
 inline constexpr bool kDefaultLockMoeSsdCache = true;
 #else
@@ -89,6 +98,8 @@ struct EngineConfig {
 
     std::string package_path;         // .mollm single-file package (required)
     Device device = Device::CPU;      // optional GPU backends require their CMake option
+    DeviceFallbackPolicy device_fallback =
+        DeviceFallbackPolicy::ALLOW_CPU;
     int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;

@@ -64,6 +64,8 @@ int main(int argc, char** argv) {
         cfg.device = Device::METAL;
     else if (device && std::strcmp(device, "cuda") == 0)
         cfg.device = Device::CUDA;
+    if (cfg.device != Device::CPU)
+        cfg.device_fallback = DeviceFallbackPolicy::REQUIRE_REQUESTED;
     LLMEngine engine;
     if (!engine.load(cfg))
         return 1;

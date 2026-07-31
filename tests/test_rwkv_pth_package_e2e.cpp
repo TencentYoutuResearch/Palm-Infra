@@ -28,6 +28,9 @@ bool run(const char* package, Device device, std::vector<float>& prefill,
     EngineConfig config;
     config.package_path = package;
     config.device = device;
+    config.device_fallback = device == Device::CPU
+        ? DeviceFallbackPolicy::ALLOW_CPU
+        : DeviceFallbackPolicy::REQUIRE_REQUESTED;
     config.n_ctx = 16;
     config.num_threads = 1;
     config.weight_loading = device == Device::CUDA
@@ -89,6 +92,31 @@ bool close_enough(const std::vector<float>& actual,
     return maximum <= tolerance;
 }
 
+bool test_cuda_fallback_policy(const char* package) {
+    EngineConfig config;
+    config.package_path = package;
+    config.device = Device::CUDA;
+    config.n_ctx = 16;
+    config.num_threads = 1;
+    config.weight_loading = WeightLoadingMode::MMAP;
+    config.device_fallback = DeviceFallbackPolicy::REQUIRE_REQUESTED;
+    LLMEngine strict;
+    if (strict.load(config)) {
+        std::fprintf(
+            stderr, "unavailable required CUDA device unexpectedly loaded\n");
+        return false;
+    }
+
+    config.device_fallback = DeviceFallbackPolicy::ALLOW_CPU;
+    LLMEngine fallback;
+    if (!fallback.load(config) ||
+        fallback.config().device != Device::CPU) {
+        std::fprintf(stderr, "permitted CUDA-to-CPU fallback failed\n");
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -108,6 +136,8 @@ int main(int argc, char** argv) {
 #ifdef MOLLM_CUDA
     CudaBackend probe;
     if (!probe.available()) {
+        if (!test_cuda_fallback_policy(argv[1]))
+            return 1;
         std::printf(
             "Tiny official-layout RWKV7 .pth CPU package E2E passed "
             "(CUDA device unavailable)\n");
@@ -132,6 +162,8 @@ int main(int argc, char** argv) {
         return 1;
     std::printf("Tiny official-layout RWKV7 .pth CPU/CUDA E2E passed\n");
 #else
+    if (!test_cuda_fallback_policy(argv[1]))
+        return 1;
     std::printf("Tiny official-layout RWKV7 .pth CPU package E2E passed\n");
 #endif
     return 0;

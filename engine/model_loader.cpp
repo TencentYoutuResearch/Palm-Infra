@@ -895,14 +895,25 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_decode_.backend = &cpu_backend_;
     exec_ctx_vision_.backend = &cpu_backend_;
     accelerator_backend_.reset();
+    auto fallback_to_cpu = [&](const char* reason) {
+        if (cfg_.device_fallback ==
+            DeviceFallbackPolicy::REQUIRE_REQUESTED) {
+            std::fprintf(
+                stderr, "Engine: %s; requested device is required\n",
+                reason);
+            return false;
+        }
+        std::fprintf(stderr, "Engine: %s; falling back to CPU\n", reason);
+        accelerator_backend_.reset();
+        cfg_.device = Device::CPU;
+        return true;
+    };
     if (cfg_.device == Device::METAL) {
 #ifdef MOLLM_METAL
         accelerator_backend_ = std::make_unique<MetalBackend>();
         if (!accelerator_backend_->available()) {
-            fprintf(stderr,
-                    "Engine: Metal backend unavailable; falling back to CPU\n");
-            accelerator_backend_.reset();
-            cfg_.device = Device::CPU;
+            if (!fallback_to_cpu("Metal backend unavailable"))
+                return false;
         } else {
             exec_ctx_prefill_.backend = accelerator_backend_.get();
             // SSD expert compute remains much faster when decode stays wholly
@@ -916,27 +927,23 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 : accelerator_backend_.get();
         }
 #else
-        fprintf(stderr,
-                "Engine: built without MOLLM_METAL; using CPU backend\n");
-        cfg_.device = Device::CPU;
+        if (!fallback_to_cpu("built without MOLLM_METAL"))
+            return false;
 #endif
     } else if (cfg_.device == Device::CUDA) {
 #ifdef MOLLM_CUDA
         accelerator_backend_ = std::make_unique<CudaBackend>();
         if (!accelerator_backend_->available()) {
-            fprintf(stderr,
-                    "Engine: CUDA backend unavailable; falling back to CPU\n");
-            accelerator_backend_.reset();
-            cfg_.device = Device::CPU;
+            if (!fallback_to_cpu("CUDA backend unavailable"))
+                return false;
         } else {
             exec_ctx_prefill_.backend = accelerator_backend_.get();
             exec_ctx_decode_.backend = accelerator_backend_.get();
             exec_ctx_vision_.backend = accelerator_backend_.get();
         }
 #else
-        fprintf(stderr,
-                "Engine: built without MOLLM_CUDA; using CPU backend\n");
-        cfg_.device = Device::CPU;
+        if (!fallback_to_cpu("built without MOLLM_CUDA"))
+            return false;
 #endif
     }
     exec_ctx_prefill_.reuse_static_workspace = false;
@@ -1007,11 +1014,9 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                         "--metal-ssd-full\n");
                 return false;
             }
-            fprintf(stderr,
-                    "Engine: DeepSeek-V4 uses the CPU backend for Metal; "
-                    "ignoring accelerator device request\n");
-            accelerator_backend_.reset();
-            cfg_.device = Device::CPU;
+            if (!fallback_to_cpu(
+                    "DeepSeek-V4 is unsupported by the Metal backend"))
+                return false;
             exec_ctx_prefill_.backend = &cpu_backend_;
             exec_ctx_decode_.backend = &cpu_backend_;
             exec_ctx_vision_.backend = &cpu_backend_;
