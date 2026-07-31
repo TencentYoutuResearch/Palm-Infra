@@ -46,10 +46,13 @@ jobs:
           python-version: "3.12"
       - name: Verify x86_64 runner
         run: test "$(uname -m)" = x86_64
-      - name: Install E2E fixture dependency
-        run: python -m pip install --disable-pip-version-check numpy
-      - name: Verify E2E fixture dependency
-        run: python -c "import numpy"
+      - name: Install E2E fixture dependencies
+        run: |
+          python -m pip install --disable-pip-version-check numpy
+          python -m pip install --disable-pip-version-check torch \
+            --index-url https://download.pytorch.org/whl/cpu
+      - name: Verify E2E fixture dependencies
+        run: python -c "import numpy, torch"
       - name: Configure
         run: >
           cmake -S . -B build
@@ -70,12 +73,15 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   cuda-build:
-    name: Linux x86_64 (CUDA compile)
+    name: Linux x86_64 (CUDA 12.8, SM80 + SM120 compile)
     runs-on: ubuntu-latest
     container: nvidia/cuda:12.8.1-devel-ubuntu24.04
     steps:
       - name: Install build tools
-        run: apt-get update && apt-get install -y --no-install-recommends cmake g++ git
+        run: >
+          apt-get update &&
+          apt-get install -y --no-install-recommends
+          cmake g++ git python3 python3-numpy
       - uses: actions/checkout@v4
       - name: Configure
         run: >
@@ -84,13 +90,13 @@ jobs:
           -DMOLLM_CUDA=ON
           -DMOLLM_BUILD_TESTS=ON
           -DMOLLM_BUILD_EXAMPLE=ON
-          -DCMAKE_CUDA_ARCHITECTURES=80
+          '-DCMAKE_CUDA_ARCHITECTURES=80;120'
       - name: Build
         run: cmake --build build -j 2
-      - name: CUDA API and package tests
-        run: >
-          ctest --test-dir build --output-on-failure
-          -R 'test_cuda_backend|test_package_install'
+      - name: Host regression tests with CUDA enabled
+        run: ctest --test-dir build --output-on-failure -LE cuda
+      - name: CUDA tests without a device
+        run: ctest --test-dir build --output-on-failure -L cuda
 
   linux-arm64-build-and-test:
     name: Linux ARM64 (${{ matrix.name }})

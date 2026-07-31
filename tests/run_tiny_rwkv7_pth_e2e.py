@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an official-layout RWKV7 .pth and compare CPU/CUDA inference."""
+"""Build an official-layout RWKV7 .pth and test converted packages."""
 
 from __future__ import annotations
 
@@ -106,6 +106,7 @@ def main() -> int:
         environment = os.environ.copy()
         environment["MOLLM_QUANT_HELPER"] = str(quantizer)
         environment["MOLLM_CUDA_PROFILE"] = "1"
+        packages = []
         for quantization in ("fp16", "w8pc", "w4mixg32", "w4mixg128"):
             package = temp_dir / f"tiny-rwkv7-{quantization}.mollm"
             subprocess.run(
@@ -124,8 +125,13 @@ def main() -> int:
                 check=True,
                 env=environment,
             )
+            packages.append((quantization, package))
 
-            print(f"=== RWKV7 {quantization} CUDA package E2E ===")
+        # Conversion is deliberately completed for every supported precision
+        # before invoking the runner. This makes the official .pth importer an
+        # independently useful CI contract even on hosts without a CUDA GPU.
+        for quantization, package in packages:
+            print(f"=== RWKV7 {quantization} package E2E ===")
             completed = subprocess.run(
                 [str(runner), str(package)],
                 check=False,

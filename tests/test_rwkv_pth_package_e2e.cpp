@@ -1,5 +1,8 @@
-#include "engine/cuda_backend.h"
 #include "engine/engine.h"
+
+#ifdef MOLLM_CUDA
+#include "engine/cuda_backend.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -30,7 +33,7 @@ bool run(const char* package, Device device, std::vector<float>& prefill,
     config.weight_loading = device == Device::CUDA
         ? WeightLoadingMode::RESIDENT
         : WeightLoadingMode::MMAP;
-    if (!engine.load(config))
+    if (!engine.load(config) || engine.config().device != device)
         return false;
     if (!engine.package_weights_mmap_backed())
         return false;
@@ -93,23 +96,30 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s <rwkv7.mollm>\n", argv[0]);
         return 2;
     }
-    CudaBackend probe;
-    if (!probe.available()) {
-        std::fprintf(stderr, "CUDA device unavailable; skipping\n");
-        return 77;
-    }
-
     std::vector<float> cpu_prefill;
     std::vector<float> cpu_first_decode;
     std::vector<float> cpu_second_decode;
+    if (!run(argv[1], Device::CPU, cpu_prefill, cpu_first_decode,
+             cpu_second_decode)) {
+        std::fprintf(stderr, "tiny RWKV7 CPU package inference failed\n");
+        return 1;
+    }
+
+#ifdef MOLLM_CUDA
+    CudaBackend probe;
+    if (!probe.available()) {
+        std::printf(
+            "Tiny official-layout RWKV7 .pth CPU package E2E passed "
+            "(CUDA device unavailable)\n");
+        return 0;
+    }
+
     std::vector<float> cuda_prefill;
     std::vector<float> cuda_first_decode;
     std::vector<float> cuda_second_decode;
-    if (!run(argv[1], Device::CPU, cpu_prefill, cpu_first_decode,
-             cpu_second_decode) ||
-        !run(argv[1], Device::CUDA, cuda_prefill, cuda_first_decode,
+    if (!run(argv[1], Device::CUDA, cuda_prefill, cuda_first_decode,
              cuda_second_decode)) {
-        std::fprintf(stderr, "tiny RWKV7 package inference failed\n");
+        std::fprintf(stderr, "tiny RWKV7 CUDA package inference failed\n");
         return 1;
     }
     bool valid = close_enough(
@@ -120,6 +130,9 @@ int main(int argc, char** argv) {
         cuda_second_decode, cpu_second_decode, 2e-3f, "second decode");
     if (!valid)
         return 1;
-    std::printf("Tiny official-layout RWKV7 .pth CUDA E2E passed\n");
+    std::printf("Tiny official-layout RWKV7 .pth CPU/CUDA E2E passed\n");
+#else
+    std::printf("Tiny official-layout RWKV7 .pth CPU package E2E passed\n");
+#endif
     return 0;
 }

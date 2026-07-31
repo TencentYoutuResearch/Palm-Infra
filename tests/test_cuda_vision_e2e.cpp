@@ -1,3 +1,4 @@
+#include "engine/cuda_backend.h"
 #include "engine/engine.h"
 #include "kernels/matmul.h"
 
@@ -34,7 +35,7 @@ bool run_model(const char* package, Device device, VisionResult& result,
     config.weight_loading = WeightLoadingMode::MMAP;
     config.num_threads = 4;
     LLMEngine engine;
-    if (!engine.load(config))
+    if (!engine.load(config) || engine.config().device != device)
         return false;
 
     constexpr int grid_t = 1;
@@ -95,6 +96,11 @@ int main(int argc, char** argv) {
     if (!package || !*package) {
         std::fprintf(
             stderr, "MOLLM_QWEN35_VL_PACKAGE is unset; skipping\n");
+        return 77;
+    }
+    CudaBackend probe;
+    if (!probe.available()) {
+        std::fprintf(stderr, "CUDA device unavailable; skipping\n");
         return 77;
     }
     g_mollm_force_fp32_acc = true;
