@@ -1720,6 +1720,30 @@ def _augment_moe_expert_storage(meta: dict,
                     f"MoE expert metadata row mismatch for {ref}: "
                     f"shape[0]={header['shape'][0]} expected={expected_rows}"
                 )
+            cols = int(spec.get("cols") or header["shape"][1])
+            if int(header["shape"][1]) != cols:
+                raise ValueError(
+                    f"MoE expert metadata column mismatch for {ref}: "
+                    f"shape[1]={header['shape'][1]} expected={cols}"
+                )
+            if int(header["precision"]) == int(Precision.FP8_E4M3):
+                # FP8 scales cover 128 output rows as well as 128 K values.
+                # An expert slice is independently addressable only when its
+                # first row begins at a scale-tile boundary.
+                groups_per_row = (cols + 127) // 128
+                expected_scales = (
+                    ((expected_rows + 127) // 128) * groups_per_row
+                )
+                if (rows_per_expert % 128 != 0 or
+                        int(header["flags"]) != WEIGHT_FLAG_FP8_BLOCK128 or
+                        int(header["group_size"]) != 128 or
+                        int(header["data_size"]) != expected_rows * cols or
+                        int(header["scales_size"]) != expected_scales or
+                        int(header["num_groups"]) != expected_scales):
+                    raise ValueError(
+                        "FP8 MoE expert storage requires independently "
+                        f"aligned 128-row scale tiles: {ref}"
+                    )
             if header["data_size"] % layer_num_experts != 0:
                 raise ValueError(f"MoE expert data size is not expert-aligned: {ref}")
             if header["scales_size"] and header["scales_size"] % layer_num_experts != 0:
@@ -1727,7 +1751,6 @@ def _augment_moe_expert_storage(meta: dict,
 
             groups_per_row = 0
             if header["group_size"]:
-                cols = int(spec.get("cols") or header["shape"][1])
                 groups_per_row = (cols + int(header["group_size"]) - 1) // int(header["group_size"])
 
             spec["weight"] = ref

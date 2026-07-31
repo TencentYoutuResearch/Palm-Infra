@@ -213,9 +213,11 @@ miss 则只在当前 forward 使用 compact device scratch：
 ```
 
 `--device-moe-cache-mb` 默认关闭，并且必须和 `--ssd-cache-mb` 一起使用。
-W8、package-native W4 BG32/BG128、MXFP4 以及 FP16/FP32 SSD expert 都可
-使用同一套有界 device cache；未放入 cache 的当前路由 expert 使用 compact
-device scratch，不触发 CPU 算子 fallback。
+W8、package-native W4 BG32/BG128、MXFP4、FP8 E4M3 block-128 以及
+FP16/FP32 SSD expert 都可使用同一套有界 device cache；FP8 expert 必须各自
+从独立的 128-row scale tile 开始，打包阶段会拒绝跨 expert 切开 scale tile 的
+metadata。未放入 cache 的当前路由 expert 使用 compact device scratch，不触发
+CPU 算子 fallback。
 
 | `model_type` | 支持的模型 |
 |---|---|

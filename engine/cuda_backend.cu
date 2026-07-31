@@ -4788,6 +4788,9 @@ void CudaBackend::dispatch(const GraphNode& node,
                 return weight->e8m0_scales && weight->group_size == 32 &&
                     weight->k % 32 == 0 &&
                     weight->groups_per_row == weight->k / 32;
+            if (weight->layout == Impl::WeightLayout::Fp8Block128)
+                return weight->e8m0_scales && weight->group_size == 128 &&
+                    weight->groups_per_row == (weight->k + 127) / 128;
             return weight->layout == Impl::WeightLayout::Dense ||
                 weight->layout == Impl::WeightLayout::Q4Bg32 ||
                 weight->layout == Impl::WeightLayout::Q4Bg128;
@@ -4846,6 +4849,9 @@ void CudaBackend::dispatch(const GraphNode& node,
                 if ((spec.flags & MappedFile::FLAG_INT4_BG128) != 0)
                     return static_cast<int>(Impl::WeightLayout::Q4Bg128);
             }
+            if (spec.precision == Precision::FP8_E4M3)
+                return static_cast<int>(
+                    Impl::WeightLayout::Fp8Block128);
             if (spec.precision == Precision::MXFP4)
                 return static_cast<int>(
                     Impl::WeightLayout::Mxfp4RowMajor);
@@ -4895,6 +4901,19 @@ void CudaBackend::dispatch(const GraphNode& node,
                         (cols / 128) * sizeof(Q4B8G128Block);
             }
             if (layout == static_cast<int>(
+                              Impl::WeightLayout::Fp8Block128)) {
+                const uint64_t groups_per_row =
+                    (static_cast<uint64_t>(cols) + 127) / 128;
+                return spec.flags == MappedFile::FLAG_FP8_BLOCK128 &&
+                    rows % 128 == 0 && spec.group_size == 128 &&
+                    spec.groups_per_row == groups_per_row &&
+                    spec.data_bytes ==
+                        static_cast<uint64_t>(rows) * cols &&
+                    spec.scales_bytes ==
+                        static_cast<uint64_t>(rows / 128) *
+                            groups_per_row;
+            }
+            if (layout == static_cast<int>(
                               Impl::WeightLayout::Mxfp4RowMajor)) {
                 return cols % 32 == 0 && spec.group_size == 32 &&
                     spec.groups_per_row == static_cast<uint32_t>(cols / 32) &&
@@ -4932,15 +4951,28 @@ void CudaBackend::dispatch(const GraphNode& node,
               gate_up->k == hidden_size &&
               down->n == num_experts * hidden_size &&
               down->k == intermediate_size));
-        const bool bf16_activations =
-            (streamed_experts && gate_up_source && down_source &&
-             gate_up_source->spec.precision == Precision::MXFP4 &&
-             down_source->spec.precision == Precision::MXFP4) ||
-            (gate_up &&
-             gate_up->layout == Impl::WeightLayout::Mxfp4RowMajor);
-        valid = valid && (streamed_experts ||
-            ((down && down->layout == Impl::WeightLayout::Mxfp4RowMajor) ==
-             bf16_activations));
+        const bool gate_up_mxfp4 = streamed_experts
+            ? gate_up_source &&
+                gate_up_source->spec.precision == Precision::MXFP4
+            : gate_up &&
+                gate_up->layout == Impl::WeightLayout::Mxfp4RowMajor;
+        const bool down_mxfp4 = streamed_experts
+            ? down_source && down_source->spec.precision == Precision::MXFP4
+            : down && down->layout == Impl::WeightLayout::Mxfp4RowMajor;
+        const bool gate_up_fp8 = streamed_experts
+            ? gate_up_source &&
+                gate_up_source->spec.precision == Precision::FP8_E4M3
+            : gate_up && gate_up->layout == Impl::WeightLayout::Fp8Block128;
+        const bool down_fp8 = streamed_experts
+            ? down_source &&
+                down_source->spec.precision == Precision::FP8_E4M3
+            : down && down->layout == Impl::WeightLayout::Fp8Block128;
+        const bool bf16_activations = gate_up_mxfp4 && down_mxfp4;
+        const bool quantize_gate_up_activation = gate_up_mxfp4 || gate_up_fp8;
+        const bool quantize_down_activation = down_mxfp4 || down_fp8;
+        valid = valid && gate_up_mxfp4 == down_mxfp4 &&
+            (!gate_up_fp8 || (2 * intermediate_size) % 128 == 0) &&
+            (!down_fp8 || hidden_size % 128 == 0);
         if (router_bias) {
             valid = valid && router_bias->prec == Precision::FP32 &&
                 router_bias->nelements() >= num_experts &&
@@ -5000,13 +5032,13 @@ void CudaBackend::dispatch(const GraphNode& node,
             auto* routed_intermediate = static_cast<float*>(impl_->scratch(
                 "moe_routed_intermediate",
                 route_count * intermediate_size * sizeof(float)));
-            auto* routed_hidden_fp8 = bf16_activations
+            auto* routed_hidden_fp8 = quantize_gate_up_activation
                 ? static_cast<float*>(impl_->scratch(
                       "moe_routed_hidden_fp8",
                       static_cast<size_t>(tokens) * hidden_size *
                           sizeof(float)))
                 : nullptr;
-            auto* routed_intermediate_fp8 = bf16_activations
+            auto* routed_intermediate_fp8 = quantize_down_activation
                 ? static_cast<float*>(impl_->scratch(
                       "moe_routed_intermediate_fp8",
                       route_count * intermediate_size * sizeof(float)))
@@ -5051,8 +5083,8 @@ void CudaBackend::dispatch(const GraphNode& node,
             const void* const* down_expert_scales = nullptr;
             valid = logits && route_indices && route_weights &&
                 routed_intermediate &&
-                (!bf16_activations ||
-                 (routed_hidden_fp8 && routed_intermediate_fp8)) &&
+                (!quantize_gate_up_activation || routed_hidden_fp8) &&
+                (!quantize_down_activation || routed_intermediate_fp8) &&
                 impl_->run_matmul_device(
                     hidden,
                     static_cast<int>(inputs[0]->stride[1] / sizeof(float)),
@@ -5370,7 +5402,7 @@ void CudaBackend::dispatch(const GraphNode& node,
                 const float* routed_hidden = hidden;
                 size_t routed_hidden_stride =
                     inputs[0]->stride[1] / sizeof(float);
-                if (bf16_activations) {
+                if (quantize_gate_up_activation) {
                     const int hidden_blocks =
                         tokens * ((hidden_size + 127) / 128);
                     quantize_activation_fp8_cuda<<<hidden_blocks, 1>>>(
@@ -5401,7 +5433,7 @@ void CudaBackend::dispatch(const GraphNode& node,
                         bf16_activations);
                 }
                 const float* down_activation = routed_intermediate;
-                if (valid && bf16_activations) {
+                if (valid && quantize_down_activation) {
                     const int intermediate_blocks = static_cast<int>(
                         route_count * ((intermediate_size + 127) / 128));
                     quantize_activation_fp8_cuda<<<

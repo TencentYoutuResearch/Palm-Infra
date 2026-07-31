@@ -430,9 +430,11 @@ FP8 projections, and resident FP8/MXFP4 hash-routed MoE operator are native.
 For SSD-offloaded MoE packages, routing is computed on CUDA and only the
 selected expert pairs are copied from the host LRU cache or reused
 directly from the optional bounded device LRU described above.
-W8 row-major, package-native W4 BG32/BG128, and DeepSeek MXFP4 experts are
-supported without CPU operator fallback. FP16 and FP32 SSD experts use the
-same bounded device cache and compact miss scratch as quantized experts.
+W8 row-major, package-native W4 BG32/BG128, DeepSeek MXFP4, and FP8 E4M3
+block-128 experts are supported without CPU operator fallback. FP8 expert
+slices must start on independent 128-row scale tiles; package creation rejects
+metadata that would split one tile between experts. FP16 and FP32 SSD experts
+use the same bounded device cache and compact miss scratch as quantized experts.
 This path is correctness-first and currently uses synchronous route and expert
 transfers.
 Other operators not yet implemented natively synchronize and use the CPU

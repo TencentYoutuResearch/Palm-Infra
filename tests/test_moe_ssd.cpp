@@ -167,6 +167,59 @@ int main() {
               "paged MXFP4 expert dispatches through matmul");
     }
 
+    // FP8 expert slices are valid only on 128-row scale-tile boundaries.
+    const std::string fp8_path = "/tmp/mollm_test_moe_ssd_fp8.bin";
+    {
+        constexpr size_t matrix_bytes = 128 * 128;
+        std::vector<uint8_t> bytes(2 * matrix_bytes + 2, 0x38);
+        bytes[2 * matrix_bytes] = 127;
+        bytes[2 * matrix_bytes + 1] = 127;
+        {
+            std::ofstream out(fp8_path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        }
+        auto fp8_spec = [](const char* name, uint64_t data_offset,
+                           uint64_t scale_offset) {
+            MoeSsdTensorSpec out;
+            out.weight_ref = name;
+            out.layer = 0;
+            out.num_experts = 1;
+            out.rows = 128;
+            out.cols = 128;
+            out.precision = Precision::FP8_E4M3;
+            out.flags = MappedFile::FLAG_FP8_BLOCK128;
+            out.group_size = 128;
+            out.groups_per_row = 1;
+            out.data_offset = data_offset;
+            out.data_bytes = matrix_bytes;
+            out.scales_offset = scale_offset;
+            out.scales_bytes = 1;
+            return out;
+        };
+        MoeSsdCache cache;
+        check(cache.open(fp8_path, bytes.size()), "open FP8 cache");
+        auto misaligned = fp8_spec("fp8_misaligned", 0, 2 * matrix_bytes);
+        misaligned.rows = 64;
+        misaligned.data_bytes = 64 * 128;
+        check(!cache.add_source(misaligned),
+              "reject FP8 expert with a partial output-row scale tile");
+        check(cache.add_source(fp8_spec(
+                  "fp8_gate", 0, 2 * matrix_bytes)) &&
+              cache.add_source(fp8_spec(
+                  "fp8_down", matrix_bytes, 2 * matrix_bytes + 1)),
+              "add aligned FP8 sources");
+        Tensor gate, down;
+        check(cache.acquire(cache.find_source("fp8_gate"),
+                            cache.find_source("fp8_down"), 0, gate, down),
+              "load FP8 expert");
+        check(gate.prec == Precision::FP8_E4M3 && gate.e8m0_scales &&
+                  gate.e8m0_scales[0] == 127 && gate.group_size == 128 &&
+                  gate.groups_per_row == 1 && gate.num_groups == 1 &&
+                  gate.is_fp8_block128,
+              "FP8 expert exposes block-128 scale metadata");
+    }
+
     {
         MoeSsdCache cache;
         check(cache.open(path, 16), "open cache");  // holds exactly two expert pairs
@@ -736,6 +789,7 @@ int main() {
 
     std::remove(path.c_str());
     std::remove(bg128_path.c_str());
+    std::remove(fp8_path.c_str());
     if (failures == 0) std::printf("All MoE SSD cache tests passed!\n");
     return failures == 0 ? 0 : 1;
 }

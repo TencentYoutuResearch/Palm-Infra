@@ -213,7 +213,8 @@ def build_qwen35_fixture(model_dir: Path) -> None:
 
 
 def build_hash_package(weights_dir: Path, package: Path,
-                       models_dir: Path, fp32_experts: bool = False) -> None:
+                       models_dir: Path, fp32_experts: bool = False,
+                       fp8_experts: bool = False) -> None:
     """Build a tiny DeepSeek graph that exercises the complete CUDA path."""
     import numpy as np
 
@@ -227,8 +228,13 @@ def build_hash_package(weights_dir: Path, package: Path,
         save_package,
     )
 
-    hidden = 32
-    intermediate = 32
+    if fp32_experts and fp8_experts:
+        raise ValueError("routed experts cannot be both FP32 and FP8")
+    # FP8 block-128 scales span 128 output rows. Keep every routed expert on
+    # an independent scale-tile boundary so resident and SSD slices describe
+    # exactly the same weight.
+    hidden = 128 if fp8_experts else 32
+    intermediate = 128 if fp8_experts else 32
     shared_intermediate = 32
     experts = 4
     top_k = 2
@@ -343,6 +349,13 @@ def build_hash_package(weights_dir: Path, package: Path,
                 -0.08, 0.08,
                 (experts * hidden, intermediate)).astype(np.float32),
             precision=Precision.FP32)
+    elif fp8_experts:
+        write_fp8(
+            "layer_0_experts_gate_up.weights",
+            experts * 2 * intermediate, hidden, 20260803)
+        write_fp8(
+            "layer_0_experts_down.weights",
+            experts * hidden, intermediate, 20260804)
     else:
         write_mxfp4(
             "layer_0_experts_gate_up.weights",
@@ -479,11 +492,13 @@ def build_hash_package(weights_dir: Path, package: Path,
         gate_up = g.weight(
             "./layer_0_experts_gate_up.weights",
             (experts * 2 * intermediate, hidden),
-            Precision.FP32 if fp32_experts else Precision.MXFP4)
+            Precision.FP32 if fp32_experts else (
+                Precision.FP8_E4M3 if fp8_experts else Precision.MXFP4))
         down = g.weight(
             "./layer_0_experts_down.weights",
             (experts * hidden, intermediate),
-            Precision.FP32 if fp32_experts else Precision.MXFP4)
+            Precision.FP32 if fp32_experts else (
+                Precision.FP8_E4M3 if fp8_experts else Precision.MXFP4))
         shared_gate = g.weight(
             "./layer_0_shared_experts_gate.weights",
             (shared_intermediate, hidden), Precision.FP8_E4M3)
@@ -533,7 +548,9 @@ def build_hash_package(weights_dir: Path, package: Path,
             "prefill_seq_len": 4,
             "quantization": (
                 "fp32-routed-fp8-shared"
-                if fp32_experts else "native-fp8-mxfp4"),
+                if fp32_experts else (
+                    "fp8-routed-fp8-shared"
+                    if fp8_experts else "native-fp8-mxfp4")),
             "moe_expert_storage": {
                 "version": 1,
                 "layout": "aggregate_rows_v1",
@@ -593,6 +610,12 @@ def main() -> int:
         build_hash_package(
             fp32_hash_weights_dir, fp32_hash_package, converter.parent,
             fp32_experts=True)
+        fp8_hash_weights_dir = temp_dir / "fp8_hash_weights"
+        fp8_hash_weights_dir.mkdir()
+        fp8_hash_package = temp_dir / "tiny_hash_moe_fp8.mollm"
+        build_hash_package(
+            fp8_hash_weights_dir, fp8_hash_package, converter.parent,
+            fp8_experts=True)
         environment = os.environ.copy()
         environment["MOLLM_QUANT_HELPER"] = str(quantizer)
         environment["MOLLM_QUANT_THREADS"] = "1"
@@ -618,7 +641,7 @@ def main() -> int:
             [str(runner), str(qwen3_package), str(qwen35_package),
              str(qwen3_w8_package), str(qwen3_w4g128_package),
              str(hash_package), str(qwen3_fp16_package),
-             str(fp32_hash_package)],
+             str(fp32_hash_package), str(fp8_hash_package)],
             check=False, env=runner_environment, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(completed.stdout, end="")

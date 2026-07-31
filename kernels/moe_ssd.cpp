@@ -205,6 +205,7 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
     if (spec.precision != Precision::FP16 && spec.precision != Precision::FP32 &&
         spec.precision != Precision::INT8 &&
         spec.precision != Precision::INT4 &&
+        spec.precision != Precision::FP8_E4M3 &&
         spec.precision != Precision::MXFP4) {
         std::fprintf(stderr, "MoE SSD: unsupported precision for %s\n",
                      spec.weight_ref.c_str());
@@ -218,12 +219,33 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
           spec.group_size == 32 && spec.cols % 32 == 0));
     if ((spec.precision == Precision::INT8 ||
          spec.precision == Precision::INT4 ||
+         spec.precision == Precision::FP8_E4M3 ||
          spec.precision == Precision::MXFP4) &&
         (spec.group_size == 0 || spec.groups_per_row == 0 ||
          (spec.scales_bytes == 0 && !has_embedded_scales))) {
         std::fprintf(stderr, "MoE SSD: quantized expert %s lacks scale metadata\n",
                      spec.weight_ref.c_str());
         return false;
+    }
+    if (spec.precision == Precision::FP8_E4M3) {
+        const uint64_t groups_per_row =
+            (static_cast<uint64_t>(spec.cols) + 127) / 128;
+        const uint64_t expected_data =
+            static_cast<uint64_t>(spec.rows) * spec.cols;
+        const uint64_t expected_scales =
+            static_cast<uint64_t>(spec.rows / 128) * groups_per_row;
+        if (spec.flags != MappedFile::FLAG_FP8_BLOCK128 ||
+            spec.rows % 128 != 0 || spec.group_size != 128 ||
+            spec.groups_per_row != groups_per_row ||
+            spec.data_bytes != expected_data ||
+            spec.scales_bytes != expected_scales) {
+            std::fprintf(
+                stderr,
+                "MoE SSD: FP8 expert %s is not aligned to 128-row "
+                "scale tiles\n",
+                spec.weight_ref.c_str());
+            return false;
+        }
     }
     LayerLayout& layout = layer_layouts_[spec.layer];
     if (layout.num_experts != 0 && layout.num_experts != spec.num_experts) {
@@ -658,6 +680,13 @@ Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
         t.is_q4_g128_packed = (s.flags & MappedFile::FLAG_INT4_BG128) != 0;
         if (t.is_q4_g32_packed) t.q4_g32_data = t.data;
         if (t.is_q4_g128_packed) t.q4_g128_data = t.data;
+    } else if (s.precision == Precision::FP8_E4M3) {
+        t.e8m0_scales = scales;
+        t.group_size = s.group_size;
+        t.groups_per_row = s.groups_per_row;
+        t.num_groups = static_cast<uint32_t>(
+            static_cast<size_t>(s.rows / 128) * s.groups_per_row);
+        t.is_fp8_block128 = true;
     } else if (s.precision == Precision::MXFP4) {
         t.e8m0_scales = scales;
         t.group_size = s.group_size;

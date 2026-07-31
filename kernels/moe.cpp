@@ -252,6 +252,23 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
                 static_cast<size_t>(rows) * groups_per_row);
         return true;
     }
+    if (src.prec == Precision::FP8_E4M3) {
+        if (!src.e8m0_scales || !src.is_fp8_block128 ||
+            src.group_size != 128 || groups_per_row <= 0 ||
+            row0 % 128 != 0 || rows % 128 != 0) {
+            return false;
+        }
+        view.data = static_cast<char*>(src.data) +
+                    static_cast<size_t>(row0) * K;
+        view.e8m0_scales = src.e8m0_scales +
+            static_cast<size_t>(row0 / 128) * groups_per_row;
+        view.group_size = 128;
+        view.groups_per_row = static_cast<uint32_t>(groups_per_row);
+        view.num_groups = static_cast<uint32_t>(
+            static_cast<size_t>(rows / 128) * groups_per_row);
+        view.is_fp8_block128 = true;
+        return true;
+    }
 
     const bool embeds_scales =
         (src.is_q4_g32_packed && src.q4_g32_data) ||

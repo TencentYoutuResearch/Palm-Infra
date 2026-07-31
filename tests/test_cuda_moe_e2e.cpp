@@ -118,7 +118,8 @@ bool compare_package(const char* package, const char* architecture,
                      const char* label, size_t stream_cache_bytes = 0,
                      size_t device_cache_bytes = 0,
                      bool require_eviction = false,
-                     bool require_device_reuse = false) {
+                     bool require_device_reuse = false,
+                     float cpu_tolerance = 4e-2f) {
     std::vector<float> cpu_prefill;
     std::vector<float> cpu_decode;
     std::vector<float> cuda_prefill;
@@ -137,8 +138,10 @@ bool compare_package(const char* package, const char* architecture,
     std::snprintf(prefill_label, sizeof(prefill_label), "%s prefill", label);
     std::snprintf(decode_label, sizeof(decode_label), "%s decode", label);
     bool valid = close_enough(
-                     cuda_prefill, cpu_prefill, 4e-2f, prefill_label) &&
-        close_enough(cuda_decode, cpu_decode, 4e-2f, decode_label);
+                     cuda_prefill, cpu_prefill, cpu_tolerance,
+                     prefill_label) &&
+        close_enough(
+            cuda_decode, cpu_decode, cpu_tolerance, decode_label);
     if (!valid || stream_cache_bytes == 0)
         return valid;
 
@@ -154,8 +157,9 @@ bool compare_package(const char* package, const char* architecture,
     std::snprintf(prefill_label, sizeof(prefill_label), "%s SSD prefill", label);
     std::snprintf(decode_label, sizeof(decode_label), "%s SSD decode", label);
     if (!close_enough(
-            streamed_prefill, cpu_prefill, 4e-2f, prefill_label) ||
-        !close_enough(streamed_decode, cpu_decode, 4e-2f, decode_label))
+            streamed_prefill, cpu_prefill, cpu_tolerance, prefill_label) ||
+        !close_enough(
+            streamed_decode, cpu_decode, cpu_tolerance, decode_label))
         return false;
     std::snprintf(
         prefill_label, sizeof(prefill_label), "%s resident/SSD prefill",
@@ -172,7 +176,7 @@ bool compare_package(const char* package, const char* architecture,
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 8) {
+    if (argc != 9) {
         std::fprintf(
             stderr,
             "usage: %s <qwen3-moe-w4g32.mollm> "
@@ -180,7 +184,8 @@ int main(int argc, char** argv) {
             "<qwen3-moe-w4g128.mollm> "
             "<deepseek-v4-fp8-mxfp4.mollm> "
             "<qwen3-moe-fp16.mollm> "
-            "<deepseek-v4-fp32-routed.mollm>\n",
+            "<deepseek-v4-fp32-routed.mollm> "
+            "<deepseek-v4-fp8-routed.mollm>\n",
             argv[0]);
         return 2;
     }
@@ -212,7 +217,13 @@ int main(int argc, char** argv) {
             32768) ||
         !compare_package(
             argv[7], "deepseek-v4", "DeepSeek FP32 device cache",
-            32768, 32768))
+            32768, 32768) ||
+        !compare_package(
+            argv[8], "deepseek-v4", "DeepSeek FP8 SSD scratch",
+            65536, 0, false, false, 6e-2f) ||
+        !compare_package(
+            argv[8], "deepseek-v4", "DeepSeek FP8 device cache",
+            65536, 100000, true, true, 6e-2f))
         return 1;
     std::printf("Tiny CUDA MoE E2E tests passed\n");
     return 0;
