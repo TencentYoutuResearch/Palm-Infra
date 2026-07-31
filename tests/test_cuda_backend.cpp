@@ -1,5 +1,6 @@
 #include "engine/cuda_backend.h"
 #include "engine/engine.h"
+#include "kernels/hyper_connection.h"
 #include "kernels/moe.h"
 #include "kernels/quant_layouts.h"
 
@@ -813,6 +814,140 @@ bool test_strided_layout_ops(CudaBackend& backend) {
         close_enough(actual, expected, 0.0f);
 }
 
+bool test_hyper_connection(CudaBackend& backend) {
+    constexpr int hidden_size = 8;
+    constexpr int hc_mult = 3;
+    constexpr int tokens = 3;
+    constexpr int wide = hidden_size * hc_mult;
+    constexpr int mix_size = (2 + hc_mult) * hc_mult;
+    constexpr int packed_size =
+        hidden_size + hc_mult + hc_mult * hc_mult;
+    auto fill = [](size_t index, int offset) {
+        return static_cast<float>(
+            static_cast<int>((index * 11 + offset) % 31) - 15) / 37.0f;
+    };
+
+    std::vector<float> input(wide * tokens);
+    std::vector<float> fn(mix_size * wide);
+    std::vector<float> base(mix_size);
+    std::vector<float> branch(hidden_size * tokens);
+    std::vector<float> head_fn(hc_mult * wide);
+    std::vector<float> head_base(hc_mult);
+    for (size_t i = 0; i < input.size(); ++i) input[i] = fill(i, 1);
+    for (size_t i = 0; i < fn.size(); ++i) fn[i] = fill(i, 3);
+    for (size_t i = 0; i < base.size(); ++i) base[i] = fill(i, 5);
+    for (size_t i = 0; i < branch.size(); ++i) branch[i] = fill(i, 7);
+    for (size_t i = 0; i < head_fn.size(); ++i)
+        head_fn[i] = fill(i, 9);
+    for (size_t i = 0; i < head_base.size(); ++i)
+        head_base[i] = fill(i, 13);
+    std::vector<float> scale = {0.75f, 1.25f, -0.55f};
+    std::vector<float> head_scale = {0.9f};
+
+    Tensor input_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, wide, tokens, 1, 1,
+        input.data());
+    Tensor fn_weight = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, mix_size, wide, 1, 1,
+        fn.data());
+    Tensor scale_weight = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, 3, 1, 1, 1,
+        scale.data());
+    Tensor base_weight = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, mix_size, 1, 1, 1,
+        base.data());
+    Tensor branch_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        branch.data());
+    Tensor head_fn_weight = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hc_mult, wide, 1, 1,
+        head_fn.data());
+    Tensor head_scale_weight = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1,
+        head_scale.data());
+    Tensor head_base_weight = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hc_mult, 1, 1, 1,
+        head_base.data());
+    std::vector<float> expected_packed(packed_size * tokens);
+    std::vector<float> expected_post(wide * tokens);
+    std::vector<float> expected_head(hidden_size * tokens);
+    Tensor expected_packed_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, packed_size, tokens, 1, 1,
+        expected_packed.data());
+    Tensor expected_post_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, wide, tokens, 1, 1,
+        expected_post.data());
+    Tensor expected_head_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        expected_head.data());
+    if (!kernel_hc_pre(
+            input_host, fn_weight, scale_weight, base_weight,
+            expected_packed_tensor, hidden_size, hc_mult, 5,
+            1e-6f, 1e-6f, nullptr) ||
+        !kernel_hc_post(
+            branch_host, input_host, expected_packed_tensor,
+            expected_post_tensor, hidden_size, hc_mult, nullptr) ||
+        !kernel_hc_head(
+            input_host, head_fn_weight, head_scale_weight,
+            head_base_weight, expected_head_tensor, hidden_size, hc_mult,
+            1e-6f, 1e-6f, nullptr))
+        return false;
+
+    backend.wrap_weight(fn_weight);
+    backend.wrap_weight(scale_weight);
+    backend.wrap_weight(base_weight);
+    backend.wrap_weight(head_fn_weight);
+    backend.wrap_weight(head_scale_weight);
+    backend.wrap_weight(head_base_weight);
+    Tensor input_device = device_tensor(backend, wide, tokens);
+    Tensor branch_device = device_tensor(backend, hidden_size, tokens);
+    Tensor packed_device = device_tensor(backend, packed_size, tokens);
+    Tensor post_device = device_tensor(backend, wide, tokens);
+    Tensor head_device = device_tensor(backend, hidden_size, tokens);
+    std::memcpy(input_device.data, input.data(), input_device.nbytes());
+    std::memcpy(branch_device.data, branch.data(), branch_device.nbytes());
+
+    // A CPU fallback can no longer access any projection parameter.
+    fn_weight.data = scale_weight.data = base_weight.data = nullptr;
+    head_fn_weight.data = head_scale_weight.data =
+        head_base_weight.data = nullptr;
+    GraphNode pre;
+    pre.op_type = OpType::HC_PRE;
+    pre.params.i32 = {hidden_size, hc_mult, 5};
+    pre.params.f32 = {1e-6f, 1e-6f};
+    GraphNode post;
+    post.op_type = OpType::HC_POST;
+    post.params.i32 = {hidden_size, hc_mult};
+    GraphNode head;
+    head.op_type = OpType::HC_HEAD;
+    head.params.i32 = {hidden_size, hc_mult};
+    head.params.f32 = {1e-6f, 1e-6f};
+    backend.clear_dispatch_error();
+    backend.dispatch(
+        pre, {&input_device, &fn_weight, &scale_weight, &base_weight},
+        &packed_device, nullptr);
+    backend.dispatch(
+        post, {&branch_device, &input_device, &packed_device},
+        &post_device, nullptr);
+    backend.dispatch(
+        head,
+        {&input_device, &head_fn_weight, &head_scale_weight,
+         &head_base_weight},
+        &head_device, nullptr);
+    backend.end_graph();
+    std::vector<float> actual_packed(expected_packed.size());
+    std::vector<float> actual_post(expected_post.size());
+    std::vector<float> actual_head(expected_head.size());
+    std::memcpy(actual_packed.data(), packed_device.data,
+                packed_device.nbytes());
+    std::memcpy(actual_post.data(), post_device.data, post_device.nbytes());
+    std::memcpy(actual_head.data(), head_device.data, head_device.nbytes());
+    return !backend.dispatch_failed() &&
+        close_enough(actual_packed, expected_packed, 3e-4f) &&
+        close_enough(actual_post, expected_post, 3e-4f) &&
+        close_enough(actual_head, expected_head, 3e-4f);
+}
+
 bool test_moe_fp16_shared(CudaBackend& backend) {
     constexpr int hidden_size = 8;
     constexpr int num_experts = 4;
@@ -1440,6 +1575,12 @@ int main() {
         return 1;
 
     {
+        CudaBackend hc_backend;
+        if (!hc_backend.available() ||
+            !test_hyper_connection(hc_backend))
+            return 1;
+    }
+    {
         CudaBackend moe_backend;
         if (!moe_backend.available() ||
             !test_moe_fp16_shared(moe_backend))
@@ -1469,8 +1610,8 @@ int main() {
             return 1;
     }
 
-    std::printf("CUDA device-resident ops, RWKV and standard/hash MoE "
-                "variants, strided views, FP16, W8, W4G32 and W4G128 "
-                "matmul tests passed\n");
+    std::printf("CUDA device-resident ops, RWKV, Hyper-Connection and "
+                "standard/hash MoE variants, strided views, FP16, W8, "
+                "W4G32 and W4G128 matmul tests passed\n");
     return 0;
 }

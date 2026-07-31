@@ -218,6 +218,9 @@ def build_hash_package(weights_dir: Path, package: Path,
     experts = 4
     top_k = 2
     vocab = 8
+    hc_mult = 3
+    wide = hidden * hc_mult
+    hc_mix = (2 + hc_mult) * hc_mult
     rng = np.random.default_rng(20260802)
 
     def matrix(rows: int, cols: int) -> object:
@@ -238,6 +241,19 @@ def build_hash_package(weights_dir: Path, package: Path,
         "layer_0_shared_experts_down.weights": matrix(
             hidden, shared_intermediate),
     }
+    fp32_weights = {
+        "hc_fn.weights": rng.uniform(
+            -0.1, 0.1, (hc_mix, wide)).astype(np.float32),
+        "hc_scale.weights": np.array(
+            [0.75, 1.25, -0.55], dtype=np.float32),
+        "hc_base.weights": rng.uniform(
+            -0.1, 0.1, hc_mix).astype(np.float32),
+        "hc_head_fn.weights": rng.uniform(
+            -0.1, 0.1, (hc_mult, wide)).astype(np.float32),
+        "hc_head_scale.weights": np.array([0.9], dtype=np.float32),
+        "hc_head_base.weights": rng.uniform(
+            -0.1, 0.1, hc_mult).astype(np.float32),
+    }
     # Physical source layout is [vocab, top_k], while mollm tensor shape is
     # [top_k, vocab] because dimension zero is the contiguous dimension.
     hash_values = np.array([
@@ -247,6 +263,9 @@ def build_hash_package(weights_dir: Path, package: Path,
     for name, values in weights.items():
         _write_weight_file(
             str(weights_dir / name), values, precision=Precision.FP16)
+    for name, values in fp32_weights.items():
+        _write_weight_file(
+            str(weights_dir / name), values, precision=Precision.FP32)
     _write_weight_file(
         str(weights_dir / "layer_0_token_hash.weights"), hash_values,
         precision=Precision.INT32, logical_shape=(top_k, vocab))
@@ -264,6 +283,17 @@ def build_hash_package(weights_dir: Path, package: Path,
         token_ids = g.input(
             "token_ids", (seq_len,), Precision.INT32,
             dynamic=(DimExpr.seq(),) if dynamic else None)
+        hc_fn = g.weight(
+            "./hc_fn.weights", (hc_mix, wide), Precision.FP32)
+        hc_scale = g.weight(
+            "./hc_scale.weights", (3,), Precision.FP32)
+        hc_base = g.weight(
+            "./hc_base.weights", (hc_mix,), Precision.FP32)
+        residual = g.tile(hidden_input, (hc_mult, 1))
+        packed = g.hc_pre(
+            residual, hc_fn, hc_scale, hc_base, hidden, hc_mult,
+            sinkhorn_iters=5, norm_eps=1e-6, sinkhorn_eps=1e-6)
+        reduced = g.slice_range(packed, 0, hidden, dim=0)
         router = g.weight(
             "./layer_0_router.weights", (experts, hidden), Precision.FP16)
         gate_up = g.weight(
@@ -284,8 +314,8 @@ def build_hash_package(weights_dir: Path, package: Path,
         hash_table = g.weight(
             "./layer_0_token_hash.weights", (top_k, vocab),
             Precision.INT32)
-        g.moe(
-            hidden_input, router, gate_up, down,
+        branch = g.moe(
+            reduced, router, gate_up, down,
             shared_gate, shared_up, shared_down, None,
             hidden_size=hidden, num_experts=experts, top_k=top_k,
             intermediate_size=intermediate,
@@ -294,6 +324,16 @@ def build_hash_package(weights_dir: Path, package: Path,
             has_shared_expert=True, shared_expert_has_gate=False,
             routed_scaling_factor=0.7, swiglu_limit=0.5,
             hash_token_ids=token_ids, hash_table=hash_table)
+        combined = g.hc_post(branch, residual, packed, hidden, hc_mult)
+        hc_head_fn = g.weight(
+            "./hc_head_fn.weights", (hc_mult, wide), Precision.FP32)
+        hc_head_scale = g.weight(
+            "./hc_head_scale.weights", (1,), Precision.FP32)
+        hc_head_base = g.weight(
+            "./hc_head_base.weights", (hc_mult,), Precision.FP32)
+        g.hc_head(
+            combined, hc_head_fn, hc_head_scale, hc_head_base,
+            hidden, hc_mult, norm_eps=1e-6, hc_eps=1e-6)
         return g
 
     save_package(

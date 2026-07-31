@@ -399,9 +399,10 @@ model-sized FP16 copies. W8 experts retain row-major values and per-group
 scales, while W4 experts retain their package-native BG32/BG128 blocks. This
 keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7, Qwen3.5 vision, Qwen3-MoE,
 and Qwen3.5-MoE graphs on CUDA without CPU operator fallback. DeepSeek-V4's
-hash-routed MoE operator is native when used with resident FP16 expert
-weights, but the complete DeepSeek-V4 graph and SSD-offloaded MoE variants
-remain CPU-only.
+FP32 Hyper-Connection stages and hash-routed MoE operator are native when the
+experts use resident FP16 weights, but its complete graph remains CPU-only
+because native FP8/MXFP4 and sparse-attention coverage is still incomplete.
+SSD-offloaded MoE variants also remain CPU-only.
 Other operators not yet implemented natively synchronize and use the CPU
 reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to
 print native/fallback operator counts. Several specialized model families

@@ -96,6 +96,13 @@ __device__ float cuda_activation(float value, int kind) {
     }
 }
 
+__device__ float cuda_round_to_bf16(float value) {
+    uint32_t bits = __float_as_uint(value);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16) & 1u);
+    return __uint_as_float(bits & 0xffff0000u);
+}
+
 __global__ void apply_activation_cuda(float* values, int rows, int columns,
                                       int kind, int begin, int end) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -781,6 +788,189 @@ __global__ void moe_select_hash_routes_cuda(
             static_cast<size_t>(token) * top_k + index;
         route_indices[output_index] = selected_indices[index];
         route_weights[output_index] = selected_weights[index];
+    }
+}
+
+__global__ void hc_project_cuda(
+    const float* input, size_t input_stride, const float* weight,
+    float* projected, int tokens, int rows, int width) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    const size_t count = static_cast<size_t>(tokens) * rows;
+    if (index >= count)
+        return;
+    const int token = static_cast<int>(index / rows);
+    const int row = static_cast<int>(index % rows);
+    const float* token_input = input +
+        static_cast<size_t>(token) * input_stride;
+    const float* row_weight = weight + static_cast<size_t>(row) * width;
+    float sum = 0.0f;
+    for (int column = 0; column < width; ++column)
+        sum += token_input[column] * row_weight[column];
+    projected[index] = sum;
+}
+
+__global__ void hc_pre_cuda(
+    const float* input, size_t input_stride, const float* projected,
+    const float* scale, const float* base, float* output,
+    size_t output_stride, int tokens, int hidden_size, int hc_mult,
+    int sinkhorn_iters, float norm_eps, float sinkhorn_eps) {
+    constexpr int maximum_hc = 16;
+    const int token = blockIdx.x;
+    if (token >= tokens || threadIdx.x != 0 || hc_mult > maximum_hc)
+        return;
+    const int wide = hidden_size * hc_mult;
+    const int mix_size = (2 + hc_mult) * hc_mult;
+    const float* token_input = input +
+        static_cast<size_t>(token) * input_stride;
+    const float* mixes = projected + static_cast<size_t>(token) * mix_size;
+    float* token_output = output +
+        static_cast<size_t>(token) * output_stride;
+    float* post_output = token_output + hidden_size;
+    float* combination_output = post_output + hc_mult;
+
+    float square_sum = 0.0f;
+    for (int index = 0; index < wide; ++index)
+        square_sum += token_input[index] * token_input[index];
+    const float inverse_rms = 1.0f / sqrtf(
+        square_sum / static_cast<float>(wide) + norm_eps);
+
+    float pre[maximum_hc];
+    float combination[maximum_hc * maximum_hc];
+    float row_sums[maximum_hc];
+    float column_sums[maximum_hc];
+    for (int h = 0; h < hc_mult; ++h) {
+        pre[h] = 1.0f /
+            (1.0f + expf(-(mixes[h] * inverse_rms * scale[0] + base[h]))) +
+            sinkhorn_eps;
+        post_output[h] = 2.0f /
+            (1.0f + expf(-(
+                mixes[hc_mult + h] * inverse_rms * scale[1] +
+                base[hc_mult + h])));
+    }
+    for (int row = 0; row < hc_mult; ++row) {
+        float maximum = -FLT_MAX;
+        for (int column = 0; column < hc_mult; ++column) {
+            const int mix_index =
+                2 * hc_mult + row * hc_mult + column;
+            const float value =
+                mixes[mix_index] * inverse_rms * scale[2] +
+                base[mix_index];
+            combination[row * hc_mult + column] = value;
+            maximum = fmaxf(maximum, value);
+        }
+        float sum = 0.0f;
+        for (int column = 0; column < hc_mult; ++column) {
+            float& value = combination[row * hc_mult + column];
+            value = expf(value - maximum);
+            sum += value;
+        }
+        for (int column = 0; column < hc_mult; ++column)
+            combination[row * hc_mult + column] =
+                combination[row * hc_mult + column] / sum + sinkhorn_eps;
+    }
+    for (int iteration = 0; iteration < sinkhorn_iters; ++iteration) {
+        if (iteration != 0) {
+            for (int row = 0; row < hc_mult; ++row)
+                row_sums[row] = 0.0f;
+            for (int row = 0; row < hc_mult; ++row)
+                for (int column = 0; column < hc_mult; ++column)
+                    row_sums[row] +=
+                        combination[row * hc_mult + column];
+            for (int row = 0; row < hc_mult; ++row)
+                for (int column = 0; column < hc_mult; ++column)
+                    combination[row * hc_mult + column] /=
+                        row_sums[row] + sinkhorn_eps;
+        }
+        for (int column = 0; column < hc_mult; ++column)
+            column_sums[column] = 0.0f;
+        for (int row = 0; row < hc_mult; ++row)
+            for (int column = 0; column < hc_mult; ++column)
+                column_sums[column] +=
+                    combination[row * hc_mult + column];
+        for (int row = 0; row < hc_mult; ++row)
+            for (int column = 0; column < hc_mult; ++column)
+                combination[row * hc_mult + column] /=
+                    column_sums[column] + sinkhorn_eps;
+    }
+    for (int dimension = 0; dimension < hidden_size; ++dimension) {
+        float sum = 0.0f;
+        for (int h = 0; h < hc_mult; ++h)
+            sum += pre[h] *
+                token_input[static_cast<size_t>(h) * hidden_size +
+                            dimension];
+        token_output[dimension] = cuda_round_to_bf16(sum);
+    }
+    for (int index = 0; index < hc_mult * hc_mult; ++index)
+        combination_output[index] = combination[index];
+}
+
+__global__ void hc_post_cuda(
+    const float* branch, size_t branch_stride, const float* residual,
+    size_t residual_stride, const float* packed, size_t packed_stride,
+    float* output, size_t output_stride, size_t count, int hidden_size,
+    int hc_mult) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    const int wide = hidden_size * hc_mult;
+    const int token = static_cast<int>(index / wide);
+    const int inner = static_cast<int>(index % wide);
+    const int output_h = inner / hidden_size;
+    const int dimension = inner % hidden_size;
+    const float* token_branch = branch +
+        static_cast<size_t>(token) * branch_stride;
+    const float* token_residual = residual +
+        static_cast<size_t>(token) * residual_stride;
+    const float* post = packed +
+        static_cast<size_t>(token) * packed_stride + hidden_size;
+    const float* combination = post + hc_mult;
+    float residual_sum = 0.0f;
+    for (int input_h = 0; input_h < hc_mult; ++input_h) {
+        residual_sum += combination[input_h * hc_mult + output_h] *
+            token_residual[input_h * hidden_size + dimension];
+    }
+    output[static_cast<size_t>(token) * output_stride + inner] =
+        cuda_round_to_bf16(
+            post[output_h] * token_branch[dimension] + residual_sum);
+}
+
+__global__ void hc_head_cuda(
+    const float* input, size_t input_stride, const float* projected,
+    const float* scale, const float* base, float* output,
+    size_t output_stride, int tokens, int hidden_size, int hc_mult,
+    float norm_eps, float hc_eps) {
+    constexpr int maximum_hc = 16;
+    const int token = blockIdx.x;
+    if (token >= tokens || threadIdx.x != 0 || hc_mult > maximum_hc)
+        return;
+    const int wide = hidden_size * hc_mult;
+    const float* token_input = input +
+        static_cast<size_t>(token) * input_stride;
+    const float* token_projected = projected +
+        static_cast<size_t>(token) * hc_mult;
+    float square_sum = 0.0f;
+    for (int index = 0; index < wide; ++index)
+        square_sum += token_input[index] * token_input[index];
+    const float inverse_rms = 1.0f / sqrtf(
+        square_sum / static_cast<float>(wide) + norm_eps);
+    float pre[maximum_hc];
+    for (int h = 0; h < hc_mult; ++h) {
+        pre[h] = 1.0f /
+            (1.0f + expf(-(
+                token_projected[h] * inverse_rms * scale[0] + base[h]))) +
+            hc_eps;
+    }
+    float* token_output = output +
+        static_cast<size_t>(token) * output_stride;
+    for (int dimension = 0; dimension < hidden_size; ++dimension) {
+        float sum = 0.0f;
+        for (int h = 0; h < hc_mult; ++h)
+            sum += pre[h] *
+                token_input[static_cast<size_t>(h) * hidden_size +
+                            dimension];
+        token_output[dimension] = cuda_round_to_bf16(sum);
     }
 }
 
@@ -2570,6 +2760,122 @@ void CudaBackend::dispatch(const GraphNode& node,
         }
     }
 
+    if ((node.op_type == OpType::HC_PRE ||
+         node.op_type == OpType::HC_HEAD) &&
+        inputs.size() == 4 && inputs[0] && inputs[1] && inputs[2] &&
+        inputs[3] && output) {
+        const int hidden_size = graph_params::get_i32(node.params, 0, 0);
+        const int hc_mult = graph_params::get_i32(node.params, 1, 4);
+        const int tokens = static_cast<int>(inputs[0]->shape[1]);
+        const int wide = hidden_size * hc_mult;
+        const int rows = node.op_type == OpType::HC_PRE
+            ? (2 + hc_mult) * hc_mult : hc_mult;
+        const int output_width = node.op_type == OpType::HC_PRE
+            ? hidden_size + hc_mult + hc_mult * hc_mult : hidden_size;
+        const auto* fn = impl_->find_weight(*inputs[1]);
+        const auto* scale = impl_->find_weight(*inputs[2]);
+        const auto* base = impl_->find_weight(*inputs[3]);
+        auto valid_fp32_weight = [](const Impl::DeviceWeight* weight,
+                                    int n, int k) {
+            return weight && weight->layout == Impl::WeightLayout::Dense &&
+                weight->type == CUDA_R_32F && weight->n == n &&
+                weight->k == k;
+        };
+        const int scale_rows = node.op_type == OpType::HC_PRE ? 3 : 1;
+        bool valid = hidden_size > 0 && hc_mult > 0 && hc_mult <= 16 &&
+            tokens > 0 && inputs[0]->shape[0] == wide &&
+            output->shape[0] == output_width &&
+            output->shape[1] == tokens && fp32_contiguous(*inputs[0]) &&
+            fp32_contiguous(*output) &&
+            valid_fp32_weight(fn, rows, wide) &&
+            valid_fp32_weight(scale, scale_rows, 1) &&
+            valid_fp32_weight(base, rows, 1);
+        const int sinkhorn_iters = node.op_type == OpType::HC_PRE
+            ? graph_params::get_i32(node.params, 2, 20) : 0;
+        valid = valid &&
+            (node.op_type != OpType::HC_PRE || sinkhorn_iters > 0);
+        const float* input = device_pointer_const<float>(*inputs[0]);
+        float* destination = device_pointer<float>(*output);
+        auto* projected = static_cast<float*>(impl_->scratch(
+            "hc_projected", static_cast<size_t>(tokens) * rows *
+                sizeof(float)));
+        valid = valid && input && destination && projected;
+        if (valid) {
+            const size_t projection_count =
+                static_cast<size_t>(tokens) * rows;
+            hc_project_cuda<<<
+                static_cast<unsigned>((projection_count + threads - 1) /
+                                      threads), threads>>>(
+                input, inputs[0]->stride[1] / sizeof(float),
+                static_cast<const float*>(fn->data), projected,
+                tokens, rows, wide);
+            if (node.op_type == OpType::HC_PRE) {
+                hc_pre_cuda<<<tokens, 1>>>(
+                    input, inputs[0]->stride[1] / sizeof(float), projected,
+                    static_cast<const float*>(scale->data),
+                    static_cast<const float*>(base->data), destination,
+                    output->stride[1] / sizeof(float), tokens, hidden_size,
+                    hc_mult, sinkhorn_iters,
+                    graph_params::get_f32(node.params, 0, 1e-6f),
+                    graph_params::get_f32(node.params, 1, 1e-6f));
+            } else {
+                hc_head_cuda<<<tokens, 1>>>(
+                    input, inputs[0]->stride[1] / sizeof(float), projected,
+                    static_cast<const float*>(scale->data),
+                    static_cast<const float*>(base->data), destination,
+                    output->stride[1] / sizeof(float), tokens, hidden_size,
+                    hc_mult,
+                    graph_params::get_f32(node.params, 0, 1e-6f),
+                    graph_params::get_f32(node.params, 1, 1e-6f));
+            }
+            if (!report_cuda(cudaGetLastError(), "CUDA Hyper-Connection")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if (node.op_type == OpType::HC_POST && inputs.size() == 3 && inputs[0] &&
+        inputs[1] && inputs[2] && output) {
+        const int hidden_size = graph_params::get_i32(node.params, 0, 0);
+        const int hc_mult = graph_params::get_i32(node.params, 1, 4);
+        const int tokens = static_cast<int>(output->shape[1]);
+        const int wide = hidden_size * hc_mult;
+        const int packed_size = hidden_size + hc_mult + hc_mult * hc_mult;
+        bool valid = hidden_size > 0 && hc_mult > 0 && tokens > 0 &&
+            inputs[0]->shape[0] == hidden_size &&
+            inputs[0]->shape[1] == tokens &&
+            inputs[1]->shape[0] == wide && inputs[1]->shape[1] == tokens &&
+            inputs[2]->shape[0] == packed_size &&
+            inputs[2]->shape[1] == tokens && output->shape[0] == wide &&
+            fp32_contiguous(*inputs[0]) && fp32_contiguous(*inputs[1]) &&
+            fp32_contiguous(*inputs[2]) && fp32_contiguous(*output);
+        const float* branch = device_pointer_const<float>(*inputs[0]);
+        const float* residual = device_pointer_const<float>(*inputs[1]);
+        const float* packed = device_pointer_const<float>(*inputs[2]);
+        float* destination = device_pointer<float>(*output);
+        valid = valid && branch && residual && packed && destination;
+        if (valid) {
+            const size_t count = static_cast<size_t>(tokens) * wide;
+            hc_post_cuda<<<
+                static_cast<unsigned>((count + threads - 1) / threads),
+                threads>>>(
+                branch, inputs[0]->stride[1] / sizeof(float), residual,
+                inputs[1]->stride[1] / sizeof(float), packed,
+                inputs[2]->stride[1] / sizeof(float), destination,
+                output->stride[1] / sizeof(float), count, hidden_size,
+                hc_mult);
+            if (!report_cuda(cudaGetLastError(), "hc_post_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
     if (node.op_type == OpType::MOE && inputs.size() >= 4 && inputs[0] &&
         inputs[1] && inputs[2] && inputs[3] && output) {
         const int hidden_size = graph_params::get_i32(
@@ -2649,8 +2955,14 @@ void CudaBackend::dispatch(const GraphNode& node,
              prepared_hash_table->n == top_k &&
              prepared_hash_table->k == hash_vocab_size &&
              device_pointer_const<int32_t>(*token_ids));
-        bool valid = fp32_contiguous(*inputs[0]) &&
-            fp32_contiguous(*output) && router &&
+        const bool fp32_row_major_hidden =
+            inputs[0]->prec == Precision::FP32 &&
+            inputs[0]->stride[0] == sizeof(float) &&
+            inputs[0]->shape[2] == 1 && inputs[0]->shape[3] == 1 &&
+            inputs[0]->stride[1] >=
+                static_cast<size_t>(hidden_size) * sizeof(float);
+        bool valid = fp32_row_major_hidden && fp32_contiguous(*output) &&
+            router &&
             valid_expert_weight(gate_up) && valid_expert_weight(down) &&
             hidden_size > 0 && num_experts > 0 && num_experts >= top_k &&
             top_k > 0 && top_k <= 64 && intermediate_size > 0 &&
