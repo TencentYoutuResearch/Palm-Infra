@@ -412,8 +412,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         auto finalize_accelerator_weight = [&]() {
             if (accelerator_backend_ &&
                 exec_ctx.backend == accelerator_backend_.get()) {
-                bool is_aggregate_expert =
-                    wref.find("_experts_") != std::string::npos;
+                const bool is_aggregate_expert =
+                    mollm::detail::is_routed_expert_aggregate_ref(wref);
                 accelerator_backend_->wrap_weight_int4(
                     t, is_aggregate_expert);
             }

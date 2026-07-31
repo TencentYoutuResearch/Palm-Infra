@@ -535,8 +535,8 @@ __device__ int moe_signed_nibble(uint8_t value) {
 }
 
 __device__ float moe_weight_value_cuda(
-    const void* data, bool dense_fp32, int layout, int row, int column,
-    int width) {
+    const void* data, const float* scales, bool dense_fp32, int layout,
+    int group_size, int groups_per_row, int row, int column, int width) {
     if (layout == 0) {
         const size_t index = static_cast<size_t>(row) * width + column;
         return dense_fp32
@@ -544,6 +544,13 @@ __device__ float moe_weight_value_cuda(
             : __half2float(static_cast<const __half*>(data)[index]);
     }
     if (layout == 1) {
+        const int group = min(column / group_size, groups_per_row - 1);
+        return static_cast<float>(
+                   static_cast<const int8_t*>(data)[
+                       static_cast<size_t>(row) * width + column]) *
+            scales[static_cast<size_t>(row) * groups_per_row + group];
+    }
+    if (layout == 2) {
         const int groups = width / 32;
         const auto& block = static_cast<const Q4B8G32Block*>(data)[
             static_cast<size_t>(row / 8) * groups + column / 32];
@@ -720,8 +727,9 @@ __global__ void moe_select_routes_cuda(
 __global__ void moe_gate_up_cuda(
     const float* hidden, size_t hidden_stride, const int* route_indices,
     const void* gate_up, bool gate_up_fp32, int gate_up_layout,
-    float* intermediate, int tokens, int top_k, int hidden_size,
-    int intermediate_size, float swiglu_limit) {
+    const float* gate_up_scales, int gate_up_group_size,
+    int gate_up_groups_per_row, float* intermediate, int tokens, int top_k,
+    int hidden_size, int intermediate_size, float swiglu_limit) {
     const size_t count = static_cast<size_t>(tokens) * top_k *
         intermediate_size;
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -740,10 +748,12 @@ __global__ void moe_gate_up_cuda(
     for (int inner = 0; inner < hidden_size; ++inner) {
         const float value = input[inner];
         gate += value * moe_weight_value_cuda(
-            gate_up, gate_up_fp32, gate_up_layout, gate_row, inner,
+            gate_up, gate_up_scales, gate_up_fp32, gate_up_layout,
+            gate_up_group_size, gate_up_groups_per_row, gate_row, inner,
             hidden_size);
         up += value * moe_weight_value_cuda(
-            gate_up, gate_up_fp32, gate_up_layout, up_row, inner,
+            gate_up, gate_up_scales, gate_up_fp32, gate_up_layout,
+            gate_up_group_size, gate_up_groups_per_row, up_row, inner,
             hidden_size);
     }
     if (swiglu_limit > 0.0f) {
@@ -756,8 +766,9 @@ __global__ void moe_gate_up_cuda(
 __global__ void moe_down_cuda(
     const int* route_indices, const float* route_weights,
     const float* intermediate, const void* down, bool down_fp32,
-    int down_layout, float* output, size_t output_stride, int tokens,
-    int top_k, int hidden_size, int intermediate_size) {
+    int down_layout, const float* down_scales, int down_group_size,
+    int down_groups_per_row, float* output, size_t output_stride,
+    int tokens, int top_k, int hidden_size, int intermediate_size) {
     const size_t count = static_cast<size_t>(tokens) * hidden_size;
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
         threadIdx.x;
@@ -775,7 +786,8 @@ __global__ void moe_down_cuda(
             contribution += intermediate[
                 static_cast<size_t>(route) * intermediate_size + inner] *
                 moe_weight_value_cuda(
-                    down, down_fp32, down_layout, row, inner,
+                    down, down_scales, down_fp32, down_layout,
+                    down_group_size, down_groups_per_row, row, inner,
                     intermediate_size);
         result += route_weights[route] * contribution;
     }
@@ -1224,15 +1236,19 @@ int signed_nibble(uint8_t value) {
 struct CudaBackend::Impl {
     enum class WeightLayout : uint8_t {
         Dense = 0,
+        Q8RowMajor,
         Q4Bg32,
         Q4Bg128,
     };
 
     struct DeviceWeight {
         void* data = nullptr;
+        float* scales = nullptr;
         cudaDataType type = CUDA_R_16F;
         int n = 0;
         int k = 0;
+        int group_size = 0;
+        int groups_per_row = 0;
         WeightLayout layout = WeightLayout::Dense;
     };
 
@@ -1370,11 +1386,48 @@ struct CudaBackend::Impl {
             }
             device_allocations.push_back(device);
             found = weights.emplace(
-                cache_key, DeviceWeight{device, type, n, k, layout}).first;
+                cache_key,
+                DeviceWeight{device, nullptr, type, n, k, 0, 0, layout})
+                        .first;
             weights_by_device.emplace(device, &found->second);
         }
         tensor.device_data = found->second.data;
         tensor.device_offset = 0;
+        return true;
+    }
+
+    bool upload_quantized_weight(
+        Tensor& tensor, const void* cache_key, const void* source,
+        size_t bytes, const float* host_scales, size_t scale_count,
+        int n, int k, int group_size, int groups_per_row,
+        WeightLayout layout) {
+        if (!host_scales || scale_count == 0 || group_size <= 0 ||
+            groups_per_row <= 0 ||
+            !upload_weight(tensor, cache_key, source, bytes, CUDA_R_8I,
+                           n, k, layout))
+            return false;
+        auto found = weights.find(cache_key);
+        if (found == weights.end())
+            return false;
+        DeviceWeight& prepared = found->second;
+        if (!prepared.scales) {
+            float* device_scales = nullptr;
+            const size_t scale_bytes = scale_count * sizeof(float);
+            if (!report_cuda(cudaMalloc(&device_scales, scale_bytes),
+                             "cudaMalloc weight scales") ||
+                !report_cuda(cudaMemcpy(device_scales, host_scales,
+                                        scale_bytes,
+                                        cudaMemcpyHostToDevice),
+                             "cudaMemcpy weight scales")) {
+                if (device_scales)
+                    cudaFree(device_scales);
+                return false;
+            }
+            device_allocations.push_back(device_scales);
+            prepared.scales = device_scales;
+        }
+        prepared.group_size = group_size;
+        prepared.groups_per_row = groups_per_row;
         return true;
     }
 
@@ -1564,6 +1617,23 @@ void CudaBackend::wrap_weight_int4(Tensor& tensor,
     const int n = static_cast<int>(tensor.shape[0]);
     const int k = static_cast<int>(tensor.shape[1]);
     if (keep_native_experts) {
+        if (tensor.prec == Precision::INT8) {
+            const void* source = tensor.rowmajor_data
+                ? tensor.rowmajor_data : tensor.data;
+            const int group_size = static_cast<int>(tensor.group_size);
+            const int groups_per_row =
+                static_cast<int>(tensor.groups_per_row);
+            if (source && tensor.scales && group_size > 0 &&
+                groups_per_row > 0) {
+                impl_->upload_quantized_weight(
+                    tensor, source, source,
+                    static_cast<size_t>(n) * k, tensor.scales,
+                    static_cast<size_t>(n) * groups_per_row, n, k,
+                    group_size, groups_per_row,
+                    Impl::WeightLayout::Q8RowMajor);
+            }
+            return;
+        }
         if (tensor.prec != Precision::INT4 || n % 8 != 0)
             return;
         if (tensor.is_q4_g32_packed && tensor.q4_g32_data &&
@@ -2473,6 +2543,13 @@ void CudaBackend::dispatch(const GraphNode& node,
         const auto* router = impl_->find_weight(*inputs[1]);
         const auto* gate_up = impl_->find_weight(*inputs[2]);
         const auto* down = impl_->find_weight(*inputs[3]);
+        auto valid_expert_weight = [](const Impl::DeviceWeight* weight) {
+            return weight &&
+                (weight->layout != Impl::WeightLayout::Q8RowMajor ||
+                 (weight->scales && weight->group_size > 0 &&
+                  weight->groups_per_row > 0 &&
+                  weight->group_size * weight->groups_per_row >= weight->k));
+        };
         const Tensor* router_bias =
             router_bias_input >= 0 &&
                     static_cast<size_t>(router_bias_input) < inputs.size()
@@ -2481,7 +2558,8 @@ void CudaBackend::dispatch(const GraphNode& node,
         const bool hash_routing =
             token_ids_input >= 0 && hash_table_input >= 0;
         bool valid = fp32_contiguous(*inputs[0]) &&
-            fp32_contiguous(*output) && router && gate_up && down &&
+            fp32_contiguous(*output) && router &&
+            valid_expert_weight(gate_up) && valid_expert_weight(down) &&
             hidden_size > 0 && num_experts > 0 && num_experts >= top_k &&
             top_k > 0 && top_k <= 64 && intermediate_size > 0 &&
             num_groups <= 64 && tokens > 0 && score_function >= 0 &&
@@ -2579,9 +2657,10 @@ void CudaBackend::dispatch(const GraphNode& node,
                     hidden,
                     inputs[0]->stride[1] / sizeof(float), route_indices,
                     gate_up->data, gate_up->type == CUDA_R_32F,
-                    static_cast<int>(gate_up->layout), routed_intermediate,
-                    tokens, top_k, hidden_size, intermediate_size,
-                    swiglu_limit);
+                    static_cast<int>(gate_up->layout), gate_up->scales,
+                    gate_up->group_size, gate_up->groups_per_row,
+                    routed_intermediate, tokens, top_k, hidden_size,
+                    intermediate_size, swiglu_limit);
                 const size_t output_count =
                     static_cast<size_t>(tokens) * hidden_size;
                 moe_down_cuda<<<
@@ -2589,7 +2668,8 @@ void CudaBackend::dispatch(const GraphNode& node,
                                           threads), threads>>>(
                     route_indices, route_weights, routed_intermediate,
                     down->data, down->type == CUDA_R_32F,
-                    static_cast<int>(down->layout), destination,
+                    static_cast<int>(down->layout), down->scales,
+                    down->group_size, down->groups_per_row, destination,
                     output->stride[1] / sizeof(float), tokens, top_k,
                     hidden_size, intermediate_size);
                 valid = report_cuda(cudaGetLastError(), "CUDA MOE routed");
@@ -2759,6 +2839,101 @@ void CudaBackend::dispatch(const GraphNode& node,
         }
         impl_->failed = true;
         return;
+    }
+
+    if (node.op_type == OpType::QK_RMS_NORM_ROPE &&
+        inputs.size() >= 6 && inputs[0] && inputs[1] && inputs[2] &&
+        inputs[3] && inputs[4] && inputs[5] && output &&
+        fp32_contiguous(*inputs[0]) && fp32_contiguous(*inputs[1]) &&
+        inputs[2]->prec == Precision::FP32 &&
+        inputs[3]->prec == Precision::FP32 &&
+        inputs[4]->prec == Precision::FP32 &&
+        inputs[5]->prec == Precision::FP32 && fp32_contiguous(*output)) {
+        const int width = static_cast<int>(output->shape[0]);
+        const int sequence_length = static_cast<int>(output->shape[1]);
+        const int total_heads = static_cast<int>(output->shape[2]);
+        const int query_heads = graph_params::get_i32(
+            node.params, 2, total_heads);
+        const int key_heads = total_heads - query_heads;
+        const int rope_dim = graph_params::get_i32(
+            node.params, 0, width);
+        const bool interleave =
+            graph_params::get_i32(node.params, 1, 1) != 0;
+        const size_t query_count = static_cast<size_t>(width) *
+            sequence_length * query_heads;
+        const size_t key_count = static_cast<size_t>(width) *
+            sequence_length * key_heads;
+        const float* query = device_pointer_const<float>(*inputs[0]);
+        const float* key = device_pointer_const<float>(*inputs[1]);
+        const float* query_weight =
+            device_pointer_const<float>(*inputs[2]);
+        const float* key_weight = device_pointer_const<float>(*inputs[3]);
+        const float* cosine = device_pointer_const<float>(*inputs[4]);
+        const float* sine = device_pointer_const<float>(*inputs[5]);
+        float* destination = device_pointer<float>(*output);
+        auto* normalized = static_cast<float*>(impl_->scratch(
+            "qk_rms_norm_rope", (query_count + key_count) * sizeof(float)));
+        const bool valid = width > 0 && width <= threads &&
+            sequence_length > 0 && query_heads > 0 && key_heads > 0 &&
+            rope_dim > 0 && rope_dim <= width && rope_dim % 2 == 0 &&
+            inputs[0]->nelements() == static_cast<int64_t>(query_count) &&
+            inputs[1]->nelements() == static_cast<int64_t>(key_count) &&
+            inputs[2]->nelements() >= width &&
+            inputs[3]->nelements() >= width &&
+            inputs[4]->shape[0] >= rope_dim / 2 &&
+            inputs[5]->shape[0] >= rope_dim / 2 && query && key &&
+            query_weight && key_weight && cosine && sine && destination &&
+            normalized;
+        if (valid) {
+            const float epsilon = graph_params::get_f32(
+                node.params, 0, 1e-6f);
+            const int query_rows = sequence_length * query_heads;
+            const int key_rows = sequence_length * key_heads;
+            float* normalized_key = normalized + query_count;
+            rms_norm_cuda<<<query_rows, threads>>>(
+                query, query_weight, normalized, width, query_rows,
+                inputs[0]->stride[1] / sizeof(float), width, epsilon);
+            rms_norm_cuda<<<key_rows, threads>>>(
+                key, key_weight, normalized_key, width, key_rows,
+                inputs[1]->stride[1] / sizeof(float), width, epsilon);
+            rope_cuda<<<
+                static_cast<unsigned>((query_count + threads - 1) / threads),
+                threads>>>(
+                normalized, cosine, sine, destination, width,
+                sequence_length, query_heads, query_heads, rope_dim,
+                interleave, 1, width,
+                static_cast<size_t>(width) * sequence_length,
+                query_count, inputs[4]->stride[0] / sizeof(float),
+                inputs[4]->stride[1] / sizeof(float),
+                inputs[5]->stride[0] / sizeof(float),
+                inputs[5]->stride[1] / sizeof(float),
+                output->stride[0] / sizeof(float),
+                output->stride[1] / sizeof(float),
+                output->stride[2] / sizeof(float),
+                output->stride[3] / sizeof(float));
+            rope_cuda<<<
+                static_cast<unsigned>((key_count + threads - 1) / threads),
+                threads>>>(
+                normalized_key, cosine, sine, destination + query_count,
+                width, sequence_length, key_heads, key_heads, rope_dim,
+                interleave, 1, width,
+                static_cast<size_t>(width) * sequence_length,
+                key_count, inputs[4]->stride[0] / sizeof(float),
+                inputs[4]->stride[1] / sizeof(float),
+                inputs[5]->stride[0] / sizeof(float),
+                inputs[5]->stride[1] / sizeof(float),
+                output->stride[0] / sizeof(float),
+                output->stride[1] / sizeof(float),
+                output->stride[2] / sizeof(float),
+                output->stride[3] / sizeof(float));
+            if (!report_cuda(cudaGetLastError(),
+                             "qk_rms_norm_rope_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
     }
 
     if (node.op_type == OpType::RMS_NORM_ROPE && inputs.size() >= 4 &&

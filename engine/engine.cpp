@@ -604,7 +604,8 @@ void LLMEngine::prepare_accelerator_prefill_weights() {
         accelerator_backend_->wrap_weight(t);
         t.data = cpu_data;
         const bool aggregate_expert =
-            node.params.str[0].find("_experts_") != std::string::npos;
+            mollm::detail::is_routed_expert_aggregate_ref(
+                node.params.str[0]);
         accelerator_backend_->wrap_weight_int4(t, aggregate_expert);
     }
 #endif

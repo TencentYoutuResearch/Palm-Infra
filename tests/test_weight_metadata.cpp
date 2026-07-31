@@ -1,3 +1,4 @@
+#include "engine/accelerator_backend.h"
 #include "engine/weight_metadata.h"
 
 #include <cstdio>
@@ -38,6 +39,19 @@ MappedFile::Header make_header(uint64_t data_size, uint64_t scales_size,
 int main() {
     float scales[8] = {};
     unsigned char e8m0_scales[16] = {};
+
+    CHECK(mollm::detail::is_routed_expert_aggregate_ref(
+              "./model_layers_0_mlp_experts_gate_up_proj.weights"),
+          "classify routed expert aggregate");
+    CHECK(mollm::detail::is_routed_expert_aggregate_ref(
+              "./layer_0_experts_down.weights"),
+          "classify compact routed expert aggregate");
+    CHECK(!mollm::detail::is_routed_expert_aggregate_ref(
+              "./model_layers_0_mlp_shared_experts_gate_proj_weight.weights"),
+          "exclude shared expert matrix from routed aggregates");
+    CHECK(!mollm::detail::is_routed_expert_aggregate_ref(
+              "model.layers.0.mlp.shared_experts.down_proj.weight"),
+          "exclude raw shared expert reference");
 
     {
         Tensor weight = make_weight(Precision::FP16, 2, 4);

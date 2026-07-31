@@ -379,23 +379,25 @@ cmake --build build_cuda -j
 
 The CUDA backend is still a correctness-first implementation. Graph outputs
 and persistent state use device-addressable managed storage, FP16/FP32 linear
-layers run through cuBLAS, and package-native W8, W4G32, and W4G128 weights are
-dequantized to FP16 device weights at load time. RMSNorm and fused norm paths,
-strided and broadcast elementwise operations, common activations, SwiGLU,
-RoPE, layout materialization, tile/concat, FP32 cached SDPA, zero-copy views,
-and the decode lm_head also stay on CUDA. Qwen3.5's recurrent Gated DeltaNet
-and short-convolution paths are native as well, including persistent
+layers run through cuBLAS, and ordinary package-native W8, W4G32, and W4G128
+weights are dequantized to FP16 device weights at load time. RMSNorm, fused
+norm paths, strided and broadcast elementwise operations, common activations,
+SwiGLU, RoPE, layout materialization, tile/concat, FP32 cached SDPA, zero-copy
+views, and the decode lm_head also stay on CUDA. Qwen3.5's recurrent Gated
+DeltaNet and short-convolution paths are native as well, including persistent
 decode-state updates. RWKV7 token shift, channel mixing, normalization, WKV7
 recurrence, post-processing, batched projections, and sparse-activation FFN
 also run natively, with persistent FP16 or FP32 recurrent state. Qwen3.5's
 single-image vision tower uses the same native matmul, LayerNorm, RoPE, SDPA,
 GELU, and layout paths. Resident Qwen3-style MoE graphs support softmax,
 sigmoid, grouped and correction-bias routing plus optional shared experts.
-Aggregate W4G32/W4G128 expert tensors remain packed on the GPU and are decoded
-inside the selected-expert kernels instead of being expanded into model-sized
-FP16 copies. This keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7, Qwen3.5
-vision, and resident Qwen3-style MoE graphs on CUDA without CPU operator
-fallback. Hash-routed and SSD-offloaded MoE variants are not native yet.
+Aggregate W8, W4G32, and W4G128 expert tensors remain quantized on the GPU and
+are decoded inside the selected-expert kernels instead of being expanded into
+model-sized FP16 copies. W8 experts retain row-major values and per-group
+scales, while W4 experts retain their package-native BG32/BG128 blocks. This
+keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7, Qwen3.5 vision, Qwen3-MoE,
+and Qwen3.5-MoE graphs on CUDA without CPU operator fallback. Hash-routed and
+SSD-offloaded MoE variants are not native yet.
 Other operators not yet implemented natively synchronize and use the CPU
 reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to
 print native/fallback operator counts. Several specialized model families

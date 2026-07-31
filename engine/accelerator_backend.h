@@ -3,6 +3,21 @@
 #include "engine/backend.h"
 
 #include <string>
+#include <string_view>
+
+namespace mollm::detail {
+
+inline bool is_routed_expert_aggregate_ref(std::string_view reference) {
+    const bool expert =
+        reference.find("_experts_") != std::string_view::npos ||
+        reference.find(".experts.") != std::string_view::npos;
+    const bool shared =
+        reference.find("_shared_experts_") != std::string_view::npos ||
+        reference.find(".shared_experts.") != std::string_view::npos;
+    return expert && !shared;
+}
+
+}  // namespace mollm::detail
 
 // Common lifecycle for graph-resident accelerator backends. LLMEngine only
 // talks to this interface; Metal, CUDA and future device backends own their
