@@ -1030,9 +1030,9 @@ bool test_explicit_cpu_fallback_bridge(CudaBackend& backend) {
     input.device_offset += sizeof(int32_t);
     input.shape[0] = 2;
 
-    // CUDA's native TILE path is FP32-only. INT32 deliberately exercises the
-    // generic CPU reference bridge with explicit D2H/H2D staging. The input
-    // is also an offset, strided view, exercising exact view-span staging.
+    // The dtype-agnostic CUDA TILE path must preserve an offset, strided INT32
+    // view exactly. The deliberately malformed ADD_RMS_NORM below remains the
+    // explicit CPU-reference fallback exercised by this helper.
     GraphNode tile;
     tile.op_type = OpType::TILE;
     tile.params.i32 = {2, 1, 1, 1};
@@ -1824,8 +1824,94 @@ bool test_strided_layout_ops(CudaBackend& backend) {
                     (row * concat_heads + head) * concat_width + column];
     actual.resize(expected.size());
     std::memcpy(actual.data(), concatenated.data, concatenated.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, expected, 0.0f))
+        return false;
+
+    // Shape materialization is a storage operation, not an FP32 arithmetic
+    // operation. Exercise all CUDA copy widths with exact bit patterns.
+    const BackendOperatorStats typed_before = backend.operator_stats();
+    Tensor int32_input = device_tensor(
+        backend, Precision::INT32, 2, 2, 1, 1);
+    int32_input.ptr<int32_t>()[0] = 10;
+    int32_input.ptr<int32_t>()[1] = -11;
+    int32_input.ptr<int32_t>()[2] = 20;
+    int32_input.ptr<int32_t>()[3] = -21;
+    Tensor int32_tiled = device_tensor(
+        backend, Precision::INT32, 4, 2, 1, 1);
+    tile.params.i32 = {2, 1, 1, 1};
+    backend.dispatch(tile, {&int32_input}, &int32_tiled, nullptr);
+
+    Tensor fp16_parent = device_tensor(
+        backend, Precision::FP16, 6, 2, 1, 1);
+    for (int index = 0; index < 12; ++index)
+        fp16_parent.ptr<uint16_t>()[index] =
+            static_cast<uint16_t>(0x3100 + index * 13);
+    Tensor fp16_first;
+    Tensor fp16_second;
+    slice.params.i32 = {0, 1, 2};
+    backend.dispatch(slice, {&fp16_parent}, &fp16_first, nullptr);
+    slice.params.i32 = {0, 4, 2};
+    backend.dispatch(slice, {&fp16_parent}, &fp16_second, nullptr);
+    Tensor fp16_concatenated = device_tensor(
+        backend, Precision::FP16, 4, 2, 1, 1);
+    concat.params.i32 = {0};
+    backend.dispatch(
+        concat, {&fp16_first, &fp16_second}, &fp16_concatenated, nullptr);
+
+    Tensor int8_parent = device_tensor(
+        backend, Precision::INT8, 5, 2, 1, 1);
+    for (int index = 0; index < 10; ++index)
+        int8_parent.ptr<int8_t>()[index] =
+            static_cast<int8_t>(index * 7 - 29);
+    Tensor int8_slice;
+    slice.params.i32 = {0, 1, 3};
+    backend.dispatch(slice, {&int8_parent}, &int8_slice, nullptr);
+    Tensor int8_contiguous = device_tensor(
+        backend, Precision::INT8, 3, 2, 1, 1);
+    GraphNode contiguous_node;
+    contiguous_node.op_type = OpType::CONTIGUOUS;
+    backend.dispatch(
+        contiguous_node, {&int8_slice}, &int8_contiguous, nullptr);
+    backend.end_graph();
+
+    const std::vector<int32_t> int32_expected = {
+        10, -11, 10, -11, 20, -21, 20, -21};
+    const std::vector<uint16_t> fp16_expected = {
+        fp16_parent.ptr<uint16_t>()[1],
+        fp16_parent.ptr<uint16_t>()[2],
+        fp16_parent.ptr<uint16_t>()[4],
+        fp16_parent.ptr<uint16_t>()[5],
+        fp16_parent.ptr<uint16_t>()[7],
+        fp16_parent.ptr<uint16_t>()[8],
+        fp16_parent.ptr<uint16_t>()[10],
+        fp16_parent.ptr<uint16_t>()[11],
+    };
+    const std::vector<int8_t> int8_expected = {
+        int8_parent.ptr<int8_t>()[1],
+        int8_parent.ptr<int8_t>()[2],
+        int8_parent.ptr<int8_t>()[3],
+        int8_parent.ptr<int8_t>()[6],
+        int8_parent.ptr<int8_t>()[7],
+        int8_parent.ptr<int8_t>()[8],
+    };
+    std::vector<int32_t> int32_actual(int32_expected.size());
+    std::vector<uint16_t> fp16_actual(fp16_expected.size());
+    std::vector<int8_t> int8_actual(int8_expected.size());
+    std::memcpy(
+        int32_actual.data(), int32_tiled.data, int32_tiled.nbytes());
+    std::memcpy(
+        fp16_actual.data(), fp16_concatenated.data,
+        fp16_concatenated.nbytes());
+    std::memcpy(
+        int8_actual.data(), int8_contiguous.data,
+        int8_contiguous.nbytes());
+    const BackendOperatorStats typed_after = backend.operator_stats();
     return !backend.dispatch_failed() &&
-        close_enough(actual, expected, 0.0f);
+        int32_actual == int32_expected &&
+        fp16_actual == fp16_expected && int8_actual == int8_expected &&
+        typed_after.native_calls >= typed_before.native_calls + 6 &&
+        typed_after.fallback_calls == typed_before.fallback_calls;
 }
 
 bool test_hyper_connection(CudaBackend& backend) {

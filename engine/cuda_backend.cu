@@ -920,9 +920,24 @@ __global__ void binary_strided_cuda(
         ? lhs_value * rhs_value : lhs_value + rhs_value;
 }
 
+__device__ void copy_storage_element(
+    const uint8_t* input, size_t input_index, uint8_t* output,
+    size_t output_index, size_t element_size) {
+    if (element_size == sizeof(uint32_t)) {
+        reinterpret_cast<uint32_t*>(output)[output_index] =
+            reinterpret_cast<const uint32_t*>(input)[input_index];
+    } else if (element_size == sizeof(uint16_t)) {
+        reinterpret_cast<uint16_t*>(output)[output_index] =
+            reinterpret_cast<const uint16_t*>(input)[input_index];
+    } else {
+        output[output_index] = input[input_index];
+    }
+}
+
 __global__ void tile_cuda(
-    const float* input, float* output, size_t count,
-    CudaTensorLayout input_layout, CudaTensorLayout output_layout) {
+    const uint8_t* input, uint8_t* output, size_t count,
+    CudaTensorLayout input_layout, CudaTensorLayout output_layout,
+    size_t element_size) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
         threadIdx.x;
     if (index >= count)
@@ -933,14 +948,15 @@ __global__ void tile_cuda(
     for (int dimension = 0; dimension < 4; ++dimension)
         input_coordinates[dimension] = coordinates[dimension] %
             static_cast<size_t>(input_layout.shape[dimension]);
-    output[layout_offset(coordinates, output_layout, false)] =
-        input[layout_offset(input_coordinates, input_layout, false)];
+    copy_storage_element(
+        input, layout_offset(input_coordinates, input_layout, false), output,
+        layout_offset(coordinates, output_layout, false), element_size);
 }
 
 __global__ void concat_cuda(
-    const float* input, float* output, size_t count,
+    const uint8_t* input, uint8_t* output, size_t count,
     CudaTensorLayout input_layout, CudaTensorLayout output_layout,
-    int concat_dimension, int64_t concat_offset) {
+    int concat_dimension, int64_t concat_offset, size_t element_size) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
         threadIdx.x;
     if (index >= count)
@@ -950,8 +966,9 @@ __global__ void concat_cuda(
     const size_t input_offset = layout_offset(
         coordinates, input_layout, false);
     coordinates[concat_dimension] += static_cast<size_t>(concat_offset);
-    output[layout_offset(coordinates, output_layout, false)] =
-        input[input_offset];
+    copy_storage_element(
+        input, input_offset, output,
+        layout_offset(coordinates, output_layout, false), element_size);
 }
 
 __global__ void sigmoid_mul_cuda(const float* value, const float* gate,
@@ -2128,21 +2145,17 @@ __global__ void moe_add_shared_cuda(
 }
 
 __global__ void contiguous_cuda(
-    const float* input, float* output, size_t count,
-    int64_t d0, int64_t d1, int64_t d2,
-    size_t s0, size_t s1, size_t s2, size_t s3) {
+    const uint8_t* input, uint8_t* output, size_t count,
+    CudaTensorLayout input_layout, size_t element_size) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
         threadIdx.x;
     if (index >= count)
         return;
-    size_t remaining = index;
-    const size_t i0 = remaining % static_cast<size_t>(d0);
-    remaining /= static_cast<size_t>(d0);
-    const size_t i1 = remaining % static_cast<size_t>(d1);
-    remaining /= static_cast<size_t>(d1);
-    const size_t i2 = remaining % static_cast<size_t>(d2);
-    const size_t i3 = remaining / static_cast<size_t>(d2);
-    output[index] = input[i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3];
+    size_t coordinates[4];
+    logical_coordinates(index, input_layout, coordinates);
+    copy_storage_element(
+        input, layout_offset(coordinates, input_layout, false), output,
+        index, element_size);
 }
 
 __global__ void rope_cuda(
@@ -3269,14 +3282,24 @@ const T* device_pointer_const(const Tensor& tensor) {
         tensor.device_offset);
 }
 
-CudaTensorLayout cuda_layout(const Tensor& tensor) {
+CudaTensorLayout cuda_layout(const Tensor& tensor, size_t element_size) {
     CudaTensorLayout layout{};
     for (int dimension = 0; dimension < 4; ++dimension) {
         layout.shape[dimension] = tensor.shape[dimension];
         layout.stride[dimension] =
-            tensor.stride[dimension] / sizeof(float);
+            tensor.stride[dimension] / element_size;
     }
     return layout;
+}
+
+CudaTensorLayout cuda_layout(const Tensor& tensor) {
+    return cuda_layout(tensor, sizeof(float));
+}
+
+bool supported_copy_element_size(size_t element_size) {
+    return element_size == sizeof(uint8_t) ||
+        element_size == sizeof(uint16_t) ||
+        element_size == sizeof(uint32_t);
 }
 
 bool fp32_contiguous(const Tensor& tensor) {
@@ -3746,13 +3769,14 @@ void CudaBackend::dispatch(const GraphNode& node,
     }
 
     if (node.op_type == OpType::TILE && !inputs.empty() && inputs[0] &&
-        output && inputs[0]->prec == Precision::FP32 &&
-        output->prec == Precision::FP32) {
+        output && inputs[0]->prec == output->prec) {
         const Tensor& source = *inputs[0];
-        const float* input = device_pointer_const<float>(source);
-        float* destination = device_pointer<float>(*output);
+        const size_t element_size = source.element_size();
+        const uint8_t* input = device_pointer_const<uint8_t>(source);
+        uint8_t* destination = device_pointer<uint8_t>(*output);
         bool valid = input && destination && source.nelements() > 0 &&
-            output->nelements() > 0;
+            output->nelements() > 0 &&
+            supported_copy_element_size(element_size);
         for (int dimension = 0; dimension < 4; ++dimension) {
             const int repeat = graph_params::get_i32(
                 node.params, dimension, 1);
@@ -3764,8 +3788,10 @@ void CudaBackend::dispatch(const GraphNode& node,
             const size_t count = static_cast<size_t>(output->nelements());
             tile_cuda<<<static_cast<unsigned>((count + threads - 1) /
                                               threads), threads>>>(
-                input, destination, count, cuda_layout(source),
-                cuda_layout(*output));
+                input, destination, count,
+                cuda_layout(source, element_size),
+                cuda_layout(*output, element_size),
+                element_size);
             if (!report_cuda(cudaGetLastError(), "tile_cuda")) {
                 impl_->failed = true;
                 return;
@@ -3776,14 +3802,15 @@ void CudaBackend::dispatch(const GraphNode& node,
     }
 
     if (node.op_type == OpType::CONCAT && !inputs.empty() && output &&
-        output->prec == Precision::FP32) {
+        supported_copy_element_size(output->element_size())) {
         const int dimension = graph_params::get_i32(node.params, 0, 0);
-        float* destination = device_pointer<float>(*output);
+        const size_t element_size = output->element_size();
+        uint8_t* destination = device_pointer<uint8_t>(*output);
         int64_t concatenated = 0;
         bool valid = destination && dimension >= 0 && dimension < 4;
         for (const Tensor* source : inputs) {
-            valid = valid && source && source->prec == Precision::FP32 &&
-                device_pointer_const<float>(*source) &&
+            valid = valid && source && source->prec == output->prec &&
+                device_pointer_const<uint8_t>(*source) &&
                 source->nelements() > 0;
             if (!valid)
                 break;
@@ -3799,11 +3826,13 @@ void CudaBackend::dispatch(const GraphNode& node,
             for (const Tensor* source : inputs) {
                 const size_t count =
                     static_cast<size_t>(source->nelements());
-                concat_cuda<<<static_cast<unsigned>((count + threads - 1) /
-                                                    threads), threads>>>(
-                    device_pointer_const<float>(*source), destination, count,
-                    cuda_layout(*source), cuda_layout(*output), dimension,
-                    offset);
+                concat_cuda<<<
+                    static_cast<unsigned>((count + threads - 1) / threads),
+                    threads>>>(
+                    device_pointer_const<uint8_t>(*source), destination,
+                    count, cuda_layout(*source, element_size),
+                    cuda_layout(*output, element_size), dimension, offset,
+                    element_size);
                 if (!report_cuda(cudaGetLastError(), "concat_cuda")) {
                     impl_->failed = true;
                     return;
@@ -3818,20 +3847,20 @@ void CudaBackend::dispatch(const GraphNode& node,
     if ((node.op_type == OpType::CONTIGUOUS ||
          node.op_type == OpType::RESHAPE) &&
         !inputs.empty() && inputs[0] && output &&
-        inputs[0]->prec == Precision::FP32 &&
-        output->prec == Precision::FP32 && output->is_contiguous()) {
+        inputs[0]->prec == output->prec && output->is_contiguous() &&
+        supported_copy_element_size(output->element_size())) {
         const Tensor& source = *inputs[0];
-        const float* input = device_pointer_const<float>(source);
-        float* destination = device_pointer<float>(*output);
+        const size_t element_size = source.element_size();
+        const uint8_t* input = device_pointer_const<uint8_t>(source);
+        uint8_t* destination = device_pointer<uint8_t>(*output);
         const size_t count = static_cast<size_t>(output->nelements());
         if (input && destination && source.nelements() == output->nelements()) {
-            contiguous_cuda<<<static_cast<unsigned>((count + threads - 1) /
-                                                    threads), threads>>>(
-                input, destination, count, source.shape[0], source.shape[1],
-                source.shape[2], source.stride[0] / sizeof(float),
-                source.stride[1] / sizeof(float),
-                source.stride[2] / sizeof(float),
-                source.stride[3] / sizeof(float));
+            contiguous_cuda<<<
+                static_cast<unsigned>((count + threads - 1) / threads),
+                threads>>>(
+                input, destination, count,
+                cuda_layout(source, element_size),
+                element_size);
             if (!report_cuda(cudaGetLastError(), "contiguous_cuda")) {
                 impl_->failed = true;
                 return;
