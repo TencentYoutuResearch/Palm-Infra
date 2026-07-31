@@ -293,6 +293,11 @@ CUDA 会自动保留 mmap-backed host package：prepared weight 会复制到设�
 模型大小的匿名内存副本。CUDA 同时会跳过 CPU-only weight repack；
 `mollm_bench` 通过 `cpu_weight_sidecar_mb` 报告其常驻大小。
 
+CUDA 上的普通 W8、W4G32 与 W4G128 权重会以 package-native 量化布局常驻
+device，不再在加载时永久展开成 FP16。单 token decode 由专用 GEMV kernel
+直接读取量化权重；多 token prefill 则逐矩阵解量化到可复用的 FP16 device
+scratch 后调用 cuBLAS，因此不会额外保留一份模型大小的 FP16 权重。
+
 ## 基准测试
 
 ```bash

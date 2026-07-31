@@ -89,11 +89,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "tiny RWKV7 package inference failed\n");
         return 1;
     }
-    if (!close_enough(cuda_prefill, cpu_prefill, 2e-3f, "prefill") ||
-        !close_enough(cuda_first_decode, cpu_first_decode, 2e-3f,
-                      "first decode") ||
-        !close_enough(cuda_second_decode, cpu_second_decode, 2e-3f,
-                      "second decode"))
+    bool valid = close_enough(
+        cuda_prefill, cpu_prefill, 2e-3f, "prefill");
+    valid &= close_enough(
+        cuda_first_decode, cpu_first_decode, 2e-3f, "first decode");
+    valid &= close_enough(
+        cuda_second_decode, cpu_second_decode, 2e-3f, "second decode");
+    if (!valid)
         return 1;
     std::printf("Tiny official-layout RWKV7 .pth CUDA E2E passed\n");
     return 0;

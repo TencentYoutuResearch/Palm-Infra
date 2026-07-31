@@ -398,7 +398,10 @@ device scratch for the current forward pass.
 The CUDA backend is still a correctness-first implementation. Graph outputs
 and persistent state use device-addressable managed storage, FP16/FP32 linear
 layers run through cuBLAS, and ordinary package-native W8, W4G32, and W4G128
-weights are dequantized to FP16 device weights at load time. RMSNorm, fused
+weights remain quantized in device storage. Single-token decode reads those
+layouts directly in specialized GEMV kernels; multi-token prefill dequantizes
+one matrix at a time into reusable FP16 device scratch before invoking cuBLAS,
+instead of retaining a model-sized FP16 expansion. RMSNorm, fused
 norm paths, strided and broadcast elementwise operations, common activations,
 SwiGLU, RoPE, layout materialization, tile/concat, FP32 cached SDPA, zero-copy
 views, and the decode lm_head also stay on CUDA. Qwen3.5's recurrent Gated

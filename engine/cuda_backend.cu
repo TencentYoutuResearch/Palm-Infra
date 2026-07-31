@@ -1375,6 +1375,160 @@ __device__ float moe_weight_value_cuda(
                      column / 32]);
 }
 
+__global__ void dequantize_q8_dense_weight_cuda(
+    const int8_t* weight, const float* scales, int group_size,
+    int groups_per_row, __half* output, size_t count, int width) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    const int row = static_cast<int>(index / width);
+    const int column = static_cast<int>(index % width);
+    const int group = min(column / group_size, groups_per_row - 1);
+    output[index] = __float2half(
+        static_cast<float>(weight[index]) *
+        scales[static_cast<size_t>(row) * groups_per_row + group]);
+}
+
+__global__ void dequantize_q4_g32_dense_weight_cuda(
+    const Q4B8G32Block* weight, __half2* output, size_t packed_count,
+    int rows, int groups) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= packed_count)
+        return;
+    constexpr int packed_per_block = 8 * 16;
+    const size_t block_index = index / packed_per_block;
+    const int packed_index = static_cast<int>(index % packed_per_block);
+    const int lane = packed_index / 16;
+    const int byte = packed_index % 16;
+    const int group = static_cast<int>(block_index % groups);
+    const int row = static_cast<int>(block_index / groups) * 8 + lane;
+    if (row >= rows)
+        return;
+    const auto& block = weight[block_index];
+    const uint8_t packed = block.q[lane][byte];
+    const float scale = block.scales[lane];
+    output[(static_cast<size_t>(row) * groups + group) * 16 + byte] =
+        __halves2half2(
+            __float2half(moe_signed_nibble(packed) * scale),
+            __float2half(moe_signed_nibble(packed >> 4) * scale));
+}
+
+__global__ void dequantize_q4_g128_dense_weight_cuda(
+    const Q4B8G128Block* weight, __half2* output, size_t packed_count,
+    int rows, int groups) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= packed_count)
+        return;
+    constexpr int packed_per_block = 4 * 8 * 16;
+    const size_t block_index = index / packed_per_block;
+    int packed_index = static_cast<int>(index % packed_per_block);
+    const int subgroup = packed_index / (8 * 16);
+    packed_index %= 8 * 16;
+    const int lane = packed_index / 16;
+    const int byte = packed_index % 16;
+    const int group = static_cast<int>(block_index % groups);
+    const int row = static_cast<int>(block_index / groups) * 8 + lane;
+    if (row >= rows)
+        return;
+    const auto& block = weight[block_index];
+    const uint8_t packed = block.q[subgroup][lane][byte];
+    const float scale = block.scales[lane];
+    output[((static_cast<size_t>(row) * groups + group) * 4 + subgroup) *
+               16 +
+           byte] = __halves2half2(
+        __float2half(moe_signed_nibble(packed) * scale),
+        __float2half(moe_signed_nibble(packed >> 4) * scale));
+}
+
+__global__ void q8_dense_gemv_cuda(
+    const float* activation, const int8_t* weight, const float* scales,
+    int group_size, int groups_per_row, float* output, int columns,
+    int inner) {
+    constexpr int warps_per_block = 4;
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int column = static_cast<int>(blockIdx.x) * warps_per_block + warp;
+    if (column >= columns)
+        return;
+    float sum = 0.0f;
+    const int8_t* row = weight + static_cast<size_t>(column) * inner;
+    const float* row_scales =
+        scales + static_cast<size_t>(column) * groups_per_row;
+    for (int group = 0; group < groups_per_row; ++group) {
+        const int begin = group * group_size;
+        const int end = min(inner, begin + group_size);
+        const float scale = row_scales[group];
+        for (int k = begin + lane; k < end; k += warpSize)
+            sum += activation[k] * static_cast<float>(row[k]) * scale;
+    }
+    for (int offset = warpSize / 2; offset != 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        output[column] = sum;
+}
+
+__global__ void q4_g32_dense_gemv_cuda(
+    const float* activation, const Q4B8G32Block* weight, float* output,
+    int columns, int inner) {
+    constexpr int warps_per_block = 4;
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int column = static_cast<int>(blockIdx.x) * warps_per_block + warp;
+    if (column >= columns)
+        return;
+    const int groups = inner / 32;
+    const int row_lane = column & 7;
+    float sum = 0.0f;
+    for (int group = 0; group < groups; ++group) {
+        const auto& block = weight[
+            static_cast<size_t>(column / 8) * groups + group];
+        float scale = lane == 0 ? block.scales[row_lane] : 0.0f;
+        scale = __shfl_sync(0xffffffffu, scale, 0);
+        const uint8_t packed = block.q[row_lane][lane / 2];
+        const int k = group * 32 + lane;
+        sum += activation[k] * moe_signed_nibble(
+            lane & 1 ? packed >> 4 : packed) * scale;
+    }
+    for (int offset = warpSize / 2; offset != 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        output[column] = sum;
+}
+
+__global__ void q4_g128_dense_gemv_cuda(
+    const float* activation, const Q4B8G128Block* weight, float* output,
+    int columns, int inner) {
+    constexpr int warps_per_block = 4;
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int column = static_cast<int>(blockIdx.x) * warps_per_block + warp;
+    if (column >= columns)
+        return;
+    const int groups = inner / 128;
+    const int row_lane = column & 7;
+    float sum = 0.0f;
+    for (int group = 0; group < groups; ++group) {
+        const auto& block = weight[
+            static_cast<size_t>(column / 8) * groups + group];
+        float scale = lane == 0 ? block.scales[row_lane] : 0.0f;
+        scale = __shfl_sync(0xffffffffu, scale, 0);
+        for (int subgroup = 0; subgroup < 4; ++subgroup) {
+            const uint8_t packed =
+                block.q[subgroup][row_lane][lane / 2];
+            const int k = group * 128 + subgroup * 32 + lane;
+            sum += activation[k] * moe_signed_nibble(
+                lane & 1 ? packed >> 4 : packed) * scale;
+        }
+    }
+    for (int offset = warpSize / 2; offset != 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        output[column] = sum;
+}
+
 __device__ float moe_router_score_cuda(float value, int score_function) {
     if (score_function == 1)
         return 1.0f / (1.0f + expf(-value));
@@ -2372,11 +2526,6 @@ __global__ void gated_deltanet_cuda(
     }
 }
 
-int signed_nibble(uint8_t value) {
-    const int nibble = value & 0x0f;
-    return nibble >= 8 ? nibble - 16 : nibble;
-}
-
 }  // namespace
 
 struct CudaBackend::Impl {
@@ -2828,7 +2977,46 @@ struct CudaBackend::Impl {
         if (ldc != n && activation_kind != Activation::NONE && act_len != 0)
             return false;
 
-        if (prepared->layout == WeightLayout::Fp8Block128 ||
+        const bool valid_q8 =
+            prepared->layout == WeightLayout::Q8RowMajor &&
+            prepared->scales && prepared->group_size > 0 &&
+            prepared->groups_per_row ==
+                (k + prepared->group_size - 1) / prepared->group_size;
+        const bool valid_q4_g32 =
+            prepared->layout == WeightLayout::Q4Bg32 && k % 32 == 0;
+        const bool valid_q4_g128 =
+            prepared->layout == WeightLayout::Q4Bg128 && k % 128 == 0;
+        const bool valid_quantized =
+            valid_q8 || valid_q4_g32 || valid_q4_g128;
+
+        if (valid_quantized && m == 1) {
+            constexpr int warps_per_block = 4;
+            constexpr int quantized_threads = warps_per_block * 32;
+            const unsigned blocks = static_cast<unsigned>(
+                (n + warps_per_block - 1) / warps_per_block);
+            const char* label = nullptr;
+            if (valid_q8) {
+                q8_dense_gemv_cuda<<<blocks, quantized_threads>>>(
+                    device_a, static_cast<const int8_t*>(prepared->data),
+                    prepared->scales, prepared->group_size,
+                    prepared->groups_per_row, device_c, n, k);
+                label = "q8_dense_gemv_cuda";
+            } else if (valid_q4_g32) {
+                q4_g32_dense_gemv_cuda<<<blocks, quantized_threads>>>(
+                    device_a,
+                    static_cast<const Q4B8G32Block*>(prepared->data),
+                    device_c, n, k);
+                label = "q4_g32_dense_gemv_cuda";
+            } else {
+                q4_g128_dense_gemv_cuda<<<blocks, quantized_threads>>>(
+                    device_a,
+                    static_cast<const Q4B8G128Block*>(prepared->data),
+                    device_c, n, k);
+                label = "q4_g128_dense_gemv_cuda";
+            }
+            if (!report_cuda(cudaGetLastError(), label))
+                return false;
+        } else if (prepared->layout == WeightLayout::Fp8Block128 ||
             prepared->layout == WeightLayout::Mxfp4RowMajor) {
             const bool valid_fp8 =
                 prepared->layout == WeightLayout::Fp8Block128 &&
@@ -2873,13 +3061,71 @@ struct CudaBackend::Impl {
                              "microscaled_matmul_cuda"))
                 return false;
         } else {
-            if (prepared->layout != WeightLayout::Dense || ldc != n)
+            const void* linear_weight = prepared->data;
+            cudaDataType linear_weight_type = prepared->type;
+            if (valid_quantized) {
+                const size_t weight_elements =
+                    static_cast<size_t>(n) * k;
+                auto* dequantized = static_cast<__half*>(scratch(
+                    "dense_quantized_weight",
+                    weight_elements * sizeof(__half)));
+                if (!dequantized)
+                    return false;
+                constexpr int dequantize_threads = 256;
+                const char* dequantize_label = nullptr;
+                if (valid_q8) {
+                    dequantize_q8_dense_weight_cuda<<<
+                        static_cast<unsigned>(
+                            (weight_elements + dequantize_threads - 1) /
+                            dequantize_threads),
+                        dequantize_threads>>>(
+                        static_cast<const int8_t*>(prepared->data),
+                        prepared->scales, prepared->group_size,
+                        prepared->groups_per_row, dequantized,
+                        weight_elements, k);
+                    dequantize_label = "dequantize_q8_dense_weight_cuda";
+                } else if (valid_q4_g32) {
+                    const size_t packed_count =
+                        static_cast<size_t>((n + 7) / 8) * (k / 32) *
+                        8 * 16;
+                    dequantize_q4_g32_dense_weight_cuda<<<
+                        static_cast<unsigned>(
+                            (packed_count + dequantize_threads - 1) /
+                            dequantize_threads),
+                        dequantize_threads>>>(
+                        static_cast<const Q4B8G32Block*>(prepared->data),
+                        reinterpret_cast<__half2*>(dequantized),
+                        packed_count, n, k / 32);
+                    dequantize_label = "dequantize_q4_g32_dense_weight_cuda";
+                } else {
+                    const size_t packed_count =
+                        static_cast<size_t>((n + 7) / 8) * (k / 128) *
+                        4 * 8 * 16;
+                    dequantize_q4_g128_dense_weight_cuda<<<
+                        static_cast<unsigned>(
+                            (packed_count + dequantize_threads - 1) /
+                            dequantize_threads),
+                        dequantize_threads>>>(
+                        static_cast<const Q4B8G128Block*>(prepared->data),
+                        reinterpret_cast<__half2*>(dequantized),
+                        packed_count, n, k / 128);
+                    dequantize_label =
+                        "dequantize_q4_g128_dense_weight_cuda";
+                }
+                if (!report_cuda(cudaGetLastError(), dequantize_label))
+                    return false;
+                linear_weight = dequantized;
+                linear_weight_type = CUDA_R_16F;
+            } else if (prepared->layout != WeightLayout::Dense) {
+                return false;
+            }
+            if (ldc != n)
                 return false;
 
             const size_t a_elements = static_cast<size_t>(m) * lda;
             const void* gemm_activation = device_a;
             cudaDataType activation_type = CUDA_R_32F;
-            if (prepared->type == CUDA_R_16F) {
+            if (linear_weight_type == CUDA_R_16F) {
                 if (!reserve(activation_fp16, activation_fp16_bytes,
                              a_elements * sizeof(__half)))
                     return false;
@@ -2903,7 +3149,7 @@ struct CudaBackend::Impl {
             if (!report_cublas(
                     cublasGemmEx(
                         cublas, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha,
-                        prepared->data, prepared->type, k, gemm_activation,
+                        linear_weight, linear_weight_type, k, gemm_activation,
                         activation_type, lda, &beta, device_c, CUDA_R_32F, n,
                         CUBLAS_COMPUTE_32F,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),
@@ -3095,128 +3341,40 @@ void CudaBackend::wrap_weight_int4(Tensor& tensor,
         }
         return;
     }
-    if (keep_native_experts) {
-        if (tensor.prec == Precision::INT8) {
-            const void* source = tensor.rowmajor_data
-                ? tensor.rowmajor_data : tensor.data;
-            const int group_size = static_cast<int>(tensor.group_size);
-            const int groups_per_row =
-                static_cast<int>(tensor.groups_per_row);
-            if (source && tensor.scales && group_size > 0 &&
-                groups_per_row > 0) {
-                impl_->upload_quantized_weight(
-                    tensor, source, source,
-                    static_cast<size_t>(n) * k, tensor.scales,
-                    static_cast<size_t>(n) * groups_per_row, n, k,
-                    group_size, groups_per_row,
-                    Impl::WeightLayout::Q8RowMajor);
-            }
-            return;
-        }
-        if (tensor.prec != Precision::INT4 || n % 8 != 0)
-            return;
-        if (tensor.is_q4_g32_packed && tensor.q4_g32_data &&
-            k % 32 == 0) {
-            const size_t bytes = static_cast<size_t>(n / 8) * (k / 32) *
-                sizeof(Q4B8G32Block);
-            impl_->upload_weight(
-                tensor, tensor.q4_g32_data, tensor.q4_g32_data, bytes,
-                CUDA_R_8I, n, k, Impl::WeightLayout::Q4Bg32);
-        } else if (tensor.is_q4_g128_packed && tensor.q4_g128_data &&
-                   k % 128 == 0) {
-            const size_t bytes = static_cast<size_t>(n / 8) * (k / 128) *
-                sizeof(Q4B8G128Block);
-            impl_->upload_weight(
-                tensor, tensor.q4_g128_data, tensor.q4_g128_data, bytes,
-                CUDA_R_8I, n, k, Impl::WeightLayout::Q4Bg128);
-        }
-        return;
-    }
-    std::vector<__half> dequantized(static_cast<size_t>(n) * k);
-
+    (void)keep_native_experts;
     if (tensor.prec == Precision::INT8) {
-        const auto* quantized = static_cast<const int8_t*>(
-            tensor.rowmajor_data ? tensor.rowmajor_data : tensor.data);
-        if (!quantized || !tensor.scales || tensor.group_size == 0 ||
-            tensor.groups_per_row == 0)
-            return;
+        const void* source = tensor.rowmajor_data
+            ? tensor.rowmajor_data : tensor.data;
         const int group_size = static_cast<int>(tensor.group_size);
         const int groups_per_row =
             static_cast<int>(tensor.groups_per_row);
-        for (int row = 0; row < n; ++row)
-            for (int inner = 0; inner < k; ++inner) {
-                const int group = std::min(
-                    inner / group_size, groups_per_row - 1);
-                const float scale = tensor.scales[
-                    static_cast<size_t>(row) * groups_per_row + group];
-                dequantized[static_cast<size_t>(row) * k + inner] =
-                    __float2half(
-                        static_cast<float>(quantized[
-                            static_cast<size_t>(row) * k + inner]) * scale);
-            }
-        const void* cache_key = tensor.rowmajor_data
-            ? tensor.rowmajor_data : tensor.data;
-        impl_->upload_weight(
-            tensor, cache_key, dequantized.data(),
-            dequantized.size() * sizeof(__half), CUDA_R_16F, n, k);
+        if (source && tensor.scales && group_size > 0 &&
+            groups_per_row == (k + group_size - 1) / group_size) {
+            impl_->upload_quantized_weight(
+                tensor, source, source,
+                static_cast<size_t>(n) * k, tensor.scales,
+                static_cast<size_t>(n) * groups_per_row, n, k,
+                group_size, groups_per_row,
+                Impl::WeightLayout::Q8RowMajor);
+        }
         return;
     }
     if (tensor.prec != Precision::INT4)
         return;
-
     if (tensor.is_q4_g32_packed && tensor.q4_g32_data && k % 32 == 0) {
-        const auto* blocks =
-            static_cast<const Q4B8G32Block*>(tensor.q4_g32_data);
-        const int groups = k / 32;
-        for (int row = 0; row < n; ++row) {
-            for (int group = 0; group < groups; ++group) {
-                const auto& block =
-                    blocks[static_cast<size_t>(row / 8) * groups + group];
-                const int lane = row % 8;
-                for (int inner = 0; inner < 32; ++inner) {
-                    const uint8_t packed = block.q[lane][inner / 2];
-                    const int value = signed_nibble(
-                        inner & 1 ? packed >> 4 : packed);
-                    dequantized[static_cast<size_t>(row) * k +
-                                group * 32 + inner] =
-                        __float2half(static_cast<float>(value) *
-                                     block.scales[lane]);
-                }
-            }
-        }
+        const size_t bytes = static_cast<size_t>((n + 7) / 8) * (k / 32) *
+            sizeof(Q4B8G32Block);
+        impl_->upload_weight(
+            tensor, tensor.q4_g32_data, tensor.q4_g32_data, bytes,
+            CUDA_R_8I, n, k, Impl::WeightLayout::Q4Bg32);
     } else if (tensor.is_q4_g128_packed && tensor.q4_g128_data &&
                k % 128 == 0) {
-        const auto* blocks =
-            static_cast<const Q4B8G128Block*>(tensor.q4_g128_data);
-        const int groups = k / 128;
-        for (int row = 0; row < n; ++row) {
-            for (int group = 0; group < groups; ++group) {
-                const auto& block =
-                    blocks[static_cast<size_t>(row / 8) * groups + group];
-                const int lane = row % 8;
-                for (int inner = 0; inner < 128; ++inner) {
-                    const int qgroup = inner / 32;
-                    const int qinner = inner % 32;
-                    const uint8_t packed =
-                        block.q[qgroup][lane][qinner / 2];
-                    const int value = signed_nibble(
-                        qinner & 1 ? packed >> 4 : packed);
-                    dequantized[static_cast<size_t>(row) * k +
-                                group * 128 + inner] =
-                        __float2half(static_cast<float>(value) *
-                                     block.scales[lane]);
-                }
-            }
-        }
-    } else {
-        return;
+        const size_t bytes = static_cast<size_t>((n + 7) / 8) * (k / 128) *
+            sizeof(Q4B8G128Block);
+        impl_->upload_weight(
+            tensor, tensor.q4_g128_data, tensor.q4_g128_data, bytes,
+            CUDA_R_8I, n, k, Impl::WeightLayout::Q4Bg128);
     }
-
-    const void* cache_key = tensor.rowmajor_data
-        ? tensor.rowmajor_data : tensor.data;
-    impl_->upload_weight(tensor, cache_key, dequantized.data(),
-                         dequantized.size() * sizeof(__half), CUDA_R_16F,
-                         n, k);
 }
 
 void* CudaBackend::alloc_output(Tensor& output, size_t nbytes, BufferPool*) {
@@ -4614,6 +4772,9 @@ void CudaBackend::dispatch(const GraphNode& node,
         auto valid_matmul_weight = [&](const Impl::DeviceWeight* weight) {
             return weight &&
                 (weight->layout == Impl::WeightLayout::Dense ||
+                 weight->layout == Impl::WeightLayout::Q8RowMajor ||
+                 weight->layout == Impl::WeightLayout::Q4Bg32 ||
+                 weight->layout == Impl::WeightLayout::Q4Bg128 ||
                  valid_microscaled_weight(weight));
         };
         auto valid_expert_weight = [](const Impl::DeviceWeight* weight) {

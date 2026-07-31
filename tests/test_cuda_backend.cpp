@@ -2515,6 +2515,47 @@ int main() {
     if (!dispatch_matmul(backend, fp16, activation, actual, m, n, k) ||
         !close_enough(actual, expected, 3e-3f))
         return 1;
+
+    constexpr int q8_group_size = 16;
+    constexpr int q8_groups_per_row = k / q8_group_size;
+    std::vector<int8_t> q8_values(static_cast<size_t>(n) * k);
+    std::vector<float> q8_scales(
+        static_cast<size_t>(n) * q8_groups_per_row);
+    std::vector<float> q8_weight(static_cast<size_t>(n) * k);
+    for (int row = 0; row < n; ++row) {
+        for (int group = 0; group < q8_groups_per_row; ++group) {
+            const float scale = 0.01f * (1 + (row + group) % 5);
+            q8_scales[static_cast<size_t>(row) * q8_groups_per_row + group] =
+                scale;
+            for (int inner = 0; inner < q8_group_size; ++inner) {
+                const int column = group * q8_group_size + inner;
+                const int8_t value = static_cast<int8_t>(
+                    (row * 7 + column * 3) % 31 - 15);
+                q8_values[static_cast<size_t>(row) * k + column] = value;
+                q8_weight[static_cast<size_t>(row) * k + column] =
+                    static_cast<float>(value) * scale;
+            }
+        }
+    }
+    Tensor q8 = Tensor::create(
+        Precision::INT8, MemoryType::EXTERNAL, n, k, 1, 1,
+        q8_values.data());
+    q8.rowmajor_data = q8_values.data();
+    q8.scales = q8_scales.data();
+    q8.group_size = q8_group_size;
+    q8.groups_per_row = q8_groups_per_row;
+    backend.wrap_weight_int4(q8);
+    reference(activation, q8_weight, expected, m, n, k);
+    if (!dispatch_matmul(backend, q8, activation, actual, m, n, k) ||
+        !close_enough(actual, expected, 3e-3f))
+        return 1;
+    std::vector<float> decode_actual(n);
+    std::vector<float> decode_expected(n);
+    reference(activation, q8_weight, decode_expected, 1, n, k);
+    if (!dispatch_matmul(
+            backend, q8, activation, decode_actual, 1, n, k) ||
+        !close_enough(decode_actual, decode_expected, 3e-3f))
+        return 1;
     {
         CudaBackend microscaled_backend;
         if (!microscaled_backend.available() ||
@@ -2545,6 +2586,7 @@ int main() {
             !test_dsv4_sparse_attention(sparse_backend))
             return 1;
     }
+    reference(activation, weight_f32, expected, m, n, k);
     if (!backend.is_device_resident() ||
         !test_device_resident_ops(backend, fp16, activation, expected,
                                   m, n, k))
@@ -2588,6 +2630,43 @@ int main() {
     if (!dispatch_matmul(backend, q4, activation, actual, m, n, k) ||
         !close_enough(actual, expected, 8e-3f))
         return 1;
+    reference(activation, q4_weight, decode_expected, 1, n, k);
+    if (!dispatch_matmul(
+            backend, q4, activation, decode_actual, 1, n, k) ||
+        !close_enough(decode_actual, decode_expected, 8e-3f))
+        return 1;
+
+    constexpr int padded_n = n - 1;
+    Q4B8G32Block padded_block = block;
+    std::vector<float> padded_q4_weight(
+        q4_weight.begin(), q4_weight.begin() + padded_n * k);
+    Tensor padded_q4 = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL, padded_n, k, 1, 1,
+        &padded_block);
+    padded_q4.rowmajor_data = &padded_block;
+    padded_q4.q4_g32_data = &padded_block;
+    padded_q4.is_q4_g32_packed = true;
+    padded_q4.group_size = 32;
+    padded_q4.groups_per_row = 1;
+    backend.wrap_weight_int4(padded_q4);
+    std::vector<float> padded_actual(static_cast<size_t>(m) * padded_n);
+    std::vector<float> padded_expected(padded_actual.size());
+    reference(
+        activation, padded_q4_weight, padded_expected, m, padded_n, k);
+    if (!dispatch_matmul(
+            backend, padded_q4, activation, padded_actual,
+            m, padded_n, k) ||
+        !close_enough(padded_actual, padded_expected, 8e-3f))
+        return 1;
+    padded_actual.resize(padded_n);
+    padded_expected.resize(padded_n);
+    reference(
+        activation, padded_q4_weight, padded_expected, 1, padded_n, k);
+    if (!dispatch_matmul(
+            backend, padded_q4, activation, padded_actual,
+            1, padded_n, k) ||
+        !close_enough(padded_actual, padded_expected, 8e-3f))
+        return 1;
 
     constexpr int k128 = 128;
     std::vector<float> activation128(static_cast<size_t>(m) * k128);
@@ -2624,6 +2703,47 @@ int main() {
     if (!dispatch_matmul(backend, q4_128, activation128, actual,
                          m, n, k128) ||
         !close_enough(actual, expected, 1.5e-2f))
+        return 1;
+    reference(
+        std::vector<float>(activation128.begin(),
+                           activation128.begin() + k128),
+        q4_weight128, decode_expected, 1, n, k128);
+    if (!dispatch_matmul(
+            backend, q4_128, activation128, decode_actual, 1, n, k128) ||
+        !close_enough(decode_actual, decode_expected, 1.5e-2f))
+        return 1;
+
+    Q4B8G128Block padded_block128 = block128;
+    std::vector<float> padded_q4_weight128(
+        q4_weight128.begin(), q4_weight128.begin() + padded_n * k128);
+    Tensor padded_q4_128 = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL, padded_n, k128, 1, 1,
+        &padded_block128);
+    padded_q4_128.rowmajor_data = &padded_block128;
+    padded_q4_128.q4_g128_data = &padded_block128;
+    padded_q4_128.is_q4_g128_packed = true;
+    padded_q4_128.group_size = 128;
+    padded_q4_128.groups_per_row = 1;
+    backend.wrap_weight_int4(padded_q4_128);
+    padded_actual.resize(static_cast<size_t>(m) * padded_n);
+    padded_expected.resize(padded_actual.size());
+    reference(
+        activation128, padded_q4_weight128, padded_expected,
+        m, padded_n, k128);
+    if (!dispatch_matmul(
+            backend, padded_q4_128, activation128, padded_actual,
+            m, padded_n, k128) ||
+        !close_enough(padded_actual, padded_expected, 1.5e-2f))
+        return 1;
+    padded_actual.resize(padded_n);
+    padded_expected.resize(padded_n);
+    reference(
+        activation128, padded_q4_weight128, padded_expected,
+        1, padded_n, k128);
+    if (!dispatch_matmul(
+            backend, padded_q4_128, activation128, padded_actual,
+            1, padded_n, k128) ||
+        !close_enough(padded_actual, padded_expected, 1.5e-2f))
         return 1;
 
     {
