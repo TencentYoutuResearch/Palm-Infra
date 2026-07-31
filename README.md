@@ -390,14 +390,18 @@ recurrence, post-processing, batched projections, and sparse-activation FFN
 also run natively, with persistent FP16 or FP32 recurrent state. Qwen3.5's
 single-image vision tower uses the same native matmul, LayerNorm, RoPE, SDPA,
 GELU, and layout paths. Resident Qwen3-style MoE graphs support softmax,
-sigmoid, grouped and correction-bias routing plus optional shared experts.
+sigmoid, grouped, correction-bias, and INT32 token-hash routing plus optional
+shared experts. Hash lookup tables remain device-resident and retain their
+package-native INT32 representation.
 Aggregate W8, W4G32, and W4G128 expert tensors remain quantized on the GPU and
 are decoded inside the selected-expert kernels instead of being expanded into
 model-sized FP16 copies. W8 experts retain row-major values and per-group
 scales, while W4 experts retain their package-native BG32/BG128 blocks. This
 keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7, Qwen3.5 vision, Qwen3-MoE,
-and Qwen3.5-MoE graphs on CUDA without CPU operator fallback. Hash-routed and
-SSD-offloaded MoE variants are not native yet.
+and Qwen3.5-MoE graphs on CUDA without CPU operator fallback. DeepSeek-V4's
+hash-routed MoE operator is native when used with resident FP16 expert
+weights, but the complete DeepSeek-V4 graph and SSD-offloaded MoE variants
+remain CPU-only.
 Other operators not yet implemented natively synchronize and use the CPU
 reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to
 print native/fallback operator counts. Several specialized model families

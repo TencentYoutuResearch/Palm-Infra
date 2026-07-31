@@ -724,6 +724,66 @@ __global__ void moe_select_routes_cuda(
     }
 }
 
+__global__ void moe_select_hash_routes_cuda(
+    const float* logits, const int32_t* token_ids,
+    const int32_t* token_to_experts, int* route_indices,
+    float* route_weights, int* invalid_route, int tokens, int num_experts,
+    int top_k, int vocab_size, bool normalize_topk, float scaling_factor) {
+    constexpr int maximum_top_k = 64;
+    const int token = blockIdx.x;
+    if (token >= tokens || threadIdx.x != 0 || top_k > maximum_top_k)
+        return;
+
+    const int token_id = token_ids[token];
+    if (token_id < 0 || token_id >= vocab_size) {
+        atomicExch(invalid_route, 1);
+        return;
+    }
+
+    int selected_indices[maximum_top_k];
+    float selected_weights[maximum_top_k];
+    float sum = 0.0f;
+    for (int index = 0; index < top_k; ++index) {
+        const int expert = token_to_experts[
+            static_cast<size_t>(token_id) * top_k + index];
+        if (expert < 0 || expert >= num_experts) {
+            atomicExch(invalid_route, 1);
+            return;
+        }
+        selected_indices[index] = expert;
+        selected_weights[index] = moe_router_score_cuda(
+            logits[static_cast<size_t>(token) * num_experts + expert], 2);
+        sum += selected_weights[index];
+    }
+
+    const float multiplier = normalize_topk && sum > 0.0f
+        ? scaling_factor / sum : scaling_factor;
+    for (int index = 0; index < top_k; ++index)
+        selected_weights[index] *= multiplier;
+
+    // The CPU implementation groups routed work by ascending expert id.
+    // Match its FP32 accumulation order while retaining each hash weight.
+    for (int index = 1; index < top_k; ++index) {
+        const int selected_index = selected_indices[index];
+        const float selected_weight = selected_weights[index];
+        int position = index;
+        while (position > 0 &&
+               selected_indices[position - 1] > selected_index) {
+            selected_indices[position] = selected_indices[position - 1];
+            selected_weights[position] = selected_weights[position - 1];
+            --position;
+        }
+        selected_indices[position] = selected_index;
+        selected_weights[position] = selected_weight;
+    }
+    for (int index = 0; index < top_k; ++index) {
+        const size_t output_index =
+            static_cast<size_t>(token) * top_k + index;
+        route_indices[output_index] = selected_indices[index];
+        route_weights[output_index] = selected_weights[index];
+    }
+}
+
 __global__ void moe_gate_up_cuda(
     const float* hidden, size_t hidden_stride, const int* route_indices,
     const void* gate_up, bool gate_up_fp32, int gate_up_layout,
@@ -1239,6 +1299,7 @@ struct CudaBackend::Impl {
         Q8RowMajor,
         Q4Bg32,
         Q4Bg128,
+        Int32Lookup,
     };
 
     struct DeviceWeight {
@@ -1606,6 +1667,11 @@ void CudaBackend::wrap_weight(Tensor& tensor) {
         impl_->upload_weight(tensor, tensor.data, tensor.data,
                              static_cast<size_t>(n) * k * sizeof(float),
                              CUDA_R_32F, n, k);
+    } else if (tensor.prec == Precision::INT32) {
+        impl_->upload_weight(
+            tensor, tensor.data, tensor.data,
+            static_cast<size_t>(n) * k * sizeof(int32_t), CUDA_R_32I,
+            n, k, Impl::WeightLayout::Int32Lookup);
     }
 }
 
@@ -2557,13 +2623,39 @@ void CudaBackend::dispatch(const GraphNode& node,
                 : nullptr;
         const bool hash_routing =
             token_ids_input >= 0 && hash_table_input >= 0;
+        const Tensor* token_ids =
+            hash_routing &&
+                    static_cast<size_t>(token_ids_input) < inputs.size()
+                ? inputs[token_ids_input]
+                : nullptr;
+        const Tensor* hash_table =
+            hash_routing &&
+                    static_cast<size_t>(hash_table_input) < inputs.size()
+                ? inputs[hash_table_input]
+                : nullptr;
+        const auto* prepared_hash_table = hash_table
+            ? impl_->find_weight(*hash_table) : nullptr;
+        const int hash_vocab_size = hash_table
+            ? static_cast<int>(hash_table->shape[1]) : 0;
+        const bool valid_hash_routing = !hash_routing ||
+            (score_function == 2 && token_ids && hash_table &&
+             token_ids->prec == Precision::INT32 &&
+             token_ids->nelements() >= tokens &&
+             hash_table->prec == Precision::INT32 &&
+             hash_table->shape[0] == top_k && hash_vocab_size > 0 &&
+             prepared_hash_table &&
+             prepared_hash_table->layout ==
+                 Impl::WeightLayout::Int32Lookup &&
+             prepared_hash_table->n == top_k &&
+             prepared_hash_table->k == hash_vocab_size &&
+             device_pointer_const<int32_t>(*token_ids));
         bool valid = fp32_contiguous(*inputs[0]) &&
             fp32_contiguous(*output) && router &&
             valid_expert_weight(gate_up) && valid_expert_weight(down) &&
             hidden_size > 0 && num_experts > 0 && num_experts >= top_k &&
             top_k > 0 && top_k <= 64 && intermediate_size > 0 &&
             num_groups <= 64 && tokens > 0 && score_function >= 0 &&
-            score_function <= 2 && !hash_routing &&
+            score_function <= 2 && valid_hash_routing &&
             inputs[0]->shape[0] == hidden_size &&
             output->shape[0] == hidden_size && output->shape[1] == tokens &&
             router->n == num_experts && router->k == hidden_size &&
@@ -2642,13 +2734,43 @@ void CudaBackend::dispatch(const GraphNode& node,
                     *inputs[1], logits, num_experts, tokens, num_experts,
                     hidden_size, Activation::NONE, 0, -1);
             if (valid) {
-                moe_select_routes_cuda<<<tokens, 1>>>(
-                    logits,
-                    router_bias
-                        ? device_pointer_const<float>(*router_bias) : nullptr,
-                    route_indices, route_weights, tokens, num_experts, top_k,
-                    score_function, normalize_topk, num_groups, topk_groups,
-                    routed_scaling_factor);
+                if (hash_routing) {
+                    auto* invalid_route = static_cast<int*>(impl_->scratch(
+                        "moe_invalid_hash_route", sizeof(int)));
+                    int host_invalid_route = 0;
+                    valid = invalid_route &&
+                        report_cuda(cudaMemset(invalid_route, 0, sizeof(int)),
+                                    "cudaMemset MOE hash route status");
+                    if (valid) {
+                        moe_select_hash_routes_cuda<<<tokens, 1>>>(
+                            logits, device_pointer_const<int32_t>(*token_ids),
+                            static_cast<const int32_t*>(
+                                prepared_hash_table->data),
+                            route_indices, route_weights, invalid_route,
+                            tokens, num_experts, top_k, hash_vocab_size,
+                            normalize_topk, routed_scaling_factor);
+                        valid = report_cuda(
+                                    cudaGetLastError(),
+                                    "CUDA MOE hash routing") &&
+                            report_cuda(
+                                cudaMemcpy(&host_invalid_route, invalid_route,
+                                           sizeof(int),
+                                           cudaMemcpyDeviceToHost),
+                                "cudaMemcpy MOE hash route status") &&
+                            host_invalid_route == 0;
+                    }
+                } else {
+                    moe_select_routes_cuda<<<tokens, 1>>>(
+                        logits,
+                        router_bias
+                            ? device_pointer_const<float>(*router_bias)
+                            : nullptr,
+                        route_indices, route_weights, tokens, num_experts,
+                        top_k, score_function, normalize_topk, num_groups,
+                        topk_groups, routed_scaling_factor);
+                }
+            }
+            if (valid) {
                 const size_t intermediate_count =
                     route_count * intermediate_size;
                 moe_gate_up_cuda<<<

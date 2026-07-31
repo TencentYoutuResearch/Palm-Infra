@@ -538,6 +538,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         // Lookup tables stay row-major; linear weights, including lm_head,
         // receive their CPU matmul layouts at load time.
         const bool lookup_table =
+            t.prec == Precision::INT32 ||
             node.params.str[0].find("embed_tokens") != std::string::npos ||
             node.params.str[0].find("vision_pos_embed.weights") !=
                 std::string::npos;

@@ -62,6 +62,16 @@ Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1,
     return tensor;
 }
 
+Tensor device_tensor(CudaBackend& backend, Precision precision,
+                     int64_t d0, int64_t d1 = 1,
+                     int64_t d2 = 1, int64_t d3 = 1) {
+    Tensor tensor = Tensor::create(
+        precision, MemoryType::NONE, d0, d1, d2, d3);
+    if (!backend.alloc_output(tensor, tensor.nbytes(), nullptr))
+        std::fprintf(stderr, "CUDA managed allocation failed\n");
+    return tensor;
+}
+
 bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
                               const std::vector<float>& activation,
                               const std::vector<float>& expected,
@@ -939,6 +949,150 @@ bool test_moe_fp16_shared(CudaBackend& backend) {
         close_enough(actual, expected, 2.5e-2f);
 }
 
+bool test_moe_hash_routing(CudaBackend& backend) {
+    constexpr int hidden_size = 8;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 2;
+    constexpr int intermediate_size = 5;
+    constexpr int shared_intermediate_size = 6;
+    constexpr int tokens = 3;
+    constexpr int vocab_size = 4;
+    auto fill = [](size_t index, int offset) {
+        return static_cast<float>(
+            static_cast<int>((index * 7 + offset) % 23) - 11) / 29.0f;
+    };
+    auto to_fp16 = [](const std::vector<float>& source) {
+        std::vector<mollm::cpu::fp16_t> result(source.size());
+        for (size_t i = 0; i < source.size(); ++i)
+            result[i] = static_cast<mollm::cpu::fp16_t>(source[i]);
+        return result;
+    };
+
+    std::vector<float> hidden(hidden_size * tokens);
+    std::vector<float> router_f32(num_experts * hidden_size);
+    std::vector<float> gate_up_f32(
+        num_experts * 2 * intermediate_size * hidden_size);
+    std::vector<float> down_f32(
+        num_experts * hidden_size * intermediate_size);
+    std::vector<float> shared_gate_f32(
+        shared_intermediate_size * hidden_size);
+    std::vector<float> shared_up_f32(
+        shared_intermediate_size * hidden_size);
+    std::vector<float> shared_down_f32(
+        hidden_size * shared_intermediate_size);
+    for (size_t i = 0; i < hidden.size(); ++i) hidden[i] = fill(i, 1);
+    for (size_t i = 0; i < router_f32.size(); ++i)
+        router_f32[i] = fill(i, 3);
+    for (size_t i = 0; i < gate_up_f32.size(); ++i)
+        gate_up_f32[i] = fill(i, 5);
+    for (size_t i = 0; i < down_f32.size(); ++i)
+        down_f32[i] = fill(i, 7);
+    for (size_t i = 0; i < shared_gate_f32.size(); ++i)
+        shared_gate_f32[i] = fill(i, 9);
+    for (size_t i = 0; i < shared_up_f32.size(); ++i)
+        shared_up_f32[i] = fill(i, 11);
+    for (size_t i = 0; i < shared_down_f32.size(); ++i)
+        shared_down_f32[i] = fill(i, 13);
+
+    auto router_data = to_fp16(router_f32);
+    auto gate_up_data = to_fp16(gate_up_f32);
+    auto down_data = to_fp16(down_f32);
+    auto shared_gate_data = to_fp16(shared_gate_f32);
+    auto shared_up_data = to_fp16(shared_up_f32);
+    auto shared_down_data = to_fp16(shared_down_f32);
+    std::vector<int32_t> token_ids_data = {2, 0, 3};
+    // Tensor storage is [vocab, top_k] in flat row-major terms: each token id
+    // owns top_k consecutive expert ids. Descending pairs exercise the CUDA
+    // accumulation-order normalization independently of lookup order.
+    std::vector<int32_t> hash_data = {
+        3, 1,
+        2, 0,
+        1, 3,
+        3, 0,
+    };
+
+    Tensor hidden_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        hidden.data());
+    Tensor router = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, num_experts, hidden_size,
+        1, 1, router_data.data());
+    Tensor gate_up = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL,
+        num_experts * 2 * intermediate_size, hidden_size, 1, 1,
+        gate_up_data.data());
+    Tensor down = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL,
+        num_experts * hidden_size, intermediate_size, 1, 1,
+        down_data.data());
+    Tensor shared_gate = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, shared_intermediate_size,
+        hidden_size, 1, 1, shared_gate_data.data());
+    Tensor shared_up = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, shared_intermediate_size,
+        hidden_size, 1, 1, shared_up_data.data());
+    Tensor shared_down = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, hidden_size,
+        shared_intermediate_size, 1, 1, shared_down_data.data());
+    Tensor token_ids = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL, tokens, 1, 1, 1,
+        token_ids_data.data());
+    Tensor hash_table = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL, top_k, vocab_size, 1, 1,
+        hash_data.data());
+    std::vector<const Tensor*> inputs = {
+        &hidden_host, &router, &gate_up, &down, &shared_gate, &shared_up,
+        &shared_down, &token_ids, &hash_table,
+    };
+    std::vector<float> expected(hidden_size * tokens);
+    Tensor expected_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        expected.data());
+    if (!kernel_qwen3_moe(
+            inputs, expected_tensor, nullptr, hidden_size, num_experts,
+            top_k, intermediate_size, shared_intermediate_size, 2, true,
+            true, 1, 1, 0.7f, false, -1, 7, 8, 0.5f))
+        return false;
+
+    backend.wrap_weight(router);
+    backend.wrap_weight(gate_up);
+    backend.wrap_weight(down);
+    backend.wrap_weight(shared_gate);
+    backend.wrap_weight(shared_up);
+    backend.wrap_weight(shared_down);
+    backend.wrap_weight(hash_table);
+    Tensor hidden_device = device_tensor(backend, hidden_size, tokens);
+    Tensor token_ids_device = device_tensor(
+        backend, Precision::INT32, tokens);
+    Tensor output_device = device_tensor(backend, hidden_size, tokens);
+    std::memcpy(hidden_device.data, hidden.data(), hidden_device.nbytes());
+    std::memcpy(token_ids_device.data, token_ids_data.data(),
+                token_ids_device.nbytes());
+    inputs = {
+        &hidden_device, &router, &gate_up, &down, &shared_gate, &shared_up,
+        &shared_down, &token_ids_device, &hash_table,
+    };
+    GraphNode node;
+    node.op_type = OpType::MOE;
+    node.params.i32 = {
+        hidden_size, num_experts, top_k, intermediate_size,
+        shared_intermediate_size, 2, 1, 1, 1, 1, 0, -1, 7, 8,
+    };
+    node.params.f32 = {0.7f, 0.5f};
+    // Remove every host-side weight, including the INT32 lookup table. A
+    // successful dispatch therefore proves that hash routing stayed on CUDA.
+    router.data = gate_up.data = down.data = nullptr;
+    shared_gate.data = shared_up.data = shared_down.data = nullptr;
+    hash_table.data = nullptr;
+    backend.clear_dispatch_error();
+    backend.dispatch(node, inputs, &output_device, nullptr);
+    backend.end_graph();
+    std::vector<float> actual(expected.size());
+    std::memcpy(actual.data(), output_device.data, output_device.nbytes());
+    return !backend.dispatch_failed() &&
+        close_enough(actual, expected, 2.5e-2f);
+}
+
 template <int group_size, typename Block>
 bool test_moe_packed(CudaBackend& backend) {
     static_assert(group_size == 32 || group_size == 128);
@@ -1294,6 +1448,12 @@ int main() {
     {
         CudaBackend moe_backend;
         if (!moe_backend.available() ||
+            !test_moe_hash_routing(moe_backend))
+            return 1;
+    }
+    {
+        CudaBackend moe_backend;
+        if (!moe_backend.available() ||
             !test_moe_packed<32, Q4B8G32Block>(moe_backend))
             return 1;
     }
@@ -1309,7 +1469,8 @@ int main() {
             return 1;
     }
 
-    std::printf("CUDA device-resident ops, RWKV and MoE variants, strided "
-                "views, FP16, W8, W4G32 and W4G128 matmul tests passed\n");
+    std::printf("CUDA device-resident ops, RWKV and standard/hash MoE "
+                "variants, strided views, FP16, W8, W4G32 and W4G128 "
+                "matmul tests passed\n");
     return 0;
 }

@@ -198,6 +198,117 @@ def build_qwen35_fixture(model_dir: Path) -> None:
     write_safetensors(model_dir / "model.safetensors", tensors)
 
 
+def build_hash_package(weights_dir: Path, package: Path,
+                       models_dir: Path) -> None:
+    """Build a minimal package that exercises engine token/hash plumbing."""
+    import numpy as np
+
+    sys.path.insert(0, str(models_dir))
+    from transpile import (  # pylint: disable=import-outside-toplevel
+        DimExpr,
+        GraphBuilder,
+        Precision,
+        _write_weight_file,
+        save_package,
+    )
+
+    hidden = 8
+    intermediate = 5
+    shared_intermediate = 6
+    experts = 4
+    top_k = 2
+    vocab = 8
+    rng = np.random.default_rng(20260802)
+
+    def matrix(rows: int, cols: int) -> object:
+        return rng.uniform(-0.12, 0.12, (rows, cols)).astype(np.float16)
+
+    weights = {
+        "embed_tokens.weights": matrix(vocab, hidden),
+        "lm_head.weights": matrix(vocab, hidden),
+        "layer_0_router.weights": matrix(experts, hidden),
+        "layer_0_experts_gate_up.weights": matrix(
+            experts * 2 * intermediate, hidden),
+        "layer_0_experts_down.weights": matrix(
+            experts * hidden, intermediate),
+        "layer_0_shared_experts_gate.weights": matrix(
+            shared_intermediate, hidden),
+        "layer_0_shared_experts_up.weights": matrix(
+            shared_intermediate, hidden),
+        "layer_0_shared_experts_down.weights": matrix(
+            hidden, shared_intermediate),
+    }
+    # Physical source layout is [vocab, top_k], while mollm tensor shape is
+    # [top_k, vocab] because dimension zero is the contiguous dimension.
+    hash_values = np.array([
+        [3, 1], [2, 0], [1, 3], [3, 0],
+        [0, 2], [2, 1], [1, 0], [0, 3],
+    ], dtype=np.int32)
+    for name, values in weights.items():
+        _write_weight_file(
+            str(weights_dir / name), values, precision=Precision.FP16)
+    _write_weight_file(
+        str(weights_dir / "layer_0_token_hash.weights"), hash_values,
+        precision=Precision.INT32, logical_shape=(top_k, vocab))
+
+    def graph(seq_len: int, dynamic: bool) -> object:
+        g = GraphBuilder()
+        g.set_model_config(
+            hidden_size=hidden, num_layers=1, vocab_size=vocab,
+            model_type="qwen3_moe", rope_dim=0, rope_theta=10000.0)
+        g.weight("./embed_tokens.weights", (vocab, hidden), Precision.FP16)
+        g.weight("./lm_head.weights", (vocab, hidden), Precision.FP16)
+        hidden_input = g.input(
+            "hidden", (hidden, seq_len), Precision.FP32,
+            dynamic=(DimExpr.const(), DimExpr.seq()) if dynamic else None)
+        token_ids = g.input(
+            "token_ids", (seq_len,), Precision.INT32,
+            dynamic=(DimExpr.seq(),) if dynamic else None)
+        router = g.weight(
+            "./layer_0_router.weights", (experts, hidden), Precision.FP16)
+        gate_up = g.weight(
+            "./layer_0_experts_gate_up.weights",
+            (experts * 2 * intermediate, hidden), Precision.FP16)
+        down = g.weight(
+            "./layer_0_experts_down.weights",
+            (experts * hidden, intermediate), Precision.FP16)
+        shared_gate = g.weight(
+            "./layer_0_shared_experts_gate.weights",
+            (shared_intermediate, hidden), Precision.FP16)
+        shared_up = g.weight(
+            "./layer_0_shared_experts_up.weights",
+            (shared_intermediate, hidden), Precision.FP16)
+        shared_down = g.weight(
+            "./layer_0_shared_experts_down.weights",
+            (hidden, shared_intermediate), Precision.FP16)
+        hash_table = g.weight(
+            "./layer_0_token_hash.weights", (top_k, vocab),
+            Precision.INT32)
+        g.moe(
+            hidden_input, router, gate_up, down,
+            shared_gate, shared_up, shared_down, None,
+            hidden_size=hidden, num_experts=experts, top_k=top_k,
+            intermediate_size=intermediate,
+            shared_intermediate_size=shared_intermediate,
+            router_score_func=2, norm_topk_prob=True,
+            has_shared_expert=True, shared_expert_has_gate=False,
+            routed_scaling_factor=0.7, swiglu_limit=0.5,
+            hash_token_ids=token_ids, hash_table=hash_table)
+        return g
+
+    save_package(
+        str(package), graph(4, True), graph(1, False), str(weights_dir),
+        {
+            "model_name": "tiny-hash-moe",
+            "architecture": "qwen3-moe",
+            "num_layers": 1,
+            "hidden_size": hidden,
+            "vocab_size": vocab,
+            "prefill_seq_len": 4,
+            "quantization": "fp16",
+        })
+
+
 def main() -> int:
     if len(sys.argv) != 4:
         print("usage: run_tiny_qwen3_moe_cuda_e2e.py "
@@ -220,6 +331,10 @@ def main() -> int:
         qwen3_package = temp_dir / "tiny_qwen3_moe_w4g32.mollm"
         qwen35_package = temp_dir / "tiny_qwen35_moe_w4g32.mollm"
         qwen3_w8_package = temp_dir / "tiny_qwen3_moe_w8g32.mollm"
+        hash_weights_dir = temp_dir / "hash_weights"
+        hash_weights_dir.mkdir()
+        hash_package = temp_dir / "tiny_hash_moe_fp16.mollm"
+        build_hash_package(hash_weights_dir, hash_package, converter.parent)
         environment = os.environ.copy()
         environment["MOLLM_QUANT_HELPER"] = str(quantizer)
         environment["MOLLM_QUANT_THREADS"] = "1"
@@ -239,7 +354,7 @@ def main() -> int:
         runner_environment["MOLLM_CUDA_PROFILE"] = "1"
         completed = subprocess.run(
             [str(runner), str(qwen3_package), str(qwen35_package),
-             str(qwen3_w8_package)],
+             str(qwen3_w8_package), str(hash_package)],
             check=False, env=runner_environment, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         print(completed.stdout, end="")
