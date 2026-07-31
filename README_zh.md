@@ -203,7 +203,8 @@ python3 models/deepseek_v4.py \
 
 CUDA 下还可以显式启用有界的 device expert LRU。cache miss 时 expert pair
 从 host cache 复制到 GPU 一次，后续命中不会再读取 SSD 或进行 H2D 传输；当前
-correctness-first kernel 仍会通过 D2D 复制组装 compact device scratch：
+kernel 通过 expert pointer table 直接读取 cache entry，放不进 device cache 的
+miss 则只在当前 forward 使用 compact device scratch：
 
 ```bash
 ./build_cuda/mollm_chat --device cuda \

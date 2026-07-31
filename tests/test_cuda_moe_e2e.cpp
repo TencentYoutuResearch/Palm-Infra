@@ -45,18 +45,27 @@ bool run(const char* package, const char* expected_architecture, Device device,
     if (!copy_finite(decode_tensor, decode) || engine.past_len() != 4)
         return false;
     if (require_device_reuse) {
+        // Token 5 changes one hash-routed expert relative to token 4. This
+        // forces a cross-forward eviction without evicting any entry pinned
+        // by the current pointer table.
+        std::vector<float> switched_decode;
+        Tensor switched = engine.decode_hidden(5);
+        if (!copy_finite(switched, switched_decode) || engine.past_len() != 5)
+            return false;
         const auto host_before = engine.moe_ssd_stats();
         const auto device_before = engine.moe_device_cache_stats();
         std::vector<float> repeated_decode;
-        Tensor repeated = engine.decode_hidden(4);
-        if (!copy_finite(repeated, repeated_decode) || engine.past_len() != 5)
+        Tensor repeated = engine.decode_hidden(5);
+        if (!copy_finite(repeated, repeated_decode) || engine.past_len() != 6)
             return false;
         const auto host_after = engine.moe_ssd_stats();
         const auto device_after = engine.moe_device_cache_stats();
         if (host_after.bytes_read != host_before.bytes_read ||
             device_after.host_to_device_bytes !=
                 device_before.host_to_device_bytes ||
-            device_after.hits < device_before.hits + 2)
+            device_after.hits < device_before.hits + 2 ||
+            device_after.direct_expert_bytes <=
+                device_before.direct_expert_bytes)
             return false;
     }
     if (stream_cache_bytes != 0) {
@@ -69,7 +78,8 @@ bool run(const char* package, const char* expected_architecture, Device device,
         const auto stats = engine.moe_device_cache_stats();
         if (stats.capacity_bytes != device_cache_bytes || stats.misses == 0 ||
             stats.host_to_device_bytes == 0 ||
-            stats.device_to_device_bytes == 0 || stats.resident_bytes == 0 ||
+            stats.direct_expert_bytes == 0 ||
+            stats.resident_bytes == 0 ||
             (require_device_reuse &&
              (stats.hits < 2 || stats.evictions == 0)))
             return false;
