@@ -302,6 +302,9 @@ CUDA 上的普通 W8、W4G32 与 W4G128 权重会以 package-native 量化布局
 device，不再在加载时永久展开成 FP16。单 token decode 由专用 GEMV kernel
 直接读取量化权重；多 token prefill 则逐矩阵解量化到可复用的 FP16 device
 scratch 后调用 cuBLAS，因此不会额外保留一份模型大小的 FP16 权重。
+标准 attention 的 KV cache 在 CUDA 上保留 package 声明的 FP16 格式，仅在
+append 时转换 FP32 K/V projection，attention 累加仍使用 FP32；
+`mollm_bench` 会通过 `kv_cache_mb` 报告实际分配量。
 
 ## 基准测试
 

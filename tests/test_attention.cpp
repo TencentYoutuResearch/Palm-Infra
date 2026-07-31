@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 static int failures = 0;
 #define CHECK(cond, msg) do { if(!(cond)){fprintf(stderr,"FAIL: %s\n",msg);failures++;}else{printf("  PASS: %s\n",msg);} } while(0)
@@ -59,7 +60,7 @@ static void ref_sdpa(const float* Q, const float* K_cache, const float* V_cache,
 
 // Run one SDPA test case
 static bool test_case(int H, int KV, int hd, int vd, int src, int cur, int past, int cap,
-                      bool causal) {
+                      bool causal, bool fp16_cache = false) {
     float scale = 1.f / sqrtf(hd);
 
     float* qd = new float[H*src*hd]; fill_rand(qd, H*src*hd);
@@ -75,8 +76,14 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur, int past,
     Tensor V_cur = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vd, cur, KV, 1, vdata);
 
     // KV cache buffers with CacheMetadata header
-    size_t k_cache_total = CacheMetadata::SIZE + KV * cap * hd * sizeof(float);
-    size_t v_cache_total = CacheMetadata::SIZE + KV * cap * vd * sizeof(float);
+    const Precision cache_precision = fp16_cache
+        ? Precision::FP16 : Precision::FP32;
+    const size_t cache_element_size = fp16_cache
+        ? sizeof(mollm::cpu::fp16_t) : sizeof(float);
+    size_t k_cache_total = CacheMetadata::SIZE +
+        static_cast<size_t>(KV) * cap * hd * cache_element_size;
+    size_t v_cache_total = CacheMetadata::SIZE +
+        static_cast<size_t>(KV) * cap * vd * cache_element_size;
     void* kc_buf = calloc(1, k_cache_total);
     void* vc_buf = calloc(1, v_cache_total);
 
@@ -92,27 +99,56 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur, int past,
     v_meta->num_kv_heads    = (uint64_t)KV;
     v_meta->v_head_dim      = (uint64_t)vd;
 
-    // Copy pre-filled cache data into data region (after metadata)
-    memcpy(cache_data(kc_buf), kc, KV * cap * hd * sizeof(float));
-    memcpy(cache_data(vc_buf), vc, KV * cap * vd * sizeof(float));
+    // Copy pre-filled cache data into data region (after metadata). Keep the
+    // reference arrays rounded to the actual cache representation.
+    if (fp16_cache) {
+        auto* key_cache = static_cast<mollm::cpu::fp16_t*>(
+            cache_data(kc_buf));
+        auto* value_cache = static_cast<mollm::cpu::fp16_t*>(
+            cache_data(vc_buf));
+        for (int i = 0; i < KV * cap * hd; ++i) {
+            key_cache[i] = static_cast<mollm::cpu::fp16_t>(kc[i]);
+            kc[i] = static_cast<float>(key_cache[i]);
+        }
+        for (int i = 0; i < KV * cap * vd; ++i) {
+            value_cache[i] = static_cast<mollm::cpu::fp16_t>(vc[i]);
+            vc[i] = static_cast<float>(value_cache[i]);
+        }
+    } else {
+        memcpy(cache_data(kc_buf), kc, KV * cap * hd * sizeof(float));
+        memcpy(cache_data(vc_buf), vc, KV * cap * vd * sizeof(float));
+    }
 
-    Tensor K_cache = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
-                                     (int64_t)k_cache_total / 4, 1, 1, 1, kc_buf);
-    Tensor V_cache = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
-                                     (int64_t)v_cache_total / 4, 1, 1, 1, vc_buf);
+    std::vector<float> reference_key(kd, kd + KV * cur * hd);
+    std::vector<float> reference_value(vdata, vdata + KV * cur * vd);
+    if (fp16_cache) {
+        for (float& value : reference_key)
+            value = static_cast<float>(mollm::cpu::fp16_t(value));
+        for (float& value : reference_value)
+            value = static_cast<float>(mollm::cpu::fp16_t(value));
+    }
+
+    Tensor K_cache = Tensor::create(cache_precision, MemoryType::EXTERNAL,
+        static_cast<int64_t>(k_cache_total / cache_element_size),
+        1, 1, 1, kc_buf);
+    Tensor V_cache = Tensor::create(cache_precision, MemoryType::EXTERNAL,
+        static_cast<int64_t>(v_cache_total / cache_element_size),
+        1, 1, 1, vc_buf);
     Tensor out = Tensor::create(Precision::FP32, MemoryType::OWNED, vd, src, H, 1, od);
-    Tensor K_out = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
-                                   (int64_t)k_cache_total / 4, 1, 1, 1, kc_buf);
-    Tensor V_out = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
-                                   (int64_t)v_cache_total / 4, 1, 1, 1, vc_buf);
+    Tensor K_out = Tensor::create(cache_precision, MemoryType::EXTERNAL,
+        static_cast<int64_t>(k_cache_total / cache_element_size),
+        1, 1, 1, kc_buf);
+    Tensor V_out = Tensor::create(cache_precision, MemoryType::EXTERNAL,
+        static_cast<int64_t>(v_cache_total / cache_element_size),
+        1, 1, 1, vc_buf);
 
     OpParams p; p.i32={2, causal?1:0, H, KV, hd, vd}; p.f32={scale};
     std::vector<const Tensor*> ins = {&Q, &K_cur, &V_cur, nullptr, &K_cache, &V_cache};
     std::vector<Tensor*> outs = {&out, &K_out, &V_out};
     kernel_sdpa(p, ins, outs);
 
-    ref_sdpa(qd, (float*)cache_data(kc_buf), (float*)cache_data(vc_buf),
-             kd, vdata, ref, H, KV, hd, vd, src, cur, past, cap, scale, causal);
+    ref_sdpa(qd, kc, vc, reference_key.data(), reference_value.data(), ref,
+             H, KV, hd, vd, src, cur, past, cap, scale, causal);
 
     // Debug first mismatch
     bool ok = true;
@@ -130,11 +166,19 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur, int past,
 
     // check cache append (only when past > 0)
     if (past > 0) {
-        float* kc_data = (float*)cache_data(kc_buf);
         for (int g = 0; g < KV; g++)
             for (int j = 0; j < cur; j++)
                 for (int d = 0; d < hd; d++)
-                    if (fabsf(kc_data[g*cap*hd + (past+j)*hd + d] - kd[g*cur*hd + j*hd + d]) > 1e-5f) ok = false;
+                    if (fabsf(
+                            (fp16_cache
+                                 ? static_cast<float>(
+                                       static_cast<mollm::cpu::fp16_t*>(
+                                           cache_data(kc_buf))[
+                                           g*cap*hd + (past+j)*hd + d])
+                                 : static_cast<float*>(cache_data(kc_buf))[
+                                       g*cap*hd + (past+j)*hd + d]) -
+                            reference_key[g*cur*hd + j*hd + d]) > 1e-5f)
+                        ok = false;
     }
 
     free(kc_buf); free(vc_buf);
@@ -155,6 +199,8 @@ int main() {
           "GQA causal prefill: H=8 KV=4 src=4 past=0");
     CHECK(test_case(16, 16, 64, 64, 1, 1, 0, 256, false),
           "decode: H=16 KV=16 src=1 past=0");
+    CHECK(test_case(8, 4, 32, 24, 4, 4, 3, 16, true, true),
+          "GQA causal prefill with FP16 KV cache");
     // Production-shaped MLA prefill: 16 heads × src=256 × past=0, causal.
     // Exercises the rewritten flash_attn_fp16_prefill kernel.
     CHECK(test_case(16, 16, 192, 128, 256, 256, 0, 512, true),

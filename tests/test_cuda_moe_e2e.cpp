@@ -40,6 +40,27 @@ bool run(const char* package, const char* expected_architecture, Device device,
     if (architecture == metadata.end() ||
         architecture->second != expected_architecture)
         return false;
+    if (device == Device::CUDA && architecture->second == "qwen3-moe") {
+        const auto layers = metadata.find("num_layers");
+        const auto heads = metadata.find("num_kv_heads");
+        const auto width = metadata.find("head_dim");
+        if (layers == metadata.end() || heads == metadata.end() ||
+            width == metadata.end())
+            return false;
+        const size_t layer_count = std::stoul(layers->second);
+        const size_t kv_heads = std::stoul(heads->second);
+        const size_t head_dim = std::stoul(width->second);
+        const size_t expected_cache_bytes = layer_count *
+            (2 * CacheMetadata::SIZE + 2 * head_dim * config.n_ctx *
+                 kv_heads * sizeof(mollm::cpu::fp16_t));
+        if (engine.kv_cache_bytes() != expected_cache_bytes) {
+            std::fprintf(
+                stderr,
+                "CUDA Qwen3-MoE KV cache is %zu bytes, expected FP16 %zu\n",
+                engine.kv_cache_bytes(), expected_cache_bytes);
+            return false;
+        }
+    }
     Tensor prefill_tensor = engine.prefill_hidden({1, 2, 3});
     if (!copy_finite(prefill_tensor, prefill) || engine.past_len() != 3)
         return false;

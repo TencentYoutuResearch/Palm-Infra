@@ -403,14 +403,19 @@ layouts directly in specialized GEMV kernels; multi-token prefill dequantizes
 one matrix at a time into reusable FP16 device scratch before invoking cuBLAS,
 instead of retaining a model-sized FP16 expansion. RMSNorm, fused
 norm paths, strided and broadcast elementwise operations, common activations,
-SwiGLU, RoPE, layout materialization, tile/concat, FP32 cached SDPA, zero-copy
-views, and the decode lm_head also stay on CUDA. Qwen3.5's recurrent Gated
-DeltaNet and short-convolution paths are native as well, including persistent
-decode-state updates. RWKV7 token shift, channel mixing, normalization, WKV7
-recurrence, post-processing, batched projections, and sparse-activation FFN
-also run natively, with persistent FP16 or FP32 recurrent state. Qwen3.5's
-single-image vision tower uses the same native matmul, LayerNorm, RoPE, SDPA,
-GELU, and layout paths. Resident Qwen3-style MoE graphs support softmax,
+SwiGLU, RoPE, layout materialization, tile/concat, FP32-accumulating cached
+SDPA, zero-copy views, and the decode lm_head also stay on CUDA. Qwen3.5's
+recurrent Gated DeltaNet and short-convolution paths are native as well,
+including persistent decode-state updates. Standard attention keeps the
+package-declared FP16 KV cache on CUDA, converting FP32 K/V projections only
+when they are appended;
+attention accumulation remains FP32. `mollm_bench` reports the resulting
+allocation as `kv_cache_mb`. RWKV7 token shift, channel mixing,
+normalization, WKV7 recurrence, post-processing, batched projections, and
+sparse-activation FFN also run natively, with persistent FP16 or FP32 recurrent
+state. Qwen3.5's single-image vision tower uses the same native matmul,
+LayerNorm, RoPE, SDPA, GELU, and layout paths. Resident Qwen3-style MoE graphs
+support softmax,
 sigmoid, grouped, correction-bias, and INT32 token-hash routing plus optional
 shared experts. Hash lookup tables remain device-resident and retain their
 package-native INT32 representation.

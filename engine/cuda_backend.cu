@@ -2194,10 +2194,26 @@ __global__ void rope_cuda(
         ? x0 * c - x1 * s : x0 * s + x1 * c;
 }
 
+__device__ float load_kv_cache_value(
+    const void* cache, size_t index, bool fp16_cache) {
+    return fp16_cache
+        ? __half2float(static_cast<const __half*>(cache)[index])
+        : static_cast<const float*>(cache)[index];
+}
+
+__device__ void store_kv_cache_value(
+    void* cache, size_t index, float value, bool fp16_cache) {
+    if (fp16_cache)
+        static_cast<__half*>(cache)[index] = __float2half_rn(value);
+    else
+        static_cast<float*>(cache)[index] = value;
+}
+
 __global__ void append_kv_cuda(
-    const float* key, const float* value, float* key_cache,
-    float* value_cache, int num_kv_heads, int current_length,
-    int past_length, int max_length, int key_dim, int value_dim,
+    const float* key, const float* value, void* key_cache,
+    void* value_cache, bool fp16_cache, int num_kv_heads,
+    int current_length, int past_length, int max_length,
+    int key_dim, int value_dim,
     size_t key_position_stride, size_t key_head_stride,
     size_t value_position_stride, size_t value_head_stride) {
     const int maximum_dim = max(key_dim, value_dim);
@@ -2213,26 +2229,34 @@ __global__ void append_kv_cuda(
     const int position = static_cast<int>(remaining % current_length);
     const int head = static_cast<int>(remaining / current_length);
     if (dimension < key_dim) {
-        key_cache[(static_cast<size_t>(head) * max_length + past_length +
-                   position) * key_dim + dimension] =
+        const size_t destination =
+            (static_cast<size_t>(head) * max_length + past_length +
+             position) * key_dim + dimension;
+        store_kv_cache_value(
+            key_cache, destination,
             key[static_cast<size_t>(head) * key_head_stride +
                 static_cast<size_t>(position) * key_position_stride +
-                dimension];
+                dimension],
+            fp16_cache);
     }
     if (dimension < value_dim) {
-        value_cache[(static_cast<size_t>(head) * max_length + past_length +
-                     position) * value_dim + dimension] =
+        const size_t destination =
+            (static_cast<size_t>(head) * max_length + past_length +
+             position) * value_dim + dimension;
+        store_kv_cache_value(
+            value_cache, destination,
             value[static_cast<size_t>(head) * value_head_stride +
                   static_cast<size_t>(position) * value_position_stride +
-                  dimension];
+                  dimension],
+            fp16_cache);
     }
 }
 
 __global__ void sdpa_scores_cuda(
-    const float* query, const float* key, float* scores,
+    const float* query, const void* key, float* scores,
     const float* mask, int num_heads, int num_kv_heads,
     int query_length, int key_length, int past_length, int key_dim,
-    int key_capacity, bool cached, bool causal, float scale,
+    int key_capacity, bool cached, bool fp16_cache, bool causal, float scale,
     size_t query_feature_stride, size_t query_position_stride,
     size_t query_head_stride, size_t key_feature_stride,
     size_t key_position_stride, size_t key_head_stride,
@@ -2252,16 +2276,24 @@ __global__ void sdpa_scores_cuda(
     const float* query_row = query +
         static_cast<size_t>(head) * query_head_stride +
         static_cast<size_t>(query_position) * query_position_stride;
-    const float* key_row = cached
-        ? key + (static_cast<size_t>(key_head) * key_capacity +
-                 key_position) * key_dim
-        : key + static_cast<size_t>(key_head) * key_head_stride +
-            static_cast<size_t>(key_position) * key_position_stride;
+    const size_t cached_key_base =
+        (static_cast<size_t>(key_head) * key_capacity + key_position) *
+        key_dim;
+    const auto* current_key = static_cast<const float*>(key);
+    const size_t current_key_base =
+        static_cast<size_t>(key_head) * key_head_stride +
+        static_cast<size_t>(key_position) * key_position_stride;
     float dot = 0.0f;
-    for (int dimension = 0; dimension < key_dim; ++dimension)
+    for (int dimension = 0; dimension < key_dim; ++dimension) {
+        const float key_value = cached
+            ? load_kv_cache_value(
+                  key, cached_key_base + dimension, fp16_cache)
+            : current_key[current_key_base +
+                          static_cast<size_t>(dimension) *
+                              key_feature_stride];
         dot += query_row[static_cast<size_t>(dimension) *
-                         query_feature_stride] *
-            key_row[static_cast<size_t>(dimension) * key_feature_stride];
+                         query_feature_stride] * key_value;
+    }
     float score = dot * scale;
     if (mask) {
         score += mask[static_cast<size_t>(query_position) * mask_row_stride +
@@ -2274,9 +2306,9 @@ __global__ void sdpa_scores_cuda(
 }
 
 __global__ void sdpa_output_cuda(
-    const float* scores, const float* value, float* output,
+    const float* scores, const void* value, float* output,
     int num_heads, int num_kv_heads, int query_length, int key_length,
-    int value_dim, int value_capacity, bool cached,
+    int value_dim, int value_capacity, bool cached, bool fp16_cache,
     size_t value_feature_stride, size_t value_position_stride,
     size_t value_head_stride, size_t output_feature_stride,
     size_t output_position_stride, size_t output_head_stride) {
@@ -2320,14 +2352,18 @@ __global__ void sdpa_output_cuda(
         for (int position = 0; position < key_length; ++position) {
             const float probability =
                 expf(score_row[position] - maximum) * inverse_sum;
-            const float* value_row = cached
-                ? value + (static_cast<size_t>(key_head) * value_capacity +
-                           position) * value_dim
-                : value + static_cast<size_t>(key_head) * value_head_stride +
-                    static_cast<size_t>(position) * value_position_stride;
-            result += probability *
-                value_row[static_cast<size_t>(dimension) *
-                          value_feature_stride];
+            const size_t cached_index =
+                (static_cast<size_t>(key_head) * value_capacity + position) *
+                    value_dim + dimension;
+            const auto* current_value = static_cast<const float*>(value);
+            const size_t current_index =
+                static_cast<size_t>(key_head) * value_head_stride +
+                static_cast<size_t>(position) * value_position_stride +
+                static_cast<size_t>(dimension) * value_feature_stride;
+            const float value_element = cached
+                ? load_kv_cache_value(value, cached_index, fp16_cache)
+                : current_value[current_index];
+            result += probability * value_element;
         }
         output[static_cast<size_t>(head) * output_head_stride +
                static_cast<size_t>(query_position) *
@@ -3697,25 +3733,32 @@ void CudaBackend::dispatch(const GraphNode& node,
         int past_length = 0;
         int key_capacity = current_length;
         bool cached = false;
-        const float* key_data = device_pointer_const<float>(current_key);
-        const float* value_data = device_pointer_const<float>(current_value);
-        float* key_cache_data = nullptr;
-        float* value_cache_data = nullptr;
+        const float* current_key_data =
+            device_pointer_const<float>(current_key);
+        const float* current_value_data =
+            device_pointer_const<float>(current_value);
+        const void* key_data = current_key_data;
+        const void* value_data = current_value_data;
+        void* key_cache_data = nullptr;
+        void* value_cache_data = nullptr;
+        bool fp16_cache = false;
         if (cache_mode == 2 && key_cache && value_cache &&
-            key_cache->prec == Precision::FP32 &&
-            value_cache->prec == Precision::FP32 &&
+            key_cache->prec == value_cache->prec &&
+            (key_cache->prec == Precision::FP16 ||
+             key_cache->prec == Precision::FP32) &&
             key_cache->device_data && value_cache->device_data) {
             const auto* metadata = cache_meta(
                 static_cast<const uint8_t*>(key_cache->data) +
                 key_cache->device_offset);
             past_length = static_cast<int>(metadata->current_seq_len);
             key_capacity = static_cast<int>(metadata->max_seq_len);
-            key_cache_data = reinterpret_cast<float*>(
+            key_cache_data =
                 static_cast<uint8_t*>(key_cache->device_data) +
-                key_cache->device_offset + CacheMetadata::SIZE);
-            value_cache_data = reinterpret_cast<float*>(
+                key_cache->device_offset + CacheMetadata::SIZE;
+            value_cache_data =
                 static_cast<uint8_t*>(value_cache->device_data) +
-                value_cache->device_offset + CacheMetadata::SIZE);
+                value_cache->device_offset + CacheMetadata::SIZE;
+            fp16_cache = key_cache->prec == Precision::FP16;
             cached = true;
         }
         const int key_length = past_length + current_length;
@@ -3723,7 +3766,8 @@ void CudaBackend::dispatch(const GraphNode& node,
         float* output_data = device_pointer<float>(*output);
         const float* mask_data = mask
             ? device_pointer_const<float>(*mask) : nullptr;
-        const bool valid = query_data && key_data && value_data &&
+        const bool valid = query_data && current_key_data &&
+            current_value_data &&
             output_data && num_heads > 0 && num_kv_heads > 0 &&
             num_heads % num_kv_heads == 0 && query_length > 0 &&
             current_length > 0 && key_dim > 0 && value_dim > 0 &&
@@ -3743,9 +3787,10 @@ void CudaBackend::dispatch(const GraphNode& node,
                 append_kv_cuda<<<
                     static_cast<unsigned>((append_count + threads - 1) /
                                           threads), threads>>>(
-                    key_data, value_data, key_cache_data, value_cache_data,
-                    num_kv_heads, current_length, past_length, key_capacity,
-                    key_dim, value_dim,
+                    current_key_data, current_value_data,
+                    key_cache_data, value_cache_data,
+                    fp16_cache, num_kv_heads, current_length, past_length,
+                    key_capacity, key_dim, value_dim,
                     current_key.stride[1] / sizeof(float),
                     current_key.stride[2] / sizeof(float),
                     current_value.stride[1] / sizeof(float),
@@ -3772,7 +3817,7 @@ void CudaBackend::dispatch(const GraphNode& node,
                 threads>>>(
                 query_data, key_data, scores, mask_data, num_heads,
                 num_kv_heads, query_length, key_length, past_length, key_dim,
-                key_capacity, cached, causal, scale,
+                key_capacity, cached, fp16_cache, causal, scale,
                 query.stride[0] / sizeof(float),
                 query.stride[1] / sizeof(float),
                 query.stride[2] / sizeof(float),
@@ -3790,6 +3835,7 @@ void CudaBackend::dispatch(const GraphNode& node,
             sdpa_output_cuda<<<num_heads * query_length, threads>>>(
                 scores, value_data, output_data, num_heads, num_kv_heads,
                 query_length, key_length, value_dim, key_capacity, cached,
+                fp16_cache,
                 cached ? 1 : current_value.stride[0] / sizeof(float),
                 cached ? static_cast<size_t>(value_dim)
                        : current_value.stride[1] / sizeof(float),

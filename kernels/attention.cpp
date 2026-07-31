@@ -960,6 +960,37 @@ static void naive_sdpa_head(
     delete[] qk_row;
 }
 
+static void naive_sdpa_head_fp16_cache(
+    const float* Q, const mollm::cpu::fp16_t* K,
+    const mollm::cpu::fp16_t* V, float* O,
+    int M, int N, int d_k, int d_v, float scale, const float* mask) {
+    float* qk_row = new float[N];
+    for (int s = 0; s < M; ++s) {
+        const float* q = Q + static_cast<size_t>(s) * d_k;
+        for (int position = 0; position < N; ++position) {
+            float dot = 0.0f;
+            const auto* key = K + static_cast<size_t>(position) * d_k;
+            for (int dimension = 0; dimension < d_k; ++dimension)
+                dot += q[dimension] * static_cast<float>(key[dimension]);
+            qk_row[position] = dot * scale;
+            if (mask)
+                qk_row[position] += mask[static_cast<size_t>(s) * N +
+                                         position];
+        }
+        softmax_row(qk_row, N);
+        float* output = O + static_cast<size_t>(s) * d_v;
+        std::memset(output, 0, static_cast<size_t>(d_v) * sizeof(float));
+        for (int position = 0; position < N; ++position) {
+            const float probability = qk_row[position];
+            const auto* value = V + static_cast<size_t>(position) * d_v;
+            for (int dimension = 0; dimension < d_v; ++dimension)
+                output[dimension] +=
+                    probability * static_cast<float>(value[dimension]);
+        }
+    }
+    delete[] qk_row;
+}
+
 #endif // !HAS_NEON
 
 // ---------------------------------------------------------------------------
@@ -1184,6 +1215,17 @@ void kernel_sdpa(const OpParams& params,
             int kv_h = h / heads_per_group;
             const float* Q_head =
                 (const float*)Q.channel<unsigned char>(h);
+            if (cache_is_fp16) {
+                const auto* K_head =
+                    static_cast<const mollm::cpu::fp16_t*>(get_k_ptr(kv_h));
+                const auto* V_head =
+                    static_cast<const mollm::cpu::fp16_t*>(get_v_ptr(kv_h));
+                float* O_head = (float*)out.channel<unsigned char>(h);
+                naive_sdpa_head_fp16_cache(
+                    Q_head, K_head, V_head, O_head, src_seqlen,
+                    dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);
+                continue;
+            }
             const float* K_head =
                 static_cast<const float*>(get_k_ptr(kv_h));
             const float* V_head =

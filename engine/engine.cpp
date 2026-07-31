@@ -622,6 +622,23 @@ void LLMEngine::release_vision_buffers() {
     invalidate_workspace_key(exec_ctx_vision_);
 }
 
+size_t LLMEngine::kv_cache_bytes() const {
+    size_t total = 0;
+    for (const auto& cache : caches_) {
+        if (cache.k) {
+            total += CacheMetadata::SIZE +
+                static_cast<size_t>(cache.k_head_dim) * cfg_.n_ctx *
+                    cache.k_num_heads * cache.k->element_size();
+        }
+        if (cache.v) {
+            total += CacheMetadata::SIZE +
+                static_cast<size_t>(cache.v_head_dim) * cfg_.n_ctx *
+                    cache.v_num_heads * cache.v->element_size();
+        }
+    }
+    return total;
+}
+
 int LLMEngine::prefill(const std::vector<int>& token_ids) {
     mollm_trace::ScopedEvent trace_prefill("inference", "prefill");
     int n = (int)token_ids.size();

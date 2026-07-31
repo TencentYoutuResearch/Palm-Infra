@@ -134,6 +134,7 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
     std::printf("peak_rss_mb=%.1f\n", peak_rss_mb());
     std::printf("cpu_weight_sidecar_mb=%.1f\n",
                 engine.cpu_weight_sidecar_bytes() / 1e6);
+    std::printf("kv_cache_mb=%.1f\n", engine.kv_cache_bytes() / 1e6);
     if (engine.moe_ssd_offload_enabled()) {
         auto ssd = engine.moe_ssd_stats();
         std::printf("moe_ssd_cache_mb=%.1f\n", engine.config().moe_ssd_cache_bytes / 1e6);
@@ -278,6 +279,7 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
     human_row("load_warmup_mb", load_warmup_bytes / 1e6,  "MB");
     human_row("cpu_weight_sidecar_mb",
               engine.cpu_weight_sidecar_bytes() / 1e6,     "MB");
+    human_row("kv_cache_mb", engine.kv_cache_bytes() / 1e6, "MB");
     human_row_int("threads", engine.config().num_threads, "");
     if (engine.moe_ssd_offload_enabled()) {
         auto ssd = engine.moe_ssd_stats();

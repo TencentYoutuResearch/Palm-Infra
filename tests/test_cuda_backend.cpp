@@ -1115,7 +1115,8 @@ bool test_rwkv_matrix_ops(CudaBackend& backend) {
         close_enough(actual, expected, 3e-3f);
 }
 
-bool test_layout_rope_and_sdpa(CudaBackend& backend) {
+bool test_layout_rope_and_sdpa(CudaBackend& backend,
+                               Precision cache_precision) {
     backend.clear_dispatch_error();
     Tensor rope_storage = device_tensor(backend, 10, 2);
     for (int i = 0; i < 20; ++i)
@@ -1353,15 +1354,21 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     for (int64_t i = 0; i < value.nelements(); ++i)
         value.ptr<float>()[i] = (static_cast<int>(i % 7) - 3) / 5.0f;
 
+    const bool fp16_cache = cache_precision == Precision::FP16;
+    const size_t cache_element_size = fp16_cache
+        ? sizeof(mollm::cpu::fp16_t) : sizeof(float);
     const size_t key_cache_bytes = CacheMetadata::SIZE +
-        static_cast<size_t>(kv_heads) * capacity * key_dim * sizeof(float);
+        static_cast<size_t>(kv_heads) * capacity * key_dim *
+            cache_element_size;
     const size_t value_cache_bytes = CacheMetadata::SIZE +
-        static_cast<size_t>(kv_heads) * capacity * value_dim * sizeof(float);
+        static_cast<size_t>(kv_heads) * capacity * value_dim *
+            cache_element_size;
     Tensor key_cache = Tensor::create(
-        Precision::FP32, MemoryType::EXTERNAL, key_cache_bytes / sizeof(float));
+        cache_precision, MemoryType::EXTERNAL,
+        key_cache_bytes / cache_element_size);
     Tensor value_cache = Tensor::create(
-        Precision::FP32, MemoryType::EXTERNAL,
-        value_cache_bytes / sizeof(float));
+        cache_precision, MemoryType::EXTERNAL,
+        value_cache_bytes / cache_element_size);
     backend.alloc_persistent(key_cache, key_cache_bytes);
     backend.alloc_persistent(value_cache, value_cache_bytes);
     auto* key_metadata = cache_meta(key_cache.data);
@@ -1374,8 +1381,6 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     value_metadata->max_seq_len = capacity;
     value_metadata->num_kv_heads = kv_heads;
     value_metadata->v_head_dim = value_dim;
-    auto* cached_key = static_cast<float*>(cache_data(key_cache.data));
-    auto* cached_value = static_cast<float*>(cache_data(value_cache.data));
     std::vector<float> initial_key(
         static_cast<size_t>(kv_heads) * capacity * key_dim, 0.0f);
     std::vector<float> initial_value(
@@ -1388,10 +1393,31 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
             initial_value[(head * capacity) * value_dim + dimension] =
                 (head * value_dim + dimension - 2) / 6.0f;
     }
-    std::memcpy(cached_key, initial_key.data(),
-                initial_key.size() * sizeof(float));
-    std::memcpy(cached_value, initial_value.data(),
-                initial_value.size() * sizeof(float));
+    auto round_for_cache = [fp16_cache](float value) {
+        return fp16_cache
+            ? static_cast<float>(mollm::cpu::fp16_t(value)) : value;
+    };
+    if (fp16_cache) {
+        auto* cached_key = static_cast<mollm::cpu::fp16_t*>(
+            cache_data(key_cache.data));
+        auto* cached_value = static_cast<mollm::cpu::fp16_t*>(
+            cache_data(value_cache.data));
+        for (size_t index = 0; index < initial_key.size(); ++index) {
+            cached_key[index] = static_cast<mollm::cpu::fp16_t>(
+                initial_key[index]);
+            initial_key[index] = static_cast<float>(cached_key[index]);
+        }
+        for (size_t index = 0; index < initial_value.size(); ++index) {
+            cached_value[index] = static_cast<mollm::cpu::fp16_t>(
+                initial_value[index]);
+            initial_value[index] = static_cast<float>(cached_value[index]);
+        }
+    } else {
+        std::memcpy(cache_data(key_cache.data), initial_key.data(),
+                    initial_key.size() * sizeof(float));
+        std::memcpy(cache_data(value_cache.data), initial_value.data(),
+                    initial_value.size() * sizeof(float));
+    }
 
     Tensor attention_output =
         device_tensor(backend, value_dim, query_length, heads);
@@ -1421,9 +1447,9 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
                     const float key_value = key_position < past_length
                         ? initial_key[(key_head * capacity + key_position) *
                                       key_dim + dimension]
-                        : key.ptr<float>()[
+                        : round_for_cache(key.ptr<float>()[
                               (key_head * current_length + key_position -
-                               past_length) * key_dim + dimension];
+                               past_length) * key_dim + dimension]);
                     score += query.ptr<float>()[
                                  (head * query_length + position) * key_dim +
                                  dimension] * key_value;
@@ -1446,9 +1472,9 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
                         ? initial_value[
                               (key_head * capacity + key_position) *
                                   value_dim + dimension]
-                        : value.ptr<float>()[
+                        : round_for_cache(value.ptr<float>()[
                               (key_head * current_length + key_position -
-                               past_length) * value_dim + dimension];
+                               past_length) * value_dim + dimension]);
                     expected[(head * query_length + position) * value_dim +
                              dimension] += scores[key_position] / sum * current;
                 }
@@ -1460,14 +1486,20 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
                 attention_output.nbytes());
     if (backend.dispatch_failed() || !close_enough(actual, expected, 3e-5f))
         return false;
+    auto cached_key_value = [&](size_t index) {
+        return fp16_cache
+            ? static_cast<float>(static_cast<mollm::cpu::fp16_t*>(
+                  cache_data(key_cache.data))[index])
+            : static_cast<float*>(cache_data(key_cache.data))[index];
+    };
     for (int head = 0; head < kv_heads; ++head)
         for (int position = 0; position < current_length; ++position)
             for (int dimension = 0; dimension < key_dim; ++dimension)
-                if (std::fabs(cached_key[
+                if (std::fabs(cached_key_value(
                         (head * capacity + past_length + position) * key_dim +
-                        dimension] - key.ptr<float>()[
+                        dimension) - round_for_cache(key.ptr<float>()[
                             (head * current_length + position) * key_dim +
-                            dimension]) > 1e-6f)
+                            dimension])) > 1e-6f)
                     return false;
     return true;
 }
@@ -2593,7 +2625,9 @@ int main() {
         return 1;
     if (!test_rwkv_matrix_ops(backend))
         return 1;
-    if (!test_layout_rope_and_sdpa(backend))
+    if (backend.kv_cache_precision(Precision::FP16) != Precision::FP16 ||
+        !test_layout_rope_and_sdpa(backend, Precision::FP32) ||
+        !test_layout_rope_and_sdpa(backend, Precision::FP16))
         return 1;
     {
         CudaBackend layout_backend;
