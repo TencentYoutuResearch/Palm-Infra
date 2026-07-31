@@ -2,6 +2,7 @@
 
 #include "engine/backend.h"
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -18,6 +19,16 @@ inline bool is_routed_expert_aggregate_ref(std::string_view reference) {
 }
 
 }  // namespace mollm::detail
+
+struct DeviceMoeCacheStats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+    uint64_t host_to_device_bytes = 0;
+    uint64_t device_to_device_bytes = 0;
+    size_t resident_bytes = 0;
+    size_t capacity_bytes = 0;
+};
 
 // Common lifecycle for graph-resident accelerator backends. LLMEngine only
 // talks to this interface; Metal, CUDA and future device backends own their
@@ -57,4 +68,8 @@ public:
     virtual bool configure_moe_ssd_io(const std::string&, size_t, int, bool) {
         return false;
     }
+    virtual bool configure_moe_device_cache(size_t capacity_bytes) {
+        return capacity_bytes == 0;
+    }
+    virtual DeviceMoeCacheStats moe_device_cache_stats() const { return {}; }
 };

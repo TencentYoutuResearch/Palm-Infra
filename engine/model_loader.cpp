@@ -804,6 +804,13 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 "--ssd-cache-mb\n");
         return false;
     }
+    if (cfg_.moe_device_cache_bytes != 0 &&
+        (cfg_.device == Device::CPU || cfg_.moe_ssd_cache_bytes == 0)) {
+        fprintf(stderr,
+                "Engine: device MoE cache requires an accelerator device "
+                "and --ssd-cache-mb\n");
+        return false;
+    }
     mollm_trace::start(cfg_.trace_path);
     mollm_trace::set_thread_name("main");
     if (cfg_.moe_ssd_cache_bytes != 0) {
@@ -958,6 +965,20 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         package_weights_size_) {
         if (moe_ssd_cache_) {
             accelerator_backend_->enable_weight_copy_mode();
+            if (cfg_.moe_device_cache_bytes != 0 &&
+                !accelerator_backend_->configure_moe_device_cache(
+                    cfg_.moe_device_cache_bytes)) {
+                fprintf(stderr,
+                        "Engine: selected accelerator does not support the "
+                        "requested device MoE cache\n");
+                return false;
+            }
+            if (cfg_.moe_device_cache_bytes != 0) {
+                fprintf(stderr,
+                        "Engine: accelerator MoE device cache enabled "
+                        "(%.1f MiB)\n",
+                        cfg_.moe_device_cache_bytes / (1024.0 * 1024.0));
+            }
             if (cfg_.metal_ssd_full) {
                 if (!accelerator_backend_->configure_moe_ssd_io(
                              cfg_.package_path, cfg_.moe_ssd_cache_bytes,

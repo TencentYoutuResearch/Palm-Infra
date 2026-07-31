@@ -2382,6 +2382,19 @@ struct CudaBackend::Impl {
         size_t capacity = 0;
     };
 
+    struct MoeDeviceCacheEntry {
+        const MoeSsdTensorSource* gate_up = nullptr;
+        const MoeSsdTensorSource* down = nullptr;
+        int expert = -1;
+        void* allocation = nullptr;
+        size_t allocation_bytes = 0;
+        const void* gate_up_data = nullptr;
+        const void* gate_up_scales = nullptr;
+        const void* down_data = nullptr;
+        const void* down_scales = nullptr;
+        uint64_t used_at = 0;
+    };
+
     bool ok = false;
     bool failed = false;
     cublasHandle_t cublas = nullptr;
@@ -2393,6 +2406,9 @@ struct CudaBackend::Impl {
     std::unordered_map<void*, size_t> managed_sizes;
     std::multimap<size_t, void*> free_managed;
     std::unordered_map<std::string, BoundaryBuffer> boundary_buffers;
+    std::vector<MoeDeviceCacheEntry> moe_device_cache;
+    DeviceMoeCacheStats moe_device_cache_stats;
+    uint64_t moe_device_cache_clock = 0;
     std::unordered_map<uint32_t, uint64_t> native_ops;
     std::unordered_map<uint32_t, uint64_t> fallback_ops;
     void* activation = nullptr;
@@ -2411,6 +2427,9 @@ struct CudaBackend::Impl {
     ~Impl() {
         if (cublas)
             cublasDestroy(cublas);
+        for (auto& entry : moe_device_cache)
+            if (entry.allocation)
+                cudaFree(entry.allocation);
         for (void* allocation : device_allocations)
             cudaFree(allocation);
         for (void* allocation : managed_allocations)
@@ -2482,6 +2501,156 @@ struct CudaBackend::Impl {
         auto& buffer = boundary_buffers[name];
         return reserve(buffer.data, buffer.capacity, requested)
             ? buffer.data : nullptr;
+    }
+
+    void clear_moe_device_cache() {
+        for (auto& entry : moe_device_cache)
+            if (entry.allocation)
+                cudaFree(entry.allocation);
+        moe_device_cache.clear();
+        moe_device_cache_stats.resident_bytes = 0;
+        moe_device_cache_clock = 0;
+    }
+
+    bool configure_moe_device_cache(size_t capacity_bytes) {
+        clear_moe_device_cache();
+        moe_device_cache_stats = {};
+        moe_device_cache_stats.capacity_bytes = capacity_bytes;
+        return true;
+    }
+
+    MoeDeviceCacheEntry* find_moe_device_expert(
+        const MoeSsdTensorSource* gate_up,
+        const MoeSsdTensorSource* down, int expert) {
+        for (auto& entry : moe_device_cache) {
+            if (entry.gate_up == gate_up && entry.down == down &&
+                entry.expert == expert) {
+                entry.used_at = ++moe_device_cache_clock;
+                ++moe_device_cache_stats.hits;
+                return &entry;
+            }
+        }
+        return nullptr;
+    }
+
+    bool has_moe_device_expert(
+        const MoeSsdTensorSource* gate_up,
+        const MoeSsdTensorSource* down, int expert) const {
+        return std::any_of(
+            moe_device_cache.begin(), moe_device_cache.end(),
+            [&](const MoeDeviceCacheEntry& entry) {
+                return entry.gate_up == gate_up && entry.down == down &&
+                    entry.expert == expert;
+            });
+    }
+
+    MoeDeviceCacheEntry* cache_moe_device_expert(
+        const MoeSsdTensorSource* gate_up,
+        const MoeSsdTensorSource* down, int expert,
+        const Tensor& gate_view, const Tensor& down_view) {
+        ++moe_device_cache_stats.misses;
+        const size_t capacity = moe_device_cache_stats.capacity_bytes;
+        if (capacity == 0)
+            return nullptr;
+
+        constexpr size_t alignment = 256;
+        auto align_offset = [=](size_t value) {
+            return (value + alignment - 1) & ~(alignment - 1);
+        };
+        const size_t gate_data_offset = 0;
+        const size_t gate_scales_offset = align_offset(
+            gate_up->spec.data_bytes);
+        const size_t down_data_offset = align_offset(
+            gate_scales_offset + gate_up->spec.scales_bytes);
+        const size_t down_scales_offset = align_offset(
+            down_data_offset + down->spec.data_bytes);
+        const size_t allocation_bytes = align_offset(
+            down_scales_offset + down->spec.scales_bytes);
+        if (allocation_bytes > capacity)
+            return nullptr;
+
+        while (moe_device_cache_stats.resident_bytes >
+               capacity - allocation_bytes) {
+            const auto victim = std::min_element(
+                moe_device_cache.begin(), moe_device_cache.end(),
+                [](const MoeDeviceCacheEntry& lhs,
+                   const MoeDeviceCacheEntry& rhs) {
+                    return lhs.used_at < rhs.used_at;
+                });
+            if (victim == moe_device_cache.end())
+                return nullptr;
+            if (!report_cuda(cudaFree(victim->allocation),
+                             "cudaFree MOE device cache entry")) {
+                failed = true;
+                return nullptr;
+            }
+            moe_device_cache_stats.resident_bytes -=
+                victim->allocation_bytes;
+            ++moe_device_cache_stats.evictions;
+            moe_device_cache.erase(victim);
+        }
+
+        const void* gate_host_scales = gate_view.e8m0_scales
+            ? static_cast<const void*>(gate_view.e8m0_scales)
+            : static_cast<const void*>(gate_view.scales);
+        const void* down_host_scales = down_view.e8m0_scales
+            ? static_cast<const void*>(down_view.e8m0_scales)
+            : static_cast<const void*>(down_view.scales);
+        if (!gate_view.data || !down_view.data ||
+            (gate_up->spec.scales_bytes != 0 && !gate_host_scales) ||
+            (down->spec.scales_bytes != 0 && !down_host_scales)) {
+            return nullptr;
+        }
+
+        void* allocation = nullptr;
+        if (!report_cuda(cudaMalloc(&allocation, allocation_bytes),
+                         "cudaMalloc MOE device cache entry")) {
+            failed = true;
+            return nullptr;
+        }
+        auto* base = static_cast<uint8_t*>(allocation);
+        auto copy_component = [&](size_t offset, const void* source,
+                                  size_t bytes, const char* label) {
+            return bytes == 0 || report_cuda(
+                cudaMemcpy(base + offset, source, bytes,
+                           cudaMemcpyHostToDevice), label);
+        };
+        const bool copied =
+            copy_component(gate_data_offset, gate_view.data,
+                           gate_up->spec.data_bytes,
+                           "cudaMemcpy cached MOE gate/up data") &&
+            copy_component(gate_scales_offset, gate_host_scales,
+                           gate_up->spec.scales_bytes,
+                           "cudaMemcpy cached MOE gate/up scales") &&
+            copy_component(down_data_offset, down_view.data,
+                           down->spec.data_bytes,
+                           "cudaMemcpy cached MOE down data") &&
+            copy_component(down_scales_offset, down_host_scales,
+                           down->spec.scales_bytes,
+                           "cudaMemcpy cached MOE down scales");
+        if (!copied) {
+            cudaFree(allocation);
+            failed = true;
+            return nullptr;
+        }
+
+        moe_device_cache.push_back({
+            gate_up,
+            down,
+            expert,
+            allocation,
+            allocation_bytes,
+            base + gate_data_offset,
+            gate_up->spec.scales_bytes ? base + gate_scales_offset : nullptr,
+            base + down_data_offset,
+            down->spec.scales_bytes ? base + down_scales_offset : nullptr,
+            ++moe_device_cache_clock,
+        });
+        moe_device_cache_stats.resident_bytes += allocation_bytes;
+        moe_device_cache_stats.host_to_device_bytes +=
+            gate_up->spec.data_bytes + gate_up->spec.scales_bytes +
+            down->spec.data_bytes + down->spec.scales_bytes;
+        return &moe_device_cache.back();
     }
 
     const DeviceWeight* find_weight(const Tensor& tensor) const {
@@ -2792,6 +2961,14 @@ CudaBackend::CudaBackend() : impl_(std::make_unique<Impl>()) {
 CudaBackend::~CudaBackend() = default;
 
 bool CudaBackend::available() const { return impl_ && impl_->ok; }
+
+bool CudaBackend::configure_moe_device_cache(size_t capacity_bytes) {
+    return available() && impl_->configure_moe_device_cache(capacity_bytes);
+}
+
+DeviceMoeCacheStats CudaBackend::moe_device_cache_stats() const {
+    return impl_ ? impl_->moe_device_cache_stats : DeviceMoeCacheStats{};
+}
 
 void CudaBackend::clear_dispatch_error() {
     impl_->failed = false;
@@ -4702,8 +4879,17 @@ void CudaBackend::dispatch(const GraphNode& node,
                     }
                 }
                 if (valid) {
-                    valid = gate_up_source->cache->request_many(
-                        gate_up_source, down_source, selected_experts);
+                    std::vector<int> host_requests;
+                    host_requests.reserve(selected_experts.size());
+                    for (int expert : selected_experts) {
+                        if (!impl_->has_moe_device_expert(
+                                gate_up_source, down_source, expert)) {
+                            host_requests.push_back(expert);
+                        }
+                    }
+                    valid = host_requests.empty() ||
+                        gate_up_source->cache->request_many(
+                            gate_up_source, down_source, host_requests);
                 }
                 const size_t selected_count = selected_experts.size();
                 auto* compact_gate_up = valid
@@ -4739,37 +4925,65 @@ void CudaBackend::dispatch(const GraphNode& node,
                     (down_source->spec.scales_bytes == 0 ||
                      compact_down_scales) && device_slots;
                 for (size_t slot = 0; valid && slot < selected_count; ++slot) {
+                    auto* cached = impl_->find_moe_device_expert(
+                        gate_up_source, down_source, selected_experts[slot]);
                     Tensor gate_view;
                     Tensor down_view;
-                    valid = gate_up_source->cache->acquire(
-                        gate_up_source, down_source, selected_experts[slot],
-                        gate_view, down_view);
-                    valid = valid && gate_view.data && down_view.data &&
-                        (gate_up_source->spec.scales_bytes == 0 ||
-                         gate_view.scales || gate_view.e8m0_scales) &&
-                        (down_source->spec.scales_bytes == 0 ||
-                         down_view.scales || down_view.e8m0_scales);
+                    if (!cached) {
+                        valid = gate_up_source->cache->acquire(
+                            gate_up_source, down_source,
+                            selected_experts[slot], gate_view, down_view);
+                        valid = valid && gate_view.data && down_view.data &&
+                            (gate_up_source->spec.scales_bytes == 0 ||
+                             gate_view.scales || gate_view.e8m0_scales) &&
+                            (down_source->spec.scales_bytes == 0 ||
+                             down_view.scales || down_view.e8m0_scales);
+                        if (valid &&
+                            impl_->moe_device_cache_stats.capacity_bytes != 0) {
+                            cached = impl_->cache_moe_device_expert(
+                                gate_up_source, down_source,
+                                selected_experts[slot], gate_view, down_view);
+                            valid = !impl_->failed;
+                        }
+                    }
                     if (valid) {
+                        const void* source_gate_data = cached
+                            ? cached->gate_up_data : gate_view.data;
+                        const void* source_gate_scales = cached
+                            ? cached->gate_up_scales
+                            : (gate_view.e8m0_scales
+                                   ? static_cast<const void*>(
+                                         gate_view.e8m0_scales)
+                                   : static_cast<const void*>(
+                                         gate_view.scales));
+                        const void* source_down_data = cached
+                            ? cached->down_data : down_view.data;
+                        const void* source_down_scales = cached
+                            ? cached->down_scales
+                            : (down_view.e8m0_scales
+                                   ? static_cast<const void*>(
+                                         down_view.e8m0_scales)
+                                   : static_cast<const void*>(
+                                         down_view.scales));
+                        const cudaMemcpyKind copy_kind = cached
+                            ? cudaMemcpyDeviceToDevice
+                            : cudaMemcpyHostToDevice;
                         valid = report_cuda(
                             cudaMemcpy(
                                 compact_gate_up +
                                     slot * gate_up_source->spec.data_bytes,
-                                gate_view.data,
+                                source_gate_data,
                                 gate_up_source->spec.data_bytes,
-                                cudaMemcpyHostToDevice),
+                                copy_kind),
                             "cudaMemcpy MOE SSD gate/up data");
                         if (valid && gate_up_source->spec.scales_bytes != 0) {
-                            const void* scales = gate_view.e8m0_scales
-                                ? static_cast<const void*>(
-                                      gate_view.e8m0_scales)
-                                : static_cast<const void*>(gate_view.scales);
                             valid = report_cuda(
                                 cudaMemcpy(
                                     compact_gate_up_scales + slot *
                                         gate_up_source->spec.scales_bytes,
-                                    scales,
+                                    source_gate_scales,
                                     gate_up_source->spec.scales_bytes,
-                                    cudaMemcpyHostToDevice),
+                                    copy_kind),
                                 "cudaMemcpy MOE SSD gate/up scales");
                         }
                         if (valid) {
@@ -4777,24 +4991,28 @@ void CudaBackend::dispatch(const GraphNode& node,
                                 cudaMemcpy(
                                     compact_down +
                                         slot * down_source->spec.data_bytes,
-                                    down_view.data,
+                                    source_down_data,
                                     down_source->spec.data_bytes,
-                                    cudaMemcpyHostToDevice),
+                                    copy_kind),
                                 "cudaMemcpy MOE SSD down data");
                         }
                         if (valid && down_source->spec.scales_bytes != 0) {
-                            const void* scales = down_view.e8m0_scales
-                                ? static_cast<const void*>(
-                                      down_view.e8m0_scales)
-                                : static_cast<const void*>(down_view.scales);
                             valid = report_cuda(
                                 cudaMemcpy(
                                     compact_down_scales + slot *
                                         down_source->spec.scales_bytes,
-                                    scales,
+                                    source_down_scales,
                                     down_source->spec.scales_bytes,
-                                    cudaMemcpyHostToDevice),
+                                    copy_kind),
                                 "cudaMemcpy MOE SSD down scales");
+                        }
+                        if (valid && cached) {
+                            impl_->moe_device_cache_stats
+                                .device_to_device_bytes +=
+                                gate_up_source->spec.data_bytes +
+                                gate_up_source->spec.scales_bytes +
+                                down_source->spec.data_bytes +
+                                down_source->spec.scales_bytes;
                         }
                     }
                 }

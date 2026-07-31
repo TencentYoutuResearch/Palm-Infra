@@ -43,6 +43,8 @@ public:
     void alloc_persistent(Tensor& tensor, size_t nbytes) override;
     void upload_input(Tensor& tensor, const std::string& key,
                       const void* host_src, size_t nbytes) override;
+    bool configure_moe_device_cache(size_t capacity_bytes) override;
+    DeviceMoeCacheStats moe_device_cache_stats() const override;
 
     bool supports_lm_head(const Tensor& weight) const override;
     void lm_head_gemv(const float* activation_host, const Tensor& weight,

@@ -140,6 +140,17 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                     (unsigned long long)ssd.hits, (unsigned long long)ssd.misses,
                     (unsigned long long)ssd.evictions, ssd.bytes_read / 1e6,
                     ssd.resident_bytes / 1e6);
+        if (engine.config().moe_device_cache_bytes != 0) {
+            const auto device = engine.moe_device_cache_stats();
+            std::printf("moe_device_cache_mb=%.1f moe_device_hits=%llu moe_device_misses=%llu moe_device_evictions=%llu moe_device_h2d_mb=%.1f moe_device_d2d_mb=%.1f moe_device_resident_mb=%.1f\n",
+                        device.capacity_bytes / 1e6,
+                        (unsigned long long)device.hits,
+                        (unsigned long long)device.misses,
+                        (unsigned long long)device.evictions,
+                        device.host_to_device_bytes / 1e6,
+                        device.device_to_device_bytes / 1e6,
+                        device.resident_bytes / 1e6);
+        }
         std::printf("moe_ssd_cross_layer_tasks=%llu moe_ssd_cross_layer_dropped=%llu moe_ssd_cross_layer_experts=%llu moe_ssd_cross_layer_used=%llu moe_ssd_cross_layer_rejected=%llu\n",
                     (unsigned long long)ssd.cross_layer_tasks,
                     (unsigned long long)ssd.cross_layer_dropped,
@@ -270,6 +281,16 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
         human_row_int("moe_ssd_misses", (long long)ssd.misses, "");
         human_row_int("moe_ssd_evictions", (long long)ssd.evictions, "");
         human_row("moe_ssd_read_mb", ssd.bytes_read / 1e6, "MB");
+        if (engine.config().moe_device_cache_bytes != 0) {
+            const auto device = engine.moe_device_cache_stats();
+            human_row("moe_device_cache_mb", device.capacity_bytes / 1e6, "MB");
+            human_row_int("moe_device_hits", (long long)device.hits, "");
+            human_row_int("moe_device_misses", (long long)device.misses, "");
+            human_row_int("moe_device_evictions", (long long)device.evictions, "");
+            human_row("moe_device_h2d_mb", device.host_to_device_bytes / 1e6, "MB");
+            human_row("moe_device_d2d_mb", device.device_to_device_bytes / 1e6, "MB");
+            human_row("moe_device_resident_mb", device.resident_bytes / 1e6, "MB");
+        }
         human_row_int("moe_ssd_cross_layer_tasks", (long long)ssd.cross_layer_tasks, "");
         human_row_int("moe_ssd_cross_layer_dropped", (long long)ssd.cross_layer_dropped, "");
         human_row_int("moe_ssd_cross_layer_experts", (long long)ssd.cross_layer_experts, "");

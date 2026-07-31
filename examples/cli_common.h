@@ -33,6 +33,7 @@ struct CliCommonOptions {
     bool lock_dense_weights = true;
     bool lock_expert_cache = kDefaultLockMoeSsdCache;
     int ssd_cache_mb = 0;        // >0: page routed MoE experts from package
+    int device_moe_cache_mb = 0; // >0: retain paged experts on accelerator
     int ssd_io_workers = 8;      // dedicated pread workers for MoE SSD cache
     bool ssd_cross_layer_prefetch = true;   // next-layer predictor (with global pool)
     int ssd_shallow_cache_layers = 0;  // early MoE layers with priority cache quota

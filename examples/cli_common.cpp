@@ -144,6 +144,15 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 error = "invalid value for --ssd-cache-mb";
                 return false;
             }
+        } else if (arg == "--device-moe-cache-mb") {
+            if (!require_value(argc, argv, i, "--device-moe-cache-mb",
+                               value, error))
+                return false;
+            if (!parse_int(value, opts.device_moe_cache_mb) ||
+                opts.device_moe_cache_mb < 1) {
+                error = "invalid value for --device-moe-cache-mb";
+                return false;
+            }
         } else if (arg == "--ssd-io-workers") {
             if (!require_value(argc, argv, i, "--ssd-io-workers", value, error)) return false;
             if (!parse_int(value, opts.ssd_io_workers) || opts.ssd_io_workers < 1) {
@@ -300,6 +309,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --device <cpu|metal|cuda> Compute backend (GPU backends require their build option)\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>    Host MoE SSD cache; pins dense weights by default\n");
+    std::printf("  --device-moe-cache-mb <int>  Accelerator LRU for SSD-streamed experts\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --ssd-cross-layer-prefetch  Next-layer gate prefetch (default with global cache)\n");
     std::printf("  --no-ssd-cross-layer-prefetch  Disable next-layer gate prefetch\n");
@@ -344,6 +354,8 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.device = opts.device;
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
+    cfg.moe_device_cache_bytes =
+        static_cast<size_t>(opts.device_moe_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;
     cfg.moe_ssd_cross_layer_prefetch = opts.ssd_global_cache &&
                                          opts.ssd_cross_layer_prefetch;

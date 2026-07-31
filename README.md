@@ -377,6 +377,20 @@ cmake --build build_cuda -j
 ./build_cuda/mollm_chat --device cuda --package model.mollm
 ```
 
+SSD-offloaded quantized MoE packages can additionally retain recently routed
+expert pairs in a bounded CUDA cache:
+
+```bash
+./build_cuda/mollm_chat --device cuda --package model.mollm \
+    --ssd-cache-mb 10240 --device-moe-cache-mb 4096
+```
+
+`--device-moe-cache-mb` is opt-in and requires `--ssd-cache-mb`. A miss copies
+an expert pair from the host cache to CUDA once; subsequent hits avoid both SSD
+reads and host-to-device transfers. The current correctness-first kernels still
+assemble the selected experts into compact device scratch with device-to-device
+copies.
+
 The CUDA backend is still a correctness-first implementation. Graph outputs
 and persistent state use device-addressable managed storage, FP16/FP32 linear
 layers run through cuBLAS, and ordinary package-native W8, W4G32, and W4G128
@@ -408,9 +422,10 @@ compressor and indexer, sparse attention, checkpoint-native dense and grouped
 FP8 projections, and resident FP8/MXFP4 hash-routed MoE operator are native.
 For SSD-offloaded MoE packages, routing is computed on CUDA and only the
 selected quantized expert pairs are copied from the host LRU cache into compact
-device scratch. W8 row-major, package-native W4 BG32/BG128, and DeepSeek MXFP4
-experts are supported without CPU operator fallback. This path is
-correctness-first and currently uses synchronous route and expert transfers;
+device scratch, or reused from the optional bounded device LRU described above.
+W8 row-major, package-native W4 BG32/BG128, and DeepSeek MXFP4 experts are
+supported without CPU operator fallback. This path is correctness-first and
+currently uses synchronous route and expert transfers;
 FP16/FP32 SSD experts retain their existing CPU/Metal behavior.
 Other operators not yet implemented natively synchronize and use the CPU
 reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to

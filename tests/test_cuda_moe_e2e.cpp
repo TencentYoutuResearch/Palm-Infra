@@ -19,7 +19,8 @@ bool copy_finite(const Tensor& tensor, std::vector<float>& values) {
 
 bool run(const char* package, const char* expected_architecture, Device device,
          std::vector<float>& prefill, std::vector<float>& decode,
-         size_t stream_cache_bytes = 0, bool require_eviction = false) {
+         size_t stream_cache_bytes = 0, size_t device_cache_bytes = 0,
+         bool require_eviction = false, bool require_device_reuse = false) {
     LLMEngine engine;
     EngineConfig config;
     config.package_path = package;
@@ -29,6 +30,7 @@ bool run(const char* package, const char* expected_architecture, Device device,
     config.weight_loading = WeightLoadingMode::MMAP;
     if (stream_cache_bytes != 0)
         config.moe_ssd_cache_bytes = stream_cache_bytes;
+    config.moe_device_cache_bytes = device_cache_bytes;
     if (!engine.load(config))
         return false;
     const auto& metadata = engine.package_metadata();
@@ -42,10 +44,34 @@ bool run(const char* package, const char* expected_architecture, Device device,
     Tensor decode_tensor = engine.decode_hidden(4);
     if (!copy_finite(decode_tensor, decode) || engine.past_len() != 4)
         return false;
+    if (require_device_reuse) {
+        const auto host_before = engine.moe_ssd_stats();
+        const auto device_before = engine.moe_device_cache_stats();
+        std::vector<float> repeated_decode;
+        Tensor repeated = engine.decode_hidden(4);
+        if (!copy_finite(repeated, repeated_decode) || engine.past_len() != 5)
+            return false;
+        const auto host_after = engine.moe_ssd_stats();
+        const auto device_after = engine.moe_device_cache_stats();
+        if (host_after.bytes_read != host_before.bytes_read ||
+            device_after.host_to_device_bytes !=
+                device_before.host_to_device_bytes ||
+            device_after.hits < device_before.hits + 2)
+            return false;
+    }
     if (stream_cache_bytes != 0) {
         const auto stats = engine.moe_ssd_stats();
         if (stats.misses == 0 || stats.bytes_read == 0 ||
             (require_eviction && stats.evictions == 0))
+            return false;
+    }
+    if (device_cache_bytes != 0) {
+        const auto stats = engine.moe_device_cache_stats();
+        if (stats.capacity_bytes != device_cache_bytes || stats.misses == 0 ||
+            stats.host_to_device_bytes == 0 ||
+            stats.device_to_device_bytes == 0 || stats.resident_bytes == 0 ||
+            (require_device_reuse &&
+             (stats.hits < 2 || stats.evictions == 0)))
             return false;
     }
     return true;
@@ -66,7 +92,9 @@ bool close_enough(const std::vector<float>& actual,
 
 bool compare_package(const char* package, const char* architecture,
                      const char* label, size_t stream_cache_bytes = 0,
-                     bool require_eviction = false) {
+                     size_t device_cache_bytes = 0,
+                     bool require_eviction = false,
+                     bool require_device_reuse = false) {
     std::vector<float> cpu_prefill;
     std::vector<float> cpu_decode;
     std::vector<float> cuda_prefill;
@@ -94,7 +122,8 @@ bool compare_package(const char* package, const char* architecture,
     std::vector<float> streamed_decode;
     if (!run(package, architecture, Device::CUDA,
              streamed_prefill, streamed_decode, stream_cache_bytes,
-             require_eviction)) {
+             device_cache_bytes, require_eviction,
+             require_device_reuse)) {
         std::fprintf(stderr, "tiny %s CUDA SSD inference failed\n", label);
         return false;
     }
@@ -124,16 +153,17 @@ int main(int argc, char** argv) {
         return 77;
     }
     if (!compare_package(
-            argv[1], "qwen3-moe", "Qwen3-MoE W4", 2048) ||
+            argv[1], "qwen3-moe", "Qwen3-MoE W4", 2048, 4096) ||
         !compare_package(
-            argv[2], "qwen3.5-moe", "Qwen3.5-MoE W4", 2048) ||
+            argv[2], "qwen3.5-moe", "Qwen3.5-MoE W4", 2048, 4096) ||
         !compare_package(
-            argv[3], "qwen3-moe", "Qwen3-MoE W8", 4096) ||
+            argv[3], "qwen3-moe", "Qwen3-MoE W8", 4096, 8192) ||
         !compare_package(
-            argv[4], "qwen3-moe", "Qwen3-MoE W4G128", 32768) ||
+            argv[4], "qwen3-moe", "Qwen3-MoE W4G128", 32768, 65536) ||
         !compare_package(
             argv[5], "deepseek-v4",
-            "DeepSeek attention/hash/HC/grouped FP8+MXFP4", 2048, true))
+            "DeepSeek attention/hash/HC/grouped FP8+MXFP4",
+            2048, 4096, true, true))
         return 1;
     std::printf("Tiny CUDA MoE E2E tests passed\n");
     return 0;

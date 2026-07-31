@@ -201,6 +201,18 @@ python3 models/deepseek_v4.py \
     --ssd-cache-mb 10240 --ssd-io-workers 8 --threads 6
 ```
 
+CUDA 下还可以显式启用有界的 device expert LRU。cache miss 时 expert pair
+从 host cache 复制到 GPU 一次，后续命中不会再读取 SSD 或进行 H2D 传输；当前
+correctness-first kernel 仍会通过 D2D 复制组装 compact device scratch：
+
+```bash
+./build_cuda/mollm_chat --device cuda \
+    --package deepseek_v4_flash_native.mollm \
+    --ssd-cache-mb 10240 --device-moe-cache-mb 4096
+```
+
+`--device-moe-cache-mb` 默认关闭，并且必须和 `--ssd-cache-mb` 一起使用。
+
 | `model_type` | 支持的模型 |
 |---|---|
 | `qwen3` | Qwen3 dense text models |

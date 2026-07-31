@@ -98,6 +98,9 @@ struct EngineConfig {
     // packages carrying `moe_expert_storage` metadata; CUDA copies only the
     // selected expert pairs into compact device scratch.
     size_t moe_ssd_cache_bytes = 0;
+    // Optional accelerator-side LRU for SSD-streamed expert pairs. The host
+    // cache remains the backing store; device hits avoid repeated PCIe copies.
+    size_t moe_device_cache_bytes = 0;
     int moe_ssd_io_workers = 8;
     // Decode-only next-layer gate prefetch. Enabled with the shared SSD pool.
     bool moe_ssd_cross_layer_prefetch = true;
@@ -259,6 +262,11 @@ public:
     }
     void reset_moe_ssd_stats() {
         if (moe_ssd_cache_) moe_ssd_cache_->reset_stats();
+    }
+    DeviceMoeCacheStats moe_device_cache_stats() const {
+        return accelerator_backend_
+            ? accelerator_backend_->moe_device_cache_stats()
+            : DeviceMoeCacheStats{};
     }
 
     /// Return raw logits. If all_positions=true, returns vocab_size*seq_len

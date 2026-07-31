@@ -23,6 +23,7 @@ struct Options {
     int threads = default_worker_threads();
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     int ssd_cache_mb = 0;
+    int device_moe_cache_mb = 0;
     int ssd_io_workers = 8;
     std::string trace_path;
     std::string token_loss_path;
@@ -62,6 +63,7 @@ void print_usage(const char* argv0) {
     std::printf("  --device <cpu|metal|cuda>  Compute backend (default: cpu)\n");
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>  Host MoE SSD cache capacity\n");
+    std::printf("  --device-moe-cache-mb <int>  Accelerator expert LRU capacity\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --metal-ssd-full      Experimental full-Metal SSD decode\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
@@ -144,6 +146,13 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
             if (!require_value("--ssd-cache-mb", value)) return false;
             if (!parse_int(value, opts.ssd_cache_mb) || opts.ssd_cache_mb < 1) {
                 error = "invalid value for --ssd-cache-mb";
+                return false;
+            }
+        } else if (arg == "--device-moe-cache-mb") {
+            if (!require_value("--device-moe-cache-mb", value)) return false;
+            if (!parse_int(value, opts.device_moe_cache_mb) ||
+                opts.device_moe_cache_mb < 1) {
+                error = "invalid value for --device-moe-cache-mb";
                 return false;
             }
         } else if (arg == "--ssd-io-workers") {
@@ -241,6 +250,8 @@ int main(int argc, char** argv) {
     cfg.sampling.temperature = 0.0f;
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
+    cfg.moe_device_cache_bytes =
+        static_cast<size_t>(opts.device_moe_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;
     cfg.metal_ssd_full = opts.metal_ssd_full;
     cfg.trace_path = opts.trace_path;
