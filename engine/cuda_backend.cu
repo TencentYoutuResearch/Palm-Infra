@@ -2419,6 +2419,7 @@ struct CudaBackend::Impl {
         const void* down_scales = nullptr;
         uint64_t used_at = 0;
         bool pinned = false;
+        bool ready = false;
     };
 
     bool ok = false;
@@ -2554,7 +2555,7 @@ struct CudaBackend::Impl {
         for (int expert : experts) {
             for (auto& entry : moe_device_cache) {
                 if (entry.gate_up != gate_up || entry.down != down ||
-                    entry.expert != expert)
+                    entry.expert != expert || !entry.ready)
                     continue;
                 entry.pinned = true;
                 entry.used_at = ++moe_device_cache_clock;
@@ -2583,14 +2584,13 @@ struct CudaBackend::Impl {
             moe_device_cache.begin(), moe_device_cache.end(),
             [&](const MoeDeviceCacheEntry& entry) {
                 return entry.gate_up == gate_up && entry.down == down &&
-                    entry.expert == expert;
+                    entry.expert == expert && entry.ready;
             });
     }
 
-    MoeDeviceCacheEntry* cache_moe_device_expert(
+    MoeDeviceCacheEntry* reserve_moe_device_expert(
         const MoeSsdTensorSource* gate_up,
-        const MoeSsdTensorSource* down, int expert,
-        const Tensor& gate_view, const Tensor& down_view) {
+        const MoeSsdTensorSource* down, int expert) {
         ++moe_device_cache_stats.misses;
         const size_t capacity = moe_device_cache_stats.capacity_bytes;
         if (capacity == 0)
@@ -2635,18 +2635,6 @@ struct CudaBackend::Impl {
             moe_device_cache.erase(victim);
         }
 
-        const void* gate_host_scales = gate_view.e8m0_scales
-            ? static_cast<const void*>(gate_view.e8m0_scales)
-            : static_cast<const void*>(gate_view.scales);
-        const void* down_host_scales = down_view.e8m0_scales
-            ? static_cast<const void*>(down_view.e8m0_scales)
-            : static_cast<const void*>(down_view.scales);
-        if (!gate_view.data || !down_view.data ||
-            (gate_up->spec.scales_bytes != 0 && !gate_host_scales) ||
-            (down->spec.scales_bytes != 0 && !down_host_scales)) {
-            return nullptr;
-        }
-
         void* allocation = nullptr;
         if (!report_cuda(cudaMalloc(&allocation, allocation_bytes),
                          "cudaMalloc MOE device cache entry")) {
@@ -2654,31 +2642,6 @@ struct CudaBackend::Impl {
             return nullptr;
         }
         auto* base = static_cast<uint8_t*>(allocation);
-        auto copy_component = [&](size_t offset, const void* source,
-                                  size_t bytes, const char* label) {
-            return bytes == 0 || report_cuda(
-                cudaMemcpy(base + offset, source, bytes,
-                           cudaMemcpyHostToDevice), label);
-        };
-        const bool copied =
-            copy_component(gate_data_offset, gate_view.data,
-                           gate_up->spec.data_bytes,
-                           "cudaMemcpy cached MOE gate/up data") &&
-            copy_component(gate_scales_offset, gate_host_scales,
-                           gate_up->spec.scales_bytes,
-                           "cudaMemcpy cached MOE gate/up scales") &&
-            copy_component(down_data_offset, down_view.data,
-                           down->spec.data_bytes,
-                           "cudaMemcpy cached MOE down data") &&
-            copy_component(down_scales_offset, down_host_scales,
-                           down->spec.scales_bytes,
-                           "cudaMemcpy cached MOE down scales");
-        if (!copied) {
-            cudaFree(allocation);
-            failed = true;
-            return nullptr;
-        }
-
         moe_device_cache.push_back({
             gate_up,
             down,
@@ -2691,12 +2654,59 @@ struct CudaBackend::Impl {
             down->spec.scales_bytes ? base + down_scales_offset : nullptr,
             ++moe_device_cache_clock,
             true,
+            false,
         });
         moe_device_cache_stats.resident_bytes += allocation_bytes;
+        return &moe_device_cache.back();
+    }
+
+    bool fill_moe_device_expert(
+        MoeDeviceCacheEntry& entry,
+        const MoeSsdTensorSource* gate_up,
+        const MoeSsdTensorSource* down,
+        const Tensor& gate_view, const Tensor& down_view) {
+        const void* gate_host_scales = gate_view.e8m0_scales
+            ? static_cast<const void*>(gate_view.e8m0_scales)
+            : static_cast<const void*>(gate_view.scales);
+        const void* down_host_scales = down_view.e8m0_scales
+            ? static_cast<const void*>(down_view.e8m0_scales)
+            : static_cast<const void*>(down_view.scales);
+        if (!gate_view.data || !down_view.data ||
+            (gate_up->spec.scales_bytes != 0 && !gate_host_scales) ||
+            (down->spec.scales_bytes != 0 && !down_host_scales)) {
+            failed = true;
+            return false;
+        }
+        auto copy_component = [](void* destination, const void* source,
+                                 size_t bytes, const char* label) {
+            return bytes == 0 || report_cuda(
+                cudaMemcpy(destination, source, bytes,
+                           cudaMemcpyHostToDevice), label);
+        };
+        if (!copy_component(
+                const_cast<void*>(entry.gate_up_data), gate_view.data,
+                gate_up->spec.data_bytes,
+                "cudaMemcpy cached MOE gate/up data") ||
+            !copy_component(
+                const_cast<void*>(entry.gate_up_scales), gate_host_scales,
+                gate_up->spec.scales_bytes,
+                "cudaMemcpy cached MOE gate/up scales") ||
+            !copy_component(
+                const_cast<void*>(entry.down_data), down_view.data,
+                down->spec.data_bytes,
+                "cudaMemcpy cached MOE down data") ||
+            !copy_component(
+                const_cast<void*>(entry.down_scales), down_host_scales,
+                down->spec.scales_bytes,
+                "cudaMemcpy cached MOE down scales")) {
+            failed = true;
+            return false;
+        }
+        entry.ready = true;
         moe_device_cache_stats.host_to_device_bytes +=
             gate_up->spec.data_bytes + gate_up->spec.scales_bytes +
             down->spec.data_bytes + down->spec.scales_bytes;
-        return &moe_device_cache.back();
+        return true;
     }
 
     const DeviceWeight* find_weight(const Tensor& tensor) const {
@@ -4926,6 +4936,9 @@ void CudaBackend::dispatch(const GraphNode& node,
                         }
                     }
                 }
+                std::vector<int> fallback_slots(
+                    static_cast<size_t>(num_experts), -1);
+                size_t fallback_count = 0;
                 if (valid) {
                     impl_->prepare_moe_device_experts(
                         gate_up_source, down_source, selected_experts);
@@ -4937,32 +4950,59 @@ void CudaBackend::dispatch(const GraphNode& node,
                             host_requests.push_back(expert);
                         }
                     }
-                    valid = host_requests.empty() ||
-                        gate_up_source->cache->request_many(
-                            gate_up_source, down_source, host_requests);
+                    for (int expert : host_requests) {
+                        if (impl_->moe_device_cache_stats.capacity_bytes ==
+                                0 ||
+                            !impl_->reserve_moe_device_expert(
+                                gate_up_source, down_source, expert)) {
+                            fallback_slots[static_cast<size_t>(expert)] =
+                                static_cast<int>(fallback_count++);
+                        }
+                    }
+                    valid = !impl_->failed &&
+                        (host_requests.empty() ||
+                         gate_up_source->cache->request_many(
+                             gate_up_source, down_source, host_requests));
                 }
                 const size_t selected_count = selected_experts.size();
+                const size_t pair_payload_bytes =
+                    gate_up_source->spec.data_bytes +
+                    gate_up_source->spec.scales_bytes +
+                    down_source->spec.data_bytes +
+                    down_source->spec.scales_bytes;
+                impl_->moe_device_cache_stats.peak_selected_bytes = std::max(
+                    impl_->moe_device_cache_stats.peak_selected_bytes,
+                    selected_count * pair_payload_bytes);
+                impl_->moe_device_cache_stats.fallback_scratch_bytes =
+                    std::max(
+                        impl_->moe_device_cache_stats.fallback_scratch_bytes,
+                        fallback_count * pair_payload_bytes);
                 auto* compact_gate_up = valid
+                    && fallback_count != 0
                     ? static_cast<uint8_t*>(impl_->scratch(
                           "moe_ssd_gate_up_data",
-                          selected_count * gate_up_source->spec.data_bytes))
+                          fallback_count * gate_up_source->spec.data_bytes))
                     : nullptr;
                 auto* compact_gate_up_scales =
-                    valid && gate_up_source->spec.scales_bytes != 0
+                    valid && fallback_count != 0 &&
+                            gate_up_source->spec.scales_bytes != 0
                     ? static_cast<uint8_t*>(impl_->scratch(
                           "moe_ssd_gate_up_scales",
-                          selected_count * gate_up_source->spec.scales_bytes))
+                          fallback_count *
+                              gate_up_source->spec.scales_bytes))
                     : nullptr;
                 auto* compact_down = valid
+                    && fallback_count != 0
                     ? static_cast<uint8_t*>(impl_->scratch(
                           "moe_ssd_down_data",
-                          selected_count * down_source->spec.data_bytes))
+                          fallback_count * down_source->spec.data_bytes))
                     : nullptr;
                 auto* compact_down_scales =
-                    valid && down_source->spec.scales_bytes != 0
+                    valid && fallback_count != 0 &&
+                            down_source->spec.scales_bytes != 0
                     ? static_cast<uint8_t*>(impl_->scratch(
                           "moe_ssd_down_scales",
-                          selected_count * down_source->spec.scales_bytes))
+                          fallback_count * down_source->spec.scales_bytes))
                     : nullptr;
                 const size_t pointer_table_bytes =
                     static_cast<size_t>(num_experts) * sizeof(void*);
@@ -4986,11 +5026,15 @@ void CudaBackend::dispatch(const GraphNode& node,
                           "moe_ssd_down_scale_ptrs",
                           pointer_table_bytes))
                     : nullptr;
-                valid = valid && compact_gate_up && compact_down &&
+                valid = valid &&
+                    (fallback_count == 0 ||
+                     (compact_gate_up && compact_down)) &&
                     (gate_up_source->spec.scales_bytes == 0 ||
-                     (compact_gate_up_scales && device_gate_up_scales)) &&
+                     (device_gate_up_scales &&
+                      (fallback_count == 0 || compact_gate_up_scales))) &&
                     (down_source->spec.scales_bytes == 0 ||
-                     (compact_down_scales && device_down_scales)) &&
+                     (device_down_scales &&
+                      (fallback_count == 0 || compact_down_scales))) &&
                     device_gate_up_data && device_down_data;
                 std::vector<const void*> host_gate_up_data(
                     static_cast<size_t>(num_experts), nullptr);
@@ -5006,7 +5050,7 @@ void CudaBackend::dispatch(const GraphNode& node,
                         gate_up_source, down_source, selected_experts[slot]);
                     Tensor gate_view;
                     Tensor down_view;
-                    if (!cached) {
+                    if (!cached || !cached->ready) {
                         valid = gate_up_source->cache->acquire(
                             gate_up_source, down_source,
                             selected_experts[slot], gate_view, down_view);
@@ -5015,16 +5059,14 @@ void CudaBackend::dispatch(const GraphNode& node,
                              gate_view.scales || gate_view.e8m0_scales) &&
                             (down_source->spec.scales_bytes == 0 ||
                              down_view.scales || down_view.e8m0_scales);
-                        if (valid &&
-                            impl_->moe_device_cache_stats.capacity_bytes != 0) {
-                            cached = impl_->cache_moe_device_expert(
-                                gate_up_source, down_source,
-                                selected_experts[slot], gate_view, down_view);
-                            valid = !impl_->failed;
+                        if (valid && cached) {
+                            valid = impl_->fill_moe_device_expert(
+                                *cached, gate_up_source, down_source,
+                                gate_view, down_view);
                         }
                     }
                     if (valid) {
-                        if (cached) {
+                        if (cached && cached->ready) {
                             host_gate_up_data[expert] = cached->gate_up_data;
                             host_gate_up_scales[expert] =
                                 cached->gate_up_scales;
@@ -5038,17 +5080,26 @@ void CudaBackend::dispatch(const GraphNode& node,
                                 down_source->spec.scales_bytes;
                             continue;
                         }
+                        const int fallback_slot = fallback_slots[
+                            static_cast<size_t>(expert)];
+                        valid = fallback_slot >= 0;
+                        if (!valid)
+                            break;
                         uint8_t* gate_data = compact_gate_up +
-                            slot * gate_up_source->spec.data_bytes;
+                            static_cast<size_t>(fallback_slot) *
+                                gate_up_source->spec.data_bytes;
                         uint8_t* gate_scales = compact_gate_up_scales
                             ? compact_gate_up_scales +
-                                slot * gate_up_source->spec.scales_bytes
+                                static_cast<size_t>(fallback_slot) *
+                                    gate_up_source->spec.scales_bytes
                             : nullptr;
                         uint8_t* down_data_pointer = compact_down +
-                            slot * down_source->spec.data_bytes;
+                            static_cast<size_t>(fallback_slot) *
+                                down_source->spec.data_bytes;
                         uint8_t* down_scales_pointer = compact_down_scales
                             ? compact_down_scales +
-                                slot * down_source->spec.scales_bytes
+                                static_cast<size_t>(fallback_slot) *
+                                    down_source->spec.scales_bytes
                             : nullptr;
                         valid = report_cuda(
                             cudaMemcpy(gate_data, gate_view.data,
@@ -5087,6 +5138,11 @@ void CudaBackend::dispatch(const GraphNode& node,
                         host_gate_up_scales[expert] = gate_scales;
                         host_down_data[expert] = down_data_pointer;
                         host_down_scales[expert] = down_scales_pointer;
+                        if (valid) {
+                            impl_->moe_device_cache_stats
+                                .fallback_host_to_device_bytes +=
+                                pair_payload_bytes;
+                        }
                     }
                 }
                 if (valid) {

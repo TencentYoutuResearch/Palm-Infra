@@ -25,10 +25,13 @@ struct DeviceMoeCacheStats {
     uint64_t misses = 0;
     uint64_t evictions = 0;
     uint64_t host_to_device_bytes = 0;
+    uint64_t fallback_host_to_device_bytes = 0;
     // Logical payload bytes made available to kernels without staging copies.
     uint64_t direct_expert_bytes = 0;
     size_t resident_bytes = 0;
     size_t capacity_bytes = 0;
+    size_t peak_selected_bytes = 0;
+    size_t fallback_scratch_bytes = 0;
 };
 
 // Common lifecycle for graph-resident accelerator backends. LLMEngine only

@@ -63,6 +63,8 @@ bool run(const char* package, const char* expected_architecture, Device device,
         if (host_after.bytes_read != host_before.bytes_read ||
             device_after.host_to_device_bytes !=
                 device_before.host_to_device_bytes ||
+            device_after.fallback_host_to_device_bytes !=
+                device_before.fallback_host_to_device_bytes ||
             device_after.hits < device_before.hits + 2 ||
             device_after.direct_expert_bytes <=
                 device_before.direct_expert_bytes)
@@ -81,8 +83,18 @@ bool run(const char* package, const char* expected_architecture, Device device,
             stats.direct_expert_bytes == 0 ||
             stats.resident_bytes == 0 ||
             (require_device_reuse &&
-             (stats.hits < 2 || stats.evictions == 0)))
+             (stats.hits < 2 || stats.evictions == 0 ||
+              stats.fallback_scratch_bytes == 0 ||
+              stats.fallback_scratch_bytes >= stats.peak_selected_bytes)))
             return false;
+        if (require_device_reuse) {
+            std::printf(
+                "tiny CUDA MoE device cache: peak selected=%zu, "
+                "fallback scratch=%zu, direct=%llu bytes\n",
+                stats.peak_selected_bytes, stats.fallback_scratch_bytes,
+                static_cast<unsigned long long>(
+                    stats.direct_expert_bytes));
+        }
     }
     return true;
 }
