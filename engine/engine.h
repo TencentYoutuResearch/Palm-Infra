@@ -93,6 +93,9 @@ struct EngineConfig {
     int rope_dim = 64;
     float rope_theta = 500000.f;
     int num_threads = default_worker_threads();
+    // CPU defaults to resident storage. An active CUDA backend transparently
+    // uses mmap because device weights are uploaded and the file-backed host
+    // view is sufficient for explicit operator fallback.
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     // Host-side MoE expert cache. A non-zero value enables SSD offload for
     // packages carrying `moe_expert_storage` metadata; CUDA exposes selected

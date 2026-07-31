@@ -307,7 +307,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
     std::printf("  --device <cpu|metal|cuda> Compute backend (GPU backends require their build option)\n");
-    std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
+    std::printf("  --mmap                  Use mmap-backed package weights (automatic on CUDA)\n");
     std::printf("  --ssd-cache-mb <int>    Host MoE SSD cache; pins dense weights by default\n");
     std::printf("  --device-moe-cache-mb <int>  Accelerator LRU for SSD-streamed experts\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");

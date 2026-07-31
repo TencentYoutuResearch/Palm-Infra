@@ -61,7 +61,7 @@ void print_usage(const char* argv0) {
     std::printf("  --threads <int>       Worker threads (default: auto, %d here)\n",
                 default_worker_threads());
     std::printf("  --device <cpu|metal|cuda>  Compute backend (default: cpu)\n");
-    std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
+    std::printf("  --mmap                Use mmap-backed package weights (automatic on CUDA)\n");
     std::printf("  --ssd-cache-mb <int>  Host MoE SSD cache capacity\n");
     std::printf("  --device-moe-cache-mb <int>  Accelerator expert LRU capacity\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");

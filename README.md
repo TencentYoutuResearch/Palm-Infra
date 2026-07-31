@@ -350,9 +350,12 @@ MoE chat:
 ./build_i8mm/mollm_chat --package qwen3_30b_a3b_w4g128.mollm --threads 4
 ```
 
-By default, `mollm_chat` loads package weights into resident memory. For mmap
+CPU inference loads package weights into resident memory by default. For mmap
 A/B testing, pass `--mmap`; mmap page warmup is enabled unless you also pass
-`--no-load-warmup`.
+`--no-load-warmup`. CUDA automatically keeps the host package mmap-backed:
+prepared weights are copied into device-owned storage, while file-backed host
+pages remain available to the explicit CPU fallback without retaining a
+second model-sized anonymous copy.
 
 ## Benchmark
 

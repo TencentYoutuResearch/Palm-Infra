@@ -27,8 +27,12 @@ bool run(const char* package, Device device, std::vector<float>& prefill,
     config.device = device;
     config.n_ctx = 16;
     config.num_threads = 1;
-    config.weight_loading = WeightLoadingMode::MMAP;
+    config.weight_loading = device == Device::CUDA
+        ? WeightLoadingMode::RESIDENT
+        : WeightLoadingMode::MMAP;
     if (!engine.load(config))
+        return false;
+    if (!engine.package_weights_mmap_backed())
         return false;
     const auto architecture = engine.package_metadata().find("architecture");
     if (architecture == engine.package_metadata().end() ||

@@ -286,7 +286,11 @@ tower 带来的包体与常驻内存开销。
 同时支持 OpenAI 风格的 `--presence-penalty` 与
 `--frequency-penalty`。参数范围和默认值可通过 `mollm_chat --help` 查看。
 
-默认情况下，`mollm_chat` 以 resident 模式加载包内权重。若需 mmap A/B 测试，传入 `--mmap`；默认 mmap 页面 warmup 已启用，可搭配 `--no-load-warmup` 关闭。
+CPU 推理默认以 resident 模式加载包内权重。若需 mmap A/B 测试，传入
+`--mmap`；默认 mmap 页面 warmup 已启用，可搭配 `--no-load-warmup` 关闭。
+CUDA 会自动保留 mmap-backed host package：prepared weight 会复制到设备自有
+存储，而 file-backed host page 仍可供显式 CPU fallback 使用，无需再保留一份
+模型大小的匿名内存副本。
 
 ## 基准测试
 
