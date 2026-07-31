@@ -439,8 +439,9 @@ This path is correctness-first and currently uses synchronous route and expert
 transfers.
 Other operators not yet implemented natively synchronize and use the CPU
 reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to
-print native/fallback operator counts. Several specialized model families
-still fall back, so this is not yet a performance-complete CUDA backend.
+print native/fallback operator counts. All currently supported graph families
+have native CUDA paths; the generic fallback remains as a correctness bridge
+for future operators. This is not yet a performance-complete CUDA backend.
 
 ## Local HTTP server
 

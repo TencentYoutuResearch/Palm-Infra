@@ -449,10 +449,13 @@ if(MOLLM_BUILD_TESTS)
         add_mollm_test(test_cuda_backend tests/test_cuda_backend.cpp)
         add_mollm_test(test_cuda_recurrent tests/test_cuda_recurrent.cpp)
         add_mollm_test(test_cuda_rwkv tests/test_cuda_rwkv.cpp)
-        add_mollm_test(test_cuda_vision_e2e tests/test_cuda_vision_e2e.cpp)
+        add_executable(test_cuda_vision_e2e tests/test_cuda_vision_e2e.cpp)
+        target_link_libraries(test_cuda_vision_e2e PRIVATE mollm_lib)
+        add_test(NAME test_cuda_vision_real_e2e
+                 COMMAND test_cuda_vision_e2e)
         set_tests_properties(
             test_cuda_backend test_cuda_recurrent test_cuda_rwkv
-            test_cuda_vision_e2e
+            test_cuda_vision_real_e2e
             PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -495,6 +498,16 @@ if(MOLLM_BUILD_TESTS)
                         ${CMAKE_CURRENT_SOURCE_DIR}/models/rwkv7.py
                         $<TARGET_FILE:test_cuda_rwkv_package_e2e>)
             set_tests_properties(test_cuda_rwkv_package_e2e
+                                 PROPERTIES SKIP_RETURN_CODE 77
+                                            LABELS "cuda;e2e")
+
+            add_test(
+                NAME test_cuda_vision_e2e
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tiny_qwen35_vision_cuda_e2e.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/models/converter.py
+                        $<TARGET_FILE:test_cuda_vision_e2e>)
+            set_tests_properties(test_cuda_vision_e2e
                                  PROPERTIES SKIP_RETURN_CODE 77
                                             LABELS "cuda;e2e")
         endif()

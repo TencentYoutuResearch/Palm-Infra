@@ -89,8 +89,9 @@ bool run_model(const char* package, Device device, VisionResult& result,
 
 }  // namespace
 
-int main() {
-    const char* package = std::getenv("MOLLM_QWEN35_VL_PACKAGE");
+int main(int argc, char** argv) {
+    const char* package = argc > 1 ? argv[1] :
+                                  std::getenv("MOLLM_QWEN35_VL_PACKAGE");
     if (!package || !*package) {
         std::fprintf(
             stderr, "MOLLM_QWEN35_VL_PACKAGE is unset; skipping\n");

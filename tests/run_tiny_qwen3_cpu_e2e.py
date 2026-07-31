@@ -95,7 +95,7 @@ def build_qwen3_fixture_model(model_dir: Path) -> None:
     write_safetensors(model_dir / "model.safetensors", tensors)
 
 
-def build_qwen35_fixture_model(model_dir: Path) -> None:
+def build_qwen35_fixture_model(model_dir: Path, include_vision: bool = False) -> None:
     import numpy as np
 
     hidden = 32
@@ -135,7 +135,6 @@ def build_qwen35_fixture_model(model_dir: Path) -> None:
             "vocab_size": vocab,
         },
     }
-    (model_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
     prefix = "model.language_model.layers.0"
     tensors = {
         "model.language_model.embed_tokens.weight": matrix(vocab, hidden),
@@ -158,6 +157,80 @@ def build_qwen35_fixture_model(model_dir: Path) -> None:
         f"{prefix}.mlp.up_proj.weight": matrix(intermediate, hidden),
         f"{prefix}.mlp.down_proj.weight": matrix(hidden, intermediate),
     }
+    if include_vision:
+        vision_hidden = 32
+        vision_heads = 4
+        vision_intermediate = 64
+        vision_positions = 16
+        merged_hidden = 4 * vision_hidden
+        config.update({
+            "image_token_id": 3,
+            "vision_start_token_id": 4,
+            "vision_end_token_id": 5,
+            "vision_config": {
+                "hidden_size": vision_hidden,
+                "in_channels": 3,
+                "temporal_patch_size": 2,
+                "patch_size": 2,
+                "depth": 1,
+                "num_heads": vision_heads,
+                "intermediate_size": vision_intermediate,
+                "spatial_merge_size": 2,
+                "out_hidden_size": hidden,
+                "num_position_embeddings": vision_positions,
+            },
+        })
+        config["text_config"]["rope_parameters"].update({
+            "partial_rotary_factor": 0.75,
+            "mrope_section": [1, 1, 1],
+        })
+        vision_prefix = "model.visual"
+        tensors.update({
+            f"{vision_prefix}.patch_embed.proj.weight": rng.uniform(
+                -0.08, 0.08,
+                (vision_hidden, 3, 2, 2, 2)).astype(np.float16),
+            f"{vision_prefix}.patch_embed.proj.bias": np.zeros(
+                vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.pos_embed.weight": matrix(
+                vision_positions, vision_hidden),
+            f"{vision_prefix}.blocks.0.norm1.weight": np.ones(
+                vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.blocks.0.norm1.bias": np.zeros(
+                vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.blocks.0.norm2.weight": np.ones(
+                vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.blocks.0.norm2.bias": np.zeros(
+                vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.blocks.0.attn.qkv.weight": matrix(
+                3 * vision_hidden, vision_hidden),
+            f"{vision_prefix}.blocks.0.attn.qkv.bias": np.zeros(
+                3 * vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.blocks.0.attn.proj.weight": matrix(
+                vision_hidden, vision_hidden),
+            f"{vision_prefix}.blocks.0.attn.proj.bias": np.zeros(
+                vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.blocks.0.mlp.linear_fc1.weight": matrix(
+                vision_intermediate, vision_hidden),
+            f"{vision_prefix}.blocks.0.mlp.linear_fc1.bias": np.zeros(
+                vision_intermediate, dtype=np.float32),
+            f"{vision_prefix}.blocks.0.mlp.linear_fc2.weight": matrix(
+                vision_hidden, vision_intermediate),
+            f"{vision_prefix}.blocks.0.mlp.linear_fc2.bias": np.zeros(
+                vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.merger.norm.weight": np.ones(
+                vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.merger.norm.bias": np.zeros(
+                vision_hidden, dtype=np.float32),
+            f"{vision_prefix}.merger.linear_fc1.weight": matrix(
+                merged_hidden, merged_hidden),
+            f"{vision_prefix}.merger.linear_fc1.bias": np.zeros(
+                merged_hidden, dtype=np.float32),
+            f"{vision_prefix}.merger.linear_fc2.weight": matrix(
+                hidden, merged_hidden),
+            f"{vision_prefix}.merger.linear_fc2.bias": np.zeros(
+                hidden, dtype=np.float32),
+        })
+    (model_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
     write_safetensors(model_dir / "model.safetensors", tensors)
 
 
