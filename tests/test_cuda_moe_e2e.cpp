@@ -18,7 +18,8 @@ bool copy_finite(const Tensor& tensor, std::vector<float>& values) {
 }
 
 bool run(const char* package, const char* expected_architecture, Device device,
-         std::vector<float>& prefill, std::vector<float>& decode) {
+         std::vector<float>& prefill, std::vector<float>& decode,
+         bool stream_experts = false) {
     LLMEngine engine;
     EngineConfig config;
     config.package_path = package;
@@ -26,6 +27,11 @@ bool run(const char* package, const char* expected_architecture, Device device,
     config.n_ctx = 8;
     config.num_threads = 1;
     config.weight_loading = WeightLoadingMode::MMAP;
+    if (stream_experts)
+        // One 1,632-byte MXFP4 expert pair fits, but two do not. This forces
+        // the host LRU to slide while CUDA keeps all routed pairs in compact
+        // device scratch for the current operator.
+        config.moe_ssd_cache_bytes = 2048;
     if (!engine.load(config))
         return false;
     const auto& metadata = engine.package_metadata();
@@ -37,7 +43,14 @@ bool run(const char* package, const char* expected_architecture, Device device,
     if (!copy_finite(prefill_tensor, prefill) || engine.past_len() != 3)
         return false;
     Tensor decode_tensor = engine.decode_hidden(4);
-    return copy_finite(decode_tensor, decode) && engine.past_len() == 4;
+    if (!copy_finite(decode_tensor, decode) || engine.past_len() != 4)
+        return false;
+    if (stream_experts) {
+        const auto stats = engine.moe_ssd_stats();
+        if (stats.misses < 4 || stats.evictions == 0 || stats.bytes_read == 0)
+            return false;
+    }
+    return true;
 }
 
 bool close_enough(const std::vector<float>& actual,
@@ -54,7 +67,7 @@ bool close_enough(const std::vector<float>& actual,
 }
 
 bool compare_package(const char* package, const char* architecture,
-                     const char* label) {
+                     const char* label, bool compare_streaming = false) {
     std::vector<float> cpu_prefill;
     std::vector<float> cpu_decode;
     std::vector<float> cuda_prefill;
@@ -72,9 +85,24 @@ bool compare_package(const char* package, const char* architecture,
     char decode_label[96];
     std::snprintf(prefill_label, sizeof(prefill_label), "%s prefill", label);
     std::snprintf(decode_label, sizeof(decode_label), "%s decode", label);
-    return close_enough(
-               cuda_prefill, cpu_prefill, 4e-2f, prefill_label) &&
+    bool valid = close_enough(
+                     cuda_prefill, cpu_prefill, 4e-2f, prefill_label) &&
         close_enough(cuda_decode, cpu_decode, 4e-2f, decode_label);
+    if (!valid || !compare_streaming)
+        return valid;
+
+    std::vector<float> streamed_prefill;
+    std::vector<float> streamed_decode;
+    if (!run(package, architecture, Device::CUDA,
+             streamed_prefill, streamed_decode, true)) {
+        std::fprintf(stderr, "tiny %s CUDA SSD inference failed\n", label);
+        return false;
+    }
+    std::snprintf(prefill_label, sizeof(prefill_label), "%s SSD prefill", label);
+    std::snprintf(decode_label, sizeof(decode_label), "%s SSD decode", label);
+    return close_enough(
+               streamed_prefill, cpu_prefill, 4e-2f, prefill_label) &&
+        close_enough(streamed_decode, cpu_decode, 4e-2f, decode_label);
 }
 
 }  // namespace
@@ -100,7 +128,7 @@ int main(int argc, char** argv) {
         !compare_package(argv[3], "qwen3-moe", "Qwen3-MoE W8") ||
         !compare_package(
             argv[4], "deepseek-v4",
-            "DeepSeek attention/hash/HC/grouped FP8+MXFP4"))
+            "DeepSeek attention/hash/HC/grouped FP8+MXFP4", true))
         return 1;
     std::printf("Tiny CUDA MoE E2E tests passed\n");
     return 0;

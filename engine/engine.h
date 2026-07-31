@@ -94,8 +94,9 @@ struct EngineConfig {
     float rope_theta = 500000.f;
     int num_threads = default_worker_threads();
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
-    // CPU-only MoE expert cache. A non-zero value enables SSD offload for
-    // packages carrying `moe_expert_storage` metadata.
+    // Host-side MoE expert cache. A non-zero value enables SSD offload for
+    // packages carrying `moe_expert_storage` metadata; CUDA copies only the
+    // selected expert pairs into compact device scratch.
     size_t moe_ssd_cache_bytes = 0;
     int moe_ssd_io_workers = 8;
     // Decode-only next-layer gate prefetch. Enabled with the shared SSD pool.

@@ -931,14 +931,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             return false;
         }
 
-        // Resident DeepSeek-V4 graphs are fully device-resident on CUDA.
-        // Metal and SSD-streamed experts still use the established CPU path;
-        // CUDA expert streaming needs a separate device-cache policy before
-        // it can avoid copying aggregate tensors into VRAM.
-        const bool unsupported_accelerator =
-            cfg_.device == Device::METAL ||
-            (cfg_.device == Device::CUDA &&
-             cfg_.moe_ssd_cache_bytes != 0);
+        // Resident and SSD-streamed DeepSeek-V4 graphs run on CUDA. Metal
+        // still uses the established CPU path unless its dedicated SSD mode
+        // grows support for the DeepSeek graph.
+        const bool unsupported_accelerator = cfg_.device == Device::METAL;
         if (unsupported_accelerator) {
             if (cfg_.metal_ssd_full) {
                 fprintf(stderr,
@@ -947,9 +943,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 return false;
             }
             fprintf(stderr,
-                    "Engine: DeepSeek-V4 uses the CPU backend for Metal or "
-                    "SSD-offloaded experts; ignoring accelerator device "
-                    "request\n");
+                    "Engine: DeepSeek-V4 uses the CPU backend for Metal; "
+                    "ignoring accelerator device request\n");
             accelerator_backend_.reset();
             cfg_.device = Device::CPU;
             exec_ctx_prefill_.backend = &cpu_backend_;
@@ -974,9 +969,18 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                         "Engine: full-Metal SSD decode enabled; experts load "
                         "directly into Shared Metal buffers\n");
             } else {
-                fprintf(stderr,
-                        "Engine: Metal/SSD hybrid adaptively selects CPU/Metal "
-                        "prefill and uses CPU decode; experts remain mmap-backed\n");
+                if (cfg_.device == Device::CUDA) {
+                    fprintf(
+                        stderr,
+                        "Engine: CUDA SSD expert streaming enabled; selected "
+                        "MXFP4 experts use compact device scratch\n");
+                } else {
+                    fprintf(
+                        stderr,
+                        "Engine: Metal/SSD hybrid adaptively selects "
+                        "CPU/Metal prefill and uses CPU decode; experts remain "
+                        "mmap-backed\n");
+                }
             }
         } else {
             if (!accelerator_backend_->register_weight_region(

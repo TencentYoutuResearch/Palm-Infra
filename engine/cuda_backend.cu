@@ -5,6 +5,7 @@
 #include "engine/engine.h"
 
 #include "kernels/activations.h"
+#include "kernels/moe_ssd.h"
 #include "kernels/quant_layouts.h"
 
 #include <cublas_v2.h>
@@ -1768,7 +1769,7 @@ __global__ void hc_head_cuda(
 
 __global__ void moe_gate_up_cuda(
     const float* hidden, size_t hidden_stride, const int* route_indices,
-    const float* route_weights,
+    const int* expert_slots, const float* route_weights,
     const void* gate_up, bool gate_up_fp32, int gate_up_layout,
     const float* gate_up_scales, int gate_up_group_size,
     int gate_up_groups_per_row, const uint8_t* gate_up_e8m0_scales,
@@ -1784,8 +1785,9 @@ __global__ void moe_gate_up_cuda(
     const int route = index / intermediate_size;
     const int token = route / top_k;
     const int expert = route_indices[route];
+    const int slot = expert_slots ? expert_slots[expert] : expert;
     const float* input = hidden + static_cast<size_t>(token) * hidden_stride;
-    const int gate_row = expert * 2 * intermediate_size + dimension;
+    const int gate_row = slot * 2 * intermediate_size + dimension;
     const int up_row = gate_row + intermediate_size;
     float gate = 0.0f;
     float up = 0.0f;
@@ -1848,7 +1850,8 @@ __global__ void moe_gate_up_cuda(
 }
 
 __global__ void moe_down_cuda(
-    const int* route_indices, const float* route_weights,
+    const int* route_indices, const int* expert_slots,
+    const float* route_weights,
     const float* intermediate, const void* down, bool down_fp32,
     int down_layout, const float* down_scales, int down_group_size,
     int down_groups_per_row, const uint8_t* down_e8m0_scales, float* output,
@@ -1865,7 +1868,8 @@ __global__ void moe_down_cuda(
     for (int route_index = 0; route_index < top_k; ++route_index) {
         const int route = token * top_k + route_index;
         const int expert = route_indices[route];
-        const int row = expert * hidden_size + dimension;
+        const int slot = expert_slots ? expert_slots[expert] : expert;
+        const int row = slot * hidden_size + dimension;
         float contribution = 0.0f;
         const float* route_input = intermediate +
             static_cast<size_t>(route) * intermediate_size;
@@ -4355,6 +4359,13 @@ void CudaBackend::dispatch(const GraphNode& node,
         const auto* router = impl_->find_weight(*inputs[1]);
         const auto* gate_up = impl_->find_weight(*inputs[2]);
         const auto* down = impl_->find_weight(*inputs[3]);
+        const auto* gate_up_source =
+            static_cast<const MoeSsdTensorSource*>(
+                inputs[2]->moe_ssd_source);
+        const auto* down_source =
+            static_cast<const MoeSsdTensorSource*>(
+                inputs[3]->moe_ssd_source);
+        const bool streamed_experts = gate_up_source || down_source;
         auto valid_microscaled_weight = [](const Impl::DeviceWeight* weight) {
             if (!weight || !weight->e8m0_scales)
                 return false;
@@ -4425,9 +4436,29 @@ void CudaBackend::dispatch(const GraphNode& node,
             inputs[0]->shape[2] == 1 && inputs[0]->shape[3] == 1 &&
             inputs[0]->stride[1] >=
                 static_cast<size_t>(hidden_size) * sizeof(float);
+        const bool valid_streamed_experts = streamed_experts &&
+            gate_up_source && down_source && gate_up_source->cache &&
+            gate_up_source->cache == down_source->cache &&
+            gate_up_source->spec.precision == Precision::MXFP4 &&
+            down_source->spec.precision == Precision::MXFP4 &&
+            gate_up_source->spec.num_experts == num_experts &&
+            down_source->spec.num_experts == num_experts &&
+            gate_up_source->spec.rows == 2 * intermediate_size &&
+            gate_up_source->spec.cols == hidden_size &&
+            down_source->spec.rows == hidden_size &&
+            down_source->spec.cols == intermediate_size &&
+            hidden_size % 32 == 0 && intermediate_size % 32 == 0 &&
+            gate_up_source->spec.group_size == 32 &&
+            gate_up_source->spec.groups_per_row == hidden_size / 32 &&
+            down_source->spec.group_size == 32 &&
+            down_source->spec.groups_per_row == intermediate_size / 32 &&
+            gate_up_source->spec.scales_bytes != 0 &&
+            down_source->spec.scales_bytes != 0;
+        const bool valid_expert_pair = streamed_experts
+            ? valid_streamed_experts
+            : valid_expert_weight(gate_up) && valid_expert_weight(down);
         bool valid = fp32_row_major_hidden && fp32_contiguous(*output) &&
-            router &&
-            valid_expert_weight(gate_up) && valid_expert_weight(down) &&
+            router && valid_expert_pair &&
             hidden_size > 0 && num_experts > 0 && num_experts >= top_k &&
             top_k > 0 && top_k <= 64 && intermediate_size > 0 &&
             num_groups <= 64 && tokens > 0 && score_function >= 0 &&
@@ -4436,15 +4467,17 @@ void CudaBackend::dispatch(const GraphNode& node,
             output->shape[0] == hidden_size && output->shape[1] == tokens &&
             router->n == num_experts && router->k == hidden_size &&
             valid_matmul_weight(router) &&
-            gate_up->n == num_experts * 2 * intermediate_size &&
-            gate_up->k == hidden_size &&
-            down->n == num_experts * hidden_size &&
-            down->k == intermediate_size;
-        const bool bf16_activations = gate_up &&
-            gate_up->layout == Impl::WeightLayout::Mxfp4RowMajor;
-        valid = valid &&
+            (streamed_experts ||
+             (gate_up->n == num_experts * 2 * intermediate_size &&
+              gate_up->k == hidden_size &&
+              down->n == num_experts * hidden_size &&
+              down->k == intermediate_size));
+        const bool bf16_activations = streamed_experts ||
+            (gate_up &&
+             gate_up->layout == Impl::WeightLayout::Mxfp4RowMajor);
+        valid = valid && (streamed_experts ||
             ((down && down->layout == Impl::WeightLayout::Mxfp4RowMajor) ==
-             bf16_activations);
+             bf16_activations));
         if (router_bias) {
             valid = valid && router_bias->prec == Precision::FP32 &&
                 router_bias->nelements() >= num_experts &&
@@ -4515,6 +4548,29 @@ void CudaBackend::dispatch(const GraphNode& node,
                       "moe_routed_intermediate_fp8",
                       route_count * intermediate_size * sizeof(float)))
                 : nullptr;
+            const void* gate_up_data = gate_up ? gate_up->data : nullptr;
+            const float* gate_up_scales = gate_up ? gate_up->scales : nullptr;
+            const uint8_t* gate_up_e8m0_scales =
+                gate_up ? gate_up->e8m0_scales : nullptr;
+            int gate_up_layout = gate_up
+                ? static_cast<int>(gate_up->layout)
+                : static_cast<int>(Impl::WeightLayout::Mxfp4RowMajor);
+            int gate_up_group_size = gate_up ? gate_up->group_size : 32;
+            int gate_up_groups_per_row = gate_up
+                ? gate_up->groups_per_row
+                : (gate_up_source ? gate_up_source->spec.groups_per_row : 0);
+            const void* down_data = down ? down->data : nullptr;
+            const float* down_scales = down ? down->scales : nullptr;
+            const uint8_t* down_e8m0_scales =
+                down ? down->e8m0_scales : nullptr;
+            int down_layout = down
+                ? static_cast<int>(down->layout)
+                : static_cast<int>(Impl::WeightLayout::Mxfp4RowMajor);
+            int down_group_size = down ? down->group_size : 32;
+            int down_groups_per_row = down
+                ? down->groups_per_row
+                : (down_source ? down_source->spec.groups_per_row : 0);
+            const int* expert_slots = nullptr;
             valid = logits && route_indices && route_weights &&
                 routed_intermediate &&
                 (!bf16_activations ||
@@ -4561,6 +4617,123 @@ void CudaBackend::dispatch(const GraphNode& node,
                         topk_groups, routed_scaling_factor);
                 }
             }
+            if (valid && streamed_experts) {
+                std::vector<int> host_routes(route_count);
+                valid = report_cuda(
+                    cudaMemcpy(host_routes.data(), route_indices,
+                               route_count * sizeof(int),
+                               cudaMemcpyDeviceToHost),
+                    "cudaMemcpy MOE SSD routes");
+                std::vector<int> selected_experts;
+                std::vector<int> host_slots(
+                    static_cast<size_t>(num_experts), -1);
+                if (valid) {
+                    selected_experts.reserve(route_count);
+                    for (int expert : host_routes) {
+                        if (expert < 0 || expert >= num_experts) {
+                            valid = false;
+                            break;
+                        }
+                        if (host_slots[static_cast<size_t>(expert)] < 0) {
+                            host_slots[static_cast<size_t>(expert)] =
+                                static_cast<int>(selected_experts.size());
+                            selected_experts.push_back(expert);
+                        }
+                    }
+                }
+                if (valid) {
+                    valid = gate_up_source->cache->request_many(
+                        gate_up_source, down_source, selected_experts);
+                }
+                const size_t selected_count = selected_experts.size();
+                auto* compact_gate_up = valid
+                    ? static_cast<uint8_t*>(impl_->scratch(
+                          "moe_ssd_gate_up_data",
+                          selected_count * gate_up_source->spec.data_bytes))
+                    : nullptr;
+                auto* compact_gate_up_scales = valid
+                    ? static_cast<uint8_t*>(impl_->scratch(
+                          "moe_ssd_gate_up_scales",
+                          selected_count * gate_up_source->spec.scales_bytes))
+                    : nullptr;
+                auto* compact_down = valid
+                    ? static_cast<uint8_t*>(impl_->scratch(
+                          "moe_ssd_down_data",
+                          selected_count * down_source->spec.data_bytes))
+                    : nullptr;
+                auto* compact_down_scales = valid
+                    ? static_cast<uint8_t*>(impl_->scratch(
+                          "moe_ssd_down_scales",
+                          selected_count * down_source->spec.scales_bytes))
+                    : nullptr;
+                auto* device_slots = valid
+                    ? static_cast<int*>(impl_->scratch(
+                          "moe_ssd_expert_slots",
+                          static_cast<size_t>(num_experts) * sizeof(int)))
+                    : nullptr;
+                valid = valid && compact_gate_up && compact_gate_up_scales &&
+                    compact_down && compact_down_scales && device_slots;
+                for (size_t slot = 0; valid && slot < selected_count; ++slot) {
+                    Tensor gate_view;
+                    Tensor down_view;
+                    valid = gate_up_source->cache->acquire(
+                        gate_up_source, down_source, selected_experts[slot],
+                        gate_view, down_view);
+                    valid = valid && gate_view.data && gate_view.e8m0_scales &&
+                        down_view.data && down_view.e8m0_scales;
+                    if (valid) {
+                        valid = report_cuda(
+                            cudaMemcpy(
+                                compact_gate_up +
+                                    slot * gate_up_source->spec.data_bytes,
+                                gate_view.data,
+                                gate_up_source->spec.data_bytes,
+                                cudaMemcpyHostToDevice),
+                            "cudaMemcpy MOE SSD gate/up data") &&
+                            report_cuda(
+                                cudaMemcpy(
+                                    compact_gate_up_scales + slot *
+                                        gate_up_source->spec.scales_bytes,
+                                    gate_view.e8m0_scales,
+                                    gate_up_source->spec.scales_bytes,
+                                    cudaMemcpyHostToDevice),
+                                "cudaMemcpy MOE SSD gate/up scales") &&
+                            report_cuda(
+                                cudaMemcpy(
+                                    compact_down +
+                                        slot * down_source->spec.data_bytes,
+                                    down_view.data,
+                                    down_source->spec.data_bytes,
+                                    cudaMemcpyHostToDevice),
+                                "cudaMemcpy MOE SSD down data") &&
+                            report_cuda(
+                                cudaMemcpy(
+                                    compact_down_scales + slot *
+                                        down_source->spec.scales_bytes,
+                                    down_view.e8m0_scales,
+                                    down_source->spec.scales_bytes,
+                                    cudaMemcpyHostToDevice),
+                                "cudaMemcpy MOE SSD down scales");
+                    }
+                }
+                if (valid) {
+                    valid = report_cuda(
+                        cudaMemcpy(device_slots, host_slots.data(),
+                                   static_cast<size_t>(num_experts) *
+                                       sizeof(int),
+                                   cudaMemcpyHostToDevice),
+                        "cudaMemcpy MOE SSD expert slots");
+                }
+                if (valid) {
+                    gate_up_data = compact_gate_up;
+                    gate_up_e8m0_scales = compact_gate_up_scales;
+                    down_data = compact_down;
+                    down_e8m0_scales = compact_down_scales;
+                    expert_slots = device_slots;
+                    gate_up_source->cache->retain_for_next_forward(
+                        gate_up_source, down_source, selected_experts);
+                }
+            }
             if (valid) {
                 const float* routed_hidden = hidden;
                 size_t routed_hidden_stride =
@@ -4586,11 +4759,11 @@ void CudaBackend::dispatch(const GraphNode& node,
                             (intermediate_count + threads - 1) / threads),
                         threads>>>(
                         routed_hidden, routed_hidden_stride, route_indices,
-                        route_weights,
-                        gate_up->data, gate_up->type == CUDA_R_32F,
-                        static_cast<int>(gate_up->layout), gate_up->scales,
-                        gate_up->group_size, gate_up->groups_per_row,
-                        gate_up->e8m0_scales, routed_intermediate, tokens,
+                        expert_slots, route_weights,
+                        gate_up_data, gate_up && gate_up->type == CUDA_R_32F,
+                        gate_up_layout, gate_up_scales,
+                        gate_up_group_size, gate_up_groups_per_row,
+                        gate_up_e8m0_scales, routed_intermediate, tokens,
                         top_k, hidden_size, intermediate_size, swiglu_limit,
                         bf16_activations);
                 }
@@ -4615,11 +4788,12 @@ void CudaBackend::dispatch(const GraphNode& node,
                         static_cast<unsigned>(
                             (output_count + threads - 1) / threads),
                         threads>>>(
-                        route_indices, route_weights, down_activation,
-                        down->data, down->type == CUDA_R_32F,
-                        static_cast<int>(down->layout), down->scales,
-                        down->group_size, down->groups_per_row,
-                        down->e8m0_scales, destination,
+                        route_indices, expert_slots, route_weights,
+                        down_activation,
+                        down_data, down && down->type == CUDA_R_32F,
+                        down_layout, down_scales,
+                        down_group_size, down_groups_per_row,
+                        down_e8m0_scales, destination,
                         output->stride[1] / sizeof(float), tokens, top_k,
                         hidden_size, intermediate_size, bf16_activations);
                     valid = report_cuda(

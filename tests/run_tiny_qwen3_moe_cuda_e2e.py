@@ -499,8 +499,28 @@ def build_hash_package(weights_dir: Path, package: Path,
             "head_dim": dsv_head_dim,
             "n_ctx": 8,
             "vocab_size": vocab,
+            "num_experts": experts,
             "prefill_seq_len": 4,
             "quantization": "native-fp8-mxfp4",
+            "moe_expert_storage": {
+                "version": 1,
+                "layout": "aggregate_rows_v1",
+                "num_experts": experts,
+                "layers": [{
+                    "layer": 0,
+                    "num_experts": experts,
+                    "gate_up": {
+                        "weight": "./layer_0_experts_gate_up.weights",
+                        "rows_per_expert": 2 * intermediate,
+                        "cols": hidden,
+                    },
+                    "down": {
+                        "weight": "./layer_0_experts_down.weights",
+                        "rows_per_expert": hidden,
+                        "cols": intermediate,
+                    },
+                }],
+            },
         })
 
 
