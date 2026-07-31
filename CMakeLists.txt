@@ -504,6 +504,22 @@ if(MOLLM_BUILD_TESTS)
                                  PROPERTIES SKIP_RETURN_CODE 77
                                             LABELS "cuda;e2e")
 
+            add_executable(
+                test_cuda_deepseek_v4_converter_e2e
+                tests/test_cuda_deepseek_v4_converter_e2e.cpp)
+            target_link_libraries(
+                test_cuda_deepseek_v4_converter_e2e PRIVATE mollm_lib)
+            add_test(
+                NAME test_cuda_deepseek_v4_converter_e2e
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tiny_deepseek_v4_cuda_e2e.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/models/deepseek_v4.py
+                        $<TARGET_FILE:test_cuda_deepseek_v4_converter_e2e>)
+            set_tests_properties(
+                test_cuda_deepseek_v4_converter_e2e
+                PROPERTIES SKIP_RETURN_CODE 77
+                           LABELS "cuda;e2e;deepseek-v4")
+
             add_test(
                 NAME test_cuda_vision_e2e
                 COMMAND ${Python3_EXECUTABLE}
