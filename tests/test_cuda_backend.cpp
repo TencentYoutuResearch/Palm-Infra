@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -49,6 +50,124 @@ bool dispatch_matmul(CudaBackend& backend, Tensor& weight,
     return !backend.dispatch_failed();
 }
 
+Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1) {
+    Tensor tensor = Tensor::create(Precision::FP32, MemoryType::NONE,
+                                   d0, d1);
+    if (!backend.alloc_output(tensor, tensor.nbytes(), nullptr))
+        std::fprintf(stderr, "CUDA managed allocation failed\n");
+    return tensor;
+}
+
+bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
+                              const std::vector<float>& activation,
+                              const std::vector<float>& expected,
+                              int m, int n, int k) {
+    Tensor a = device_tensor(backend, k, m);
+    Tensor c = device_tensor(backend, n, m);
+    if (!a.data || !c.data)
+        return false;
+    std::memcpy(a.data, activation.data(), a.nbytes());
+
+    GraphNode matmul;
+    matmul.op_type = OpType::MATMUL;
+    backend.clear_dispatch_error();
+    backend.dispatch(matmul, {&a, &weight}, &c, nullptr);
+    backend.end_graph();
+    std::vector<float> actual(static_cast<size_t>(m) * n);
+    std::memcpy(actual.data(), c.data, c.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, expected, 3e-3f))
+        return false;
+
+    constexpr int width = 8;
+    constexpr int rows = 2;
+    std::vector<float> norm_input(width * rows);
+    std::vector<float> norm_weight(width);
+    std::vector<float> norm_expected(width * rows);
+    for (size_t i = 0; i < norm_input.size(); ++i)
+        norm_input[i] = static_cast<float>(static_cast<int>(i) - 7) / 9.0f;
+    for (int i = 0; i < width; ++i)
+        norm_weight[i] = 0.75f + i * 0.025f;
+    for (int row = 0; row < rows; ++row) {
+        float sum = 0.0f;
+        for (int column = 0; column < width; ++column) {
+            const float value = norm_input[row * width + column];
+            sum += value * value;
+        }
+        const float scale = 1.0f / std::sqrt(sum / width + 1e-6f);
+        for (int column = 0; column < width; ++column)
+            norm_expected[row * width + column] =
+                norm_input[row * width + column] * scale *
+                norm_weight[column];
+    }
+    Tensor norm_source = device_tensor(backend, width, rows);
+    Tensor norm_output = device_tensor(backend, width, rows);
+    std::memcpy(norm_source.data, norm_input.data(), norm_source.nbytes());
+    Tensor norm_scale = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, width, 1, 1, 1,
+        norm_weight.data());
+    backend.wrap_weight(norm_scale);
+    GraphNode rms_norm;
+    rms_norm.op_type = OpType::RMS_NORM;
+    backend.dispatch(rms_norm, {&norm_source, &norm_scale},
+                     &norm_output, nullptr);
+    backend.end_graph();
+    actual.resize(norm_expected.size());
+    std::memcpy(actual.data(), norm_output.data, norm_output.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, norm_expected, 2e-5f))
+        return false;
+
+    Tensor lhs = device_tensor(backend, width, rows);
+    Tensor rhs = device_tensor(backend, width, rows);
+    Tensor sum = device_tensor(backend, width, rows);
+    Tensor silu = device_tensor(backend, width, rows);
+    auto* lhs_data = lhs.ptr<float>();
+    auto* rhs_data = rhs.ptr<float>();
+    std::vector<float> elementwise_expected(width * rows);
+    for (int i = 0; i < width * rows; ++i) {
+        lhs_data[i] = (i - 5) / 7.0f;
+        rhs_data[i] = (3 - i) / 11.0f;
+        const float value = lhs_data[i] + rhs_data[i];
+        elementwise_expected[i] = value / (1.0f + std::exp(-value));
+    }
+    GraphNode add;
+    add.op_type = OpType::ADD;
+    GraphNode silu_node;
+    silu_node.op_type = OpType::SILU;
+    backend.dispatch(add, {&lhs, &rhs}, &sum, nullptr);
+    backend.dispatch(silu_node, {&sum}, &silu, nullptr);
+    backend.end_graph();
+    actual.resize(elementwise_expected.size());
+    std::memcpy(actual.data(), silu.data, silu.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, elementwise_expected, 2e-6f))
+        return false;
+
+    Tensor view_source = device_tensor(backend, 6, 2);
+    for (int i = 0; i < 12; ++i)
+        view_source.ptr<float>()[i] = (i - 4) / 5.0f;
+    Tensor slice;
+    GraphNode slice_node;
+    slice_node.op_type = OpType::SLICE;
+    slice_node.params.i32 = {0, 2, 2};
+    backend.dispatch(slice_node, {&view_source}, &slice, nullptr);
+    Tensor view_result = device_tensor(backend, 2, 2);
+    backend.dispatch(silu_node, {&slice}, &view_result, nullptr);
+    backend.end_graph();
+    std::vector<float> view_expected(4);
+    for (int row = 0; row < 2; ++row)
+        for (int column = 0; column < 2; ++column) {
+            const float value = view_source.ptr<float>()[row * 6 + column + 2];
+            view_expected[row * 2 + column] =
+                value / (1.0f + std::exp(-value));
+        }
+    actual.resize(view_expected.size());
+    std::memcpy(actual.data(), view_result.data, view_result.nbytes());
+    return !backend.dispatch_failed() &&
+        close_enough(actual, view_expected, 2e-6f);
+}
+
 }  // namespace
 
 int main() {
@@ -81,6 +200,10 @@ int main() {
     reference(activation, weight_f32, expected, m, n, k);
     if (!dispatch_matmul(backend, fp16, activation, actual, m, n, k) ||
         !close_enough(actual, expected, 3e-3f))
+        return 1;
+    if (!backend.is_device_resident() ||
+        !test_device_resident_ops(backend, fp16, activation, expected,
+                                  m, n, k))
         return 1;
 
     Q4B8G32Block block{};
@@ -149,6 +272,7 @@ int main() {
         !close_enough(actual, expected, 1.5e-2f))
         return 1;
 
-    std::printf("CUDA FP16, W4G32 and W4G128 matmul tests passed\n");
+    std::printf("CUDA device-resident ops, fallback views, FP16, W4G32 and "
+                "W4G128 matmul tests passed\n");
     return 0;
 }

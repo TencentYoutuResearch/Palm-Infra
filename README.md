@@ -374,12 +374,16 @@ cmake --build build_cuda -j
 ./build_cuda/mollm_chat --device cuda --package model.mollm
 ```
 
-The initial CUDA backend is a correctness baseline. FP16/FP32 linear layers
-run through cuBLAS, and package-native W4G32/W4G128 weights are dequantized to
-FP16 device weights at load time. Operators not yet implemented in CUDA use
-the CPU reference dispatcher with host-visible intermediates. This is useful
-for end-to-end validation and per-node comparison, but it is not yet the
-fully device-resident performance path.
+The CUDA backend is still a correctness-first implementation. Graph outputs
+and persistent state use device-addressable managed storage, FP16/FP32 linear
+layers run through cuBLAS, and package-native W4G32/W4G128 weights are
+dequantized to FP16 device weights at load time. RMSNorm, dense elementwise
+operations, common activations, SwiGLU, zero-copy views, and the decode lm_head
+also stay on CUDA. Operators not yet implemented natively synchronize and use
+the CPU reference dispatcher over the managed buffers. Set
+`MOLLM_CUDA_PROFILE=1` to print native/fallback operator counts. Attention,
+RoPE, and some strided layout paths still fall back, so this is not yet a
+performance-complete CUDA backend.
 
 ## Local HTTP server
 

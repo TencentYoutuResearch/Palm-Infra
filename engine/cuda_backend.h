@@ -4,11 +4,10 @@
 
 #include <memory>
 
-// Initial CUDA backend: CUDA owns prepared linear weights and executes
-// supported MATMUL/lm_head operations through cuBLAS. Other graph operators
-// deliberately use the CPU reference dispatcher while intermediates remain
-// host-visible. This provides an end-to-end correctness baseline before the
-// graph allocator and remaining operators become device-resident.
+// CUDA backend with device-resident graph storage. CUDA owns prepared linear
+// weights and managed intermediate/persistent buffers. Operators not yet
+// implemented natively synchronize and use the CPU reference dispatcher over
+// those managed buffers, providing an explicit incremental migration path.
 class CudaBackend final : public AcceleratorBackend {
 public:
     CudaBackend();
@@ -26,8 +25,13 @@ public:
     void clear_dispatch_error() override;
     bool dispatch_failed() const override;
 
-    // The correctness backend keeps graph intermediates host-visible.
-    bool is_device_resident() const override { return false; }
+    void* alloc_output(Tensor& output, size_t nbytes,
+                       BufferPool* pool) override;
+    void free_output(Tensor& tensor, BufferPool* pool) override;
+    bool is_device_resident() const override { return true; }
+    void synchronize_for_host_read() override;
+    void begin_graph() override;
+    void end_graph() override;
     Precision kv_cache_precision(Precision) const override {
         return Precision::FP32;
     }
