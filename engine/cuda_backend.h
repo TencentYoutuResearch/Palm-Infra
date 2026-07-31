@@ -40,6 +40,7 @@ public:
     void wrap_weight(Tensor& tensor) override;
     void wrap_weight_int4(Tensor& tensor,
                           bool keep_native_experts = false) override;
+    bool wants_cpu_weight_sidecars() const override { return false; }
     void alloc_persistent(Tensor& tensor, size_t nbytes) override;
     void upload_input(Tensor& tensor, const std::string& key,
                       const void* host_src, size_t nbytes) override;

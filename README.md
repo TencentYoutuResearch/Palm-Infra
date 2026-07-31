@@ -355,7 +355,8 @@ A/B testing, pass `--mmap`; mmap page warmup is enabled unless you also pass
 `--no-load-warmup`. CUDA automatically keeps the host package mmap-backed:
 prepared weights are copied into device-owned storage, while file-backed host
 pages remain available to the explicit CPU fallback without retaining a
-second model-sized anonymous copy.
+second model-sized anonymous copy. CUDA also skips CPU-only weight repacks;
+`mollm_bench` reports their retained size as `cpu_weight_sidecar_mb`.
 
 ## Benchmark
 

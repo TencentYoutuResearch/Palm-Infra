@@ -168,6 +168,20 @@ void LLMEngine::clear_model_state() {
     sampler_.reset();
 }
 
+size_t LLMEngine::cpu_weight_sidecar_bytes() const {
+    size_t bytes = 0;
+    for (const auto& [key, buffer] : packed_weights_) {
+        (void)key;
+        bytes += buffer.size();
+    }
+    for (const auto& [key, prepared] : prepared_weights_) {
+        (void)key;
+        for (const auto& buffer : prepared.layouts)
+            bytes += buffer.size();
+    }
+    return bytes;
+}
+
 size_t LLMEngine::warmup_package_weights() {
     if (!package_weights_base_ || package_weights_size_ == 0)
         return 0;
@@ -364,6 +378,11 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         }
     }
 
+    const bool build_cpu_weight_sidecars =
+        !accelerator_backend_ ||
+        exec_ctx.backend != accelerator_backend_.get() ||
+        accelerator_backend_->wants_cpu_weight_sidecars();
+
     for (auto& node : g.nodes) {
         if (node.op_type != OpType::CONSTANT || node.params.str.empty())
             continue;
@@ -481,13 +500,15 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     wref.find("embed_tokens") != std::string::npos ||
                     wref.find("vision_pos_embed.weights") !=
                         std::string::npos;
-                prepare_matmul_weight(
-                    t, wref, data, packed_weights_, prepared_weights_,
-                    !lookup_table,
-                    native_fp8_weight_nodes.count(node.id) == 0);
-                if (native_fp8_weight_nodes.count(node.id) != 0)
-                    prepare_fp8_bf16_fp16_weight(
-                        t, wref, data, packed_weights_);
+                if (build_cpu_weight_sidecars) {
+                    prepare_matmul_weight(
+                        t, wref, data, packed_weights_, prepared_weights_,
+                        !lookup_table,
+                        native_fp8_weight_nodes.count(node.id) == 0);
+                    if (native_fp8_weight_nodes.count(node.id) != 0)
+                        prepare_fp8_bf16_fp16_weight(
+                            t, wref, data, packed_weights_);
+                }
                 // Once a CPU sidecar owns every value needed by the selected
                 // FP8 kernel, the original package pages are no longer used at
                 // inference time. Exclude the whole weight blob (header, data,
@@ -542,13 +563,15 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             node.params.str[0].find("embed_tokens") != std::string::npos ||
             node.params.str[0].find("vision_pos_embed.weights") !=
                 std::string::npos;
-        prepare_matmul_weight(
-            t, wpath, t.data, packed_weights_, prepared_weights_,
-            !lookup_table,
-            native_fp8_weight_nodes.count(node.id) == 0);
-        if (native_fp8_weight_nodes.count(node.id) != 0)
-            prepare_fp8_bf16_fp16_weight(
-                t, wpath, t.data, packed_weights_);
+        if (build_cpu_weight_sidecars) {
+            prepare_matmul_weight(
+                t, wpath, t.data, packed_weights_, prepared_weights_,
+                !lookup_table,
+                native_fp8_weight_nodes.count(node.id) == 0);
+            if (native_fp8_weight_nodes.count(node.id) != 0)
+                prepare_fp8_bf16_fp16_weight(
+                    t, wpath, t.data, packed_weights_);
+        }
         finalize_accelerator_weight();
     }
 

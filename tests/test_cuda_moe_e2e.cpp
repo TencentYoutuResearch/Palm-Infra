@@ -33,6 +33,8 @@ bool run(const char* package, const char* expected_architecture, Device device,
     config.moe_device_cache_bytes = device_cache_bytes;
     if (!engine.load(config))
         return false;
+    if (device == Device::CUDA && engine.cpu_weight_sidecar_bytes() != 0)
+        return false;
     const auto& metadata = engine.package_metadata();
     const auto architecture = metadata.find("architecture");
     if (architecture == metadata.end() ||

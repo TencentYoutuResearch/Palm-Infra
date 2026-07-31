@@ -259,6 +259,7 @@ public:
     bool package_weights_mmap_backed() const {
         return package_weights_base_ != nullptr && !package_weights_resident_;
     }
+    size_t cpu_weight_sidecar_bytes() const;
     bool moe_ssd_offload_enabled() const { return moe_ssd_cache_ != nullptr; }
     MoeSsdCache::Stats moe_ssd_stats() const {
         return moe_ssd_cache_ ? moe_ssd_cache_->stats() : MoeSsdCache::Stats{};

@@ -49,6 +49,11 @@ public:
     virtual void wrap_weight(Tensor& tensor) = 0;
     virtual void wrap_weight_int4(Tensor& tensor,
                                   bool keep_native_experts = false) = 0;
+    // CPU-specific repacks are optional when a backend owns every prepared
+    // linear weight. Raw package layouts remain available for the explicit
+    // reference fallback, so disabling sidecars changes memory/performance,
+    // not serialized weight semantics.
+    virtual bool wants_cpu_weight_sidecars() const { return true; }
 
     // Persistent state and reusable graph-boundary transfers.
     virtual void alloc_persistent(Tensor& tensor, size_t nbytes) = 0;

@@ -290,7 +290,8 @@ CPU 推理默认以 resident 模式加载包内权重。若需 mmap A/B 测试�
 `--mmap`；默认 mmap 页面 warmup 已启用，可搭配 `--no-load-warmup` 关闭。
 CUDA 会自动保留 mmap-backed host package：prepared weight 会复制到设备自有
 存储，而 file-backed host page 仍可供显式 CPU fallback 使用，无需再保留一份
-模型大小的匿名内存副本。
+模型大小的匿名内存副本。CUDA 同时会跳过 CPU-only weight repack；
+`mollm_bench` 通过 `cpu_weight_sidecar_mb` 报告其常驻大小。
 
 ## 基准测试
 
