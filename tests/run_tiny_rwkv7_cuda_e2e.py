@@ -18,10 +18,10 @@ def build_checkpoint(path: Path, tokenizer_path: Path) -> None:
         raise RuntimeError("PyTorch is unavailable") from exc
 
     generator = torch.Generator().manual_seed(20260801)
-    hidden = 64
-    heads = 1
+    hidden = 128
+    heads = 2
     head_size = 64
-    intermediate = 128
+    intermediate = 256
     vocab = 32
     rank = 8
 
@@ -82,9 +82,9 @@ def build_checkpoint(path: Path, tokenizer_path: Path) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4:
         print(
-            f"usage: {sys.argv[0]} <models/rwkv7.py> <e2e-runner>",
+            f"usage: {sys.argv[0]} <models/rwkv7.py> <quantizer> <e2e-runner>",
             file=sys.stderr,
         )
         return 2
@@ -96,47 +96,53 @@ def main() -> int:
         return 77
 
     converter = Path(sys.argv[1]).resolve()
-    runner = Path(sys.argv[2]).resolve()
+    quantizer = Path(sys.argv[2]).resolve()
+    runner = Path(sys.argv[3]).resolve()
     temp_dir = Path(tempfile.mkdtemp(prefix="mollm_tiny_rwkv7_"))
     try:
         checkpoint = temp_dir / "tiny-rwkv7.pth"
         tokenizer = temp_dir / "rwkv_vocab.txt"
-        package = temp_dir / "tiny-rwkv7.mollm"
         build_checkpoint(checkpoint, tokenizer)
-        subprocess.run(
-            [
-                sys.executable,
-                str(converter),
-                str(checkpoint),
-                str(package),
-                "--prefill-seq-len",
-                "8",
-                "--tokenizer",
-                str(tokenizer),
-                "--quant",
-                "fp16",
-            ],
-            check=True,
-        )
-
         environment = os.environ.copy()
+        environment["MOLLM_QUANT_HELPER"] = str(quantizer)
         environment["MOLLM_CUDA_PROFILE"] = "1"
-        completed = subprocess.run(
-            [str(runner), str(package)],
-            check=False,
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        print(completed.stdout, end="")
-        print(completed.stderr, end="", file=sys.stderr)
-        if completed.returncode == 77:
-            return 77
-        completed.check_returncode()
-        if "  fallback " in completed.stderr:
-            raise AssertionError(
-                "tiny RWKV7 CUDA package E2E used an operator fallback")
+        for quantization in ("fp16", "w8pc", "w4mixg32", "w4mixg128"):
+            package = temp_dir / f"tiny-rwkv7-{quantization}.mollm"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(converter),
+                    str(checkpoint),
+                    str(package),
+                    "--prefill-seq-len",
+                    "8",
+                    "--tokenizer",
+                    str(tokenizer),
+                    "--quant",
+                    quantization,
+                ],
+                check=True,
+                env=environment,
+            )
+
+            print(f"=== RWKV7 {quantization} CUDA package E2E ===")
+            completed = subprocess.run(
+                [str(runner), str(package)],
+                check=False,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            print(completed.stdout, end="")
+            print(completed.stderr, end="", file=sys.stderr)
+            if completed.returncode == 77:
+                return 77
+            completed.check_returncode()
+            if "  fallback " in completed.stderr:
+                raise AssertionError(
+                    f"tiny RWKV7 {quantization} CUDA package E2E used an "
+                    "operator fallback")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
     return 0

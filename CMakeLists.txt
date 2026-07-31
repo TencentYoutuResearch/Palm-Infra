@@ -491,11 +491,13 @@ if(MOLLM_BUILD_TESTS)
             add_executable(test_cuda_rwkv_package_e2e
                            tests/test_cuda_rwkv_package_e2e.cpp)
             target_link_libraries(test_cuda_rwkv_package_e2e PRIVATE mollm_lib)
+            add_dependencies(test_cuda_rwkv_package_e2e mollm-quantize)
             add_test(
                 NAME test_cuda_rwkv_package_e2e
                 COMMAND ${Python3_EXECUTABLE}
                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tiny_rwkv7_cuda_e2e.py
                         ${CMAKE_CURRENT_SOURCE_DIR}/models/rwkv7.py
+                        $<TARGET_FILE:mollm-quantize>
                         $<TARGET_FILE:test_cuda_rwkv_package_e2e>)
             set_tests_properties(test_cuda_rwkv_package_e2e
                                  PROPERTIES SKIP_RETURN_CODE 77

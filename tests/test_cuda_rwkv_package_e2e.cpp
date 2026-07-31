@@ -55,11 +55,25 @@ bool close_enough(const std::vector<float>& actual,
     if (actual.size() != expected.size())
         return false;
     float maximum = 0.0f;
-    for (size_t index = 0; index < actual.size(); ++index)
-        maximum = std::max(
-            maximum, std::fabs(actual[index] - expected[index]));
-    std::printf("tiny RWKV7 %s CPU/CUDA max abs error: %.7f\n", label,
-                maximum);
+    double squared_error = 0.0;
+    double squared_reference = 0.0;
+    for (size_t index = 0; index < actual.size(); ++index) {
+        const float error = actual[index] - expected[index];
+        maximum = std::max(maximum, std::fabs(error));
+        squared_error += static_cast<double>(error) * error;
+        squared_reference +=
+            static_cast<double>(expected[index]) * expected[index];
+    }
+    const double rms_error = std::sqrt(
+        squared_error / static_cast<double>(actual.size()));
+    const double rms_reference = std::sqrt(
+        squared_reference / static_cast<double>(actual.size()));
+    const double relative_rms = rms_reference > 0.0
+        ? rms_error / rms_reference : rms_error;
+    std::printf(
+        "tiny RWKV7 %s CPU/CUDA max abs error: %.7f, RMS: %.7g "
+        "(relative %.7g)\n",
+        label, maximum, rms_error, relative_rms);
     return maximum <= tolerance;
 }
 
