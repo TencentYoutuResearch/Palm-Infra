@@ -36,7 +36,7 @@ Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1,
                      int64_t d2 = 1) {
     Tensor tensor = Tensor::create(
         Precision::FP32, MemoryType::NONE, d0, d1, d2);
-    backend.alloc_output(tensor, tensor.nbytes(), nullptr);
+    backend.alloc_persistent(tensor, tensor.nbytes());
     return tensor;
 }
 

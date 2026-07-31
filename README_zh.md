@@ -302,6 +302,11 @@ CUDA 上的普通 W8、W4G32 与 W4G128 权重会以 package-native 量化布局
 device，不再在加载时永久展开成 FP16。单 token decode 由专用 GEMV kernel
 直接读取量化权重；多 token prefill 则逐矩阵解量化到可复用的 FP16 device
 scratch 后调用 cuBLAS，因此不会额外保留一份模型大小的 FP16 权重。
+graph intermediate 采用可复用的 device-only `cudaMalloc` 存储；host readback、
+调试以及 generic CPU fallback 都通过显式传输边界完成，不再依赖 Unified
+Memory 的隐式迁移。仍需由 engine 在 host 侧更新 metadata 或执行 reset 的
+持久 cache/recurrent state 暂时继续使用 managed storage。未原生实现的算子会
+显式执行 D2H、CPU reference、H2D bridge。
 标准 attention 的 KV cache 在 CUDA 上保留 package 声明的 FP16 格式，仅在
 append 时转换 FP32 K/V projection，attention 累加仍使用 FP32；
 `mollm_bench` 会通过 `kv_cache_mb` 报告实际分配量。

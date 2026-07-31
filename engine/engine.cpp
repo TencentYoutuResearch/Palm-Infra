@@ -151,7 +151,8 @@ void finish_graph_temporaries(Graph& graph, ExecContext& ctx) {
 }
 
 Tensor copy_tensor_contiguous(const Tensor& src,
-                              std::vector<uint8_t>& storage) {
+                              std::vector<uint8_t>& storage,
+                              Backend* backend) {
     size_t es = src.element_size();
     size_t bytes = (size_t)src.nelements() * es;
     storage.resize(bytes);
@@ -160,16 +161,30 @@ Tensor copy_tensor_contiguous(const Tensor& src,
                                 src.shape[1], src.shape[2], src.shape[3],
                                 storage.data());
 
-    if (!src.data || bytes == 0)
+    if ((!src.data && !src.device_data) || bytes == 0)
         return dst;
 
     if (src.is_contiguous()) {
-        std::memcpy(dst.data, src.data, bytes);
+        if (backend) {
+            if (!backend->copy_to_host(src, dst.data, bytes))
+                return Tensor();
+        } else {
+            std::memcpy(dst.data, src.data, bytes);
+        }
         return dst;
     }
 
+    std::vector<uint8_t> source_storage(src.view_span_bytes());
+    if (backend) {
+        if (!backend->copy_to_host(
+                src, source_storage.data(), source_storage.size()))
+            return Tensor();
+    } else {
+        std::memcpy(source_storage.data(), src.data, source_storage.size());
+    }
     char* dp = static_cast<char*>(dst.data);
-    const char* sp_base = static_cast<const char*>(src.data);
+    const char* sp_base =
+        reinterpret_cast<const char*>(source_storage.data());
     size_t flat = 0;
     for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
         for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
@@ -382,8 +397,22 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
                 *lm_head_weight_, C.ptr<float>(), vocab_size, hidden_dim);
     } else if (accelerator_backend_ &&
                accelerator_backend_->supports_lm_head(*lm_head_weight_)) {
+        std::vector<float> host_activation;
+        const float* activation = A.ptr<float>();
+        if (hidden.device_data) {
+            host_activation.resize(static_cast<size_t>(hidden_dim));
+            if (!accelerator_backend_->copy_to_host(
+                    hidden, host_activation.data(),
+                    host_activation.size() * sizeof(float),
+                    static_cast<size_t>(last_pos) * hidden_dim *
+                        sizeof(float))) {
+                release_pool_tensor(graph_prefill_.runtime.pool, C);
+                return -1;
+            }
+            activation = host_activation.data();
+        }
         accelerator_backend_->lm_head_gemv(
-            A.ptr<float>(), *lm_head_weight_, C.ptr<float>(), vocab_size,
+            activation, *lm_head_weight_, C.ptr<float>(), vocab_size,
             hidden_dim);
     } else {
         kernel_matmul_fp32(A, *lm_head_weight_, C,
@@ -436,8 +465,20 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
 
         if (accelerator_backend_ &&
             accelerator_backend_->supports_lm_head(*lm_head_weight_)) {
+            std::vector<float> host_activation;
+            const float* activation = A.ptr<float>();
+            if (hidden.device_data) {
+                host_activation.resize(static_cast<size_t>(hidden_dim));
+                if (!accelerator_backend_->copy_to_host(
+                        hidden, host_activation.data(),
+                        host_activation.size() * sizeof(float),
+                        static_cast<size_t>(pos) * hidden_dim *
+                            sizeof(float)))
+                    return {};
+                activation = host_activation.data();
+            }
             accelerator_backend_->lm_head_gemv(
-                A.ptr<float>(), *lm_head_weight_, C.ptr<float>(), vocab_size,
+                activation, *lm_head_weight_, C.ptr<float>(), vocab_size,
                 hidden_dim);
         } else {
             kernel_matmul_fp32(A, *lm_head_weight_, C,
@@ -839,13 +880,14 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     mollm_set_matmul_profile_phase("unscoped");
     Tensor copied;
     if (out.data)
-        copied = copy_tensor_contiguous(out, hidden_output_copy_);
+        copied = copy_tensor_contiguous(
+            out, hidden_output_copy_, exec_ctx_prefill_.backend);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
     release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
-    if (out.data) {
+    if (copied.data) {
         past_len_ += n;
         for (auto& cp : caches_) {
             if (cp.k)
@@ -1089,13 +1131,14 @@ Tensor LLMEngine::decode_hidden(int token_id) {
     mollm_set_matmul_profile_phase("unscoped");
     Tensor copied;
     if (out.data)
-        copied = copy_tensor_contiguous(out, hidden_output_copy_);
+        copied = copy_tensor_contiguous(
+            out, hidden_output_copy_, exec_ctx_decode_.backend);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
     release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
-    if (out.data) {
+    if (copied.data) {
         past_len_++;
         for (auto& cp : caches_) {
             if (cp.k)

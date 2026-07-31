@@ -159,6 +159,18 @@ struct Tensor {
         return stride[3] * shape[3];
     }
 
+    /// Byte span reachable from this tensor view's first element through its
+    /// last logical element. Unlike nbytes(), this does not include unused
+    /// row tails before the view's starting offset.
+    size_t view_span_bytes() const {
+        if (nelements() <= 0) return 0;
+        size_t span = element_size();
+        for (int dimension = 0; dimension < 4; ++dimension)
+            span += static_cast<size_t>(shape[dimension] - 1) *
+                stride[dimension];
+        return span;
+    }
+
     /// Check whether the tensor is densely packed in row-major order.
     bool is_contiguous() const {
         size_t expected = element_size();

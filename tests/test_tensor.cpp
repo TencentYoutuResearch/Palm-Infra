@@ -16,6 +16,7 @@ int main() {
     CHECK(a.element_size() == 2, "FP16 element size");
     CHECK(a.nelements() == 12, "nelements 4*3=12");
     CHECK(a.nbytes() == 24, "nbytes 4*3*2=24");
+    CHECK(a.view_span_bytes() == 24, "contiguous view span is 24 bytes");
     CHECK(a.is_contiguous(), "contiguous after create");
 
     // ---- strides ----
@@ -31,6 +32,12 @@ int main() {
     Tensor v2 = a.view_2d(2, 3);
     CHECK(v2.shape[0] == 2 && v2.shape[1] == 3, "view_2d shape 2x3");
     CHECK(v2.data == a.data, "view_2d shares data");
+    Tensor strided_slice = a;
+    strided_slice.shape[0] = 2;
+    CHECK(strided_slice.nbytes() == 24,
+          "legacy nbytes retains the parent row span");
+    CHECK(strided_slice.view_span_bytes() == 20,
+          "view span excludes the final unused row tail");
 
     // ---- storage identity ----
     float storage[4] = {};

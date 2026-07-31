@@ -4,6 +4,9 @@
 #include "kernels/tensor.h"
 #include "graph/buffer_pool.h"
 
+#include <cstdint>
+#include <cstring>
+
 class ThreadPool;
 
 // ---------------------------------------------------------------------------
@@ -62,9 +65,10 @@ public:
     // behaviour the CPU executor used before, so CPU semantics are byte-identical.
     // -----------------------------------------------------------------------
 
-    /// Allocate storage for a node output of `nbytes`. Sets out.data (host
-    /// pointer, possibly a device buffer's shared contents), out.mem_type,
-    /// out.owner_id, out.storage_id. Returns out.data (non-null on success).
+    /// Allocate storage for a node output of `nbytes`. `out.data` is a
+    /// non-null storage handle on success, but device backends may place an
+    /// opaque, non-host-accessible address there. Host access must use the
+    /// explicit transfer methods below.
     virtual void* alloc_output(Tensor& out, size_t nbytes, BufferPool* pool) {
         void* buf = pool->acquire(nbytes);
         if (!buf) return nullptr;
@@ -87,6 +91,53 @@ public:
     /// op type instead of host-pointer equality.
     virtual bool is_device_resident() const { return false; }
 
+    /// Explicit tensor transfer boundary. Device backends override these;
+    /// the CPU implementation copies from ordinary host storage. Offsets are
+    /// relative to the tensor view, after any backend-specific device offset.
+    virtual bool copy_to_host(const Tensor& source, void* destination,
+                              size_t nbytes, size_t source_offset = 0) {
+        if (!source.data || !destination ||
+            source_offset > source.view_span_bytes() ||
+            nbytes > source.view_span_bytes() - source_offset)
+            return false;
+        std::memcpy(
+            destination,
+            static_cast<const uint8_t*>(source.data) + source_offset,
+            nbytes);
+        return true;
+    }
+    virtual bool copy_from_host(const void* source, Tensor& destination,
+                                size_t nbytes,
+                                size_t destination_offset = 0) {
+        if (!source || !destination.data ||
+            destination_offset > destination.view_span_bytes() ||
+            nbytes > destination.view_span_bytes() - destination_offset)
+            return false;
+        std::memcpy(
+            static_cast<uint8_t*>(destination.data) + destination_offset,
+            source, nbytes);
+        return true;
+    }
+
+    /// Apply an FP32 -> BF16-rounded FP32 activation boundary in place.
+    /// CPUBackend inherits the host implementation; device backends launch
+    /// their own kernel so the executor never dereferences device memory.
+    virtual bool round_to_bf16(Tensor& tensor) {
+        if (tensor.prec != Precision::FP32 || !tensor.data)
+            return false;
+        float* values = tensor.ptr<float>();
+        const size_t count = static_cast<size_t>(tensor.nelements());
+        for (size_t i = 0; i < count; ++i) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &values[i], sizeof(bits));
+            if ((bits & 0x7f800000u) != 0x7f800000u)
+                bits += 0x7fffu + ((bits >> 16) & 1u);
+            bits &= 0xffff0000u;
+            std::memcpy(&values[i], &bits, sizeof(values[i]));
+        }
+        return true;
+    }
+
     /// Select the physical precision for persistent KV storage. Graph files
     /// describe the preferred format; a backend may request a correctness
     /// fallback when its attention implementation cannot consume it.
@@ -94,8 +145,8 @@ public:
         return requested;
     }
 
-    /// Make preceding device writes visible through Tensor::data for a
-    /// host-side consumer such as SSD route prediction. CPU is already
+    /// Complete preceding device writes before a host-side consumer such as
+    /// SSD route prediction performs an explicit transfer. CPU is already
     /// coherent; device backends may submit and wait for queued work.
     virtual void synchronize_for_host_read() {}
 

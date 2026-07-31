@@ -2614,9 +2614,10 @@ struct CudaBackend::Impl {
     std::unordered_map<const void*, DeviceWeight> weights;
     std::unordered_map<const void*, const DeviceWeight*> weights_by_device;
     std::vector<void*> device_allocations;
+    std::vector<void*> pooled_allocations;
+    std::unordered_map<void*, size_t> pooled_sizes;
+    std::multimap<size_t, void*> free_pooled;
     std::vector<void*> managed_allocations;
-    std::unordered_map<void*, size_t> managed_sizes;
-    std::multimap<size_t, void*> free_managed;
     std::unordered_map<std::string, BoundaryBuffer> boundary_buffers;
     std::vector<MoeDeviceCacheEntry> moe_device_cache;
     DeviceMoeCacheStats moe_device_cache_stats;
@@ -2643,6 +2644,8 @@ struct CudaBackend::Impl {
             if (entry.allocation)
                 cudaFree(entry.allocation);
         for (void* allocation : device_allocations)
+            cudaFree(allocation);
+        for (void* allocation : pooled_allocations)
             cudaFree(allocation);
         for (void* allocation : managed_allocations)
             cudaFree(allocation);
@@ -2674,26 +2677,26 @@ struct CudaBackend::Impl {
         }
     }
 
-    void* acquire_managed(size_t bytes) {
-        auto found = free_managed.lower_bound(bytes);
-        if (found != free_managed.end()) {
+    void* acquire_pooled(size_t bytes) {
+        auto found = free_pooled.lower_bound(bytes);
+        if (found != free_pooled.end()) {
             void* pointer = found->second;
-            free_managed.erase(found);
+            free_pooled.erase(found);
             return pointer;
         }
         void* pointer = nullptr;
-        if (!report_cuda(cudaMallocManaged(&pointer, bytes),
-                         "cudaMallocManaged output"))
+        if (!report_cuda(cudaMalloc(&pointer, bytes),
+                         "cudaMalloc output"))
             return nullptr;
-        managed_allocations.push_back(pointer);
-        managed_sizes.emplace(pointer, bytes);
+        pooled_allocations.push_back(pointer);
+        pooled_sizes.emplace(pointer, bytes);
         return pointer;
     }
 
-    void release_managed(void* pointer) {
-        const auto found = managed_sizes.find(pointer);
-        if (found != managed_sizes.end())
-            free_managed.emplace(found->second, pointer);
+    void release_pooled(void* pointer) {
+        const auto found = pooled_sizes.find(pointer);
+        if (found != pooled_sizes.end())
+            free_pooled.emplace(found->second, pointer);
     }
 
     bool reserve(void*& pointer, size_t& capacity, size_t requested) {
@@ -3416,7 +3419,7 @@ void CudaBackend::wrap_weight_int4(Tensor& tensor,
 void* CudaBackend::alloc_output(Tensor& output, size_t nbytes, BufferPool*) {
     if (!available() || nbytes == 0)
         return nullptr;
-    void* pointer = impl_->acquire_managed(nbytes);
+    void* pointer = impl_->acquire_pooled(nbytes);
     if (!pointer) {
         impl_->failed = true;
         return nullptr;
@@ -3432,7 +3435,85 @@ void* CudaBackend::alloc_output(Tensor& output, size_t nbytes, BufferPool*) {
 
 void CudaBackend::free_output(Tensor& tensor, BufferPool*) {
     if (tensor.device_data)
-        impl_->release_managed(tensor.device_data);
+        impl_->release_pooled(tensor.device_data);
+}
+
+bool CudaBackend::copy_to_host(const Tensor& source, void* destination,
+                               size_t nbytes, size_t source_offset) {
+    if (!destination || source_offset > source.view_span_bytes() ||
+        nbytes > source.view_span_bytes() - source_offset) {
+        impl_->failed = true;
+        return false;
+    }
+    const auto* device = device_pointer_const<uint8_t>(source);
+    if (!device) {
+        if (!source.data) {
+            impl_->failed = true;
+            return false;
+        }
+        std::memcpy(
+            destination,
+            static_cast<const uint8_t*>(source.data) + source_offset,
+            nbytes);
+        return true;
+    }
+    if (!report_cuda(
+            cudaMemcpy(destination, device + source_offset, nbytes,
+                       cudaMemcpyDeviceToHost),
+            "cudaMemcpy tensor to host")) {
+        impl_->failed = true;
+        return false;
+    }
+    return true;
+}
+
+bool CudaBackend::copy_from_host(const void* source, Tensor& destination,
+                                 size_t nbytes,
+                                 size_t destination_offset) {
+    if (!source || destination_offset > destination.view_span_bytes() ||
+        nbytes > destination.view_span_bytes() - destination_offset) {
+        impl_->failed = true;
+        return false;
+    }
+    auto* device = device_pointer<uint8_t>(destination);
+    if (!device) {
+        if (!destination.data) {
+            impl_->failed = true;
+            return false;
+        }
+        std::memcpy(
+            static_cast<uint8_t*>(destination.data) + destination_offset,
+            source, nbytes);
+        return true;
+    }
+    if (!report_cuda(
+            cudaMemcpy(device + destination_offset, source, nbytes,
+                       cudaMemcpyHostToDevice),
+            "cudaMemcpy tensor from host")) {
+        impl_->failed = true;
+        return false;
+    }
+    return true;
+}
+
+bool CudaBackend::round_to_bf16(Tensor& tensor) {
+    float* values = device_pointer<float>(tensor);
+    if (!values || tensor.prec != Precision::FP32) {
+        impl_->failed = true;
+        return false;
+    }
+    const size_t count = static_cast<size_t>(tensor.nelements());
+    if (count == 0)
+        return true;
+    constexpr int threads = 256;
+    round_bf16_cuda<<<
+        static_cast<unsigned>((count + threads - 1) / threads), threads>>>(
+        values, count);
+    if (!report_cuda(cudaGetLastError(), "round_bf16_cuda")) {
+        impl_->failed = true;
+        return false;
+    }
+    return true;
 }
 
 void CudaBackend::synchronize_for_host_read() {
@@ -6097,25 +6178,90 @@ void CudaBackend::dispatch(const GraphNode& node,
         return;
     std::vector<Tensor> host_tensors;
     std::vector<const Tensor*> host_inputs;
+    std::vector<std::vector<uint32_t>> host_storage;
+    std::vector<int> staged_storage(inputs.size(), -1);
     host_tensors.reserve(inputs.size());
     host_inputs.reserve(inputs.size());
-    for (const Tensor* input : inputs) {
+    host_storage.reserve(inputs.size());
+    for (size_t input_index = 0; input_index < inputs.size(); ++input_index) {
+        const Tensor* input = inputs[input_index];
         if (!input) {
             host_inputs.push_back(nullptr);
             continue;
         }
         host_tensors.push_back(*input);
         Tensor& host = host_tensors.back();
-        if (host.data && host.device_offset)
-            host.data = static_cast<uint8_t*>(host.data) +
-                host.device_offset;
+        // Constants retain their package-native host view for CPU reference
+        // kernels. Device activations and persistent state are staged
+        // explicitly; Tensor::data may be an opaque cudaMalloc address.
+        const bool device_weight = impl_->find_weight(*input) != nullptr;
+        if (input->device_data && !device_weight) {
+            const size_t bytes = input->view_span_bytes();
+            host_storage.emplace_back((bytes + sizeof(uint32_t) - 1) /
+                                      sizeof(uint32_t));
+            staged_storage[input_index] =
+                static_cast<int>(host_storage.size() - 1);
+            void* destination = host_storage.back().data();
+            const void* source = device_pointer_const<uint8_t>(*input);
+            if (!source || !report_cuda(
+                    cudaMemcpy(destination, source, bytes,
+                               cudaMemcpyDeviceToHost),
+                    "cudaMemcpy fallback input")) {
+                impl_->failed = true;
+                return;
+            }
+            host.data = destination;
+        } else if (device_weight && !host.data) {
+            // CUDA can execute device-only weights natively, but a CPU
+            // fallback needs the package-native host view.
+            impl_->failed = true;
+            return;
+        }
         host.device_data = nullptr;
         host.device_offset = 0;
         host_inputs.push_back(&host);
     }
+    if (!output || !output->device_data) {
+        impl_->failed = true;
+        return;
+    }
+    const size_t output_bytes = output->nbytes();
+    std::vector<uint32_t> host_output_storage(
+        (output_bytes + sizeof(uint32_t) - 1) / sizeof(uint32_t));
+    Tensor host_output = *output;
+    host_output.data = host_output_storage.data();
+    host_output.device_data = nullptr;
+    host_output.device_offset = 0;
     impl_->cpu.clear_dispatch_error();
-    impl_->cpu.dispatch(node, host_inputs, output, thread_pool);
+    impl_->cpu.dispatch(node, host_inputs, &host_output, thread_pool);
     if (impl_->cpu.dispatch_failed()) {
+        impl_->failed = true;
+        return;
+    }
+    // Reference kernels may update cache/recurrent inputs in place. Copy all
+    // staged tensors back so the bridge preserves those semantics; copying a
+    // read-only activation is harmless and keeps this generic.
+    for (size_t input_index = 0; input_index < inputs.size(); ++input_index) {
+        const int storage_index = staged_storage[input_index];
+        if (storage_index < 0)
+            continue;
+        const Tensor& input = *inputs[input_index];
+        const size_t bytes = input.view_span_bytes();
+        if (!report_cuda(
+                cudaMemcpy(
+                    device_pointer<uint8_t>(input),
+                    host_storage[static_cast<size_t>(storage_index)].data(),
+                    bytes, cudaMemcpyHostToDevice),
+                "cudaMemcpy fallback updated input")) {
+            impl_->failed = true;
+            return;
+        }
+    }
+    if (host_output.data != host_output_storage.data() ||
+        !report_cuda(
+            cudaMemcpy(device_pointer<uint8_t>(*output), host_output.data,
+                       output_bytes, cudaMemcpyHostToDevice),
+            "cudaMemcpy fallback output")) {
         impl_->failed = true;
         return;
     }

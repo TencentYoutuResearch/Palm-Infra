@@ -874,8 +874,9 @@ Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1,
                      int64_t d2, int64_t d3) {
     Tensor tensor = Tensor::create(Precision::FP32, MemoryType::NONE,
                                    d0, d1, d2, d3);
-    if (!backend.alloc_output(tensor, tensor.nbytes(), nullptr))
-        std::fprintf(stderr, "CUDA managed allocation failed\n");
+    backend.alloc_persistent(tensor, tensor.nbytes());
+    if (!tensor.data)
+        std::fprintf(stderr, "CUDA host-visible test allocation failed\n");
     return tensor;
 }
 
@@ -884,8 +885,9 @@ Tensor device_tensor(CudaBackend& backend, Precision precision,
                      int64_t d2, int64_t d3) {
     Tensor tensor = Tensor::create(
         precision, MemoryType::NONE, d0, d1, d2, d3);
-    if (!backend.alloc_output(tensor, tensor.nbytes(), nullptr))
-        std::fprintf(stderr, "CUDA managed allocation failed\n");
+    backend.alloc_persistent(tensor, tensor.nbytes());
+    if (!tensor.data)
+        std::fprintf(stderr, "CUDA host-visible test allocation failed\n");
     return tensor;
 }
 
@@ -893,11 +895,15 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
                               const std::vector<float>& activation,
                               const std::vector<float>& expected,
                               int m, int n, int k) {
-    Tensor a = device_tensor(backend, k, m);
-    Tensor c = device_tensor(backend, n, m);
-    if (!a.data || !c.data)
+    Tensor a = Tensor::create(
+        Precision::FP32, MemoryType::NONE, k, m);
+    Tensor c = Tensor::create(
+        Precision::FP32, MemoryType::NONE, n, m);
+    if (!backend.alloc_output(a, a.nbytes(), nullptr) ||
+        !backend.alloc_output(c, c.nbytes(), nullptr) ||
+        !backend.copy_from_host(
+            activation.data(), a, a.nbytes()))
         return false;
-    std::memcpy(a.data, activation.data(), a.nbytes());
 
     GraphNode matmul;
     matmul.op_type = OpType::MATMUL;
@@ -905,10 +911,13 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
     backend.dispatch(matmul, {&a, &weight}, &c, nullptr);
     backend.end_graph();
     std::vector<float> actual(static_cast<size_t>(m) * n);
-    std::memcpy(actual.data(), c.data, c.nbytes());
+    if (!backend.copy_to_host(c, actual.data(), c.nbytes()))
+        return false;
     if (backend.dispatch_failed() ||
         !close_enough(actual, expected, 3e-3f))
         return false;
+    backend.free_output(a, nullptr);
+    backend.free_output(c, nullptr);
 
     constexpr int width = 8;
     constexpr int rows = 2;
@@ -997,6 +1006,116 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
     std::memcpy(actual.data(), view_result.data, view_result.nbytes());
     return !backend.dispatch_failed() &&
         close_enough(actual, view_expected, 2e-6f);
+}
+
+bool test_explicit_cpu_fallback_bridge(CudaBackend& backend) {
+    std::vector<int32_t> source = {
+        10, 11, -7, 12,
+        20, 21, 29, 22,
+    };
+    std::vector<int32_t> expected = {
+        11, -7, 11, -7,
+        21, 29, 21, 29,
+    };
+    std::vector<int32_t> actual(expected.size());
+    Tensor parent = Tensor::create(
+        Precision::INT32, MemoryType::NONE, 4, 2);
+    Tensor output = Tensor::create(
+        Precision::INT32, MemoryType::NONE, 4, 2);
+    if (!backend.alloc_output(parent, parent.nbytes(), nullptr) ||
+        !backend.alloc_output(output, output.nbytes(), nullptr) ||
+        !backend.copy_from_host(source.data(), parent, parent.nbytes()))
+        return false;
+    Tensor input = parent;
+    input.device_offset += sizeof(int32_t);
+    input.shape[0] = 2;
+
+    // CUDA's native TILE path is FP32-only. INT32 deliberately exercises the
+    // generic CPU reference bridge with explicit D2H/H2D staging. The input
+    // is also an offset, strided view, exercising exact view-span staging.
+    GraphNode tile;
+    tile.op_type = OpType::TILE;
+    tile.params.i32 = {2, 1, 1, 1};
+    backend.clear_dispatch_error();
+    backend.dispatch(tile, {&input}, &output, nullptr);
+    backend.end_graph();
+    const bool valid = !backend.dispatch_failed() &&
+        backend.copy_to_host(output, actual.data(), output.nbytes()) &&
+        actual == expected;
+    backend.free_output(parent, nullptr);
+    backend.free_output(output, nullptr);
+    if (!valid)
+        return false;
+
+    constexpr int width = 4;
+    constexpr int rows = 2;
+    std::vector<float> residual_values = {
+        0.25f, -0.5f, 0.75f, 1.0f,
+        -0.2f, 0.4f, -0.6f, 0.8f,
+    };
+    std::vector<float> update_values = {
+        0.1f, 0.2f, -0.3f, 0.4f,
+        0.5f, -0.4f, 0.3f, -0.2f,
+    };
+    std::vector<float> weight_values = {0.8f, 0.9f, 1.1f, 1.2f};
+    std::vector<float> expected_residual(residual_values.size());
+    std::vector<float> expected_norm(residual_values.size());
+    for (int row = 0; row < rows; ++row) {
+        float square_sum = 0.0f;
+        for (int column = 0; column < width; ++column) {
+            const size_t index = static_cast<size_t>(row) * width + column;
+            expected_residual[index] =
+                residual_values[index] + update_values[index];
+            square_sum += expected_residual[index] * expected_residual[index];
+        }
+        const float scale = 1.0f / std::sqrt(square_sum / width + 1e-6f);
+        for (int column = 0; column < width; ++column) {
+            const size_t index = static_cast<size_t>(row) * width + column;
+            expected_norm[index] =
+                expected_residual[index] * scale * weight_values[column];
+        }
+    }
+
+    Tensor residual = Tensor::create(
+        Precision::FP32, MemoryType::NONE, width, rows);
+    Tensor update = Tensor::create(
+        Precision::FP32, MemoryType::NONE, width, rows);
+    Tensor normalized = Tensor::create(
+        Precision::FP32, MemoryType::NONE, width, rows);
+    Tensor weight = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, width, 1, 1, 1,
+        weight_values.data());
+    if (!backend.alloc_output(residual, residual.nbytes(), nullptr) ||
+        !backend.alloc_output(update, update.nbytes(), nullptr) ||
+        !backend.alloc_output(normalized, normalized.nbytes(), nullptr) ||
+        !backend.copy_from_host(
+            residual_values.data(), residual, residual.nbytes()) ||
+        !backend.copy_from_host(update_values.data(), update, update.nbytes()))
+        return false;
+    backend.wrap_weight(weight);
+    // Deliberately invalidate CUDA's contiguous-weight precondition without
+    // changing the CPU reference's logical 1-D weight values.
+    weight.stride[0] = sizeof(float) * 2;
+    GraphNode add_norm;
+    add_norm.op_type = OpType::ADD_RMS_NORM;
+    add_norm.params.f32 = {1e-6f};
+    backend.clear_dispatch_error();
+    backend.dispatch(
+        add_norm, {&residual, &update, &weight}, &normalized, nullptr);
+    backend.end_graph();
+    std::vector<float> actual_residual(expected_residual.size());
+    std::vector<float> actual_norm(expected_norm.size());
+    const bool stateful_valid = !backend.dispatch_failed() &&
+        backend.copy_to_host(
+            residual, actual_residual.data(), residual.nbytes()) &&
+        backend.copy_to_host(
+            normalized, actual_norm.data(), normalized.nbytes()) &&
+        close_enough(actual_residual, expected_residual, 0.0f) &&
+        close_enough(actual_norm, expected_norm, 2e-6f);
+    backend.free_output(residual, nullptr);
+    backend.free_output(update, nullptr);
+    backend.free_output(normalized, nullptr);
+    return stateful_valid;
 }
 
 bool test_rwkv_matrix_ops(CudaBackend& backend) {
@@ -2623,6 +2742,12 @@ int main() {
         !test_device_resident_ops(backend, fp16, activation, expected,
                                   m, n, k))
         return 1;
+    {
+        CudaBackend fallback_backend;
+        if (!fallback_backend.available() ||
+            !test_explicit_cpu_fallback_bridge(fallback_backend))
+            return 1;
+    }
     if (!test_rwkv_matrix_ops(backend))
         return 1;
     if (backend.kv_cache_precision(Precision::FP16) != Precision::FP16 ||

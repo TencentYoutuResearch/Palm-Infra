@@ -742,8 +742,12 @@ bool LLMEngine::encode_vision_patches(
     output.grid_w = grid_w;
     output.values.resize(
         static_cast<size_t>(output.tokens) * output.hidden_size);
-    std::memcpy(output.values.data(), result.data,
-                output.values.size() * sizeof(float));
+    if (!exec_ctx_vision_.backend->copy_to_host(
+            result, output.values.data(),
+            output.values.size() * sizeof(float))) {
+        release_vision_buffers();
+        return fail(error, "vision output readback failed");
+    }
     // Vision runs once per attached image. Its SDPA graph conservatively keeps
     // intermediates alive through the call, so return both CPU pool storage
     // and accelerator allocations immediately instead of retaining hundreds
