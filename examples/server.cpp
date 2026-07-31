@@ -42,7 +42,7 @@ void usage(const char *argv0) {
     std::fprintf(
         stderr,
         "Usage: %s --package model.mollm [--host 127.0.0.1] [--port 8080]\n"
-        "       [--device cpu|metal] [--threads N] [--n-ctx N]\n"
+        "       [--device cpu|metal|cuda] [--threads N] [--n-ctx N]\n"
         "Endpoints: GET /v1/models, POST /v1/chat/completions\n",
         argv0);
 }
@@ -88,6 +88,10 @@ bool parse_args(int argc, char **argv, ServerOptions &o) {
 #ifdef MOLLM_METAL
             else if (!std::strcmp(v, "metal"))
                 o.runtime.device = Device::METAL;
+#endif
+#ifdef MOLLM_CUDA
+            else if (!std::strcmp(v, "cuda"))
+                o.runtime.device = Device::CUDA;
 #endif
             else {
                 std::fprintf(stderr, "server: unsupported device %s\n", v);

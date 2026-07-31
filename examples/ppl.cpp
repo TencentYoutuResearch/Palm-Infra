@@ -59,7 +59,7 @@ void print_usage(const char* argv0) {
     std::printf("  --n-ctx <int>         Context size (default 4096)\n");
     std::printf("  --threads <int>       Worker threads (default: auto, %d here)\n",
                 default_worker_threads());
-    std::printf("  --device <cpu|metal>  Compute backend (default: cpu)\n");
+    std::printf("  --device <cpu|metal|cuda>  Compute backend (default: cpu)\n");
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>  CPU MoE SSD cache capacity\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
@@ -131,7 +131,13 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
 #else
                 error = "--device metal requires a build with -DMOLLM_METAL=ON"; return false;
 #endif
-            } else { error = std::string("unknown --device '") + dev + "' (cpu|metal)"; return false; }
+            } else if (dev == "cuda") {
+#ifdef MOLLM_CUDA
+                opts.device = Device::CUDA;
+#else
+                error = "--device cuda requires a build with -DMOLLM_CUDA=ON"; return false;
+#endif
+            } else { error = std::string("unknown --device '") + dev + "' (cpu|metal|cuda)"; return false; }
         } else if (arg == "--mmap") {
             opts.weight_loading = WeightLoadingMode::MMAP;
         } else if (arg == "--ssd-cache-mb") {

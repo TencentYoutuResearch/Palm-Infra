@@ -69,6 +69,29 @@ jobs:
           MOLLM_X86_ISA: scalar
         run: ctest --test-dir build --output-on-failure
 
+  cuda-build:
+    name: Linux x86_64 (CUDA compile)
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - name: Install build tools
+        run: apt-get update && apt-get install -y --no-install-recommends cmake g++ git
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DMOLLM_CUDA=ON
+          -DMOLLM_BUILD_TESTS=ON
+          -DMOLLM_BUILD_EXAMPLE=ON
+          -DCMAKE_CUDA_ARCHITECTURES=80
+      - name: Build
+        run: cmake --build build -j 2
+      - name: CUDA API and package tests
+        run: >
+          ctest --test-dir build --output-on-failure
+          -R 'test_cuda_backend|test_package_install'
+
   linux-arm64-build-and-test:
     name: Linux ARM64 (${{ matrix.name }})
     strategy:

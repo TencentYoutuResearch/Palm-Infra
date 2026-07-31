@@ -124,8 +124,16 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 error = "--device metal requires a build with -DMOLLM_METAL=ON";
                 return false;
 #endif
+            } else if (dev == "cuda") {
+#ifdef MOLLM_CUDA
+                opts.device = Device::CUDA;
+#else
+                error = "--device cuda requires a build with -DMOLLM_CUDA=ON";
+                return false;
+#endif
             } else {
-                error = std::string("unknown --device value '") + dev + "' (use cpu|metal)";
+                error = std::string("unknown --device value '") + dev +
+                        "' (use cpu|metal|cuda)";
                 return false;
             }
         } else if (arg == "--mmap") {
@@ -289,7 +297,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
                 default_worker_threads());
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
-    std::printf("  --device <cpu|metal>     Compute backend (metal requires MOLLM_METAL build)\n");
+    std::printf("  --device <cpu|metal|cuda> Compute backend (GPU backends require their build option)\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache; pins dense weights by default\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");

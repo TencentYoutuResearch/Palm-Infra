@@ -2,6 +2,7 @@
 
 #include "kernels/matmul.h"
 #include "kernels/matmul_profile.h"
+#include "kernels/quant_layouts.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -49,28 +50,6 @@ inline void load_w8_b_scales8(const float* scales, int n, int c_valid,
     hi = vld1q_f32(tmp + 4);
 }
 #endif
-
-struct alignas(16) Q4B8G128Block {
-    float scales[8];
-    uint8_t q[4][8][16];
-};
-static_assert(sizeof(Q4B8G128Block) == 544, "unexpected Q4B8G128Block size");
-
-struct alignas(16) Q4B8G32Block {
-    float scales[8];
-    uint8_t q[8][16];
-};
-static_assert(sizeof(Q4B8G32Block) == 160, "unexpected Q4B8G32Block size");
-
-// x86 VNNI prefill sidecar for one 8-output x 32-K block. Each row stores
-// four consecutive K nibbles for all eight outputs. Runtime unpacking then
-// feeds one VPDPBUSD that accumulates all eight outputs without horizontal
-// sums, while keeping the sidecar at the original four-bit density.
-struct alignas(16) Q4B8G32VnniBlock {
-    uint8_t q[8][16];
-};
-static_assert(sizeof(Q4B8G32VnniBlock) == 128,
-              "unexpected Q4B8G32VnniBlock size");
 
 struct alignas(16) Q8A4Block {
     float scales[4];

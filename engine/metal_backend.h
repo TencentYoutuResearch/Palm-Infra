@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/backend.h"
+#include "engine/accelerator_backend.h"
 #include <memory>
 #include <string>
 
@@ -20,7 +20,7 @@
 
 class MetalBufferPool;
 
-class MetalBackend : public Backend {
+class MetalBackend : public AcceleratorBackend {
 public:
     // metallib_path: path to the compiled default.metallib. If empty, the
     // backend looks next to the executable / uses a compile-time define.
@@ -31,7 +31,7 @@ public:
     MetalBackend& operator=(const MetalBackend&) = delete;
 
     /// True if a Metal device was found and the metallib loaded.
-    bool available() const;
+    bool available() const override;
 
     // --- Backend interface ---
     ShapeMode shape_mode() const override { return ShapeMode::DYNAMIC; }
@@ -57,37 +57,38 @@ public:
     /// Register the whole package weight region as one shared MTLBuffer wrapping
     /// the mmap (newBufferWithBytesNoCopy). Individual weight tensors then carry
     /// device_offset = (weight ptr - base). Returns false if wrapping failed.
-    bool register_weight_region(void* base, size_t size);
+    bool register_weight_region(void* base, size_t size) override;
 
     /// Enable per-weight copies for hybrid SSD-MoE. The package remains mmap'd
     /// so expert aggregates stay unmaterialized; dense constants are copied
     /// into individual Shared Metal buffers by wrap_weight().
-    void enable_weight_copy_mode();
+    void enable_weight_copy_mode() override;
 
     /// True when hybrid copy mode currently owns at least one dense weight.
-    bool has_weight_copies() const;
+    bool has_weight_copies() const override;
 
     /// Configure the full-Metal SSD expert cache. Metal I/O loads package
     /// ranges directly into Shared buffers consumed by routed-expert kernels.
     bool configure_moe_ssd_io(const std::string& package_path,
                               size_t capacity_bytes, int max_commands_in_flight,
-                              bool cross_layer_prefetch);
+                              bool cross_layer_prefetch) override;
 
     /// After register_weight_region, point a weight/constant tensor at the
     /// shared weight buffer with the correct device_offset (from t.data).
-    void wrap_weight(Tensor& t);
+    void wrap_weight(Tensor& t) override;
 
     /// Second pass for packed INT4 weights (call after quant metadata is set):
     /// decode ordinary BG32/BG128 linear weights into a Metal-friendly raw
     /// nibble + scale device buffer. Aggregate expert tensors stay in their
     /// package-native layout and are consumed directly by MoE kernels.
-    void wrap_weight_int4(Tensor& t, bool keep_native_experts = false);
+    void wrap_weight_int4(Tensor& t,
+                          bool keep_native_experts = false) override;
 
     /// Allocate a device-resident buffer of nbytes and point t at it (used for
     /// KV cache and boundary buffers). Sets t.device_data / t.device_offset and
     /// t.data = [buffer contents] (Shared storage, host-visible). Persistent
     /// buffers allocated here are owned for the lifetime of the backend.
-    void alloc_persistent(Tensor& t, size_t nbytes);
+    void alloc_persistent(Tensor& t, size_t nbytes) override;
 
     /// Upload host bytes into a REUSABLE device buffer identified by `key`
     /// (e.g. graph INPUT node name like "hidden"/"cos"). The buffer is owned by
@@ -95,7 +96,14 @@ public:
     /// size is needed. Sets t.device_data / t.device_offset (t.data unchanged so
     /// host reads still work). Used for boundary inputs (hidden/mask/cos/sin).
     void upload_input(Tensor& t, const std::string& key,
-                      const void* host_src, size_t nbytes);
+                      const void* host_src, size_t nbytes) override;
+
+    bool supports_lm_head(const Tensor& weight) const override {
+        return weight.device_data &&
+            (weight.prec == Precision::FP16 ||
+             weight.prec == Precision::INT8 ||
+             weight.prec == Precision::INT4);
+    }
 
     /// Run a single GEMV on the GPU: out[N] = a[K] (fp32) * W[N,K] (fp16),
     /// used for the lm_head projection during decode. `a_host` is a host FP32
@@ -103,14 +111,15 @@ public:
     /// (W.device_data set, shape[0]=N, shape[1]=K). Results written to
     /// `out_host` (length N). Runs its own command buffer (commit+wait).
     void lm_head_gemv(const float* a_host, const Tensor& weight,
-                      float* out_host, int N, int K, int activation = 0);
+                      float* out_host, int N, int K,
+                      int activation = 0) override;
 
     /// Append lm_head GEMV to the currently open graph command stream, reading
     /// the graph output directly from its device buffer. This closes and waits
     /// for the graph, then copies logits to `out_host` for sampling.
     void lm_head_gemv_device_and_end_graph(
         const Tensor& a, size_t a_element_offset, const Tensor& weight,
-        float* out_host, int N, int K, int activation = 0);
+        float* out_host, int N, int K, int activation = 0) override;
 
 private:
     void lm_head_gemv_impl(void* a_device, size_t a_byte_offset,

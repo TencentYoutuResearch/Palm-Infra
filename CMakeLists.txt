@@ -19,6 +19,7 @@ option(MOLLM_BUILD_TESTS "Build tests" ON)
 option(MOLLM_BUILD_EXAMPLE "Build example CLI" ON)
 option(MOLLM_ARM_NATIVE "Build ARM64 kernels with -mcpu=native for local benchmarking" OFF)
 option(MOLLM_METAL "Build the Metal GPU backend (Apple only)" OFF)
+option(MOLLM_CUDA "Build the CUDA correctness backend" OFF)
 set(MOLLM_ARM_I8MM "AUTO" CACHE STRING
     "ARM64 i8mm kernel target mode: AUTO, ON, or OFF")
 set_property(CACHE MOLLM_ARM_I8MM PROPERTY STRINGS AUTO ON OFF)
@@ -96,6 +97,7 @@ set(SOURCES
 )
 
 set(PUBLIC_ENGINE_HEADERS
+    engine/accelerator_backend.h
     engine/backend.h
     engine/engine.h
     engine/sampler.h
@@ -331,6 +333,27 @@ if(MOLLM_METAL)
 endif()
 
 # ---------------------------------------------------------------------------
+# CUDA GPU backend (optional)
+# ---------------------------------------------------------------------------
+
+if(MOLLM_CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        # Emit SASS for common datacenter/consumer generations and retain PTX
+        # for forward-compatible driver JIT on newer GPUs.
+        set(CMAKE_CUDA_ARCHITECTURES 75 80 86)
+    endif()
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_sources(mollm_lib PRIVATE engine/cuda_backend.cu)
+    target_compile_definitions(mollm_lib PUBLIC MOLLM_CUDA=1)
+    target_link_libraries(mollm_lib PUBLIC CUDA::cudart CUDA::cublas)
+    set_target_properties(mollm_lib PROPERTIES
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON)
+    message(STATUS "CUDA correctness backend enabled")
+endif()
+
+# ---------------------------------------------------------------------------
 # example CLI
 # ---------------------------------------------------------------------------
 
@@ -422,6 +445,10 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_e2e           tests/test_e2e.cpp)
     add_mollm_test(test_quantized_e2e tests/test_quantized_e2e.cpp)
     add_mollm_test(test_thread_pool_stress tests/test_thread_pool_stress.cpp)
+    if(MOLLM_CUDA)
+        add_mollm_test(test_cuda_backend tests/test_cuda_backend.cpp)
+        set_tests_properties(test_cuda_backend PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_executable(test_tiny_cpu_inference tests/test_tiny_cpu_inference.cpp)

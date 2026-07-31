@@ -96,7 +96,7 @@ bool matmul_int8_range(const float* A, const int8_t* B, const float* scales,
 
 }  // namespace mollm::cpu
 
-#if !MOLLM_CPU_ARM_NEON && !defined(__clang__)
+#if !MOLLM_CPU_ARM_NEON && !defined(__clang__) && !defined(__CUDACC__)
 // Legacy CPU kernels still spell their storage element as `__fp16`.  Keep the
 // compatibility name at this one architecture boundary while those kernels
 // are moved behind providers; no generic caller needs a compiler extension.

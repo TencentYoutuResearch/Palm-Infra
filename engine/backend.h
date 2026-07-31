@@ -87,6 +87,13 @@ public:
     /// op type instead of host-pointer equality.
     virtual bool is_device_resident() const { return false; }
 
+    /// Select the physical precision for persistent KV storage. Graph files
+    /// describe the preferred format; a backend may request a correctness
+    /// fallback when its attention implementation cannot consume it.
+    virtual Precision kv_cache_precision(Precision requested) const {
+        return requested;
+    }
+
     /// Make preceding device writes visible through Tensor::data for a
     /// host-side consumer such as SSD route prediction. CPU is already
     /// coherent; device backends may submit and wait for queued work.
@@ -118,6 +125,12 @@ public:
 
     void clear_dispatch_error() override { dispatch_failed_ = false; }
     bool dispatch_failed() const override { return dispatch_failed_; }
+    Precision kv_cache_precision(Precision requested) const override {
+        if (requested == Precision::FP16 &&
+            !mollm::cpu::capabilities().fp16_kv_cache)
+            return Precision::FP32;
+        return requested;
+    }
 
 private:
     bool dispatch_failed_ = false;

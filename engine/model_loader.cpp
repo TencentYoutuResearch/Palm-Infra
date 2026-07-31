@@ -8,12 +8,9 @@
 #include "kernels/cpu_platform.h"
 #ifdef MOLLM_METAL
 #include "engine/metal_backend.h"
-
-namespace {
-MetalBackend* as_metal(const std::unique_ptr<Backend>& backend) {
-    return static_cast<MetalBackend*>(backend.get());
-}
-}  // namespace
+#endif
+#ifdef MOLLM_CUDA
+#include "engine/cuda_backend.h"
 #endif
 
 #include <algorithm>
@@ -120,7 +117,7 @@ void LLMEngine::clear_model_state() {
     exec_ctx_prefill_ = ExecContext{};
     exec_ctx_decode_ = ExecContext{};
     exec_ctx_vision_ = ExecContext{};
-    metal_backend_.reset();
+    accelerator_backend_.reset();
 
     caches_.clear();
     auxiliary_states_.clear();
@@ -403,32 +400,24 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.q4_g128_data = nullptr;
             t.prepared_weight = nullptr;
             t.prepared_weight_row_offset = 0;
-#ifdef MOLLM_METAL
-            // Alias this weight into the registered device weight buffer NOW,
-            // while t.data still points at the raw mmap region (before any CPU
-            // load-time repacking rewrites t.data to an out-of-region buffer).
-            // Packed INT4 weights need a second pass after quant metadata is set
-            // (see finalize_metal_weight) to decode the packed block layout.
-            if (metal_backend_ && exec_ctx.backend == metal_backend_.get())
-                as_metal(metal_backend_)->wrap_weight(t);
-#endif
+            // Prepare accelerator storage while t.data still points at the raw
+            // package bytes. CPU load-time packing may replace t.data later.
+            if (accelerator_backend_ &&
+                exec_ctx.backend == accelerator_backend_.get())
+                accelerator_backend_->wrap_weight(t);
         };
 
-#ifdef MOLLM_METAL
-        // Once packed-INT4 metadata is populated, decode ordinary linear
-        // weights into a Metal raw nibble+scale sidecar. Aggregate experts
-        // remain in their native BG32/BG128 package layout.
-        auto finalize_metal_weight = [&]() {
-            if (metal_backend_ && exec_ctx.backend == metal_backend_.get()) {
+        // Quantized layout metadata is only known after parsing the weight
+        // header, so let the accelerator perform its second preparation pass.
+        auto finalize_accelerator_weight = [&]() {
+            if (accelerator_backend_ &&
+                exec_ctx.backend == accelerator_backend_.get()) {
                 bool is_aggregate_expert =
                     wref.find("_experts_") != std::string::npos;
-                as_metal(metal_backend_)
-                    ->wrap_weight_int4(t, is_aggregate_expert);
+                accelerator_backend_->wrap_weight_int4(
+                    t, is_aggregate_expert);
             }
         };
-#else
-        auto finalize_metal_weight = [&]() {};
-#endif
 
         // Package mode: resolve weight from package mmap via offset map.
         // The weight path (e.g. "./foo.weights") is looked up in
@@ -514,7 +503,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     mmap_weight_exclusion_ranges_.push_back(
                         {pit->second.first, pit->second.second});
                 }
-                finalize_metal_weight();
+                finalize_accelerator_weight();
                 continue;
             }
         }
@@ -559,7 +548,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         if (native_fp8_weight_nodes.count(node.id) != 0)
             prepare_fp8_bf16_fp16_weight(
                 t, wpath, t.data, packed_weights_);
-        finalize_metal_weight();
+        finalize_accelerator_weight();
     }
 
     // Find special externally-driven weights. lm_head is stored explicitly in
@@ -608,14 +597,13 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
             auxiliary_states_[input.layer] = &tensor;
             continue;
         }
-        // Cache precision is a CPU-provider policy, not a graph-format or
-        // loader architecture check.  The scalar provider keeps K/V in FP32;
-        // the ARM provider retains the serialized FP16 cache path unchanged.
-        if (exec_ctx_prefill_.backend == &cpu_backend_ &&
-            !mollm::cpu::capabilities().fp16_kv_cache &&
-            (input.kind == PersistentInputKind::KV_KEY ||
-             input.kind == PersistentInputKind::KV_VALUE)) {
-            tensor.prec = Precision::FP32;
+        // Cache storage is selected by the active execution backend. This
+        // keeps device policy out of the loader and lets correctness backends
+        // request FP32 while their native attention path is incomplete.
+        if (input.kind == PersistentInputKind::KV_KEY ||
+            input.kind == PersistentInputKind::KV_VALUE) {
+            tensor.prec = exec_ctx_prefill_.backend->kv_cache_precision(
+                tensor.prec);
             tensor.compute_strides();
         }
         if (input.layer >= (int)caches_.size())
@@ -663,17 +651,13 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
 
     // Allocate cache/state data buffers from engine-owned persistent storage
     // (once, at load time). Graph runtime pools are execution-temporary only.
-    // Allocate a persistent buffer for a cache tensor. On Metal, allocate a
-    // device MTLBuffer (Shared storage, so the CacheMetadata header stays
-    // host-readable/writable and SDPA appends device-side). On CPU, use the
-    // engine persistent_pool_. Returns the host-visible pointer (buf).
+    // Allocate a persistent buffer for a cache tensor. Accelerators provide a
+    // host-visible mirror when metadata is maintained by the engine.
     auto alloc_cache_buf = [&](Tensor* t, size_t total) -> void* {
-#ifdef MOLLM_METAL
-        if (metal_backend_) {
-            as_metal(metal_backend_)->alloc_persistent(*t, total);
-            return t->data; // = [buffer contents], host-visible
+        if (accelerator_backend_) {
+            accelerator_backend_->alloc_persistent(*t, total);
+            return t->data;
         }
-#endif
         void* buf = persistent_pool_.acquire(total);
         t->data = buf;
         t->owner_id = persistent_pool_.id();
@@ -844,17 +828,17 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_prefill_.backend = &cpu_backend_;
     exec_ctx_decode_.backend = &cpu_backend_;
     exec_ctx_vision_.backend = &cpu_backend_;
-    metal_backend_.reset();
+    accelerator_backend_.reset();
     if (cfg_.device == Device::METAL) {
 #ifdef MOLLM_METAL
-        metal_backend_.reset(new MetalBackend());
-        if (!as_metal(metal_backend_)->available()) {
+        accelerator_backend_ = std::make_unique<MetalBackend>();
+        if (!accelerator_backend_->available()) {
             fprintf(stderr,
                     "Engine: Metal backend unavailable; falling back to CPU\n");
-            metal_backend_.reset();
+            accelerator_backend_.reset();
             cfg_.device = Device::CPU;
         } else {
-            exec_ctx_prefill_.backend = metal_backend_.get();
+            exec_ctx_prefill_.backend = accelerator_backend_.get();
             // SSD expert compute remains much faster when decode stays wholly
             // on CPU: alternating a GPU dense segment with every CPU expert
             // layer throttles the routed matmuls on UMA. Keep Metal for the
@@ -863,11 +847,28 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             exec_ctx_decode_.backend =
                 cfg_.moe_ssd_cache_bytes != 0 && !cfg_.metal_ssd_full
                 ? static_cast<Backend*>(&cpu_backend_)
-                : metal_backend_.get();
+                : accelerator_backend_.get();
         }
 #else
         fprintf(stderr,
                 "Engine: built without MOLLM_METAL; using CPU backend\n");
+        cfg_.device = Device::CPU;
+#endif
+    } else if (cfg_.device == Device::CUDA) {
+#ifdef MOLLM_CUDA
+        accelerator_backend_ = std::make_unique<CudaBackend>();
+        if (!accelerator_backend_->available()) {
+            fprintf(stderr,
+                    "Engine: CUDA backend unavailable; falling back to CPU\n");
+            accelerator_backend_.reset();
+            cfg_.device = Device::CPU;
+        } else {
+            exec_ctx_prefill_.backend = accelerator_backend_.get();
+            exec_ctx_decode_.backend = accelerator_backend_.get();
+        }
+#else
+        fprintf(stderr,
+                "Engine: built without MOLLM_CUDA; using CPU backend\n");
         cfg_.device = Device::CPU;
 #endif
     }
@@ -929,9 +930,9 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         }
 
         // DeepSeek-V4 currently has CPU-only FP8/MXFP4, hyper-connection and
-        // sparse-attention kernels. Running this graph through Metal would
+        // sparse-attention kernels. Running this graph through an accelerator would
         // silently dispatch unsupported operators and corrupt the result.
-        if (cfg_.device == Device::METAL) {
+        if (cfg_.device != Device::CPU) {
             if (cfg_.metal_ssd_full) {
                 fprintf(stderr,
                         "Engine: DeepSeek-V4 does not yet support "
@@ -940,8 +941,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             }
             fprintf(stderr,
                     "Engine: DeepSeek-V4 currently uses the CPU backend; "
-                    "ignoring --device metal\n");
-            metal_backend_.reset();
+                    "ignoring accelerator device request\n");
+            accelerator_backend_.reset();
             cfg_.device = Device::CPU;
             exec_ctx_prefill_.backend = &cpu_backend_;
             exec_ctx_decode_.backend = &cpu_backend_;
@@ -949,15 +950,13 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         }
     }
 
-#ifdef MOLLM_METAL
-    // Wrap the whole package weight region as one zero-copy MTLBuffer so each
-    // weight tensor can alias it via device_offset (set in setup_weight).
-    if (metal_backend_ && package_weights_base_ && package_weights_size_) {
+    // Give the accelerator the package region before constants are loaded.
+    if (accelerator_backend_ && package_weights_base_ &&
+        package_weights_size_) {
         if (moe_ssd_cache_) {
-            as_metal(metal_backend_)->enable_weight_copy_mode();
+            accelerator_backend_->enable_weight_copy_mode();
             if (cfg_.metal_ssd_full) {
-                if (!as_metal(metal_backend_)
-                         ->configure_moe_ssd_io(
+                if (!accelerator_backend_->configure_moe_ssd_io(
                              cfg_.package_path, cfg_.moe_ssd_cache_bytes,
                              cfg_.moe_ssd_io_workers,
                              cfg_.moe_ssd_cross_layer_prefetch)) {
@@ -972,16 +971,14 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                         "prefill and uses CPU decode; experts remain mmap-backed\n");
             }
         } else {
-            if (!as_metal(metal_backend_)
-                     ->register_weight_region(
+            if (!accelerator_backend_->register_weight_region(
                          const_cast<uint8_t*>(package_weights_base_),
                          package_weights_size_)) {
                 fprintf(stderr,
-                        "Engine: failed to register weight region with Metal\n");
+                        "Engine: failed to prepare accelerator weight region\n");
             }
         }
     }
-#endif
 
     // Load prefill graph first (establishes shared weights)
     const std::string& pf_path_load =

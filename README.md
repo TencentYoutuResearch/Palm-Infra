@@ -364,6 +364,23 @@ Standard mollm benchmark:
     --threads 4
 ```
 
+## CUDA correctness backend
+
+CUDA support can be built independently of the CPU provider:
+
+```bash
+cmake -S . -B build_cuda -DCMAKE_BUILD_TYPE=Release -DMOLLM_CUDA=ON
+cmake --build build_cuda -j
+./build_cuda/mollm_chat --device cuda --package model.mollm
+```
+
+The initial CUDA backend is a correctness baseline. FP16/FP32 linear layers
+run through cuBLAS, and package-native W4G32/W4G128 weights are dequantized to
+FP16 device weights at load time. Operators not yet implemented in CUDA use
+the CPU reference dispatcher with host-visible intermediates. This is useful
+for end-to-end validation and per-node comparison, but it is not yet the
+fully device-resident performance path.
+
 ## Local HTTP server
 
 ```bash
