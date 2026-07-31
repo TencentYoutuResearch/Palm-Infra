@@ -427,6 +427,195 @@ __global__ void sdpa_output_cuda(
     }
 }
 
+__global__ void shortconv_cuda(
+    const float* input, const float* weight, float* state, float* output,
+    int groups, int sequence_length, int kernel_size, int real_length,
+    size_t input_row_stride) {
+    const int group = static_cast<int>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (group >= groups)
+        return;
+    const int prefix_length = kernel_size - 1;
+    const int process_length = real_length > 0 && real_length < sequence_length
+        ? real_length : sequence_length;
+    const float* group_weight = weight +
+        static_cast<size_t>(group) * kernel_size;
+    float* group_state = state +
+        static_cast<size_t>(group) * prefix_length;
+    float* group_output = output +
+        static_cast<size_t>(group) * sequence_length;
+
+    for (int token = 0; token < sequence_length; ++token) {
+        float sum = 0.0f;
+        for (int inner = 0; inner < kernel_size; ++inner) {
+            const int window_position = token + inner;
+            const float value = window_position < prefix_length
+                ? group_state[window_position]
+                : input[static_cast<size_t>(window_position - prefix_length) *
+                            input_row_stride + group];
+            sum += value * group_weight[inner];
+        }
+        group_output[token] = token < process_length
+            ? sum / (1.0f + expf(-sum)) : 0.0f;
+    }
+
+    for (int inner = 0; inner < prefix_length; ++inner) {
+        const int window_position = process_length + inner;
+        group_state[inner] = window_position < prefix_length
+            ? group_state[window_position]
+            : input[static_cast<size_t>(window_position - prefix_length) *
+                        input_row_stride + group];
+    }
+}
+
+__device__ float gdn_block_sum(float value, float* reduction) {
+    reduction[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float result = reduction[0];
+    __syncthreads();
+    return result;
+}
+
+__device__ float gdn_softplus_cuda(float value) {
+    if (value > 20.0f)
+        return value;
+    if (value < -20.0f)
+        return expf(value);
+    return log1pf(expf(value));
+}
+
+__global__ void gated_deltanet_cuda(
+    const float* qkv, const float* a, const float* b, const float* z,
+    const float* a_log, const float* dt_bias, const float* norm_weight,
+    float* state, float* output, int num_heads, int key_dim, int value_dim,
+    int sequence_length, int real_length, int num_value_heads,
+    bool use_l2_norm, size_t a_row_stride, size_t b_row_stride,
+    size_t z_row_stride, size_t output_row_stride, float rms_epsilon,
+    float l2_epsilon, float scale) {
+    const int value_head = blockIdx.x;
+    if (value_head >= num_value_heads)
+        return;
+    const int repeat = num_value_heads / num_heads;
+    const int key_head = value_head / repeat;
+    const int qkv_dim = num_heads * key_dim;
+    const int process_length = real_length > 0 &&
+            real_length < sequence_length
+        ? real_length : sequence_length;
+    extern __shared__ float shared[];
+    float* query = shared;
+    float* key = query + key_dim;
+    float* reduction = key + key_dim;
+    float* gate = reduction + blockDim.x;
+    float* state_head = state +
+        static_cast<size_t>(value_head) * key_dim * value_dim;
+
+    for (int token = 0; token < sequence_length; ++token) {
+        if (token >= process_length) {
+            for (int dimension = threadIdx.x; dimension < value_dim;
+                 dimension += blockDim.x)
+                output[static_cast<size_t>(token) * output_row_stride +
+                       static_cast<size_t>(value_head) * value_dim +
+                       dimension] = 0.0f;
+            __syncthreads();
+            continue;
+        }
+
+        for (int dimension = threadIdx.x; dimension < key_dim;
+             dimension += blockDim.x) {
+            query[dimension] = qkv[
+                static_cast<size_t>(key_head * key_dim + dimension) *
+                    sequence_length + token];
+            key[dimension] = qkv[
+                static_cast<size_t>(qkv_dim + key_head * key_dim +
+                                    dimension) * sequence_length + token];
+        }
+        __syncthreads();
+
+        float query_sum = 0.0f;
+        float key_sum = 0.0f;
+        for (int dimension = threadIdx.x; dimension < key_dim;
+             dimension += blockDim.x) {
+            query_sum += query[dimension] * query[dimension];
+            key_sum += key[dimension] * key[dimension];
+        }
+        const float query_total = gdn_block_sum(query_sum, reduction);
+        const float key_total = gdn_block_sum(key_sum, reduction);
+        const float query_inverse = use_l2_norm
+            ? rsqrtf(query_total + l2_epsilon) : 1.0f;
+        const float key_inverse = use_l2_norm
+            ? rsqrtf(key_total + l2_epsilon) : 1.0f;
+        for (int dimension = threadIdx.x; dimension < key_dim;
+             dimension += blockDim.x) {
+            query[dimension] *= query_inverse;
+            key[dimension] *= key_inverse;
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            const float a_value =
+                a[static_cast<size_t>(token) * a_row_stride + value_head];
+            const float b_value =
+                b[static_cast<size_t>(token) * b_row_stride + value_head];
+            const float softplus = gdn_softplus_cuda(
+                a_value + dt_bias[value_head]);
+            gate[0] = expf(-expf(a_log[value_head]) * softplus);
+            gate[1] = 1.0f / (1.0f + expf(-b_value));
+        }
+        __syncthreads();
+        const float decay = gate[0];
+        const float beta = gate[1];
+
+        float attention = 0.0f;
+        if (threadIdx.x < value_dim) {
+            const int value_column = threadIdx.x;
+            float memory_value = 0.0f;
+            for (int key_row = 0; key_row < key_dim; ++key_row) {
+                const float decayed =
+                    state_head[static_cast<size_t>(key_row) * value_dim +
+                               value_column] * decay;
+                memory_value += decayed * key[key_row];
+            }
+            const float current_value = qkv[
+                static_cast<size_t>(2 * qkv_dim +
+                                    value_head * value_dim + value_column) *
+                    sequence_length + token];
+            const float delta = (current_value - memory_value) * beta;
+            float updated_attention = 0.0f;
+            for (int key_row = 0; key_row < key_dim; ++key_row) {
+                const size_t state_index =
+                    static_cast<size_t>(key_row) * value_dim + value_column;
+                const float updated =
+                    state_head[state_index] * decay + key[key_row] * delta;
+                state_head[state_index] = updated;
+                updated_attention += updated * query[key_row];
+            }
+            attention = updated_attention * scale;
+        }
+        const float attention_sum = gdn_block_sum(
+            threadIdx.x < value_dim ? attention * attention : 0.0f,
+            reduction);
+        const float rms_inverse =
+            rsqrtf(attention_sum / value_dim + rms_epsilon);
+        if (threadIdx.x < value_dim) {
+            const int value_column = threadIdx.x;
+            const float z_value = z[
+                static_cast<size_t>(token) * z_row_stride +
+                static_cast<size_t>(value_head) * value_dim + value_column];
+            const float silu = z_value / (1.0f + expf(-z_value));
+            output[static_cast<size_t>(token) * output_row_stride +
+                   static_cast<size_t>(value_head) * value_dim +
+                   value_column] = attention * rms_inverse *
+                norm_weight[value_column] * silu;
+        }
+        __syncthreads();
+    }
+}
+
 int signed_nibble(uint8_t value) {
     const int nibble = value & 0x0f;
     return nibble >= 8 ? nibble - 16 : nibble;
@@ -470,6 +659,8 @@ struct CudaBackend::Impl {
     size_t attention_scores_bytes = 0;
     void* norm_scratch = nullptr;
     size_t norm_scratch_bytes = 0;
+    void* gdn_qkv_scratch = nullptr;
+    size_t gdn_qkv_scratch_bytes = 0;
 
     ~Impl() {
         if (cublas)
@@ -491,6 +682,8 @@ struct CudaBackend::Impl {
             cudaFree(attention_scores);
         if (norm_scratch)
             cudaFree(norm_scratch);
+        if (gdn_qkv_scratch)
+            cudaFree(gdn_qkv_scratch);
         if (std::getenv("MOLLM_CUDA_PROFILE")) {
             std::fprintf(stderr, "\nCudaBackend operator coverage:\n");
             for (const auto& entry : native_ops)
@@ -964,7 +1157,6 @@ void CudaBackend::dispatch(const GraphNode& node,
         inputs[0] && inputs[1] && inputs[2] && output &&
         inputs[0]->prec == Precision::FP32 &&
         inputs[1]->prec == Precision::FP32 &&
-        inputs[2]->prec == Precision::FP32 &&
         output->prec == Precision::FP32) {
         const Tensor& source = *inputs[0];
         const Tensor& cosine = *inputs[1];
@@ -1149,6 +1341,147 @@ void CudaBackend::dispatch(const GraphNode& node,
                 output->stride[1] / sizeof(float),
                 output->stride[2] / sizeof(float));
             if (!report_cuda(cudaGetLastError(), "sdpa_output_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if ((node.op_type == OpType::GATED_DELTANET_PREFILL ||
+         node.op_type == OpType::GATED_DELTANET_DECODE ||
+         node.op_type == OpType::GATED_DELTANET_CONV_DECODE) &&
+        inputs.size() >= 8 && output) {
+        const bool conv_decode =
+            node.op_type == OpType::GATED_DELTANET_CONV_DECODE;
+        const int num_heads = graph_params::get_i32(node.params, 0, 16);
+        const int key_dim = graph_params::get_i32(node.params, 1, 128);
+        const int value_dim = graph_params::get_i32(node.params, 2, 128);
+        const int sequence_length = conv_decode ? 1 :
+            graph_params::get_i32(node.params, 3, 1);
+        const bool use_l2_norm =
+            graph_params::get_i32(node.params, 4, 1) != 0;
+        const int real_length = conv_decode ? 1 :
+            graph_params::get_i32(node.params, 6, sequence_length);
+        const int num_value_heads = graph_params::get_i32(
+            node.params, 7, num_heads);
+        const int qkv_total =
+            2 * num_heads * key_dim + num_value_heads * value_dim;
+        float rms_epsilon = graph_params::get_f32(
+            node.params, 0, 1e-6f);
+        float l2_epsilon = graph_params::get_f32(
+            node.params, 1, 1e-6f);
+        float scale = graph_params::get_f32(node.params, 2, 0.0f);
+        if (scale == 0.0f)
+            scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
+        const float* qkv_data = device_pointer_const<float>(*inputs[0]);
+        const float* a_data = device_pointer_const<float>(*inputs[1]);
+        const float* b_data = device_pointer_const<float>(*inputs[2]);
+        const float* z_data = device_pointer_const<float>(*inputs[3]);
+        const float* a_log_data = device_pointer_const<float>(*inputs[4]);
+        const float* dt_bias_data = device_pointer_const<float>(*inputs[5]);
+        const float* norm_data = device_pointer_const<float>(*inputs[6]);
+        float* state_data = device_pointer<float>(*inputs[7]);
+        float* output_data = device_pointer<float>(*output);
+
+        bool valid = qkv_data && a_data && b_data && z_data && a_log_data &&
+            dt_bias_data && norm_data && state_data && output_data &&
+            num_heads > 0 && key_dim > 0 && value_dim > 0 &&
+            value_dim <= threads && sequence_length > 0 &&
+            num_value_heads >= num_heads &&
+            num_value_heads % num_heads == 0 &&
+            output->nelements() >=
+                static_cast<int64_t>(sequence_length) * num_value_heads *
+                    value_dim;
+        if (conv_decode) {
+            valid = valid && inputs.size() >= 10 && inputs[8] && inputs[9];
+            if (valid) {
+                const int kernel_size = graph_params::get_i32(
+                    node.params, 5, 4);
+                const float* conv_weight =
+                    device_pointer_const<float>(*inputs[8]);
+                float* conv_state = device_pointer<float>(*inputs[9]);
+                const size_t scratch_bytes =
+                    static_cast<size_t>(qkv_total) * sizeof(float);
+                valid = conv_weight && conv_state && kernel_size > 0 &&
+                    inputs[8]->nelements() >=
+                        static_cast<int64_t>(qkv_total) * kernel_size &&
+                    inputs[9]->nelements() >=
+                        static_cast<int64_t>(qkv_total) * (kernel_size - 1) &&
+                    impl_->reserve(impl_->gdn_qkv_scratch,
+                                   impl_->gdn_qkv_scratch_bytes,
+                                   scratch_bytes);
+                if (valid) {
+                    auto* convolved =
+                        static_cast<float*>(impl_->gdn_qkv_scratch);
+                    shortconv_cuda<<<
+                        static_cast<unsigned>((qkv_total + threads - 1) /
+                                              threads), threads>>>(
+                        qkv_data, conv_weight, conv_state, convolved,
+                        qkv_total, 1, kernel_size, 1,
+                        inputs[0]->stride[1] / sizeof(float));
+                    if (!report_cuda(cudaGetLastError(),
+                                     "gdn shortconv_cuda")) {
+                        impl_->failed = true;
+                        return;
+                    }
+                    qkv_data = convolved;
+                }
+            }
+        }
+        if (valid) {
+            const size_t shared_bytes =
+                static_cast<size_t>(2 * key_dim + threads + 2) *
+                sizeof(float);
+            gated_deltanet_cuda<<<num_value_heads, threads, shared_bytes>>>(
+                qkv_data, a_data, b_data, z_data, a_log_data, dt_bias_data,
+                norm_data, state_data, output_data, num_heads, key_dim,
+                value_dim, sequence_length, real_length, num_value_heads,
+                use_l2_norm, inputs[1]->stride[1] / sizeof(float),
+                inputs[2]->stride[1] / sizeof(float),
+                inputs[3]->stride[1] / sizeof(float),
+                output->stride[1] / sizeof(float), rms_epsilon, l2_epsilon,
+                scale);
+            if (!report_cuda(cudaGetLastError(), "gated_deltanet_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if (node.op_type == OpType::SHORTCONV && inputs.size() >= 3 &&
+        inputs[0] && inputs[1] && inputs[2] && output &&
+        inputs[0]->prec == Precision::FP32 &&
+        inputs[1]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32) {
+        const Tensor& input = *inputs[0];
+        const int kernel_size = graph_params::get_i32(node.params, 0, 4);
+        const int groups = static_cast<int>(input.shape[0]);
+        const int sequence_length = static_cast<int>(input.shape[1]);
+        const int real_length = graph_params::get_i32(
+            node.params, 1, sequence_length);
+        const float* input_data = device_pointer_const<float>(input);
+        const float* weight_data = device_pointer_const<float>(*inputs[1]);
+        float* state_data = device_pointer<float>(*inputs[2]);
+        float* output_data = device_pointer<float>(*output);
+        if (input_data && weight_data && state_data && output_data &&
+            groups > 0 && sequence_length > 0 && kernel_size > 0 &&
+            inputs[1]->nelements() >=
+                static_cast<int64_t>(groups) * kernel_size &&
+            inputs[2]->nelements() >=
+                static_cast<int64_t>(groups) * (kernel_size - 1) &&
+            output->nelements() >=
+                static_cast<int64_t>(groups) * sequence_length) {
+            shortconv_cuda<<<
+                static_cast<unsigned>((groups + threads - 1) / threads),
+                threads>>>(
+                input_data, weight_data, state_data, output_data, groups,
+                sequence_length, kernel_size, real_length,
+                input.stride[1] / sizeof(float));
+            if (!report_cuda(cudaGetLastError(), "shortconv_cuda")) {
                 impl_->failed = true;
                 return;
             }

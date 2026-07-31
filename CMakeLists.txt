@@ -447,7 +447,10 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_thread_pool_stress tests/test_thread_pool_stress.cpp)
     if(MOLLM_CUDA)
         add_mollm_test(test_cuda_backend tests/test_cuda_backend.cpp)
-        set_tests_properties(test_cuda_backend PROPERTIES SKIP_RETURN_CODE 77)
+        add_mollm_test(test_cuda_recurrent tests/test_cuda_recurrent.cpp)
+        set_tests_properties(
+            test_cuda_backend test_cuda_recurrent
+            PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

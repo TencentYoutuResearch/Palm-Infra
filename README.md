@@ -380,12 +380,12 @@ layers run through cuBLAS, and package-native W4G32/W4G128 weights are
 dequantized to FP16 device weights at load time. RMSNorm and fused norm paths,
 dense elementwise operations, common activations, SwiGLU, RoPE, strided layout
 materialization, FP32 cached SDPA, zero-copy views, and the decode lm_head also
-stay on CUDA. Operators not yet implemented natively synchronize and use the
-CPU reference dispatcher over the managed buffers. Set
-`MOLLM_CUDA_PROFILE=1` to print native/fallback operator counts. Recurrent
-Gated DeltaNet/short-convolution operators and several specialized model
-families still fall back, so this is not yet a performance-complete CUDA
-backend.
+stay on CUDA. Qwen3.5's recurrent Gated DeltaNet and short-convolution paths
+are native as well, including persistent decode-state updates. Operators not
+yet implemented natively synchronize and use the CPU reference dispatcher over
+the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to print native/fallback
+operator counts. Several specialized model families still fall back, so this
+is not yet a performance-complete CUDA backend.
 
 ## Local HTTP server
 
