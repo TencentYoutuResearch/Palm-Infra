@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build tiny Qwen3/Qwen3.5 W4G32 MoE packages and compare CPU/CUDA."""
+"""Build tiny quantized MoE packages and compare CPU/CUDA."""
 
 from __future__ import annotations
 
@@ -208,13 +208,14 @@ def build_hash_package(weights_dir: Path, package: Path,
         DimExpr,
         GraphBuilder,
         Precision,
+        WEIGHT_FLAG_FP8_BLOCK128,
         _write_weight_file,
         save_package,
     )
 
-    hidden = 8
-    intermediate = 5
-    shared_intermediate = 6
+    hidden = 32
+    intermediate = 32
+    shared_intermediate = 32
     experts = 4
     top_k = 2
     vocab = 8
@@ -230,16 +231,6 @@ def build_hash_package(weights_dir: Path, package: Path,
         "embed_tokens.weights": matrix(vocab, hidden),
         "lm_head.weights": matrix(vocab, hidden),
         "layer_0_router.weights": matrix(experts, hidden),
-        "layer_0_experts_gate_up.weights": matrix(
-            experts * 2 * intermediate, hidden),
-        "layer_0_experts_down.weights": matrix(
-            experts * hidden, intermediate),
-        "layer_0_shared_experts_gate.weights": matrix(
-            shared_intermediate, hidden),
-        "layer_0_shared_experts_up.weights": matrix(
-            shared_intermediate, hidden),
-        "layer_0_shared_experts_down.weights": matrix(
-            hidden, shared_intermediate),
     }
     fp32_weights = {
         "hc_fn.weights": rng.uniform(
@@ -263,6 +254,55 @@ def build_hash_package(weights_dir: Path, package: Path,
     for name, values in weights.items():
         _write_weight_file(
             str(weights_dir / name), values, precision=Precision.FP16)
+
+    def write_mxfp4(name: str, rows: int, width: int, seed: int) -> None:
+        if width % 32:
+            raise AssertionError("MXFP4 fixture width must be divisible by 32")
+        local_rng = np.random.default_rng(seed)
+        low = local_rng.integers(
+            0, 16, size=(rows, width // 2), dtype=np.uint8)
+        high = local_rng.integers(
+            0, 16, size=(rows, width // 2), dtype=np.uint8)
+        packed = low | (high << np.uint8(4))
+        scales = local_rng.integers(
+            124, 127, size=rows * (width // 32), dtype=np.uint8)
+        _write_weight_file(
+            str(weights_dir / name), packed, scales=scales,
+            group_size=32, num_groups=scales.size,
+            precision=Precision.MXFP4, logical_shape=(rows, width),
+            scale_dtype=np.uint8)
+
+    def write_fp8(name: str, rows: int, width: int, seed: int) -> None:
+        local_rng = np.random.default_rng(seed)
+        codes = np.array([
+            0x00, 0x20, 0x28, 0x30, 0x38, 0x40,
+            0xA0, 0xA8, 0xB0, 0xB8, 0xC0,
+        ], dtype=np.uint8)
+        values = local_rng.choice(codes, size=(rows, width))
+        scale_count = ((rows + 127) // 128) * ((width + 127) // 128)
+        scales = local_rng.integers(
+            124, 127, size=scale_count, dtype=np.uint8)
+        _write_weight_file(
+            str(weights_dir / name), values, scales=scales,
+            group_size=128, num_groups=scales.size,
+            precision=Precision.FP8_E4M3, logical_shape=(rows, width),
+            flags=WEIGHT_FLAG_FP8_BLOCK128, scale_dtype=np.uint8)
+
+    write_mxfp4(
+        "layer_0_experts_gate_up.weights",
+        experts * 2 * intermediate, hidden, 20260803)
+    write_mxfp4(
+        "layer_0_experts_down.weights",
+        experts * hidden, intermediate, 20260804)
+    write_fp8(
+        "layer_0_shared_experts_gate.weights",
+        shared_intermediate, hidden, 20260805)
+    write_fp8(
+        "layer_0_shared_experts_up.weights",
+        shared_intermediate, hidden, 20260806)
+    write_fp8(
+        "layer_0_shared_experts_down.weights",
+        hidden, shared_intermediate, 20260807)
     for name, values in fp32_weights.items():
         _write_weight_file(
             str(weights_dir / name), values, precision=Precision.FP32)
@@ -298,19 +338,19 @@ def build_hash_package(weights_dir: Path, package: Path,
             "./layer_0_router.weights", (experts, hidden), Precision.FP16)
         gate_up = g.weight(
             "./layer_0_experts_gate_up.weights",
-            (experts * 2 * intermediate, hidden), Precision.FP16)
+            (experts * 2 * intermediate, hidden), Precision.MXFP4)
         down = g.weight(
             "./layer_0_experts_down.weights",
-            (experts * hidden, intermediate), Precision.FP16)
+            (experts * hidden, intermediate), Precision.MXFP4)
         shared_gate = g.weight(
             "./layer_0_shared_experts_gate.weights",
-            (shared_intermediate, hidden), Precision.FP16)
+            (shared_intermediate, hidden), Precision.FP8_E4M3)
         shared_up = g.weight(
             "./layer_0_shared_experts_up.weights",
-            (shared_intermediate, hidden), Precision.FP16)
+            (shared_intermediate, hidden), Precision.FP8_E4M3)
         shared_down = g.weight(
             "./layer_0_shared_experts_down.weights",
-            (hidden, shared_intermediate), Precision.FP16)
+            (hidden, shared_intermediate), Precision.FP8_E4M3)
         hash_table = g.weight(
             "./layer_0_token_hash.weights", (top_k, vocab),
             Precision.INT32)
@@ -345,7 +385,7 @@ def build_hash_package(weights_dir: Path, package: Path,
             "hidden_size": hidden,
             "vocab_size": vocab,
             "prefill_seq_len": 4,
-            "quantization": "fp16",
+            "quantization": "native-fp8-mxfp4",
         })
 
 
@@ -373,7 +413,7 @@ def main() -> int:
         qwen3_w8_package = temp_dir / "tiny_qwen3_moe_w8g32.mollm"
         hash_weights_dir = temp_dir / "hash_weights"
         hash_weights_dir.mkdir()
-        hash_package = temp_dir / "tiny_hash_moe_fp16.mollm"
+        hash_package = temp_dir / "tiny_hash_moe_native.mollm"
         build_hash_package(hash_weights_dir, hash_package, converter.parent)
         environment = os.environ.copy()
         environment["MOLLM_QUANT_HELPER"] = str(quantizer)

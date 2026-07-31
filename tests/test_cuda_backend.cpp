@@ -1,6 +1,7 @@
 #include "engine/cuda_backend.h"
 #include "engine/engine.h"
 #include "kernels/hyper_connection.h"
+#include "kernels/matmul.h"
 #include "kernels/moe.h"
 #include "kernels/quant_layouts.h"
 
@@ -36,6 +37,138 @@ void reference(const std::vector<float>& activation,
                        weight[static_cast<size_t>(col) * k + inner];
             output[static_cast<size_t>(row) * n + col] = sum;
         }
+}
+
+bool dispatch_matmul(CudaBackend& backend, Tensor& weight,
+                     const std::vector<float>& activation,
+                     std::vector<float>& output, int m, int n, int k);
+
+bool test_microscaled_matmul(CudaBackend& backend) {
+    constexpr int m = 3;
+    constexpr int fp8_n = 130;
+    constexpr int fp8_k = 257;
+    std::vector<float> activation(static_cast<size_t>(m) * fp8_k);
+    for (size_t index = 0; index < activation.size(); ++index)
+        activation[index] =
+            static_cast<float>(static_cast<int>(index % 19) - 9) / 23.0f;
+    std::vector<uint8_t> fp8_weights(
+        static_cast<size_t>(fp8_n) * fp8_k);
+    constexpr uint8_t fp8_codes[] = {
+        0x00, 0x28, 0x30, 0x38, 0x40, 0x48,
+        0xa8, 0xb0, 0xb8, 0xc0, 0xc8};
+    for (size_t index = 0; index < fp8_weights.size(); ++index)
+        fp8_weights[index] = fp8_codes[
+            (index * 7 + index / fp8_k) %
+            (sizeof(fp8_codes) / sizeof(fp8_codes[0]))];
+    constexpr int fp8_groups_per_row = (fp8_k + 127) / 128;
+    std::vector<uint8_t> fp8_scales(
+        static_cast<size_t>((fp8_n + 127) / 128) *
+        fp8_groups_per_row);
+    for (size_t index = 0; index < fp8_scales.size(); ++index)
+        fp8_scales[index] = static_cast<uint8_t>(125 + index % 5);
+    std::vector<float> fp8_expected(static_cast<size_t>(m) * fp8_n);
+    for (int row = 0; row < m; ++row) {
+        for (int column = 0; column < fp8_n; ++column) {
+            float sum = 0.0f;
+            for (int group = 0; group < fp8_groups_per_row; ++group) {
+                float block = 0.0f;
+                const int begin = group * 128;
+                const int end = std::min(fp8_k, begin + 128);
+                for (int inner = begin; inner < end; ++inner) {
+                    block += activation[static_cast<size_t>(row) * fp8_k +
+                                        inner] *
+                        decode_fp8_e4m3fn(fp8_weights[
+                            static_cast<size_t>(column) * fp8_k + inner]);
+                }
+                block *= decode_e8m0(fp8_scales[
+                    static_cast<size_t>(column / 128) *
+                        fp8_groups_per_row + group]);
+                sum += block;
+            }
+            fp8_expected[static_cast<size_t>(row) * fp8_n + column] = sum;
+        }
+    }
+    Tensor fp8 = Tensor::create(
+        Precision::FP8_E4M3, MemoryType::EXTERNAL, fp8_n, fp8_k, 1, 1,
+        fp8_weights.data());
+    fp8.rowmajor_data = fp8_weights.data();
+    fp8.e8m0_scales = fp8_scales.data();
+    fp8.group_size = 128;
+    fp8.groups_per_row = fp8_groups_per_row;
+    fp8.num_groups = static_cast<uint32_t>(fp8_scales.size());
+    fp8.is_fp8_block128 = true;
+    backend.wrap_weight_int4(fp8);
+    fp8.data = nullptr;
+    fp8.rowmajor_data = nullptr;
+    fp8.e8m0_scales = nullptr;
+    std::vector<float> fp8_actual(fp8_expected.size());
+    if (!dispatch_matmul(
+            backend, fp8, activation, fp8_actual, m, fp8_n, fp8_k) ||
+        !close_enough(fp8_actual, fp8_expected, 1.0e-4f))
+        return false;
+
+    constexpr int mx_n = 7;
+    constexpr int mx_k = 64;
+    std::vector<float> mx_activation(static_cast<size_t>(m) * mx_k);
+    for (size_t index = 0; index < mx_activation.size(); ++index)
+        mx_activation[index] =
+            static_cast<float>(static_cast<int>(index % 17) - 8) / 13.0f;
+    std::vector<uint8_t> mx_weights(
+        static_cast<size_t>(mx_n) * mx_k / 2);
+    for (size_t index = 0; index < mx_weights.size(); ++index) {
+        const uint8_t low = static_cast<uint8_t>((index * 3 + 1) & 0x0f);
+        const uint8_t high = static_cast<uint8_t>((index * 5 + 9) & 0x0f);
+        mx_weights[index] = low | static_cast<uint8_t>(high << 4);
+    }
+    constexpr int mx_groups_per_row = mx_k / 32;
+    std::vector<uint8_t> mx_scales(
+        static_cast<size_t>(mx_n) * mx_groups_per_row);
+    for (size_t index = 0; index < mx_scales.size(); ++index)
+        mx_scales[index] = static_cast<uint8_t>(126 + index % 4);
+    std::vector<float> mx_expected(static_cast<size_t>(m) * mx_n);
+    std::vector<float> mx_quantized_activation(mx_activation.size());
+    for (int row = 0; row < m; ++row) {
+        float maximum = 1.0e-4f;
+        for (int inner = 0; inner < mx_k; ++inner)
+            maximum = std::max(
+                maximum,
+                std::fabs(mx_activation[
+                    static_cast<size_t>(row) * mx_k + inner]));
+        const int exponent = static_cast<int>(
+            std::ceil(std::log2(maximum / 448.0f)));
+        const float scale = std::ldexp(1.0f, exponent);
+        for (int inner = 0; inner < mx_k; ++inner) {
+            const size_t index = static_cast<size_t>(row) * mx_k + inner;
+            const float scaled = std::clamp(
+                mx_activation[index] / scale, -448.0f, 448.0f);
+            mx_quantized_activation[index] =
+                decode_fp8_e4m3fn(encode_fp8_e4m3fn(scaled)) * scale;
+        }
+    }
+    Tensor mx_activation_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, mx_k, m, 1, 1,
+        mx_quantized_activation.data());
+    Tensor mx = Tensor::create(
+        Precision::MXFP4, MemoryType::EXTERNAL, mx_n, mx_k, 1, 1,
+        mx_weights.data());
+    mx.rowmajor_data = mx_weights.data();
+    mx.e8m0_scales = mx_scales.data();
+    mx.group_size = 32;
+    mx.groups_per_row = mx_groups_per_row;
+    mx.num_groups = static_cast<uint32_t>(mx_scales.size());
+    Tensor mx_expected_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, mx_n, m, 1, 1,
+        mx_expected.data());
+    kernel_matmul_mxfp4_reference(
+        mx_activation_tensor, mx, mx_expected_tensor);
+    backend.wrap_weight_int4(mx);
+    mx.data = nullptr;
+    mx.rowmajor_data = nullptr;
+    mx.e8m0_scales = nullptr;
+    std::vector<float> mx_actual(mx_expected.size());
+    return dispatch_matmul(
+               backend, mx, mx_activation, mx_actual, m, mx_n, mx_k) &&
+        close_enough(mx_actual, mx_expected, 1.0e-4f);
 }
 
 bool dispatch_matmul(CudaBackend& backend, Tensor& weight,
@@ -1084,6 +1217,212 @@ bool test_moe_fp16_shared(CudaBackend& backend) {
         close_enough(actual, expected, 2.5e-2f);
 }
 
+bool test_moe_mxfp4_fp8_shared(CudaBackend& backend) {
+    constexpr int hidden_size = 32;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 2;
+    constexpr int intermediate_size = 32;
+    constexpr int shared_intermediate_size = 32;
+    constexpr int tokens = 2;
+    constexpr int gate_up_rows =
+        num_experts * 2 * intermediate_size;
+    constexpr int down_rows = num_experts * hidden_size;
+
+    std::vector<float> hidden(hidden_size * tokens);
+    std::vector<float> router_f32(num_experts * hidden_size);
+    for (size_t index = 0; index < hidden.size(); ++index)
+        hidden[index] =
+            static_cast<float>(static_cast<int>(index % 17) - 8) / 31.0f;
+    // Equal logits make both implementations use exact 0.5 route weights.
+    // This keeps the test focused on checkpoint layout and BF16 boundaries,
+    // rather than libm/libdevice exp differences in the router softmax.
+    std::fill(router_f32.begin(), router_f32.end(), 0.0f);
+    auto fill_mxfp4 = [](std::vector<uint8_t>& values,
+                         std::vector<uint8_t>& scales,
+                         int rows, int width, int seed) {
+        values.resize(static_cast<size_t>(rows) * width / 2);
+        scales.resize(static_cast<size_t>(rows) * (width / 32));
+        for (size_t index = 0; index < values.size(); ++index) {
+            const uint8_t low = static_cast<uint8_t>(
+                (index * 3 + seed) & 0x0f);
+            const uint8_t high = static_cast<uint8_t>(
+                (index * 7 + seed + 5) & 0x0f);
+            values[index] = low | static_cast<uint8_t>(high << 4);
+        }
+        for (size_t index = 0; index < scales.size(); ++index)
+            scales[index] = static_cast<uint8_t>(124 +
+                (index + static_cast<size_t>(seed)) % 3);
+    };
+    std::vector<uint8_t> gate_up_values;
+    std::vector<uint8_t> gate_up_scales;
+    std::vector<uint8_t> down_values;
+    std::vector<uint8_t> down_scales;
+    fill_mxfp4(gate_up_values, gate_up_scales,
+               gate_up_rows, hidden_size, 1);
+    fill_mxfp4(down_values, down_scales,
+               down_rows, intermediate_size, 9);
+
+    auto fill_fp8 = [](std::vector<uint8_t>& values,
+                       std::vector<uint8_t>& scales,
+                       int rows, int width, int seed) {
+        constexpr uint8_t codes[] = {
+            0x00, 0x20, 0x28, 0x30, 0x38, 0x40,
+            0xa0, 0xa8, 0xb0, 0xb8, 0xc0};
+        values.resize(static_cast<size_t>(rows) * width);
+        scales.resize(static_cast<size_t>((rows + 127) / 128) *
+                      static_cast<size_t>((width + 127) / 128));
+        for (size_t index = 0; index < values.size(); ++index)
+            values[index] = codes[
+                (index * 5 + static_cast<size_t>(seed)) %
+                (sizeof(codes) / sizeof(codes[0]))];
+        for (size_t index = 0; index < scales.size(); ++index)
+            scales[index] = static_cast<uint8_t>(124 +
+                (index + static_cast<size_t>(seed)) % 3);
+    };
+    std::vector<uint8_t> shared_gate_values;
+    std::vector<uint8_t> shared_gate_scales;
+    std::vector<uint8_t> shared_up_values;
+    std::vector<uint8_t> shared_up_scales;
+    std::vector<uint8_t> shared_down_values;
+    std::vector<uint8_t> shared_down_scales;
+    fill_fp8(shared_gate_values, shared_gate_scales,
+             shared_intermediate_size, hidden_size, 2);
+    fill_fp8(shared_up_values, shared_up_scales,
+             shared_intermediate_size, hidden_size, 6);
+    fill_fp8(shared_down_values, shared_down_scales,
+             hidden_size, shared_intermediate_size, 10);
+
+    Tensor hidden_host = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        hidden.data());
+    Tensor router = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, num_experts, hidden_size,
+        1, 1, router_f32.data());
+    Tensor gate_up = Tensor::create(
+        Precision::MXFP4, MemoryType::EXTERNAL, gate_up_rows, hidden_size,
+        1, 1, gate_up_values.data());
+    gate_up.rowmajor_data = gate_up_values.data();
+    gate_up.e8m0_scales = gate_up_scales.data();
+    gate_up.group_size = 32;
+    gate_up.groups_per_row = hidden_size / 32;
+    gate_up.num_groups = static_cast<uint32_t>(gate_up_scales.size());
+    Tensor down = Tensor::create(
+        Precision::MXFP4, MemoryType::EXTERNAL, down_rows,
+        intermediate_size, 1, 1, down_values.data());
+    down.rowmajor_data = down_values.data();
+    down.e8m0_scales = down_scales.data();
+    down.group_size = 32;
+    down.groups_per_row = intermediate_size / 32;
+    down.num_groups = static_cast<uint32_t>(down_scales.size());
+
+    auto make_fp8 = [](int rows, int width, std::vector<uint8_t>& values,
+                       std::vector<uint8_t>& scales) {
+        Tensor tensor = Tensor::create(
+            Precision::FP8_E4M3, MemoryType::EXTERNAL, rows, width,
+            1, 1, values.data());
+        tensor.rowmajor_data = values.data();
+        tensor.e8m0_scales = scales.data();
+        tensor.group_size = 128;
+        tensor.groups_per_row = (width + 127) / 128;
+        tensor.num_groups = static_cast<uint32_t>(scales.size());
+        tensor.is_fp8_block128 = true;
+        return tensor;
+    };
+    Tensor shared_gate = make_fp8(
+        shared_intermediate_size, hidden_size,
+        shared_gate_values, shared_gate_scales);
+    Tensor shared_up = make_fp8(
+        shared_intermediate_size, hidden_size,
+        shared_up_values, shared_up_scales);
+    Tensor shared_down = make_fp8(
+        hidden_size, shared_intermediate_size,
+        shared_down_values, shared_down_scales);
+    std::vector<const Tensor*> inputs = {
+        &hidden_host, &router, &gate_up, &down,
+        &shared_gate, &shared_up, &shared_down,
+    };
+    std::vector<float> expected(hidden_size * tokens);
+    std::vector<float> routed_expected(hidden_size * tokens);
+    Tensor expected_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        expected.data());
+    Tensor routed_expected_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, hidden_size, tokens, 1, 1,
+        routed_expected.data());
+    const bool previous_force_fp32 = g_mollm_force_fp32_acc;
+    g_mollm_force_fp32_acc = true;
+    const bool routed_reference_ok = kernel_qwen3_moe(
+        {&hidden_host, &router, &gate_up, &down}, routed_expected_tensor,
+        nullptr, hidden_size, num_experts, top_k, intermediate_size, 0,
+        0, true, false, 2, 1, 1.0f, false);
+    const bool reference_ok = kernel_qwen3_moe(
+            inputs, expected_tensor, nullptr, hidden_size, num_experts,
+            top_k, intermediate_size, shared_intermediate_size, 0, true,
+            true, 2, 1, 1.0f, false);
+    g_mollm_force_fp32_acc = previous_force_fp32;
+    if (!routed_reference_ok || !reference_ok)
+        return false;
+    if (std::none_of(expected.begin(), expected.end(),
+                     [](float value) { return std::fabs(value) > 1e-7f; }))
+        return false;
+
+    backend.wrap_weight(router);
+    backend.wrap_weight_int4(gate_up, true);
+    backend.wrap_weight_int4(down, true);
+    backend.wrap_weight_int4(shared_gate);
+    backend.wrap_weight_int4(shared_up);
+    backend.wrap_weight_int4(shared_down);
+    Tensor hidden_device = device_tensor(backend, hidden_size, tokens);
+    Tensor output_device = device_tensor(backend, hidden_size, tokens);
+    std::memcpy(hidden_device.data, hidden.data(), hidden_device.nbytes());
+    GraphNode routed_node;
+    routed_node.op_type = OpType::MOE;
+    routed_node.params.i32 = {
+        hidden_size, num_experts, top_k, intermediate_size,
+        0, 0, 1, 0, 2, 1, 0, -1, -1, -1,
+    };
+    routed_node.params.f32 = {1.0f, 0.0f};
+    backend.clear_dispatch_error();
+    backend.dispatch(
+        routed_node, {&hidden_device, &router, &gate_up, &down},
+        &output_device, nullptr);
+    backend.end_graph();
+    std::vector<float> routed_actual(routed_expected.size());
+    std::memcpy(routed_actual.data(), output_device.data,
+                output_device.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(routed_actual, routed_expected, 2.0e-4f)) {
+        std::fprintf(stderr, "CUDA MXFP4 routed-only mismatch\n");
+        return false;
+    }
+    inputs = {
+        &hidden_device, &router, &gate_up, &down,
+        &shared_gate, &shared_up, &shared_down,
+    };
+    GraphNode node;
+    node.op_type = OpType::MOE;
+    node.params.i32 = {
+        hidden_size, num_experts, top_k, intermediate_size,
+        shared_intermediate_size, 0, 1, 1, 2, 1, 0, -1, -1, -1,
+    };
+    node.params.f32 = {1.0f, 0.0f};
+    router.data = gate_up.data = down.data = nullptr;
+    gate_up.rowmajor_data = down.rowmajor_data = nullptr;
+    gate_up.e8m0_scales = down.e8m0_scales = nullptr;
+    shared_gate.data = shared_up.data = shared_down.data = nullptr;
+    shared_gate.rowmajor_data = shared_up.rowmajor_data =
+        shared_down.rowmajor_data = nullptr;
+    shared_gate.e8m0_scales = shared_up.e8m0_scales =
+        shared_down.e8m0_scales = nullptr;
+    backend.clear_dispatch_error();
+    backend.dispatch(node, inputs, &output_device, nullptr);
+    backend.end_graph();
+    std::vector<float> actual(expected.size());
+    std::memcpy(actual.data(), output_device.data, output_device.nbytes());
+    return !backend.dispatch_failed() &&
+        close_enough(actual, expected, 2.0e-4f);
+}
+
 bool test_moe_hash_routing(CudaBackend& backend) {
     constexpr int hidden_size = 8;
     constexpr int num_experts = 4;
@@ -1493,6 +1832,12 @@ int main() {
     if (!dispatch_matmul(backend, fp16, activation, actual, m, n, k) ||
         !close_enough(actual, expected, 3e-3f))
         return 1;
+    {
+        CudaBackend microscaled_backend;
+        if (!microscaled_backend.available() ||
+            !test_microscaled_matmul(microscaled_backend))
+            return 1;
+    }
     if (!backend.is_device_resident() ||
         !test_device_resident_ops(backend, fp16, activation, expected,
                                   m, n, k))
@@ -1589,6 +1934,12 @@ int main() {
     {
         CudaBackend moe_backend;
         if (!moe_backend.available() ||
+            !test_moe_mxfp4_fp8_shared(moe_backend))
+            return 1;
+    }
+    {
+        CudaBackend moe_backend;
+        if (!moe_backend.available() ||
             !test_moe_hash_routing(moe_backend))
             return 1;
     }
@@ -1611,7 +1962,7 @@ int main() {
     }
 
     std::printf("CUDA device-resident ops, RWKV, Hyper-Connection and "
-                "standard/hash MoE variants, strided views, FP16, W8, "
-                "W4G32 and W4G128 matmul tests passed\n");
+                "standard/hash MoE variants, strided views, FP16, FP8, "
+                "MXFP4, W8, W4G32 and W4G128 matmul tests passed\n");
     return 0;
 }

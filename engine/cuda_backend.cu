@@ -103,6 +103,58 @@ __device__ float cuda_round_to_bf16(float value) {
     return __uint_as_float(bits & 0xffff0000u);
 }
 
+__device__ float cuda_decode_e8m0(uint8_t value) {
+    if (value == 0xff)
+        return __uint_as_float(0x7fffffffu);
+    const uint32_t bits = value == 0
+        ? (1u << 22) : static_cast<uint32_t>(value) << 23;
+    return __uint_as_float(bits);
+}
+
+__device__ float cuda_decode_fp8_e4m3fn(uint8_t value) {
+    const bool negative = (value & 0x80u) != 0;
+    const int exponent = (value >> 3) & 0x0f;
+    const int mantissa = value & 0x07;
+    float decoded = 0.0f;
+    if (exponent == 0x0f && mantissa == 0x07)
+        decoded = __uint_as_float(0x7fffffffu);
+    else if (exponent == 0)
+        decoded = ldexpf(static_cast<float>(mantissa), -9);
+    else
+        decoded = ldexpf(1.0f + static_cast<float>(mantissa) * 0.125f,
+                         exponent - 7);
+    return negative ? -decoded : decoded;
+}
+
+__device__ uint8_t cuda_encode_fp8_e4m3fn(float value) {
+    if (isnan(value))
+        return 0x7f;
+    const uint8_t sign = signbit(value) ? 0x80u : 0u;
+    const float magnitude = fminf(fabsf(value), 448.0f);
+    if (magnitude < (1.0f / 64.0f)) {
+        const int code = max(0, min(8,
+            static_cast<int>(nearbyintf(magnitude * 512.0f))));
+        return static_cast<uint8_t>(sign | code);
+    }
+    const uint32_t bits = __float_as_uint(magnitude);
+    int exponent = static_cast<int>((bits >> 23) & 0xffu) - 127;
+    int significand = static_cast<int>(
+        nearbyintf(ldexpf(magnitude, 3 - exponent)));
+    if (significand == 16) {
+        ++exponent;
+        significand = 8;
+    }
+    const int code = max(0, min(126, (exponent + 6) * 8 + significand));
+    return static_cast<uint8_t>(sign | code);
+}
+
+__device__ float cuda_decode_mxfp4_e2m1(uint8_t value) {
+    constexpr float magnitudes[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float magnitude = magnitudes[value & 0x07u];
+    return value & 0x08u ? -magnitude : magnitude;
+}
+
 __global__ void apply_activation_cuda(float* values, int rows, int columns,
                                       int kind, int begin, int end) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -113,6 +165,86 @@ __global__ void apply_activation_cuda(float* values, int rows, int columns,
     const int column = static_cast<int>(index % columns);
     if (column >= begin && column < end)
         values[index] = cuda_activation(values[index], kind);
+}
+
+__global__ void round_bf16_cuda(float* values, size_t count) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index < count)
+        values[index] = cuda_round_to_bf16(values[index]);
+}
+
+__global__ void quantize_activation_fp8_cuda(
+    const float* input, int lda, float* output, int rows, int inner) {
+    const int block = blockIdx.x;
+    const int blocks_per_row = (inner + 127) / 128;
+    const int row = block / blocks_per_row;
+    const int group = block % blocks_per_row;
+    if (row >= rows || threadIdx.x != 0)
+        return;
+    const int begin = group * 128;
+    const int end = min(inner, begin + 128);
+    const float* input_row = input + static_cast<size_t>(row) * lda;
+    float maximum = 1.0e-4f;
+    for (int k = begin; k < end; ++k)
+        maximum = fmaxf(maximum, fabsf(input_row[k]));
+    const int exponent = static_cast<int>(ceilf(log2f(maximum / 448.0f)));
+    const float scale = ldexpf(1.0f, exponent);
+    float* output_row = output + static_cast<size_t>(row) * inner;
+    for (int k = begin; k < end; ++k) {
+        const float scaled = fminf(448.0f,
+            fmaxf(-448.0f, input_row[k] / scale));
+        output_row[k] = cuda_decode_fp8_e4m3fn(
+            cuda_encode_fp8_e4m3fn(scaled)) * scale;
+    }
+}
+
+__global__ void microscaled_matmul_cuda(
+    const float* activation, int lda, const uint8_t* weight,
+    const uint8_t* scales, int layout, float* output, int ldc,
+    int rows, int columns, int inner, int groups_per_row) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    const size_t count = static_cast<size_t>(rows) * columns;
+    if (index >= count)
+        return;
+    const int row = static_cast<int>(index / columns);
+    const int column = static_cast<int>(index % columns);
+    const float* input = activation + static_cast<size_t>(row) * lda;
+    float sum = 0.0f;
+    // Layout 5 is row-major E4M3 with one E8M0 scale per 128x128 tile.
+    if (layout == 5) {
+        const uint8_t* weight_row =
+            weight + static_cast<size_t>(column) * inner;
+        for (int group = 0; group < groups_per_row; ++group) {
+            const int begin = group * 128;
+            const int end = min(inner, begin + 128);
+            float block = 0.0f;
+            for (int k = begin; k < end; ++k)
+                block += input[k] *
+                    cuda_decode_fp8_e4m3fn(weight_row[k]);
+            sum += block * cuda_decode_e8m0(
+                scales[static_cast<size_t>(column / 128) *
+                           groups_per_row + group]);
+        }
+    } else {
+        // Layout 6 is row-major packed E2M1 with one E8M0 scale per K32.
+        const uint8_t* weight_row =
+            weight + static_cast<size_t>(column) * (inner / 2);
+        for (int group = 0; group < groups_per_row; ++group) {
+            float block = 0.0f;
+            const int begin = group * 32;
+            for (int k = begin; k < begin + 32; ++k) {
+                const uint8_t packed = weight_row[k / 2];
+                const uint8_t nibble = k & 1 ? packed >> 4
+                                              : packed & 0x0f;
+                block += input[k] * cuda_decode_mxfp4_e2m1(nibble);
+            }
+            sum += block * cuda_decode_e8m0(
+                scales[static_cast<size_t>(column) * groups_per_row + group]);
+        }
+    }
+    output[static_cast<size_t>(row) * ldc + column] = sum;
 }
 
 __global__ void binary_cuda(const float* lhs, const float* rhs, float* output,
@@ -542,8 +674,9 @@ __device__ int moe_signed_nibble(uint8_t value) {
 }
 
 __device__ float moe_weight_value_cuda(
-    const void* data, const float* scales, bool dense_fp32, int layout,
-    int group_size, int groups_per_row, int row, int column, int width) {
+    const void* data, const float* scales, const uint8_t* e8m0_scales,
+    bool dense_fp32, int layout, int group_size, int groups_per_row,
+    int row, int column, int width) {
     if (layout == 0) {
         const size_t index = static_cast<size_t>(row) * width + column;
         return dense_fp32
@@ -568,17 +701,32 @@ __device__ float moe_weight_value_cuda(
                    inner & 1 ? packed >> 4 : packed)) *
             block.scales[lane];
     }
-    const int groups = width / 128;
-    const auto& block = static_cast<const Q4B8G128Block*>(data)[
-        static_cast<size_t>(row / 8) * groups + column / 128];
-    const int lane = row & 7;
-    const int inner = column & 127;
-    const int subgroup = inner / 32;
-    const int subgroup_inner = inner & 31;
-    const uint8_t packed = block.q[subgroup][lane][subgroup_inner / 2];
-    return static_cast<float>(moe_signed_nibble(
-               subgroup_inner & 1 ? packed >> 4 : packed)) *
-        block.scales[lane];
+    if (layout == 3) {
+        const int groups = width / 128;
+        const auto& block = static_cast<const Q4B8G128Block*>(data)[
+            static_cast<size_t>(row / 8) * groups + column / 128];
+        const int lane = row & 7;
+        const int inner = column & 127;
+        const int subgroup = inner / 32;
+        const int subgroup_inner = inner & 31;
+        const uint8_t packed = block.q[subgroup][lane][subgroup_inner / 2];
+        return static_cast<float>(moe_signed_nibble(
+                   subgroup_inner & 1 ? packed >> 4 : packed)) *
+            block.scales[lane];
+    }
+    if (layout == 5) {
+        const uint8_t encoded = static_cast<const uint8_t*>(data)[
+            static_cast<size_t>(row) * width + column];
+        return cuda_decode_fp8_e4m3fn(encoded) * cuda_decode_e8m0(
+            e8m0_scales[static_cast<size_t>(row / 128) * groups_per_row +
+                         column / 128]);
+    }
+    const uint8_t packed = static_cast<const uint8_t*>(data)[
+        static_cast<size_t>(row) * (width / 2) + column / 2];
+    const uint8_t nibble = column & 1 ? packed >> 4 : packed & 0x0f;
+    return cuda_decode_mxfp4_e2m1(nibble) * cuda_decode_e8m0(
+        e8m0_scales[static_cast<size_t>(row) * groups_per_row +
+                     column / 32]);
 }
 
 __device__ float moe_router_score_cuda(float value, int score_function) {
@@ -976,10 +1124,12 @@ __global__ void hc_head_cuda(
 
 __global__ void moe_gate_up_cuda(
     const float* hidden, size_t hidden_stride, const int* route_indices,
+    const float* route_weights,
     const void* gate_up, bool gate_up_fp32, int gate_up_layout,
     const float* gate_up_scales, int gate_up_group_size,
-    int gate_up_groups_per_row, float* intermediate, int tokens, int top_k,
-    int hidden_size, int intermediate_size, float swiglu_limit) {
+    int gate_up_groups_per_row, const uint8_t* gate_up_e8m0_scales,
+    float* intermediate, int tokens, int top_k, int hidden_size,
+    int intermediate_size, float swiglu_limit, bool bf16_activations) {
     const size_t count = static_cast<size_t>(tokens) * top_k *
         intermediate_size;
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -995,30 +1145,71 @@ __global__ void moe_gate_up_cuda(
     const int up_row = gate_row + intermediate_size;
     float gate = 0.0f;
     float up = 0.0f;
-    for (int inner = 0; inner < hidden_size; ++inner) {
-        const float value = input[inner];
-        gate += value * moe_weight_value_cuda(
-            gate_up, gate_up_scales, gate_up_fp32, gate_up_layout,
-            gate_up_group_size, gate_up_groups_per_row, gate_row, inner,
-            hidden_size);
-        up += value * moe_weight_value_cuda(
-            gate_up, gate_up_scales, gate_up_fp32, gate_up_layout,
-            gate_up_group_size, gate_up_groups_per_row, up_row, inner,
-            hidden_size);
+    if (bf16_activations) {
+        const auto* packed = static_cast<const uint8_t*>(gate_up);
+        const uint8_t* gate_row_data =
+            packed + static_cast<size_t>(gate_row) * (hidden_size / 2);
+        const uint8_t* up_row_data =
+            packed + static_cast<size_t>(up_row) * (hidden_size / 2);
+        for (int group = 0; group < gate_up_groups_per_row; ++group) {
+            float gate_block = 0.0f;
+            float up_block = 0.0f;
+            const int begin = group * 32;
+            for (int inner = begin; inner < begin + 32; ++inner) {
+                const uint8_t gate_packed = gate_row_data[inner / 2];
+                const uint8_t up_packed = up_row_data[inner / 2];
+                const uint8_t gate_nibble = inner & 1
+                    ? gate_packed >> 4 : gate_packed & 0x0f;
+                const uint8_t up_nibble = inner & 1
+                    ? up_packed >> 4 : up_packed & 0x0f;
+                gate_block += input[inner] *
+                    cuda_decode_mxfp4_e2m1(gate_nibble);
+                up_block += input[inner] *
+                    cuda_decode_mxfp4_e2m1(up_nibble);
+            }
+            gate += gate_block * cuda_decode_e8m0(
+                gate_up_e8m0_scales[
+                    static_cast<size_t>(gate_row) *
+                        gate_up_groups_per_row + group]);
+            up += up_block * cuda_decode_e8m0(
+                gate_up_e8m0_scales[
+                    static_cast<size_t>(up_row) *
+                        gate_up_groups_per_row + group]);
+        }
+    } else {
+        for (int inner = 0; inner < hidden_size; ++inner) {
+            const float value = input[inner];
+            gate += value * moe_weight_value_cuda(
+                gate_up, gate_up_scales, gate_up_e8m0_scales, gate_up_fp32,
+                gate_up_layout, gate_up_group_size, gate_up_groups_per_row,
+                gate_row, inner, hidden_size);
+            up += value * moe_weight_value_cuda(
+                gate_up, gate_up_scales, gate_up_e8m0_scales, gate_up_fp32,
+                gate_up_layout, gate_up_group_size, gate_up_groups_per_row,
+                up_row, inner, hidden_size);
+        }
+    }
+    if (bf16_activations) {
+        gate = cuda_round_to_bf16(gate);
+        up = cuda_round_to_bf16(up);
     }
     if (swiglu_limit > 0.0f) {
         gate = fminf(gate, swiglu_limit);
         up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
     }
-    intermediate[index] = gate / (1.0f + expf(-gate)) * up;
+    float value = gate / (1.0f + expf(-gate)) * up;
+    if (bf16_activations)
+        value = cuda_round_to_bf16(value * route_weights[route]);
+    intermediate[index] = value;
 }
 
 __global__ void moe_down_cuda(
     const int* route_indices, const float* route_weights,
     const float* intermediate, const void* down, bool down_fp32,
     int down_layout, const float* down_scales, int down_group_size,
-    int down_groups_per_row, float* output, size_t output_stride,
-    int tokens, int top_k, int hidden_size, int intermediate_size) {
+    int down_groups_per_row, const uint8_t* down_e8m0_scales, float* output,
+    size_t output_stride, int tokens, int top_k, int hidden_size,
+    int intermediate_size, bool bf16_activations) {
     const size_t count = static_cast<size_t>(tokens) * hidden_size;
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
         threadIdx.x;
@@ -1032,32 +1223,63 @@ __global__ void moe_down_cuda(
         const int expert = route_indices[route];
         const int row = expert * hidden_size + dimension;
         float contribution = 0.0f;
-        for (int inner = 0; inner < intermediate_size; ++inner)
-            contribution += intermediate[
-                static_cast<size_t>(route) * intermediate_size + inner] *
-                moe_weight_value_cuda(
-                    down, down_scales, down_fp32, down_layout,
-                    down_group_size, down_groups_per_row, row, inner,
-                    intermediate_size);
-        result += route_weights[route] * contribution;
+        const float* route_input = intermediate +
+            static_cast<size_t>(route) * intermediate_size;
+        if (bf16_activations) {
+            const auto* packed = static_cast<const uint8_t*>(down) +
+                static_cast<size_t>(row) * (intermediate_size / 2);
+            for (int group = 0; group < down_groups_per_row; ++group) {
+                float block = 0.0f;
+                const int begin = group * 32;
+                for (int inner = begin; inner < begin + 32; ++inner) {
+                    const uint8_t byte = packed[inner / 2];
+                    const uint8_t nibble = inner & 1
+                        ? byte >> 4 : byte & 0x0f;
+                    block += route_input[inner] *
+                        cuda_decode_mxfp4_e2m1(nibble);
+                }
+                contribution += block * cuda_decode_e8m0(
+                    down_e8m0_scales[
+                        static_cast<size_t>(row) *
+                            down_groups_per_row + group]);
+            }
+        } else {
+            for (int inner = 0; inner < intermediate_size; ++inner)
+                contribution += route_input[inner] *
+                    moe_weight_value_cuda(
+                        down, down_scales, down_e8m0_scales, down_fp32,
+                        down_layout, down_group_size, down_groups_per_row,
+                        row, inner, intermediate_size);
+        }
+        if (bf16_activations) {
+            contribution = cuda_round_to_bf16(contribution);
+            result += contribution;
+        } else {
+            result += route_weights[route] * contribution;
+        }
     }
     output[static_cast<size_t>(token) * output_stride + dimension] = result;
 }
 
 __global__ void moe_swiglu_cuda(
     const float* gate, const float* up, float* output, size_t count,
-    float swiglu_limit) {
+    float swiglu_limit, bool bf16_activations) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
         threadIdx.x;
     if (index >= count)
         return;
     float gate_value = gate[index];
     float up_value = up[index];
+    if (bf16_activations) {
+        gate_value = cuda_round_to_bf16(gate_value);
+        up_value = cuda_round_to_bf16(up_value);
+    }
     if (swiglu_limit > 0.0f) {
         gate_value = fminf(gate_value, swiglu_limit);
         up_value = fminf(fmaxf(up_value, -swiglu_limit), swiglu_limit);
     }
-    output[index] = gate_value / (1.0f + expf(-gate_value)) * up_value;
+    const float value = gate_value / (1.0f + expf(-gate_value)) * up_value;
+    output[index] = bf16_activations ? cuda_round_to_bf16(value) : value;
 }
 
 __global__ void moe_add_shared_cuda(
@@ -1490,11 +1712,14 @@ struct CudaBackend::Impl {
         Q4Bg32,
         Q4Bg128,
         Int32Lookup,
+        Fp8Block128,
+        Mxfp4RowMajor,
     };
 
     struct DeviceWeight {
         void* data = nullptr;
         float* scales = nullptr;
+        uint8_t* e8m0_scales = nullptr;
         cudaDataType type = CUDA_R_16F;
         int n = 0;
         int k = 0;
@@ -1638,7 +1863,8 @@ struct CudaBackend::Impl {
             device_allocations.push_back(device);
             found = weights.emplace(
                 cache_key,
-                DeviceWeight{device, nullptr, type, n, k, 0, 0, layout})
+                DeviceWeight{
+                    device, nullptr, nullptr, type, n, k, 0, 0, layout})
                         .first;
             weights_by_device.emplace(device, &found->second);
         }
@@ -1682,6 +1908,40 @@ struct CudaBackend::Impl {
         return true;
     }
 
+    bool upload_microscaled_weight(
+        Tensor& tensor, const void* cache_key, const void* source,
+        size_t bytes, const uint8_t* host_scales, size_t scale_count,
+        int n, int k, int group_size, int groups_per_row,
+        WeightLayout layout) {
+        if (!host_scales || scale_count == 0 || group_size <= 0 ||
+            groups_per_row <= 0 ||
+            !upload_weight(tensor, cache_key, source, bytes, CUDA_R_8U,
+                           n, k, layout))
+            return false;
+        auto found = weights.find(cache_key);
+        if (found == weights.end())
+            return false;
+        DeviceWeight& prepared = found->second;
+        if (!prepared.e8m0_scales) {
+            uint8_t* device_scales = nullptr;
+            if (!report_cuda(cudaMalloc(&device_scales, scale_count),
+                             "cudaMalloc E8M0 weight scales") ||
+                !report_cuda(cudaMemcpy(device_scales, host_scales,
+                                        scale_count,
+                                        cudaMemcpyHostToDevice),
+                             "cudaMemcpy E8M0 weight scales")) {
+                if (device_scales)
+                    cudaFree(device_scales);
+                return false;
+            }
+            device_allocations.push_back(device_scales);
+            prepared.e8m0_scales = device_scales;
+        }
+        prepared.group_size = group_size;
+        prepared.groups_per_row = groups_per_row;
+        return true;
+    }
+
     bool run_matmul_device(const float* device_a, int lda,
                            const Tensor& weight, float* device_c, int ldc,
                            int m, int n, int k,
@@ -1689,41 +1949,93 @@ struct CudaBackend::Impl {
                            int act_len) {
         const DeviceWeight* prepared = find_weight(weight);
         if (!prepared || prepared->n != n || prepared->k != k || !device_a ||
-            !device_c || ldc != n ||
-            prepared->layout != WeightLayout::Dense)
+            !device_c || ldc < n)
+            return false;
+        if (ldc != n && activation_kind != Activation::NONE && act_len != 0)
             return false;
 
-        const size_t a_elements = static_cast<size_t>(m) * lda;
-        const void* gemm_activation = device_a;
-        cudaDataType activation_type = CUDA_R_32F;
-        if (prepared->type == CUDA_R_16F) {
-            if (!reserve(activation_fp16, activation_fp16_bytes,
-                         a_elements * sizeof(__half)))
+        if (prepared->layout == WeightLayout::Fp8Block128 ||
+            prepared->layout == WeightLayout::Mxfp4RowMajor) {
+            const bool valid_fp8 =
+                prepared->layout == WeightLayout::Fp8Block128 &&
+                prepared->e8m0_scales && prepared->group_size == 128 &&
+                prepared->groups_per_row == (k + 127) / 128;
+            const bool valid_mxfp4 =
+                prepared->layout == WeightLayout::Mxfp4RowMajor &&
+                prepared->e8m0_scales && prepared->group_size == 32 &&
+                k % 32 == 0 && prepared->groups_per_row == k / 32;
+            if (!valid_fp8 && !valid_mxfp4)
                 return false;
             constexpr int threads = 256;
-            fp32_to_fp16<<<
-                static_cast<unsigned>((a_elements + threads - 1) / threads),
-                threads>>>(device_a,
-                           static_cast<__half*>(activation_fp16), a_elements);
-            if (!report_cuda(cudaGetLastError(), "fp32_to_fp16"))
+            const bool quantize_activation = valid_mxfp4 ||
+                (valid_fp8 && k >= 32 && k % 32 == 0);
+            const float* matmul_activation = device_a;
+            int matmul_lda = lda;
+            if (quantize_activation) {
+                auto* quantized = static_cast<float*>(scratch(
+                    "microscaled_activation",
+                    static_cast<size_t>(m) * k * sizeof(float)));
+                if (!quantized)
+                    return false;
+                const int blocks = m * ((k + 127) / 128);
+                quantize_activation_fp8_cuda<<<blocks, 1>>>(
+                    device_a, lda, quantized, m, k);
+                if (!report_cuda(cudaGetLastError(),
+                                 "quantize_activation_fp8_cuda"))
+                    return false;
+                matmul_activation = quantized;
+                matmul_lda = k;
+            }
+            const size_t count = static_cast<size_t>(m) * n;
+            microscaled_matmul_cuda<<<
+                static_cast<unsigned>((count + threads - 1) / threads),
+                threads>>>(
+                matmul_activation, matmul_lda,
+                static_cast<const uint8_t*>(prepared->data),
+                prepared->e8m0_scales,
+                static_cast<int>(prepared->layout), device_c, ldc,
+                m, n, k, prepared->groups_per_row);
+            if (!report_cuda(cudaGetLastError(),
+                             "microscaled_matmul_cuda"))
                 return false;
-            gemm_activation = activation_fp16;
-            activation_type = CUDA_R_16F;
-        }
+        } else {
+            if (prepared->layout != WeightLayout::Dense || ldc != n)
+                return false;
 
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        // Row-major C[M,N] = A[M,K] * W[N,K]^T is the equivalent
-        // column-major operation C_col[N,M] = W_col[K,N]^T * A_col[K,M].
-        if (!report_cublas(
-                cublasGemmEx(
-                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha,
-                    prepared->data, prepared->type, k, gemm_activation,
-                    activation_type, lda, &beta, device_c, CUDA_R_32F, n,
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                "cublasGemmEx"))
-            return false;
+            const size_t a_elements = static_cast<size_t>(m) * lda;
+            const void* gemm_activation = device_a;
+            cudaDataType activation_type = CUDA_R_32F;
+            if (prepared->type == CUDA_R_16F) {
+                if (!reserve(activation_fp16, activation_fp16_bytes,
+                             a_elements * sizeof(__half)))
+                    return false;
+                constexpr int threads = 256;
+                fp32_to_fp16<<<
+                    static_cast<unsigned>(
+                        (a_elements + threads - 1) / threads),
+                    threads>>>(device_a,
+                               static_cast<__half*>(activation_fp16),
+                               a_elements);
+                if (!report_cuda(cudaGetLastError(), "fp32_to_fp16"))
+                    return false;
+                gemm_activation = activation_fp16;
+                activation_type = CUDA_R_16F;
+            }
+
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            // Row-major C[M,N] = A[M,K] * W[N,K]^T is the equivalent
+            // column-major operation C_col[N,M] = W_col[K,N]^T * A_col[K,M].
+            if (!report_cublas(
+                    cublasGemmEx(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha,
+                        prepared->data, prepared->type, k, gemm_activation,
+                        activation_type, lda, &beta, device_c, CUDA_R_32F, n,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "cublasGemmEx"))
+                return false;
+        }
 
         if (activation_kind != Activation::NONE && act_len != 0) {
             const int begin = std::max(0, act_begin);
@@ -1745,7 +2057,7 @@ struct CudaBackend::Impl {
                     Activation activation_kind, int act_begin, int act_len) {
         const size_t a_bytes = static_cast<size_t>(m) * lda * sizeof(float);
         const size_t c_bytes = static_cast<size_t>(m) * n * sizeof(float);
-        if (!host_a || !host_c ||
+        if (!host_a || !host_c || ldc != n ||
             !reserve(activation, activation_bytes, a_bytes) ||
             !reserve(output, output_bytes, c_bytes) ||
             !report_cuda(cudaMemcpy(activation, host_a, a_bytes,
@@ -1872,6 +2184,35 @@ void CudaBackend::wrap_weight_int4(Tensor& tensor,
         return;
     const int n = static_cast<int>(tensor.shape[0]);
     const int k = static_cast<int>(tensor.shape[1]);
+    const void* rowmajor_source = tensor.rowmajor_data
+        ? tensor.rowmajor_data : tensor.data;
+    if (tensor.prec == Precision::FP8_E4M3) {
+        const int groups_per_row = (k + 127) / 128;
+        const size_t scale_count =
+            static_cast<size_t>((n + 127) / 128) * groups_per_row;
+        if (rowmajor_source && tensor.e8m0_scales &&
+            tensor.is_fp8_block128 && tensor.group_size == 128 &&
+            tensor.groups_per_row == static_cast<uint32_t>(groups_per_row)) {
+            impl_->upload_microscaled_weight(
+                tensor, rowmajor_source, rowmajor_source,
+                static_cast<size_t>(n) * k, tensor.e8m0_scales,
+                scale_count, n, k, 128, groups_per_row,
+                Impl::WeightLayout::Fp8Block128);
+        }
+        return;
+    }
+    if (tensor.prec == Precision::MXFP4) {
+        if (rowmajor_source && tensor.e8m0_scales && k % 32 == 0 &&
+            tensor.group_size == 32 &&
+            tensor.groups_per_row == static_cast<uint32_t>(k / 32)) {
+            impl_->upload_microscaled_weight(
+                tensor, rowmajor_source, rowmajor_source,
+                static_cast<size_t>(n) * k / 2, tensor.e8m0_scales,
+                static_cast<size_t>(n) * (k / 32), n, k, 32, k / 32,
+                Impl::WeightLayout::Mxfp4RowMajor);
+        }
+        return;
+    }
     if (keep_native_experts) {
         if (tensor.prec == Precision::INT8) {
             const void* source = tensor.rowmajor_data
@@ -2915,12 +3256,36 @@ void CudaBackend::dispatch(const GraphNode& node,
         const auto* router = impl_->find_weight(*inputs[1]);
         const auto* gate_up = impl_->find_weight(*inputs[2]);
         const auto* down = impl_->find_weight(*inputs[3]);
-        auto valid_expert_weight = [](const Impl::DeviceWeight* weight) {
+        auto valid_microscaled_weight = [](const Impl::DeviceWeight* weight) {
+            if (!weight || !weight->e8m0_scales)
+                return false;
+            if (weight->layout == Impl::WeightLayout::Fp8Block128)
+                return weight->group_size == 128 &&
+                    weight->groups_per_row == (weight->k + 127) / 128;
+            if (weight->layout == Impl::WeightLayout::Mxfp4RowMajor)
+                return weight->group_size == 32 && weight->k % 32 == 0 &&
+                    weight->groups_per_row == weight->k / 32;
+            return false;
+        };
+        auto valid_matmul_weight = [&](const Impl::DeviceWeight* weight) {
             return weight &&
-                (weight->layout != Impl::WeightLayout::Q8RowMajor ||
-                 (weight->scales && weight->group_size > 0 &&
-                  weight->groups_per_row > 0 &&
-                  weight->group_size * weight->groups_per_row >= weight->k));
+                (weight->layout == Impl::WeightLayout::Dense ||
+                 valid_microscaled_weight(weight));
+        };
+        auto valid_expert_weight = [](const Impl::DeviceWeight* weight) {
+            if (!weight)
+                return false;
+            if (weight->layout == Impl::WeightLayout::Q8RowMajor)
+                return weight->scales && weight->group_size > 0 &&
+                    weight->groups_per_row > 0 &&
+                    weight->group_size * weight->groups_per_row >= weight->k;
+            if (weight->layout == Impl::WeightLayout::Mxfp4RowMajor)
+                return weight->e8m0_scales && weight->group_size == 32 &&
+                    weight->k % 32 == 0 &&
+                    weight->groups_per_row == weight->k / 32;
+            return weight->layout == Impl::WeightLayout::Dense ||
+                weight->layout == Impl::WeightLayout::Q4Bg32 ||
+                weight->layout == Impl::WeightLayout::Q4Bg128;
         };
         const Tensor* router_bias =
             router_bias_input >= 0 &&
@@ -2971,11 +3336,16 @@ void CudaBackend::dispatch(const GraphNode& node,
             inputs[0]->shape[0] == hidden_size &&
             output->shape[0] == hidden_size && output->shape[1] == tokens &&
             router->n == num_experts && router->k == hidden_size &&
-            router->layout == Impl::WeightLayout::Dense &&
+            valid_matmul_weight(router) &&
             gate_up->n == num_experts * 2 * intermediate_size &&
             gate_up->k == hidden_size &&
             down->n == num_experts * hidden_size &&
             down->k == intermediate_size;
+        const bool bf16_activations = gate_up &&
+            gate_up->layout == Impl::WeightLayout::Mxfp4RowMajor;
+        valid = valid &&
+            ((down && down->layout == Impl::WeightLayout::Mxfp4RowMajor) ==
+             bf16_activations);
         if (router_bias) {
             valid = valid && router_bias->prec == Precision::FP32 &&
                 router_bias->nelements() >= num_experts &&
@@ -2996,10 +3366,9 @@ void CudaBackend::dispatch(const GraphNode& node,
                 const auto* prepared_gate = impl_->find_weight(*shared_gate);
                 const auto* prepared_up = impl_->find_weight(*shared_up);
                 const auto* prepared_down = impl_->find_weight(*shared_down);
-                valid = prepared_gate && prepared_up && prepared_down &&
-                    prepared_gate->layout == Impl::WeightLayout::Dense &&
-                    prepared_up->layout == Impl::WeightLayout::Dense &&
-                    prepared_down->layout == Impl::WeightLayout::Dense &&
+                valid = valid_matmul_weight(prepared_gate) &&
+                    valid_matmul_weight(prepared_up) &&
+                    valid_matmul_weight(prepared_down) &&
                     prepared_gate->n == shared_intermediate_size &&
                     prepared_gate->k == hidden_size &&
                     prepared_up->n == shared_intermediate_size &&
@@ -3012,9 +3381,7 @@ void CudaBackend::dispatch(const GraphNode& node,
                         shared_scale_weight = inputs[7];
                         const auto* prepared_scale =
                             impl_->find_weight(*shared_scale_weight);
-                        valid = prepared_scale &&
-                            prepared_scale->layout ==
-                                Impl::WeightLayout::Dense &&
+                        valid = valid_matmul_weight(prepared_scale) &&
                             prepared_scale->n == 1 &&
                             prepared_scale->k == hidden_size;
                     }
@@ -3038,8 +3405,21 @@ void CudaBackend::dispatch(const GraphNode& node,
             auto* routed_intermediate = static_cast<float*>(impl_->scratch(
                 "moe_routed_intermediate",
                 route_count * intermediate_size * sizeof(float)));
+            auto* routed_hidden_fp8 = bf16_activations
+                ? static_cast<float*>(impl_->scratch(
+                      "moe_routed_hidden_fp8",
+                      static_cast<size_t>(tokens) * hidden_size *
+                          sizeof(float)))
+                : nullptr;
+            auto* routed_intermediate_fp8 = bf16_activations
+                ? static_cast<float*>(impl_->scratch(
+                      "moe_routed_intermediate_fp8",
+                      route_count * intermediate_size * sizeof(float)))
+                : nullptr;
             valid = logits && route_indices && route_weights &&
                 routed_intermediate &&
+                (!bf16_activations ||
+                 (routed_hidden_fp8 && routed_intermediate_fp8)) &&
                 impl_->run_matmul_device(
                     hidden,
                     static_cast<int>(inputs[0]->stride[1] / sizeof(float)),
@@ -3083,30 +3463,69 @@ void CudaBackend::dispatch(const GraphNode& node,
                 }
             }
             if (valid) {
+                const float* routed_hidden = hidden;
+                size_t routed_hidden_stride =
+                    inputs[0]->stride[1] / sizeof(float);
+                if (bf16_activations) {
+                    const int hidden_blocks =
+                        tokens * ((hidden_size + 127) / 128);
+                    quantize_activation_fp8_cuda<<<hidden_blocks, 1>>>(
+                        hidden,
+                        static_cast<int>(routed_hidden_stride),
+                        routed_hidden_fp8, tokens, hidden_size);
+                    valid = report_cuda(
+                        cudaGetLastError(),
+                        "CUDA MOE FP8 routed activation");
+                    routed_hidden = routed_hidden_fp8;
+                    routed_hidden_stride = hidden_size;
+                }
                 const size_t intermediate_count =
                     route_count * intermediate_size;
-                moe_gate_up_cuda<<<
-                    static_cast<unsigned>((intermediate_count + threads - 1) /
-                                          threads), threads>>>(
-                    hidden,
-                    inputs[0]->stride[1] / sizeof(float), route_indices,
-                    gate_up->data, gate_up->type == CUDA_R_32F,
-                    static_cast<int>(gate_up->layout), gate_up->scales,
-                    gate_up->group_size, gate_up->groups_per_row,
-                    routed_intermediate, tokens, top_k, hidden_size,
-                    intermediate_size, swiglu_limit);
+                if (valid) {
+                    moe_gate_up_cuda<<<
+                        static_cast<unsigned>(
+                            (intermediate_count + threads - 1) / threads),
+                        threads>>>(
+                        routed_hidden, routed_hidden_stride, route_indices,
+                        route_weights,
+                        gate_up->data, gate_up->type == CUDA_R_32F,
+                        static_cast<int>(gate_up->layout), gate_up->scales,
+                        gate_up->group_size, gate_up->groups_per_row,
+                        gate_up->e8m0_scales, routed_intermediate, tokens,
+                        top_k, hidden_size, intermediate_size, swiglu_limit,
+                        bf16_activations);
+                }
+                const float* down_activation = routed_intermediate;
+                if (valid && bf16_activations) {
+                    const int intermediate_blocks = static_cast<int>(
+                        route_count * ((intermediate_size + 127) / 128));
+                    quantize_activation_fp8_cuda<<<
+                        intermediate_blocks, 1>>>(
+                        routed_intermediate, intermediate_size,
+                        routed_intermediate_fp8,
+                        static_cast<int>(route_count), intermediate_size);
+                    valid = report_cuda(
+                        cudaGetLastError(),
+                        "CUDA MOE FP8 down activation");
+                    down_activation = routed_intermediate_fp8;
+                }
                 const size_t output_count =
                     static_cast<size_t>(tokens) * hidden_size;
-                moe_down_cuda<<<
-                    static_cast<unsigned>((output_count + threads - 1) /
-                                          threads), threads>>>(
-                    route_indices, route_weights, routed_intermediate,
-                    down->data, down->type == CUDA_R_32F,
-                    static_cast<int>(down->layout), down->scales,
-                    down->group_size, down->groups_per_row, destination,
-                    output->stride[1] / sizeof(float), tokens, top_k,
-                    hidden_size, intermediate_size);
-                valid = report_cuda(cudaGetLastError(), "CUDA MOE routed");
+                if (valid) {
+                    moe_down_cuda<<<
+                        static_cast<unsigned>(
+                            (output_count + threads - 1) / threads),
+                        threads>>>(
+                        route_indices, route_weights, down_activation,
+                        down->data, down->type == CUDA_R_32F,
+                        static_cast<int>(down->layout), down->scales,
+                        down->group_size, down->groups_per_row,
+                        down->e8m0_scales, destination,
+                        output->stride[1] / sizeof(float), tokens, top_k,
+                        hidden_size, intermediate_size, bf16_activations);
+                    valid = report_cuda(
+                        cudaGetLastError(), "CUDA MOE routed");
+                }
             }
 
             if (valid && has_shared) {
@@ -3152,7 +3571,8 @@ void CudaBackend::dispatch(const GraphNode& node,
                         static_cast<unsigned>((shared_count + threads - 1) /
                                               threads), threads>>>(
                         shared_gate_output, shared_up_output,
-                        shared_intermediate, shared_count, swiglu_limit);
+                        shared_intermediate, shared_count, swiglu_limit,
+                        bf16_activations);
                     valid = report_cuda(
                         cudaGetLastError(), "CUDA MOE shared SwiGLU") &&
                         impl_->run_matmul_device(
@@ -3160,6 +3580,18 @@ void CudaBackend::dispatch(const GraphNode& node,
                             *shared_down, shared_output, hidden_size, tokens,
                             hidden_size, shared_intermediate_size,
                             Activation::NONE, 0, -1);
+                    if (valid && bf16_activations) {
+                        const size_t shared_output_count =
+                            static_cast<size_t>(tokens) * hidden_size;
+                        round_bf16_cuda<<<
+                            static_cast<unsigned>(
+                                (shared_output_count + threads - 1) /
+                                threads), threads>>>(
+                            shared_output, shared_output_count);
+                        valid = report_cuda(
+                            cudaGetLastError(),
+                            "CUDA MOE shared BF16 output");
+                    }
                 }
                 if (valid && shared_has_gate) {
                     valid = impl_->run_matmul_device(
@@ -3168,6 +3600,15 @@ void CudaBackend::dispatch(const GraphNode& node,
                                          sizeof(float)),
                         *shared_scale_weight, shared_scale, 1, tokens, 1,
                         hidden_size, Activation::NONE, 0, -1);
+                    if (valid && bf16_activations) {
+                        round_bf16_cuda<<<
+                            static_cast<unsigned>((tokens + threads - 1) /
+                                                  threads), threads>>>(
+                            shared_scale, tokens);
+                        valid = report_cuda(
+                            cudaGetLastError(),
+                            "CUDA MOE shared BF16 scale");
+                    }
                 }
                 if (valid) {
                     const size_t output_count =

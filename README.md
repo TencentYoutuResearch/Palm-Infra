@@ -396,13 +396,18 @@ package-native INT32 representation.
 Aggregate W8, W4G32, and W4G128 expert tensors remain quantized on the GPU and
 are decoded inside the selected-expert kernels instead of being expanded into
 model-sized FP16 copies. W8 experts retain row-major values and per-group
-scales, while W4 experts retain their package-native BG32/BG128 blocks. This
+scales, while W4 experts retain their package-native BG32/BG128 blocks.
+Checkpoint-native FP8 E4M3 block-128 dense/shared-expert weights and resident
+MXFP4 E2M1/E8M0 group-32 routed experts likewise stay byte-packed on the GPU.
+Their CUDA paths reproduce the checkpoint's FP8 activation quantization and
+the BF16 boundaries around MXFP4 MoE gate/up, routed scaling, and down output.
+This
 keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7, Qwen3.5 vision, Qwen3-MoE,
 and Qwen3.5-MoE graphs on CUDA without CPU operator fallback. DeepSeek-V4's
-FP32 Hyper-Connection stages and hash-routed MoE operator are native when the
-experts use resident FP16 weights, but its complete graph remains CPU-only
-because native FP8/MXFP4 and sparse-attention coverage is still incomplete.
-SSD-offloaded MoE variants also remain CPU-only.
+FP32 Hyper-Connection stages, checkpoint-native dense matmuls, and resident
+FP8/MXFP4 hash-routed MoE operator are native, but its complete graph remains
+CPU-only because grouped projections and sparse-attention coverage are still
+incomplete. SSD-offloaded MoE variants also remain CPU-only.
 Other operators not yet implemented natively synchronize and use the CPU
 reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to
 print native/fallback operator counts. Several specialized model families
