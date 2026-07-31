@@ -34,6 +34,17 @@ struct DeviceMoeCacheStats {
     size_t fallback_scratch_bytes = 0;
 };
 
+// Aggregate graph-dispatch coverage reported by accelerator backends. A
+// tracked backend classifies every dispatched node as either native or an
+// explicit reference-backend fallback. This remains separate from timing
+// profiles so correctness tests and embedding applications do not need to
+// enable or scrape diagnostic logging.
+struct BackendOperatorStats {
+    bool tracked = false;
+    uint64_t native_calls = 0;
+    uint64_t fallback_calls = 0;
+};
+
 enum class PersistentHostAccess {
     // The complete allocation must remain directly host-addressable. This is
     // useful for low-level tooling and backends whose native storage is shared.
@@ -96,4 +107,5 @@ public:
         return capacity_bytes == 0;
     }
     virtual DeviceMoeCacheStats moe_device_cache_stats() const { return {}; }
+    virtual BackendOperatorStats operator_stats() const { return {}; }
 };

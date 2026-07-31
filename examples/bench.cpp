@@ -135,6 +135,13 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
     std::printf("cpu_weight_sidecar_mb=%.1f\n",
                 engine.cpu_weight_sidecar_bytes() / 1e6);
     std::printf("kv_cache_mb=%.1f\n", engine.kv_cache_bytes() / 1e6);
+    const auto operator_stats = engine.backend_operator_stats();
+    if (operator_stats.tracked) {
+        std::printf(
+            "backend_native_ops=%llu backend_fallback_ops=%llu\n",
+            static_cast<unsigned long long>(operator_stats.native_calls),
+            static_cast<unsigned long long>(operator_stats.fallback_calls));
+    }
     if (engine.moe_ssd_offload_enabled()) {
         auto ssd = engine.moe_ssd_stats();
         std::printf("moe_ssd_cache_mb=%.1f\n", engine.config().moe_ssd_cache_bytes / 1e6);
@@ -281,6 +288,15 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
               engine.cpu_weight_sidecar_bytes() / 1e6,     "MB");
     human_row("kv_cache_mb", engine.kv_cache_bytes() / 1e6, "MB");
     human_row_int("threads", engine.config().num_threads, "");
+    const auto operator_stats = engine.backend_operator_stats();
+    if (operator_stats.tracked) {
+        human_row_int(
+            "backend_native_ops",
+            static_cast<long long>(operator_stats.native_calls), "");
+        human_row_int(
+            "backend_fallback_ops",
+            static_cast<long long>(operator_stats.fallback_calls), "");
+    }
     if (engine.moe_ssd_offload_enabled()) {
         auto ssd = engine.moe_ssd_stats();
         human_row("moe_ssd_cache_mb", engine.config().moe_ssd_cache_bytes / 1e6, "MB");

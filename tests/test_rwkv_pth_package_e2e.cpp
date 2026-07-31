@@ -57,11 +57,26 @@ bool run(const char* package, Device device, std::vector<float>& prefill,
     engine.reset();
     std::vector<float> reset_prefill;
     std::vector<float> reset_decode;
-    return engine.past_len() == 0 &&
+    const bool reset_valid = engine.past_len() == 0 &&
         copy_finite(engine.prefill_hidden({1, 2, 3}), reset_prefill) &&
         copy_finite(engine.decode_hidden(4), reset_decode) &&
         reset_prefill == prefill && reset_decode == first_decode &&
         engine.past_len() == 4;
+    if (!reset_valid)
+        return false;
+    if (device == Device::CUDA) {
+        const auto stats = engine.backend_operator_stats();
+        if (!stats.tracked || stats.native_calls == 0 ||
+            stats.fallback_calls != 0) {
+            std::fprintf(
+                stderr,
+                "RWKV7 CUDA operator coverage is native=%llu fallback=%llu\n",
+                static_cast<unsigned long long>(stats.native_calls),
+                static_cast<unsigned long long>(stats.fallback_calls));
+            return false;
+        }
+    }
+    return true;
 }
 
 bool close_enough(const std::vector<float>& actual,

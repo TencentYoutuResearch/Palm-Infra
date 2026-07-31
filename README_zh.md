@@ -227,6 +227,10 @@ FP16/FP32 SSD expert 都可使用同一套有界 device cache；FP8 expert 必�
 metadata。未放入 cache 的当前路由 expert 使用 compact device scratch，不触发
 CPU 算子 fallback。
 
+`mollm_bench` 会输出汇总的 `backend_native_ops` 与
+`backend_fallback_ops`；库调用方也可以通过
+`LLMEngine::backend_operator_stats()` 直接读取，无需解析 profile 日志。
+
 | `model_type` | 支持的模型 |
 |---|---|
 | `qwen3` | Qwen3 dense text models |

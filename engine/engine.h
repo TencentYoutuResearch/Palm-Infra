@@ -285,6 +285,11 @@ public:
             ? accelerator_backend_->moe_device_cache_stats()
             : DeviceMoeCacheStats{};
     }
+    BackendOperatorStats backend_operator_stats() const {
+        return accelerator_backend_
+            ? accelerator_backend_->operator_stats()
+            : BackendOperatorStats{};
+    }
 
     /// Return raw logits. If all_positions=true, returns vocab_size*seq_len
     /// floats (seq_len blocks of vocab_size). Otherwise just the last position.

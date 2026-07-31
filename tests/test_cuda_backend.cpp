@@ -2794,6 +2794,13 @@ int main() {
         if (!fallback_backend.available() ||
             !test_explicit_cpu_fallback_bridge(fallback_backend))
             return 1;
+        const auto stats = fallback_backend.operator_stats();
+        if (!stats.tracked || stats.fallback_calls == 0) {
+            std::fprintf(
+                stderr,
+                "CUDA fallback bridge was not reflected in operator stats\n");
+            return 1;
+        }
     }
     if (!test_persistent_storage_modes(backend))
         return 1;

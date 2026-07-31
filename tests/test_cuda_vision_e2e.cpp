@@ -88,6 +88,18 @@ bool run_model(const char* package, Device device, VisionResult& result,
         std::fprintf(stderr, "vision prefill failed: %s\n", error.c_str());
         return false;
     }
+    if (device == Device::CUDA) {
+        const auto stats = engine.backend_operator_stats();
+        if (!stats.tracked || stats.native_calls == 0 ||
+            stats.fallback_calls != 0) {
+            std::fprintf(
+                stderr,
+                "CUDA vision operator coverage is native=%llu fallback=%llu\n",
+                static_cast<unsigned long long>(stats.native_calls),
+                static_cast<unsigned long long>(stats.fallback_calls));
+            return false;
+        }
+    }
     return true;
 }
 

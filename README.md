@@ -459,9 +459,12 @@ transfers.
 Other operators not yet implemented natively synchronize, stage their device
 inputs to host memory, run the CPU reference dispatcher, and copy the result
 back to the device. Set `MOLLM_CUDA_PROFILE=1` to print native/fallback operator
-counts. All currently supported graph families have native CUDA paths; the
-generic fallback remains as a correctness bridge for future operators. This is
-not yet a performance-complete CUDA backend.
+counts by type. `mollm_bench` always reports aggregate `backend_native_ops` and
+`backend_fallback_ops`; library callers can query the same counters through
+`LLMEngine::backend_operator_stats()` without enabling diagnostic logging. All
+currently supported graph families have native CUDA paths; the generic fallback
+remains as a correctness bridge for future operators. This is not yet a
+performance-complete CUDA backend.
 
 ## Local HTTP server
 

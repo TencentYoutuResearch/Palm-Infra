@@ -3325,6 +3325,18 @@ DeviceMoeCacheStats CudaBackend::moe_device_cache_stats() const {
     return impl_ ? impl_->moe_device_cache_stats : DeviceMoeCacheStats{};
 }
 
+BackendOperatorStats CudaBackend::operator_stats() const {
+    BackendOperatorStats stats;
+    stats.tracked = impl_ != nullptr;
+    if (!impl_)
+        return stats;
+    for (const auto& entry : impl_->native_ops)
+        stats.native_calls += entry.second;
+    for (const auto& entry : impl_->fallback_ops)
+        stats.fallback_calls += entry.second;
+    return stats;
+}
+
 void CudaBackend::clear_dispatch_error() {
     impl_->failed = false;
     impl_->cpu.clear_dispatch_error();
