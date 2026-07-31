@@ -1,5 +1,6 @@
 #include "engine/cuda_backend.h"
 #include "engine/engine.h"
+#include "kernels/deepseek_v4_attention.h"
 #include "kernels/hyper_connection.h"
 #include "kernels/matmul.h"
 #include "kernels/moe.h"
@@ -42,6 +43,8 @@ void reference(const std::vector<float>& activation,
 bool dispatch_matmul(CudaBackend& backend, Tensor& weight,
                      const std::vector<float>& activation,
                      std::vector<float>& output, int m, int n, int k);
+Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1,
+                     int64_t d2 = 1, int64_t d3 = 1);
 
 bool test_microscaled_matmul(CudaBackend& backend) {
     constexpr int m = 3;
@@ -171,6 +174,69 @@ bool test_microscaled_matmul(CudaBackend& backend) {
         close_enough(mx_actual, mx_expected, 1.0e-4f);
 }
 
+bool test_dsv4_grouped_fp8_linear(CudaBackend& backend) {
+    constexpr int groups = 4;
+    constexpr int group_width = 256;
+    constexpr int rank = 64;
+    constexpr int tokens = 3;
+    constexpr int input_width = groups * group_width;
+    constexpr int output_width = groups * rank;
+    constexpr int k_blocks = group_width / 128;
+    std::vector<float> input(static_cast<size_t>(tokens) * input_width);
+    for (size_t index = 0; index < input.size(); ++index)
+        input[index] = static_cast<float>(
+            static_cast<int>((index * 11 + index / input_width) % 31) - 15) /
+            37.0f;
+    constexpr uint8_t codes[] = {
+        0x00, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48,
+        0xa0, 0xa8, 0xb0, 0xb8, 0xc0, 0xc8};
+    std::vector<uint8_t> weight_values(
+        static_cast<size_t>(output_width) * group_width);
+    for (size_t index = 0; index < weight_values.size(); ++index)
+        weight_values[index] = codes[
+            (index * 7 + index / group_width * 3) %
+            (sizeof(codes) / sizeof(codes[0]))];
+    std::vector<uint8_t> scales = {125, 128, 129, 126};
+
+    Tensor input_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, input_width, tokens,
+        1, 1, input.data());
+    Tensor weight = Tensor::create(
+        Precision::FP8_E4M3, MemoryType::EXTERNAL,
+        output_width, group_width, 1, 1, weight_values.data());
+    weight.rowmajor_data = weight_values.data();
+    weight.e8m0_scales = scales.data();
+    weight.group_size = 128;
+    weight.groups_per_row = k_blocks;
+    weight.num_groups = static_cast<uint32_t>(scales.size());
+    weight.is_fp8_block128 = true;
+    std::vector<float> expected(static_cast<size_t>(tokens) * output_width);
+    Tensor expected_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, output_width, tokens,
+        1, 1, expected.data());
+    if (!kernel_dsv4_grouped_linear(
+            input_tensor, weight, expected_tensor, groups))
+        return false;
+
+    backend.wrap_weight_int4(weight);
+    Tensor input_device = device_tensor(backend, input_width, tokens);
+    Tensor output_device = device_tensor(backend, output_width, tokens);
+    std::memcpy(input_device.data, input.data(), input_device.nbytes());
+    weight.data = nullptr;
+    weight.rowmajor_data = nullptr;
+    weight.e8m0_scales = nullptr;
+    GraphNode node;
+    node.op_type = OpType::DSV4_GROUPED_LINEAR;
+    node.params.i32 = {groups};
+    backend.clear_dispatch_error();
+    backend.dispatch(node, {&input_device, &weight}, &output_device, nullptr);
+    backend.end_graph();
+    std::vector<float> actual(expected.size());
+    std::memcpy(actual.data(), output_device.data, output_device.nbytes());
+    return !backend.dispatch_failed() &&
+        close_enough(actual, expected, 1.0e-4f);
+}
+
 bool dispatch_matmul(CudaBackend& backend, Tensor& weight,
                      const std::vector<float>& activation,
                      std::vector<float>& output, int m, int n, int k) {
@@ -187,8 +253,8 @@ bool dispatch_matmul(CudaBackend& backend, Tensor& weight,
     return !backend.dispatch_failed();
 }
 
-Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1,
-                     int64_t d2 = 1, int64_t d3 = 1) {
+Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1,
+                     int64_t d2, int64_t d3) {
     Tensor tensor = Tensor::create(Precision::FP32, MemoryType::NONE,
                                    d0, d1, d2, d3);
     if (!backend.alloc_output(tensor, tensor.nbytes(), nullptr))
@@ -1838,6 +1904,12 @@ int main() {
             !test_microscaled_matmul(microscaled_backend))
             return 1;
     }
+    {
+        CudaBackend grouped_backend;
+        if (!grouped_backend.available() ||
+            !test_dsv4_grouped_fp8_linear(grouped_backend))
+            return 1;
+    }
     if (!backend.is_device_resident() ||
         !test_device_resident_ops(backend, fp16, activation, expected,
                                   m, n, k))
@@ -1961,8 +2033,9 @@ int main() {
             return 1;
     }
 
-    std::printf("CUDA device-resident ops, RWKV, Hyper-Connection and "
-                "standard/hash MoE variants, strided views, FP16, FP8, "
-                "MXFP4, W8, W4G32 and W4G128 matmul tests passed\n");
+    std::printf("CUDA device-resident ops, RWKV, Hyper-Connection, DeepSeek "
+                "grouped FP8 and standard/hash MoE variants, strided views, "
+                "FP16, FP8, MXFP4, W8, W4G32 and W4G128 matmul tests "
+                "passed\n");
     return 0;
 }

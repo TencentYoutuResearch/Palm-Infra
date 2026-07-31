@@ -931,9 +931,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             return false;
         }
 
-        // DeepSeek-V4 currently has CPU-only FP8/MXFP4, hyper-connection and
-        // sparse-attention kernels. Running this graph through an accelerator would
-        // silently dispatch unsupported operators and corrupt the result.
+        // DeepSeek-V4's CUDA path now covers resident FP8/MXFP4 weights,
+        // Hyper-Connection, MoE, and its grouped output projection. The
+        // compressor, indexer, and sparse-attention stages remain CPU-only, so
+        // keep the complete graph on one backend until those stateful stages
+        // are native as well.
         if (cfg_.device != Device::CPU) {
             if (cfg_.metal_ssd_full) {
                 fprintf(stderr,

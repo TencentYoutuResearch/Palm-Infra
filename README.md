@@ -404,10 +404,11 @@ the BF16 boundaries around MXFP4 MoE gate/up, routed scaling, and down output.
 This
 keeps the dense Qwen3, Qwen3.5, Youtu MLA, RWKV7, Qwen3.5 vision, Qwen3-MoE,
 and Qwen3.5-MoE graphs on CUDA without CPU operator fallback. DeepSeek-V4's
-FP32 Hyper-Connection stages, checkpoint-native dense matmuls, and resident
-FP8/MXFP4 hash-routed MoE operator are native, but its complete graph remains
-CPU-only because grouped projections and sparse-attention coverage are still
-incomplete. SSD-offloaded MoE variants also remain CPU-only.
+FP32 Hyper-Connection stages, checkpoint-native dense and grouped FP8
+projections, and resident FP8/MXFP4 hash-routed MoE operator are native, but
+its complete graph remains CPU-only because the compressor, indexer, and
+sparse-attention stages are still incomplete. SSD-offloaded MoE variants also
+remain CPU-only.
 Other operators not yet implemented natively synchronize and use the CPU
 reference dispatcher over the managed buffers. Set `MOLLM_CUDA_PROFILE=1` to
 print native/fallback operator counts. Several specialized model families

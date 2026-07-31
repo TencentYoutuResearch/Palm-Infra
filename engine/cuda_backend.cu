@@ -247,6 +247,37 @@ __global__ void microscaled_matmul_cuda(
     output[static_cast<size_t>(row) * ldc + column] = sum;
 }
 
+__global__ void dsv4_grouped_fp8_linear_cuda(
+    const float* input, size_t input_stride, const uint8_t* weight,
+    const uint8_t* scales, float* output, size_t output_stride,
+    int tokens, int groups, int group_width, int rank,
+    int k_blocks) {
+    const int output_width = groups * rank;
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    const size_t count = static_cast<size_t>(tokens) * output_width;
+    if (index >= count)
+        return;
+    const int token = static_cast<int>(index / output_width);
+    const int row = static_cast<int>(index % output_width);
+    const int group = row / rank;
+    const float* group_input = input +
+        static_cast<size_t>(token) * input_stride +
+        static_cast<size_t>(group) * group_width;
+    const uint8_t* weight_row =
+        weight + static_cast<size_t>(row) * group_width;
+    float sum = 0.0f;
+    for (int k = 0; k < group_width; ++k) {
+        const float weight_value = cuda_round_to_bf16(
+            cuda_decode_fp8_e4m3fn(weight_row[k]) *
+            cuda_decode_e8m0(
+                scales[static_cast<size_t>(row / 128) * k_blocks +
+                       k / 128]));
+        sum += group_input[k] * weight_value;
+    }
+    output[static_cast<size_t>(token) * output_stride + row] = sum;
+}
+
 __global__ void binary_cuda(const float* lhs, const float* rhs, float* output,
                             size_t count, bool multiply) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -3209,6 +3240,58 @@ void CudaBackend::dispatch(const GraphNode& node,
                 output->stride[1] / sizeof(float), count, hidden_size,
                 hc_mult);
             if (!report_cuda(cudaGetLastError(), "hc_post_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if (node.op_type == OpType::DSV4_GROUPED_LINEAR &&
+        inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
+        const int groups = graph_params::get_i32(node.params, 0, 8);
+        const auto* prepared = impl_->find_weight(*inputs[1]);
+        const int input_width = static_cast<int>(inputs[0]->shape[0]);
+        const int tokens = static_cast<int>(inputs[0]->shape[1]);
+        const int output_width = static_cast<int>(output->shape[0]);
+        const int group_width = groups > 0 ? input_width / groups : 0;
+        const int rank = groups > 0 ? output_width / groups : 0;
+        const float* source = device_pointer_const<float>(*inputs[0]);
+        float* destination = device_pointer<float>(*output);
+        const bool valid = groups > 0 && input_width > 0 && tokens > 0 &&
+            input_width % groups == 0 && output_width > 0 &&
+            output_width % groups == 0 &&
+            inputs[0]->prec == Precision::FP32 &&
+            inputs[0]->stride[0] == sizeof(float) &&
+            inputs[0]->shape[2] == 1 && inputs[0]->shape[3] == 1 &&
+            inputs[0]->stride[1] >=
+                static_cast<size_t>(input_width) * sizeof(float) &&
+            output->prec == Precision::FP32 &&
+            output->stride[0] == sizeof(float) &&
+            output->shape[1] == tokens && output->shape[2] == 1 &&
+            output->shape[3] == 1 && output->stride[1] >=
+                static_cast<size_t>(output_width) * sizeof(float) &&
+            prepared &&
+            prepared->layout == Impl::WeightLayout::Fp8Block128 &&
+            prepared->e8m0_scales && prepared->group_size == 128 &&
+            prepared->n == output_width && prepared->k == group_width &&
+            prepared->groups_per_row == (group_width + 127) / 128 &&
+            inputs[1]->shape[0] == output_width &&
+            inputs[1]->shape[1] == group_width && source && destination;
+        if (valid) {
+            const size_t count =
+                static_cast<size_t>(tokens) * output_width;
+            dsv4_grouped_fp8_linear_cuda<<<
+                static_cast<unsigned>((count + threads - 1) / threads),
+                threads>>>(
+                source, inputs[0]->stride[1] / sizeof(float),
+                static_cast<const uint8_t*>(prepared->data),
+                prepared->e8m0_scales, destination,
+                output->stride[1] / sizeof(float), tokens, groups,
+                group_width, rank, prepared->groups_per_row);
+            if (!report_cuda(
+                    cudaGetLastError(), "DSV4 grouped FP8 linear")) {
                 impl_->failed = true;
                 return;
             }

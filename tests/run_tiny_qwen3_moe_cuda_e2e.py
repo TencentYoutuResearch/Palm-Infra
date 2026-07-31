@@ -303,6 +303,8 @@ def build_hash_package(weights_dir: Path, package: Path,
     write_fp8(
         "layer_0_shared_experts_down.weights",
         hidden, shared_intermediate, 20260807)
+    write_fp8(
+        "layer_0_grouped.weights", hidden, hidden // 4, 20260808)
     for name, values in fp32_weights.items():
         _write_weight_file(
             str(weights_dir / name), values, precision=Precision.FP32)
@@ -323,13 +325,18 @@ def build_hash_package(weights_dir: Path, package: Path,
         token_ids = g.input(
             "token_ids", (seq_len,), Precision.INT32,
             dynamic=(DimExpr.seq(),) if dynamic else None)
+        grouped_weight = g.weight(
+            "./layer_0_grouped.weights", (hidden, hidden // 4),
+            Precision.FP8_E4M3)
+        projected_hidden = g.dsv4_grouped_linear(
+            hidden_input, grouped_weight, 4)
         hc_fn = g.weight(
             "./hc_fn.weights", (hc_mix, wide), Precision.FP32)
         hc_scale = g.weight(
             "./hc_scale.weights", (3,), Precision.FP32)
         hc_base = g.weight(
             "./hc_base.weights", (hc_mix,), Precision.FP32)
-        residual = g.tile(hidden_input, (hc_mult, 1))
+        residual = g.tile(projected_hidden, (hc_mult, 1))
         packed = g.hc_pre(
             residual, hc_fn, hc_scale, hc_base, hidden, hc_mult,
             sinkhorn_iters=5, norm_eps=1e-6, sinkhorn_eps=1e-6)
