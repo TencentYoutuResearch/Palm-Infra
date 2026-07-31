@@ -61,6 +61,8 @@ public:
     bool configure_moe_device_cache(size_t capacity_bytes) override;
     DeviceMoeCacheStats moe_device_cache_stats() const override;
     BackendOperatorStats operator_stats() const override;
+    bool set_operator_fallback_policy(
+        OperatorFallbackPolicy policy) override;
 
     bool supports_lm_head(const Tensor& weight) const override;
     void lm_head_gemv(const float* activation_host, const Tensor& weight,

@@ -390,6 +390,10 @@ command exits with an error instead of silently running the model on CPU.
 Library callers can retain the default CPU fallback or set
 `EngineConfig::device_fallback` to
 `DeviceFallbackPolicy::REQUIRE_REQUESTED` for the same strict behaviour.
+Pass `--require-native` when a run must also reject per-operator reference
+fallback inside the selected accelerator. CUDA implements this policy today;
+library callers select it with
+`EngineConfig::operator_fallback = OperatorFallbackPolicy::REQUIRE_NATIVE`.
 
 SSD-offloaded quantized MoE packages can additionally retain recently routed
 expert pairs in a bounded CUDA cache:
@@ -463,8 +467,9 @@ counts by type. `mollm_bench` always reports aggregate `backend_native_ops` and
 `backend_fallback_ops`; library callers can query the same counters through
 `LLMEngine::backend_operator_stats()` without enabling diagnostic logging. All
 currently supported graph families have native CUDA paths; the generic fallback
-remains as a correctness bridge for future operators. This is not yet a
-performance-complete CUDA backend.
+remains as a correctness bridge for future operators unless
+`--require-native` is selected. This is not yet a performance-complete CUDA
+backend.
 
 ## Local HTTP server
 

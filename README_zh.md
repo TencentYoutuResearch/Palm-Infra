@@ -208,6 +208,9 @@ python3 models/deepseek_v4.py \
 库调用方可以保留默认的 CPU fallback，也可以将
 `EngineConfig::device_fallback` 设为
 `DeviceFallbackPolicy::REQUIRE_REQUESTED` 获得同样的严格行为。
+如果还要禁止所选 accelerator 内部逐算子回退到 reference backend，可传
+`--require-native`。当前 CUDA 已实现该策略；库调用方可设置
+`EngineConfig::operator_fallback = OperatorFallbackPolicy::REQUIRE_NATIVE`。
 
 CUDA 下还可以显式启用有界的 device expert LRU。cache miss 时 expert pair
 从 host cache 复制到 GPU 一次，后续命中不会再读取 SSD 或进行 H2D 传输；当前

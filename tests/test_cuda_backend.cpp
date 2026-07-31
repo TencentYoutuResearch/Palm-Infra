@@ -2802,6 +2802,20 @@ int main() {
             return 1;
         }
     }
+    {
+        CudaBackend native_only_backend;
+        if (!native_only_backend.available() ||
+            !native_only_backend.set_operator_fallback_policy(
+                OperatorFallbackPolicy::REQUIRE_NATIVE) ||
+            test_explicit_cpu_fallback_bridge(native_only_backend) ||
+            !native_only_backend.dispatch_failed() ||
+            native_only_backend.operator_stats().fallback_calls != 0) {
+            std::fprintf(
+                stderr,
+                "CUDA native-only policy did not reject reference fallback\n");
+            return 1;
+        }
+    }
     if (!test_persistent_storage_modes(backend))
         return 1;
     if (!test_rwkv_matrix_ops(backend))

@@ -946,6 +946,15 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             return false;
 #endif
     }
+    if (accelerator_backend_ &&
+        !accelerator_backend_->set_operator_fallback_policy(
+            cfg_.operator_fallback)) {
+        std::fprintf(
+            stderr,
+            "Engine: selected accelerator does not support the requested "
+            "operator fallback policy\n");
+        return false;
+    }
     exec_ctx_prefill_.reuse_static_workspace = false;
     exec_ctx_prefill_.reuse_same_shape_workspace = true;
     exec_ctx_decode_.reuse_static_workspace = true;

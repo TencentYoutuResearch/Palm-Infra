@@ -32,6 +32,7 @@ struct Options {
     bool apply_chat_template = false;
     bool decode_token_by_token = false;
     bool metal_ssd_full = false;
+    bool require_native = false;
     Device device = Device::CPU;
 };
 
@@ -61,6 +62,7 @@ void print_usage(const char* argv0) {
     std::printf("  --threads <int>       Worker threads (default: auto, %d here)\n",
                 default_worker_threads());
     std::printf("  --device <cpu|metal|cuda>  Compute backend (default: cpu)\n");
+    std::printf("  --require-native       Reject accelerator operator fallback\n");
     std::printf("  --mmap                Use mmap-backed package weights (automatic on CUDA)\n");
     std::printf("  --ssd-cache-mb <int>  Host MoE SSD cache capacity\n");
     std::printf("  --device-moe-cache-mb <int>  Accelerator expert LRU capacity\n");
@@ -142,6 +144,8 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
             } else { error = std::string("unknown --device '") + dev + "' (cpu|metal|cuda)"; return false; }
         } else if (arg == "--mmap") {
             opts.weight_loading = WeightLoadingMode::MMAP;
+        } else if (arg == "--require-native") {
+            opts.require_native = true;
         } else if (arg == "--ssd-cache-mb") {
             if (!require_value("--ssd-cache-mb", value)) return false;
             if (!parse_int(value, opts.ssd_cache_mb) || opts.ssd_cache_mb < 1) {
@@ -203,6 +207,10 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
         error = "use only one of --text or --text-file";
         return false;
     }
+    if (opts.require_native && opts.device == Device::CPU) {
+        error = "--require-native requires an accelerator device";
+        return false;
+    }
     return true;
 }
 
@@ -259,6 +267,9 @@ int main(int argc, char** argv) {
     cfg.device_fallback = opts.device == Device::CPU
         ? DeviceFallbackPolicy::ALLOW_CPU
         : DeviceFallbackPolicy::REQUIRE_REQUESTED;
+    cfg.operator_fallback = opts.require_native
+        ? OperatorFallbackPolicy::REQUIRE_NATIVE
+        : OperatorFallbackPolicy::ALLOW_REFERENCE;
     if (!engine.load(cfg)) {
         std::fprintf(stderr, "ppl: failed to load package\n");
         return 1;

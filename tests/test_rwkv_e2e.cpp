@@ -30,6 +30,8 @@ int main() {
         cfg.device = Device::CUDA;
     if (cfg.device != Device::CPU)
         cfg.device_fallback = DeviceFallbackPolicy::REQUIRE_REQUESTED;
+    if (cfg.device == Device::CUDA)
+        cfg.operator_fallback = OperatorFallbackPolicy::REQUIRE_NATIVE;
     if (!engine.load(cfg)) {
         std::fprintf(stderr, "FAIL: could not load RWKV package\n");
         return 1;

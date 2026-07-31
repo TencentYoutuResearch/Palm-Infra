@@ -45,6 +45,11 @@ struct BackendOperatorStats {
     uint64_t fallback_calls = 0;
 };
 
+enum class OperatorFallbackPolicy {
+    ALLOW_REFERENCE,
+    REQUIRE_NATIVE,
+};
+
 enum class PersistentHostAccess {
     // The complete allocation must remain directly host-addressable. This is
     // useful for low-level tooling and backends whose native storage is shared.
@@ -108,4 +113,10 @@ public:
     }
     virtual DeviceMoeCacheStats moe_device_cache_stats() const { return {}; }
     virtual BackendOperatorStats operator_stats() const { return {}; }
+    // Backends that do not override this retain their established reference
+    // fallback behavior and explicitly reject native-only mode.
+    virtual bool set_operator_fallback_policy(
+        OperatorFallbackPolicy policy) {
+        return policy == OperatorFallbackPolicy::ALLOW_REFERENCE;
+    }
 };

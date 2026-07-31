@@ -31,6 +31,9 @@ bool run(const char* package, Device device, std::vector<float>& prefill,
     config.device_fallback = device == Device::CPU
         ? DeviceFallbackPolicy::ALLOW_CPU
         : DeviceFallbackPolicy::REQUIRE_REQUESTED;
+    config.operator_fallback = device == Device::CUDA
+        ? OperatorFallbackPolicy::REQUIRE_NATIVE
+        : OperatorFallbackPolicy::ALLOW_REFERENCE;
     config.n_ctx = 16;
     config.num_threads = 1;
     config.weight_loading = device == Device::CUDA

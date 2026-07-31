@@ -2638,6 +2638,8 @@ struct CudaBackend::Impl {
     uint64_t moe_device_cache_clock = 0;
     std::unordered_map<uint32_t, uint64_t> native_ops;
     std::unordered_map<uint32_t, uint64_t> fallback_ops;
+    OperatorFallbackPolicy operator_fallback =
+        OperatorFallbackPolicy::ALLOW_REFERENCE;
     void* activation = nullptr;
     size_t activation_bytes = 0;
     void* activation_fp16 = nullptr;
@@ -3335,6 +3337,14 @@ BackendOperatorStats CudaBackend::operator_stats() const {
     for (const auto& entry : impl_->fallback_ops)
         stats.fallback_calls += entry.second;
     return stats;
+}
+
+bool CudaBackend::set_operator_fallback_policy(
+    OperatorFallbackPolicy policy) {
+    if (!impl_)
+        return false;
+    impl_->operator_fallback = policy;
+    return true;
 }
 
 void CudaBackend::clear_dispatch_error() {
@@ -6274,6 +6284,16 @@ void CudaBackend::dispatch(const GraphNode& node,
             record_native();
             return;
         }
+    }
+
+    if (impl_->operator_fallback ==
+        OperatorFallbackPolicy::REQUIRE_NATIVE) {
+        std::fprintf(
+            stderr,
+            "CudaBackend: native-only mode rejected %s operator fallback\n",
+            op_type_name(node.op_type));
+        impl_->failed = true;
+        return;
     }
 
     synchronize_for_host_read();

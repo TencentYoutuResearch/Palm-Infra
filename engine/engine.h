@@ -100,6 +100,8 @@ struct EngineConfig {
     Device device = Device::CPU;      // optional GPU backends require their CMake option
     DeviceFallbackPolicy device_fallback =
         DeviceFallbackPolicy::ALLOW_CPU;
+    OperatorFallbackPolicy operator_fallback =
+        OperatorFallbackPolicy::ALLOW_REFERENCE;
     int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;

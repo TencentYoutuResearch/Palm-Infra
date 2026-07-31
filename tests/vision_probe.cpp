@@ -66,6 +66,8 @@ int main(int argc, char** argv) {
         cfg.device = Device::CUDA;
     if (cfg.device != Device::CPU)
         cfg.device_fallback = DeviceFallbackPolicy::REQUIRE_REQUESTED;
+    if (cfg.device == Device::CUDA)
+        cfg.operator_fallback = OperatorFallbackPolicy::REQUIRE_NATIVE;
     LLMEngine engine;
     if (!engine.load(cfg))
         return 1;
