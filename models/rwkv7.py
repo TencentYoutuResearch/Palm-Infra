@@ -1,8 +1,9 @@
 """RWKV v7 (.pth) converter.
 
 This intentionally targets the checkpoint format used by the official RWKV
-releases rather than requiring a Hugging Face model directory.  The package is
-CPU-only for now: WKV state is recurrent and is not an attention KV cache.
+releases rather than requiring a Hugging Face model directory. WKV state is
+recurrent rather than an attention KV cache; both CPU and CUDA runtimes retain
+and update it between decode steps.
 """
 from __future__ import annotations
 

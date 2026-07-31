@@ -171,6 +171,122 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
         close_enough(actual, view_expected, 2e-6f);
 }
 
+bool test_rwkv_matrix_ops(CudaBackend& backend) {
+    constexpr int m = 2;
+    constexpr int n = 5;
+    constexpr int k = 7;
+    constexpr int batch = 2;
+    std::vector<std::vector<float>> activation(
+        batch, std::vector<float>(static_cast<size_t>(m) * k));
+    std::vector<std::vector<float>> weight(
+        batch, std::vector<float>(static_cast<size_t>(n) * k));
+    std::vector<std::vector<mollm::cpu::fp16_t>> weight_fp16(
+        batch, std::vector<mollm::cpu::fp16_t>(
+                   static_cast<size_t>(n) * k));
+    std::vector<Tensor> activation_device;
+    std::vector<Tensor> weights;
+    activation_device.reserve(batch);
+    weights.reserve(batch);
+    std::vector<float> expected(static_cast<size_t>(batch) * m * n);
+    for (int item = 0; item < batch; ++item) {
+        for (size_t index = 0; index < activation[item].size(); ++index)
+            activation[item][index] =
+                (static_cast<int>((index + item * 3) % 11) - 5) / 13.0f;
+        for (size_t index = 0; index < weight[item].size(); ++index) {
+            weight[item][index] =
+                (static_cast<int>((index + item * 5) % 9) - 4) / 17.0f;
+            weight_fp16[item][index] =
+                static_cast<mollm::cpu::fp16_t>(weight[item][index]);
+        }
+        activation_device.push_back(device_tensor(backend, k, m));
+        std::memcpy(activation_device.back().data, activation[item].data(),
+                    activation_device.back().nbytes());
+        weights.push_back(Tensor::create(
+            Precision::FP16, MemoryType::EXTERNAL, n, k, 1, 1,
+            weight_fp16[item].data()));
+        backend.wrap_weight(weights.back());
+        std::vector<float> item_expected(static_cast<size_t>(m) * n);
+        reference(activation[item], weight[item], item_expected, m, n, k);
+        std::copy(item_expected.begin(), item_expected.end(),
+                  expected.begin() + static_cast<size_t>(item) * m * n);
+    }
+
+    Tensor batch_output = device_tensor(backend, n, m, batch);
+    GraphNode batch_node;
+    batch_node.op_type = OpType::MATMUL_BATCH;
+    std::vector<const Tensor*> batch_inputs;
+    for (int item = 0; item < batch; ++item) {
+        batch_inputs.push_back(&activation_device[item]);
+        batch_inputs.push_back(&weights[item]);
+    }
+    backend.clear_dispatch_error();
+    backend.dispatch(batch_node, batch_inputs, &batch_output, nullptr);
+    backend.end_graph();
+    std::vector<float> actual(expected.size());
+    std::memcpy(actual.data(), batch_output.data, batch_output.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, expected, 3e-3f))
+        return false;
+
+    for (int row = 0; row < m; ++row)
+        for (int inner = 0; inner < k; ++inner)
+            if ((row * k + inner) % 3 != 0)
+                activation_device[0].ptr<float>()[row * k + inner] = 0.0f;
+    std::memcpy(activation[0].data(), activation_device[0].data,
+                activation_device[0].nbytes());
+    reference(activation[0], weight[0], expected, m, n, k);
+    Tensor sparse_output = device_tensor(backend, n, m);
+    GraphNode sparse;
+    sparse.op_type = OpType::GEMV_SPARSE_A;
+    backend.clear_dispatch_error();
+    backend.dispatch(sparse, {&activation_device[0], &weights[0]},
+                     &sparse_output, nullptr);
+    backend.end_graph();
+    actual.resize(static_cast<size_t>(m) * n);
+    std::memcpy(actual.data(), sparse_output.data, sparse_output.nbytes());
+    if (backend.dispatch_failed() ||
+        !close_enough(actual, expected, 3e-3f))
+        return false;
+
+    constexpr int group_size = 4;
+    constexpr int groups_per_row = 2;
+    std::vector<int8_t> quantized(static_cast<size_t>(n) * k);
+    std::vector<float> scales(static_cast<size_t>(n) * groups_per_row);
+    std::vector<float> dequantized(static_cast<size_t>(n) * k);
+    for (int row = 0; row < n; ++row) {
+        for (int group = 0; group < groups_per_row; ++group)
+            scales[row * groups_per_row + group] =
+                0.025f + 0.005f * (row + group);
+        for (int inner = 0; inner < k; ++inner) {
+            const int8_t value = static_cast<int8_t>(
+                (row * 7 + inner * 3) % 31 - 15);
+            quantized[static_cast<size_t>(row) * k + inner] = value;
+            dequantized[static_cast<size_t>(row) * k + inner] =
+                value * scales[row * groups_per_row +
+                               inner / group_size];
+        }
+    }
+    Tensor int8 = Tensor::create(Precision::INT8, MemoryType::EXTERNAL,
+                                 n, k, 1, 1, quantized.data());
+    int8.rowmajor_data = quantized.data();
+    int8.scales = scales.data();
+    int8.group_size = group_size;
+    int8.groups_per_row = groups_per_row;
+    int8.num_groups = n * groups_per_row;
+    backend.wrap_weight_int4(int8);
+    reference(activation[1], dequantized, expected, m, n, k);
+    Tensor int8_output = device_tensor(backend, n, m);
+    backend.clear_dispatch_error();
+    GraphNode matmul;
+    matmul.op_type = OpType::MATMUL;
+    backend.dispatch(matmul, {&activation_device[1], &int8},
+                     &int8_output, nullptr);
+    backend.end_graph();
+    std::memcpy(actual.data(), int8_output.data, int8_output.nbytes());
+    return !backend.dispatch_failed() &&
+        close_enough(actual, expected, 3e-3f);
+}
+
 bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     backend.clear_dispatch_error();
     Tensor rope_storage = device_tensor(backend, 10, 2);
@@ -653,6 +769,8 @@ int main() {
         !test_device_resident_ops(backend, fp16, activation, expected,
                                   m, n, k))
         return 1;
+    if (!test_rwkv_matrix_ops(backend))
+        return 1;
     if (!test_layout_rope_and_sdpa(backend))
         return 1;
     {
@@ -728,7 +846,7 @@ int main() {
         !close_enough(actual, expected, 1.5e-2f))
         return 1;
 
-    std::printf("CUDA device-resident ops, strided views, FP16, W4G32 and "
-                "W4G128 matmul tests passed\n");
+    std::printf("CUDA device-resident ops, RWKV matrix variants, strided "
+                "views, FP16, W8, W4G32 and W4G128 matmul tests passed\n");
     return 0;
 }

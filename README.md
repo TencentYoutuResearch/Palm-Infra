@@ -98,7 +98,7 @@ amortized logical-expert-byte definition as the 122B table above.
 | Qwen3.5-122B-A10B MoE | CPU W4 with SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4; experimental single-image vision |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
-| RWKV7 | FP16, W8, mixed W4; recurrent CPU prefill/decode |
+| RWKV7 | Official `.pth` conversion; FP16, W8, mixed W4; recurrent CPU/CUDA prefill and decode |
 | DeepSeek-V4-Flash | Experimental CPU inference with native FP8/MXFP4 and SSD expert offload |
 
 The most tested runtime path today is `w4g128`: it has the lowest memory use and
@@ -376,14 +376,17 @@ cmake --build build_cuda -j
 
 The CUDA backend is still a correctness-first implementation. Graph outputs
 and persistent state use device-addressable managed storage, FP16/FP32 linear
-layers run through cuBLAS, and package-native W4G32/W4G128 weights are
+layers run through cuBLAS, and package-native W8, W4G32, and W4G128 weights are
 dequantized to FP16 device weights at load time. RMSNorm and fused norm paths,
 strided and broadcast elementwise operations, common activations, SwiGLU,
 RoPE, layout materialization, tile/concat, FP32 cached SDPA, zero-copy views,
 and the decode lm_head also stay on CUDA. Qwen3.5's recurrent Gated DeltaNet
 and short-convolution paths are native as well, including persistent
-decode-state updates. This keeps the dense Qwen3, Qwen3.5, and Youtu MLA text
-graphs on CUDA without CPU operator fallback. Operators not yet implemented
+decode-state updates. RWKV7 token shift, channel mixing, normalization, WKV7
+recurrence, post-processing, batched projections, and sparse-activation FFN
+also run natively, with persistent FP16 or FP32 recurrent state. This keeps
+the dense Qwen3, Qwen3.5, Youtu MLA, and RWKV7 text graphs on CUDA without CPU
+operator fallback. Operators not yet implemented
 natively synchronize and use the CPU reference dispatcher over the managed
 buffers. Set `MOLLM_CUDA_PROFILE=1` to print native/fallback operator counts.
 Several specialized model families still fall back, so this is not yet a

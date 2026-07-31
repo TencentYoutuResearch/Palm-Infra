@@ -26,6 +26,8 @@ int main() {
     const char* device = std::getenv("MOLLM_RWKV_DEVICE");
     if (device && std::strcmp(device, "metal") == 0)
         cfg.device = Device::METAL;
+    else if (device && std::strcmp(device, "cuda") == 0)
+        cfg.device = Device::CUDA;
     if (!engine.load(cfg)) {
         std::fprintf(stderr, "FAIL: could not load RWKV package\n");
         return 1;
