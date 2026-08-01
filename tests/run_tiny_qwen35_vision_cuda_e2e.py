@@ -6,11 +6,40 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 
 from run_tiny_qwen3_cpu_e2e import build_qwen35_fixture_model
+
+
+def write_png(path: Path, width: int = 64, height: int = 48) -> None:
+    """Write a dependency-free RGBA fixture with non-square color content."""
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)  # PNG filter: none
+        for x in range(width):
+            rows.extend((
+                (x * 5 + y * 3) & 0xFF,
+                (x * 2 + y * 7) & 0xFF,
+                (x * 11 + y) & 0xFF,
+                255 if (x + y) % 5 else 0,
+            ))
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload)) + kind + payload +
+            struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n" +
+        chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)) +
+        chunk(b"IDAT", zlib.compress(bytes(rows), level=9)) +
+        chunk(b"IEND", b"")
+    )
 
 
 def main() -> int:
@@ -37,6 +66,13 @@ def main() -> int:
         model_dir = temp_dir / "model"
         model_dir.mkdir()
         build_qwen35_fixture_model(model_dir, include_vision=True)
+        # The fixture uses 2x2 patches rather than the real model's 16x16
+        # patches. Keep its processor budget proportional so a small PNG does
+        # not expand into thousands of text-side image tokens.
+        (model_dir / "preprocessor_config.json").write_text(
+            '{"size":{"shortest_edge":1024,"longest_edge":65536}}\n',
+            encoding="utf-8",
+        )
         package = temp_dir / "tiny-qwen35-vision.mollm"
         subprocess.run(
             [sys.executable, str(converter), str(model_dir), str(package)],
@@ -46,22 +82,29 @@ def main() -> int:
 
         environment = os.environ.copy()
         environment["MOLLM_CUDA_PROFILE"] = "1"
-        completed = subprocess.run(
+        image = temp_dir / "fixture.png"
+        write_png(image)
+        commands = (
             [str(runner), str(package)],
-            check=False,
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            [str(runner), str(package), "--image", str(image)],
         )
-        print(completed.stdout, end="")
-        print(completed.stderr, end="", file=sys.stderr)
-        if completed.returncode == 77:
-            return 77
-        completed.check_returncode()
-        if "  fallback " in completed.stderr:
-            raise AssertionError(
-                "tiny Qwen3.5 vision CUDA E2E used an operator fallback")
+        for command in commands:
+            completed = subprocess.run(
+                command,
+                check=False,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            print(completed.stdout, end="")
+            print(completed.stderr, end="", file=sys.stderr)
+            if completed.returncode == 77:
+                return 77
+            completed.check_returncode()
+            if "  fallback " in completed.stderr:
+                raise AssertionError(
+                    "tiny Qwen3.5 vision CUDA E2E used an operator fallback")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
     return 0

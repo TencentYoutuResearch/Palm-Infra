@@ -320,7 +320,7 @@ One-shot deterministic smoke test:
     --temperature 0
 ```
 
-Experimental Qwen3.5 single-image chat (macOS image-file decoding):
+Experimental Qwen3.5 single-image chat (PNG/JPEG on macOS and Linux):
 
 ```bash
 ./build_i8mm/mollm_chat \
@@ -333,13 +333,14 @@ Experimental Qwen3.5 single-image chat (macOS image-file decoding):
 The converter packages the checkpoint's FP16 vision tower alongside the
 quantized text model. The first implementation supports one static image in
 single-shot chat. With `--device cuda`, both the vision encoder and subsequent
-text graph stay on CUDA; image-file decoding itself is currently macOS-only.
-Linux callers can use the preprocessed `encode_vision_patches` API directly.
-Multi-image/video input, server integration, and Metal vision execution are not
-enabled yet. Images default to a 262,144-pixel resize budget (roughly 512x512);
-use `--image-max-pixels` to trade speed for detail, up to 1,048,576 pixels. Use
-converter option `--text-only` when the vision tower is not needed, avoiding
-its package and resident-memory overhead.
+text graph stay on CUDA. Image-file decoding accepts PNG and JPEG on Linux via
+the vendored decoder and uses ImageIO on Apple platforms; callers with an
+existing preprocessing pipeline can still use `encode_vision_patches`
+directly. Multi-image/video input, server integration, and Metal vision
+execution are not enabled yet. Images default to a 262,144-pixel resize budget
+(roughly 512x512); use `--image-max-pixels` to trade speed for detail, up to
+1,048,576 pixels. Use converter option `--text-only` when the vision tower is
+not needed, avoiding its package and resident-memory overhead.
 
 Sampled generation:
 

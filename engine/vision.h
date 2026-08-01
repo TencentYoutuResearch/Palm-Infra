@@ -12,7 +12,8 @@ void smart_resize_dimensions(int source_h, int source_w, int factor,
                              int& target_h, int& target_w);
 
 /// Decode an image to row-major RGBA while preserving hidden RGB values in
-/// fully transparent PNG pixels. Currently implemented on Apple platforms.
+/// fully transparent PNG pixels. Apple uses ImageIO; other platforms use the
+/// vendored PNG/JPEG decoder.
 bool decode_image_file_rgba(const std::string& path,
                             std::vector<unsigned char>& rgba,
                             int& width, int& height);

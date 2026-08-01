@@ -17,6 +17,15 @@ namespace {
 bool close_enough(const std::vector<float>& actual,
                   const std::vector<float>& expected, float tolerance) {
     for (size_t i = 0; i < actual.size(); ++i) {
+        if (std::isnan(actual[i]) || std::isnan(expected[i]) ||
+            ((!std::isfinite(actual[i]) || !std::isfinite(expected[i])) &&
+             actual[i] != expected[i])) {
+            std::fprintf(
+                stderr,
+                "CUDA non-finite value at %zu: actual=%g expected=%g\n",
+                i, actual[i], expected[i]);
+            return false;
+        }
         if (std::fabs(actual[i] - expected[i]) > tolerance) {
             std::fprintf(stderr,
                          "CUDA mismatch at %zu: actual=%g expected=%g\n",
@@ -1670,6 +1679,156 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
     return true;
 }
 
+bool test_long_strided_sdpa(CudaBackend& backend) {
+    constexpr int heads = 8;
+    constexpr int kv_heads = 2;
+    constexpr int dimension = 256;
+    constexpr int sequence = 224;
+    constexpr int capacity = 16384;
+
+    Tensor query = device_tensor(backend, dimension, sequence, heads);
+    Tensor key = device_tensor(backend, dimension, sequence, kv_heads);
+    Tensor mask = device_tensor(backend, sequence, sequence);
+    // Match Qwen3.5 prefill before SDPA: V is physically [D, NKV, S], then
+    // exposed as a zero-copy [D, S, NKV] permuted view.
+    Tensor value_base =
+        device_tensor(backend, dimension, kv_heads, sequence);
+    for (int64_t index = 0; index < query.nelements(); ++index)
+        query.ptr<float>()[index] =
+            (static_cast<int>((index * 17) % 127) - 63) / 97.0f;
+    for (int64_t index = 0; index < key.nelements(); ++index)
+        key.ptr<float>()[index] =
+            (static_cast<int>((index * 13) % 113) - 56) / 89.0f;
+    for (int query_position = 0; query_position < sequence;
+         ++query_position) {
+        for (int key_position = 0; key_position < sequence;
+             ++key_position) {
+            mask.ptr<float>()[
+                static_cast<size_t>(query_position) * sequence +
+                key_position] = key_position > query_position
+                ? -1e38f : 0.0f;
+        }
+    }
+    float maximum_value = 0.0f;
+    for (int position = 0; position < sequence; ++position) {
+        for (int head = 0; head < kv_heads; ++head) {
+            for (int feature = 0; feature < dimension; ++feature) {
+                const float value =
+                    (static_cast<int>(
+                         (static_cast<size_t>(position) * 19 +
+                          head * 23 + feature * 7) % 151) - 75) /
+                    83.0f;
+                value_base.ptr<float>()[
+                    (static_cast<size_t>(position) * kv_heads + head) *
+                        dimension + feature] = value;
+                maximum_value = std::max(maximum_value, std::fabs(value));
+            }
+        }
+    }
+    Tensor value;
+    GraphNode permute;
+    permute.op_type = OpType::PERMUTE;
+    permute.params.i32 = {0, 2, 1, 3};
+    backend.dispatch(permute, {&value_base}, &value, nullptr);
+    if (value.shape[0] != dimension || value.shape[1] != sequence ||
+        value.shape[2] != kv_heads ||
+        value.stride[1] !=
+            static_cast<size_t>(dimension * kv_heads) * sizeof(float) ||
+        value.stride[2] !=
+            static_cast<size_t>(dimension) * sizeof(float)) {
+        std::fprintf(stderr, "CUDA long SDPA V view has invalid layout\n");
+        return false;
+    }
+
+    const size_t data_elements =
+        static_cast<size_t>(kv_heads) * capacity * dimension;
+    const size_t cache_bytes =
+        CacheMetadata::SIZE + data_elements * sizeof(mollm::cpu::fp16_t);
+    auto make_cache = [&](bool is_key) {
+        Tensor cache = Tensor::create(
+            Precision::FP16, MemoryType::EXTERNAL,
+            static_cast<int64_t>(cache_bytes / sizeof(mollm::cpu::fp16_t)));
+        backend.alloc_persistent(
+            cache, cache_bytes, PersistentHostAccess::MIRRORED_PREFIX,
+            CacheMetadata::SIZE);
+        CacheMetadata metadata;
+        metadata.max_seq_len = capacity;
+        metadata.num_kv_heads = kv_heads;
+        if (is_key)
+            metadata.head_dim = dimension;
+        else
+            metadata.v_head_dim = dimension;
+        if (!backend.copy_from_host(&metadata, cache, sizeof(metadata)))
+            cache.data = nullptr;
+        return cache;
+    };
+    Tensor key_cache = make_cache(true);
+    Tensor value_cache = make_cache(false);
+    if (!key_cache.data || !value_cache.data)
+        return false;
+
+    Tensor output = device_tensor(backend, dimension, sequence, heads);
+    GraphNode sdpa;
+    sdpa.op_type = OpType::SDPA;
+    sdpa.params.i32 =
+        {2, 1, heads, kv_heads, dimension, dimension};
+    sdpa.params.f32 =
+        {1.0f / std::sqrt(static_cast<float>(dimension))};
+    backend.clear_dispatch_error();
+    backend.dispatch(
+        sdpa,
+        {&query, &key, &value, &mask, &key_cache, &value_cache},
+        &output, nullptr);
+    backend.end_graph();
+    if (backend.dispatch_failed())
+        return false;
+
+    for (int64_t index = 0; index < output.nelements(); ++index) {
+        const float actual = output.ptr<float>()[index];
+        if (!std::isfinite(actual) ||
+            std::fabs(actual) > maximum_value + 1e-3f) {
+            std::fprintf(
+                stderr,
+                "CUDA long SDPA escaped value bounds at %lld: "
+                "actual=%g input_max=%g\n",
+                static_cast<long long>(index), actual, maximum_value);
+            return false;
+        }
+    }
+
+    std::vector<uint16_t> cache_storage(
+        (cache_bytes + sizeof(uint16_t) - 1) / sizeof(uint16_t));
+    if (!backend.copy_to_host(
+            value_cache, cache_storage.data(), cache_bytes))
+        return false;
+    const auto* cached = reinterpret_cast<const mollm::cpu::fp16_t*>(
+        reinterpret_cast<const uint8_t*>(cache_storage.data()) +
+        CacheMetadata::SIZE);
+    for (int head = 0; head < kv_heads; ++head) {
+        for (int position = 0; position < sequence; ++position) {
+            for (int feature = 0; feature < dimension; ++feature) {
+                const float expected = value_base.ptr<float>()[
+                    (static_cast<size_t>(position) * kv_heads + head) *
+                        dimension + feature];
+                const float actual = static_cast<float>(cached[
+                    (static_cast<size_t>(head) * capacity + position) *
+                        dimension + feature]);
+                const float rounded = static_cast<float>(
+                    static_cast<mollm::cpu::fp16_t>(expected));
+                if (actual != rounded) {
+                    std::fprintf(
+                        stderr,
+                        "CUDA long SDPA cache mismatch h=%d p=%d d=%d: "
+                        "actual=%g expected=%g\n",
+                        head, position, feature, actual, rounded);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool test_strided_layout_ops(CudaBackend& backend) {
     backend.clear_dispatch_error();
 
@@ -2910,6 +3069,12 @@ int main() {
         !test_layout_rope_and_sdpa(backend, Precision::FP32) ||
         !test_layout_rope_and_sdpa(backend, Precision::FP16))
         return 1;
+    {
+        CudaBackend long_sdpa_backend;
+        if (!long_sdpa_backend.available() ||
+            !test_long_strided_sdpa(long_sdpa_backend))
+            return 1;
+    }
     {
         CudaBackend layout_backend;
         if (!layout_backend.available() ||

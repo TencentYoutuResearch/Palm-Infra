@@ -2332,33 +2332,26 @@ __global__ void sdpa_output_cuda(
         return;
     const int key_head = head / (num_heads / num_kv_heads);
     const float* score_row = scores + static_cast<size_t>(row) * key_length;
-    __shared__ float reduction[256];
-    float local_maximum = -FLT_MAX;
-    for (int position = threadIdx.x; position < key_length;
-         position += blockDim.x)
-        local_maximum = fmaxf(local_maximum, score_row[position]);
-    reduction[threadIdx.x] = local_maximum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            reduction[threadIdx.x] = fmaxf(
-                reduction[threadIdx.x], reduction[threadIdx.x + stride]);
-        __syncthreads();
+    // Keep the correctness backend's softmax statistics independent of
+    // warp/block reduction behavior. In particular, this avoids a
+    // value-dependent shared-reduction failure observed on sm_120 for long
+    // Qwen3.5 prefills. The value accumulation below is already O(D*S), so
+    // the extra serial O(S) max/sum pass per row is a small correctness-first
+    // cost and can be replaced by a separately tested optimized reduction.
+    __shared__ float softmax_stats[2];
+    if (threadIdx.x == 0) {
+        float maximum = -FLT_MAX;
+        for (int position = 0; position < key_length; ++position)
+            maximum = fmaxf(maximum, score_row[position]);
+        float sum = 0.0f;
+        for (int position = 0; position < key_length; ++position)
+            sum += expf(score_row[position] - maximum);
+        softmax_stats[0] = maximum;
+        softmax_stats[1] = sum > 0.0f ? 1.0f / sum : 0.0f;
     }
-    const float maximum = reduction[0];
-    float local_sum = 0.0f;
-    for (int position = threadIdx.x; position < key_length;
-         position += blockDim.x)
-        local_sum += expf(score_row[position] - maximum);
-    reduction[threadIdx.x] = local_sum;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float inverse_sum = reduction[0] > 0.0f
-        ? 1.0f / reduction[0] : 0.0f;
+    const float maximum = softmax_stats[0];
+    const float inverse_sum = softmax_stats[1];
     for (int dimension = threadIdx.x; dimension < value_dim;
          dimension += blockDim.x) {
         float result = 0.0f;

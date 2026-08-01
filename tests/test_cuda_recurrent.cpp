@@ -13,6 +13,14 @@ bool close_enough(const float* actual, const float* expected, size_t count,
     float maximum = 0.0f;
     size_t maximum_index = 0;
     for (size_t index = 0; index < count; ++index) {
+        if (!std::isfinite(actual[index]) ||
+            !std::isfinite(expected[index])) {
+            std::fprintf(
+                stderr,
+                "%s non-finite value at %zu: actual=%g expected=%g\n",
+                label, index, actual[index], expected[index]);
+            return false;
+        }
         const float error = std::fabs(actual[index] - expected[index]);
         if (error > maximum) {
             maximum = error;
@@ -29,7 +37,128 @@ bool close_enough(const float* actual, const float* expected, size_t count,
 }
 
 Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1,
-                     int64_t d2 = 1) {
+                     int64_t d2 = 1);
+Tensor physical_float_state(CudaBackend& backend, int64_t elements);
+Tensor device_constant(CudaBackend& backend, std::vector<float>& values,
+                       int64_t d0, int64_t d1 = 1);
+void fill_values(float* values, size_t count, int modulus, float divisor);
+void gdn_reference(
+    const float* qkv, const float* a, const float* b, const float* z,
+    const float* a_log, const float* dt_bias, const float* norm_weight,
+    float* state, float* output, int num_heads, int key_dim, int value_dim,
+    int sequence_length, int real_length, int num_value_heads,
+    int a_row_stride, int b_row_stride, int z_row_stride,
+    float rms_epsilon, float l2_epsilon, float scale);
+
+bool test_gdn_long_prefill_decode(CudaBackend& backend) {
+    constexpr int heads = 16;
+    constexpr int key_dim = 128;
+    constexpr int value_dim = 128;
+    constexpr int value_heads = 16;
+    constexpr int sequence = 224;
+    constexpr int qkv_dim = heads * key_dim;
+    constexpr int qkv_total = 2 * qkv_dim + value_heads * value_dim;
+    constexpr int output_dim = value_heads * value_dim;
+    constexpr size_t state_elements =
+        static_cast<size_t>(value_heads) * key_dim * value_dim;
+    constexpr float rms_epsilon = 1e-6f;
+    constexpr float l2_epsilon = 1e-6f;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
+
+    Tensor qkv = device_tensor(backend, qkv_total, sequence);
+    Tensor a = device_tensor(backend, value_heads, sequence);
+    Tensor b = device_tensor(backend, value_heads, sequence);
+    Tensor z = device_tensor(backend, output_dim, sequence);
+    fill_values(qkv.ptr<float>(), qkv.nelements(), 257, 181.0f);
+    fill_values(a.ptr<float>(), a.nelements(), 31, 23.0f);
+    fill_values(b.ptr<float>(), b.nelements(), 37, 29.0f);
+    fill_values(z.ptr<float>(), z.nelements(), 257, 197.0f);
+
+    std::vector<float> a_log(value_heads), dt_bias(value_heads),
+        norm(value_dim);
+    for (int index = 0; index < value_heads; ++index) {
+        a_log[index] = -0.7f + 0.025f * index;
+        dt_bias[index] = -0.3f + 0.04f * index;
+    }
+    for (int index = 0; index < value_dim; ++index)
+        norm[index] = 0.8f + 0.003f * index;
+    Tensor a_log_tensor = device_constant(backend, a_log, value_heads);
+    Tensor dt_bias_tensor = device_constant(backend, dt_bias, value_heads);
+    Tensor norm_tensor = device_constant(backend, norm, value_dim);
+    Tensor state = physical_float_state(backend, state_elements);
+    std::fill_n(static_cast<float*>(state.data), state_elements, 0.0f);
+    std::vector<float> expected_state(state_elements, 0.0f);
+    std::vector<float> expected_output(
+        static_cast<size_t>(sequence) * output_dim);
+    gdn_reference(
+        qkv.ptr<float>(), a.ptr<float>(), b.ptr<float>(), z.ptr<float>(),
+        a_log.data(), dt_bias.data(), norm.data(), expected_state.data(),
+        expected_output.data(), heads, key_dim, value_dim, sequence,
+        sequence, value_heads, value_heads, value_heads, output_dim,
+        rms_epsilon, l2_epsilon, scale);
+
+    Tensor output = device_tensor(backend, output_dim, sequence);
+    GraphNode prefill;
+    prefill.op_type = OpType::GATED_DELTANET_PREFILL;
+    prefill.params.i32 = {heads, key_dim, value_dim, sequence,
+                          1, 4, sequence, value_heads};
+    prefill.params.f32 = {rms_epsilon, l2_epsilon, scale};
+    backend.clear_dispatch_error();
+    backend.dispatch(
+        prefill,
+        {&qkv, &a, &b, &z, &a_log_tensor, &dt_bias_tensor, &norm_tensor,
+         &state},
+        &output, nullptr);
+    backend.end_graph();
+    if (backend.dispatch_failed() ||
+        !close_enough(output.ptr<float>(), expected_output.data(),
+                      expected_output.size(), 3e-4f,
+                      "GDN long prefill output") ||
+        !close_enough(static_cast<float*>(state.data), expected_state.data(),
+                      expected_state.size(), 3e-4f,
+                      "GDN long prefill state")) {
+        return false;
+    }
+
+    Tensor decode_qkv = device_tensor(backend, qkv_total);
+    Tensor decode_a = device_tensor(backend, value_heads);
+    Tensor decode_b = device_tensor(backend, value_heads);
+    Tensor decode_z = device_tensor(backend, output_dim);
+    fill_values(decode_qkv.ptr<float>(), decode_qkv.nelements(), 251, 173.0f);
+    fill_values(decode_a.ptr<float>(), decode_a.nelements(), 29, 31.0f);
+    fill_values(decode_b.ptr<float>(), decode_b.nelements(), 31, 37.0f);
+    fill_values(decode_z.ptr<float>(), decode_z.nelements(), 251, 211.0f);
+    std::vector<float> expected_decode(output_dim);
+    gdn_reference(
+        decode_qkv.ptr<float>(), decode_a.ptr<float>(), decode_b.ptr<float>(),
+        decode_z.ptr<float>(), a_log.data(), dt_bias.data(), norm.data(),
+        expected_state.data(), expected_decode.data(), heads, key_dim,
+        value_dim, 1, 1, value_heads, value_heads, value_heads, output_dim,
+        rms_epsilon, l2_epsilon, scale);
+    Tensor decode_output = device_tensor(backend, output_dim);
+    GraphNode decode;
+    decode.op_type = OpType::GATED_DELTANET_DECODE;
+    decode.params.i32 =
+        {heads, key_dim, value_dim, 1, 1, 4, 1, value_heads};
+    decode.params.f32 = {rms_epsilon, l2_epsilon, scale};
+    backend.clear_dispatch_error();
+    backend.dispatch(
+        decode,
+        {&decode_qkv, &decode_a, &decode_b, &decode_z, &a_log_tensor,
+         &dt_bias_tensor, &norm_tensor, &state},
+        &decode_output, nullptr);
+    backend.end_graph();
+    return !backend.dispatch_failed() &&
+        close_enough(decode_output.ptr<float>(), expected_decode.data(),
+                     expected_decode.size(), 3e-4f,
+                     "GDN long continuation output") &&
+        close_enough(static_cast<float*>(state.data), expected_state.data(),
+                     expected_state.size(), 3e-4f,
+                     "GDN long continuation state");
+}
+
+Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1,
+                     int64_t d2) {
     Tensor tensor = Tensor::create(Precision::FP32, MemoryType::NONE,
                                    d0, d1, d2);
     backend.alloc_persistent(tensor, tensor.nbytes());
@@ -47,7 +176,7 @@ Tensor physical_float_state(CudaBackend& backend, int64_t elements) {
 }
 
 Tensor device_constant(CudaBackend& backend, std::vector<float>& values,
-                       int64_t d0, int64_t d1 = 1) {
+                       int64_t d0, int64_t d1) {
     Tensor tensor = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
                                    d0, d1, 1, 1, values.data());
     backend.wrap_weight(tensor);
@@ -410,6 +539,11 @@ int main() {
     {
         CudaBackend backend;
         if (!test_gdn_prefill(backend))
+            return 1;
+    }
+    {
+        CudaBackend backend;
+        if (!test_gdn_long_prefill_decode(backend))
             return 1;
     }
     {

@@ -19,6 +19,13 @@ struct VisionResult {
     std::vector<float> decode_logits;
 };
 
+struct TextResult {
+    std::vector<float> prefill_hidden;
+    std::vector<float> prefill_logits;
+    std::vector<float> decode_hidden;
+    std::vector<float> decode_logits;
+};
+
 int metadata_int(const LLMEngine& engine, const char* key, int fallback) {
     const auto found = engine.package_metadata().find(key);
     if (found == engine.package_metadata().end())
@@ -42,7 +49,7 @@ bool copy_finite(const Tensor& tensor, std::vector<float>& values) {
 }
 
 bool run_text_continuation(LLMEngine& engine, int image_token_id,
-                           VisionResult& result) {
+                           VisionResult& result, const char* device_label) {
     std::vector<int> tokens(
         static_cast<size_t>(result.embedding.tokens), image_token_id);
     std::string error;
@@ -60,7 +67,17 @@ bool run_text_continuation(LLMEngine& engine, int image_token_id,
     }
     Tensor hidden = engine.decode_hidden(result.next_token);
     if (!copy_finite(hidden, result.decode_hidden)) {
-        std::fprintf(stderr, "vision continuation hidden state is invalid\n");
+        size_t non_finite = 0;
+        if (hidden.data && hidden.prec == Precision::FP32) {
+            const float* values = hidden.ptr<float>();
+            for (int64_t index = 0; index < hidden.nelements(); ++index)
+                non_finite += !std::isfinite(values[index]);
+        }
+        std::fprintf(
+            stderr, "%s vision continuation hidden state is invalid "
+                    "(elements=%lld non_finite=%zu)\n",
+            device_label, static_cast<long long>(hidden.nelements()),
+            non_finite);
         return false;
     }
     result.decode_logits = engine.run_lmhead_raw(hidden);
@@ -120,8 +137,78 @@ bool compare_values(const std::vector<float>& actual,
     return true;
 }
 
-bool run_model(const char* package, Device device, VisionResult& result,
-               bool repeat_encoder) {
+bool run_long_text_model(const char* package, Device device,
+                         TextResult& result) {
+    EngineConfig config;
+    config.package_path = package;
+    config.device = device;
+    config.device_fallback = device == Device::CPU
+        ? DeviceFallbackPolicy::ALLOW_CPU
+        : DeviceFallbackPolicy::REQUIRE_REQUESTED;
+    config.operator_fallback = device == Device::CUDA
+        ? OperatorFallbackPolicy::REQUIRE_NATIVE
+        : OperatorFallbackPolicy::ALLOW_REFERENCE;
+    config.weight_loading = WeightLoadingMode::MMAP;
+    config.num_threads = 4;
+    LLMEngine engine;
+    if (!engine.load(config) || engine.config().device != device)
+        return false;
+
+    constexpr int token_count = 224;
+    std::vector<int> tokens(token_count);
+    for (int index = 0; index < token_count; ++index)
+        tokens[index] = 1 + index % 31;
+    if (!copy_finite(
+            engine.prefill_hidden(tokens), result.prefill_hidden)) {
+        std::fprintf(
+            stderr, "%s long text prefill hidden state is invalid\n",
+            device == Device::CUDA ? "CUDA" : "CPU");
+        return false;
+    }
+    result.prefill_logits = engine.run_lmhead_raw(
+        Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            static_cast<int64_t>(result.prefill_hidden.size()), 1, 1, 1,
+            result.prefill_hidden.data()));
+    if (result.prefill_logits.empty() ||
+        !std::all_of(
+            result.prefill_logits.begin(), result.prefill_logits.end(),
+            [](float value) { return std::isfinite(value); })) {
+        std::fprintf(
+            stderr, "%s long text prefill logits are invalid\n",
+            device == Device::CUDA ? "CUDA" : "CPU");
+        return false;
+    }
+    const int next_token = static_cast<int>(
+        std::max_element(
+            result.prefill_logits.begin(), result.prefill_logits.end()) -
+        result.prefill_logits.begin());
+    if (!copy_finite(
+            engine.decode_hidden(next_token), result.decode_hidden)) {
+        std::fprintf(
+            stderr, "%s long text continuation hidden state is invalid\n",
+            device == Device::CUDA ? "CUDA" : "CPU");
+        return false;
+    }
+    result.decode_logits = engine.run_lmhead_raw(
+        Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            static_cast<int64_t>(result.decode_hidden.size()), 1, 1, 1,
+            result.decode_hidden.data()));
+    if (result.decode_logits.empty() ||
+        !std::all_of(
+            result.decode_logits.begin(), result.decode_logits.end(),
+            [](float value) { return std::isfinite(value); })) {
+        std::fprintf(
+            stderr, "%s long text continuation logits are invalid\n",
+            device == Device::CUDA ? "CUDA" : "CPU");
+        return false;
+    }
+    return engine.past_len() == token_count + 1;
+}
+
+bool run_model(const char* package, const char* image_path, Device device,
+               VisionResult& result, bool repeat_encoder) {
     EngineConfig config;
     config.package_path = package;
     config.device = device;
@@ -151,27 +238,37 @@ bool run_model(const char* package, Device device, VisionResult& result,
             (static_cast<int>((index * 7) % 53) - 26) / 53.0f;
 
     std::string error;
-    if (!engine.encode_vision_patches(
-            pixels, grid_t, grid_h, grid_w, result.embedding, &error)) {
+    auto encode = [&](VisionEmbedding& embedding) {
+        return image_path
+            ? engine.encode_image_file(image_path, embedding, &error)
+            : engine.encode_vision_patches(
+                  pixels, grid_t, grid_h, grid_w, embedding, &error);
+    };
+    if (!encode(result.embedding)) {
         std::fprintf(stderr, "vision encode failed: %s\n", error.c_str());
         return false;
     }
     const int merge = metadata_int(engine, "vision_spatial_merge_size", 2);
-    if (merge <= 0 || grid_h % merge != 0 || grid_w % merge != 0 ||
+    const int encoded_grid_t = result.embedding.grid_t;
+    const int encoded_grid_h = result.embedding.grid_h;
+    const int encoded_grid_w = result.embedding.grid_w;
+    if (merge <= 0 || encoded_grid_t <= 0 ||
+        encoded_grid_h % merge != 0 || encoded_grid_w % merge != 0 ||
         result.embedding.tokens !=
-            grid_t * grid_h * grid_w / (merge * merge)) {
+            encoded_grid_t * encoded_grid_h * encoded_grid_w /
+                (merge * merge)) {
         const int expected_tokens = merge > 0
-            ? grid_t * grid_h * grid_w / (merge * merge) : -1;
+            ? encoded_grid_t * encoded_grid_h * encoded_grid_w /
+                (merge * merge) : -1;
         std::fprintf(
-            stderr, "non-square vision token count mismatch: got=%d "
+            stderr, "vision token count mismatch: got=%d "
                     "expected=%d\n",
             result.embedding.tokens, expected_tokens);
         return false;
     }
     if (repeat_encoder) {
         const VisionEmbedding first = result.embedding;
-        if (!engine.encode_vision_patches(
-                pixels, grid_t, grid_h, grid_w, result.embedding, &error)) {
+        if (!encode(result.embedding)) {
             std::fprintf(
                 stderr, "repeated vision encode failed: %s\n",
                 error.c_str());
@@ -187,7 +284,9 @@ bool run_model(const char* package, Device device, VisionResult& result,
 
     const int image_token_id = metadata_int(engine, "image_token_id", -1);
     if (image_token_id < 0 ||
-        !run_text_continuation(engine, image_token_id, result))
+        !run_text_continuation(
+            engine, image_token_id, result,
+            device == Device::CUDA ? "CUDA" : "CPU"))
         return false;
     if (repeat_encoder) {
         engine.reset();
@@ -197,7 +296,8 @@ bool run_model(const char* package, Device device, VisionResult& result,
         }
         VisionResult replay;
         replay.embedding = result.embedding;
-        if (!run_text_continuation(engine, image_token_id, replay) ||
+        if (!run_text_continuation(
+                engine, image_token_id, replay, "CUDA replay") ||
             !exactly_matches(replay, result)) {
             std::fprintf(
                 stderr, "CUDA vision continuation changed after reset\n");
@@ -222,22 +322,31 @@ bool run_model(const char* package, Device device, VisionResult& result,
 }  // namespace
 
 int main(int argc, char** argv) {
-    const bool explicit_real_model = argc == 3 &&
+    const bool explicit_real_model = argc >= 2 &&
         std::strcmp(argv[1], "--real-model") == 0;
-    if (argc > 3 || (argc == 3 && !explicit_real_model)) {
+    const int package_index = explicit_real_model ? 2 : 1;
+    const int option_index = package_index + 1;
+    const bool explicit_image = argc == option_index + 2 &&
+        std::strcmp(argv[option_index], "--image") == 0;
+    const bool environment_model = argc == 1;
+    if ((!environment_model && argc <= package_index) ||
+        (!environment_model && argc != option_index && !explicit_image)) {
         std::fprintf(
             stderr,
-            "usage: %s [tiny.mollm]\n"
-            "       %s --real-model <qwen35-vl.mollm>\n",
+            "usage: %s [tiny.mollm [--image image.png]]\n"
+            "       %s --real-model <qwen35-vl.mollm> "
+            "[--image image.png]\n",
             argv[0], argv[0]);
         return 2;
     }
     const char* environment_package =
         std::getenv("MOLLM_QWEN35_VL_PACKAGE");
     const char* package = explicit_real_model
-        ? argv[2] : (argc == 2 ? argv[1] : environment_package);
+        ? argv[package_index]
+        : (environment_model ? environment_package : argv[package_index]);
+    const char* image_path = explicit_image ? argv[option_index + 1] : nullptr;
     const bool real_model = explicit_real_model ||
-        (argc == 1 && environment_package && *environment_package);
+        (environment_model && environment_package && *environment_package);
     if (!package || !*package) {
         std::fprintf(
             stderr, "MOLLM_QWEN35_VL_PACKAGE is unset; skipping\n");
@@ -249,10 +358,38 @@ int main(int argc, char** argv) {
         return 77;
     }
     g_mollm_force_fp32_acc = true;
+    if (real_model) {
+        TextResult cpu_text;
+        TextResult cuda_text;
+        if (!run_long_text_model(package, Device::CPU, cpu_text) ||
+            !run_long_text_model(package, Device::CUDA, cuda_text)) {
+            return 1;
+        }
+        bool text_matches = compare_values(
+            cuda_text.prefill_hidden, cpu_text.prefill_hidden,
+            3.5e-1f, 3.5e-2f, "long text prefill hidden CPU/CUDA", false);
+        text_matches = compare_values(
+            cuda_text.prefill_logits, cpu_text.prefill_logits,
+            1.2e-1f, 2.5e-2f, "long text prefill logits CPU/CUDA", true) &&
+            text_matches;
+        text_matches = compare_values(
+            cuda_text.decode_hidden, cpu_text.decode_hidden,
+            3.5e-1f, 3.5e-2f, "long text decode hidden CPU/CUDA", false) &&
+            text_matches;
+        text_matches = compare_values(
+            cuda_text.decode_logits, cpu_text.decode_logits,
+            1.2e-1f, 2.5e-2f, "long text decode logits CPU/CUDA", true) &&
+            text_matches;
+        if (!text_matches)
+            return 1;
+    }
     VisionResult cpu;
     VisionResult cuda;
-    if (!run_model(package, Device::CPU, cpu, false) ||
-        !run_model(package, Device::CUDA, cuda, true))
+    const bool cpu_ok =
+        run_model(package, image_path, Device::CPU, cpu, false);
+    const bool cuda_ok =
+        run_model(package, image_path, Device::CUDA, cuda, true);
+    if (!cpu_ok || !cuda_ok)
         return 1;
     if (cpu.embedding.tokens != cuda.embedding.tokens ||
         cpu.embedding.hidden_size != cuda.embedding.hidden_size ||

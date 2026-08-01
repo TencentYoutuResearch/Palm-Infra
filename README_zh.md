@@ -282,7 +282,7 @@ W4 转换需要 C++ 构建的 `mollm-quantize` 工具；FP16 和 W8 不需要。
     --temperature 0
 ```
 
-实验性的 Qwen3.5 单图对话（macOS，CPU vision encoder）：
+实验性的 Qwen3.5 单图对话（macOS/Linux PNG 或 JPEG）：
 
 ```bash
 ./build_i8mm/mollm_chat \
@@ -293,11 +293,13 @@ W4 转换需要 C++ 构建的 `mollm-quantize` 工具；FP16 和 W8 不需要。
 ```
 
 converter 会将 checkpoint 的 FP16 vision tower 与量化后的文本模型一起写入
-`.mollm` 包。当前首版支持 single-shot chat 中的一张静态图片；暂未支持多图、
-视频、server 接口及 Metal vision encoder。图片默认按 262,144 像素预算缩放
-（约 512x512）；可用 `--image-max-pixels` 在速度和细节间调整，最高
-1,048,576 像素。如果不需要视觉能力，转换时可传 `--text-only`，避免 vision
-tower 带来的包体与常驻内存开销。
+`.mollm` 包。当前首版支持 single-shot chat 中的一张静态图片；Linux 通过内置
+decoder 读取 PNG/JPEG，Apple 平台使用 ImageIO，也可直接调用
+`encode_vision_patches` 接入已有预处理流程。指定 `--device cuda` 时，vision
+encoder 与后续文本图都会留在 CUDA。暂未支持多图、视频、server 接口及 Metal
+vision encoder。图片默认按 262,144 像素预算缩放（约 512x512）；可用
+`--image-max-pixels` 在速度和细节间调整，最高 1,048,576 像素。如果不需要视觉
+能力，转换时可传 `--text-only`，避免 vision tower 带来的包体与常驻内存开销。
 
 采样生成：
 

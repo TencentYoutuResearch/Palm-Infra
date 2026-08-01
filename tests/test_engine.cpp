@@ -159,7 +159,6 @@ int main() {
               "small image is aligned and raised to minimum budget");
     }
 
-#ifdef __APPLE__
     // ---- transparent PNG keeps RGB underneath alpha=0 ----
     {
         static const unsigned char png[] = {
@@ -201,8 +200,6 @@ int main() {
               "transparent pixel keeps its hidden red RGB value");
         std::remove(path);
     }
-#endif
-
     // ---- engine lifecycle (without graph) ----
     {
         LLMEngine e;

@@ -12,6 +12,12 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
+#else
+#define STBI_FAILURE_USERMSG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#define STB_IMAGE_IMPLEMENTATION
+#include "third_party/stb_image.h"
 #endif
 
 namespace {
@@ -39,7 +45,12 @@ float load_weight_value(const Tensor& tensor, size_t index) {
     return static_cast<const float*>(raw)[index];
 }
 
-#ifdef __APPLE__
+bool image_dimensions_allowed(int width, int height) {
+    constexpr int64_t max_source_pixels = int64_t{64} * 1024 * 1024;
+    return width > 0 && height > 0 &&
+        static_cast<int64_t>(width) * height <= max_source_pixels;
+}
+
 float bicubic_filter(float x) {
     x = std::fabs(x);
     if (x < 1.0f)
@@ -129,6 +140,7 @@ std::vector<uint8_t> resize_rgba_bicubic(
     return output;
 }
 
+#ifdef __APPLE__
 bool decode_image_rgba(CGImageRef image, int width, int height,
                        std::vector<uint8_t>& decoded) {
     decoded.resize(static_cast<size_t>(height) * width * 4);
@@ -234,8 +246,25 @@ bool mollm::detail::decode_image_file_rgba(
     width = 0;
     height = 0;
 #if !defined(__APPLE__)
-    (void)path;
-    return false;
+    int channels = 0;
+    if (!stbi_info(path.c_str(), &width, &height, &channels) ||
+        !image_dimensions_allowed(width, height)) {
+        width = 0;
+        height = 0;
+        return false;
+    }
+    stbi_uc* decoded = stbi_load(
+        path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+    if (!decoded || !image_dimensions_allowed(width, height)) {
+        stbi_image_free(decoded);
+        width = 0;
+        height = 0;
+        return false;
+    }
+    const size_t count = static_cast<size_t>(width) * height * 4;
+    rgba.assign(decoded, decoded + count);
+    stbi_image_free(decoded);
+    return true;
 #else
     CFURLRef url = CFURLCreateFromFileSystemRepresentation(
         kCFAllocatorDefault,
@@ -251,7 +280,7 @@ bool mollm::detail::decode_image_file_rgba(
     width = static_cast<int>(CGImageGetWidth(image));
     height = static_cast<int>(CGImageGetHeight(image));
     const bool ok =
-        width > 0 && height > 0 &&
+        image_dimensions_allowed(width, height) &&
         decode_image_rgba(image, width, height, rgba);
     CGImageRelease(image);
     if (!ok) {
@@ -458,12 +487,6 @@ int LLMEngine::prefill_with_image(const std::vector<int>& token_ids,
 bool LLMEngine::encode_image_file(const std::string& path,
                                   VisionEmbedding& output,
                                   std::string* error) {
-#if !defined(__APPLE__)
-    (void)path;
-    (void)output;
-    return fail(error,
-                "image file decoding is currently available on macOS only");
-#else
     std::vector<uint8_t> decoded;
     int source_w = 0;
     int source_h = 0;
@@ -541,7 +564,6 @@ bool LLMEngine::encode_image_file(const std::string& path,
     }
     return encode_vision_patches(
         pixels, 1, grid_h, grid_w, output, error);
-#endif
 }
 
 bool LLMEngine::encode_vision_patches(
