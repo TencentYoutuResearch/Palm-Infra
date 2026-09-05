@@ -4,6 +4,7 @@
 #include "kernels/threading.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <memory>
@@ -1416,6 +1417,48 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
         return;
     }
 #endif  // HAS_NEON
+
+    if (M == 2 && is_fp16 && !B.is_interleaved && !is_repacked &&
+        mollm::cpu::capabilities().fp16_m2_shared_weight) {
+        const int n_threads = thread_pool ? thread_pool->num_threads() : 1;
+        _timer.set_shape("fp16_m2_shared_weight", M, N, K, 0, 0, false,
+                         false, n_threads);
+
+        auto run = [&](int n_begin, int n_end) {
+            if (!mollm::cpu::matmul_dense_fp16_m2_range_n(
+                    a_ptr, b_fp16, c_ptr, N, K, lda, K_weight, ldc,
+                    n_begin, n_end)) {
+                return false;
+            }
+            const auto local = local_activation_range(
+                act_n_begin, act_n_len, n_begin, n_end);
+            if (act != Activation::NONE && local.length != 0) {
+                matmul_apply_activation(c_ptr + n_begin, M,
+                                        n_end - n_begin, ldc, 0, M, act,
+                                        local.begin, local.length);
+            }
+            return true;
+        };
+
+        bool accepted = true;
+        if (thread_pool && n_threads > 1 && N > 64) {
+            std::atomic<bool> provider_accepted{true};
+            const int chunk = std::max((N + n_threads - 1) / n_threads, 64);
+            thread_pool->parallel_for(
+                0, N, chunk, [&](int, int n_begin, int n_end) {
+                    if (!run(n_begin, n_end))
+                        provider_accepted.store(false,
+                                                std::memory_order_relaxed);
+                });
+            accepted = provider_accepted.load(std::memory_order_relaxed);
+        } else {
+            accepted = run(0, N);
+        }
+        if (accepted)
+            return;
+        // A rejecting provider writes nothing. Even if a different shard
+        // completed, the standard fallback below overwrites the full output.
+    }
 
     // ---- Standard path (FP32 or non-packed FP16) ----
 

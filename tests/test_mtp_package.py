@@ -60,10 +60,12 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="mollm_mtp_package_") as tmp:
         root = Path(tmp)
         package = root / "mtp.mollm"
+        verify = tiny_graph("hidden")
+        draft = tiny_graph("target_hidden")
         save_package(
             str(package), tiny_graph("hidden"), tiny_graph("hidden"),
             str(root), {"architecture": "test"},
-            g_mtp=tiny_graph("target_hidden"))
+            g_mtp=draft, g_mtp_verify=verify)
         raw = package.read_bytes()
         values = struct.unpack("<II15Q", raw[:128])
         assert values[0] == 0x4D4C4F4D and values[1] == 1
@@ -71,12 +73,22 @@ def main() -> int:
         weights_offset = values[12]
         mtp_length = values[-1]
         assert mtp_length > 0
-        assert weights_offset >= mtp_length
         metadata = json.loads(
             raw[metadata_offset:metadata_offset + metadata_length])
         assert metadata["architecture"] == "test"
-        assert raw[weights_offset - mtp_length:weights_offset]
-
+        verify_length = metadata["mtp_verify_graph_length"]
+        assert 0 < verify_length < mtp_length
+        mtp_offset = values[10] + values[11] + values[15]
+        bundle_offset = mtp_offset
+        verify_blob = raw[bundle_offset:bundle_offset + verify_length]
+        draft_blob = raw[bundle_offset + verify_length:
+                          bundle_offset + mtp_length]
+        assert struct.unpack_from("<I", verify_blob)[0] == 0x4D4C4C47
+        assert struct.unpack_from("<I", draft_blob)[0] == 0x4D4C4C47
+        assert len(verify_blob) == verify_length
+        assert len(draft_blob) == mtp_length - verify_length
+        assert bundle_offset + mtp_length <= weights_offset
+        assert raw[weights_offset:] == b""
     print("MTP package tests passed")
     return 0
 

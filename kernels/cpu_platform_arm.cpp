@@ -74,6 +74,11 @@ bool matmul_dense_fp16_range(const float*, const fp16_t*, float*, int, int, int,
     return false;
 }
 
+bool matmul_dense_fp16_m2_range_n(
+    const float*, const fp16_t*, float*, int, int, int, int, int, int, int) {
+    return false;
+}
+
 bool matmul_int8_range(const float*, const int8_t*, const float*, float*, int,
                        int, int, int, int, int, int, int, int, int, int, bool) {
     return false;

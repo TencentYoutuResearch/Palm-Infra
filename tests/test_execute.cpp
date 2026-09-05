@@ -61,6 +61,30 @@ int main() {
         cpu_backend.clear_dispatch_error();
     }
 
+
+    // Transactional GDN verification patches its checkpoint boundary at
+    // runtime independently of ordinary prefill's n_real_tokens field.
+    {
+        Graph verify;
+        GraphNode node;
+        node.id = 0;
+        node.op_type = OpType::GATED_DELTANET_CONV_VERIFY;
+        node.params.i32 = {2, 4, 4, 8, 1, 4, 0, 2, 0};
+        node.out_shape[0] = 8;
+        node.out_shape[1] = 8;
+        node.out_prec = Precision::FP32;
+        verify.nodes.push_back(node);
+        verify.runtime.tensors.resize(1);
+        ExecContext verify_ctx;
+        verify_ctx.graph = &verify;
+        verify_ctx.runtime_seq_len = 2;
+        verify_ctx.confirmed_prefix_tokens = 1;
+        inject_runtime_shapes(verify_ctx);
+        CHECK(verify.nodes[0].params.i32[3] == 2,
+              "verification runtime sequence length is injected");
+        CHECK(verify.nodes[0].params.i32[8] == 1,
+              "verification confirmed prefix is injected");
+    }
     // Partial execution is used by MTP synchronization: run through the
     // stateful cache-update node, but skip an expensive stateless suffix.
     {

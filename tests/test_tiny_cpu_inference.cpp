@@ -200,6 +200,83 @@ void test_unavailable_cuda_policy(const char* path) {
           "unavailable CUDA fallback preserves resident CPU package storage");
 }
 
+std::vector<int> generate_tokens(const char* path, bool use_mtp,
+                                 LLMEngine::MtpStats* stats,
+                                 bool zero_prompt = false) {
+    LLMEngine engine;
+    EngineConfig config;
+    config.package_path = path;
+    config.n_ctx = 64;
+    config.num_threads = 1;
+    config.sampling.temperature = 0.0f;
+    config.mtp_draft_tokens = use_mtp ? 1 : 0;
+
+    CHECK(engine.load(config),
+          use_mtp ? "load tiny Qwen3.5 MTP package"
+                  : "load tiny Qwen3.5 baseline package");
+    if (failures)
+        return {};
+    CHECK(engine.has_mtp() == use_mtp,
+          "MTP graph loads only when speculation is enabled");
+
+    constexpr int kGenerated = 24;
+    std::vector<int> tokens;
+    const std::vector<int> prompt = zero_prompt
+        ? std::vector<int>{0, 0, 0}
+        : std::vector<int>{1, 2, 3};
+    int next = engine.prefill(prompt);
+    CHECK(next >= 0, "Qwen3.5 generation prefill executes");
+    if (next < 0)
+        return {};
+    tokens.push_back(next);
+
+    while (static_cast<int>(tokens.size()) < kGenerated) {
+        if (!use_mtp) {
+            next = engine.decode(next);
+            CHECK(next >= 0, "Qwen3.5 baseline decode executes");
+            if (next < 0)
+                return {};
+            tokens.push_back(next);
+            continue;
+        }
+
+        const int target_before = engine.past_len();
+        const uint64_t accepted_before = engine.mtp_stats().accepted;
+        std::vector<int> decoded;
+        CHECK(engine.speculative_decode(
+                  next, decoded, kGenerated - static_cast<int>(tokens.size())),
+              "Qwen3.5 speculative decode executes");
+        if (decoded.empty())
+            return {};
+        CHECK(engine.past_len() ==
+                  target_before + static_cast<int>(decoded.size()),
+              engine.mtp_stats().accepted > accepted_before
+                  ? "accepted draft preserves target state continuity"
+                  : "rejected draft restores target state continuity");
+        const int remaining = kGenerated - static_cast<int>(tokens.size());
+        if (static_cast<int>(decoded.size()) > remaining)
+            decoded.resize(static_cast<size_t>(remaining));
+        tokens.insert(tokens.end(), decoded.begin(), decoded.end());
+        next = tokens.back();
+    }
+
+    if (stats)
+        *stats = engine.mtp_stats();
+    return tokens;
+}
+
+void check_mtp_draft_limit(const char* path) {
+    LLMEngine engine;
+    EngineConfig config;
+    config.package_path = path;
+    config.n_ctx = 64;
+    config.num_threads = 1;
+    config.sampling.temperature = 0.0f;
+    config.mtp_draft_tokens = 2;
+    CHECK(!engine.load(config),
+          "Qwen3.5 package rejects unsupported multi-draft speculation");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -227,13 +304,12 @@ int main(int argc, char** argv) {
         return 77;
 #endif
     }
-    if (argc != 4) {
+    if (argc != 5) {
         std::fprintf(stderr,
                      "usage: %s <qwen3-fp16.mollm> <qwen3-w4.mollm> "
-                     "<qwen35-fp16.mollm>\n"
+                     "<qwen35-reject.mollm> <qwen35-accept.mollm>\n"
                      "       %s --real-model <dense.mollm>\n",
-                     argv[0],
-                     argv[0]);
+                     argv[0], argv[0]);
         return 2;
     }
 
@@ -257,8 +333,9 @@ int main(int argc, char** argv) {
     // guard against layout/scale corruption rather than a W4 quality target.
     CHECK(max_error < 0.30f,
           "W4G32 package remains numerically bounded against FP16 reference");
-    run_package(
-        argv[3], "load tiny Qwen3.5 GDN package", "qwen3.5", true);
+    run_package(argv[3], "load tiny Qwen3.5 GDN package", "qwen3.5", true);
+    check_mtp_draft_limit(argv[3]);
+
 #ifdef MOLLM_CUDA
     CudaBackend probe;
     if (probe.available()) {
@@ -273,6 +350,27 @@ int main(int argc, char** argv) {
     }
 #endif
     test_unavailable_cuda_policy(argv[1]);
+
+    LLMEngine::MtpStats reject_stats;
+    const std::vector<int> reject_plain =
+        generate_tokens(argv[3], false, nullptr);
+    const std::vector<int> reject_mtp =
+        generate_tokens(argv[3], true, &reject_stats);
+    CHECK(!reject_plain.empty() && reject_plain == reject_mtp,
+          "greedy Qwen3.5 rejected-draft output is identical with MTP");
+    CHECK(reject_stats.drafted > 0 &&
+              reject_stats.accepted < reject_stats.drafted,
+          "Qwen3.5 fixture exercises rejected-draft rollback");
+
+    LLMEngine::MtpStats accept_stats;
+    const std::vector<int> accept_plain =
+        generate_tokens(argv[4], false, nullptr, true);
+    const std::vector<int> accept_mtp =
+        generate_tokens(argv[4], true, &accept_stats, true);
+    CHECK(!accept_plain.empty() && accept_plain == accept_mtp,
+          "greedy Qwen3.5 accepted-draft output is identical with MTP");
+    CHECK(accept_stats.drafted > 0 && accept_stats.accepted > 0,
+          "Qwen3.5 fixture exercises accepted-draft commit");
     if (failures == 0)
         std::printf("Tiny CPU inference test passed\n");
     return failures == 0 ? 0 : 1;

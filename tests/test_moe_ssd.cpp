@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -968,8 +969,13 @@ int main() {
         const MoeSsdTensorSource* down = cache.find_source("stats_down");
         check(cache.prefetch_many(gate, down, {0}, {1.0f}),
               "queue unused speculative expert");
-        check(wait_until([&] { return cache.stats().bytes_read >= 8; }),
-              "wait for unused speculative expert");
+        bool prefetched = false;
+        for (int spin = 0; spin < 1000 && !prefetched; ++spin) {
+            prefetched = cache.is_ready(gate, down, 0);
+            if (!prefetched)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(prefetched, "speculative expert becomes ready before eviction");
 
         Tensor gu, dw;
         check(cache.acquire(gate, down, 1, gu, dw),

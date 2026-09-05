@@ -579,6 +579,68 @@ int main() {
         delete[] a_data; delete[] b_data; delete[] c_data; delete[] ref_c;
     }
 
+    // ---- row-major FP16 M=2 matches two independent GEMVs bit-for-bit ----
+    {
+        auto test_fp16_m2 = [&](int K, int N, int num_threads,
+                                const char* shape_label) {
+            constexpr int M = 2;
+            std::vector<float> a(M * K);
+            std::vector<__fp16> weights(N * K);
+            std::vector<float> batched(M * N, -1.0f);
+            std::vector<float> rowwise(M * N, -2.0f);
+
+            for (int i = 0; i < M * K; ++i) {
+                a[i] = static_cast<float>((i * 37 + 11) % 257 - 128) /
+                       128.0f;
+            }
+            for (int i = 0; i < N * K; ++i) {
+                weights[i] = static_cast<__fp16>(
+                    static_cast<float>((i * 29 + 7) % 193 - 96) / 256.0f);
+            }
+
+            Tensor A = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1,
+                a.data());
+            Tensor B = Tensor::create(
+                Precision::FP16, MemoryType::EXTERNAL, N, K, 1, 1,
+                weights.data());
+            Tensor C = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1,
+                batched.data());
+            ThreadPool pool(num_threads);
+            kernel_matmul_fp32(A, B, C, &pool);
+
+            for (int row = 0; row < M; ++row) {
+                Tensor row_a = Tensor::create(
+                    Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
+                    a.data() + row * K);
+                Tensor row_c = Tensor::create(
+                    Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                    rowwise.data() + row * N);
+                kernel_matmul_fp32(row_a, B, row_c, &pool);
+            }
+
+            for (int row = 0; row < M; ++row) {
+                char message[160];
+                std::snprintf(
+                    message, sizeof(message),
+                    "row-major FP16 M=2 row=%d bitwise parity %s threads=%d",
+                    row, shape_label, num_threads);
+                CHECK(std::memcmp(batched.data() + row * N,
+                                  rowwise.data() + row * N,
+                                  N * sizeof(float)) == 0,
+                      message);
+            }
+        };
+
+        for (int num_threads : {1, 4}) {
+            test_fp16_m2(37, 131, num_threads, "odd K/N tails");
+            // One eighth of the official 4B fused GDN input projection.
+            test_fp16_m2(320, 1544, num_threads,
+                         "scaled 12352x2560 projection");
+        }
+    }
+
     // ---- FP16 tests with interleaved packing (pre-packed B) ----
     {
         // Helper: pack B then run matmul

@@ -10,6 +10,9 @@ void matmul_fp32_avx512_range(const float* A, const float* B, float* C, int N,
 void matmul_fp16_avx512_range(const float* A, const fp16_t* B, float* C, int N,
                               int K, int lda, int K_weight, int ldc,
                               int m_begin, int m_end);
+void matmul_fp16_m2_avx512_range_n(const float* A, const fp16_t* B, float* C,
+                                    int N, int K, int lda, int K_weight,
+                                    int ldc, int n_begin, int n_end);
 void matmul_int4_bg_avx512_range(const Tensor& A, const Tensor& B, Tensor& C,
                                  int lda, int ldc, int m_begin, int m_end,
                                  int n_begin, int n_end);

@@ -20,6 +20,7 @@ struct CliCommonOptions {
     float rope_theta = 10000000.f;
     int num_threads = default_worker_threads();
     bool profile = false;
+    bool dump_token_ids = false;
     int warmup = 1;
     bool static_padded = false;  // pad short prompts to graph_seq_len (A/B vs DYNAMIC)
     Device device = Device::CPU;  // compute backend (--device cpu|metal|cuda)

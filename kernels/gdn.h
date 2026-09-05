@@ -80,3 +80,11 @@ void kernel_gdn_conv_decode(const OpParams& params,
                             const std::vector<const Tensor*>& inputs,
                             std::vector<Tensor*>& outputs,
                             ThreadPool* thread_pool = nullptr);
+
+// Multi-token CPU verification composition. Inputs append the live conv
+// state, then FP32 GDN/conv checkpoint buffers. The live state advances over
+// all tokens; checkpoints capture the state after the confirmed prefix.
+void kernel_gdn_conv_verify(const OpParams& params,
+                            const std::vector<const Tensor*>& inputs,
+                            std::vector<Tensor*>& outputs,
+                            ThreadPool* thread_pool = nullptr);

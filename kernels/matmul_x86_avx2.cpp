@@ -125,6 +125,58 @@ void matmul_fp16_avx2_range(const float* A, const fp16_t* B, float* C, int N,
     }
 }
 
+void matmul_fp16_m2_avx2_range_n(const float* A, const fp16_t* B, float* C,
+                                  int N, int K, int lda, int K_weight, int ldc,
+                                  int n_begin, int n_end) {
+    (void)N;
+    const float* a_row0 = A;
+    const float* a_row1 = A + lda;
+    float* c_row0 = C;
+    float* c_row1 = C + ldc;
+    for (int n = n_begin; n < n_end; ++n) {
+        const fp16_t* b_row = B + static_cast<size_t>(n) * K_weight;
+        __m256 acc00 = _mm256_setzero_ps();
+        __m256 acc01 = _mm256_setzero_ps();
+        __m256 acc10 = _mm256_setzero_ps();
+        __m256 acc11 = _mm256_setzero_ps();
+        int k = 0;
+        for (; k + 15 < K; k += 16) {
+            const __m128i b0 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(b_row + k));
+            const __m128i b1 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(b_row + k + 8));
+            const __m256 weights0 = _mm256_cvtph_ps(b0);
+            const __m256 weights1 = _mm256_cvtph_ps(b1);
+            acc00 = _mm256_fmadd_ps(_mm256_loadu_ps(a_row0 + k), weights0,
+                                    acc00);
+            acc01 = _mm256_fmadd_ps(_mm256_loadu_ps(a_row0 + k + 8), weights1,
+                                    acc01);
+            acc10 = _mm256_fmadd_ps(_mm256_loadu_ps(a_row1 + k), weights0,
+                                    acc10);
+            acc11 = _mm256_fmadd_ps(_mm256_loadu_ps(a_row1 + k + 8), weights1,
+                                    acc11);
+        }
+        __m256 acc0 = _mm256_add_ps(acc00, acc01);
+        __m256 acc1 = _mm256_add_ps(acc10, acc11);
+        for (; k + 7 < K; k += 8) {
+            const __m128i packed = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(b_row + k));
+            const __m256 weights = _mm256_cvtph_ps(packed);
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a_row0 + k), weights, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a_row1 + k), weights, acc1);
+        }
+        float sum0 = horizontal_sum(acc0);
+        float sum1 = horizontal_sum(acc1);
+        for (; k < K; ++k) {
+            const float weight = static_cast<float>(b_row[k]);
+            sum0 += a_row0[k] * weight;
+            sum1 += a_row1[k] * weight;
+        }
+        c_row0[n] = sum0;
+        c_row1[n] = sum1;
+    }
+}
+
 void matmul_int4_bg_avx2_range(const Tensor& A, const Tensor& B, Tensor& C,
                                int lda, int ldc, int m_begin, int m_end,
                                int n_begin, int n_end) {

@@ -179,6 +179,34 @@ void CPUBackend::dispatch(const GraphNode& node,
         kernel_gdn_conv_decode(params, inputs, gdn_outs, thread_pool);
         break;
     }
+    case OpType::GATED_DELTANET_CONV_VERIFY: {
+        const int seq_len = graph_params::get_i32(params, 3, 0);
+        const int confirmed_prefix = graph_params::get_i32(params, 8, 0);
+        const bool valid_inputs = inputs.size() == 12 &&
+            std::all_of(inputs.begin(), inputs.end(), [](const Tensor* input) {
+                return input != nullptr && input->data != nullptr;
+            });
+        const bool valid_state = valid_inputs &&
+            inputs[7]->prec == Precision::FP32 &&
+            inputs[9]->prec == Precision::FP32 &&
+            inputs[10]->prec == Precision::FP32 &&
+            inputs[11]->prec == Precision::FP32 &&
+            inputs[7]->nbytes() == inputs[10]->nbytes() &&
+            inputs[9]->nbytes() == inputs[11]->nbytes();
+        if (!valid_inputs || !output || !valid_state || seq_len <= 1 ||
+            confirmed_prefix < 1 || confirmed_prefix >= seq_len) {
+            std::fprintf(
+                stderr,
+                "CPUBackend: invalid GATED_DELTANET_CONV_VERIFY contract "
+                "(inputs=%zu, seq_len=%d, confirmed_prefix=%d)\n",
+                inputs.size(), seq_len, confirmed_prefix);
+            reject();
+            break;
+        }
+        std::vector<Tensor*> gdn_outs = { output };
+        kernel_gdn_conv_verify(params, inputs, gdn_outs, thread_pool);
+        break;
+    }
     case OpType::MOE: {
         int hidden_size = graph_params::get_i32(params, 0, output ? (int)output->shape[0] : 0);
         int num_experts = graph_params::get_i32(params, 1, 0);
