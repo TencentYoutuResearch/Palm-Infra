@@ -4,7 +4,7 @@
 
 #include <memory>
 
-// CUDA backend with device-resident graph storage. CUDA owns prepared linear
+// CUDA graph backend with device-resident graph storage. CUDA owns prepared linear
 // weights and cudaMalloc-backed intermediate/persistent buffers. KV metadata
 // may retain a small coherent host prefix. Operators not yet implemented
 // natively use an explicit D2H -> CPU reference -> H2D bridge.

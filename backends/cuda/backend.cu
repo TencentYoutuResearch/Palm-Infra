@@ -1,8 +1,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "engine/cuda_backend.h"
-#include "engine/cuda_internal.h"
+#include "backends/cuda/backend.h"
+#include "backends/cuda/internal.h"
 
 #include "backends/cpu/backend.h"
 #include "core/cache_layout.h"

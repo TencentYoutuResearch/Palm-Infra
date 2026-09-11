@@ -1,5 +1,7 @@
 #pragma once
 
+// CUDA block-reduction helpers shared by GPU operator kernels.
+
 #include <cuda_runtime.h>
 
 namespace mollm_cuda::detail {
