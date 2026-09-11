@@ -4,6 +4,7 @@
 #include "engine/cuda_backend.h"
 #include "engine/cuda_internal.h"
 
+#include "backends/cpu/backend.h"
 #include "core/cache_layout.h"
 
 #include "kernels/activations.h"

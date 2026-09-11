@@ -124,6 +124,15 @@ set(PUBLIC_CORE_HEADERS
     core/cache_layout.h
 )
 
+set(PUBLIC_RUNTIME_HEADERS
+    runtime/backend.h
+    runtime/accelerator_backend.h
+)
+
+set(PUBLIC_CPU_BACKEND_HEADERS
+    backends/cpu/backend.h
+)
+
 set(PUBLIC_GRAPH_HEADERS
     graph/buffer_pool.h
     graph/mmap_file.h
@@ -601,6 +610,10 @@ install(FILES ${PUBLIC_ENGINE_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/engine)
 install(FILES ${PUBLIC_CORE_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/core)
+install(FILES ${PUBLIC_RUNTIME_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/runtime)
+install(FILES ${PUBLIC_CPU_BACKEND_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/backends/cpu)
 install(FILES ${PUBLIC_GRAPH_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/graph)
 install(FILES ${PUBLIC_KERNEL_HEADERS}
