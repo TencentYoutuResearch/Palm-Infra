@@ -1,5 +1,5 @@
-#include "engine/metal_backend.h"
-#include "graph/metal_pool.h"
+#include "backends/metal/backend.h"
+#include "backends/metal/buffer_pool.h"
 #include "graph/graph.h"
 #include "graph/mmap_file.h"
 #include "kernels/matmul.h"

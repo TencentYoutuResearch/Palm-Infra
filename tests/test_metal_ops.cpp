@@ -5,7 +5,7 @@
 #include "kernels/matmul.h"
 #include "kernels/moe.h"
 #include "kernels/rwkv.h"
-#include "engine/metal_backend.h"
+#include "backends/metal/backend.h"
 #include "graph/graph.h"
 #include <algorithm>
 #include <cmath>

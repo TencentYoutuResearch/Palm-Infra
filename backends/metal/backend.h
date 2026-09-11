@@ -13,7 +13,8 @@
 // input/output boundary tensors are copied host<->device.
 //
 // This header is plain C++ (opaque void* handles, PIMPL) so it can be included
-// by pure-C++ translation units. The implementation is in metal_backend.mm.
+// by pure-C++ translation units. The implementation is in
+// backends/metal/backend.mm.
 //
 // Only compiled when MOLLM_METAL is defined.
 // ---------------------------------------------------------------------------

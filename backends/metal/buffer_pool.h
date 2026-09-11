@@ -20,7 +20,8 @@
 //   clear() -> releases all buffers back to Metal.
 //
 // The header is plain C++ (opaque void* handles) so it can be included by
-// non-ObjC translation units. The implementation is in metal_pool.mm.
+// non-ObjC translation units. The implementation is in
+// backends/metal/buffer_pool.mm.
 // ---------------------------------------------------------------------------
 
 class MetalBufferPool {
