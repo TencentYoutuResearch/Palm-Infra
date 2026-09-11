@@ -64,7 +64,7 @@ set(SOURCES
     graph/buffer_pool.cpp
     graph/mmap_file.cpp
     graph/io.cpp
-    graph/cpu_backend.cpp
+    backends/cpu/backend.cpp
     graph/execute.cpp
     # kernels
     kernels/matmul.cpp

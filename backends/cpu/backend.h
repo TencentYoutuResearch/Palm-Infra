@@ -3,8 +3,7 @@
 #include "runtime/backend.h"
 #include "kernels/cpu_platform.h"
 
-// CPU graph dispatcher. The implementation currently remains in
-// graph/cpu_backend.cpp and moves with the later physical backend migration.
+// CPU graph dispatcher. The implementation is in backends/cpu/backend.cpp.
 class CPUBackend : public Backend {
 public:
     ShapeMode shape_mode() const override { return ShapeMode::DYNAMIC; }

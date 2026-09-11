@@ -20,7 +20,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// CPUBackend::dispatch — kernel dispatcher for CPU (ARM NEON) backend.
+// CPUBackend::dispatch — CPU graph dispatcher.
 //
 // Routes OpType to the appropriate kernel. This is the only dispatch
 // entry point for CPU; future NPU backend will have its own dispatch().
