@@ -9,6 +9,7 @@
 
 #include "kernels/quant_layouts.h"
 
+// CUDA backend resources and kernel-launch declarations.
 namespace mollm_cuda {
 
 struct ArgMaxPair {

@@ -1,5 +1,5 @@
-#include "engine/cuda_internal.h"
-#include "engine/cuda_reduction.cuh"
+#include "backends/cuda/internal.h"
+#include "kernels/cuda/reduction.cuh"
 
 #include <cfloat>
 #include <cstdint>

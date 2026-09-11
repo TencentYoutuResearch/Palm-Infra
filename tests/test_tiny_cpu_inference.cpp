@@ -1,6 +1,6 @@
 #include "engine/engine.h"
 #ifdef MOLLM_CUDA
-#include "engine/cuda_backend.h"
+#include "backends/cuda/backend.h"
 #endif
 
 #include <algorithm>
