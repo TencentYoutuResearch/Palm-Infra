@@ -1,6 +1,6 @@
 #include "kernels/attention.h"
 #include "kernels/threading.h"
-#include "engine/engine.h"  // for CacheMetadata, cache_meta, cache_data
+#include "core/cache_layout.h"
 
 #include <algorithm>
 #include <chrono>

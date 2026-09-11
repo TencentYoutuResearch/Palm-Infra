@@ -3,7 +3,8 @@
 
 #include "engine/cuda_backend.h"
 #include "engine/cuda_internal.h"
-#include "engine/engine.h"
+
+#include "core/cache_layout.h"
 
 #include "kernels/activations.h"
 #include "kernels/quant_layouts.h"

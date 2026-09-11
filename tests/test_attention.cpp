@@ -1,5 +1,5 @@
 #include "kernels/attention.h"
-#include "engine/engine.h"  // for CacheMetadata
+#include "core/cache_layout.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

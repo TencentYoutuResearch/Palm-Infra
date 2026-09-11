@@ -120,6 +120,10 @@ set(PUBLIC_ENGINE_HEADERS
     engine/tokenizer.h
 )
 
+set(PUBLIC_CORE_HEADERS
+    core/cache_layout.h
+)
+
 set(PUBLIC_GRAPH_HEADERS
     graph/buffer_pool.h
     graph/mmap_file.h
@@ -595,6 +599,8 @@ install(TARGETS mollm_lib
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm)
 install(FILES ${PUBLIC_ENGINE_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/engine)
+install(FILES ${PUBLIC_CORE_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/core)
 install(FILES ${PUBLIC_GRAPH_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/graph)
 install(FILES ${PUBLIC_KERNEL_HEADERS}
