@@ -56,6 +56,7 @@ struct Capabilities {
     bool fp16_vector_math = false;
     bool fp16_kv_cache = false;
     bool fp16_interleaved_weights = false;
+    bool fp16_m2_shared_weight = false;
     bool x86_avx2 = false;
     bool x86_fma = false;
     bool x86_f16c = false;
@@ -88,6 +89,10 @@ bool matmul_dense_fp32_range(const float* A, const float* B, float* C, int N,
 bool matmul_dense_fp16_range(const float* A, const fp16_t* B, float* C, int N,
                              int K, int lda, int K_weight, int ldc,
                              int m_begin, int m_end, bool interleaved);
+bool matmul_dense_fp16_m2_range_n(
+    const float* A, const fp16_t* B, float* C,
+    int N, int K, int lda, int K_weight, int ldc,
+    int n_begin, int n_end);
 bool matmul_int8_range(const float* A, const int8_t* B, const float* scales,
                        float* C, int N, int K, int group_size,
                        int groups_per_row, int lda, int K_weight, int ldc,

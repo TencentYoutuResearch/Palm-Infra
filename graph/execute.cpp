@@ -87,6 +87,7 @@ void prepare_execution(ExecContext& ctx) {
             node.op_type == OpType::GATED_DELTANET_PREFILL ||
             node.op_type == OpType::GATED_DELTANET_DECODE ||
             node.op_type == OpType::GATED_DELTANET_CONV_DECODE ||
+            node.op_type == OpType::GATED_DELTANET_CONV_VERIFY ||
             node.op_type == OpType::SHORTCONV ||
             node.op_type == OpType::RMS_NORM_ROPE ||
             node.op_type == OpType::QK_RMS_NORM_ROPE ||
@@ -223,6 +224,12 @@ void inject_runtime_shapes(ExecContext& ctx) {
             n.params.i32[6] = n_real;  // n_real_tokens (skip padding positions)
             if (patch_seq_len && n.params.i32.size() > 3) {
                 n.params.i32[3] = n_real;  // seq_len = n_real in DYNAMIC mode
+            }
+        } else if (n.op_type == OpType::GATED_DELTANET_CONV_VERIFY) {
+            if (n.params.i32.size() <= 8) n.params.i32.resize(9, 0);
+            n.params.i32[8] = ctx.confirmed_prefix_tokens;
+            if (patch_seq_len && n.params.i32.size() > 3) {
+                n.params.i32[3] = n_real;
             }
         } else if (n.op_type == OpType::SHORTCONV) {
             if (n.params.i32.size() <= 1) n.params.i32.resize(2, 0);

@@ -253,7 +253,14 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
         fprintf(stderr, "Engine: package MTP graph has invalid length\n");
         return false;
     }
-    out.mtp_off = out.w_off - out.mtp_len;
+    // The writer may align weights, leaving padding after the MTP bundle.
+    // MTP therefore starts after the preceding graph sections, not at
+    // `weights_offset - mtp_length`.
+    if (!checked_add(out.dc_off, out.dc_len, out.mtp_off) ||
+        !checked_add(out.mtp_off, out.vi_len, out.mtp_off)) {
+        fprintf(stderr, "Engine: package MTP graph offset overflows\n");
+        return false;
+    }
 
     if (!section_in_file(out.meta_off, out.meta_len, file_size, "metadata") ||
         !section_in_file(out.tok_off, out.tok_len, file_size, "tokenizer") ||
@@ -320,6 +327,7 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
 
 bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                              std::string& dc_path, std::string& vi_path,
+                             std::string& mtp_verify_path,
                              std::string& mtp_path,
                              std::string& tok_path,
                              std::string& jinja_path) {
@@ -352,9 +360,24 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
     }
 
     int prefill_seq_len = 256;
+    uint64_t mtp_verify_len = 0;
     auto parse_metadata = [&](const std::string& meta_str) -> bool {
         try {
             auto meta = json::parse(meta_str);
+            if (meta.contains("mtp_verify_graph_length")) {
+                if (!meta["mtp_verify_graph_length"].is_number_unsigned() &&
+                    !meta["mtp_verify_graph_length"].is_number_integer()) {
+                    fprintf(stderr, "Engine: invalid mtp_verify_graph_length metadata\n");
+                    return false;
+                }
+                const int64_t parsed =
+                    meta["mtp_verify_graph_length"].get<int64_t>();
+                if (parsed < 0 || static_cast<uint64_t>(parsed) > ph.mtp_len) {
+                    fprintf(stderr, "Engine: mtp_verify_graph_length exceeds MTP section\n");
+                    return false;
+                }
+                mtp_verify_len = static_cast<uint64_t>(parsed);
+            }
             if (meta.contains("prefill_seq_len")) {
                 prefill_seq_len = meta["prefill_seq_len"].get<int>();
                 if (prefill_seq_len <= 0) {
@@ -669,8 +692,12 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                                  ph.vi_len, "vision graph", vi_path,
                                  temp_files_) &&
             extract_temp_section(package_file.get(), nullptr, ph.mtp_off,
-                                 ph.mtp_len, "MTP graph", mtp_path,
-                                 temp_files_) &&
+                                 mtp_verify_len, "MTP verification graph",
+                                 mtp_verify_path, temp_files_) &&
+            extract_temp_section(
+                package_file.get(), nullptr, ph.mtp_off + mtp_verify_len,
+                ph.mtp_len - mtp_verify_len, "MTP draft graph", mtp_path,
+                temp_files_) &&
             extract_temp_section(package_file.get(), nullptr, ph.tok_off,
                                  ph.tok_len, "tokenizer", tok_path,
                                  temp_files_) &&
@@ -704,8 +731,12 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                               dc_path, temp_files_) ||
         !extract_temp_section(-1, base, ph.vi_off, ph.vi_len, "vision graph",
                               vi_path, temp_files_) ||
-        !extract_temp_section(-1, base, ph.mtp_off, ph.mtp_len, "MTP graph",
-                              mtp_path, temp_files_) ||
+        !extract_temp_section(-1, base, ph.mtp_off, mtp_verify_len,
+                              "MTP verification graph", mtp_verify_path,
+                              temp_files_) ||
+        !extract_temp_section(-1, base, ph.mtp_off + mtp_verify_len,
+                              ph.mtp_len - mtp_verify_len,
+                              "MTP draft graph", mtp_path, temp_files_) ||
         !extract_temp_section(-1, base, ph.tok_off, ph.tok_len, "tokenizer",
                               tok_path, temp_files_) ||
         !extract_temp_section(-1, base, ph.jin_off, ph.jin_len,

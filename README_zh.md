@@ -111,8 +111,7 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
 
 - macOS/Apple Silicon、ARM Linux 或 Linux x86_64
 - CMake 与 Ninja 或 Make
-- Python 3
-- 转换所需的 Python 包，主要是 `numpy` 与 `safetensors`
+- Python 3，以及用于模型转换的 `numpy`
 
 推荐构建方式：
 
@@ -225,7 +224,7 @@ W4 转换需要 C++ 构建的 `mollm-quantize` 工具；FP16 和 W8 不需要。
 ./build_i8mm/mollm_chat \
     --package qwen35_4b_w4g128.mollm \
     --prompt "请只输出一句话，不要解释：杭州有什么特点？" \
-    --max-new-tokens 64 \
+    --max-new-tokens 65 \
     --threads 4 \
     --temperature 0
 ```
@@ -267,7 +266,7 @@ tower 带来的包体与常驻内存开销。
 ./build_i8mm/mollm_bench \
     --package qwen35_4b_w4g128.mollm \
     --prompt-tokens 256 \
-    --max-new-tokens 64 \
+    --max-new-tokens 65 \
     --warmup 3 \
     --threads 4
 ```

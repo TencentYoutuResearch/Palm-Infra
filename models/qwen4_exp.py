@@ -289,7 +289,8 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                              c0=first_cache, c1=second_cache) -> int:
             if kind == "linear_attention":
                 return _build_linear_attn_layer(
-                    g, x, current, weights_dir, c0, c1, eps, seq_len,
+                    g, x, current, weights_dir, c0, c1, None, None,
+                    eps, seq_len,
                     linear_num_heads, linear_k_dim, linear_v_dim,
                     linear_num_v_heads, conv_kernel, hidden_size,
                     is_prefill=is_prefill,

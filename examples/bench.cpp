@@ -187,6 +187,15 @@ void print_human_ssd_phase(const MoeSsdCache::Stats& stats, int tokens,
 }
 
 // Default machine-parseable key/value output.
+void print_generated_token_ids(const GenerationResult& result) {
+    std::printf("generated_token_ids=");
+    for (size_t i = 0; i < result.token_ids.size(); ++i) {
+        std::printf("%s%d", i == 0 ? "" : ",", result.token_ids[i]);
+    }
+    std::printf("\n");
+}
+
+// Default machine-parseable output (byte-identical to pre-polish behavior).
 void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_bytes,
                       const GenerationMetrics& m,
                       const GenerationResult& result, double total_ms,
@@ -359,6 +368,9 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                 mm_ms,
                 mm_ms > 0 ? (pack_ms / mm_ms * 100.0) : 0.0,
                 mm_ms > 0 ? (q8_quant_a_ms / mm_ms * 100.0) : 0.0);
+    if (opts.dump_token_ids) {
+        print_generated_token_ids(result);
+    }
 }
 
 // Human-readable output: top summary line + grouped aligned sections.
@@ -505,6 +517,9 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
         std::printf(" %s\n", result.text.c_str());
         std::printf("%s\n", kSepLight);
     }
+    if (opts.dump_token_ids) {
+        print_generated_token_ids(result);
+    }
 }
 
 } // namespace
@@ -644,6 +659,10 @@ int main(int argc, char** argv) {
     if (opts.profile) {
         print_profile_section("prefill_profile", engine.prefill_exec_ctx());
         print_profile_section("decode_profile", engine.decode_exec_ctx());
+        if (engine.has_mtp()) {
+            print_profile_section("mtp_draft_profile", engine.mtp_exec_ctx());
+            print_profile_section("mtp_verify_profile", engine.mtp_verify_exec_ctx());
+        }
         if (mollm_matmul_shape_profile_enabled()) {
             mollm_print_matmul_shape_profile("matmul_shape_profile", 24);
         }

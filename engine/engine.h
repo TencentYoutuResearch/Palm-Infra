@@ -264,6 +264,10 @@ public:
     void reset_profiles();
     const ExecContext& prefill_exec_ctx() const { return exec_ctx_prefill_; }
     const ExecContext& decode_exec_ctx() const { return exec_ctx_decode_; }
+    const ExecContext& mtp_exec_ctx() const { return exec_ctx_mtp_; }
+    const ExecContext& mtp_verify_exec_ctx() const {
+        return exec_ctx_mtp_verify_;
+    }
 
     /// BufferPool memory stats (for leak detection in benchmarks).
     /// Returns {active_bytes, peak_bytes, acquire_count, release_count} from the prefill graph's pool.
@@ -321,10 +325,12 @@ private:
     Graph graph_decode_;
     Graph graph_vision_;
     Graph graph_mtp_;
+    Graph graph_mtp_verify_;
     ExecContext exec_ctx_prefill_;
     ExecContext exec_ctx_decode_;
     ExecContext exec_ctx_vision_;
     ExecContext exec_ctx_mtp_;
+    ExecContext exec_ctx_mtp_verify_;
     ThreadPool thread_pool_;
     CPUBackend cpu_backend_;     // owned by engine; assigned to ExecContexts
     // Active graph-resident accelerator. The engine is deliberately unaware
@@ -379,6 +385,10 @@ private:
     std::vector<uint8_t> mtp_hidden_output_copy_;
     Tensor mtp_draft_hidden_device_;
     std::vector<float> mtp_pending_hidden_;
+    // Qwen3.5 trains its MTP head on the backbone's pre-final-norm hidden
+    // state. Keep a reusable host copy separate from the normalized graph
+    // output consumed by lm_head.
+    std::vector<uint8_t> mtp_target_hidden_copy_;
 
     // Engine-lifetime storage for KV cache and recurrent state. Graph pools
     // are reserved for per-execution temporaries.
@@ -396,7 +406,9 @@ private:
 
         // GDN recurrent state (linear attention layers)
         Tensor* gdn_state = nullptr;   // [v_dim, k_dim, num_heads] FP32
-        Tensor* gdn_conv = nullptr;     // [groups, kernel-1] FP32
+        Tensor* gdn_conv = nullptr;    // [groups, kernel-1] FP32
+        Tensor* gdn_checkpoint = nullptr;
+        Tensor* gdn_conv_checkpoint = nullptr;
         int gdn_v_dim = 0;
         int gdn_k_dim = 0;
         int gdn_num_heads = 0;
@@ -455,7 +467,14 @@ private:
     bool sync_mtp(const std::vector<int>& token_ids,
                   const Tensor& verified_hidden, int position,
                   int preserved_prefix = 0);
+    bool restore_confirmed_target_state(int target_length);
+    Tensor verify_target_tokens(const std::vector<int>& token_ids,
+                                int position, std::vector<float>* logits,
+                                std::vector<int>* top1);
     void set_cache_length(std::vector<CachePair>& caches, int length);
+    Tensor capture_mtp_target_hidden(Graph& graph, const Tensor& fallback,
+                                     Backend* backend);
+    Tensor current_mtp_target_hidden(int tokens);
 
     /// Transactional public-load implementation and shared teardown path.
     bool load_impl(const EngineConfig& cfg);
@@ -465,6 +484,7 @@ private:
     bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path);
     bool load_package(const std::string& path, std::string& pf_path,
                       std::string& dc_path, std::string& vi_path,
+                      std::string& mtp_verify_path,
                       std::string& mtp_path,
                       std::string& tok_path, std::string& jinja_path);
     size_t lock_dense_package_weights();

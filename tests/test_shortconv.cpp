@@ -102,11 +102,17 @@ void run_case(int groups, int seq_len, int kernel_size, int n_real,
 } // namespace
 
 int main() {
-    ThreadPool pool(4);
-    run_case(8, 1, 4, 1, &pool, "decode k=4");
-    run_case(7, 5, 4, 3, &pool, "padded prefill k=4");
-    run_case(7, 5, 4, 3, &pool, "strided prefill input", 5);
-    run_case(5, 4, 3, 4, &pool, "generic kernel size");
+    ThreadPool single_thread_pool(1);
+    ThreadPool four_thread_pool(4);
+    run_case(8, 1, 4, 1, &single_thread_pool, "decode k=4 one thread");
+    run_case(8, 1, 4, 1, &four_thread_pool, "decode k=4 four threads");
+    run_case(8, 1, 4, 1, &single_thread_pool,
+             "strided decode k=4 one thread", 5);
+    run_case(8, 1, 4, 1, &four_thread_pool,
+             "strided decode k=4 four threads", 5);
+    run_case(7, 5, 4, 3, &four_thread_pool, "padded prefill k=4");
+    run_case(7, 5, 4, 3, &four_thread_pool, "strided prefill input", 5);
+    run_case(5, 4, 3, 4, &four_thread_pool, "generic kernel size");
 
     if (failures == 0)
         std::printf("All shortconv tests passed!\n");

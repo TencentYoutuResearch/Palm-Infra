@@ -119,6 +119,7 @@ enum class OpType : uint32_t {
     GATED_DELTANET_DECODE  = 110,
     GATED_DELTANET_PREFILL = 111,
     GATED_DELTANET_CONV_DECODE = 112,
+    GATED_DELTANET_CONV_VERIFY = 113,
     MOE                 = 120,
     HC_PRE               = 130,
     HC_POST              = 131,
@@ -179,6 +180,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::GATED_DELTANET_DECODE: return "GATED_DELTANET_DECODE";
     case OpType::GATED_DELTANET_PREFILL: return "GATED_DELTANET_PREFILL";
     case OpType::GATED_DELTANET_CONV_DECODE: return "GATED_DELTANET_CONV_DECODE";
+    case OpType::GATED_DELTANET_CONV_VERIFY: return "GATED_DELTANET_CONV_VERIFY";
     case OpType::MOE: return "MOE";
     case OpType::HC_PRE: return "HC_PRE";
     case OpType::HC_POST: return "HC_POST";

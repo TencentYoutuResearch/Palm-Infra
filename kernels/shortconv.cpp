@@ -25,38 +25,41 @@ void kernel_shortconv(const OpParams& params,
     float* state_data = static_cast<float*>(inputs[2]->data);
     float* output_data = output.ptr<float>();
 
-#if HAS_NEON
     // The decode path is common enough to avoid allocating the prefill
     // staging buffer. Qwen3.5 uses a fixed four-element convolution.
     if (seq_len == 1 && kernel_size == 4) {
         constexpr int prefix_len = 3;
-        auto process_decode = [&](int, int begin, int end) {
+        auto process_decode_groups = [&](int /*thread_id*/, int begin,
+                                         int end) {
             for (int group = begin; group < end; ++group) {
                 float* state = state_data + group * prefix_len;
                 const float value = x_data[group];
                 const float* weights = weight_data + group * kernel_size;
-                const float sum =
-                    state[0] * weights[0] + state[1] * weights[1] +
-                    state[2] * weights[2] + value * weights[3];
-                const float sigmoid = 1.f / (1.f + std::exp(-sum));
-                output_data[group] = sum * sigmoid;
+                float sum = 0.f;
+                sum += state[0] * weights[0];
+                sum += state[1] * weights[1];
+                sum += state[2] * weights[2];
+                sum += value * weights[3];
+                output_data[group] = sum / (1.f + std::exp(-sum));
 
                 state[0] = state[1];
                 state[1] = state[2];
                 state[2] = value;
             }
         };
-        if (thread_pool && thread_pool->num_threads() > 1 && groups >= 1024) {
-            const int chunk =
-                (groups + thread_pool->num_threads() - 1) /
-                thread_pool->num_threads();
-            thread_pool->parallel_for(0, groups, chunk, process_decode);
+
+        if (thread_pool && groups >= 4) {
+            int chunk = (groups + thread_pool->num_threads() - 1) /
+                        thread_pool->num_threads();
+            if (chunk < 1)
+                chunk = 1;
+            thread_pool->parallel_for(0, groups, chunk,
+                                      process_decode_groups);
         } else {
-            process_decode(0, 0, groups);
+            process_decode_groups(0, 0, groups);
         }
         return;
     }
-#endif
 
     const int n_real = graph_params::get_i32(params, 1, seq_len);
     const int prefix_len = kernel_size - 1;

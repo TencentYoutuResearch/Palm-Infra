@@ -304,3 +304,77 @@ void kernel_gdn_conv_decode(const OpParams& params,
         inputs[5], inputs[6], inputs[7]};
     kernel_gdn_decode(params, gdn_inputs, outputs, thread_pool);
 }
+
+void kernel_gdn_conv_verify(const OpParams& params,
+                            const std::vector<const Tensor*>& inputs,
+                            std::vector<Tensor*>& outputs,
+                            ThreadPool* thread_pool) {
+    if (inputs.size() != 12 || outputs.size() != 1 || !outputs[0])
+        return;
+
+    const int num_heads = graph_params::get_i32(params, 0, 16);
+    const int k_dim = graph_params::get_i32(params, 1, 128);
+    const int v_dim = graph_params::get_i32(params, 2, 128);
+    const int seq_len = graph_params::get_i32(params, 3, 2);
+    const int conv_kernel = graph_params::get_i32(params, 5, 4);
+    const int num_v_heads = graph_params::get_i32(params, 7, num_heads);
+    const int confirmed_prefix = graph_params::get_i32(params, 8, 1);
+    const int qkv_total =
+        2 * num_heads * k_dim + num_v_heads * v_dim;
+    const int z_dim = num_v_heads * v_dim;
+
+    std::vector<float> convolved(static_cast<size_t>(qkv_total));
+    Tensor qkv_conv = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, qkv_total, 1, 1, 1,
+        convolved.data());
+    OpParams conv_params;
+    conv_params.i32 = {conv_kernel, 1};
+    OpParams decode_params = params;
+    if (decode_params.i32.size() < 9)
+        decode_params.i32.resize(9, 0);
+    decode_params.i32[3] = 1;
+    decode_params.i32[6] = 1;
+
+    auto token_view = [](const Tensor& source, int token, int dim) {
+        char* data = static_cast<char*>(source.data) +
+                     static_cast<size_t>(token) * source.stride[1];
+        return Tensor::create(
+            source.prec, MemoryType::EXTERNAL, dim, 1, 1, 1, data);
+    };
+    std::vector<const Tensor*> conv_inputs(3);
+    conv_inputs[1] = inputs[8];
+    conv_inputs[2] = inputs[9];
+    std::vector<const Tensor*> gdn_inputs(8);
+    gdn_inputs[0] = &qkv_conv;
+    gdn_inputs[4] = inputs[4];
+    gdn_inputs[5] = inputs[5];
+    gdn_inputs[6] = inputs[6];
+    gdn_inputs[7] = inputs[7];
+    std::vector<Tensor*> gdn_outputs(1);
+
+
+    for (int token = 0; token < seq_len; ++token) {
+        Tensor qkv = token_view(*inputs[0], token, qkv_total);
+        Tensor a = token_view(*inputs[1], token, num_v_heads);
+        Tensor b = token_view(*inputs[2], token, num_v_heads);
+        Tensor z = token_view(*inputs[3], token, z_dim);
+        Tensor out = token_view(*outputs[0], token, z_dim);
+
+        conv_inputs[0] = &qkv;
+        kernel_shortconv(
+            conv_params, conv_inputs, qkv_conv, thread_pool);
+        gdn_inputs[1] = &a;
+        gdn_inputs[2] = &b;
+        gdn_inputs[3] = &z;
+        gdn_outputs[0] = &out;
+        kernel_gdn_decode(
+            decode_params, gdn_inputs, gdn_outputs, thread_pool);
+
+        if (token == confirmed_prefix - 1) {
+            std::memcpy(inputs[10]->data, inputs[7]->data,
+                        inputs[7]->nbytes());
+            std::memcpy(inputs[11]->data, inputs[9]->data,
+                        inputs[9]->nbytes());
+        }
+    }
+}

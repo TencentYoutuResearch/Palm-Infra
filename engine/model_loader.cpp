@@ -35,6 +35,8 @@ enum class PersistentInputKind {
     KV_VALUE,
     GDN_STATE,
     GDN_CONV,
+    GDN_CHECKPOINT,
+    GDN_CONV_CHECKPOINT,
     STATE,
     ATT_SHIFT,
     FFN_SHIFT,
@@ -73,6 +75,11 @@ PersistentInput parse_persistent_input(const std::string& name) {
         input.kind = PersistentInputKind::GDN_STATE;
     } else if (parse_indexed_input_name(name, "gdn_conv", input.layer)) {
         input.kind = PersistentInputKind::GDN_CONV;
+    } else if (parse_indexed_input_name(name, "gdn_checkpoint", input.layer)) {
+        input.kind = PersistentInputKind::GDN_CHECKPOINT;
+    } else if (parse_indexed_input_name(
+                   name, "gdn_conv_checkpoint", input.layer)) {
+        input.kind = PersistentInputKind::GDN_CONV_CHECKPOINT;
     } else if (parse_indexed_input_name(name, "rwkv_state", input.layer)) {
         input.kind = PersistentInputKind::STATE;
     } else if (parse_indexed_input_name(name, "rwkv_att_shift", input.layer)) {
@@ -115,11 +122,13 @@ void LLMEngine::clear_model_state() {
     graph_decode_ = Graph{};
     graph_vision_ = Graph{};
     graph_mtp_ = Graph{};
+    graph_mtp_verify_ = Graph{};
     exec_ctx_prefill_ = ExecContext{};
     exec_ctx_decode_ = ExecContext{};
     exec_ctx_vision_ = ExecContext{};
     exec_ctx_mtp_ = ExecContext{};
     accelerator_backend_.reset();
+    exec_ctx_mtp_verify_ = ExecContext{};
 
     caches_.clear();
     mtp_caches_.clear();
@@ -132,6 +141,7 @@ void LLMEngine::clear_model_state() {
     mtp_hidden_output_copy_.clear();
     mtp_draft_hidden_device_ = Tensor{};
     mtp_pending_hidden_.clear();
+    mtp_target_hidden_copy_.clear();
     mtp_stats_ = MtpStats{};
 
     for (const auto& range : locked_dense_ranges_) {
@@ -824,6 +834,12 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
             cache.gdn_conv_groups = (int)node.out_shape[0];
             cache.gdn_conv_kernel = (int)node.out_shape[1] + 1;
             break;
+        case PersistentInputKind::GDN_CHECKPOINT:
+            cache.gdn_checkpoint = &tensor;
+            break;
+        case PersistentInputKind::GDN_CONV_CHECKPOINT:
+            cache.gdn_conv_checkpoint = &tensor;
+            break;
         case PersistentInputKind::STATE:
             cache.rwkv_state = &tensor;
             break;
@@ -1037,10 +1053,12 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_decode_.thread_pool = &thread_pool_;
     exec_ctx_vision_.thread_pool = &thread_pool_;
     exec_ctx_mtp_.thread_pool = &thread_pool_;
+    exec_ctx_mtp_verify_.thread_pool = &thread_pool_;
     exec_ctx_prefill_.trace_label = "prefill";
     exec_ctx_decode_.trace_label = "decode";
     exec_ctx_vision_.trace_label = "vision";
     exec_ctx_mtp_.trace_label = "mtp";
+    exec_ctx_mtp_verify_.trace_label = "mtp.verify";
     exec_ctx_prefill_.moe_cross_layer_prefetch = false;
     exec_ctx_prefill_.moe_hash_cross_layer_prefetch = false;
     exec_ctx_mtp_.moe_cross_layer_prefetch = false;
@@ -1055,6 +1073,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_decode_.backend = &cpu_backend_;
     exec_ctx_vision_.backend = &cpu_backend_;
     exec_ctx_mtp_.backend = &cpu_backend_;
+    exec_ctx_mtp_verify_.backend = &cpu_backend_;
     exec_ctx_prefill_.moe_backend = nullptr;
     exec_ctx_decode_.moe_backend = nullptr;
     exec_ctx_vision_.moe_backend = nullptr;
@@ -1128,6 +1147,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_decode_.reuse_same_shape_workspace = false;
     exec_ctx_mtp_.reuse_static_workspace = false;
     exec_ctx_mtp_.reuse_same_shape_workspace = true;
+    exec_ctx_mtp_verify_.reuse_static_workspace = false;
+    exec_ctx_mtp_verify_.reuse_same_shape_workspace = true;
 
     // Load the .mollm package (sets up weights mmap, extracts graphs to temp
     // files, parses metadata for weight offset map).
@@ -1136,11 +1157,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 "Engine: package_path is required (use .mollm package)\n");
         return false;
     }
-    std::string pf_path, dc_path, vi_path, mtp_path;
+    std::string pf_path, dc_path, vi_path, mtp_verify_path, mtp_path;
     {
         std::string tok_tmp, jinja_tmp;
         if (!load_package(cfg.package_path, pf_path, dc_path, vi_path,
-                          mtp_path,
+                          mtp_verify_path, mtp_path,
                           tok_tmp, jinja_tmp)) {
             return false;
         }
@@ -1156,12 +1177,73 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 "Engine: --mtp-draft-tokens requires a package with an MTP graph\n");
         return false;
     }
+    if (cfg_.mtp_draft_tokens > 0) {
+        auto max_drafts = package_metadata_.find("mtp_max_draft_tokens");
+        if (max_drafts != package_metadata_.end()) {
+            char* end = nullptr;
+            const long limit = std::strtol(
+                max_drafts->second.c_str(), &end, 10);
+            if (!end || *end != '\0' || limit <= 0 ||
+                cfg_.mtp_draft_tokens > limit) {
+                fprintf(
+                    stderr,
+                    "Engine: package supports at most %ld MTP draft token(s); "
+                    "requested %d\n",
+                    limit, cfg_.mtp_draft_tokens);
+                return false;
+            }
+        }
+    }
 
     const auto architecture_it = package_metadata_.find("architecture");
     const std::string architecture =
         architecture_it != package_metadata_.end()
             ? architecture_it->second
             : std::string();
+    const bool qwen35_transactional_mtp =
+        architecture == "qwen3.5" && cfg_.mtp_draft_tokens > 0;
+    if (qwen35_transactional_mtp) {
+        const auto transactional =
+            package_metadata_.find("mtp_transactional_state");
+        if (cfg_.mtp_draft_tokens != 1) {
+            fprintf(stderr,
+                    "Engine: Qwen3.5 transactional MTP supports exactly one "
+                    "draft token\n");
+            return false;
+        }
+        if (!sampler_.uses_plain_argmax()) {
+            fprintf(stderr,
+                    "Engine: Qwen3.5 transactional MTP requires greedy "
+                    "sampling\n");
+            return false;
+        }
+        if (cfg.device == Device::METAL) {
+            fprintf(stderr,
+                    "Engine: Qwen3.5 transactional MTP is CPU-only\n");
+            return false;
+        }
+        if (transactional == package_metadata_.end() ||
+            transactional->second != "1") {
+            fprintf(stderr,
+                    "Engine: Qwen3.5 MTP package lacks transactional state "
+                    "metadata\n");
+            return false;
+        }
+        if (mtp_verify_path.empty()) {
+            fprintf(stderr,
+                    "Engine: Qwen3.5 MTP package is missing the target "
+                    "verification graph\n");
+            return false;
+        }
+        const auto vision = package_metadata_.find("vision");
+        if (vision != package_metadata_.end() &&
+            (vision->second == "true" || vision->second == "1")) {
+            fprintf(stderr,
+                    "Engine: Qwen3.5 transactional MTP does not support "
+                    "vision packages\n");
+            return false;
+        }
+    }
     if (architecture == "deepseek-v4") {
         const auto context_it = package_metadata_.find("n_ctx");
         if (context_it == package_metadata_.end()) {
@@ -1303,11 +1385,108 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         return false;
     }
 
-    // Load decode graph (reuses shared weights via weight_map_)
+    // Load decode graph (reuses shared weights via weight_map_).
     if (!load_graph(graph_decode_, exec_ctx_decode_, dc_path.c_str())) {
         return false;
     }
     if (cfg_.mtp_draft_tokens > 0) {
+        if (qwen35_transactional_mtp) {
+            if (!load_graph(graph_mtp_verify_, exec_ctx_mtp_verify_,
+                            mtp_verify_path.c_str())) {
+                return false;
+            }
+
+            for (auto& node : graph_mtp_verify_.nodes) {
+                if (node.op_type != OpType::INPUT || node.params.str.empty())
+                    continue;
+                const PersistentInput input =
+                    parse_persistent_input(node.params.str[0]);
+                if (input.kind == PersistentInputKind::NONE)
+                    continue;
+                if (input.layer < 0 || input.layer >= (int)caches_.size()) {
+                    fprintf(stderr,
+                            "Engine: verification graph references invalid "
+                            "cache layer %d\n", input.layer);
+                    return false;
+                }
+
+                Tensor& tensor =
+                    graph_mtp_verify_.runtime.tensors[node.id];
+                initialize_input_tensor(tensor, node);
+                CachePair& cache = caches_[input.layer];
+                const Tensor* source = nullptr;
+                switch (input.kind) {
+                case PersistentInputKind::KV_KEY:
+                    source = cache.k;
+                    break;
+                case PersistentInputKind::KV_VALUE:
+                    source = cache.v;
+                    break;
+                case PersistentInputKind::GDN_STATE:
+                    source = cache.gdn_state;
+                    break;
+                case PersistentInputKind::GDN_CONV:
+                    source = cache.gdn_conv;
+                    break;
+                case PersistentInputKind::GDN_CHECKPOINT:
+                case PersistentInputKind::GDN_CONV_CHECKPOINT: {
+                    if (tensor.prec != Precision::FP32 || tensor.nbytes() == 0) {
+                        fprintf(stderr,
+                                "Engine: verification checkpoint must be "
+                                "non-empty FP32\n");
+                        return false;
+                    }
+                    const size_t bytes = tensor.nbytes();
+                    void* buffer = persistent_pool_.acquire(bytes);
+                    tensor.data = buffer;
+                    tensor.owner_id = persistent_pool_.id();
+                    tensor.storage_id = persistent_pool_.storage_id(buffer);
+                    tensor.mem_type = MemoryType::POOLED;
+                    std::memset(buffer, 0, bytes);
+                    if (input.kind == PersistentInputKind::GDN_CHECKPOINT)
+                        cache.gdn_checkpoint = &tensor;
+                    else
+                        cache.gdn_conv_checkpoint = &tensor;
+                    break;
+                }
+                case PersistentInputKind::STATE:
+                case PersistentInputKind::ATT_SHIFT:
+                case PersistentInputKind::FFN_SHIFT:
+                case PersistentInputKind::AUX_STATE:
+                case PersistentInputKind::NONE:
+                    break;
+                }
+                if (source) {
+                    tensor = *source;
+                } else if (input.kind != PersistentInputKind::GDN_CHECKPOINT &&
+                           input.kind !=
+                               PersistentInputKind::GDN_CONV_CHECKPOINT) {
+                    fprintf(stderr,
+                            "Engine: verification graph cache input %s has "
+                            "no target state\n", node.params.str[0].c_str());
+                    return false;
+                }
+            }
+            for (const CachePair& cache : caches_) {
+                if (!cache.is_linear_attn)
+                    continue;
+                if (!cache.gdn_state || !cache.gdn_conv ||
+                    !cache.gdn_checkpoint || !cache.gdn_conv_checkpoint ||
+                    cache.gdn_state->prec != Precision::FP32 ||
+                    cache.gdn_conv->prec != Precision::FP32 ||
+                    cache.gdn_checkpoint->prec != Precision::FP32 ||
+                    cache.gdn_conv_checkpoint->prec != Precision::FP32 ||
+                    cache.gdn_state->nbytes() !=
+                        cache.gdn_checkpoint->nbytes() ||
+                    cache.gdn_conv->nbytes() !=
+                        cache.gdn_conv_checkpoint->nbytes()) {
+                    fprintf(stderr,
+                            "Engine: invalid Qwen3.5 verification checkpoint "
+                            "binding\n");
+                    return false;
+                }
+            }
+        }
         if (!load_graph(graph_mtp_, exec_ctx_mtp_, mtp_path.c_str())) {
             return false;
         }
@@ -1372,6 +1551,9 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             break;
         case PersistentInputKind::GDN_CONV:
             source = cache.gdn_conv;
+            break;
+        case PersistentInputKind::GDN_CHECKPOINT:
+        case PersistentInputKind::GDN_CONV_CHECKPOINT:
             break;
         case PersistentInputKind::STATE:
             source = cache.rwkv_state;

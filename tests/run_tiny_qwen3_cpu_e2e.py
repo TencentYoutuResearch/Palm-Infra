@@ -95,18 +95,19 @@ def build_qwen3_fixture_model(model_dir: Path) -> None:
     write_safetensors(model_dir / "model.safetensors", tensors)
 
 
-def build_qwen35_fixture_model(model_dir: Path) -> None:
+def build_qwen35_fixture_model(
+        model_dir: Path, force_accept: bool = False) -> None:
     import numpy as np
 
     hidden = 32
     head_dim = 8
     linear_heads = 2
-    linear_value_heads = 2
+    linear_value_heads = 4
     linear_k_dim = 8
     linear_v_dim = 8
     qkv_total = linear_heads * linear_k_dim * 2 + linear_value_heads * linear_v_dim
     intermediate = 64
-    vocab = 32
+    vocab = 1 if force_accept else 32
     rng = np.random.default_rng(20260730)
 
     def matrix(rows: int, cols: int) -> object:
@@ -133,13 +134,16 @@ def build_qwen35_fixture_model(model_dir: Path) -> None:
             "linear_conv_kernel_dim": 4,
             "intermediate_size": intermediate,
             "vocab_size": vocab,
+            "mtp_num_hidden_layers": 1,
         },
     }
     (model_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
     prefix = "model.language_model.layers.0"
     tensors = {
         "model.language_model.embed_tokens.weight": matrix(vocab, hidden),
-        "lm_head.weight": matrix(vocab, hidden),
+        "lm_head.weight": (
+            np.zeros((vocab, hidden), dtype=np.float16)
+            if force_accept else matrix(vocab, hidden)),
         "model.language_model.norm.weight": np.zeros(hidden, dtype=np.float32),
         f"{prefix}.input_layernorm.weight": np.zeros(hidden, dtype=np.float32),
         f"{prefix}.post_attention_layernorm.weight": np.zeros(hidden, dtype=np.float32),
@@ -157,6 +161,21 @@ def build_qwen35_fixture_model(model_dir: Path) -> None:
         f"{prefix}.mlp.gate_proj.weight": matrix(intermediate, hidden),
         f"{prefix}.mlp.up_proj.weight": matrix(intermediate, hidden),
         f"{prefix}.mlp.down_proj.weight": matrix(hidden, intermediate),
+        "mtp.pre_fc_norm_embedding.weight": np.zeros(hidden, dtype=np.float32),
+        "mtp.pre_fc_norm_hidden.weight": np.zeros(hidden, dtype=np.float32),
+        "mtp.fc.weight": matrix(hidden, 2 * hidden),
+        "mtp.layers.0.input_layernorm.weight": np.zeros(hidden, dtype=np.float32),
+        "mtp.layers.0.post_attention_layernorm.weight": np.zeros(hidden, dtype=np.float32),
+        "mtp.layers.0.self_attn.q_proj.weight": matrix(2 * 2 * head_dim, hidden),
+        "mtp.layers.0.self_attn.k_proj.weight": matrix(head_dim, hidden),
+        "mtp.layers.0.self_attn.v_proj.weight": matrix(head_dim, hidden),
+        "mtp.layers.0.self_attn.q_norm.weight": np.zeros(head_dim, dtype=np.float32),
+        "mtp.layers.0.self_attn.k_norm.weight": np.zeros(head_dim, dtype=np.float32),
+        "mtp.layers.0.self_attn.o_proj.weight": matrix(hidden, 2 * head_dim),
+        "mtp.layers.0.mlp.gate_proj.weight": matrix(intermediate, hidden),
+        "mtp.layers.0.mlp.up_proj.weight": matrix(intermediate, hidden),
+        "mtp.layers.0.mlp.down_proj.weight": matrix(hidden, intermediate),
+        "mtp.norm.weight": np.zeros(hidden, dtype=np.float32),
     }
     write_safetensors(model_dir / "model.safetensors", tensors)
 
@@ -197,24 +216,31 @@ def main() -> int:
         qwen3_dir = temp_dir / "qwen3"
         qwen3_dir.mkdir()
         build_qwen3_fixture_model(qwen3_dir)
-        qwen35_dir = temp_dir / "qwen35"
-        qwen35_dir.mkdir()
-        build_qwen35_fixture_model(qwen35_dir)
+        qwen35_reject_dir = temp_dir / "qwen35_reject"
+        qwen35_reject_dir.mkdir()
+        build_qwen35_fixture_model(qwen35_reject_dir)
+        qwen35_accept_dir = temp_dir / "qwen35_accept"
+        qwen35_accept_dir.mkdir()
+        build_qwen35_fixture_model(qwen35_accept_dir, force_accept=True)
         fp16 = temp_dir / "tiny_fp16.mollm"
         w4 = temp_dir / "tiny_w4g32.mollm"
-        qwen35 = temp_dir / "tiny_qwen35_fp16.mollm"
+        qwen35_reject = temp_dir / "tiny_qwen35_reject_fp16.mollm"
+        qwen35_accept = temp_dir / "tiny_qwen35_accept_fp16.mollm"
         environment = os.environ.copy()
         environment["MOLLM_QUANT_HELPER"] = str(quantizer)
         environment["MOLLM_QUANT_THREADS"] = "1"
         for model_dir, package, quant in (
                 (qwen3_dir, fp16, "fp16"),
                 (qwen3_dir, w4, "w4g32"),
-                (qwen35_dir, qwen35, "fp16")):
+                (qwen35_reject_dir, qwen35_reject, "fp16"),
+                (qwen35_accept_dir, qwen35_accept, "fp16")):
             subprocess.run(
                 [sys.executable, str(converter), str(model_dir), str(package), quant],
                 check=True, env=environment, cwd=str(converter.parent.parent))
         assert_has_bg32_weight(w4)
-        subprocess.run([str(runner), str(fp16), str(w4), str(qwen35)], check=True)
+        subprocess.run(
+            [str(runner), str(fp16), str(w4), str(qwen35_reject),
+             str(qwen35_accept)], check=True)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
     return 0

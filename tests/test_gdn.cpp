@@ -389,11 +389,150 @@ static bool test_prefill_then_decode() {
     return ok;
 }
 
+
+static bool test_transactional_conv_verify(int num_v_heads) {
+    const int num_heads = 2;
+    const int k_dim = 4;
+    const int v_dim = 4;
+    const int seq_len = 2;
+    const int conv_kernel = 4;
+    const int qkv_total =
+        2 * num_heads * k_dim + num_v_heads * v_dim;
+    const int z_dim = num_v_heads * v_dim;
+    const int state_size = num_v_heads * k_dim * v_dim;
+    const int conv_state_size = qkv_total * (conv_kernel - 1);
+    unsigned int seed = 700u + static_cast<unsigned int>(num_v_heads);
+
+    std::vector<float> qkv(seq_len * qkv_total);
+    std::vector<float> a(seq_len * num_v_heads);
+    std::vector<float> b(seq_len * num_v_heads);
+    std::vector<float> z(seq_len * z_dim);
+    std::vector<float> A_log(num_v_heads);
+    std::vector<float> dt_bias(num_v_heads);
+    std::vector<float> norm(v_dim);
+    std::vector<float> conv_weight(qkv_total * conv_kernel);
+    fill_rand(qkv.data(), qkv.size(), &seed);
+    fill_rand(a.data(), a.size(), &seed);
+    fill_rand(b.data(), b.size(), &seed);
+    fill_rand(z.data(), z.size(), &seed);
+    fill_rand(A_log.data(), A_log.size(), &seed);
+    fill_rand(dt_bias.data(), dt_bias.size(), &seed);
+    fill_rand(norm.data(), norm.size(), &seed);
+    fill_rand(conv_weight.data(), conv_weight.size(), &seed);
+
+    std::vector<float> initial_state(state_size);
+    std::vector<float> initial_conv(conv_state_size);
+    fill_rand(initial_state.data(), initial_state.size(), &seed);
+    fill_rand(initial_conv.data(), initial_conv.size(), &seed);
+    std::vector<float> sequential_state = initial_state;
+    std::vector<float> sequential_conv = initial_conv;
+    std::vector<float> sequential_out(seq_len * z_dim, 0.0f);
+    std::vector<float> midpoint_state;
+    std::vector<float> midpoint_conv;
+
+    auto tensor = [](int d0, int d1, void* data) {
+        return Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, d0, d1, 1, 1, data);
+    };
+    Tensor A_t = tensor(num_v_heads, 1, A_log.data());
+    Tensor dt_t = tensor(num_v_heads, 1, dt_bias.data());
+    Tensor norm_t = tensor(v_dim, 1, norm.data());
+    Tensor conv_weight_t =
+        tensor(qkv_total, conv_kernel, conv_weight.data());
+    Tensor sequential_state_t =
+        tensor(state_size, 1, sequential_state.data());
+    Tensor sequential_conv_t =
+        tensor(qkv_total, conv_kernel - 1, sequential_conv.data());
+
+    OpParams decode_params;
+    decode_params.i32 = {num_heads, k_dim, v_dim, 1, 1, conv_kernel,
+                         1, num_v_heads};
+    decode_params.f32 = {1e-6f, 1e-6f, 1.f / std::sqrt((float)k_dim)};
+    for (int token = 0; token < seq_len; ++token) {
+        Tensor qkv_t = tensor(
+            qkv_total, 1, qkv.data() + token * qkv_total);
+        Tensor a_t = tensor(
+            num_v_heads, 1, a.data() + token * num_v_heads);
+        Tensor b_t = tensor(
+            num_v_heads, 1, b.data() + token * num_v_heads);
+        Tensor z_t = tensor(z_dim, 1, z.data() + token * z_dim);
+        Tensor out_t = tensor(
+            z_dim, 1, sequential_out.data() + token * z_dim);
+        std::vector<const Tensor*> inputs = {
+            &qkv_t, &a_t, &b_t, &z_t, &A_t, &dt_t, &norm_t,
+            &sequential_state_t, &conv_weight_t, &sequential_conv_t};
+        std::vector<Tensor*> outputs = {&out_t};
+        kernel_gdn_conv_decode(decode_params, inputs, outputs, nullptr);
+        if (token == 0) {
+            midpoint_state = sequential_state;
+            midpoint_conv = sequential_conv;
+        }
+    }
+
+    std::vector<float> verify_state = initial_state;
+    std::vector<float> verify_conv = initial_conv;
+    std::vector<float> checkpoint_state(state_size, 0.0f);
+    std::vector<float> checkpoint_conv(conv_state_size, 0.0f);
+    std::vector<float> verify_out(seq_len * z_dim, 0.0f);
+    Tensor qkv_t = tensor(qkv_total, seq_len, qkv.data());
+    Tensor a_t = tensor(num_v_heads, seq_len, a.data());
+    Tensor b_t = tensor(num_v_heads, seq_len, b.data());
+    Tensor z_t = tensor(z_dim, seq_len, z.data());
+    Tensor verify_state_t = tensor(state_size, 1, verify_state.data());
+    Tensor verify_conv_t =
+        tensor(qkv_total, conv_kernel - 1, verify_conv.data());
+    Tensor checkpoint_state_t =
+        tensor(state_size, 1, checkpoint_state.data());
+    Tensor checkpoint_conv_t =
+        tensor(qkv_total, conv_kernel - 1, checkpoint_conv.data());
+    Tensor verify_out_t = tensor(z_dim, seq_len, verify_out.data());
+    OpParams verify_params = decode_params;
+    verify_params.i32[3] = seq_len;
+    verify_params.i32.push_back(1);
+    std::vector<const Tensor*> verify_inputs = {
+        &qkv_t, &a_t, &b_t, &z_t, &A_t, &dt_t, &norm_t,
+        &verify_state_t, &conv_weight_t, &verify_conv_t,
+        &checkpoint_state_t, &checkpoint_conv_t};
+    std::vector<Tensor*> verify_outputs = {&verify_out_t};
+    kernel_gdn_conv_verify(
+        verify_params, verify_inputs, verify_outputs, nullptr);
+
+    bool ok = compare(
+        sequential_out.data(), verify_out.data(), seq_len * z_dim,
+        num_v_heads == num_heads ? "verify output" : "repeat verify output");
+    ok &= std::memcmp(sequential_state.data(), verify_state.data(),
+                      verify_state.size() * sizeof(float)) == 0;
+    ok &= std::memcmp(sequential_conv.data(), verify_conv.data(),
+                      verify_conv.size() * sizeof(float)) == 0;
+    ok &= std::memcmp(midpoint_state.data(), checkpoint_state.data(),
+                      checkpoint_state.size() * sizeof(float)) == 0;
+    ok &= std::memcmp(midpoint_conv.data(), checkpoint_conv.data(),
+                      checkpoint_conv.size() * sizeof(float)) == 0;
+    CHECK(checkpoint_conv.size() * sizeof(float) ==
+              static_cast<size_t>(qkv_total * (conv_kernel - 1)) *
+                  sizeof(float),
+          "transactional conv checkpoint uses the full FP32 byte count");
+
+    std::memcpy(verify_state.data(), checkpoint_state.data(),
+                checkpoint_state.size() * sizeof(float));
+    std::memcpy(verify_conv.data(), checkpoint_conv.data(),
+                checkpoint_conv.size() * sizeof(float));
+    ok &= std::memcmp(midpoint_state.data(), verify_state.data(),
+                      verify_state.size() * sizeof(float)) == 0;
+    ok &= std::memcmp(midpoint_conv.data(), verify_conv.data(),
+                      verify_conv.size() * sizeof(float)) == 0;
+    return ok;
+}
+
 int main() {
     CHECK(test_prefill_basic(),                "GDN prefill matches reference");
     CHECK(test_prefill_repeated_value_heads(), "GDN repeat-value-head prefill matches reference");
     CHECK(test_decode_basic(),                 "GDN decode matches reference");
     CHECK(test_prefill_then_decode(),          "GDN prefill→decode state continuity");
+    CHECK(test_transactional_conv_verify(2),
+          "GDN transactional verification matches sequential midpoint");
+    CHECK(test_transactional_conv_verify(4),
+          "GDN repeated-value-head transactional verification matches sequential midpoint");
     printf(failures ? "\n%d FAILED\n" : "\nAll GDN tests passed!\n", failures);
     return failures;
 }

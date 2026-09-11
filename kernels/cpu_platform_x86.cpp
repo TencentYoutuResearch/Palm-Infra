@@ -21,6 +21,8 @@ using DenseFp32Fn = void (*)(const float*, const float*, float*, int, int, int,
                              int, int, int, int);
 using DenseFp16Fn = void (*)(const float*, const fp16_t*, float*, int, int, int,
                              int, int, int, int);
+using DenseFp16M2Fn = void (*)(const float*, const fp16_t*, float*, int, int,
+                               int, int, int, int, int);
 using Int4Fn = void (*)(const Tensor&, const Tensor&, Tensor&, int, int, int,
                         int, int, int);
 using Int8Fn = void (*)(const float*, const int8_t*, const float*, float*, int,
@@ -36,6 +38,7 @@ struct X86Dispatch {
     const char* name = "x86-scalar";
     DenseFp32Fn fp32 = nullptr;
     DenseFp16Fn fp16 = nullptr;
+    DenseFp16M2Fn fp16_m2 = nullptr;
     Int4Fn int4 = nullptr;
     Int4VnniFn int4_vnni = nullptr;
     QuantizeVnniFn quantize_vnni = nullptr;
@@ -75,8 +78,11 @@ X86Dispatch detect_dispatch() {
         dispatch.caps.x86_isa = X86Isa::AVX512;
         dispatch.name = "x86-avx512";
         dispatch.fp32 = x86::matmul_fp32_avx512_range;
-        if (has_f16c)
+        if (has_f16c) {
             dispatch.fp16 = x86::matmul_fp16_avx512_range;
+            dispatch.fp16_m2 = x86::matmul_fp16_m2_avx512_range_n;
+        }
+        dispatch.caps.fp16_m2_shared_weight = dispatch.fp16_m2 != nullptr;
         dispatch.int4 = x86::matmul_int4_bg_avx512_range;
         if (dispatch.caps.x86_avx512_vnni)
             dispatch.int4_vnni = x86::matmul_int4_bg32_vnni_range;
@@ -92,8 +98,11 @@ X86Dispatch detect_dispatch() {
         dispatch.caps.x86_isa = X86Isa::AVX2;
         dispatch.name = "x86-avx2";
         dispatch.fp32 = x86::matmul_fp32_avx2_range;
-        if (has_f16c)
+        if (has_f16c) {
             dispatch.fp16 = x86::matmul_fp16_avx2_range;
+            dispatch.fp16_m2 = x86::matmul_fp16_m2_avx2_range_n;
+        }
+        dispatch.caps.fp16_m2_shared_weight = dispatch.fp16_m2 != nullptr;
         dispatch.int4 = x86::matmul_int4_bg_avx2_range;
         dispatch.int8 = x86::matmul_int8_avx2_range;
     }
@@ -286,6 +295,17 @@ bool matmul_dense_fp16_range(const float* A, const fp16_t* B, float* C, int N,
     if (interleaved || !kernel)
         return false;
     kernel(A, B, C, N, K, lda, K_weight, ldc, m_begin, m_end);
+    return true;
+}
+
+bool matmul_dense_fp16_m2_range_n(
+    const float* A, const fp16_t* B, float* C,
+    int N, int K, int lda, int K_weight, int ldc,
+    int n_begin, int n_end) {
+    const auto kernel = dispatch().fp16_m2;
+    if (!kernel)
+        return false;
+    kernel(A, B, C, N, K, lda, K_weight, ldc, n_begin, n_end);
     return true;
 }
 

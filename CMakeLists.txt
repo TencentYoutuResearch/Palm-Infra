@@ -530,6 +530,18 @@ if(MOLLM_BUILD_TESTS)
             NAME test_hy_v3_adapter
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hy_v3_adapter.py)
+        if(TARGET mollm_bench)
+            add_test(
+                NAME bench_qwen35_mtp
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_qwen35_mtp.py
+                        $<TARGET_FILE:mollm_bench>)
+            set_tests_properties(bench_qwen35_mtp
+                                 PROPERTIES SKIP_RETURN_CODE 77
+                                            RUN_SERIAL TRUE
+                                            TIMEOUT 1800
+                                            LABELS "performance;cpu;real-fixture")
+        endif()
         add_executable(test_tiny_cpu_inference tests/test_tiny_cpu_inference.cpp)
         target_link_libraries(test_tiny_cpu_inference PRIVATE mollm_lib)
         add_dependencies(test_tiny_cpu_inference mollm-quantize)

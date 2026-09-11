@@ -110,6 +110,8 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             }
         } else if (arg == "--profile") {
             opts.profile = true;
+        } else if (arg == "--dump-token-ids") {
+            opts.dump_token_ids = true;
         } else if (arg == "--static-padded") {
             opts.static_padded = true;
         } else if (arg == "--device") {
@@ -309,6 +311,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --threads <int>          Default: auto (%d on this host)\n",
                 default_worker_threads());
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
+    std::printf("  --dump-token-ids         Print generated token IDs in bench output\n");
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
     std::printf("  --device <cpu|metal|cuda> Compute backend (GPU backends require their build option)\n");
     std::printf("  --require-native         Reject accelerator operator fallback\n");

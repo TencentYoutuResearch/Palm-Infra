@@ -67,6 +67,7 @@ struct ExecContext {
     int  runtime_batch   = -1;     // reserved for future BATCH dim support
     bool static_padded   = false;  // STATIC_PADDED mode (NPU backend future)
     int  padded_seq_len  = -1;     // padded_seq_len for STATIC_PADDED mode
+    int  confirmed_prefix_tokens = 0;  // transactional verification checkpoint
 
     // liveness: release_queue[i] = nodes that can be freed after node i
     std::vector<std::vector<uint32_t>> release_queue;

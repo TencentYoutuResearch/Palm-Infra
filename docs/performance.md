@@ -33,6 +33,35 @@ greedy generation check produced byte-identical text across scalar, AVX2, and
 AVX-512. These are development measurements rather than a cross-runtime
 comparison.
 
+#### Qwen3.5-4B transactional MTP
+
+The CPU greedy transactional-MTP path was measured on a 13th Gen Intel
+Core i9-13900HX using the AVX2 provider, four threads, and an official
+`Qwen/Qwen3.5-4B` text-only FP16 package converted from revision
+`851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. Plain and MTP runs used the same
+package and binary, 256 dummy prompt tokens, `warmup=3`, and five alternating
+independent processes per arm. `--max-new-tokens 65` is required for exactly
+64 timed decode tokens because the first generated token is produced during
+prefill.
+
+```text
+plain decode median: 6.21 tok/s
+MTP decode median:    9.61 tok/s
+MTP speedup:          1.5475x
+MTP acceptance:       100.0% (aggregate)
+```
+
+The ten observed decode samples were plain `6.21, 6.21, 6.21, 6.26, 6.22`
+tok/s and MTP `9.45, 9.52, 9.61, 9.63, 9.67` tok/s. Generated token IDs
+matched exactly for every paired run. The package SHA-256 was
+`b7afac4aea1e32296207665cd75dcbcc669570422d34d8af7769fcc8c970e18a`.
+
+The shared-weight FP16 `M=2` kernel measured `26.89 ms` for the
+`M=2,K=2560,N=248320` LM-head shape versus `25.64 ms` for `M=1`, while the
+verification profile routed all target `M=2` matmuls through
+`fp16_m2_shared_weight`. This optimization is CPU x86-specific; quantized,
+vision, Metal, and multi-draft MTP are not covered by these results.
+
 ### Apple Silicon
 
 The results below compare mollm with llama.cpp on an Apple M5 Pro using four

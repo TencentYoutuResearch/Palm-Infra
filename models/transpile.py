@@ -80,6 +80,7 @@ class OpType(IntEnum):
     GATED_DELTANET_DECODE  = 110
     GATED_DELTANET_PREFILL = 111
     GATED_DELTANET_CONV_DECODE = 112
+    GATED_DELTANET_CONV_VERIFY = 113
     MOE            = 120
     HC_PRE         = 130
     HC_POST        = 131
@@ -351,7 +352,8 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
         return (_CONST, DimExpr.seq(), _CONST, _CONST)
 
     if op in (OpType.GATED_DELTANET_DECODE,
-              OpType.GATED_DELTANET_CONV_DECODE):
+              OpType.GATED_DELTANET_CONV_DECODE,
+              OpType.GATED_DELTANET_CONV_VERIFY):
         return _CONST4
 
     # Default: don't propagate (conservative).
@@ -1028,6 +1030,28 @@ class GraphBuilder:
                  (1 if use_qk_l2norm else 0) |
                  (2 if output_gate_type == "sigmoid" else 0),
                  conv_kernel, 0, num_v_heads],
+            f32=[rms_eps, 1e-6, scale])
+
+    def gated_deltanet_conv_verify(
+            self, qkv: int, a_out: int, b_out: int, z_out: int,
+            A_log: int, dt_bias: int, norm_weight: int, gdn_state: int,
+            conv_weight: int, conv_state: int, gdn_checkpoint: int,
+            conv_checkpoint: int, num_heads: int, k_dim: int, v_dim: int,
+            seq_len: int, conv_kernel: int, use_qk_l2norm: bool = True,
+            rms_eps: float = 1e-6, num_v_heads: int | None = None) -> int:
+        """Verify a short sequence while checkpointing the confirmed prefix."""
+        if num_v_heads is None:
+            num_v_heads = num_heads
+        scale = float(k_dim ** -0.5)
+        return self._add(
+            OpType.GATED_DELTANET_CONV_VERIFY,
+            [qkv, a_out, b_out, z_out, A_log, dt_bias, norm_weight,
+             gdn_state, conv_weight, conv_state, gdn_checkpoint,
+             conv_checkpoint],
+            (num_v_heads * v_dim, seq_len),
+            prec=Precision.FP32,
+            i32=[num_heads, k_dim, v_dim, seq_len,
+                 1 if use_qk_l2norm else 0, conv_kernel, 0, num_v_heads, 1],
             f32=[rms_eps, 1e-6, scale])
 
     def moe(self, hidden: int, router: int,
@@ -2076,6 +2100,7 @@ def save_package(output_path: str,
                  jinja_path: str = "",
                  g_vision: 'GraphBuilder | None' = None,
                  g_mtp: 'GraphBuilder | None' = None,
+                 g_mtp_verify: 'GraphBuilder | None' = None,
                  remove_weight_files: bool = False,
                  streamed_weights: dict[str, StreamedWeight] | None = None):
     """Pack model graphs + weights + tokenizer + jinja into one .mollm file.
@@ -2097,9 +2122,10 @@ def save_package(output_path: str,
         g_decode.save(os.path.join(tmp_dir, "model_decode"))
         if g_vision is not None:
             g_vision.save(os.path.join(tmp_dir, "model_vision"))
+        if g_mtp_verify is not None:
+            g_mtp_verify.save(os.path.join(tmp_dir, "model_mtp_verify"))
         if g_mtp is not None:
             g_mtp.save(os.path.join(tmp_dir, "model_mtp"))
-
         # Step 2: read graph bytes
         with open(os.path.join(tmp_dir, "model_prefill.graph"), 'rb') as f:
             pf_bytes = f.read()
@@ -2109,10 +2135,15 @@ def save_package(output_path: str,
         if g_vision is not None:
             with open(os.path.join(tmp_dir, "model_vision.graph"), 'rb') as f:
                 vi_bytes = f.read()
+        mtp_verify_bytes = b""
+        if g_mtp_verify is not None:
+            with open(os.path.join(tmp_dir, "model_mtp_verify.graph"), 'rb') as f:
+                mtp_verify_bytes = f.read()
         mtp_bytes = b""
         if g_mtp is not None:
             with open(os.path.join(tmp_dir, "model_mtp.graph"), 'rb') as f:
                 mtp_bytes = f.read()
+        mtp_bundle_bytes = mtp_verify_bytes + mtp_bytes
 
         # Step 3: collect weight files referenced by both graphs
         weight_files = {}  # relative_name -> (offset, size)
@@ -2128,6 +2159,8 @@ def save_package(output_path: str,
         graphs = [g_prefill, g_decode]
         if g_vision is not None:
             graphs.append(g_vision)
+        if g_mtp_verify is not None:
+            graphs.append(g_mtp_verify)
         if g_mtp is not None:
             graphs.append(g_mtp)
         for g in graphs:
@@ -2172,9 +2205,9 @@ def save_package(output_path: str,
                 weight_paths[ref] = wpath
                 weight_headers[ref] = header
 
-        # Step 4: build metadata
         meta = dict(metadata)
         meta["weights"] = weight_files
+        meta["mtp_verify_graph_length"] = len(mtp_verify_bytes)
         if any(int(header["precision"]) == int(Precision.INT4)
                for header in weight_headers.values()):
             meta["int4_storage"] = "canonical_bg_block_v1"
@@ -2230,9 +2263,8 @@ def save_package(output_path: str,
         dc_off = pf_off + len(pf_bytes)
         vi_off = dc_off + len(dc_bytes) if vi_bytes else 0
         mtp_off = dc_off + len(dc_bytes) + len(vi_bytes)
-        weights_unaligned = mtp_off + len(mtp_bytes)
+        weights_unaligned = mtp_off + len(mtp_bundle_bytes)
         w_off = (weights_unaligned + 63) & ~63
-
         with open(output_path, 'wb') as f:
             f.write(struct.pack('<II', PACKAGE_MAGIC, PACKAGE_VERSION))
             f.write(struct.pack('<QQ', meta_off, len(meta_json)))
@@ -2242,14 +2274,14 @@ def save_package(output_path: str,
             f.write(struct.pack('<QQ', dc_off, len(dc_bytes)))
             f.write(struct.pack('<QQ', w_off, weights_len))
             f.write(struct.pack('<QQ', vi_off, len(vi_bytes)))
-            f.write(struct.pack('<Q', len(mtp_bytes)))
+            f.write(struct.pack('<Q', len(mtp_bundle_bytes)))
             f.write(meta_json)
             f.write(tok_bytes)
             f.write(jinja_bytes)
             f.write(pf_bytes)
             f.write(dc_bytes)
             f.write(vi_bytes)
-            f.write(mtp_bytes)
+            f.write(mtp_bundle_bytes)
             f.write(b'\0' * (w_off - weights_unaligned))
             buf = bytearray(8 * 1024 * 1024)
             view = memoryview(buf)
@@ -2277,7 +2309,7 @@ def save_package(output_path: str,
         print(f"Saved {output_path} ({weights_len} weights + {len(tok_bytes)} tokenizer + "
               f"{len(jinja_bytes)} jinja + {len(pf_bytes)} prefill + "
               f"{len(dc_bytes)} decode + {len(vi_bytes)} vision + "
-              f"{len(mtp_bytes)} MTP = {total} bytes)")
+              f"{len(mtp_bundle_bytes)} MTP = {total} bytes)")
 
     finally:
         shutil.rmtree(tmp_dir)
