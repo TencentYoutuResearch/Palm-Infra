@@ -2,6 +2,7 @@
 
 #include "graph/graph.h"
 #include "graph/execute.h"
+#include "core/cache_layout.h"
 #include "engine/backend.h"
 #include "engine/accelerator_backend.h"
 #include "engine/sampler.h"
@@ -22,45 +23,6 @@
 // KV cache with embedded metadata header.
 // Weights shared between graphs via path-dedup mapping.
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// CacheMetadata — embedded in KV cache buffer header (64 bytes)
-//
-// Layout of a cache buffer:
-//   [0..63]       CacheMetadata
-//   [64..]        key/value data (FP32)
-// ---------------------------------------------------------------------------
-
-struct CacheMetadata {
-    uint64_t current_seq_len = 0;   // valid sequence length (past_len)
-    uint64_t max_seq_len     = 0;   // buffer capacity (n_ctx)
-    uint64_t num_kv_heads    = 0;
-    uint64_t head_dim        = 0;
-    uint64_t v_head_dim      = 0;
-    uint64_t reserved[3]     = {0, 0, 0};
-
-    static constexpr size_t SIZE = 64;
-};
-
-static_assert(sizeof(CacheMetadata) == CacheMetadata::SIZE, "CacheMetadata must be 64 bytes");
-
-// Helper: get metadata pointer from cache tensor data
-inline CacheMetadata* cache_meta(void* data) {
-    return static_cast<CacheMetadata*>(data);
-}
-
-inline const CacheMetadata* cache_meta(const void* data) {
-    return static_cast<const CacheMetadata*>(data);
-}
-
-// Helper: get key/value data pointer (after metadata header)
-inline void* cache_data(void* data) {
-    return static_cast<char*>(data) + CacheMetadata::SIZE;
-}
-
-inline const void* cache_data(const void* data) {
-    return static_cast<const char*>(data) + CacheMetadata::SIZE;
-}
 
 // ---------------------------------------------------------------------------
 // EngineConfig

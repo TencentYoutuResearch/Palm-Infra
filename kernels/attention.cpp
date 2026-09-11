@@ -1,7 +1,7 @@
 #include "kernels/attention.h"
 #include "kernels/matmul.h"
 #include "kernels/threading.h"
-#include "engine/engine.h"  // for CacheMetadata, cache_meta, cache_data
+#include "core/cache_layout.h"
 
 #if defined(MOLLM_CPU_X86_SIMD)
 #include "kernels/attention_x86.h"
