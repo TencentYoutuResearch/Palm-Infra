@@ -4,7 +4,7 @@
 #include "kernels/matmul.h"
 #include "kernels/trace.h"
 #ifdef MOLLM_METAL
-#include "engine/metal_backend.h"
+#include "backends/metal/backend.h"
 #endif
 #include <algorithm>
 #include <cassert>

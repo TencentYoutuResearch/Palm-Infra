@@ -7,7 +7,7 @@
 #include "kernels/trace.h"
 #include "kernels/cpu_platform.h"
 #ifdef MOLLM_METAL
-#include "engine/metal_backend.h"
+#include "backends/metal/backend.h"
 #endif
 #ifdef MOLLM_CUDA
 #include "backends/cuda/backend.h"

@@ -1,4 +1,4 @@
-#include "graph/metal_pool.h"
+#include "backends/metal/buffer_pool.h"
 
 #import <Metal/Metal.h>
 
