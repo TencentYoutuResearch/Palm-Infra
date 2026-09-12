@@ -220,10 +220,10 @@ static inline bool broadcasts_to(const Tensor& b, const Tensor& a) {
     return true;
 }
 
-void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
+void kernel_elementwise(ElementwiseOp op, const std::vector<const Tensor*>& inputs,
                         Tensor* output, ThreadPool* thread_pool) {
     switch (op) {
-    case OpType::ADD:
+    case ElementwiseOp::ADD:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             const Tensor& a = *inputs[0];
             const Tensor& b = *inputs[1];
@@ -316,7 +316,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::MUL:
+    case ElementwiseOp::MUL:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             const Tensor& a = *inputs[0];
             const Tensor& b = *inputs[1];
@@ -393,7 +393,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::SIGMOID_MUL:
+    case ElementwiseOp::SIGMOID_MUL:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             const Tensor& value = *inputs[0];
             const Tensor& gate = *inputs[1];
@@ -448,7 +448,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::SILU:
+    case ElementwiseOp::SILU:
         // SiLU: x * sigmoid(x). Stride-aware — handles SLICE views (gate/up
         // halves of merged gate_up matmul).
         if (inputs.size() >= 1 && inputs[0] && output) {
@@ -483,7 +483,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::GELU:
+    case ElementwiseOp::GELU:
         // Match the fused MATMUL GELU convention used by both backends.
         if (inputs.size() >= 1 && inputs[0] && output) {
             const Tensor& src = *inputs[0];
@@ -507,7 +507,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::TANH:
+    case ElementwiseOp::TANH:
         if (inputs.size() >= 1 && inputs[0] && output) {
             const Tensor& src = *inputs[0];
             const char* base = (const char*)src.data;
@@ -526,7 +526,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::SWIGLU:
+    case ElementwiseOp::SWIGLU:
         // Fused SwiGLU over a merged [2I, ...] tensor: out[i] = silu(gate[i]) *
         // up[i], gate = row[0..I), up = row[I..2I). Reads both halves from the
         // single merged row (stride-aware); output is dense [I, ...]. NOT a
@@ -582,7 +582,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::SIGMOID:
+    case ElementwiseOp::SIGMOID:
         if (inputs.size() >= 1 && inputs[0] && output) {
             float* o = output->ptr<float>();
 #if HAS_NEON
@@ -611,7 +611,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::SIGMOID_EXACT:
+    case ElementwiseOp::SIGMOID_EXACT:
         if (inputs.size() >= 1 && inputs[0] && output) {
             const Tensor& src = *inputs[0];
             const int64_t total = src.nelements();
@@ -648,7 +648,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::EXP:
+    case ElementwiseOp::EXP:
         if (inputs.size() >= 1 && inputs[0] && output) {
             float* o = output->ptr<float>();
 #if HAS_NEON
@@ -698,7 +698,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::EXP_EXACT:
+    case ElementwiseOp::EXP_EXACT:
         if (inputs.size() >= 1 && inputs[0] && output) {
             const Tensor& src = *inputs[0];
             const int64_t total = src.nelements();
@@ -730,7 +730,7 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
-    case OpType::SOFTPLUS:
+    case ElementwiseOp::SOFTPLUS:
         if (inputs.size() >= 1 && inputs[0] && output) {
             float* o = output->ptr<float>();
 #if HAS_NEON

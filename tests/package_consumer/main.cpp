@@ -2,6 +2,8 @@
 #include <engine/sampler.h>
 #include <engine/tokenizer.h>
 #include <core/activation.h>
+#include <core/gdn_params.h>
+#include <core/rwkv_params.h>
 #include <core/attention_params.h>
 #include <core/shortconv_params.h>
 #include <core/bf16.h>

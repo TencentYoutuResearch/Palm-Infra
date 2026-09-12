@@ -19,6 +19,26 @@
 #include <cstring>
 #include <vector>
 
+namespace {
+
+GdnParams resolve_gdn_params(const OpParams& params) {
+    GdnParams result;
+    result.num_heads = graph_params::get_i32(params, 0, 16);
+    result.k_head_dim = graph_params::get_i32(params, 1, 128);
+    result.v_head_dim = graph_params::get_i32(params, 2, 128);
+    result.seq_len = graph_params::get_i32(params, 3, 4);
+    result.flags = graph_params::get_i32(params, 4, 1);
+    result.conv_kernel = graph_params::get_i32(params, 5, 4);
+    result.real_tokens = graph_params::get_i32(params, 6, result.seq_len);
+    result.num_v_heads = graph_params::get_i32(params, 7, result.num_heads);
+    result.rms_eps = graph_params::get_f32(params, 0, 1e-6f);
+    result.l2norm_eps = graph_params::get_f32(params, 1, 1e-6f);
+    result.scale = graph_params::get_f32(params, 2, 0.f);
+    return result;
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // CPUBackend::dispatch — CPU graph dispatcher.
 //
@@ -214,17 +234,17 @@ void CPUBackend::dispatch(const GraphNode& node,
     }
     case OpType::GATED_DELTANET_PREFILL: {
         std::vector<Tensor*> gdn_outs = { output };
-        kernel_gdn_prefill(params, inputs, gdn_outs, thread_pool);
+        kernel_gdn_prefill(resolve_gdn_params(params), inputs, gdn_outs, thread_pool);
         break;
     }
     case OpType::GATED_DELTANET_DECODE: {
         std::vector<Tensor*> gdn_outs = { output };
-        kernel_gdn_decode(params, inputs, gdn_outs, thread_pool);
+        kernel_gdn_decode(resolve_gdn_params(params), inputs, gdn_outs, thread_pool);
         break;
     }
     case OpType::GATED_DELTANET_CONV_DECODE: {
         std::vector<Tensor*> gdn_outs = { output };
-        kernel_gdn_conv_decode(params, inputs, gdn_outs, thread_pool);
+        kernel_gdn_conv_decode(resolve_gdn_params(params), inputs, gdn_outs, thread_pool);
         break;
     }
     case OpType::MOE: {
@@ -547,21 +567,40 @@ void CPUBackend::dispatch(const GraphNode& node,
             reject();
         }
         break;
-    case OpType::RWKV_TOKEN_SHIFT:
-        kernel_rwkv_token_shift(params, inputs, *output);
+    case OpType::RWKV_TOKEN_SHIFT: {
+        RwkvTokenShiftParams config;
+        config.hidden = graph_params::get_i32(params, 0, 0);
+        config.seq_len = graph_params::get_i32(params, 1, 1);
+        config.real_tokens = graph_params::get_i32(params, 2, config.seq_len);
+        kernel_rwkv_token_shift(config, inputs, *output);
         break;
+    }
     case OpType::RWKV_MIX:
-        kernel_rwkv_mix(params, inputs, *output);
+        kernel_rwkv_mix(inputs, *output);
         break;
     case OpType::RWKV_L2_NORM:
-        kernel_rwkv_l2_norm(params, inputs, *output);
+        kernel_rwkv_l2_norm(
+            RwkvL2NormParams{graph_params::get_i32(params, 0, 0),
+                             graph_params::get_i32(params, 1, 0),
+                             graph_params::get_f32(params, 0, 1e-12f)},
+            inputs, *output);
         break;
     case OpType::RWKV_POST:
-        kernel_rwkv_post(params, inputs, *output, thread_pool);
+        kernel_rwkv_post(
+            RwkvPostParams{graph_params::get_i32(params, 0, 0),
+                           graph_params::get_i32(params, 1, 0),
+                           graph_params::get_f32(params, 0, 64e-5f)},
+            inputs, *output, thread_pool);
         break;
-    case OpType::RWKV7:
-        kernel_rwkv7(params, inputs, *output, thread_pool);
+    case OpType::RWKV7: {
+        Rwkv7Params config;
+        config.num_heads = graph_params::get_i32(params, 0, 0);
+        config.head_dim = graph_params::get_i32(params, 1, 0);
+        config.seq_len = graph_params::get_i32(params, 2, 1);
+        config.real_tokens = graph_params::get_i32(params, 3, config.seq_len);
+        kernel_rwkv7(config, inputs, *output, thread_pool);
         break;
+    }
     case OpType::SHORTCONV:
         if (output)
             kernel_shortconv(
@@ -605,18 +644,40 @@ void CPUBackend::dispatch(const GraphNode& node,
 
 
     case OpType::ADD:
+        kernel_elementwise(ElementwiseOp::ADD, inputs, output, thread_pool);
+        break;
     case OpType::MUL:
+        kernel_elementwise(ElementwiseOp::MUL, inputs, output, thread_pool);
+        break;
     case OpType::SIGMOID_MUL:
+        kernel_elementwise(ElementwiseOp::SIGMOID_MUL, inputs, output, thread_pool);
+        break;
     case OpType::SILU:
+        kernel_elementwise(ElementwiseOp::SILU, inputs, output, thread_pool);
+        break;
     case OpType::GELU:
+        kernel_elementwise(ElementwiseOp::GELU, inputs, output, thread_pool);
+        break;
     case OpType::TANH:
+        kernel_elementwise(ElementwiseOp::TANH, inputs, output, thread_pool);
+        break;
     case OpType::SWIGLU:
+        kernel_elementwise(ElementwiseOp::SWIGLU, inputs, output, thread_pool);
+        break;
     case OpType::SIGMOID:
+        kernel_elementwise(ElementwiseOp::SIGMOID, inputs, output, thread_pool);
+        break;
     case OpType::SIGMOID_EXACT:
+        kernel_elementwise(ElementwiseOp::SIGMOID_EXACT, inputs, output, thread_pool);
+        break;
     case OpType::EXP:
+        kernel_elementwise(ElementwiseOp::EXP, inputs, output, thread_pool);
+        break;
     case OpType::EXP_EXACT:
+        kernel_elementwise(ElementwiseOp::EXP_EXACT, inputs, output, thread_pool);
+        break;
     case OpType::SOFTPLUS:
-        kernel_elementwise(op, inputs, output, thread_pool);
+        kernel_elementwise(ElementwiseOp::SOFTPLUS, inputs, output, thread_pool);
         break;
 
     default:

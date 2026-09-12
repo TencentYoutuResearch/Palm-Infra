@@ -1,7 +1,7 @@
 #include "backends/cuda/backend.h"
 #include "engine/engine.h"
 #include "graph/execute.h"
-#include "kernels/cpu/recurrent/gdn.h"
+#include "backends/cpu/backend.h"
 #include "core/quant_layouts.h"
 
 #include <algorithm>
@@ -1415,8 +1415,12 @@ bool test_gdn(CudaBackend& backend) {
         output_width, sequence_length, 1, 1, expected_output.data());
     std::vector<const Tensor*> host_inputs = {
         &h_qkv, &h_a, &h_b, &h_z, &h_a_log, &h_dt_bias, &h_norm, &h_state};
-    std::vector<Tensor*> host_outputs = {&h_output};
-    kernel_gdn_prefill(params, host_inputs, host_outputs);
+    {
+        GraphNode reference;
+        reference.op_type = OpType::GATED_DELTANET_PREFILL;
+        reference.params = params;
+        CPUBackend{}.dispatch(reference, host_inputs, &h_output, nullptr);
+    }
 
     Tensor qkv = device_tensor(backend, qkv_width, sequence_length);
     Tensor a = device_tensor(backend, value_heads, sequence_length);
@@ -1485,7 +1489,12 @@ bool test_gdn(CudaBackend& backend) {
     h_state.data = expected_raw_state.data();
     h_output.data = expected_raw_output.data();
     params.i32[4] = 0;
-    kernel_gdn_prefill(params, host_inputs, host_outputs);
+    {
+        GraphNode reference;
+        reference.op_type = OpType::GATED_DELTANET_PREFILL;
+        reference.params = params;
+        CPUBackend{}.dispatch(reference, host_inputs, &h_output, nullptr);
+    }
     if (!upload(backend, state, initial_state))
         return false;
     gdn.params = params;
@@ -1542,8 +1551,12 @@ bool test_gdn(CudaBackend& backend) {
     params.i32[6] = 1;
     host_inputs = {
         &h_qkv, &h_a, &h_b, &h_z, &h_a_log, &h_dt_bias, &h_norm, &h_state};
-    host_outputs = {&h_output};
-    kernel_gdn_decode(params, host_inputs, host_outputs);
+    {
+        GraphNode reference;
+        reference.op_type = OpType::GATED_DELTANET_DECODE;
+        reference.params = params;
+        CPUBackend{}.dispatch(reference, host_inputs, &h_output, nullptr);
+    }
 
     qkv = device_tensor(backend, qkv_width);
     a = device_tensor(backend, value_heads);
@@ -1602,8 +1615,12 @@ bool test_gdn(CudaBackend& backend) {
     host_inputs = {
         &h_raw_qkv, &h_a, &h_b, &h_z, &h_a_log, &h_dt_bias, &h_norm,
         &h_state, &h_conv_weight, &h_conv_state};
-    host_outputs = {&h_output};
-    kernel_gdn_conv_decode(params, host_inputs, host_outputs);
+    {
+        GraphNode reference;
+        reference.op_type = OpType::GATED_DELTANET_CONV_DECODE;
+        reference.params = params;
+        CPUBackend{}.dispatch(reference, host_inputs, &h_output, nullptr);
+    }
 
     Tensor raw_qkv_tensor = device_tensor(backend, qkv_width);
     Tensor conv_weight =

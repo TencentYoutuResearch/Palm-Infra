@@ -12,6 +12,7 @@
 // which introduces ~1e-3 error vs the scalar std::exp path. This does not
 // affect end-to-end PPL (test_e2e confirms PPL 8.49 vs HF 8.50).
 
+#include "backends/cpu/backend.h"
 #include "kernels/cpu/recurrent/gdn.h"
 #include "graph/graph.h"
 #include "kernels/tensor.h"
@@ -22,6 +23,7 @@
 #include <vector>
 
 static int failures = 0;
+static bool through_backend = false;
 #define CHECK(cond, msg) do { if(!(cond)){fprintf(stderr,"FAIL: %s\n",msg);failures++;}else{printf("  PASS: %s\n",msg);} } while(0)
 
 static void fill_rand(float* d, int n, unsigned int* seed) {
@@ -167,17 +169,27 @@ static bool run_kernel(bool prefill,
     Tensor state_t = make_2d(Precision::FP32, v_dim * k_dim * num_v_heads, 1, state);
     Tensor out_t   = make_2d(Precision::FP32, z_dim,      seq_len,  out_buf);
 
-    OpParams params;
-    params.i32 = {num_heads, k_dim, v_dim, seq_len,
-                  1 | (sigmoid_output_gate ? 2 : 0),
-                  4 /*conv_kernel*/, seq_len /*n_real*/, num_v_heads};
-    params.f32 = {1e-6f /*rms_eps*/, 1e-6f /*l2norm_eps*/, 1.f / std::sqrt((float)k_dim)};
+    GdnParams params{num_heads, k_dim, v_dim, seq_len,
+                     1 | (sigmoid_output_gate ? 2 : 0), 4, seq_len, num_v_heads,
+                     1e-6f, 1e-6f, 1.f / std::sqrt((float)k_dim)};
 
     std::vector<const Tensor*> inputs = {&qkv_t, &a_t, &b_t, &z_t,
                                           &A_log_t, &dtb_t, &norm_t, &state_t};
     std::vector<Tensor*> outputs = {&out_t};
 
-    if (prefill) {
+    if (through_backend) {
+        GraphNode node;
+        node.op_type = prefill ? OpType::GATED_DELTANET_PREFILL
+                               : OpType::GATED_DELTANET_DECODE;
+        node.params.i32 = {num_heads, k_dim, v_dim, seq_len,
+                           params.flags, 4};
+        // Omitted defaults must follow the supplied sequence and head counts.
+        if (num_v_heads != num_heads) {
+            node.params.i32.push_back(seq_len);
+            node.params.i32.push_back(num_v_heads);
+        }
+        CPUBackend{}.dispatch(node, inputs, &out_t, nullptr);
+    } else if (prefill) {
         kernel_gdn_prefill(params, inputs, outputs, nullptr);
     } else {
         kernel_gdn_decode(params, inputs, outputs, nullptr);
@@ -390,10 +402,14 @@ static bool test_prefill_then_decode() {
 }
 
 int main() {
-    CHECK(test_prefill_basic(),                "GDN prefill matches reference");
-    CHECK(test_prefill_repeated_value_heads(), "GDN repeat-value-head prefill matches reference");
-    CHECK(test_decode_basic(),                 "GDN decode matches reference");
-    CHECK(test_prefill_then_decode(),          "GDN prefill→decode state continuity");
+    for (bool backend : {false, true}) {
+        through_backend = backend;
+        std::printf("GDN route: %s\n", backend ? "backend" : "kernel");
+        CHECK(test_prefill_basic(),                "GDN prefill matches reference");
+        CHECK(test_prefill_repeated_value_heads(), "GDN repeat-value-head prefill matches reference");
+        CHECK(test_decode_basic(),                 "GDN decode matches reference");
+        CHECK(test_prefill_then_decode(),          "GDN prefill→decode state continuity");
+    }
     printf(failures ? "\n%d FAILED\n" : "\nAll GDN tests passed!\n", failures);
     return failures;
 }

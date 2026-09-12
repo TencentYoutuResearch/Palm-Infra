@@ -96,9 +96,8 @@ int main() {
     Tensor state_t = make(Precision::FP32, state_size, 1,       state_k);
     Tensor out_t   = make(Precision::FP32, z_dim,      seq_len, out_k);
 
-    OpParams params;
-    params.i32 = {num_heads, k_dim, v_dim, seq_len, 1 /*use_l2norm*/, 4 /*conv_kernel*/};
-    params.f32 = {1e-6f /*rms_eps*/, 1e-6f /*l2norm_eps*/, 1.f / std::sqrt((float)k_dim)};
+    GdnParams params{num_heads, k_dim, v_dim, seq_len, 1, 4, seq_len, num_heads,
+                     1e-6f, 1e-6f, 1.f / std::sqrt((float)k_dim)};
 
     std::vector<const Tensor*> inputs = {&qkv_t, &a_t, &b_t, &z_t,
                                           &A_log_t, &dtb_t, &norm_t, &state_t};
