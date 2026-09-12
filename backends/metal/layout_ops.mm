@@ -3,6 +3,9 @@
 #include "backends/metal/pipeline_cache.h"
 #include "kernels/metal/metal_common.h"
 
+#include <cassert>
+#include <cstdio>
+
 namespace {
 
 id<MTLBuffer> buffer_of(const Tensor* tensor) {
@@ -146,6 +149,97 @@ bool MetalLayoutOps::dispatch(
                 pipelines_->pipeline("contiguous_f32");
             [encoder setComputePipelineState:pipeline];
             dispatch_1d(encoder, static_cast<int>(output->nelements()));
+        }
+        return true;
+    }
+
+    case OpType::TILE: {
+        const Tensor& source = *inputs[0];
+        int repetitions[4] = {1, 1, 1, 1};
+        for (int dimension = 0;
+             dimension < 4 && dimension < static_cast<int>(params.i32.size());
+             ++dimension) {
+            repetitions[dimension] = params.i32[dimension];
+        }
+        if (repetitions[0] != 1 || repetitions[1] != 1 ||
+            repetitions[2] < 1 || repetitions[3] != 1) {
+            std::fprintf(
+                stderr,
+                "MetalBackend: TILE only supports dim-2 broadcast "
+                "(reps=%d,%d,%d,%d)\n",
+                repetitions[0], repetitions[1], repetitions[2],
+                repetitions[3]);
+            assert(false && "metal TILE: dim-2 only");
+            return true;
+        }
+        TensorDesc descriptor{};
+        descriptor.shape[0] = static_cast<int>(source.shape[0]);
+        descriptor.shape[1] = static_cast<int>(source.shape[1]);
+        descriptor.shape[2] = repetitions[2];
+        descriptor.shape[3] = 1;
+        for (int dimension = 0; dimension < 4; ++dimension)
+            descriptor.stride[dimension] = element_stride(source, dimension);
+        descriptor.offset = element_offset(source);
+        id<MTLComputePipelineState> pipeline =
+            pipelines_->pipeline("tile_dim2_f32");
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:buffer_of(&source) offset:0 atIndex:0];
+        [encoder setBuffer:buffer_of(output) offset:0 atIndex:2];
+        [encoder setBytes:&descriptor length:sizeof(descriptor) atIndex:3];
+        constexpr NSUInteger threads_x = 64;
+        constexpr NSUInteger threads_y = 4;
+        const MTLSize group_size = MTLSizeMake(threads_x, threads_y, 1);
+        const MTLSize group_count = MTLSizeMake(
+            (static_cast<NSUInteger>(descriptor.shape[0]) + threads_x - 1) /
+                threads_x,
+            (static_cast<NSUInteger>(descriptor.shape[1]) + threads_y - 1) /
+                threads_y,
+            static_cast<NSUInteger>(descriptor.shape[2]));
+        [encoder dispatchThreadgroups:group_count
+                threadsPerThreadgroup:group_size];
+        return true;
+    }
+
+    case OpType::CONCAT: {
+        const int dimension = params.i32.empty() ? 0 : params.i32[0];
+        if (dimension != 0) {
+            std::fprintf(
+                stderr,
+                "MetalBackend: CONCAT only supports dim=0 (got %d)\n",
+                dimension);
+            assert(false && "metal CONCAT: dim-0 only");
+            return true;
+        }
+        id<MTLComputePipelineState> pipeline =
+            pipelines_->pipeline("concat_dim0_f32");
+        [encoder setComputePipelineState:pipeline];
+        int dimension_offset = 0;
+        for (const Tensor* input : inputs) {
+            if (!input || !input->device.buffer)
+                continue;
+            ConcatParams concat{};
+            for (int axis = 0; axis < 4; ++axis) {
+                concat.shape[axis] = static_cast<int>(input->shape[axis]);
+                concat.stride[axis] = element_stride(*input, axis);
+            }
+            concat.offset = element_offset(*input);
+            concat.dim_offset = dimension_offset;
+            concat.out_shape0 = static_cast<int>(output->shape[0]);
+            [encoder setBuffer:buffer_of(input) offset:0 atIndex:0];
+            [encoder setBuffer:buffer_of(output) offset:0 atIndex:2];
+            [encoder setBytes:&concat length:sizeof(concat) atIndex:3];
+            constexpr NSUInteger threads_x = 64;
+            constexpr NSUInteger threads_y = 4;
+            const MTLSize group_size = MTLSizeMake(threads_x, threads_y, 1);
+            const MTLSize group_count = MTLSizeMake(
+                (static_cast<NSUInteger>(concat.shape[0]) + threads_x - 1) /
+                    threads_x,
+                (static_cast<NSUInteger>(concat.shape[1]) + threads_y - 1) /
+                    threads_y,
+                static_cast<NSUInteger>(concat.shape[2]));
+            [encoder dispatchThreadgroups:group_count
+                    threadsPerThreadgroup:group_size];
+            dimension_offset += static_cast<int>(input->shape[0]);
         }
         return true;
     }
