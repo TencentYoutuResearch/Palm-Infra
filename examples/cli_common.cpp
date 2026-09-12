@@ -1,7 +1,7 @@
 #include "examples/cli_common.h"
 
 #include "graph/graph.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <chrono>

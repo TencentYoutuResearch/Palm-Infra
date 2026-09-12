@@ -2,7 +2,7 @@
 #include "engine/input_prep.h"
 #include "engine/sampler.h"
 #include "kernels/matmul.h"
-#include "kernels/trace.h"
+#include "runtime/trace.h"
 #ifdef MOLLM_METAL
 #include "backends/metal/backend.h"
 #endif

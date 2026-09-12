@@ -2,7 +2,7 @@
 
 #include "graph/graph.h"
 #include "kernels/tensor.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 void kernel_rwkv_token_shift(const OpParams&, const std::vector<const Tensor*>&,
                              Tensor&);

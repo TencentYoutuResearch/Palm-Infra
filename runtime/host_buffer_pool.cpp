@@ -1,4 +1,4 @@
-#include "graph/buffer_pool.h"
+#include "runtime/host_buffer_pool.h"
 #include <algorithm>
 #include <cassert>
 #include <atomic>

@@ -12,7 +12,7 @@
 // Under TSan, any data race triggers a report and (with halt_on_error=1)
 // aborts. Under plain -fsanitize=undefined it just runs the correctness checks.
 
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <atomic>
 #include <chrono>

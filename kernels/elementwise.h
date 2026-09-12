@@ -2,7 +2,7 @@
 
 #include "graph/graph.h"
 #include "kernels/tensor.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <vector>
 

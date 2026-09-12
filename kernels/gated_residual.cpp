@@ -1,7 +1,7 @@
 #include "kernels/gated_residual.h"
 
 #include "kernels/bf16.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <cmath>
 #include <cstdio>

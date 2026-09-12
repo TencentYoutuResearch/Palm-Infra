@@ -7,7 +7,7 @@
 #include "kernels/moe_routing.h"
 #include "kernels/moe_ssd.h"
 #include "kernels/metal/metal_common.h"
-#include "kernels/trace.h"
+#include "runtime/trace.h"
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>

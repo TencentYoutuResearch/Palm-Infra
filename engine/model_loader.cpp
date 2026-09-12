@@ -4,7 +4,7 @@
 
 #include "kernels/matmul.h"
 #include "kernels/moe_ssd.h"
-#include "kernels/trace.h"
+#include "runtime/trace.h"
 #include "kernels/cpu_platform.h"
 #ifdef MOLLM_METAL
 #include "backends/metal/backend.h"

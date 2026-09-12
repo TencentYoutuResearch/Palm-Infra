@@ -1,5 +1,5 @@
 #include "kernels/norm.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <cmath>

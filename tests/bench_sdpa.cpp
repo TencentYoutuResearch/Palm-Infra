@@ -1,5 +1,5 @@
 #include "kernels/attention.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 #include "core/cache_layout.h"
 
 #include <algorithm>

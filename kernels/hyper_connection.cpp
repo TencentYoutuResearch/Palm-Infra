@@ -1,7 +1,7 @@
 #include "kernels/hyper_connection.h"
 
 #include "kernels/bf16.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <cmath>

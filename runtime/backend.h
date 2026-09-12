@@ -2,7 +2,7 @@
 
 #include "graph/graph.h"
 #include "kernels/tensor.h"
-#include "graph/buffer_pool.h"
+#include "runtime/host_buffer_pool.h"
 
 #include <cstdint>
 #include <cstring>
