@@ -380,7 +380,8 @@ if(MOLLM_METAL)
         backends/metal/command_context.mm
         backends/metal/pipeline_cache.mm
         backends/metal/resource_store.mm
-        backends/metal/ssd_expert_cache.mm)
+        backends/metal/ssd_expert_cache.mm
+        backends/metal/ssd_shared_expert.mm)
     # The Objective-C++ sources use ARC bridge-cast ownership semantics.
     set_source_files_properties(
         backends/metal/backend.mm backends/metal/buffer_pool.mm
@@ -388,6 +389,7 @@ if(MOLLM_METAL)
         backends/metal/pipeline_cache.mm
         backends/metal/resource_store.mm
         backends/metal/ssd_expert_cache.mm
+        backends/metal/ssd_shared_expert.mm
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_compile_definitions(mollm_lib PUBLIC
         MOLLM_METAL=1
