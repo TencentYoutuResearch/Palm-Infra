@@ -2,8 +2,12 @@
 #include <cuda_runtime.h>
 
 #include "backends/cuda/backend.h"
+#include "backends/cuda/device_runtime.h"
 #include "graph/graph.h"
-#include "backends/cuda/internal.h"
+#include "kernels/cuda/attention.h"
+#include "kernels/cuda/elementwise.h"
+#include "kernels/cuda/matmul.h"
+#include "kernels/cuda/recurrent.h"
 
 #include "backends/cpu/backend.h"
 #include "core/cache_layout.h"

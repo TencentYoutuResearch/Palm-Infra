@@ -415,7 +415,7 @@ if(MOLLM_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_sources(mollm_lib PRIVATE
         backends/cuda/backend.cu
-        backends/cuda/memory.cu
+        backends/cuda/device_runtime.cu
         kernels/cuda/attention.cu
         kernels/cuda/matmul.cu
         kernels/cuda/elementwise.cu

@@ -1,5 +1,7 @@
-#include "backends/cuda/internal.h"
+#include "kernels/cuda/attention.h"
 #include "kernels/cuda/reduction.cuh"
+
+#include <cuda_fp16.h>
 
 #include <cfloat>
 #include <cstdint>
