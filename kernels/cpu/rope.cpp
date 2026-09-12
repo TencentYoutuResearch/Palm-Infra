@@ -1,4 +1,5 @@
 #include "kernels/cpu/rope.h"
+#include "kernels/cpu_platform.h"
 
 #include <algorithm>
 #include <cmath>

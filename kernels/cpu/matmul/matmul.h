@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernels/cpu/activations.h" // for Activation enum
+#include "kernels/cpu_platform.h"
 #include "kernels/tensor.h"
 
 #include <string>

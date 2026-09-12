@@ -126,6 +126,7 @@ set(PUBLIC_ENGINE_HEADERS
 )
 
 set(PUBLIC_CORE_HEADERS
+    core/fp16.h
     core/rwkv_params.h
     core/gdn_params.h
     core/attention_params.h
