@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/moe_ssd.h"
+#include "storage/ssd_expert_cache/cache.h"
 
 #include <cstdint>
 #include <memory>

@@ -1,7 +1,7 @@
 #include "graph/execute.h"
 #include "backends/cpu/backend.h"
 #include "kernels/cpu/moe/moe.h"
-#include "kernels/moe_ssd.h"
+#include "storage/ssd_expert_cache/cache.h"
 #include "kernels/tensor.h"
 
 #include <algorithm>

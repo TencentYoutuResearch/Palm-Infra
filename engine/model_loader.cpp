@@ -1,9 +1,9 @@
 #include "engine/engine.h"
-#include "engine/byte_ranges.h"
+#include "storage/byte_ranges.h"
 #include "engine/weight_metadata.h"
 
 #include "kernels/cpu/matmul/matmul.h"
-#include "kernels/moe_ssd.h"
+#include "storage/ssd_expert_cache/cache.h"
 #include "runtime/trace.h"
 #include "kernels/cpu_platform.h"
 #ifdef MOLLM_METAL

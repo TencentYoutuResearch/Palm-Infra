@@ -3,7 +3,7 @@
 #include "core/bf16.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/moe/moe_routing.h"
-#include "kernels/moe_ssd.h"
+#include "storage/ssd_expert_cache/cache.h"
 #include "runtime/trace.h"
 #include "runtime/threading.h"
 
