@@ -1,5 +1,6 @@
 #include "backends/metal/backend.h"
 #include "backends/metal/buffer_pool.h"
+#include "backends/metal/command_context.h"
 #include "backends/metal/pipeline_cache.h"
 #include "backends/metal/resource_store.h"
 #include "graph/graph.h"
@@ -13,7 +14,6 @@
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
-#import <os/signpost.h>
 
 #include <algorithm>
 #include <cassert>
@@ -21,7 +21,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,10 +36,10 @@
 
 struct MetalBackend::Impl {
     id<MTLDevice>            device = nil;
-    id<MTLCommandQueue>      queue  = nil;
     id<MTLLibrary>           library = nil;
 
     std::unique_ptr<MetalBufferPool> pool;
+    std::unique_ptr<MetalCommandContext> commands;
     std::unique_ptr<MetalPipelineCache> pipeline_cache;
     std::unique_ptr<MetalResourceStore> resources;
 
@@ -104,40 +103,9 @@ struct MetalBackend::Impl {
     };
     std::unordered_map<int, SsdMoeLayerInfo> ssd_moe_layers;
 
-    // Buffers freed during graph encoding, returned to the pool only after the
-    // command buffer completes (deferred GPU execution — see free_output).
-    std::vector<std::pair<void*, size_t>> pending_free;
-
-    // GPU timing accumulators (MOLLM_METAL_GPU_TIME).
-    double   gpu_time_ms = 0.0;
-    uint64_t gpu_graphs  = 0;
-
-    // Per-op-type GPU-time profiling (MOLLM_METAL_PROFILE). When on, dispatch()
-    // commits+waits each op separately and attributes the command buffer's GPU
-    // time to the op type. Reported (and reset) via dump_profile().
-    struct OpStat { double gpu_ms = 0.0; uint64_t calls = 0; };
-    // MATMUL is split by concrete kernel path so decode profiles distinguish
-    // quantized/FP16 GEMV from prefill tensor GEMM.
-    std::map<std::string, OpStat> op_stats;
-    bool profile = false;
-
     // True iff the tensor-API GEMM kernel is compiled AND the GPU supports the
     // Metal 4 tensor family (M5/A19+). Set in the constructor.
     bool has_tensor = false;
-
-    // os_signpost log for Instruments "Points of Interest" (CPU-side phase
-    // markers, Apple's analogue of NVTX). Lazily created.
-    os_log_t signpost_log = nullptr;
-    os_log_t sp() {
-        if (!signpost_log) signpost_log = os_log_create("com.mollm.metal", "profiling");
-        return signpost_log;
-    }
-
-    // current command buffer / encoder for one graph run
-    id<MTLCommandBuffer>        cmd = nil;
-    id<MTLComputeCommandEncoder> enc = nil;
-    int                         ops_in_cmd = 0;
-    bool                        chunk_graph = false;
 
     bool ok = false;
 
@@ -400,18 +368,19 @@ struct MetalBackend::Impl {
     }
 
     bool finish_ssd_prefix(int layer, const char* error_context) {
-        [enc endEncoding];
-        enc = nil;
+        [commands->enc endEncoding];
+        commands->enc = nil;
         const uint64_t wait_start = mollm_trace::now_ns();
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        [commands->cmd commit];
+        [commands->cmd waitUntilCompleted];
         const uint64_t wait_end = mollm_trace::now_ns();
         const std::string args =
             "{\"layer\":" + std::to_string(layer) + "}";
         mollm_trace::record_duration(
             "metal.ssd", "prefix_wait", wait_start, wait_end, args,
             "thread_state_iowait");
-        const double gpu_seconds = cmd.GPUEndTime - cmd.GPUStartTime;
+        const double gpu_seconds =
+            commands->cmd.GPUEndTime - commands->cmd.GPUStartTime;
         if (gpu_seconds > 0.0 && wait_end != 0) {
             const uint64_t gpu_ns =
                 static_cast<uint64_t>(gpu_seconds * 1e9);
@@ -420,14 +389,14 @@ struct MetalBackend::Impl {
                 wait_end > gpu_ns ? wait_end - gpu_ns : 0,
                 wait_end, args, "thread_state_running");
         }
-        if (cmd.status == MTLCommandBufferStatusError) {
-            NSError* error = cmd.error;
+        if (commands->cmd.status == MTLCommandBufferStatusError) {
+            NSError* error = commands->cmd.error;
             fprintf(stderr, "MetalBackend: %s failed: %s\n", error_context,
                     error ? error.localizedDescription.UTF8String : "?");
-            cmd = nil;
+            commands->cmd = nil;
             return false;
         }
-        cmd = nil;
+        commands->cmd = nil;
         return true;
     }
 
@@ -794,7 +763,7 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
             fprintf(stderr, "MetalBackend: no Metal device\n");
             return;
         }
-        impl_->queue = [impl_->device newCommandQueue];
+        id<MTLCommandQueue> queue = [impl_->device newCommandQueue];
 
         NSError* err = nil;
         std::string path = metallib_path.empty() ? std::string(MOLLM_METALLIB_PATH)
@@ -813,9 +782,10 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
             (__bridge void*)impl_->device,
             (__bridge void*)impl_->library));
         impl_->pool.reset(new MetalBufferPool((__bridge void*)impl_->device));
+        impl_->commands.reset(new MetalCommandContext(
+            (__bridge void*)queue, impl_->pool.get()));
         impl_->resources.reset(
             new MetalResourceStore((__bridge void*)impl_->device));
-        impl_->profile = getenv("MOLLM_METAL_PROFILE") != nullptr;
 
         // Enable the tensor-API GEMM only if the kernel was compiled (metallib
         // built with -DMOLLM_METAL_TENSOR) AND the GPU is M5/A19+ (MTLGPUFamily
@@ -852,6 +822,7 @@ MetalBackend::~MetalBackend() {
                     impl_->ssd_bytes_read / 1e6,
                     impl_->ssd_resident_bytes / 1e6);
         }
+        impl_->commands.reset();
         impl_->pipeline_cache.reset();
         impl_->resources.reset();
         impl_->pool.reset();
@@ -933,7 +904,7 @@ bool MetalBackend::lm_head_small_batch_impl(
         weight.groups_per_row == 0 ||
         (weight.prec == Precision::INT4 && (K & 1) != 0) ||
         (weight.prec == Precision::INT8 && !weight.scales_device_data)) {
-        if (finish_open_graph && impl_->cmd)
+        if (finish_open_graph && impl_->commands->cmd)
             end_graph();
         return false;
     }
@@ -944,7 +915,7 @@ bool MetalBackend::lm_head_small_batch_impl(
             static_cast<size_t>(M) * N * sizeof(float);
         void* cbuf_handle = impl_->pool->acquire(c_bytes);
         if (!cbuf_handle) {
-            if (finish_open_graph && impl_->cmd)
+            if (finish_open_graph && impl_->commands->cmd)
                 end_graph();
             return false;
         }
@@ -969,7 +940,7 @@ bool MetalBackend::lm_head_small_batch_impl(
             if (partial_handle)
                 impl_->pool->release(partial_handle, partial_bytes);
             impl_->pool->release(cbuf_handle, c_bytes);
-            if (finish_open_graph && impl_->cmd)
+            if (finish_open_graph && impl_->commands->cmd)
                 end_graph();
             return false;
         }
@@ -988,12 +959,12 @@ bool MetalBackend::lm_head_small_batch_impl(
         p.groups_per_row = static_cast<int>(weight.groups_per_row);
 
         id<MTLCommandBuffer> command = finish_open_graph
-            ? impl_->cmd : [impl_->queue commandBuffer];
+            ? impl_->commands->cmd : [impl_->commands->queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = finish_open_graph
-            ? impl_->enc : [command computeCommandEncoder];
+            ? impl_->commands->enc : [command computeCommandEncoder];
         if (!command || !encoder) {
             impl_->pool->release(cbuf_handle, c_bytes);
-            if (finish_open_graph && impl_->cmd)
+            if (finish_open_graph && impl_->commands->cmd)
                 end_graph();
             return false;
         }
@@ -1072,11 +1043,11 @@ bool MetalBackend::lm_head_small_batch_impl(
                     error ? error.localizedDescription.UTF8String : "?");
             impl_->dispatch_failed = true;
         } else {
-            if (impl_->profile) {
+            if (impl_->commands->profile) {
                 const double gpu_ms =
                     (command.GPUEndTime - command.GPUStartTime) * 1000.0;
                 const char* quant = is_w8 ? "W8" : "W4";
-                auto& stat = impl_->op_stats[
+                auto& stat = impl_->commands->op_stats[
                     std::string(top1_out ? "LM_HEAD_SMALL_M_ARGMAX_"
                                          : "LM_HEAD_SMALL_M_") + quant +
                     "[M=" + std::to_string(M) +
@@ -1162,9 +1133,9 @@ void MetalBackend::lm_head_gemv_impl(
         id<MTLBuffer> C = (__bridge id<MTLBuffer>)cbuf;
 
         id<MTLCommandBuffer> cmd =
-            finish_open_graph ? impl_->cmd : [impl_->queue commandBuffer];
+            finish_open_graph ? impl_->commands->cmd : [impl_->commands->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc =
-            finish_open_graph ? impl_->enc : [cmd computeCommandEncoder];
+            finish_open_graph ? impl_->commands->enc : [cmd computeCommandEncoder];
         assert(cmd && enc);
         [enc setBuffer:A offset:a_byte_offset atIndex:0];
         [enc setBuffer:B offset:weight.device_offset atIndex:1];
@@ -1273,7 +1244,7 @@ void MetalBackend::lm_head_gemv_impl(
             // next MTP depth.  The next graph consumes this buffer before its
             // own tail overwrites it, so one persistent ping buffer is enough.
             [enc endEncoding];
-            impl_->enc = nil;
+            impl_->commands->enc = nil;
             id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
             [blit copyFromBuffer:A
                     sourceOffset:a_byte_offset
@@ -1300,13 +1271,13 @@ void MetalBackend::lm_head_gemv_impl(
         }
 
         if (!impl_->dispatch_failed) {
-            if (impl_->profile) {
+            if (impl_->commands->profile) {
                 const double gpu_ms =
                     (cmd.GPUEndTime - cmd.GPUStartTime) * 1000.0;
                 const char* quant = weight.prec == Precision::INT8
                     ? "W8"
                     : weight.prec == Precision::INT4 ? "W4" : "FP16";
-                auto& stat = impl_->op_stats[
+                auto& stat = impl_->commands->op_stats[
                     std::string(top1_out ? "MTP_LM_HEAD_ARGMAX_"
                                          : "LM_HEAD_GEMV_") +
                     quant + "[N=" + std::to_string(N) +
@@ -1462,9 +1433,7 @@ void MetalBackend::free_output(Tensor& t, BufferPool* /*pool*/) {
     // end_graph(). Releasing a buffer to the pool now would let a later node
     // reacquire and overwrite it while earlier (not-yet-executed) kernels still
     // depend on its contents. Defer all frees until after waitUntilCompleted.
-    if (!t.device_data) return;
-    if (impl_->cmd) impl_->pending_free.push_back({t.device_data, t.nbytes()});
-    else impl_->pool->release(t.device_data, t.nbytes());
+    impl_->commands->release_or_defer(t.device_data, t.nbytes());
 }
 
 // ===========================================================================
@@ -1472,104 +1441,28 @@ void MetalBackend::free_output(Tensor& t, BufferPool* /*pool*/) {
 // ===========================================================================
 
 void MetalBackend::begin_graph() {
-    impl_->cmd = [impl_->queue commandBuffer];
-    impl_->cmd.label = @"mollm graph";
-    impl_->enc = [impl_->cmd computeCommandEncoder];
-    impl_->enc.label = @"mollm compute";
-    impl_->ops_in_cmd = 0;
-    impl_->chunk_graph = false;
-    // os_signpost interval for the whole graph run — visible in Instruments'
-    // "Points of Interest" track (Apple's NVTX analogue) alongside the Metal
-    // System Trace GPU timeline.
-    os_signpost_interval_begin(impl_->sp(), OS_SIGNPOST_ID_EXCLUSIVE, "graph");
+    impl_->commands->begin_graph();
 }
 
 void MetalBackend::synchronize_for_host_read() {
-    if (impl_->enc) {
-        [impl_->enc endEncoding];
-        impl_->enc = nil;
-    }
-    if (impl_->cmd) {
-        [impl_->cmd commit];
-        [impl_->cmd waitUntilCompleted];
-        if (impl_->cmd.status == MTLCommandBufferStatusError) {
-            NSError* e = impl_->cmd.error;
-            fprintf(stderr, "MetalBackend: host-read sync failed: %s\n",
-                    e ? e.localizedDescription.UTF8String : "?");
-            impl_->dispatch_failed = true;
-        }
-        impl_->cmd = nil;
-    }
+    if (impl_->commands)
+        impl_->commands->synchronize_for_host_read(impl_->dispatch_failed);
 }
 
 // Debug: commit + wait after each op so intermediate device buffers are
 // host-readable for per-node CPU/Metal diffing. Enabled by MOLLM_METAL_SYNC_EACH.
 void MetalBackend::sync_point() {
-    if (!getenv("MOLLM_METAL_SYNC_EACH")) return;
-    if (impl_->enc) { [impl_->enc endEncoding]; impl_->enc = nil; }
-    if (impl_->cmd) {
-        [impl_->cmd commit];
-        [impl_->cmd waitUntilCompleted];
-        if (impl_->cmd.status == MTLCommandBufferStatusError) {
-            NSError* e = impl_->cmd.error;
-            fprintf(stderr, "MetalBackend: sync-point command buffer error: %s\n",
-                    e ? e.localizedDescription.UTF8String : "?");
-            impl_->dispatch_failed = true;
-        }
-        impl_->cmd = nil;
-    }
-    impl_->cmd = [impl_->queue commandBuffer];
-    impl_->enc = [impl_->cmd computeCommandEncoder];
+    if (impl_->commands)
+        impl_->commands->sync_point(impl_->dispatch_failed);
 }
 
 void MetalBackend::dump_profile() {
-    if (!impl_->profile || impl_->op_stats.empty()) return;
-    double total = 0.0;
-    for (auto& kv : impl_->op_stats) total += kv.second.gpu_ms;
-    fprintf(stderr, "\n=== Metal per-op GPU time (MOLLM_METAL_PROFILE) ===\n");
-    fprintf(stderr, "%-32s %10s %8s %10s %6s\n",
-            "op", "gpu_ms", "calls", "us/call", "%%");
-    // Sort by total gpu_ms descending for readability.
-    std::vector<std::pair<std::string, Impl::OpStat>> rows(
-        impl_->op_stats.begin(), impl_->op_stats.end());
-    std::sort(rows.begin(), rows.end(),
-              [](auto& a, auto& b){ return a.second.gpu_ms > b.second.gpu_ms; });
-    for (auto& r : rows) {
-        double per_call_us = r.second.calls ? (r.second.gpu_ms * 1000.0 / r.second.calls) : 0.0;
-        fprintf(stderr, "%-32s %10.3f %8llu %10.2f %6.1f\n",
-                r.first.c_str(), r.second.gpu_ms,
-                (unsigned long long)r.second.calls, per_call_us,
-                total > 0 ? 100.0 * r.second.gpu_ms / total : 0.0);
-    }
-    fprintf(stderr, "%-32s %10.3f\n", "TOTAL", total);
-    impl_->op_stats.clear();
+    if (impl_->commands) impl_->commands->dump_profile();
 }
 
 void MetalBackend::end_graph() {
-    if (impl_->enc) { [impl_->enc endEncoding]; impl_->enc = nil; }
-    if (impl_->cmd) {
-        [impl_->cmd commit];
-        [impl_->cmd waitUntilCompleted];
-        if (impl_->cmd.status == MTLCommandBufferStatusError) {
-            NSError* e = impl_->cmd.error;
-            fprintf(stderr, "MetalBackend: command buffer error: %s\n",
-                    e ? e.localizedDescription.UTF8String : "?");
-            impl_->dispatch_failed = true;
-        }
-        if (getenv("MOLLM_METAL_GPU_TIME")) {
-            double gpu_ms = (impl_->cmd.GPUEndTime - impl_->cmd.GPUStartTime) * 1000.0;
-            impl_->gpu_time_ms += gpu_ms;
-            impl_->gpu_graphs += 1;
-            fprintf(stderr, "[metal] graph GPU time %.3f ms (cumulative %.1f ms over %llu graphs)\n",
-                    gpu_ms, impl_->gpu_time_ms, (unsigned long long)impl_->gpu_graphs);
-        }
-        impl_->cmd = nil;
-    }
-    // Now that all GPU work has completed, return deferred-freed buffers to the
-    // pool for reuse by the next graph run.
-    for (auto& pf : impl_->pending_free) impl_->pool->release(pf.first, pf.second);
-    impl_->pending_free.clear();
-    os_signpost_interval_end(impl_->sp(), OS_SIGNPOST_ID_EXCLUSIVE, "graph");
+    if (impl_->commands)
+        impl_->commands->end_graph(impl_->dispatch_failed);
 }
 
 // ===========================================================================
@@ -1582,17 +1475,7 @@ void MetalBackend::dispatch(const GraphNode& node,
     // Hybrid CPU/Metal operators may synchronize for a host read in the
     // middle of a graph, which intentionally closes the current command
     // buffer. Resume GPU encoding lazily for the next device operation.
-    if (!impl_->cmd) {
-        impl_->cmd = [impl_->queue commandBuffer];
-        impl_->cmd.label = @"mollm graph continuation";
-        impl_->enc = [impl_->cmd computeCommandEncoder];
-        impl_->enc.label = @"mollm compute continuation";
-        impl_->ops_in_cmd = 0;
-    } else if (!impl_->enc) {
-        impl_->enc = [impl_->cmd computeCommandEncoder];
-        impl_->enc.label = @"mollm compute continuation";
-    }
-    id<MTLComputeCommandEncoder> enc = impl_->enc;
+    id<MTLComputeCommandEncoder> enc = impl_->commands->ensure_encoder();
     const OpParams& params = node.params;
     const OpType op = node.op_type;
     std::string profile_label = op_type_name(op);
@@ -1752,7 +1635,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 (size_t)p.M * (size_t)p.K * sizeof(uint16_t);
             void* handle = impl_->pool->acquire(bytes);
             id<MTLBuffer> result = (__bridge id<MTLBuffer>)handle;
-            impl_->pending_free.push_back({handle, bytes});
+            impl_->commands->pending_free.push_back({handle, bytes});
             id<MTLComputePipelineState> ps =
                 impl_->pipeline("matmul_cast_f32_to_f16");
             [enc setComputePipelineState:ps];
@@ -1766,7 +1649,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         // Decode graphs use M=1 throughout. Enable prefix submission only
         // after observing that invariant; large-M prefill benefits from one
         // command buffer and does not need CPU/GPU encoding overlap.
-        if (p.M == 1) impl_->chunk_graph = true;
+        if (p.M == 1) impl_->commands->chunk_graph = true;
 
         if (p.M >= 2 && p.M <= 4 && p.N <= 512 &&
             B.prec == Precision::FP16) {
@@ -1977,8 +1860,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                 void* sa_h   = impl_->pool->acquire(sa_bytes);
                 id<MTLBuffer> a_i8 = (__bridge id<MTLBuffer>)a_i8_h;
                 id<MTLBuffer> sa   = (__bridge id<MTLBuffer>)sa_h;
-                impl_->pending_free.push_back({a_i8_h, a_i8_bytes});
-                impl_->pending_free.push_back({sa_h,   sa_bytes});
+                impl_->commands->pending_free.push_back({a_i8_h, a_i8_bytes});
+                impl_->commands->pending_free.push_back({sa_h,   sa_bytes});
 
                 // 1) per-token activation quantization.
                 {
@@ -2091,7 +1974,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     fast || (!accurate && p.activation == 0);
                 if (w4a16) {
                     profile_label = "MATMUL_W4A16_GEMM";
-                    if (impl_->profile) {
+                    if (impl_->commands->profile) {
                         profile_label +=
                             "[M=" + std::to_string(p.M) +
                             ",N=" + std::to_string(p.N) +
@@ -2163,8 +2046,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                 void* sa_h   = impl_->pool->acquire(sa_bytes);
                 id<MTLBuffer> a_i8 = (__bridge id<MTLBuffer>)a_i8_h;
                 id<MTLBuffer> sa   = (__bridge id<MTLBuffer>)sa_h;
-                impl_->pending_free.push_back({a_i8_h, a_i8_bytes});
-                impl_->pending_free.push_back({sa_h,   sa_bytes});
+                impl_->commands->pending_free.push_back({a_i8_h, a_i8_bytes});
+                impl_->commands->pending_free.push_back({sa_h,   sa_bytes});
 
                 // 1) per-token activation quantization -> int8 [M,K] + scale_a[M].
                 {
@@ -2353,7 +2236,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 grid1d(p.M * p.N);
             }
         }
-        if (impl_->profile) {
+        if (impl_->commands->profile) {
             profile_label += "[M=" + std::to_string(p.M) +
                              ",N=" + std::to_string(p.N) +
                              ",K=" + std::to_string(p.K) + "]";
@@ -2972,11 +2855,11 @@ void MetalBackend::dispatch(const GraphNode& node,
             id<MTLBuffer> ge = (__bridge id<MTLBuffer>)ge_h;
             id<MTLBuffer> be = (__bridge id<MTLBuffer>)be_h;
             id<MTLBuffer> raw = (__bridge id<MTLBuffer>)raw_h;
-            impl_->pending_free.push_back({qn_h, qk_bytes});
-            impl_->pending_free.push_back({kn_h, qk_bytes});
-            impl_->pending_free.push_back({ge_h, gate_bytes});
-            impl_->pending_free.push_back({be_h, gate_bytes});
-            impl_->pending_free.push_back({raw_h, raw_bytes});
+            impl_->commands->pending_free.push_back({qn_h, qk_bytes});
+            impl_->commands->pending_free.push_back({kn_h, qk_bytes});
+            impl_->commands->pending_free.push_back({ge_h, gate_bytes});
+            impl_->commands->pending_free.push_back({be_h, gate_bytes});
+            impl_->commands->pending_free.push_back({raw_h, raw_bytes});
 
             id<MTLComputePipelineState> prep =
                 impl_->pipeline("gdn_prepare_qk_f32");
@@ -3159,7 +3042,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             max_seq = (int)meta[1];  // max_seq_len
         }
         std::string sdpa_profile_suffix;
-        if (impl_->profile) {
+        if (impl_->commands->profile) {
             sdpa_profile_suffix =
                 "[S=" + std::to_string(src_seqlen) +
                 ",P=" + std::to_string(past) +
@@ -3171,25 +3054,25 @@ void MetalBackend::dispatch(const GraphNode& node,
         }
 
         auto profile_sdpa_stage = [&](const char* label) {
-            if (!impl_->profile) return;
-            if (impl_->enc) {
-                [impl_->enc endEncoding];
-                impl_->enc = nil;
+            if (!impl_->commands->profile) return;
+            if (impl_->commands->enc) {
+                [impl_->commands->enc endEncoding];
+                impl_->commands->enc = nil;
             }
-            if (impl_->cmd) {
-                [impl_->cmd commit];
-                [impl_->cmd waitUntilCompleted];
+            if (impl_->commands->cmd) {
+                [impl_->commands->cmd commit];
+                [impl_->commands->cmd waitUntilCompleted];
                 const double gpu_ms =
-                    (impl_->cmd.GPUEndTime -
-                     impl_->cmd.GPUStartTime) * 1000.0;
+                    (impl_->commands->cmd.GPUEndTime -
+                     impl_->commands->cmd.GPUStartTime) * 1000.0;
                 auto& stat =
-                    impl_->op_stats[std::string(label) + sdpa_profile_suffix];
+                    impl_->commands->op_stats[std::string(label) + sdpa_profile_suffix];
                 stat.gpu_ms += gpu_ms;
                 stat.calls += 1;
             }
-            impl_->cmd = [impl_->queue commandBuffer];
-            impl_->enc = [impl_->cmd computeCommandEncoder];
-            enc = impl_->enc;
+            impl_->commands->cmd = [impl_->commands->queue commandBuffer];
+            impl_->commands->enc = [impl_->commands->cmd computeCommandEncoder];
+            enc = impl_->commands->enc;
         };
 
         int dst_seqlen = past + cur_seqlen;
@@ -3324,7 +3207,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 (size_t)num_heads * nparts * (128 + 2) * sizeof(float);
             void* partial_h = impl_->pool->acquire(partial_bytes);
             id<MTLBuffer> partial = (__bridge id<MTLBuffer>)partial_h;
-            impl_->pending_free.push_back({partial_h, partial_bytes});
+            impl_->commands->pending_free.push_back({partial_h, partial_bytes});
             [enc setBuffer:partial offset:0 atIndex:7];
             [enc setBytes:&nparts length:sizeof(nparts) atIndex:6];
             [enc dispatchThreadgroups:MTLSizeMake(nparts,(NSUInteger)num_heads,1)
@@ -3510,7 +3393,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             const Tensor& gu = *inputs[2]; const Tensor& down = *inputs[3];
             const Tensor* bias = router_bias;
             int seq = (int)x.shape[1];
-            if (impl_->profile)
+            if (impl_->commands->profile)
                 profile_label += "[S=" + std::to_string(seq) + "]";
             size_t idx_bytes=(size_t)seq*top_k*sizeof(int);
             size_t tw_bytes=(size_t)seq*top_k*sizeof(float);
@@ -3524,27 +3407,27 @@ void MetalBackend::dispatch(const GraphNode& node,
             id<MTLBuffer> logits=(__bridge id<MTLBuffer>)logits_h;
             id<MTLBuffer> merged=(__bridge id<MTLBuffer>)merged_h;
             auto profile_resident_moe_stage = [&](const char* label) {
-                if (!impl_->profile || ssd_w4) return;
-                if (impl_->enc) {
-                    [impl_->enc endEncoding];
-                    impl_->enc = nil;
+                if (!impl_->commands->profile || ssd_w4) return;
+                if (impl_->commands->enc) {
+                    [impl_->commands->enc endEncoding];
+                    impl_->commands->enc = nil;
                 }
-                if (impl_->cmd) {
-                    [impl_->cmd commit];
-                    [impl_->cmd waitUntilCompleted];
+                if (impl_->commands->cmd) {
+                    [impl_->commands->cmd commit];
+                    [impl_->commands->cmd waitUntilCompleted];
                     const double gpu_ms =
-                        (impl_->cmd.GPUEndTime -
-                         impl_->cmd.GPUStartTime) * 1000.0;
+                        (impl_->commands->cmd.GPUEndTime -
+                         impl_->commands->cmd.GPUStartTime) * 1000.0;
                     const std::string stage_label =
                         std::string(label) +
                         "[S=" + std::to_string(seq) + "]";
-                    auto& stat = impl_->op_stats[stage_label];
+                    auto& stat = impl_->commands->op_stats[stage_label];
                     stat.gpu_ms += gpu_ms;
                     stat.calls += 1;
                 }
-                impl_->cmd = [impl_->queue commandBuffer];
-                impl_->enc = [impl_->cmd computeCommandEncoder];
-                enc = impl_->enc;
+                impl_->commands->cmd = [impl_->commands->queue commandBuffer];
+                impl_->commands->enc = [impl_->commands->cmd computeCommandEncoder];
+                enc = impl_->commands->enc;
             };
             const Impl::SsdMoeLayerInfo* predicted_layer = nullptr;
             void* predicted_idx_h = nullptr;
@@ -3847,7 +3730,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                             impl_->pool->acquire(activation_bytes);
                         activation =
                             (__bridge id<MTLBuffer>)activation_h;
-                        impl_->pending_free.push_back(
+                        impl_->commands->pending_free.push_back(
                             {activation_h, activation_bytes});
 
                         [enc setComputePipelineState:
@@ -4195,25 +4078,25 @@ void MetalBackend::dispatch(const GraphNode& node,
                                  (seq + 3) / 4, 1)
                         threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
 
-                    impl_->pending_free.push_back({qx_h, qx_bytes});
-                    impl_->pending_free.push_back({sx_h, sx_bytes});
-                    impl_->pending_free.push_back({qi_h, qi_bytes});
-                    impl_->pending_free.push_back({si_h, si_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back({qx_h, qx_bytes});
+                    impl_->commands->pending_free.push_back({sx_h, sx_bytes});
+                    impl_->commands->pending_free.push_back({qi_h, qi_bytes});
+                    impl_->commands->pending_free.push_back({si_h, si_bytes});
+                    impl_->commands->pending_free.push_back(
                         {selected_h, selected_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {counts_h, expert_counts_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {routes_h, expert_routes_bytes});
-                    impl_->pending_free.push_back({jobs_h, jobs_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back({jobs_h, jobs_bytes});
+                    impl_->commands->pending_free.push_back(
                         {job_count_h, job_count_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {dispatch_h, dispatch_bytes});
-                    impl_->pending_free.push_back({idx_h, idx_bytes});
-                    impl_->pending_free.push_back({tw_h, tw_bytes});
-                    impl_->pending_free.push_back({logits_h, logits_bytes});
-                    impl_->pending_free.push_back({merged_h, merged_bytes});
+                    impl_->commands->pending_free.push_back({idx_h, idx_bytes});
+                    impl_->commands->pending_free.push_back({tw_h, tw_bytes});
+                    impl_->commands->pending_free.push_back({logits_h, logits_bytes});
+                    impl_->commands->pending_free.push_back({merged_h, merged_bytes});
                     break;
                 }
                 if (w8pc && seq == 1) {
@@ -4349,16 +4232,16 @@ void MetalBackend::dispatch(const GraphNode& node,
                                  (hidden_size + 255) / 256, 1, 1)
                         threadsPerThreadgroup:
                              MTLSizeMake(256, 1, 1)];
-                    impl_->pending_free.push_back({qx_h, qx_bytes});
-                    impl_->pending_free.push_back({sx_h, sx_bytes});
-                    impl_->pending_free.push_back({qi_h, qi_bytes});
-                    impl_->pending_free.push_back({si_h, si_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back({qx_h, qx_bytes});
+                    impl_->commands->pending_free.push_back({sx_h, sx_bytes});
+                    impl_->commands->pending_free.push_back({qi_h, qi_bytes});
+                    impl_->commands->pending_free.push_back({si_h, si_bytes});
+                    impl_->commands->pending_free.push_back(
                         {selected_h, selected_bytes});
-                    impl_->pending_free.push_back({idx_h, idx_bytes});
-                    impl_->pending_free.push_back({tw_h, tw_bytes});
-                    impl_->pending_free.push_back({logits_h, logits_bytes});
-                    impl_->pending_free.push_back({merged_h, merged_bytes});
+                    impl_->commands->pending_free.push_back({idx_h, idx_bytes});
+                    impl_->commands->pending_free.push_back({tw_h, tw_bytes});
+                    impl_->commands->pending_free.push_back({logits_h, logits_bytes});
+                    impl_->commands->pending_free.push_back({merged_h, merged_bytes});
                     break;
                 }
                 const bool exact_decode =
@@ -4438,10 +4321,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 profile_resident_moe_stage("MOE.down_w8");
 
-                impl_->pending_free.push_back({idx_h, idx_bytes});
-                impl_->pending_free.push_back({tw_h, tw_bytes});
-                impl_->pending_free.push_back({logits_h, logits_bytes});
-                impl_->pending_free.push_back({merged_h, merged_bytes});
+                impl_->commands->pending_free.push_back({idx_h, idx_bytes});
+                impl_->commands->pending_free.push_back({tw_h, tw_bytes});
+                impl_->commands->pending_free.push_back({logits_h, logits_bytes});
+                impl_->commands->pending_free.push_back({merged_h, merged_bytes});
                 break;
             }
 
@@ -4503,8 +4386,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                     predicted_layer = nullptr;
                 }
 
-                impl_->cmd = [impl_->queue commandBuffer];
-                impl_->cmd.label = @"mollm Metal SSD expert";
+                impl_->commands->cmd = [impl_->commands->queue commandBuffer];
+                impl_->commands->cmd.label = @"mollm Metal SSD expert";
                 const int selections = seq * top_k;
                 const size_t qx_bytes = (size_t)seq * hidden_size;
                 const size_t sx_bytes = (size_t)seq * sizeof(float);
@@ -4577,7 +4460,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                         void* event_key =
                             (__bridge void*)view.gate_ready_event;
                         if (waited_events.insert(event_key).second) {
-                            [impl_->cmd
+                            [impl_->commands->cmd
                                 encodeWaitForEvent:view.gate_ready_event
                                              value:view.gate_ready_value];
                         }
@@ -4585,9 +4468,9 @@ void MetalBackend::dispatch(const GraphNode& node,
                 };
                 if (ready_selections == 0)
                     encode_gate_waits(0);
-                impl_->enc = [impl_->cmd computeCommandEncoder];
-                impl_->enc.label = @"mollm Metal SSD expert";
-                enc = impl_->enc;
+                impl_->commands->enc = [impl_->commands->cmd computeCommandEncoder];
+                impl_->commands->enc.label = @"mollm Metal SSD expert";
+                enc = impl_->commands->enc;
 
                 const size_t qi_bytes = (size_t)selections * intermediate;
                 const size_t si_bytes = (size_t)selections * sizeof(float);
@@ -4706,13 +4589,13 @@ void MetalBackend::dispatch(const GraphNode& node,
                 if (pending_selections > 0 &&
                     ready_selections > 0) {
                     [enc endEncoding];
-                    impl_->enc = nil;
+                    impl_->commands->enc = nil;
                     encode_gate_waits(ready_selections);
-                    impl_->enc =
-                        [impl_->cmd computeCommandEncoder];
-                    impl_->enc.label =
+                    impl_->commands->enc =
+                        [impl_->commands->cmd computeCommandEncoder];
+                    impl_->commands->enc.label =
                         @"mollm pending Metal SSD expert";
-                    enc = impl_->enc;
+                    enc = impl_->commands->enc;
                 }
                 if (pending_selections > 0) {
                     selected_bg128(
@@ -4751,7 +4634,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 }
                 if (has_pending_down) {
                     [enc endEncoding];
-                    impl_->enc = nil;
+                    impl_->commands->enc = nil;
                     for (const auto& view : expert_views) {
                         if (!view.down_ready_event ||
                             view.down_ready_event.signaledValue >=
@@ -4760,16 +4643,16 @@ void MetalBackend::dispatch(const GraphNode& node,
                         void* event_key =
                             (__bridge void*)view.down_ready_event;
                         if (waited_down_events.insert(event_key).second) {
-                            [impl_->cmd
+                            [impl_->commands->cmd
                                 encodeWaitForEvent:view.down_ready_event
                                              value:view.down_ready_value];
                         }
                     }
-                    impl_->enc =
-                        [impl_->cmd computeCommandEncoder];
-                    impl_->enc.label =
+                    impl_->commands->enc =
+                        [impl_->commands->cmd computeCommandEncoder];
+                    impl_->commands->enc.label =
                         @"mollm Metal SSD down experts";
-                    enc = impl_->enc;
+                    enc = impl_->commands->enc;
                 }
 
                 selected_bg128(
@@ -4797,13 +4680,13 @@ void MetalBackend::dispatch(const GraphNode& node,
 
                 if (has_shared) {
                     [enc endEncoding];
-                    impl_->enc = nil;
-                    [impl_->cmd
+                    impl_->commands->enc = nil;
+                    [impl_->commands->cmd
                         encodeWaitForEvent:impl_->ssd_shared_compute_event
                                    value:shared_ready_value];
-                    impl_->enc = [impl_->cmd computeCommandEncoder];
-                    impl_->enc.label = @"mollm combine SSD experts";
-                    enc = impl_->enc;
+                    impl_->commands->enc = [impl_->commands->cmd computeCommandEncoder];
+                    impl_->commands->enc.label = @"mollm combine SSD experts";
+                    enc = impl_->commands->enc;
                     const uint count = (uint)hidden_size;
                     [enc setComputePipelineState:
                              impl_->pipeline("add_inplace_f32")];
@@ -4815,35 +4698,35 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc dispatchThreadgroups:
                              MTLSizeMake((hidden_size + 255) / 256, 1, 1)
                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {shared_inter_h, shared_inter_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {shared_qx_h, qx_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {shared_sx_h, sx_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {shared_qinter_h, shared_qinter_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {shared_qinter_scale_h, sizeof(float)});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {shared_scale_h, sizeof(float)});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {shared_output_h, shared_output_bytes});
                 }
-                impl_->pending_free.push_back({qx_h, qx_bytes});
-                impl_->pending_free.push_back({sx_h, sx_bytes});
-                impl_->pending_free.push_back({qi_h, qi_bytes});
-                impl_->pending_free.push_back({si_h, si_bytes});
-                impl_->pending_free.push_back(
+                impl_->commands->pending_free.push_back({qx_h, qx_bytes});
+                impl_->commands->pending_free.push_back({sx_h, sx_bytes});
+                impl_->commands->pending_free.push_back({qi_h, qi_bytes});
+                impl_->commands->pending_free.push_back({si_h, si_bytes});
+                impl_->commands->pending_free.push_back(
                     {selected_h, selected_bytes});
-                impl_->pending_free.push_back(
+                impl_->commands->pending_free.push_back(
                     {slot_offsets_h, slot_offsets_bytes});
-                impl_->pending_free.push_back(
+                impl_->commands->pending_free.push_back(
                     {selection_indices_h, selection_indices_bytes});
-                impl_->pending_free.push_back({idx_h, idx_bytes});
-                impl_->pending_free.push_back({tw_h, tw_bytes});
-                impl_->pending_free.push_back({logits_h, logits_bytes});
-                impl_->pending_free.push_back({merged_h, merged_bytes});
+                impl_->commands->pending_free.push_back({idx_h, idx_bytes});
+                impl_->commands->pending_free.push_back({tw_h, tw_bytes});
+                impl_->commands->pending_free.push_back({logits_h, logits_bytes});
+                impl_->commands->pending_free.push_back({merged_h, merged_bytes});
                 break;
             }
 
@@ -4995,7 +4878,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     grid1d(1);
                     [enc memoryBarrierWithScope:
                              MTLBarrierScopeBuffers];
-                    if (impl_->profile) {
+                    if (impl_->commands->profile) {
                         profile_resident_moe_stage(
                             "MOE.group_routes");
                         const auto* counts =
@@ -5373,26 +5256,26 @@ void MetalBackend::dispatch(const GraphNode& node,
                         threadsPerThreadgroup:
                              MTLSizeMake(64, 4, 1)];
                 }
-                impl_->pending_free.push_back({qx_h,qx_bytes});impl_->pending_free.push_back({sx_h,sx_bytes});
-                impl_->pending_free.push_back({qi_h,qi_bytes});impl_->pending_free.push_back({si_h,si_bytes});
-                impl_->pending_free.push_back(
+                impl_->commands->pending_free.push_back({qx_h,qx_bytes});impl_->commands->pending_free.push_back({sx_h,sx_bytes});
+                impl_->commands->pending_free.push_back({qi_h,qi_bytes});impl_->commands->pending_free.push_back({si_h,si_bytes});
+                impl_->commands->pending_free.push_back(
                     {selected_h,selected_bytes});
                 if (grouped_prefill) {
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {expert_counts_h, expert_counts_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {expert_routes_h, expert_routes_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {grouped_jobs_h, grouped_jobs_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {grouped_job_count_h,
                          grouped_job_count_bytes});
-                    impl_->pending_free.push_back(
+                    impl_->commands->pending_free.push_back(
                         {grouped_dispatch_h,
                          grouped_dispatch_bytes});
                 }
-                impl_->pending_free.push_back({idx_h,idx_bytes});impl_->pending_free.push_back({tw_h,tw_bytes});
-                impl_->pending_free.push_back({logits_h,logits_bytes});impl_->pending_free.push_back({merged_h,merged_bytes});
+                impl_->commands->pending_free.push_back({idx_h,idx_bytes});impl_->commands->pending_free.push_back({tw_h,tw_bytes});
+                impl_->commands->pending_free.push_back({logits_h,logits_bytes});impl_->commands->pending_free.push_back({merged_h,merged_bytes});
                 break;
             }
 #endif
@@ -5422,25 +5305,25 @@ void MetalBackend::dispatch(const GraphNode& node,
             [enc setThreadgroupMemoryLength:4*sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake((hidden_size+3)/4,seq,1)
                 threadsPerThreadgroup:MTLSizeMake(128,1,1)];
-            impl_->pending_free.push_back({idx_h,idx_bytes});
-            impl_->pending_free.push_back({tw_h,tw_bytes});
-            impl_->pending_free.push_back({logits_h,logits_bytes});
-            impl_->pending_free.push_back({merged_h,merged_bytes});
+            impl_->commands->pending_free.push_back({idx_h,idx_bytes});
+            impl_->commands->pending_free.push_back({tw_h,tw_bytes});
+            impl_->commands->pending_free.push_back({logits_h,logits_bytes});
+            impl_->commands->pending_free.push_back({merged_h,merged_bytes});
             break;
         }
 
         // Generic correctness fallback for FP16/W8/shared-expert variants.
-        if (impl_->enc) { [impl_->enc endEncoding]; impl_->enc = nil; }
-        if (impl_->cmd) {
-            [impl_->cmd commit];
-            [impl_->cmd waitUntilCompleted];
-            if (impl_->cmd.status == MTLCommandBufferStatusError) {
-                NSError* e = impl_->cmd.error;
+        if (impl_->commands->enc) { [impl_->commands->enc endEncoding]; impl_->commands->enc = nil; }
+        if (impl_->commands->cmd) {
+            [impl_->commands->cmd commit];
+            [impl_->commands->cmd waitUntilCompleted];
+            if (impl_->commands->cmd.status == MTLCommandBufferStatusError) {
+                NSError* e = impl_->commands->cmd.error;
                 fprintf(stderr, "MetalBackend: pre-MOE command buffer error: %s\n",
                         e ? e.localizedDescription.UTF8String : "?");
                 impl_->dispatch_failed = true;
             }
-            impl_->cmd = nil;
+            impl_->commands->cmd = nil;
         }
 
         if (impl_->dispatch_failed)
@@ -5452,8 +5335,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                          router_score_func, norm_topk, has_shared,
                          n_group, topk_group, routed_scale);
 
-        impl_->cmd = [impl_->queue commandBuffer];
-        impl_->enc = [impl_->cmd computeCommandEncoder];
+        impl_->commands->cmd = [impl_->commands->queue commandBuffer];
+        impl_->commands->enc = [impl_->commands->cmd computeCommandEncoder];
         break;
     }
 
@@ -5464,35 +5347,35 @@ void MetalBackend::dispatch(const GraphNode& node,
     }
     // Per-op flush: debug diffing (MOLLM_METAL_SYNC_EACH) and/or per-op GPU
     // timing (MOLLM_METAL_PROFILE). Both need each op in its own command buffer.
-    if (impl_->profile) {
-        if (impl_->enc) { [impl_->enc endEncoding]; impl_->enc = nil; }
-        if (impl_->cmd) {
-            [impl_->cmd commit];
-            [impl_->cmd waitUntilCompleted];
-            double gpu_ms = (impl_->cmd.GPUEndTime - impl_->cmd.GPUStartTime) * 1000.0;
-            auto& st = impl_->op_stats[profile_label];
+    if (impl_->commands->profile) {
+        if (impl_->commands->enc) { [impl_->commands->enc endEncoding]; impl_->commands->enc = nil; }
+        if (impl_->commands->cmd) {
+            [impl_->commands->cmd commit];
+            [impl_->commands->cmd waitUntilCompleted];
+            double gpu_ms = (impl_->commands->cmd.GPUEndTime - impl_->commands->cmd.GPUStartTime) * 1000.0;
+            auto& st = impl_->commands->op_stats[profile_label];
             st.gpu_ms += gpu_ms;
             st.calls  += 1;
-            impl_->cmd = nil;
+            impl_->commands->cmd = nil;
         }
-        impl_->cmd = [impl_->queue commandBuffer];
-        impl_->enc = [impl_->cmd computeCommandEncoder];
+        impl_->commands->cmd = [impl_->commands->queue commandBuffer];
+        impl_->commands->enc = [impl_->commands->cmd computeCommandEncoder];
     } else {
         sync_point();  // no-op unless MOLLM_METAL_SYNC_EACH (per-op debug flush)
         const int chunk_ops = metal_cmd_chunk_ops();
-        if (impl_->chunk_graph && chunk_ops > 0 &&
+        if (impl_->commands->chunk_graph && chunk_ops > 0 &&
             !getenv("MOLLM_METAL_SYNC_EACH") &&
             !getenv("MOLLM_METAL_GPU_TIME") &&
-            encoded_gpu_work && ++impl_->ops_in_cmd >= chunk_ops) {
+            encoded_gpu_work && ++impl_->commands->ops_in_cmd >= chunk_ops) {
             // Submit a prefix without waiting. Command buffers from one queue
             // execute in order, so later graph nodes retain their dependencies
             // while CPU encoding overlaps execution of the submitted prefix.
-            [impl_->enc endEncoding];
-            impl_->enc = nil;
-            [impl_->cmd commit];
-            impl_->cmd = [impl_->queue commandBuffer];
-            impl_->enc = [impl_->cmd computeCommandEncoder];
-            impl_->ops_in_cmd = 0;
+            [impl_->commands->enc endEncoding];
+            impl_->commands->enc = nil;
+            [impl_->commands->cmd commit];
+            impl_->commands->cmd = [impl_->commands->queue commandBuffer];
+            impl_->commands->enc = [impl_->commands->cmd computeCommandEncoder];
+            impl_->commands->ops_in_cmd = 0;
         }
     }
 }
@@ -5814,7 +5697,7 @@ bool MetalBackend::dispatch_host_moe(
     id<MTLBuffer> index_buffer =
         (__bridge id<MTLBuffer>)indices_handle;
 
-    id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
+    id<MTLCommandBuffer> command = [impl_->commands->queue commandBuffer];
     command.label = @"mollm hybrid MXFP4 SSD MoE";
     std::unordered_set<void*> waited_events;
     for (const auto& view : views) {
