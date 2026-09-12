@@ -60,6 +60,8 @@ endif()
 # ---------------------------------------------------------------------------
 
 set(SOURCES
+    # portable backend helpers
+    backends/metal/weight_layout.cpp
     # runtime
     runtime/host_buffer_pool.cpp
     runtime/threading.cpp
@@ -484,6 +486,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_buffer_pool   tests/test_buffer_pool.cpp)
     add_mollm_test(test_mmap_file     tests/test_mmap_file.cpp)
     add_mollm_test(test_weight_metadata tests/test_weight_metadata.cpp)
+    add_mollm_test(test_metal_weight_layout tests/test_metal_weight_layout.cpp)
     add_mollm_test(test_sampler       tests/test_sampler.cpp)
     add_executable(vision_probe       tests/vision_probe.cpp)
     target_link_libraries(vision_probe PRIVATE mollm_lib)

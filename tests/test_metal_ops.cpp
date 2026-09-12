@@ -6,6 +6,7 @@
 #include "kernels/cpu/moe/moe.h"
 #include "kernels/cpu/models/rwkv.h"
 #include "backends/metal/backend.h"
+#include "core/quant_layouts.h"
 #include "graph/graph.h"
 #include <algorithm>
 #include <cmath>
@@ -1958,7 +1959,6 @@ int main() {
     // registered weight region so wrap_weight's decode path is exercised.
     {
         setenv("MOLLM_METAL_W4_PREFILL_MODE", "accurate", 1);
-        struct alignas(16) Q4B8G128Block { float scales[8]; uint8_t q[4][8][16]; };
         for (int ci = 0; ci < 6 && mb.has_tensor_path(); ci++) {
             const bool quant_probe = ci == 3;
             const bool balanced_probe = ci >= 4;
@@ -2223,10 +2223,6 @@ int main() {
     // Covers GPU routing with a no-shared-expert input layout and the direct
     // selected-expert kernel used by resident W4 packages.
     if (mb.has_tensor_path()) {
-        struct alignas(16) Q4B8G128Block {
-            float scales[8];
-            uint8_t q[4][8][16];
-        };
         constexpr int H = 128;
         constexpr int I = 128;
         constexpr int E = 256;
@@ -2537,11 +2533,6 @@ int main() {
     // two's-complement nibbles. Cover both the selected decode kernel and the
     // expert-grouped prefill kernel against the CPU packed-BG32 path.
     if (mb.has_tensor_path()) {
-        struct alignas(16) Q4B8G32Block {
-            float scales[8];
-            uint8_t q[8][16];
-        };
-        static_assert(sizeof(Q4B8G32Block) == 160);
         constexpr int H = 128;
         constexpr int I = 128;
         constexpr int E = 128;
