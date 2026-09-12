@@ -2,6 +2,7 @@
 #include "backends/metal/buffer_pool.h"
 #include "backends/metal/command_context.h"
 #include "backends/metal/dispatch_tuning.h"
+#include "backends/metal/layout_ops.h"
 #include "backends/metal/lm_head.h"
 #include "backends/metal/pipeline_cache.h"
 #include "backends/metal/resource_store.h"
@@ -44,6 +45,7 @@ struct MetalBackend::Impl {
     std::unique_ptr<MetalBufferPool> pool;
     std::unique_ptr<MetalCommandContext> commands;
     std::unique_ptr<MetalPipelineCache> pipeline_cache;
+    std::unique_ptr<MetalLayoutOps> layout_ops;
     std::unique_ptr<MetalLmHead> lm_head;
     std::unique_ptr<MetalResourceStore> resources;
     std::unique_ptr<MetalSsdExpertCache> ssd_cache;
@@ -274,6 +276,8 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
         impl_->pipeline_cache.reset(new MetalPipelineCache(
             (__bridge void*)impl_->device,
             (__bridge void*)impl_->library));
+        impl_->layout_ops.reset(
+            new MetalLayoutOps(impl_->pipeline_cache.get()));
         impl_->pool.reset(new MetalBufferPool((__bridge void*)impl_->device));
         impl_->commands.reset(new MetalCommandContext(
             (__bridge void*)queue, impl_->pool.get()));
@@ -317,6 +321,7 @@ MetalBackend::~MetalBackend() {
         impl_->ssd_cache.reset();
         impl_->ssd_shared_expert.reset();
         impl_->lm_head.reset();
+        impl_->layout_ops.reset();
         impl_->commands.reset();
         impl_->pipeline_cache.reset();
         impl_->resources.reset();
@@ -546,116 +551,11 @@ void MetalBackend::dispatch(const GraphNode& node,
         [enc dispatchThreadgroups:tgc threadsPerThreadgroup:tgs];
     };
 
-    switch (op) {
-    // --- view ops: metadata only, alias the input's device buffer ---
-    case OpType::INPUT:
-    case OpType::CONSTANT:
-        encoded_gpu_work = false;
-        break;
-
-    case OpType::RESHAPE: {
-        const Tensor& src = *inputs[0];
-        if (src.is_contiguous()) {
-            encoded_gpu_work = false;
-            // zero-copy: alias device buffer + offset, keep new shape
-            void* dd = src.device.buffer;
-            size_t doff = src.device.offset;
-            int64_t sh[4] = { output->shape[0], output->shape[1],
-                              output->shape[2], output->shape[3] };
-            *output = src;
-            output->shape[0]=sh[0]; output->shape[1]=sh[1];
-            output->shape[2]=sh[2]; output->shape[3]=sh[3];
-            output->compute_strides();
-            output->device.buffer = dd;
-            output->device.offset = doff;
-        } else {
-            // materialize via contiguous kernel (output buffer already allocated)
-            TensorDesc d{};
-            for (int i=0;i<4;i++){ d.shape[i]=(int)src.shape[i]; d.stride[i]=estride(src,i);}            
-            d.offset = eoffset(src);
-            id<MTLComputePipelineState> ps = impl_->pipeline("contiguous_f32");
-            [enc setComputePipelineState:ps];
-            [enc setBuffer:buf_of(&src) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(output) offset:0 atIndex:2];
-            [enc setBytes:&d length:sizeof(d) atIndex:3];
-            grid1d((int)output->nelements());
-        }
-        break;
-    }
-
-    case OpType::PERMUTE: {
-        encoded_gpu_work = false;
-        // zero-copy: reuse device buffer + offset, shape/stride already set by
-        // the CPU permute() metadata path via *output = permuted view.
-        const Tensor& src = *inputs[0];
-        // Recompute permuted shape/stride from params (axis order) like CPU.
-        // The executor left output shape from out_shape; but PERMUTE needs the
-        // permuted strides. Mirror kernels: params.i32[0..3] = axis order.
-        int a0=params.i32.size()>0?params.i32[0]:0;
-        int a1=params.i32.size()>1?params.i32[1]:1;
-        int a2=params.i32.size()>2?params.i32[2]:2;
-        int a3=params.i32.size()>3?params.i32[3]:3;
-        Tensor v = src;
-        int64_t ns[4]; size_t nst[4];
-        ns[a0]=src.shape[0]; nst[a0]=src.stride[0];
-        ns[a1]=src.shape[1]; nst[a1]=src.stride[1];
-        ns[a2]=src.shape[2]; nst[a2]=src.stride[2];
-        ns[a3]=src.shape[3]; nst[a3]=src.stride[3];
-        for(int i=0;i<4;i++){v.shape[i]=ns[i]; v.stride[i]=nst[i];}
-        *output = v;
-        output->device.buffer = src.device.buffer;
-        output->device.offset = src.device.offset;
-        break;
-    }
-
-    case OpType::SLICE: {
-        encoded_gpu_work = false;
-        // zero-copy: view of the parent along `dim`, preserving stride layout.
-        // Mirrors the CPU SLICE (execute.cpp): device.offset advances by
-        // offset*stride[dim] (bytes), shape[dim] shrinks to size.
-        const Tensor& src = *inputs[0];
-        int dim    = params.i32.size()>0 ? params.i32[0] : 0;
-        int offset = params.i32.size()>1 ? params.i32[1] : 0;
-        int size   = params.i32.size()>2 ? params.i32[2] : (int)src.shape[dim];
-        *output = src;
-        output->device.buffer = src.device.buffer;
-        output->device.offset = src.device.offset + (size_t)offset * src.stride[dim];
-        output->shape[dim] = size;
-        break;
-    }
-
-    case OpType::CONTIGUOUS: {
-        const Tensor& src = *inputs[0];
-        // Dense inputs are handled as zero-copy aliases by the executor. Only
-        // genuinely strided layouts reach this materialization kernel.
-        TensorDesc d{};
-        for (int i=0;i<4;i++){ d.shape[i]=(int)src.shape[i]; d.stride[i]=estride(src,i);}        
-        d.offset = eoffset(src);
-        [enc setBuffer:buf_of(&src) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(output) offset:0 atIndex:2];
-        [enc setBytes:&d length:sizeof(d) atIndex:3];
-        // 3D fast path (no per-element div/mod) when the tensor collapses to
-        // <=3 dims (shape[3]==1, the common attention transpose case).
-        if (d.shape[3] == 1) {
-            // NOTE: this M5 Pro GPU returns WRONG partial results with
-            // dispatchThreads: (non-uniform threadgroups); use dispatchThreadgroups:
-            // with a rounded-up grid + in-kernel bounds check (see M1 notes).
-            id<MTLComputePipelineState> ps = impl_->pipeline("contiguous3d_f32");
-            [enc setComputePipelineState:ps];
-            const NSUInteger tx = 64, ty = 4;
-            MTLSize tgs = MTLSizeMake(tx, ty, 1);
-            MTLSize tgc = MTLSizeMake(((NSUInteger)d.shape[0] + tx - 1)/tx,
-                                      ((NSUInteger)d.shape[1] + ty - 1)/ty,
-                                      (NSUInteger)d.shape[2]);
-            [enc dispatchThreadgroups:tgc threadsPerThreadgroup:tgs];
-        } else {
-            id<MTLComputePipelineState> ps = impl_->pipeline("contiguous_f32");
-            [enc setComputePipelineState:ps];
-            grid1d((int)output->nelements());
-        }
-        break;
-    }
-
+    const bool handled_layout = impl_->layout_ops &&
+        impl_->layout_ops->dispatch(
+            node, inputs, output, enc, encoded_gpu_work);
+    if (!handled_layout) {
+        switch (op) {
     case OpType::MATMUL:
     case OpType::GEMV_SPARSE_A: {
         const Tensor& A = *inputs[0];
@@ -4395,6 +4295,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         fprintf(stderr, "MetalBackend: unsupported op %d\n", (int)op);
         assert(false && "unsupported metal op");
         break;
+        }
     }
     // Per-op flush: debug diffing (MOLLM_METAL_SYNC_EACH) and/or per-op GPU
     // timing (MOLLM_METAL_PROFILE). Both need each op in its own command buffer.

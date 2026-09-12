@@ -389,6 +389,7 @@ if(MOLLM_METAL)
         backends/metal/backend.mm
         backends/metal/buffer_pool.mm
         backends/metal/command_context.mm
+        backends/metal/layout_ops.mm
         backends/metal/lm_head.mm
         backends/metal/pipeline_cache.mm
         backends/metal/resource_store.mm
@@ -398,6 +399,7 @@ if(MOLLM_METAL)
     set_source_files_properties(
         backends/metal/backend.mm backends/metal/buffer_pool.mm
         backends/metal/command_context.mm
+        backends/metal/layout_ops.mm
         backends/metal/lm_head.mm
         backends/metal/pipeline_cache.mm
         backends/metal/resource_store.mm
