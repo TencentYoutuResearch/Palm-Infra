@@ -105,6 +105,8 @@ set(SOURCES
     kernels/cpu/moe/moe.cpp
     kernels/cpu/moe/moe_routing.cpp
     kernels/cpu/models/rwkv.cpp
+    # backend selection
+    backends/factory.cpp
     # engine
     engine/engine.cpp
     engine/input_prep.cpp
