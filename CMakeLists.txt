@@ -402,6 +402,7 @@ if(MOLLM_METAL)
     add_dependencies(mollm_lib mollm_metallib)
 
     target_sources(mollm_lib PRIVATE
+        backends/metal/attention_ops.mm
         backends/metal/backend.mm
         backends/metal/buffer_pool.mm
         backends/metal/command_context.mm
@@ -417,6 +418,7 @@ if(MOLLM_METAL)
         backends/metal/ssd_shared_expert.mm)
     # The Objective-C++ sources use ARC bridge-cast ownership semantics.
     set_source_files_properties(
+        backends/metal/attention_ops.mm
         backends/metal/backend.mm backends/metal/buffer_pool.mm
         backends/metal/command_context.mm
         backends/metal/elementwise_ops.mm
