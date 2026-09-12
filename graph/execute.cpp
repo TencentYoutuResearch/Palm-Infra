@@ -1,6 +1,6 @@
 #include "graph/execute.h"
 #include "runtime/backend.h"
-#include "kernels/bf16.h"
+#include "core/bf16.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/moe/moe.h"
 #include "kernels/moe_ssd.h"
