@@ -149,6 +149,7 @@ set(PUBLIC_RUNTIME_HEADERS
 
 set(PUBLIC_CPU_BACKEND_HEADERS
     backends/cpu/backend.h
+    backends/cpu/platform.h
 )
 
 set(PUBLIC_STORAGE_HEADERS

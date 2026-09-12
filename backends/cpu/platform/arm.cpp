@@ -1,4 +1,4 @@
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 
 #include <cstdlib>
 #include <cstring>

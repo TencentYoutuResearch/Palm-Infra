@@ -1,7 +1,7 @@
 #pragma once
 
 #include "runtime/backend.h"
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 
 // CPU graph dispatcher. The implementation is in backends/cpu/backend.cpp.
 class CPUBackend : public Backend {

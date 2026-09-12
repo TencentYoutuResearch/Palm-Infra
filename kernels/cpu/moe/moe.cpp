@@ -1,7 +1,7 @@
 #include "kernels/cpu/moe/moe.h"
 
 #include "core/bf16.h"
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/moe/moe_routing.h"
 #include "runtime/expert_provider.h"

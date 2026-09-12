@@ -1,6 +1,6 @@
 #include "kernels/cpu/recurrent/gdn.h"
 #include "kernels/cpu/recurrent/shortconv.h"
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 
 #if defined(MOLLM_CPU_X86_SIMD)
 #include "kernels/cpu/x86/gdn_x86.h"
