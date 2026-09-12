@@ -998,17 +998,17 @@ static void naive_sdpa_head_fp16_cache(
 // kernel_sdpa
 // ---------------------------------------------------------------------------
 
-void kernel_sdpa(const OpParams& params,
+void kernel_sdpa(const SdpaParams& params,
                  const std::vector<const Tensor*>& inputs,
                  std::vector<Tensor*>& outputs,
                  ThreadPool* thread_pool) {
-    int kv_cache    = graph_params::get_i32(params, 0, 2);
-    int causal      = graph_params::get_i32(params, 1, 1);
-    int num_heads   = graph_params::get_i32(params, 2, 16);
-    int num_kv_heads= graph_params::get_i32(params, 3, 16);
-    int head_dim    = graph_params::get_i32(params, 4, 192);
-    int v_head_dim  = graph_params::get_i32(params, 5, 128);
-    float scale     = graph_params::get_f32(params, 0, 0.f);
+    int kv_cache    = params.kv_cache;
+    int causal      = params.causal;
+    int num_heads   = params.num_heads;
+    int num_kv_heads= params.num_kv_heads;
+    int head_dim    = params.head_dim;
+    int v_head_dim  = params.v_head_dim;
+    float scale     = params.scale;
     if (scale == 0.f) scale = 1.f / std::sqrt((float)head_dim);
 
     int heads_per_group = num_heads / num_kv_heads;

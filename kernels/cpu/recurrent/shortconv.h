@@ -1,6 +1,6 @@
 #pragma once
 
-#include "graph/graph.h"
+#include "core/shortconv_params.h"
 #include "kernels/tensor.h"
 #include "runtime/threading.h"
 
@@ -13,9 +13,6 @@
 //   groups] inputs[1] weight     FP32, [kernel_size, groups] inputs[2] state
 //   FP32, [kernel_size - 1, groups], updated in place
 //
-// Params:
-//   i32[0] = kernel_size
-//   i32[1] = number of real tokens when a prefill input is padded
-void kernel_shortconv(const OpParams& params,
+void kernel_shortconv(const ShortConvParams& params,
                       const std::vector<const Tensor*>& inputs, Tensor& output,
                       ThreadPool* thread_pool = nullptr);
