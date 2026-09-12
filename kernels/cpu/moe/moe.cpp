@@ -3,7 +3,7 @@
 #include "core/bf16.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/moe/moe_routing.h"
-#include "storage/ssd_expert_cache/cache.h"
+#include "runtime/expert_provider.h"
 #include "runtime/trace.h"
 #include "runtime/threading.h"
 
@@ -394,11 +394,11 @@ static bool validate_inputs(const std::vector<const Tensor*>& inputs,
         return false;
     }
     for (size_t i = 0; i < required_inputs; i++) {
-        // Routed expert aggregates may intentionally be data-less: the SSD
-        // cache supplies one selected expert pair at a time.
-        bool is_ssd_expert = (i == 2 || i == 3) && inputs[i] &&
+        // Routed expert aggregates may be data-less: their provider supplies
+        // one selected expert pair at a time.
+        bool is_provider_expert = (i == 2 || i == 3) && inputs[i] &&
                              inputs[i]->moe_ssd_source != nullptr;
-        if (!inputs[i] || (!inputs[i]->data && !is_ssd_expert)) {
+        if (!inputs[i] || (!inputs[i]->data && !is_provider_expert)) {
             std::fprintf(stderr, "MOE: missing input %zu\n", i);
             return false;
         }
@@ -633,20 +633,18 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     const bool use_bf16_activations =
         experts_gate_up.prec == Precision::MXFP4 ||
         experts_gate_up.prec == Precision::NVFP4;
-    const auto* gate_up_source = static_cast<const MoeSsdTensorSource*>(
-        experts_gate_up.moe_ssd_source);
-    const auto* down_source = static_cast<const MoeSsdTensorSource*>(
-        experts_down.moe_ssd_source);
-    const bool use_ssd = gate_up_source || down_source;
-    if (use_ssd && (!gate_up_source || !down_source ||
-                    gate_up_source->cache != down_source->cache)) {
-        std::fprintf(stderr, "MOE: incomplete SSD expert source pair\n");
+    const auto* gate_up_source = experts_gate_up.moe_ssd_source;
+    const auto* down_source = experts_down.moe_ssd_source;
+    const bool use_provider = gate_up_source || down_source;
+    if (use_provider && (!gate_up_source || !down_source || !gate_up_source->provider ||
+                    gate_up_source->provider != down_source->provider)) {
+        std::fprintf(stderr, "MOE: incomplete expert provider source pair\n");
         return false;
     }
     std::string trace_layer_args;
     if (mollm_trace::enabled()) {
-        trace_layer_args = use_ssd
-            ? "{\"layer\":" + std::to_string(gate_up_source->spec.layer) + "}"
+        trace_layer_args = use_provider
+            ? "{\"layer\":" + std::to_string(gate_up_source->layer) + "}"
             : "{}";
     }
     mollm_trace::ScopedEvent trace_moe("compute", "moe", trace_layer_args);
@@ -729,8 +727,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     if (profile) moe_profile_add(MoeProfileStage::TopK, stage_start);
 
     std::vector<int> selected_experts;
-    bool stream_ssd_window = false;
-    if (use_ssd) {
+    bool stream_expert_window = false;
+    if (use_provider) {
         selected_experts.reserve((size_t)seq_len * (size_t)top_k);
         for (int t = 0; t < seq_len; t++) {
             for (int k = 0; k < top_k; k++) {
@@ -746,7 +744,7 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         if (seq_len == 1 && !top_idx.empty()) {
             std::vector<int> ranked_experts(
                 top_idx.begin(), top_idx.begin() + top_k);
-            gate_up_source->cache->retain_for_next_forward(
+            gate_up_source->provider->retain_for_next_forward(
                 gate_up_source, down_source, ranked_experts,
                 !exact_hash_route);
         }
@@ -754,12 +752,12 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         // can now fill them while this CPU thread executes the independent
         // shared MLP below; acquire() only waits for a particular expert when
         // its routed matmul is about to run.
-        if (!gate_up_source->cache->request_many(gate_up_source, down_source,
+        if (!gate_up_source->provider->request_many(gate_up_source, down_source,
                                                   selected_experts)) {
-            std::fprintf(stderr, "MOE: failed to queue SSD expert reads\n");
+            std::fprintf(stderr, "MOE: failed to request expert weights\n");
             return false;
         }
-        stream_ssd_window = gate_up_source->cache->resident_count(
+        stream_expert_window = gate_up_source->provider->resident_count(
             gate_up_source, down_source, selected_experts) < selected_experts.size();
     }
 
@@ -820,7 +818,7 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     std::vector<int> batched_slots;
     std::vector<float> batch_down_out;
     const bool can_batch_ready_decode =
-        use_ssd && seq_len == 1 && thread_pool &&
+        use_provider && seq_len == 1 && thread_pool &&
         thread_pool->num_threads() > 1 && selected_experts.size() > 1;
     if (can_batch_ready_decode)
         batched_slots.assign(num_experts, -1);
@@ -829,16 +827,17 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         const size_t batch = experts.size();
         const size_t output_base =
             batch_down_out.size() / static_cast<size_t>(hidden_size);
+        std::vector<ExpertLease> leases(batch);
         std::vector<Tensor> gate_up_weights(batch);
         std::vector<Tensor> down_weights(batch);
         for (size_t i = 0; i < batch; ++i) {
-            if (!gate_up_source->cache->acquire(
-                    gate_up_source, down_source, experts[i],
-                    gate_up_weights[i], down_weights[i])) {
-                std::fprintf(stderr, "MOE: failed to page in expert %d\n",
-                             experts[i]);
-                return false;
-            }
+            if (!gate_up_source->provider->borrow(
+                    gate_up_source, down_source, experts[i], leases[i], false))
+                return false;  // Readiness changed; fall back to sequential borrowing.
+            gate_up_weights[i] = leases[i].gate_up;
+            down_weights[i] = leases[i].down;
+        }
+        for (size_t i = 0; i < batch; ++i) {
             batched_slots[experts[i]] =
                 static_cast<int>(output_base + i);
         }
@@ -864,7 +863,7 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         const std::string batch_trace_args =
             mollm_trace::enabled()
                 ? "{\"layer\":" +
-                      std::to_string(gate_up_source->spec.layer) +
+                      std::to_string(gate_up_source->layer) +
                       ",\"experts\":" + std::to_string(batch) + "}"
                 : std::string();
         if (profile) stage_start = moe_profile_now();
@@ -966,7 +965,7 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             std::vector<int> ready;
             for (int expert : selected_experts) {
                 if (counts[expert] == 1 && batched_slots[expert] < 0 &&
-                    gate_up_source->cache->is_ready(
+                    gate_up_source->provider->is_ready(
                         gate_up_source, down_source, expert)) {
                     ready.push_back(expert);
                 }
@@ -974,22 +973,22 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             if (ready.size() < 2)
                 break;
             if (!process_ready_batch(ready))
-                return false;
+                break;
         }
     }
 
     auto advance_stream_window = [&](int expert) {
-        if (!use_ssd || !stream_ssd_window) return;
-        gate_up_source->cache->release(
+        if (!use_provider || !stream_expert_window) return;
+        gate_up_source->provider->evict(
             gate_up_source, down_source, expert);
         auto next = std::upper_bound(
             selected_experts.begin(), selected_experts.end(), expert);
         for (; next != selected_experts.end(); ++next) {
-            if (!gate_up_source->cache->contains(
+            if (!gate_up_source->provider->contains(
                     gate_up_source, down_source, *next)) {
                 // Submit one exact replacement. Passing every remaining route
                 // could evict a nearer ready expert while reserving the tail.
-                gate_up_source->cache->request_many(
+                gate_up_source->provider->request_many(
                     gate_up_source, down_source, {*next});
                 break;
             }
@@ -1003,8 +1002,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         std::string trace_expert_args;
         if (mollm_trace::enabled()) {
             trace_expert_args = "{\"expert\":" + std::to_string(e) +
-                                (use_ssd ? ",\"layer\":" +
-                                               std::to_string(gate_up_source->spec.layer)
+                                (use_provider ? ",\"layer\":" +
+                                               std::to_string(gate_up_source->layer)
                                          : std::string()) + "}";
         }
         const int batched_slot =
@@ -1039,16 +1038,19 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         }
         if (profile) moe_profile_add(MoeProfileStage::RoutedGather, stage_start);
 
+        ExpertLease lease;
         Tensor gate_up_b;
         Tensor down_b;
         bool has_gate_up_view = false;
         bool has_down_view = false;
-        if (use_ssd) {
-            if (!gate_up_source->cache->acquire(gate_up_source, down_source, e,
-                                                gate_up_b, down_b)) {
-                std::fprintf(stderr, "MOE: failed to page in expert %d\n", e);
+        if (use_provider) {
+            if (!gate_up_source->provider->borrow(gate_up_source, down_source, e,
+                                                 lease)) {
+                std::fprintf(stderr, "MOE: failed to borrow expert %d\n", e);
                 return false;
             }
+            gate_up_b = lease.gate_up;
+            down_b = lease.down;
             has_gate_up_view = true;
             has_down_view = true;
         } else {
@@ -1144,6 +1146,7 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             if (profile) moe_profile_add(MoeProfileStage::RoutedScatter, stage_start);
         }
 
+        lease.reset();
         // Weight views are no longer used. Advance a bounded cache immediately
         // so its replacement read overlaps the next ready expert.
         advance_stream_window(e);

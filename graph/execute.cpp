@@ -385,9 +385,9 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
                 schedule_moe_hash_cross_layer_prefetch(
                     tensors[moe_inputs[token_ids_input]],
                     tensors[moe_inputs[hash_table_input]],
-                    static_cast<const MoeSsdTensorSource*>(
+                    dynamic_cast<const MoeSsdTensorSource*>(
                         gate.moe_ssd_source),
-                    static_cast<const MoeSsdTensorSource*>(
+                    dynamic_cast<const MoeSsdTensorSource*>(
                         down.moe_ssd_source),
                     graph_params::get_i32(moe.params, 1, 0),
                     graph_params::get_i32(moe.params, 2, 0),
@@ -609,9 +609,9 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
                     schedule_moe_hash_cross_layer_prefetch(
                         tensors[next_inputs[token_ids_input]],
                         tensors[next_inputs[hash_table_input]],
-                        static_cast<const MoeSsdTensorSource*>(
+                        dynamic_cast<const MoeSsdTensorSource*>(
                             next_gate.moe_ssd_source),
-                        static_cast<const MoeSsdTensorSource*>(
+                        dynamic_cast<const MoeSsdTensorSource*>(
                             next_down.moe_ssd_source),
                         num_experts, top_k);
                 } else if (ctx.moe_cross_layer_prefetch) {
@@ -645,9 +645,9 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
                     }
                     schedule_moe_cross_layer_prefetch(
                         prediction_input, next_router, next_bias,
-                        static_cast<const MoeSsdTensorSource*>(
+                        dynamic_cast<const MoeSsdTensorSource*>(
                             next_gate.moe_ssd_source),
-                        static_cast<const MoeSsdTensorSource*>(
+                        dynamic_cast<const MoeSsdTensorSource*>(
                             next_down.moe_ssd_source),
                         config);
                 }

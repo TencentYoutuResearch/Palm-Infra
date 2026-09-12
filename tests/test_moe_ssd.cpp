@@ -64,6 +64,48 @@ int main() {
         out.write(reinterpret_cast<const char*>(contents), sizeof(contents));
     }
 
+    // Leases protect resident payloads independently of cache-retention policy.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 16), "open two-pair lease cache");
+        check(cache.add_source(spec("lease_gate", 0)) &&
+                  cache.add_source(spec("lease_down", 12)), "register lease sources");
+        const auto* gate = cache.find_source("lease_gate");
+        const auto* down = cache.find_source("lease_down");
+        ExpertProvider& provider = cache;
+        ExpertLease first, second, missing;
+        check(provider.borrow(gate, down, 0, first) &&
+                  provider.borrow(gate, down, 1, second), "borrow two expert pairs");
+        check(!provider.evict(gate, down, 0) && !cache.clear_resident(),
+              "eviction and cache clearing reject active leases");
+        check(!cache.open(path, 16), "reopening cannot invalidate active leases");
+        check(provider.request_many(gate, down, {2}), "request while both slots are pinned");
+        check(provider.contains(gate, down, 0) && provider.contains(gate, down, 1),
+              "new demand cannot recycle pinned expert data");
+        check(!provider.borrow(gate, down, 2, missing, false) && !missing,
+              "nonblocking borrow does not wait or allocate on a miss");
+        ExpertLease moved = std::move(first);
+        check(!first && moved && !provider.evict(gate, down, 0),
+              "moving a lease transfers its pin");
+        check(moved.gate_up.data &&
+                  moved.gate_up.ptr<uint16_t>()[0] == contents[0],
+              "pinned bytes survive competing demand");
+        moved.reset();
+        check(provider.request_many(gate, down, {2}) &&
+                  wait_until([&] { return provider.is_ready(gate, down, 2); }),
+              "freed pin lets the request window advance");
+        check(provider.borrow(gate, down, 2, missing, false), "borrow newly-ready pair");
+        missing = std::move(second);
+        check(!second && provider.evict(gate, down, 2) &&
+                  !provider.evict(gate, down, 1),
+              "move assignment releases the old pin and retains the new one");
+        ExpertSource foreign;
+        foreign.provider = &provider;
+        check(!provider.borrow(&foreign, down, 0, missing) && !missing,
+              "failed replacement clears the old lease and rejects foreign metadata");
+        check(cache.clear_resident(), "all lease pins are returned on reset and failure");
+    }
+
     // Reject corrupt package metadata during registration, before an I/O
     // worker can turn it into a short read or an overflowing allocation.
     {
@@ -542,8 +584,9 @@ int main() {
             std::ofstream empty(path, std::ios::binary | std::ios::trunc);
         }
         Tensor gu, dw;
-        check(!cache.acquire(gate, down, 0, gu, dw),
-              "first acquire observes truncated-file read failure");
+        ExpertLease failed;
+        check(!cache.borrow(gate, down, 0, failed) && !failed,
+              "failed borrow observes truncated-file read failure and releases its pin");
         check(!cache.contains(gate, down, 0),
               "failed entry is not reported as cached");
 

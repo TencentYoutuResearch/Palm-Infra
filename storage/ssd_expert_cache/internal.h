@@ -56,6 +56,7 @@ struct MoeSsdCache::Entry {
     uint64_t used_at = 0;
     State state = State::Loading;
     int pending_reads = 0;
+    size_t pins = 0;  // Active ExpertLeases; pinned entries cannot be evicted.
     bool fresh_miss = false;  // first acquire after a queued miss is not a hit
     bool speculative = false;
     // Immutable for one residency lifetime. Unlike speculative, this remains

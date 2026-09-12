@@ -3950,10 +3950,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                 : nullptr;
         float routed_scale = params.f32.size()>0 ? params.f32[0] : 1.0f;
         const auto* ssd_gate = inputs.size() > 2
-            ? static_cast<const MoeSsdTensorSource*>(inputs[2]->moe_ssd_source)
+            ? dynamic_cast<const MoeSsdTensorSource*>(inputs[2]->moe_ssd_source)
             : nullptr;
         const auto* ssd_down = inputs.size() > 3
-            ? static_cast<const MoeSsdTensorSource*>(inputs[3]->moe_ssd_source)
+            ? dynamic_cast<const MoeSsdTensorSource*>(inputs[3]->moe_ssd_source)
             : nullptr;
         // Qwen-style W4 routed experts stay on the GPU. Resident package
         // weights use native BG128 blocks: short prefill uses independent
@@ -6026,9 +6026,9 @@ bool MetalBackend::dispatch_host_moe(
     const float routed_scale = graph_params::get_f32(params, 0, 1.0f);
     const float swiglu_limit = graph_params::get_f32(params, 1, 0.0f);
 
-    const auto* gate_source = static_cast<const MoeSsdTensorSource*>(
+    const auto* gate_source = dynamic_cast<const MoeSsdTensorSource*>(
         inputs[2]->moe_ssd_source);
-    const auto* down_source = static_cast<const MoeSsdTensorSource*>(
+    const auto* down_source = dynamic_cast<const MoeSsdTensorSource*>(
         inputs[3]->moe_ssd_source);
     const bool supported = impl_->ssd_io_queue && gate_source && down_source &&
         gate_source->cache == down_source->cache &&

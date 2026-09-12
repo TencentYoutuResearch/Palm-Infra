@@ -97,7 +97,7 @@ bool MoeSsdCache::clear_resident() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!io_jobs_.empty() || !low_priority_io_jobs_.empty()) return false;
     for (const auto& entry : entries_) {
-        if (entry->is_loading()) return false;
+        if (entry->is_loading() || entry->pins != 0) return false;
     }
     entries_.clear();
     entry_locations_.clear();
@@ -134,6 +134,13 @@ void MoeSsdCache::stop_io_workers() {
 bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
                        int io_workers, bool enable_cross_layer_worker,
                        bool lock_expert_pages) {
+    // Like initial registration, reopening requires the caller to stop new
+    // requests. Do not invalidate any already-issued expert leases.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& entry : entries_)
+            if (entry->pins != 0) return false;
+    }
     if (capacity_bytes == 0 || io_workers < 1) {
         std::fprintf(stderr, "MoE SSD: cache capacity and I/O worker count must be non-zero\n");
         return false;
@@ -325,6 +332,8 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
     MoeSsdTensorSource source;
     source.spec = spec;
     source.cache = this;
+    source.provider = this;
+    source.layer = spec.layer;
     auto inserted = sources_.emplace(spec.weight_ref, std::move(source));
     if (!inserted.second) {
         std::fprintf(stderr, "MoE SSD: duplicate expert storage metadata for %s\n",
@@ -471,7 +480,7 @@ const MoeSsdCache::Entry* MoeSsdCache::find_entry_locked(
 
 std::unique_ptr<MoeSsdCache::Entry> MoeSsdCache::remove_entry_locked(
     Entry* entry, bool count_eviction) {
-    if (!entry || entry->is_loading())
+    if (!entry || entry->is_loading() || entry->pins != 0)
         return nullptr;
 
     const auto location = entry_locations_.find(entry);
@@ -551,7 +560,7 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
         Entry* victim_entry = nullptr;
         if (global_capacity_pool_) {
             for (const auto& entry : entries_) {
-                if (entry->is_loading()) continue;
+                if (entry->is_loading() || entry->pins != 0) continue;
                 if (!victim_entry || global_victim_before_locked(entry.get(), victim_entry)) {
                     victim_entry = entry.get();
                 }
@@ -559,13 +568,14 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
         } else {
             auto victim = std::min_element(layer_entries.begin(), layer_entries.end(),
                 [](const Entry* a, const Entry* b) {
-                    if (a->is_loading() != b->is_loading())
-                        return !a->is_loading();
+                    const bool a_busy = a->is_loading() || a->pins != 0;
+                    const bool b_busy = b->is_loading() || b->pins != 0;
+                    if (a_busy != b_busy) return !a_busy;
                     return a->used_at < b->used_at;
                 });
             if (victim != layer_entries.end()) victim_entry = *victim;
         }
-        if (!victim_entry || victim_entry->is_loading()) {
+        if (!victim_entry || victim_entry->is_loading() || victim_entry->pins != 0) {
             // The asynchronous request window for this layer is full. The
             // caller can let workers finish and retry later.
             return nullptr;
@@ -1154,6 +1164,13 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
                           int expert,
                           Tensor& gate_up_out,
                           Tensor& down_out) {
+    return acquire_impl(gate_up, down, expert, gate_up_out, down_out, nullptr, true);
+}
+
+bool MoeSsdCache::acquire_impl(const MoeSsdTensorSource* gate_up,
+                              const MoeSsdTensorSource* down, int expert,
+                              Tensor& gate_up_out, Tensor& down_out,
+                              Entry** pinned_entry, bool wait) {
     if (!valid_pair(gate_up, down, expert)) {
         std::fprintf(stderr, "MoE SSD: invalid expert pair request\n");
         return false;
@@ -1182,13 +1199,34 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
     }
     if (global_capacity_pool_) active_layer_ = gate_up->spec.layer;
     Entry* entry = find_entry_locked(gate_up, down, expert);
+    if (!wait && (!entry || !entry->is_ready())) return false;
     if (entry && entry->state == Entry::State::Failed) {
         if (remove_entry_locked(entry, false))
             entry = nullptr;
     }
+    // Protect the entry before releasing the mutex to wait for I/O. Otherwise
+    // another requester could evict a just-completed read before we wake up.
+    struct PendingPin {
+        Entry* entry = nullptr;
+        std::condition_variable& ready;
+        void hold(Entry* value) {
+            if (value && !entry) {
+                entry = value;
+                ++entry->pins;
+            }
+        }
+        ~PendingPin() {
+            if (entry) {
+                --entry->pins;
+                ready.notify_all();
+            }
+        }
+    } pin{nullptr, ready_cv_};
+    pin.hold(entry);
     while (!entry) {
         entry = reserve_entry_locked(gate_up, down, expert);
         if (entry) {
+            pin.hold(entry);
             ++misses_;
             enqueue_entry_reads_locked({entry});
             lock.unlock();
@@ -1206,6 +1244,7 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
                 SteadyClock::now() - slot_wait_start).count());
         ++slot_waits_;
         entry = find_entry_locked(gate_up, down, expert);
+        pin.hold(entry);
     }
     if (entry && entry->is_loading()) begin_wait();
     ready_cv_.wait(lock, [&] { return entry && !entry->is_loading(); });
@@ -1248,6 +1287,10 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
             "ssd", "acquire", trace_start, mollm_trace::now_ns(),
             "{\"layer\":" + std::to_string(gate_up->spec.layer) +
             ",\"expert\":" + std::to_string(expert) + "}");
+    }
+    if (pinned_entry) {
+        *pinned_entry = entry;
+        pin.entry = nullptr;  // Transfer the pin to the returned ExpertLease.
     }
     return true;
 }
