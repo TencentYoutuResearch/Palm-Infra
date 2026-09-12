@@ -39,6 +39,10 @@ GdnParams resolve_gdn_params(const OpParams& params) {
 
 }  // namespace
 
+void CPUBackend::begin_execution() {
+    matmul_reset_activation_cache();
+}
+
 // ---------------------------------------------------------------------------
 // CPUBackend::dispatch — CPU graph dispatcher.
 //

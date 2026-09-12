@@ -1,7 +1,6 @@
 #include "graph/execute.h"
 #include "runtime/backend.h"
 #include "core/bf16.h"
-#include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/moe/moe.h"
 #include "storage/ssd_expert_cache/cache.h"
 #include "kernels/tensor.h"
@@ -261,7 +260,9 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
         return;
     }
     ctx.backend->clear_dispatch_error();
-    matmul_reset_activation_cache();
+    ctx.backend->begin_execution();
+    if (ctx.moe_backend && ctx.moe_backend != ctx.backend)
+        ctx.moe_backend->begin_execution();
     // Device-resident backends (Metal) keep intermediates in device buffers,
     // so borrowed-view detection can't rely on host-pointer equality; classify
     // views by op type instead, and skip the host owner-id assertions.

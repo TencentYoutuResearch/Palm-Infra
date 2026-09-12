@@ -23,6 +23,7 @@ public:
                   const std::vector<const Tensor*>& inputs,
                   Tensor* output, ThreadPool* thread_pool) override;
     void clear_dispatch_error() override;
+    void begin_execution() override;
     bool dispatch_failed() const override;
     bool set_operator_fallback_policy(
         OperatorFallbackPolicy policy) override;

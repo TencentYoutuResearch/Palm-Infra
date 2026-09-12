@@ -71,6 +71,12 @@ public:
     virtual void clear_dispatch_error() {}
     virtual bool dispatch_failed() const { return false; }
 
+    /// Start a new execute_graph() pass, including partial/repeated passes.
+    /// Invalidate backend execution caches even when tensor addresses and
+    /// workspace storage are reused. This does not open a device command
+    /// buffer: begin_graph()/end_graph() remain owned by the caller.
+    virtual void begin_execution() {}
+
     // -----------------------------------------------------------------------
     // Storage allocation hooks.
     //
