@@ -409,6 +409,7 @@ if(MOLLM_METAL)
         backends/metal/elementwise_ops.mm
         backends/metal/layout_ops.mm
         backends/metal/lm_head.mm
+        backends/metal/matmul_ops.mm
         backends/metal/normalization_ops.mm
         backends/metal/pipeline_cache.mm
         backends/metal/recurrent_ops.mm
@@ -424,6 +425,7 @@ if(MOLLM_METAL)
         backends/metal/elementwise_ops.mm
         backends/metal/layout_ops.mm
         backends/metal/lm_head.mm
+        backends/metal/matmul_ops.mm
         backends/metal/normalization_ops.mm
         backends/metal/pipeline_cache.mm
         backends/metal/recurrent_ops.mm
