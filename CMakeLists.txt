@@ -76,6 +76,7 @@ set(SOURCES
     # graph
     graph/io.cpp
     backends/cpu/backend.cpp
+    backends/cpu/deepseek_v4_ops.cpp
     graph/execute.cpp
     # kernels
     kernels/cpu/matmul/matmul.cpp
