@@ -1,4 +1,4 @@
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/matmul/matmul_internal.h"
 

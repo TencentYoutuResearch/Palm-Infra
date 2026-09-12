@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 
 namespace mollm::cpu::x86 {
 

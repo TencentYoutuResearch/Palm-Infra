@@ -1,6 +1,6 @@
 #include "engine/sampler.h"
 
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 #include "kernels/tensor.h"
 
 #include <algorithm>

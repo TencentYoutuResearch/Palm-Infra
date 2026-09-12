@@ -1,7 +1,7 @@
 // Shared NEON helpers for GDN prefill and decode kernels.
 #pragma once
 
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 
 #if HAS_NEON
 #include <arm_neon.h>

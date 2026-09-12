@@ -1,5 +1,5 @@
 #include "engine/weight_metadata.h"
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 
 #include "kernels/cpu/matmul/matmul.h"
 

@@ -1,6 +1,6 @@
 #include "kernels/cpu/elementwise.h"
 #include "kernels/cpu/activations.h"
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 
 #include <algorithm>
 #include <cmath>

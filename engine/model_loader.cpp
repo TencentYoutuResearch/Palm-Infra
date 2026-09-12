@@ -5,7 +5,6 @@
 #include "kernels/cpu/matmul/matmul.h"
 #include "storage/ssd_expert_cache/cache.h"
 #include "runtime/trace.h"
-#include "kernels/cpu_platform.h"
 #ifdef MOLLM_METAL
 #include "backends/metal/backend.h"
 #endif

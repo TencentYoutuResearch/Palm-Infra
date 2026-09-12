@@ -1,5 +1,5 @@
 #include "kernels/cpu/recurrent/shortconv.h"
-#include "kernels/cpu_platform.h"
+#include "backends/cpu/platform.h"
 
 #include <cmath>
 #include <vector>
