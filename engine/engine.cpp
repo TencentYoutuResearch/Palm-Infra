@@ -4,9 +4,6 @@
 #include "core/fp16.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "runtime/trace.h"
-#ifdef MOLLM_METAL
-#include "backends/metal/backend.h"
-#endif
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -17,13 +14,6 @@
 #include <vector>
 
 namespace {
-
-#ifdef MOLLM_METAL
-MetalBackend* as_metal(
-    const std::unique_ptr<AcceleratorBackend>& backend) {
-    return static_cast<MetalBackend*>(backend.get());
-}
-#endif
 
 int metal_ssd_prefill_min_tokens() {
     static int threshold = [] {
@@ -506,21 +496,18 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
     int n_pos = all_positions ? n_tokens : 1;
     std::vector<float> logits(n_pos * vocab_size);
 
-#ifdef MOLLM_METAL
     // Speculative verification needs logits for every position in a tiny
     // incremental-prefill batch.  Submit one shared-weight small-M W4
     // projection instead of M standalone GEMVs (and M command-buffer waits).
     if (all_positions && n_pos >= 2 && n_pos <= 4 && hidden.is_contiguous() &&
         cfg_.device == Device::METAL && accelerator_backend_ &&
-        lm_head_weight_->device_data &&
-        (lm_head_weight_->prec == Precision::INT4 ||
-         lm_head_weight_->prec == Precision::INT8)) {
-        if (as_metal(accelerator_backend_)->lm_head_small_batch(
+        accelerator_backend_->supports_lm_head_small_batch(
+            *lm_head_weight_)) {
+        if (accelerator_backend_->lm_head_small_batch(
                 static_cast<const float*>(hidden.data), *lm_head_weight_,
                 logits.data(), n_pos, vocab_size, hidden_dim))
             return logits;
     }
-#endif
 
     for (int p = 0; p < n_pos; p++) {
         int pos = all_positions
@@ -770,36 +757,31 @@ bool LLMEngine::execute_mtp_tokens(
     Tensor mask = build_causal_mask(n, position);
     set_cache_length(mtp_caches_, position);
 
-    bool fuse_metal_lm_head = false;
-    Tensor* device_hidden_copy = nullptr;
-#ifdef MOLLM_METAL
-    fuse_metal_lm_head = !cache_only && draft_token &&
+    const bool fuse_accelerator_lm_head =
+        !cache_only && draft_token &&
         cfg_.device == Device::METAL && accelerator_backend_ &&
         exec_ctx_mtp_.backend == accelerator_backend_.get() &&
-        lm_head_weight_ && lm_head_weight_->device_data &&
-        (lm_head_weight_->prec == Precision::FP16 ||
-         lm_head_weight_->prec == Precision::INT8 ||
-         lm_head_weight_->prec == Precision::INT4);
-    if (fuse_metal_lm_head) {
+        lm_head_weight_ &&
+        accelerator_backend_->supports_lm_head_argmax(*lm_head_weight_);
+    Tensor* device_hidden_copy = nullptr;
+    if (fuse_accelerator_lm_head) {
         const int hidden = static_cast<int>(lm_head_weight_->shape[1]);
         if (!mtp_draft_hidden_device_.device_data) {
             mtp_draft_hidden_device_ = Tensor::create(
                 Precision::FP32, MemoryType::EXTERNAL,
                 hidden, 1, 1, 1, nullptr);
-            as_metal(accelerator_backend_)->alloc_persistent(
+            accelerator_backend_->alloc_persistent(
                 mtp_draft_hidden_device_,
                 static_cast<size_t>(hidden) * sizeof(float));
         }
         device_hidden_copy = &mtp_draft_hidden_device_;
     }
-#endif
     Tensor out = run_graph(
         graph_mtp_, exec_ctx_mtp_, token_hidden, mask, cos, sin,
-        nullptr, fuse_metal_lm_head, &target_hidden, position,
+        nullptr, fuse_accelerator_lm_head, &target_hidden, position,
         stop_after_node_index);
 
-#ifdef MOLLM_METAL
-    if (fuse_metal_lm_head) {
+    if (fuse_accelerator_lm_head) {
         if (out.data && out.device_data) {
             const int vocab = static_cast<int>(lm_head_weight_->shape[0]);
             const int hidden = static_cast<int>(lm_head_weight_->shape[1]);
@@ -807,8 +789,7 @@ bool LLMEngine::execute_mtp_tokens(
             // greedy top-k=1 drafts, so copying the full vocabulary to CPU
             // would add a host transfer, allocation, and scan every depth.
             *draft_token =
-                as_metal(accelerator_backend_)
-                    ->lm_head_argmax_device_and_end_graph(
+                accelerator_backend_->lm_head_argmax_device_and_end_graph(
                 out, static_cast<size_t>(n - 1) * hidden,
                 *lm_head_weight_, vocab, hidden, 0, device_hidden_copy);
         } else {
@@ -817,11 +798,10 @@ bool LLMEngine::execute_mtp_tokens(
             accelerator_backend_->end_graph();
         }
     }
-#endif
     Tensor copied;
     if (!cache_only && out.data &&
         !exec_ctx_mtp_.backend->dispatch_failed()) {
-        if (fuse_metal_lm_head && device_hidden_copy &&
+        if (fuse_accelerator_lm_head && device_hidden_copy &&
             device_hidden_copy->device_data)
             copied = *device_hidden_copy;
         else
@@ -1174,31 +1154,26 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
         all_logits->clear();
     if (all_top1)
         all_top1->clear();
-    bool fuse_metal_lm_head = false;
-#ifdef MOLLM_METAL
-    fuse_metal_lm_head = (all_logits || all_top1) &&
+    const bool fuse_accelerator_lm_head = (all_logits || all_top1) &&
         !use_padding && n >= 2 && n <= 4 &&
         cfg_.device == Device::METAL && accelerator_backend_ &&
         exec_ctx_prefill_.backend == accelerator_backend_.get() &&
-        lm_head_weight_ && lm_head_weight_->device_data &&
-        (lm_head_weight_->prec == Precision::INT4 ||
-         lm_head_weight_->prec == Precision::INT8);
-#endif
+        lm_head_weight_ &&
+        accelerator_backend_->supports_lm_head_small_batch(
+            *lm_head_weight_);
     Tensor out = run_graph(
         graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin,
-        &token_tensor, fuse_metal_lm_head);
-#ifdef MOLLM_METAL
-    if (fuse_metal_lm_head) {
+        &token_tensor, fuse_accelerator_lm_head);
+    if (fuse_accelerator_lm_head) {
         if (out.data && out.device_data) {
             const int vocab = static_cast<int>(lm_head_weight_->shape[0]);
             const int hidden = static_cast<int>(lm_head_weight_->shape[1]);
             if (all_top1) {
                 all_top1->resize(static_cast<size_t>(n), -1);
-                const bool top1_ok =
-                    as_metal(accelerator_backend_)
-                        ->lm_head_small_batch_argmax_device_and_end_graph(
-                            out, *lm_head_weight_, all_top1->data(),
-                            n, vocab, hidden);
+                const bool top1_ok = accelerator_backend_
+                    ->lm_head_small_batch_argmax_device_and_end_graph(
+                        out, *lm_head_weight_, all_top1->data(),
+                        n, vocab, hidden);
                 if (!top1_ok ||
                     !std::all_of(
                         all_top1->begin(), all_top1->end(),
@@ -1209,7 +1184,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
                 }
             } else {
                 all_logits->resize(static_cast<size_t>(n) * vocab);
-                if (!as_metal(accelerator_backend_)
+                if (!accelerator_backend_
                          ->lm_head_small_batch_device_and_end_graph(
                              out, *lm_head_weight_, all_logits->data(),
                              n, vocab, hidden)) {
@@ -1220,7 +1195,6 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
             accelerator_backend_->end_graph();
         }
     }
-#endif
     mollm_set_matmul_profile_phase("unscoped");
     Tensor copied;
     if (out.data && !exec_ctx_prefill_.backend->dispatch_failed())
