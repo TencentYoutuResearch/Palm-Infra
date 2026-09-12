@@ -1,5 +1,7 @@
 #include "backends/metal/backend.h"
 #include "backends/metal/buffer_pool.h"
+#include "backends/metal/weight_layout.h"
+#include "core/quant_layouts.h"
 #include "graph/graph.h"
 #include "storage/mapped_file.h"
 #include "kernels/cpu/matmul/matmul.h"
@@ -29,18 +31,6 @@
 #ifndef MOLLM_METALLIB_PATH
 #define MOLLM_METALLIB_PATH ""
 #endif
-
-// CPU-side packed INT4 blocks, mirrored from kernels/cpu/matmul/matmul_internal.h. Dense
-// weights are decoded into a Metal-friendly raw layout at load time; aggregate
-// experts remain native and are read directly by specialized MoE kernels.
-struct alignas(16) Q4B8G128Block {
-    float   scales[8];
-    uint8_t q[4][8][16];
-};
-struct alignas(16) Q4B8G32Block {
-    float   scales[8];
-    uint8_t q[8][16];
-};
 
 // ===========================================================================
 // MetalBackend::Impl
@@ -1831,44 +1821,14 @@ void MetalBackend::wrap_weight_int4(Tensor& t, bool keep_native_experts) {
             impl_->persistent.push_back(b);
         uint8_t* nib = (uint8_t*)[b contents];
         float*   sc  = (float*)(nib + nib_bytes);
-        constexpr uint64_t sign_bits = 0x8888888888888888ull;
-        for (int n = 0; n < N; n++) {
-            int nt = (n / 8), c = n % 8;
-            uint8_t* nrow = nib + (size_t)n * (K / 2);
-            for (int g = 0; g < gpr; g++) {
-                if (bg32) {
-                    const auto* blocks =
-                        reinterpret_cast<const Q4B8G32Block*>(packed_data);
-                    const Q4B8G32Block& block =
-                        blocks[(size_t)nt * gpr + g];
-                    sc[(size_t)n * gpr + g] = block.scales[c];
-                    uint8_t* dst =
-                        nrow + (size_t)(g * 32) / 2;
-                    const uint64_t* src64 =
-                        reinterpret_cast<const uint64_t*>(block.q[c]);
-                    uint64_t* dst64 = reinterpret_cast<uint64_t*>(dst);
-                    dst64[0] = src64[0] ^ sign_bits;
-                    dst64[1] = src64[1] ^ sign_bits;
-                } else {
-                    const auto* blocks =
-                        reinterpret_cast<const Q4B8G128Block*>(packed_data);
-                    const Q4B8G128Block& block =
-                        blocks[(size_t)nt * gpr + g];
-                    sc[(size_t)n * gpr + g] = block.scales[c];
-                    for (int qgi = 0; qgi < 4; qgi++) {
-                        uint8_t* dst =
-                            nrow +
-                            (size_t)(g * 128 + qgi * 32) / 2;
-                        const uint64_t* src64 =
-                            reinterpret_cast<const uint64_t*>(
-                                block.q[qgi][c]);
-                        uint64_t* dst64 =
-                            reinterpret_cast<uint64_t*>(dst);
-                        dst64[0] = src64[0] ^ sign_bits;
-                        dst64[1] = src64[1] ^ sign_bits;
-                    }
-                }
-            }
+        const bool decoded = mollm::metal::decode_q4_weight(
+            packed_data,
+            bg32 ? mollm::metal::PackedQ4Layout::BG32
+                 : mollm::metal::PackedQ4Layout::BG128,
+            N, K, gpr, nib, sc);
+        if (!decoded) {
+            fprintf(stderr, "MetalBackend: invalid packed Q4 weight layout\n");
+            return;
         }
         t.device_data = (__bridge void*)b;
         t.device_offset = 0;
