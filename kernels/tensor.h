@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <cstring>
 
-#include "kernels/cpu_platform.h"
 #include "core/prepared_weight.h"
 
 struct ExpertSource;

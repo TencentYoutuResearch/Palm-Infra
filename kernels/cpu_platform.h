@@ -9,6 +9,8 @@
 
 #include <cstdint>
 
+#include "core/fp16.h"
+
 struct Tensor;
 class ThreadPool;
 
@@ -30,25 +32,13 @@ class ThreadPool;
 
 namespace mollm::cpu {
 
+using fp16_t = mollm::fp16_t;
+
 enum class X86Isa : uint8_t {
     SCALAR = 0,
     AVX2 = 1,
     AVX512 = 2,
 };
-
-#if MOLLM_CPU_ARM_NEON
-using fp16_t = __fp16;
-#elif defined(__clang__)
-// Clang exposes __fp16 as a storage-only type on x86. Keep it as the
-// canonical storage spelling so legacy kernel signatures remain compatible.
-using fp16_t = __fp16;
-#else
-// GCC supports IEEE binary16 storage on x86 Linux. It is used only for model
-// bytes and scalar conversion; it does not imply native FP16 SIMD.
-using fp16_t = _Float16;
-#endif
-
-static_assert(sizeof(fp16_t) == 2, "mollm FP16 storage must be binary16");
 
 struct Capabilities {
     bool arm_neon = false;
@@ -95,13 +85,6 @@ bool matmul_int8_range(const float* A, const int8_t* B, const float* scales,
                        bool interleaved);
 
 }  // namespace mollm::cpu
-
-#if !MOLLM_CPU_ARM_NEON && !defined(__clang__) && !defined(__CUDACC__)
-// Legacy CPU kernels still spell their storage element as `__fp16`.  Keep the
-// compatibility name at this one architecture boundary while those kernels
-// are moved behind providers; no generic caller needs a compiler extension.
-using __fp16 = mollm::cpu::fp16_t;
-#endif
 
 // Transitional compatibility for existing NEON kernels.  New generic code
 // should use mollm::cpu::Capabilities instead of testing this macro.

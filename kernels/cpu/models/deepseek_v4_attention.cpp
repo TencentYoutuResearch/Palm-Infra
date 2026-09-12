@@ -1,6 +1,7 @@
 #include "kernels/cpu/models/deepseek_v4_attention.h"
 
 #include "core/bf16.h"
+#include "kernels/cpu_platform.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "runtime/threading.h"
 

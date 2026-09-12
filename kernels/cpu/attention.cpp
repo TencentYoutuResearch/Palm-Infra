@@ -1,4 +1,5 @@
 #include "kernels/cpu/attention.h"
+#include "kernels/cpu_platform.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "runtime/threading.h"
 #include "core/cache_layout.h"

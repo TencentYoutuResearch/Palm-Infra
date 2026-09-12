@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/activation.h"
-#include "kernels/tensor.h"  // for HAS_NEON
+#include "kernels/cpu_platform.h"
 
 #include <cmath>
 #include <cstdint>

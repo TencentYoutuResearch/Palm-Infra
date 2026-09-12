@@ -1,5 +1,6 @@
 #include "engine/engine.h"
 #include "engine/vision.h"
+#include "core/fp16.h"
 
 #include <algorithm>
 #include <cmath>

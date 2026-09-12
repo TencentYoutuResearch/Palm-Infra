@@ -1,4 +1,5 @@
 #include "kernels/cpu/models/rwkv.h"
+#include "kernels/cpu_platform.h"
 #include "runtime/threading.h"
 
 #include <cmath>

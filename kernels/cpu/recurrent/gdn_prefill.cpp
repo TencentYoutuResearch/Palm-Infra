@@ -4,6 +4,7 @@
 
 #include "kernels/cpu/recurrent/gdn.h"
 #include "kernels/cpu/arm/gdn_neon.h"
+#include "kernels/cpu_platform.h"
 #include "runtime/threading.h"
 
 #if HAS_NEON
