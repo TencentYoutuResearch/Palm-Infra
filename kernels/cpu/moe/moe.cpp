@@ -226,9 +226,9 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
     view.q4_repack_data = nullptr;
     view.q4_g32_data = nullptr;
     view.q4_g128_data = nullptr;
-    view.prepared_weight = src.prepared_weight;
-    view.prepared_weight_row_offset =
-        src.prepared_weight_row_offset + static_cast<size_t>(row0);
+    view.prepared.weight = src.prepared.weight;
+    view.prepared.row_offset =
+        src.prepared.row_offset + static_cast<size_t>(row0);
 
     if (src.prec == Precision::FP32 || src.prec == Precision::FP16) {
         size_t elem = precision_size(src.prec);

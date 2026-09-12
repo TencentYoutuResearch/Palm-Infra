@@ -324,7 +324,7 @@ void maybe_pack_int4_weight(Tensor& weight, const std::string& key,
             }
         }
         if (!vnni.empty())
-            weight.prepared_weight = &prepared;
+            weight.prepared.weight = &prepared;
     }
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
     if (!is_2d_linear_weight(weight))

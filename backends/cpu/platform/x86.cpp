@@ -1,4 +1,5 @@
 #include "backends/cpu/platform.h"
+#include "core/prepared_weight.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/matmul/matmul_internal.h"
 #include "runtime/threading.h"
@@ -143,12 +144,12 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
     const auto int4_vnni = dispatch().int4_vnni;
     const auto quantize_vnni = dispatch().quantize_vnni;
     const void* vnni_data = nullptr;
-    if (B.prepared_weight && (B.prepared_weight_row_offset % 8) == 0) {
-        const void* base = B.prepared_weight->data(
+    if (B.prepared.weight && (B.prepared.row_offset % 8) == 0) {
+        const void* base = B.prepared.weight->data(
             WeightLayout::X86_VNNI_Q4_G32);
         if (base) {
             vnni_data = static_cast<const uint8_t*>(base) +
-                (B.prepared_weight_row_offset / 8) *
+                (B.prepared.row_offset / 8) *
                     pack_b_q4_vnni_bytes(8, K);
         }
     }

@@ -3,6 +3,7 @@
 #include "graph/graph.h"
 #include "graph/execute.h"
 #include "core/cache_layout.h"
+#include "core/prepared_weight.h"
 #include "runtime/backend.h"
 #include "runtime/accelerator_backend.h"
 #include "backends/cpu/backend.h"

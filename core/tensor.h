@@ -5,9 +5,8 @@
 #include <cstdint>
 #include <cstring>
 
-#include "core/prepared_weight.h"
-
 struct ExpertSource;
+struct PreparedWeight;
 
 // ---------------------------------------------------------------------------
 // mollm — Tensor definition
@@ -62,6 +61,14 @@ struct DeviceStorage {
     size_t scales_offset = 0;
 };
 
+// Non-owning reference to a backend-prepared representation of a logical
+// weight. Backend-specific row views retain the shared storage and advance
+// the logical output row instead of manufacturing sidecar pointers.
+struct PreparedWeightView {
+    const PreparedWeight* weight = nullptr;
+    size_t row_offset = 0;
+};
+
 struct Tensor {
     Precision   prec     = Precision::FP32;
     MemoryType  mem_type = MemoryType::NONE;
@@ -109,11 +116,7 @@ struct Tensor {
     const void* q4_repack_data = nullptr; // optional [N/8, K/32, 8, 16B] INT4 dot layout
     const void* q4_g32_data = nullptr; // optional [N/8, K/32] G32 packed INT4+scales
     const void* q4_g128_data = nullptr; // optional [N/8, K/128] G128 packed INT4+scales
-    // Non-owning reference to backend-specific load-time layouts. Row views
-    // retain the same prepared weight and advance this logical output-row
-    // offset instead of manufacturing backend-specific sidecar pointers.
-    const PreparedWeight* prepared_weight = nullptr;
-    size_t prepared_weight_row_offset = 0;
+    PreparedWeightView prepared;
     const void* sparse_data = nullptr; // optional [N/8,K,8] sparse-A GEMV layout
     // Provider-owned expert source. The historical field name is retained;
     // compute uses ExpertProvider rather than a concrete SSD cache.
