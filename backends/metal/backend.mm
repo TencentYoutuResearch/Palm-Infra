@@ -1,7 +1,6 @@
 #include "backends/metal/backend.h"
 #include "backends/metal/buffer_pool.h"
-#include "backends/metal/weight_layout.h"
-#include "core/quant_layouts.h"
+#include "backends/metal/resource_store.h"
 #include "graph/graph.h"
 #include "storage/mapped_file.h"
 #include "kernels/cpu/matmul/matmul.h"
@@ -26,7 +25,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <unistd.h>
 
 #ifndef MOLLM_METALLIB_PATH
 #define MOLLM_METALLIB_PATH ""
@@ -42,31 +40,12 @@ struct MetalBackend::Impl {
     id<MTLLibrary>           library = nil;
 
     std::unique_ptr<MetalBufferPool> pool;
+    std::unique_ptr<MetalResourceStore> resources;
 
     // pipeline cache by kernel function name
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
 
-    struct WeightRegion {
-        id<MTLBuffer> buffer = nil;
-        char* base = nullptr;
-        size_t size = 0;
-    };
-    // Zero-copy views over the package mmap. Most packages need one region;
-    // very large packages are split at the device's single-buffer limit.
-    std::vector<WeightRegion> weight_regions;
-    id<MTLBuffer>            weight_buffer = nil;
-    void*                    weight_base   = nullptr;
-    size_t                   weight_size   = 0;
-    bool                     copy_weights = false;
     bool                     dispatch_failed = false;
-
-    // persistent device buffers owned by the backend (KV cache)
-    std::vector<id<MTLBuffer>> persistent;
-    // Dense weight copies used only during Metal prefill in SSD hybrid mode.
-    // Kept separate so they can be dropped before CPU expert decode on UMA.
-    std::vector<id<MTLBuffer>> weight_copies;
-    std::unordered_map<const void*, id<MTLBuffer>> copied_weights;
-    std::unordered_map<const void*, id<MTLBuffer>> decoded_q4_weights;
 
     struct SsdExpertBuffers {
         id<MTLBuffer> gate_up = nil;
@@ -126,12 +105,6 @@ struct MetalBackend::Impl {
     };
     std::unordered_map<int, SsdMoeLayerInfo> ssd_moe_layers;
 
-    // reusable per-key boundary input buffers (hidden/mask/cos/sin), keyed by
-    // graph INPUT node name; grown on demand.
-    std::unordered_map<std::string, id<MTLBuffer>> input_buffers;
-    std::unordered_map<std::string, size_t> input_capacity;
-    std::unordered_map<std::string, bool> input_is_zero;
-
     // Buffers freed during graph encoding, returned to the pool only after the
     // command buffer completes (deferred GPU execution — see free_output).
     std::vector<std::pair<void*, size_t>> pending_free;
@@ -168,21 +141,6 @@ struct MetalBackend::Impl {
     bool                        chunk_graph = false;
 
     bool ok = false;
-
-    const WeightRegion* find_weight_region(const void* ptr, size_t bytes,
-                                           size_t& offset) const {
-        if (!ptr) return nullptr;
-        const char* p = static_cast<const char*>(ptr);
-        for (const auto& region : weight_regions) {
-            if (p < region.base) continue;
-            const size_t relative = static_cast<size_t>(p - region.base);
-            if (relative <= region.size && bytes <= region.size - relative) {
-                offset = relative;
-                return &region;
-            }
-        }
-        return nullptr;
-    }
 
     static uint64_t ssd_key(int layer, int expert) {
         return (static_cast<uint64_t>(static_cast<uint32_t>(layer)) << 32) |
@@ -1043,6 +1001,8 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
             return;
         }
         impl_->pool.reset(new MetalBufferPool((__bridge void*)impl_->device));
+        impl_->resources.reset(
+            new MetalResourceStore((__bridge void*)impl_->device));
         impl_->profile = getenv("MOLLM_METAL_PROFILE") != nullptr;
 
         // Enable the tensor-API GEMM only if the kernel was compiled (metallib
@@ -1082,12 +1042,7 @@ MetalBackend::~MetalBackend() {
         }
         impl_->pipelines.clear();
         impl_->spec_pipelines.clear();
-        impl_->copied_weights.clear();
-        impl_->decoded_q4_weights.clear();
-        impl_->weight_copies.clear();
-        impl_->persistent.clear();
-        impl_->weight_regions.clear();
-        impl_->weight_buffer = nil;
+        impl_->resources.reset();
         impl_->pool.reset();
     }
 }
@@ -1575,55 +1530,15 @@ bool MetalBackend::has_tensor_path() const {
 }
 
 bool MetalBackend::register_weight_region(void* base, size_t size) {
-    if (!impl_->ok || !base || size == 0) return false;
-    @autoreleasepool {
-        impl_->weight_regions.clear();
-        const size_t page_size = static_cast<size_t>(getpagesize());
-        const size_t max_buffer =
-            static_cast<size_t>(impl_->device.maxBufferLength);
-        const size_t chunk_limit = (max_buffer / page_size) * page_size;
-        if (chunk_limit == 0) return false;
-        size_t offset = 0;
-        while (offset < size) {
-            const size_t length = std::min(chunk_limit, size - offset);
-            char* chunk_base = static_cast<char*>(base) + offset;
-            id<MTLBuffer> buffer =
-                [impl_->device newBufferWithBytesNoCopy:chunk_base
-                                                  length:length
-                                                 options:MTLResourceStorageModeShared
-                                             deallocator:nil];
-            if (!buffer) {
-                fprintf(stderr,
-                        "MetalBackend: newBufferWithBytesNoCopy(%zu) failed "
-                        "at package offset %zu (maxBufferLength=%llu)\n",
-                        length, offset,
-                        (unsigned long long)impl_->device.maxBufferLength);
-                impl_->weight_regions.clear();
-                impl_->weight_buffer = nil;
-                return false;
-            }
-            impl_->weight_regions.push_back({buffer, chunk_base, length});
-            offset += length;
-        }
-        impl_->weight_buffer = impl_->weight_regions.front().buffer;
-        impl_->weight_base = base;
-        impl_->weight_size = size;
-        if (impl_->weight_regions.size() > 1) {
-            fprintf(stderr,
-                    "MetalBackend: split %.1f MB weight region across %zu "
-                    "zero-copy buffers\n",
-                    size / 1e6, impl_->weight_regions.size());
-        }
-    }
-    return true;
+    return impl_->ok && impl_->resources->register_weight_region(base, size);
 }
 
 void MetalBackend::enable_weight_copy_mode() {
-    impl_->copy_weights = true;
+    if (impl_->resources) impl_->resources->enable_weight_copy_mode();
 }
 
 bool MetalBackend::has_weight_copies() const {
-    return !impl_->weight_copies.empty();
+    return impl_->resources && impl_->resources->has_weight_copies();
 }
 
 bool MetalBackend::configure_moe_ssd_io(const std::string& package_path,
@@ -1681,162 +1596,16 @@ bool MetalBackend::configure_moe_ssd_io(const std::string& package_path,
 }
 
 void MetalBackend::wrap_weight(Tensor& t) {
-    if (!t.data) return;
-    if (impl_->weight_regions.empty()) {
-        if (!impl_->copy_weights) return;
-        // INT4 g128 is decoded after quant metadata is configured. INT8 needs
-        // its scale storage co-located and is not yet supported by the hybrid
-        // path. FP16/FP32 constants can be copied immediately.
-        if (t.prec == Precision::FP16 || t.prec == Precision::FP32) {
-            void* src = t.data;
-            size_t bytes = t.nbytes();
-            auto found = impl_->copied_weights.find(src);
-            if (found != impl_->copied_weights.end()) {
-                t.device_data = (__bridge void*)found->second;
-                t.device_offset = 0;
-            } else {
-                @autoreleasepool {
-                    id<MTLBuffer> b =
-                        [impl_->device newBufferWithLength:bytes
-                                                   options:MTLResourceStorageModeShared];
-                    std::memcpy([b contents], src, bytes);
-                    impl_->weight_copies.push_back(b);
-                    impl_->copied_weights[src] = b;
-                    t.device_data = (__bridge void*)b;
-                    t.device_offset = 0;
-                }
-            }
-        }
-        return;
-    }
-    size_t storage_bytes = t.nbytes();
-    if (t.prec == Precision::INT4 &&
-        ((t.is_q4_g128_packed && t.q4_g128_data) ||
-         (t.is_q4_g32_packed && t.q4_g32_data))) {
-        int last = 3;
-        while (last > 1 && t.shape[last] == 1) --last;
-        int64_t rows = 1;
-        for (int d = 0; d < last; ++d) rows *= t.shape[d];
-        const size_t block_bytes = t.is_q4_g128_packed
-            ? sizeof(Q4B8G128Block)
-            : sizeof(Q4B8G32Block);
-        storage_bytes =
-            static_cast<size_t>((rows + 7) / 8) *
-            static_cast<size_t>(t.groups_per_row) * block_bytes;
-    }
-    size_t offset = 0;
-    void* ptr = t.data;
-    const auto* region =
-        impl_->find_weight_region(ptr, storage_bytes, offset);
-    if (!region) {
-        // A tensor straddling a package-region boundary is rare; copy just
-        // that tensor rather than forcing the whole package into one buffer.
-        alloc_persistent(t, storage_bytes);
-        std::memcpy(t.data, ptr, storage_bytes);
-        if (t.prec == Precision::INT8) wrap_weight_int8(t);
-        return;
-    }
-    t.device_data = (__bridge void*)region->buffer;
-    t.device_offset = offset;
-    if (t.prec == Precision::INT8) wrap_weight_int8(t);
+    if (impl_->resources) impl_->resources->wrap_weight(t);
 }
 
 void MetalBackend::wrap_weight_int8(Tensor& t) {
-    if (t.prec != Precision::INT8 || !t.scales || t.num_groups == 0)
-        return;
-    const size_t scale_bytes =
-        static_cast<size_t>(t.num_groups) * sizeof(float);
-    size_t offset = 0;
-    const auto* region =
-        impl_->find_weight_region(t.scales, scale_bytes, offset);
-    if (region) {
-        t.scales_device_data = (__bridge void*)region->buffer;
-        t.scales_device_offset = offset;
-        return;
-    }
-    @autoreleasepool {
-        id<MTLBuffer> buffer =
-            [impl_->device newBufferWithLength:scale_bytes
-                                       options:MTLResourceStorageModeShared];
-        if (!buffer) return;
-        std::memcpy([buffer contents], t.scales, scale_bytes);
-        impl_->persistent.push_back(buffer);
-        t.scales_device_data = (__bridge void*)buffer;
-        t.scales_device_offset = 0;
-    }
+    if (impl_->resources) impl_->resources->wrap_weight_int8(t);
 }
 
 void MetalBackend::wrap_weight_int4(Tensor& t, bool keep_native_experts) {
-    const bool bg32 =
-        t.prec == Precision::INT4 && t.is_q4_g32_packed && t.q4_g32_data;
-    const bool bg128 =
-        t.prec == Precision::INT4 && t.is_q4_g128_packed && t.q4_g128_data;
-    if (!bg32 && !bg128) return;
-
-    // Packed weights interleave scales and nibbles per K block. Ordinary Metal
-    // matmul kernels want a simple raw
-    // [N,K/2] nibble array + [N,gpr] fp32 scales, so decode once at load time
-    // into a dedicated device buffer: [ nibbles (N*K/2) | scales (N*gpr f32) ].
-    // The package stores signed int4 in two's-complement nibble form. XOR the
-    // sign bit while copying to make the Metal-only buffer offset-binary
-    // (q + 8); this lets hot kernels decode with a subtract instead of a
-    // per-vector sign-bit XOR. CPU/native packed storage remains unchanged.
-    // device_offset stays 0 (nibbles at start); scales live at byte N*(K/2),
-    // which the W4 dispatch binds directly (co-located, no weight_base math).
-    // Ordinary linear weights are [N,K,1,1]. Fused MoE expert weights retain
-    // their logical 3-D shape [E,N_per_expert,K], but the packed storage is the
-    // same flat sequence of rows. Flatten every dimension before the final K
-    // dimension so both layouts decode identically.
-    int last = 3;
-    while (last > 1 && t.shape[last] == 1) --last;
-    const int K = (int)t.shape[last];
-    int64_t rows64 = 1;
-    for (int d = 0; d < last; ++d) rows64 *= t.shape[d];
-    const int N = (int)rows64;
-    // Expert tensors dominate MoE package size. Keep their native packed blocks
-    // zero-copy; the selected-expert tensor kernel decodes blocks while staging.
-    // Materializing a second raw-W4 copy here adds ~9GB and causes UMA paging.
-    // Aggregate packages serialize experts flattened as [E*N,K], so the
-    // loader passes keep_native_experts based on the explicit weight role.
-    if (keep_native_experts || last >= 2) {
-        wrap_weight(t);
-        return;
-    }
-    const int gpr = (int)t.groups_per_row;
-    const size_t nib_bytes = (size_t)N * (K / 2);
-    const size_t sc_bytes  = (size_t)N * gpr * sizeof(float);
-    const void* packed_data = bg32 ? t.q4_g32_data : t.q4_g128_data;
-    auto cached = impl_->decoded_q4_weights.find(packed_data);
-    if (cached != impl_->decoded_q4_weights.end()) {
-        t.device_data = (__bridge void*)cached->second;
-        t.device_offset = 0;
-        return;
-    }
-    @autoreleasepool {
-        id<MTLBuffer> b = [impl_->device newBufferWithLength:nib_bytes + sc_bytes
-                                                     options:MTLResourceStorageModeShared];
-        if (impl_->copy_weights)
-            impl_->weight_copies.push_back(b);
-        else
-            impl_->persistent.push_back(b);
-        uint8_t* nib = (uint8_t*)[b contents];
-        float*   sc  = (float*)(nib + nib_bytes);
-        const bool decoded = mollm::metal::decode_q4_weight(
-            packed_data,
-            bg32 ? mollm::metal::PackedQ4Layout::BG32
-                 : mollm::metal::PackedQ4Layout::BG128,
-            N, K, gpr, nib, sc);
-        if (!decoded) {
-            fprintf(stderr, "MetalBackend: invalid packed Q4 weight layout\n");
-            return;
-        }
-        t.device_data = (__bridge void*)b;
-        t.device_offset = 0;
-        impl_->decoded_q4_weights[packed_data] = b;
-        // Keep t.scales pointing at the package's CPU layout. Metal binds the
-        // co-located decoded scales by byte offset, while hybrid/CPU kernels
-        // still need the original packed tensor metadata.
-    }
+    if (impl_->resources)
+        impl_->resources->wrap_weight_int4(t, keep_native_experts);
 }
 
 void MetalBackend::alloc_persistent(
@@ -1844,55 +1613,19 @@ void MetalBackend::alloc_persistent(
     size_t host_prefix_bytes) {
     (void)host_access;
     (void)host_prefix_bytes;
-    @autoreleasepool {
-        id<MTLBuffer> b = [impl_->device newBufferWithLength:nbytes
-                                                     options:MTLResourceStorageModeShared];
-        impl_->persistent.push_back(b);
-        t.device_data = (__bridge void*)b;
-        t.device_offset = 0;
-        t.data = [b contents];
-    }
+    if (impl_->resources) impl_->resources->alloc_persistent(t, nbytes);
 }
 
 void MetalBackend::upload_input(Tensor& t, const std::string& key,
                                 const void* host_src, size_t nbytes) {
-    id<MTLBuffer> buf = nil;
-    auto it = impl_->input_buffers.find(key);
-    if (it != impl_->input_buffers.end() && impl_->input_capacity[key] >= nbytes) {
-        buf = it->second;
-    } else {
-        buf = [impl_->device newBufferWithLength:nbytes
-                                         options:MTLResourceStorageModeShared];
-        impl_->input_buffers[key] = buf;
-        impl_->input_capacity[key] = nbytes;
-    }
-    if (host_src) std::memcpy([buf contents], host_src, nbytes);
-    impl_->input_is_zero[key] = false;
-    t.device_data = (__bridge void*)buf;
-    t.device_offset = 0;
+    if (impl_->resources)
+        impl_->resources->upload_input(t, key, host_src, nbytes);
 }
 
 void MetalBackend::upload_zero_input(Tensor& t, const std::string& key,
                                      size_t nbytes) {
-    id<MTLBuffer> buf = nil;
-    auto it = impl_->input_buffers.find(key);
-    const bool grow = it == impl_->input_buffers.end() ||
-        impl_->input_capacity[key] < nbytes;
-    if (grow) {
-        buf = [impl_->device newBufferWithLength:nbytes
-                                         options:MTLResourceStorageModeShared];
-        impl_->input_buffers[key] = buf;
-        impl_->input_capacity[key] = nbytes;
-        impl_->input_is_zero[key] = false;
-    } else {
-        buf = it->second;
-    }
-    if (!impl_->input_is_zero[key]) {
-        std::memset([buf contents], 0, impl_->input_capacity[key]);
-        impl_->input_is_zero[key] = true;
-    }
-    t.device_data = (__bridge void*)buf;
-    t.device_offset = 0;
+    if (impl_->resources)
+        impl_->resources->upload_zero_input(t, key, nbytes);
 }
 
 // ===========================================================================
@@ -2674,13 +2407,13 @@ void MetalBackend::dispatch(const GraphNode& node,
                     w.groups_per_row = (int)B.groups_per_row;
                     char* native_ptr =
                         (char*)B.q4_g128_data;
-                    char* weight_base =
-                        (char*)impl_->weight_base;
+                    void* native_buffer_handle = nullptr;
+                    size_t native_buffer_offset = 0;
                     const bool native_bg128 =
                         B.is_q4_g128_packed && native_ptr &&
-                        impl_->weight_buffer && weight_base &&
-                        native_ptr >= weight_base &&
-                        native_ptr < weight_base + impl_->weight_size;
+                        impl_->resources->locate_weight(
+                            native_ptr, 1, native_buffer_handle,
+                            native_buffer_offset);
                     // Decoded W4 buffer: [ nibbles (N*K/2) | scales (N*gpr f32) ].
                     size_t scales_boff = (size_t)p.N * (p.K / 2);
                     id<MTLComputePipelineState> ps = impl_->pipeline(
@@ -2698,8 +2431,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setComputePipelineState:ps];
                     [enc setBuffer:a_i8 offset:0 atIndex:0];
                     if (native_bg128) {
-                        [enc setBuffer:impl_->weight_buffer
-                               offset:(size_t)(native_ptr - weight_base)
+                        [enc setBuffer:(__bridge id<MTLBuffer>)native_buffer_handle
+                               offset:native_buffer_offset
                               atIndex:1];
                     } else {
                         [enc setBuffer:buf_of(&B)
