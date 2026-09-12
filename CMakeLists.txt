@@ -343,7 +343,8 @@ if(MOLLM_METAL)
 
     # Compile each shader domain independently, then link one metallib.
     set(MOLLM_METAL_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/mollm.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/matmul.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/moe.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/attention.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/elementwise.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/layout.metal
