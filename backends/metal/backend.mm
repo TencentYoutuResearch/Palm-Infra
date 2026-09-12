@@ -2,6 +2,7 @@
 #include "backends/metal/buffer_pool.h"
 #include "backends/metal/command_context.h"
 #include "backends/metal/dispatch_tuning.h"
+#include "backends/metal/elementwise_ops.h"
 #include "backends/metal/layout_ops.h"
 #include "backends/metal/lm_head.h"
 #include "backends/metal/pipeline_cache.h"
@@ -45,6 +46,7 @@ struct MetalBackend::Impl {
     std::unique_ptr<MetalBufferPool> pool;
     std::unique_ptr<MetalCommandContext> commands;
     std::unique_ptr<MetalPipelineCache> pipeline_cache;
+    std::unique_ptr<MetalElementwiseOps> elementwise_ops;
     std::unique_ptr<MetalLayoutOps> layout_ops;
     std::unique_ptr<MetalLmHead> lm_head;
     std::unique_ptr<MetalResourceStore> resources;
@@ -276,6 +278,8 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
         impl_->pipeline_cache.reset(new MetalPipelineCache(
             (__bridge void*)impl_->device,
             (__bridge void*)impl_->library));
+        impl_->elementwise_ops.reset(
+            new MetalElementwiseOps(impl_->pipeline_cache.get()));
         impl_->layout_ops.reset(
             new MetalLayoutOps(impl_->pipeline_cache.get()));
         impl_->pool.reset(new MetalBufferPool((__bridge void*)impl_->device));
@@ -321,6 +325,7 @@ MetalBackend::~MetalBackend() {
         impl_->ssd_cache.reset();
         impl_->ssd_shared_expert.reset();
         impl_->lm_head.reset();
+        impl_->elementwise_ops.reset();
         impl_->layout_ops.reset();
         impl_->commands.reset();
         impl_->pipeline_cache.reset();
@@ -554,7 +559,10 @@ void MetalBackend::dispatch(const GraphNode& node,
     const bool handled_layout = impl_->layout_ops &&
         impl_->layout_ops->dispatch(
             node, inputs, output, enc, encoded_gpu_work);
-    if (!handled_layout) {
+    const bool handled_elementwise = !handled_layout &&
+        impl_->elementwise_ops &&
+        impl_->elementwise_ops->dispatch(node, inputs, output, enc);
+    if (!handled_layout && !handled_elementwise) {
         switch (op) {
     case OpType::MATMUL:
     case OpType::GEMV_SPARSE_A: {
@@ -1432,89 +1440,6 @@ void MetalBackend::dispatch(const GraphNode& node,
         break;
     }
 
-    case OpType::ADD:
-    case OpType::MUL:
-    case OpType::SIGMOID_MUL: {
-        const Tensor& A = *inputs[0];
-        const Tensor& B = *inputs[1];
-        Tensor& O = *output;
-        EwiseParams p{};
-        p.n = (int)O.nelements();
-        p.broadcast_b = (B.nelements()==1) ? 1 : 0;
-        p.shape0 = (int)O.shape[0];
-        p.a_row_stride = estride(A, 1);
-        p.b_row_stride = estride(B, 1);
-        p.out_row_stride = estride(O, 1);
-        p.a_offset = eoffset(A);
-        p.b_offset = eoffset(B);
-        p.out_offset = eoffset(O);
-        for (int d = 0; d < 4; ++d) {
-            p.shape[d] = (int)O.shape[d];
-            p.a_stride[d] = A.shape[d] == 1 && O.shape[d] != 1
-                ? 0 : estride(A, d);
-            p.b_stride[d] = B.shape[d] == 1 && O.shape[d] != 1
-                ? 0 : estride(B, d);
-            p.out_stride[d] = estride(O, d);
-        }
-        const char* kernel =
-            op == OpType::ADD ? "add_f32" :
-            op == OpType::MUL ? "mul_f32" : "sigmoid_mul_f32";
-        id<MTLComputePipelineState> ps = impl_->pipeline(kernel);
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&B) offset:0 atIndex:1];
-        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        dispatch_1d(ps, p.n);
-        break;
-    }
-
-    case OpType::SILU: {
-        const Tensor& X = *inputs[0];
-        Tensor& O = *output;
-        EwiseParams p{};
-        p.n = (int)O.nelements();
-        p.a_offset = eoffset(X);
-        p.out_offset = eoffset(O);
-        id<MTLComputePipelineState> ps = impl_->pipeline("silu_f32");
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        dispatch_1d(ps, p.n);
-        break;
-    }
-
-    case OpType::SIGMOID:
-    case OpType::SIGMOID_EXACT:
-    case OpType::GELU:
-    case OpType::TANH:
-    case OpType::EXP:
-    case OpType::EXP_EXACT:
-    case OpType::SOFTPLUS: {
-        const Tensor& X = *inputs[0];
-        Tensor& O = *output;
-        EwiseParams p{};
-        p.n = (int)O.nelements();
-        p.shape0 = (int)O.shape[0];
-        p.a_row_stride = estride(X, 1);
-        p.out_row_stride = estride(O, 1);
-        p.a_offset = eoffset(X);
-        p.out_offset = eoffset(O);
-        const char* kernel =
-            (op == OpType::GELU) ? "gelu_f32" :
-            (op == OpType::TANH) ? "tanh_f32" :
-            (op == OpType::EXP || op == OpType::EXP_EXACT) ? "exp_f32" :
-            (op == OpType::SOFTPLUS) ? "softplus_f32" : "sigmoid_f32";
-        id<MTLComputePipelineState> ps = impl_->pipeline(kernel);
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        dispatch_1d(ps, p.n);
-        break;
-    }
-
     case OpType::RWKV_TOKEN_SHIFT: {
         const Tensor& X = *inputs[0];
         const Tensor& STATE = *inputs[1];
@@ -1937,27 +1862,6 @@ void MetalBackend::dispatch(const GraphNode& node,
         NSUInteger tg = 64;
         MTLSize tgc = MTLSizeMake(((NSUInteger)p.groups + tg - 1)/tg, 1, 1);
         [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
-        break;
-    }
-
-    case OpType::SWIGLU: {
-        // Fused silu(gate)*up over a merged [2I, rows] tensor. Reads both halves
-        // from the single merged buffer (merged row stride = 2I), writes dense
-        // [I, rows]. Splits internally — does NOT rely on stride-aware slice views.
-        const Tensor& M = *inputs[0];
-        Tensor& O = *output;
-        SwigluParams p{};
-        p.I = (int)M.shape[0] / 2;
-        p.n = (int)O.nelements();
-        p.merged_offset = eoffset(M);
-        p.out_offset = eoffset(O);
-        p.merged_row_stride = estride(M, 1);   // elements between tokens (= 2I)
-        id<MTLComputePipelineState> ps = impl_->pipeline("swiglu_f32");
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&M) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        dispatch_1d(ps, p.n);
         break;
     }
 
