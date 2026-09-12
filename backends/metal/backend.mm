@@ -1104,6 +1104,11 @@ MetalBackend::~MetalBackend() {
 
 bool MetalBackend::available() const { return impl_ && impl_->ok; }
 
+void MetalBackend::begin_execution() {
+    // Host routing and host-resident MoE paths share the CPU quantization cache.
+    matmul_reset_activation_cache();
+}
+
 void MetalBackend::clear_dispatch_error() {
     impl_->dispatch_failed = false;
 }

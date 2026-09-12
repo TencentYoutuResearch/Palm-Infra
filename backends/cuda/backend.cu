@@ -449,6 +449,10 @@ CudaBackend::~CudaBackend() = default;
 
 bool CudaBackend::available() const { return impl_ && impl_->ok; }
 
+void CudaBackend::begin_execution() {
+    impl_->cpu.begin_execution();
+}
+
 void CudaBackend::clear_dispatch_error() {
     impl_->failed = false;
     impl_->cpu.clear_dispatch_error();
@@ -1818,6 +1822,9 @@ void CudaBackend::dispatch(const GraphNode& node,
     host_output.data = host_output_storage.data();
     host_output.device_data = nullptr;
     host_output.device_offset = 0;
+    // Staging allocations can reuse addresses/storage IDs across fallback
+    // operators within one device graph. Their contents have a new lifetime.
+    impl_->cpu.begin_execution();
     impl_->cpu.clear_dispatch_error();
     impl_->cpu.dispatch(node, host_inputs, &host_output, thread_pool);
     if (impl_->cpu.dispatch_failed()) {

@@ -13,6 +13,7 @@ public:
                   Tensor* output, ThreadPool* thread_pool) override;
 
     void clear_dispatch_error() override { dispatch_failed_ = false; }
+    void begin_execution() override;
     bool dispatch_failed() const override { return dispatch_failed_; }
     Precision kv_cache_precision(Precision requested) const override {
         if (requested == Precision::FP16 &&
