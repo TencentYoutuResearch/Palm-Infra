@@ -1,17 +1,11 @@
 #include "engine/engine.h"
+#include "backends/factory.h"
 #include "storage/byte_ranges.h"
 #include "engine/weight_metadata.h"
 
 #include "kernels/cpu/matmul/matmul.h"
 #include "storage/ssd_expert_cache/cache.h"
 #include "runtime/trace.h"
-#ifdef MOLLM_METAL
-#include "backends/metal/backend.h"
-#endif
-#ifdef MOLLM_CUDA
-#include "backends/cuda/backend.h"
-#endif
-
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -1072,9 +1066,13 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         return true;
     };
     if (cfg_.device == Device::METAL) {
-#ifdef MOLLM_METAL
-        accelerator_backend_ = std::make_unique<MetalBackend>();
-        if (!accelerator_backend_->available()) {
+        std::string factory_error;
+        accelerator_backend_ = create_accelerator_backend(
+            AcceleratorBackendKind::METAL, factory_error);
+        if (!accelerator_backend_) {
+            if (!fallback_to_cpu(factory_error.c_str()))
+                return false;
+        } else if (!accelerator_backend_->available()) {
             if (!fallback_to_cpu("Metal backend unavailable"))
                 return false;
         } else {
@@ -1090,14 +1088,14 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 : accelerator_backend_.get();
             exec_ctx_mtp_.backend = exec_ctx_decode_.backend;
         }
-#else
-        if (!fallback_to_cpu("built without MOLLM_METAL"))
-            return false;
-#endif
     } else if (cfg_.device == Device::CUDA) {
-#ifdef MOLLM_CUDA
-        accelerator_backend_ = std::make_unique<CudaBackend>();
-        if (!accelerator_backend_->available()) {
+        std::string factory_error;
+        accelerator_backend_ = create_accelerator_backend(
+            AcceleratorBackendKind::CUDA, factory_error);
+        if (!accelerator_backend_) {
+            if (!fallback_to_cpu(factory_error.c_str()))
+                return false;
+        } else if (!accelerator_backend_->available()) {
             if (!fallback_to_cpu("CUDA backend unavailable"))
                 return false;
         } else {
@@ -1106,10 +1104,6 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             exec_ctx_mtp_.backend = accelerator_backend_.get();
             exec_ctx_vision_.backend = accelerator_backend_.get();
         }
-#else
-        if (!fallback_to_cpu("built without MOLLM_CUDA"))
-            return false;
-#endif
     }
     if (accelerator_backend_ &&
         !accelerator_backend_->set_operator_fallback_policy(
