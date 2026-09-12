@@ -175,16 +175,6 @@ public:
         Tensor* hidden_copy = nullptr) override;
 
 private:
-    void lm_head_gemv_impl(void* a_device, size_t a_byte_offset,
-                           const Tensor& weight, float* out_host,
-                           int N, int K, int activation,
-                           bool finish_open_graph, int* top1_out = nullptr,
-                           Tensor* hidden_copy = nullptr);
-    bool lm_head_small_batch_impl(
-        void* a_device, size_t a_byte_offset, const Tensor& weight,
-        float* out_host, int M, int N, int K, int activation,
-        bool finish_open_graph, int* top1_out = nullptr);
-
     /// Debug: flush the current command buffer (commit+wait) so intermediate
     /// device buffers become host-readable. No-op unless MOLLM_METAL_SYNC_EACH.
     void sync_point();

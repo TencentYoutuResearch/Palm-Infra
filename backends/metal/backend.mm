@@ -1,6 +1,8 @@
 #include "backends/metal/backend.h"
 #include "backends/metal/buffer_pool.h"
 #include "backends/metal/command_context.h"
+#include "backends/metal/dispatch_tuning.h"
+#include "backends/metal/lm_head.h"
 #include "backends/metal/pipeline_cache.h"
 #include "backends/metal/resource_store.h"
 #include "backends/metal/ssd_expert_cache.h"
@@ -42,6 +44,7 @@ struct MetalBackend::Impl {
     std::unique_ptr<MetalBufferPool> pool;
     std::unique_ptr<MetalCommandContext> commands;
     std::unique_ptr<MetalPipelineCache> pipeline_cache;
+    std::unique_ptr<MetalLmHead> lm_head;
     std::unique_ptr<MetalResourceStore> resources;
     std::unique_ptr<MetalSsdExpertCache> ssd_cache;
     std::unique_ptr<MetalSsdSharedExpert> ssd_shared_expert;
@@ -226,42 +229,6 @@ uint eoffset(const Tensor& t) {
     return (uint)(t.device_offset / esize(t.prec));
 }
 
-int gemv_nsg_cap() {
-    static const int cap = [] {
-        const char* value = std::getenv("MOLLM_METAL_GEMV_NSG");
-        if (!value) return 8;
-        const int parsed = std::atoi(value);
-        return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
-                   ? parsed
-                   : 4;
-    }();
-    return cap;
-}
-
-int gemv_w4_nr0(int n, int k) {
-    const char* value = std::getenv("MOLLM_METAL_GEMV_W4_NR");
-    if (value) {
-        const int parsed = std::atoi(value);
-        if (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
-            return parsed;
-    }
-    (void)n;
-    (void)k;
-    return 1;
-}
-
-int gemv_w4_nsg_cap() {
-    static const int cap = [] {
-        const char* value = std::getenv("MOLLM_METAL_GEMV_W4_NSG");
-        if (!value) return 4;
-        const int parsed = std::atoi(value);
-        return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
-                   ? parsed
-                   : 4;
-    }();
-    return cap;
-}
-
 int metal_cmd_chunk_ops() {
     static const int chunk = [] {
         const char* value = std::getenv("MOLLM_METAL_CMD_CHUNK");
@@ -310,6 +277,9 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
         impl_->pool.reset(new MetalBufferPool((__bridge void*)impl_->device));
         impl_->commands.reset(new MetalCommandContext(
             (__bridge void*)queue, impl_->pool.get()));
+        impl_->lm_head.reset(new MetalLmHead(
+            impl_->pool.get(), impl_->commands.get(),
+            impl_->pipeline_cache.get(), impl_->dispatch_failed));
         impl_->resources.reset(
             new MetalResourceStore((__bridge void*)impl_->device));
         impl_->ssd_cache.reset(
@@ -346,6 +316,7 @@ MetalBackend::~MetalBackend() {
         dump_profile();  // report per-op GPU time table if MOLLM_METAL_PROFILE
         impl_->ssd_cache.reset();
         impl_->ssd_shared_expert.reset();
+        impl_->lm_head.reset();
         impl_->commands.reset();
         impl_->pipeline_cache.reset();
         impl_->resources.reset();
@@ -368,463 +339,50 @@ bool MetalBackend::dispatch_failed() const {
     return impl_->dispatch_failed;
 }
 
-void MetalBackend::lm_head_gemv(const float* a_host, const Tensor& weight,
-                                float* out_host, int N, int K, int activation) {
-    @autoreleasepool {
-        // Standalone path used by prefill/raw-logit callers.
-        clear_dispatch_error();
-        void* abuf = impl_->pool->acquire((size_t)K * 4);
-        std::memcpy(MetalBufferPool::contents(abuf), a_host, (size_t)K * 4);
-        lm_head_gemv_impl(abuf, 0, weight, out_host, N, K, activation,
-                          false);
-        impl_->pool->release(abuf, (size_t)K * 4);
-    }
+void MetalBackend::lm_head_gemv(
+    const float* activation_host, const Tensor& weight, float* output_host,
+    int n, int k, int activation) {
+    impl_->lm_head->gemv(
+        activation_host, weight, output_host, n, k, activation);
 }
 
 bool MetalBackend::lm_head_small_batch(
-    const float* a_host, const Tensor& weight, float* out_host,
-    int M, int N, int K, int activation) {
-    if (!a_host)
-        return false;
-    @autoreleasepool {
-        const size_t a_bytes =
-            static_cast<size_t>(M) * K * sizeof(float);
-        void* abuf_handle = impl_->pool->acquire(a_bytes);
-        if (!abuf_handle)
-            return false;
-        std::memcpy(MetalBufferPool::contents(abuf_handle), a_host, a_bytes);
-        const bool ok = lm_head_small_batch_impl(
-            abuf_handle, 0, weight, out_host, M, N, K, activation, false);
-        impl_->pool->release(abuf_handle, a_bytes);
-        return ok;
-    }
+    const float* activation_host, const Tensor& weight, float* output_host,
+    int m, int n, int k, int activation) {
+    return impl_->lm_head->small_batch(
+        activation_host, weight, output_host, m, n, k, activation);
 }
 
 bool MetalBackend::lm_head_small_batch_device_and_end_graph(
-    const Tensor& a, const Tensor& weight, float* out_host,
-    int M, int N, int K, int activation) {
-    return lm_head_small_batch_impl(
-        a.device_data, a.device_offset, weight, out_host,
-        M, N, K, activation, true);
+    const Tensor& activation, const Tensor& weight, float* output_host,
+    int m, int n, int k, int activation_kind) {
+    return impl_->lm_head->small_batch_device_and_end_graph(
+        activation, weight, output_host, m, n, k, activation_kind);
 }
 
 bool MetalBackend::lm_head_small_batch_argmax_device_and_end_graph(
-    const Tensor& a, const Tensor& weight, int* top1_out,
-    int M, int N, int K, int activation) {
-    return lm_head_small_batch_impl(
-        a.device_data, a.device_offset, weight, nullptr,
-        M, N, K, activation, true, top1_out);
-}
-
-bool MetalBackend::lm_head_small_batch_impl(
-    void* a_device, size_t a_byte_offset, const Tensor& weight,
-    float* out_host, int M, int N, int K, int activation,
-    bool finish_open_graph, int* top1_out) {
-    if (!a_device || (!out_host && !top1_out) ||
-        M < 2 || M > 4 || N <= 0 || K <= 0 ||
-        (weight.prec != Precision::INT4 &&
-         weight.prec != Precision::INT8) ||
-        !weight.device_data || weight.group_size == 0 ||
-        weight.groups_per_row == 0 ||
-        (weight.prec == Precision::INT4 && (K & 1) != 0) ||
-        (weight.prec == Precision::INT8 && !weight.scales_device_data)) {
-        if (finish_open_graph && impl_->commands->cmd)
-            end_graph();
-        return false;
-    }
-
-    @autoreleasepool {
-        clear_dispatch_error();
-        const size_t c_bytes =
-            static_cast<size_t>(M) * N * sizeof(float);
-        void* cbuf_handle = impl_->pool->acquire(c_bytes);
-        if (!cbuf_handle) {
-            if (finish_open_graph && impl_->commands->cmd)
-                end_graph();
-            return false;
-        }
-        constexpr uint kArgMaxThreads = 256;
-        const uint argmax_groups = top1_out
-            ? std::min<uint>(
-                  kArgMaxThreads,
-                  (static_cast<uint>(N) + kArgMaxThreads - 1) /
-                      kArgMaxThreads)
-            : 0;
-        const size_t partial_bytes =
-            static_cast<size_t>(argmax_groups) * sizeof(ArgMaxPair);
-        const size_t result_bytes =
-            static_cast<size_t>(M) * sizeof(uint);
-        void* partial_handle = top1_out
-            ? impl_->pool->acquire(partial_bytes) : nullptr;
-        void* result_handle = top1_out
-            ? impl_->pool->acquire(result_bytes) : nullptr;
-        if (top1_out && (!partial_handle || !result_handle)) {
-            if (result_handle)
-                impl_->pool->release(result_handle, result_bytes);
-            if (partial_handle)
-                impl_->pool->release(partial_handle, partial_bytes);
-            impl_->pool->release(cbuf_handle, c_bytes);
-            if (finish_open_graph && impl_->commands->cmd)
-                end_graph();
-            return false;
-        }
-        if (top1_out)
-            std::fill(top1_out, top1_out + M, -1);
-        id<MTLBuffer> abuf = (__bridge id<MTLBuffer>)a_device;
-        id<MTLBuffer> cbuf = (__bridge id<MTLBuffer>)cbuf_handle;
-
-        MatmulW8Params p{};
-        p.M = M; p.N = N; p.K = K;
-        p.a_offset = 0; p.c_offset = 0;
-        p.a_row_stride = K; p.c_row_stride = N;
-        p.activation = activation;
-        p.act_n_begin = 0; p.act_n_len = -1;
-        p.group_size = static_cast<int>(weight.group_size);
-        p.groups_per_row = static_cast<int>(weight.groups_per_row);
-
-        id<MTLCommandBuffer> command = finish_open_graph
-            ? impl_->commands->cmd : [impl_->commands->queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = finish_open_graph
-            ? impl_->commands->enc : [command computeCommandEncoder];
-        if (!command || !encoder) {
-            impl_->pool->release(cbuf_handle, c_bytes);
-            if (finish_open_graph && impl_->commands->cmd)
-                end_graph();
-            return false;
-        }
-        if (!finish_open_graph)
-            command.label = @"mollm small-M lm_head";
-        const bool is_w8 = weight.prec == Precision::INT8;
-        const int nsg = is_w8
-            ? std::min(gemv_nsg_cap(), (K + 127) / 128)
-            : std::min(gemv_w4_nsg_cap(), (K / 2 + 63) / 64);
-        [encoder setComputePipelineState:impl_->pipeline_small_m(
-                     is_w8 ? "gemv_w8_small_m_f32a_i8b_f32c"
-                           : "gemv_w4_small_m_f32a_i4b_f32c", M)];
-        [encoder setBuffer:abuf offset:a_byte_offset atIndex:0];
-        [encoder setBuffer:buf_of(&weight)
-                   offset:weight.device_offset atIndex:1];
-        [encoder setBuffer:cbuf offset:0 atIndex:2];
-        [encoder setBytes:&p length:sizeof(p) atIndex:3];
-        if (is_w8) {
-            [encoder setBuffer:scales_buf_of(&weight)
-                       offset:weight.scales_device_offset atIndex:4];
-        } else {
-            [encoder setBuffer:buf_of(&weight)
-                       offset:static_cast<size_t>(N) * (K / 2) atIndex:4];
-        }
-        const NSUInteger groups =
-            (static_cast<NSUInteger>(N) + nsg - 1) / nsg;
-        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
-        if (top1_out) {
-            ArgMaxParams rp{};
-            rp.count = static_cast<uint>(N);
-            rp.group_count = argmax_groups;
-            id<MTLBuffer> partial =
-                (__bridge id<MTLBuffer>)partial_handle;
-            id<MTLBuffer> result =
-                (__bridge id<MTLBuffer>)result_handle;
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            for (int m = 0; m < M; ++m) {
-                [encoder setComputePipelineState:
-                     impl_->pipeline("argmax_f32_stage1")];
-                [encoder setBuffer:cbuf
-                           offset:static_cast<size_t>(m) * N * sizeof(float)
-                          atIndex:0];
-                [encoder setBuffer:partial offset:0 atIndex:1];
-                [encoder setBytes:&rp length:sizeof(rp) atIndex:2];
-                [encoder dispatchThreadgroups:
-                     MTLSizeMake(argmax_groups, 1, 1)
-                     threadsPerThreadgroup:
-                     MTLSizeMake(kArgMaxThreads, 1, 1)];
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                [encoder setComputePipelineState:
-                     impl_->pipeline("argmax_f32_stage2")];
-                [encoder setBuffer:partial offset:0 atIndex:0];
-                [encoder setBuffer:result
-                           offset:static_cast<size_t>(m) * sizeof(uint)
-                          atIndex:1];
-                [encoder setBytes:&rp length:sizeof(rp) atIndex:2];
-                [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                     threadsPerThreadgroup:
-                     MTLSizeMake(kArgMaxThreads, 1, 1)];
-                if (m + 1 < M)
-                    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            }
-        }
-        if (finish_open_graph) {
-            end_graph();
-        } else {
-            [encoder endEncoding];
-            [command commit];
-            [command waitUntilCompleted];
-        }
-        if (command.status == MTLCommandBufferStatusError) {
-            NSError* error = command.error;
-            fprintf(stderr,
-                    "MetalBackend: small-M lm_head command failed: %s\n",
-                    error ? error.localizedDescription.UTF8String : "?");
-            impl_->dispatch_failed = true;
-        } else {
-            if (impl_->commands->profile) {
-                const double gpu_ms =
-                    (command.GPUEndTime - command.GPUStartTime) * 1000.0;
-                const char* quant = is_w8 ? "W8" : "W4";
-                auto& stat = impl_->commands->op_stats[
-                    std::string(top1_out ? "LM_HEAD_SMALL_M_ARGMAX_"
-                                         : "LM_HEAD_SMALL_M_") + quant +
-                    "[M=" + std::to_string(M) +
-                    ",N=" + std::to_string(N) +
-                    ",K=" + std::to_string(K) + "]"];
-                stat.gpu_ms += gpu_ms;
-                ++stat.calls;
-            }
-            if (top1_out) {
-                const auto* result = static_cast<const uint*>(
-                    MetalBufferPool::contents(result_handle));
-                for (int m = 0; m < M; ++m) {
-                    if (result[m] < static_cast<uint>(N))
-                        top1_out[m] = static_cast<int>(result[m]);
-                }
-            } else {
-                std::memcpy(out_host, MetalBufferPool::contents(cbuf_handle),
-                            c_bytes);
-            }
-        }
-        if (result_handle)
-            impl_->pool->release(result_handle, result_bytes);
-        if (partial_handle)
-            impl_->pool->release(partial_handle, partial_bytes);
-        impl_->pool->release(cbuf_handle, c_bytes);
-        return !impl_->dispatch_failed;
-    }
+    const Tensor& activation, const Tensor& weight, int* top1_output,
+    int m, int n, int k, int activation_kind) {
+    return impl_->lm_head->small_batch_argmax_device_and_end_graph(
+        activation, weight, top1_output, m, n, k, activation_kind);
 }
 
 void MetalBackend::lm_head_gemv_device_and_end_graph(
-    const Tensor& a, size_t a_element_offset, const Tensor& weight,
-    float* out_host, int N, int K, int activation) {
-    lm_head_gemv_impl(a.device_data,
-                      a.device_offset + a_element_offset*sizeof(float),
-                      weight, out_host, N, K, activation, true);
+    const Tensor& activation, size_t activation_element_offset,
+    const Tensor& weight, float* output_host, int n, int k,
+    int activation_kind) {
+    impl_->lm_head->gemv_device_and_end_graph(
+        activation, activation_element_offset, weight, output_host,
+        n, k, activation_kind);
 }
 
 int MetalBackend::lm_head_argmax_device_and_end_graph(
-    const Tensor& a, size_t a_element_offset, const Tensor& weight,
-    int N, int K, int activation, Tensor* hidden_copy) {
-    int token = -1;
-    lm_head_gemv_impl(a.device_data,
-                      a.device_offset + a_element_offset*sizeof(float),
-                      weight, nullptr, N, K, activation, true, &token,
-                      hidden_copy);
-    return token;
-}
-
-void MetalBackend::lm_head_gemv_impl(
-    void* a_device, size_t a_byte_offset, const Tensor& weight,
-    float* out_host, int N, int K, int activation,
-    bool finish_open_graph, int* top1_out, Tensor* hidden_copy) {
-    @autoreleasepool {
-        if (top1_out)
-            *top1_out = -1;
-        void* cbuf = impl_->pool->acquire((size_t)N * 4);
-        constexpr uint kArgMaxThreads = 256;
-        const uint argmax_groups = top1_out
-            ? std::min<uint>(kArgMaxThreads,
-                             (static_cast<uint>(N) + kArgMaxThreads - 1) /
-                                 kArgMaxThreads)
-            : 0;
-        const size_t partial_bytes =
-            static_cast<size_t>(argmax_groups) * sizeof(ArgMaxPair);
-        void* partial_handle = top1_out
-            ? impl_->pool->acquire(partial_bytes) : nullptr;
-        void* result_handle = top1_out
-            ? impl_->pool->acquire(sizeof(uint)) : nullptr;
-        const bool reduce_top1 =
-            top1_out && partial_handle && result_handle && argmax_groups > 0;
-        MatmulParams p{};
-        p.M = 1; p.N = N; p.K = K;
-        p.a_offset = 0;
-        p.b_offset = 0;  // bind B at its byte offset below (64-bit, no overflow)
-        p.c_offset = 0;
-        p.a_row_stride = K;
-        p.b_row_stride = (int)weight.shape[1];  // K
-        p.c_row_stride = N;
-        p.activation = activation;
-
-        id<MTLBuffer> A = (__bridge id<MTLBuffer>)a_device;
-        id<MTLBuffer> B = buf_of(&weight);
-        id<MTLBuffer> C = (__bridge id<MTLBuffer>)cbuf;
-
-        id<MTLCommandBuffer> cmd =
-            finish_open_graph ? impl_->commands->cmd : [impl_->commands->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc =
-            finish_open_graph ? impl_->commands->enc : [cmd computeCommandEncoder];
-        assert(cmd && enc);
-        [enc setBuffer:A offset:a_byte_offset atIndex:0];
-        [enc setBuffer:B offset:weight.device_offset atIndex:1];
-        [enc setBuffer:C offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        id<MTLComputePipelineState> ps = nil;
-        if (weight.prec == Precision::INT8) {
-            MatmulW8Params w{};
-            w.M=1; w.N=N; w.K=K;
-            w.a_offset=0; w.c_offset=0;
-            w.a_row_stride=K; w.c_row_stride=N;
-            w.activation=activation;
-            w.group_size=(int)weight.group_size;
-            w.groups_per_row=(int)weight.groups_per_row;
-            const size_t scales_boff = weight.scales_device_offset;
-            constexpr int NR0=2;
-            const int NSG =
-                std::min(gemv_nsg_cap(), (K+127)/128);
-            ps=impl_->pipeline("gemv_w8_f32a_i8b_f32c");
-            [enc setComputePipelineState:ps];
-            [enc setBuffer:scales_buf_of(&weight)
-                   offset:scales_boff atIndex:4];
-            [enc setBytes:&w length:sizeof(w) atIndex:3];
-            const NSUInteger tgcount =
-                ((NSUInteger)N+NR0-1)/NR0;
-            [enc setThreadgroupMemoryLength:
-                    NR0*32*sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(tgcount,1,1)
-                threadsPerThreadgroup:
-                    MTLSizeMake(32,(NSUInteger)NSG,1)];
-        } else if (weight.prec == Precision::INT4) {
-            MatmulW8Params w{};
-            w.M=1; w.N=N; w.K=K;
-            w.a_offset=0; w.c_offset=0;
-            w.a_row_stride=K; w.c_row_stride=N;
-            w.activation=activation;
-            w.group_size=(int)weight.group_size;
-            w.groups_per_row=(int)weight.groups_per_row;
-            const size_t scales_boff=(size_t)N*(K/2);
-            const int NR0=gemv_w4_nr0(N,K);
-            const int NSG=std::min(
-                gemv_w4_nsg_cap(), (K/2+63)/64);
-            ps=impl_->pipeline_gemv_w4(NR0);
-            [enc setComputePipelineState:ps];
-            [enc setBuffer:B offset:scales_boff atIndex:4];
-            [enc setBytes:&w length:sizeof(w) atIndex:3];
-            [enc setThreadgroupMemoryLength:
-                    (NSUInteger)(NR0*32*sizeof(float)) atIndex:0];
-            const NSUInteger rows_per_tg =
-                (NSUInteger)NR0*(NSUInteger)std::max(1,NSG);
-            const NSUInteger tgcount =
-                ((NSUInteger)N+rows_per_tg-1)/rows_per_tg;
-            [enc dispatchThreadgroups:MTLSizeMake(tgcount,1,1)
-                threadsPerThreadgroup:
-                    MTLSizeMake(32*(NSUInteger)std::max(1,NSG),1,1)];
-        } else {
-            // FP16 uses tuned gemv2 (NR0=2 + NSG-split K).
-            constexpr int NR0=2;
-            const int NSG=std::min(
-                gemv_nsg_cap(), (K+127)/128);
-            ps=impl_->pipeline_gemv2(NR0);
-            if (ps) {
-                [enc setComputePipelineState:ps];
-                [enc setThreadgroupMemoryLength:
-                        NR0*32*sizeof(float) atIndex:0];
-                const NSUInteger tgcount =
-                    ((NSUInteger)N+NR0-1)/NR0;
-                [enc dispatchThreadgroups:MTLSizeMake(tgcount,1,1)
-                    threadsPerThreadgroup:
-                        MTLSizeMake(32,(NSUInteger)NSG,1)];
-            } else {
-            ps = impl_->pipeline("gemv_f32a_f16b_f32c");
-            const NSUInteger rows_per_tg = 8;
-            [enc setComputePipelineState:ps];
-            NSUInteger tgcount = ((NSUInteger)N + rows_per_tg - 1) / rows_per_tg;
-            [enc dispatchThreadgroups:MTLSizeMake(tgcount,1,1)
-                threadsPerThreadgroup:MTLSizeMake(rows_per_tg * 32, 1, 1)];
-            }
-        }
-        if (reduce_top1) {
-            ArgMaxParams rp{};
-            rp.count = static_cast<uint>(N);
-            rp.group_count = argmax_groups;
-            id<MTLBuffer> partial =
-                (__bridge id<MTLBuffer>)partial_handle;
-            id<MTLBuffer> result =
-                (__bridge id<MTLBuffer>)result_handle;
-            [enc setComputePipelineState:impl_->pipeline(
-                     "argmax_f32_stage1")];
-            [enc setBuffer:C offset:0 atIndex:0];
-            [enc setBuffer:partial offset:0 atIndex:1];
-            [enc setBytes:&rp length:sizeof(rp) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(argmax_groups, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(kArgMaxThreads, 1, 1)];
-            [enc setComputePipelineState:impl_->pipeline(
-                     "argmax_f32_stage2")];
-            [enc setBuffer:partial offset:0 atIndex:0];
-            [enc setBuffer:result offset:0 atIndex:1];
-            [enc setBytes:&rp length:sizeof(rp) atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(kArgMaxThreads, 1, 1)];
-        }
-        if (finish_open_graph && hidden_copy && hidden_copy->device_data &&
-            hidden_copy->nbytes() >= static_cast<size_t>(K) * sizeof(float)) {
-            // Preserve the recursively predicted hidden state on GPU for the
-            // next MTP depth.  The next graph consumes this buffer before its
-            // own tail overwrites it, so one persistent ping buffer is enough.
-            [enc endEncoding];
-            impl_->commands->enc = nil;
-            id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-            [blit copyFromBuffer:A
-                    sourceOffset:a_byte_offset
-                        toBuffer:(__bridge id<MTLBuffer>)hidden_copy->device_data
-               destinationOffset:hidden_copy->device_offset
-                            size:static_cast<size_t>(K) * sizeof(float)];
-            [blit endEncoding];
-        }
-        if (finish_open_graph) {
-            // end_graph() commits this tail after previously submitted chunks;
-            // one queue preserves ordering, and its single wait covers both the
-            // graph and lm_head.
-            end_graph();
-        } else {
-            [enc endEncoding];
-            [cmd commit];
-            [cmd waitUntilCompleted];
-            if (cmd.status == MTLCommandBufferStatusError) {
-                NSError* e = cmd.error;
-                fprintf(stderr, "MetalBackend: lm_head command buffer error: %s\n",
-                        e ? e.localizedDescription.UTF8String : "?");
-                impl_->dispatch_failed = true;
-            }
-        }
-
-        if (!impl_->dispatch_failed) {
-            if (impl_->commands->profile) {
-                const double gpu_ms =
-                    (cmd.GPUEndTime - cmd.GPUStartTime) * 1000.0;
-                const char* quant = weight.prec == Precision::INT8
-                    ? "W8"
-                    : weight.prec == Precision::INT4 ? "W4" : "FP16";
-                auto& stat = impl_->commands->op_stats[
-                    std::string(top1_out ? "MTP_LM_HEAD_ARGMAX_"
-                                         : "LM_HEAD_GEMV_") +
-                    quant + "[N=" + std::to_string(N) +
-                    ",K=" + std::to_string(K) + "]"];
-                stat.gpu_ms += gpu_ms;
-                ++stat.calls;
-            }
-            if (reduce_top1) {
-                const uint token = *static_cast<const uint*>(
-                    MetalBufferPool::contents(result_handle));
-                if (token < static_cast<uint>(N))
-                    *top1_out = static_cast<int>(token);
-            } else if (out_host) {
-                std::memcpy(out_host, MetalBufferPool::contents(cbuf),
-                            (size_t)N * 4);
-            }
-        }
-        if (result_handle)
-            impl_->pool->release(result_handle, sizeof(uint));
-        if (partial_handle)
-            impl_->pool->release(partial_handle, partial_bytes);
-        impl_->pool->release(cbuf, (size_t)N * 4);
-    }
+    const Tensor& activation, size_t activation_element_offset,
+    const Tensor& weight, int n, int k, int activation_kind,
+    Tensor* hidden_copy) {
+    return impl_->lm_head->argmax_device_and_end_graph(
+        activation, activation_element_offset, weight, n, k,
+        activation_kind, hidden_copy);
 }
 
 // ===========================================================================
@@ -1150,7 +708,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             MatmulParams small = p;
             small.b_offset = 0;
             const int nsg =
-                std::min(gemv_nsg_cap(), (p.K + 127) / 128);
+                std::min(mollm::metal::gemv_nsg_cap(), (p.K + 127) / 128);
             [enc setComputePipelineState:
                      impl_->pipeline_small_m(
                          "gemv_small_m_f32a_f16b_f32c", p.M)];
@@ -1180,7 +738,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.group_size = (int)B.group_size;
             w.groups_per_row = (int)B.groups_per_row;
             const int nsg =
-                std::min(gemv_nsg_cap(), (p.K + 127) / 128);
+                std::min(mollm::metal::gemv_nsg_cap(), (p.K + 127) / 128);
             [enc setComputePipelineState:
                      impl_->pipeline_small_m(
                          "gemv_w8_small_m_f32a_i8b_f32c", p.M)];
@@ -1214,7 +772,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             size_t scales_boff = B.scales_device_offset;
             const int NR0 = 2;
             const int NSG =
-                std::min(gemv_nsg_cap(), (p.K + 127) / 128);
+                std::min(mollm::metal::gemv_nsg_cap(), (p.K + 127) / 128);
             id<MTLComputePipelineState> ps =
                 impl_->pipeline("gemv_w8_f32a_i8b_f32c");
             [enc setComputePipelineState:ps];
@@ -1246,7 +804,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.groups_per_row = (int)B.groups_per_row;
             const size_t scales_boff = (size_t)p.N * (p.K / 2);
             const int NSG = std::min(
-                gemv_w4_nsg_cap(), (p.K / 2 + 63) / 64);
+                mollm::metal::gemv_w4_nsg_cap(), (p.K / 2 + 63) / 64);
             id<MTLComputePipelineState> ps =
                 impl_->pipeline_small_m(
                     "gemv_w4_small_m_f32a_i4b_f32c", p.M);
@@ -1279,9 +837,9 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.groups_per_row = (int)B.groups_per_row;
             // Decoded W4 buffer layout: [ nibbles (N*K/2) | scales (N*gpr f32) ].
             size_t scales_boff = (size_t)p.N * (p.K / 2);
-            const int NR0 = gemv_w4_nr0(p.N, p.K);
+            const int NR0 = mollm::metal::gemv_w4_nr0(p.N, p.K);
             const int NSG =
-                std::min(gemv_w4_nsg_cap(), (p.K / 2 + 63) / 64);
+                std::min(mollm::metal::gemv_w4_nsg_cap(), (p.K / 2 + 63) / 64);
             id<MTLComputePipelineState> ps = impl_->pipeline_gemv_w4(NR0);
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
@@ -1319,7 +877,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 // on M5 Pro. The environment override keeps this tunable for
                 // future GPU families.
                 int nsg =
-                    std::min(gemv_nsg_cap(), (p.K + 127) / 128);
+                    std::min(mollm::metal::gemv_nsg_cap(), (p.K + 127) / 128);
                 if (nsg < 1) nsg = 1;
                 [enc setThreadgroupMemoryLength:(NSUInteger)(NR0 * 32 * sizeof(float)) atIndex:0];
                 NSUInteger tgcount = ((NSUInteger)p.N + NR0 - 1) / NR0;
@@ -3057,7 +2615,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             if (!ssd_w4) {
                 const int router_nsg =
                     std::min(
-                        gemv_nsg_cap(),
+                        mollm::metal::gemv_nsg_cap(),
                         (hidden_size + 127) / 128);
                 const bool fuse_router_quant =
                     native_gu && seq == 1 && router_nsg == 8;
@@ -3163,7 +2721,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     router_mp.act_n_begin = 0;
                     router_mp.act_n_len = -1;
                     const int router_groups = std::min(
-                        gemv_nsg_cap(), (hidden_size + 127) / 128);
+                        mollm::metal::gemv_nsg_cap(), (hidden_size + 127) / 128);
                     [enc setComputePipelineState:
                              impl_->pipeline_small_m(
                                  "gemv_small_m_f32a_f16b_f32c", seq)];
