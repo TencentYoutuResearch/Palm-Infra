@@ -407,6 +407,7 @@ if(MOLLM_METAL)
         backends/metal/lm_head.mm
         backends/metal/normalization_ops.mm
         backends/metal/pipeline_cache.mm
+        backends/metal/recurrent_ops.mm
         backends/metal/resource_store.mm
         backends/metal/ssd_expert_cache.mm
         backends/metal/ssd_shared_expert.mm)
@@ -419,6 +420,7 @@ if(MOLLM_METAL)
         backends/metal/lm_head.mm
         backends/metal/normalization_ops.mm
         backends/metal/pipeline_cache.mm
+        backends/metal/recurrent_ops.mm
         backends/metal/resource_store.mm
         backends/metal/ssd_expert_cache.mm
         backends/metal/ssd_shared_expert.mm
