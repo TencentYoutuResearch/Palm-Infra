@@ -72,6 +72,7 @@ public:
 
     /// True when hybrid copy mode currently owns at least one dense weight.
     bool has_weight_copies() const override;
+    bool supports_moe_ssd_prefill_switching() const override { return true; }
 
     /// Configure the full-Metal SSD expert cache. Metal I/O loads package
     /// ranges directly into Shared buffers consumed by routed-expert kernels.

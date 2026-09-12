@@ -906,8 +906,8 @@ bool LLMEngine::sync_mtp(const std::vector<int>& token_ids,
 // ---------------------------------------------------------------------------
 
 void LLMEngine::prepare_accelerator_prefill_weights() {
-#ifdef MOLLM_METAL
     if (!moe_ssd_cache_ || !accelerator_backend_ ||
+        !accelerator_backend_->supports_moe_ssd_prefill_switching() ||
         exec_ctx_prefill_.backend != accelerator_backend_.get())
         return;
     if (accelerator_backend_->has_weight_copies()) return;
@@ -931,7 +931,6 @@ void LLMEngine::prepare_accelerator_prefill_weights() {
                 node.params.str[0]);
         accelerator_backend_->wrap_weight_int4(t, aggregate_expert);
     }
-#endif
 }
 
 void LLMEngine::release_prefill_buffers() {
@@ -968,14 +967,15 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
 
     Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
     bool short_ssd_cpu_prefill = false;
-#ifdef MOLLM_METAL
-    const bool is_ssd_metal =
+    const bool switchable_ssd_accelerator =
         moe_ssd_cache_ && accelerator_backend_ &&
+        accelerator_backend_->supports_moe_ssd_prefill_switching() &&
         saved_prefill_backend == accelerator_backend_.get();
     const bool metal_weights_ready =
-        is_ssd_metal && accelerator_backend_->has_weight_copies();
+        switchable_ssd_accelerator &&
+        accelerator_backend_->has_weight_copies();
     short_ssd_cpu_prefill =
-        is_ssd_metal &&
+        switchable_ssd_accelerator &&
         (n < metal_ssd_prefill_min_tokens() ||
          (!metal_weights_ready && !metal_ssd_reload_weights()));
     if (short_ssd_cpu_prefill) {
@@ -988,9 +988,6 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     } else {
         prepare_accelerator_prefill_weights();
     }
-#else
-    prepare_accelerator_prefill_weights();
-#endif
     auto finish_prefill_phase = [&] {
         // Hybrid decode is CPU-only, so no prefill workspace is useful after
         // the last chunk. Dense Metal weights remain cached for later prompts.
@@ -1067,14 +1064,15 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
 
     Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
     bool short_ssd_cpu_prefill = false;
-#ifdef MOLLM_METAL
-    const bool is_ssd_metal =
+    const bool switchable_ssd_accelerator =
         moe_ssd_cache_ && accelerator_backend_ &&
+        accelerator_backend_->supports_moe_ssd_prefill_switching() &&
         saved_prefill_backend == accelerator_backend_.get();
     const bool metal_weights_ready =
-        is_ssd_metal && accelerator_backend_->has_weight_copies();
+        switchable_ssd_accelerator &&
+        accelerator_backend_->has_weight_copies();
     short_ssd_cpu_prefill =
-        is_ssd_metal &&
+        switchable_ssd_accelerator &&
         (n < metal_ssd_prefill_min_tokens() ||
          (!metal_weights_ready && !metal_ssd_reload_weights()));
     if (short_ssd_cpu_prefill) {
@@ -1084,9 +1082,6 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     } else {
         prepare_accelerator_prefill_weights();
     }
-#else
-    prepare_accelerator_prefill_weights();
-#endif
 
     int graph_seq_len = 1;
     for (auto& node : graph_prefill_.nodes) {
