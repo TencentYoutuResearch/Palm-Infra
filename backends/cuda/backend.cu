@@ -159,9 +159,9 @@ struct CudaBackend::Impl {
     }
 
     const DeviceWeight* find_weight(const Tensor& tensor) const {
-        if (!tensor.device_data)
+        if (!tensor.device.buffer)
             return nullptr;
-        const auto found = weights_by_device.find(tensor.device_data);
+        const auto found = weights_by_device.find(tensor.device.buffer);
         return found == weights_by_device.end() ? nullptr : found->second;
     }
 
@@ -204,8 +204,8 @@ struct CudaBackend::Impl {
                         .first;
             weights_by_device.emplace(device, &found->second);
         }
-        tensor.device_data = found->second.data;
-        tensor.device_offset = 0;
+        tensor.device.buffer = found->second.data;
+        tensor.device.offset = 0;
         return true;
     }
 
@@ -405,19 +405,19 @@ namespace {
 
 template <typename T>
 T* device_pointer(const Tensor& tensor) {
-    if (!tensor.device_data)
+    if (!tensor.device.buffer)
         return nullptr;
     return reinterpret_cast<T*>(
-        static_cast<uint8_t*>(tensor.device_data) + tensor.device_offset);
+        static_cast<uint8_t*>(tensor.device.buffer) + tensor.device.offset);
 }
 
 template <typename T>
 const T* device_pointer_const(const Tensor& tensor) {
-    if (!tensor.device_data)
+    if (!tensor.device.buffer)
         return nullptr;
     return reinterpret_cast<const T*>(
-        static_cast<const uint8_t*>(tensor.device_data) +
-        tensor.device_offset);
+        static_cast<const uint8_t*>(tensor.device.buffer) +
+        tensor.device.offset);
 }
 
 bool fp32_contiguous(const Tensor& tensor) {
@@ -542,8 +542,8 @@ void* CudaBackend::alloc_output(Tensor& output, size_t nbytes, BufferPool*) {
         return nullptr;
     }
     output.data = pointer;
-    output.device_data = pointer;
-    output.device_offset = 0;
+    output.device.buffer = pointer;
+    output.device.offset = 0;
     output.mem_type = MemoryType::POOLED;
     output.owner_id = 0;
     output.storage_id = 0;
@@ -551,9 +551,9 @@ void* CudaBackend::alloc_output(Tensor& output, size_t nbytes, BufferPool*) {
 }
 
 void CudaBackend::free_output(Tensor& tensor, BufferPool*) {
-    if (tensor.device_data)
+    if (tensor.device.buffer)
         mollm_cuda::release_device_buffer(
-            impl_->output_pool, tensor.device_data);
+            impl_->output_pool, tensor.device.buffer);
 }
 
 bool CudaBackend::copy_to_host(const Tensor& source, void* destination,
@@ -565,8 +565,8 @@ bool CudaBackend::copy_to_host(const Tensor& source, void* destination,
     }
     size_t host_prefix_bytes = 0;
     const auto mirror = impl_->persistent_host_mirrors.find(
-        source.device_data);
-    const size_t absolute_offset = source.device_offset + source_offset;
+        source.device.buffer);
+    const size_t absolute_offset = source.device.offset + source_offset;
     if (mirror != impl_->persistent_host_mirrors.end() &&
         !mirror->second.device_coherent &&
         absolute_offset < mirror->second.size) {
@@ -611,9 +611,9 @@ bool CudaBackend::copy_from_host(const void* source, Tensor& destination,
         return false;
     }
     const auto mirror = impl_->persistent_host_mirrors.find(
-        destination.device_data);
+        destination.device.buffer);
     const size_t absolute_offset =
-        destination.device_offset + destination_offset;
+        destination.device.offset + destination_offset;
     size_t host_prefix_bytes = 0;
     if (mirror != impl_->persistent_host_mirrors.end() &&
         absolute_offset < mirror->second.size) {
@@ -666,8 +666,8 @@ bool CudaBackend::zero_tensor(Tensor& tensor, size_t nbytes,
         return false;
     }
     const auto mirror = impl_->persistent_host_mirrors.find(
-        tensor.device_data);
-    const size_t absolute_offset = tensor.device_offset + destination_offset;
+        tensor.device.buffer);
+    const size_t absolute_offset = tensor.device.offset + destination_offset;
     size_t host_prefix_bytes = 0;
     if (mirror != impl_->persistent_host_mirrors.end() &&
         absolute_offset < mirror->second.size) {
@@ -785,8 +785,8 @@ void CudaBackend::alloc_persistent(
             tensor.data = storage;
         }
     }
-    tensor.device_data = storage;
-    tensor.device_offset = 0;
+    tensor.device.buffer = storage;
+    tensor.device.offset = 0;
     tensor.mem_type = MemoryType::EXTERNAL;
 }
 
@@ -813,8 +813,8 @@ void CudaBackend::upload_input(Tensor& tensor, const std::string& key,
         impl_->failed = true;
         return;
     }
-    tensor.device_data = buffer.data;
-    tensor.device_offset = 0;
+    tensor.device.buffer = buffer.data;
+    tensor.device.offset = 0;
 }
 
 bool CudaBackend::supports_lm_head(const Tensor& weight) const {
@@ -880,7 +880,7 @@ void CudaBackend::dispatch(const GraphNode& node,
             static_cast<size_t>(offset) * source.stride[dimension];
         if (source.data)
             output->data = static_cast<uint8_t*>(source.data) + byte_offset;
-        output->device_offset = source.device_offset + byte_offset;
+        output->device.offset = source.device.offset + byte_offset;
         output->shape[dimension] = size;
         record_native();
         return;
@@ -1018,21 +1018,21 @@ void CudaBackend::dispatch(const GraphNode& node,
             key_cache->prec == value_cache->prec &&
             (key_cache->prec == Precision::FP16 ||
              key_cache->prec == Precision::FP32) &&
-            key_cache->device_data && value_cache->device_data) {
+            key_cache->device.buffer && value_cache->device.buffer) {
             const auto* key_metadata = cache_meta(
                 static_cast<const uint8_t*>(key_cache->data) +
-                key_cache->device_offset);
+                key_cache->device.offset);
             const auto* value_metadata = cache_meta(
                 static_cast<const uint8_t*>(value_cache->data) +
-                value_cache->device_offset);
+                value_cache->device.offset);
             past_length = static_cast<int>(key_metadata->current_seq_len);
             key_capacity = static_cast<int>(key_metadata->max_seq_len);
             key_cache_data =
-                static_cast<uint8_t*>(key_cache->device_data) +
-                key_cache->device_offset + CacheMetadata::SIZE;
+                static_cast<uint8_t*>(key_cache->device.buffer) +
+                key_cache->device.offset + CacheMetadata::SIZE;
             value_cache_data =
-                static_cast<uint8_t*>(value_cache->device_data) +
-                value_cache->device_offset + CacheMetadata::SIZE;
+                static_cast<uint8_t*>(value_cache->device.buffer) +
+                value_cache->device.offset + CacheMetadata::SIZE;
             fp16_cache = key_cache->prec == Precision::FP16;
             cached =
                 value_metadata->current_seq_len ==
@@ -1226,7 +1226,7 @@ void CudaBackend::dispatch(const GraphNode& node,
         matmul_weight &&
         matmul_weight->n == inputs[1]->shape[0] &&
         matmul_weight->k == inputs[0]->shape[0] &&
-        inputs[1]->device_offset == 0) {
+        inputs[1]->device.offset == 0) {
         const Tensor& a = *inputs[0];
         const Tensor& weight = *inputs[1];
         const int m = static_cast<int>(a.shape[1]);
@@ -1793,7 +1793,7 @@ void CudaBackend::dispatch(const GraphNode& node,
         // Device intermediates and persistent state are staged from the first
         // byte of the tensor view, preserving their original shape/strides.
         const bool device_weight = impl_->find_weight(*input) != nullptr;
-        if (input->device_data && !device_weight) {
+        if (input->device.buffer && !device_weight) {
             const size_t bytes = input->view_span_bytes();
             host_storage.emplace_back(
                 (bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
@@ -1812,11 +1812,11 @@ void CudaBackend::dispatch(const GraphNode& node,
             impl_->failed = true;
             return;
         }
-        host.device_data = nullptr;
-        host.device_offset = 0;
+        host.device.buffer = nullptr;
+        host.device.offset = 0;
         host_inputs.push_back(&host);
     }
-    if (!output || !output->device_data) {
+    if (!output || !output->device.buffer) {
         impl_->failed = true;
         return;
     }
@@ -1825,8 +1825,8 @@ void CudaBackend::dispatch(const GraphNode& node,
         (output_bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
     Tensor host_output = *output;
     host_output.data = host_output_storage.data();
-    host_output.device_data = nullptr;
-    host_output.device_offset = 0;
+    host_output.device.buffer = nullptr;
+    host_output.device.offset = 0;
     // Staging allocations can reuse addresses/storage IDs across fallback
     // operators within one device graph. Their contents have a new lifetime.
     impl_->cpu.begin_execution();
@@ -1916,10 +1916,10 @@ int CudaBackend::lm_head_argmax_device_and_end_graph(
         impl_->failed = true;
         return -1;
     }
-    if (hidden_copy && hidden_copy->device_data &&
+    if (hidden_copy && hidden_copy->device.buffer &&
         hidden_copy->nbytes() >= static_cast<size_t>(k) * sizeof(float) &&
         !mollm_cuda::copy_memory(
-            hidden_copy->device_data, source,
+            hidden_copy->device.buffer, source,
             static_cast<size_t>(k) * sizeof(float),
             cudaMemcpyDeviceToDevice, "cudaMemcpy lm_head hidden")) {
         impl_->failed = true;

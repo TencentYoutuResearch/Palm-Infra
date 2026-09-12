@@ -814,7 +814,7 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
         misaligned_query.shape[2] = heads;
         misaligned_query.shape[3] = 1;
         misaligned_query.compute_strides();
-        misaligned_query.device_offset += sizeof(float);
+        misaligned_query.device.offset += sizeof(float);
         backend.dispatch(
             sdpa,
             {&misaligned_query, &decode_key, &decode_value, nullptr,
@@ -1748,7 +1748,7 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
         return false;
 
     Tensor view = storage;
-    view.device_offset += 2 * sizeof(float);
+    view.device.offset += 2 * sizeof(float);
     view.shape[0] = 2;
     const size_t span = view.view_span_bytes();
     std::vector<float> raw_span(span / sizeof(float));
@@ -1859,11 +1859,11 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
         PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX, 16);
     backend.alloc_persistent(
         device_only, device_only.nbytes(), PersistentHostAccess::NONE);
-    if (!full.data || full.data != full.device_data ||
-        !mirrored.data || mirrored.data == mirrored.device_data ||
+    if (!full.data || full.data != full.device.buffer ||
+        !mirrored.data || mirrored.data == mirrored.device.buffer ||
         !host_authoritative.data ||
-        host_authoritative.data == host_authoritative.device_data ||
-        !device_only.data || device_only.data != device_only.device_data)
+        host_authoritative.data == host_authoritative.device.buffer ||
+        !device_only.data || device_only.data != device_only.device.buffer)
         return false;
     const uint32_t prefix[4] = {7, 8, 9, 10};
     if (!backend.copy_from_host(prefix, mirrored, sizeof(prefix)) ||
@@ -1897,10 +1897,10 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
         return false;
 
     Tensor pooled_a = device_tensor(backend, 64);
-    void* pooled_pointer = pooled_a.device_data;
+    void* pooled_pointer = pooled_a.device.buffer;
     backend.free_output(pooled_a, nullptr);
     Tensor pooled_b = device_tensor(backend, 32);
-    if (pooled_b.device_data != pooled_pointer)
+    if (pooled_b.device.buffer != pooled_pointer)
         return false;
 
     backend.clear_dispatch_error();
@@ -2178,7 +2178,7 @@ int main() {
     misaligned_activation.shape[0] = k;
     misaligned_activation.shape[1] = m;
     misaligned_activation.compute_strides();
-    misaligned_activation.device_offset += sizeof(float);
+    misaligned_activation.device.offset += sizeof(float);
     Tensor misaligned_output = device_tensor(backend, n, m);
     GraphNode q4_matmul;
     q4_matmul.op_type = OpType::MATMUL;
@@ -2233,7 +2233,7 @@ int main() {
     invalid_q4.group_size = 16;
     invalid_q4.groups_per_row = 2;
     backend.wrap_weight_int4(invalid_q4);
-    if (invalid_q4.device_data)
+    if (invalid_q4.device.buffer)
         return 1;
 
     constexpr int k64 = 64;

@@ -65,8 +65,8 @@ bool is_view_op(OpType op) {
 
 void clear_tensor_storage(Tensor& tensor) {
     tensor.data = nullptr;
-    tensor.device_data = nullptr;
-    tensor.device_offset = 0;
+    tensor.device.buffer = nullptr;
+    tensor.device.offset = 0;
     tensor.mem_type = MemoryType::NONE;
     tensor.owner_id = 0;
     tensor.storage_id = 0;
@@ -164,7 +164,7 @@ Tensor copy_tensor_contiguous(const Tensor& src,
                                 src.shape[1], src.shape[2], src.shape[3],
                                 storage.data());
 
-    if ((!src.data && !src.device_data) || bytes == 0)
+    if ((!src.data && !src.device.buffer) || bytes == 0)
         return dst;
 
     if (src.is_contiguous()) {
@@ -434,8 +434,8 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
     C.storage_id = graph_prefill_.runtime.pool.storage_id(c_buf);
 
     if (finish_accelerator_graph) {
-        assert(accelerator_backend_ && hidden.device_data &&
-               lm_head_weight_->device_data);
+        assert(accelerator_backend_ && hidden.device.buffer &&
+               lm_head_weight_->device.buffer);
         accelerator_backend_->lm_head_gemv_device_and_end_graph(
                 hidden, (size_t)last_pos*(size_t)hidden_dim,
                 *lm_head_weight_, C.ptr<float>(), vocab_size, hidden_dim);
@@ -443,7 +443,7 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
                accelerator_backend_->supports_lm_head(*lm_head_weight_)) {
         std::vector<float> host_activation;
         const float* activation = A.ptr<float>();
-        if (hidden.device_data) {
+        if (hidden.device.buffer) {
             host_activation.resize(static_cast<size_t>(hidden_dim));
             if (!accelerator_backend_->copy_to_host(
                     hidden, host_activation.data(),
@@ -529,7 +529,7 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
             accelerator_backend_->supports_lm_head(*lm_head_weight_)) {
             std::vector<float> host_activation;
             const float* activation = A.ptr<float>();
-            if (hidden.device_data) {
+            if (hidden.device.buffer) {
                 host_activation.resize(static_cast<size_t>(hidden_dim));
                 if (!accelerator_backend_->copy_to_host(
                         hidden, host_activation.data(),
@@ -766,7 +766,7 @@ bool LLMEngine::execute_mtp_tokens(
     Tensor* device_hidden_copy = nullptr;
     if (fuse_accelerator_lm_head) {
         const int hidden = static_cast<int>(lm_head_weight_->shape[1]);
-        if (!mtp_draft_hidden_device_.device_data) {
+        if (!mtp_draft_hidden_device_.device.buffer) {
             mtp_draft_hidden_device_ = Tensor::create(
                 Precision::FP32, MemoryType::EXTERNAL,
                 hidden, 1, 1, 1, nullptr);
@@ -782,7 +782,7 @@ bool LLMEngine::execute_mtp_tokens(
         stop_after_node_index);
 
     if (fuse_accelerator_lm_head) {
-        if (out.data && out.device_data) {
+        if (out.data && out.device.buffer) {
             const int vocab = static_cast<int>(lm_head_weight_->shape[0]);
             const int hidden = static_cast<int>(lm_head_weight_->shape[1]);
             // Keep projection and top-1 in the graph command stream.  MTP uses
@@ -802,7 +802,7 @@ bool LLMEngine::execute_mtp_tokens(
     if (!cache_only && out.data &&
         !exec_ctx_mtp_.backend->dispatch_failed()) {
         if (fuse_accelerator_lm_head && device_hidden_copy &&
-            device_hidden_copy->device_data)
+            device_hidden_copy->device.buffer)
             copied = *device_hidden_copy;
         else
             copied = copy_tensor_contiguous(
@@ -922,8 +922,8 @@ void LLMEngine::prepare_accelerator_prefill_weights() {
         // expose the original mmap bytes only while recreating the Metal copy.
         void* cpu_data = t.data;
         t.data = const_cast<void*>(t.rowmajor_data);
-        t.device_data = nullptr;
-        t.device_offset = 0;
+        t.device.buffer = nullptr;
+        t.device.offset = 0;
         accelerator_backend_->wrap_weight(t);
         t.data = cpu_data;
         const bool aggregate_expert =
@@ -1165,7 +1165,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
         graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin,
         &token_tensor, fuse_accelerator_lm_head);
     if (fuse_accelerator_lm_head) {
-        if (out.data && out.device_data) {
+        if (out.data && out.device.buffer) {
             const int vocab = static_cast<int>(lm_head_weight_->shape[0]);
             const int hidden = static_cast<int>(lm_head_weight_->shape[1]);
             if (all_top1) {
@@ -1530,7 +1530,7 @@ bool LLMEngine::speculative_decode(int token_id,
         ++mtp_stats_.drafted_by_depth[static_cast<size_t>(i)];
         current = draft;
         draft_history.push_back(draft);
-        if (mtp_hidden.device_data) {
+        if (mtp_hidden.device.buffer) {
             state_tensor = mtp_hidden;
         } else {
             const float* mtp_data =

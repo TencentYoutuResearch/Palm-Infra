@@ -107,7 +107,7 @@ int main() {
         Tensor second = Tensor::create(Precision::FP32, MemoryType::NONE, 256);
         mb.alloc_output(first, first.nbytes(), nullptr);
         mb.alloc_output(second, second.nbytes(), nullptr);
-        CHECK(first.device_data != second.device_data,
+        CHECK(first.device.buffer != second.device.buffer,
               "Metal pool rejects duplicate release");
         mb.free_output(first, nullptr);
         mb.free_output(second, nullptr);
@@ -402,7 +402,7 @@ int main() {
         Tensor M=make_dev(mb,Precision::FP32,full,rows);
         Tensor G=M, U=M;
         G.shape[0]=I;
-        U.shape[0]=I; U.device_offset=(size_t)I*sizeof(float);
+        U.shape[0]=I; U.device.offset=(size_t)I*sizeof(float);
         Tensor O=make_dev(mb,Precision::FP32,I,rows);
         std::vector<float> merged(full*rows),ref(I*rows);
         fill_rand(merged.data(),merged.size());
@@ -672,7 +672,7 @@ int main() {
         Tensor B = AB;
         A.shape[0] = VH;
         B.shape[0] = VH;
-        B.device_offset += (size_t)VH * sizeof(float);
+        B.device.offset += (size_t)VH * sizeof(float);
         Tensor Z = make_dev(mb, Precision::FP32, zdim, S);          // [seq, zdim]
         Tensor ALG = make_dev(mb, Precision::FP32, VH, 1);
         Tensor DTB = make_dev(mb, Precision::FP32, VH, 1);
@@ -1217,7 +1217,7 @@ int main() {
         int full=96, off=32, hd=64, S=7, H=2, half=hd/2;
         Tensor PARENT=make_dev3(mb, Precision::FP32, full, S, H);
         Tensor IN=PARENT;
-        IN.shape[0]=hd; IN.device_offset=(size_t)off*sizeof(float);
+        IN.shape[0]=hd; IN.device.offset=(size_t)off*sizeof(float);
         Tensor X=make_dev3(mb, Precision::FP32, hd, S, H);
         Tensor COS=make_dev(mb, Precision::FP32, half, S);
         Tensor SIN=make_dev(mb, Precision::FP32, half, S);
@@ -1250,7 +1250,7 @@ int main() {
         Tensor P = SRC;
         P.shape[0]=b; P.shape[1]=a;
         P.stride[0]=SRC.stride[1]; P.stride[1]=SRC.stride[0];
-        P.device_data = SRC.device_data; P.device_offset = SRC.device_offset;
+        P.device.buffer = SRC.device.buffer; P.device.offset = SRC.device.offset;
         Tensor O = make_dev(mb, Precision::FP32, b, a);     // dense [b, a]
         metal_op(mb, OpType::CONTIGUOUS, {&P}, O);
         // ref: O[j + i*b]?  O is [b(inner), a]: O[i2*... ] row-major over shape.
@@ -1272,7 +1272,7 @@ int main() {
         Tensor P = SRC;                       // [d, s, h] view of [d,h,s]
         P.shape[0]=d; P.shape[1]=s; P.shape[2]=h;
         P.stride[0]=SRC.stride[0]; P.stride[1]=SRC.stride[2]; P.stride[2]=SRC.stride[1];
-        P.device_data = SRC.device_data; P.device_offset = SRC.device_offset;
+        P.device.buffer = SRC.device.buffer; P.device.offset = SRC.device.offset;
         Tensor O = make_dev3(mb, Precision::FP32, d, s, h);
         metal_op(mb, OpType::CONTIGUOUS, {&P}, O);
         // dense O index t -> (i0=d, i1=s, i2=h); source = SRC[i0, i2(h), i1(s)]
@@ -2208,7 +2208,7 @@ int main() {
         memcpy(B.data, b.data(), b.size()*sizeof(float));
         // A = FULL[0:keep] along dim0 as a view (stride preserved = full0 rows).
         Tensor A = FULL;
-        A.shape[0] = keep;   // device_offset 0, strides unchanged (stride[1]=full0)
+        A.shape[0] = keep;   // device.offset 0, strides unchanged (stride[1]=full0)
         metal_op(mb, OpType::CONCAT, {&A,&B}, OUT, {0});
         int O0=keep+b0;
         std::vector<float> ref(O0*s1*s2);

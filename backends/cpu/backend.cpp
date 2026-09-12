@@ -200,7 +200,7 @@ void CPUBackend::dispatch(const GraphNode& node,
                 (size_t)query_heads * output->stride[2];
             key_out.data =
                 static_cast<char*>(output->data) + key_offset;
-            key_out.device_offset = output->device_offset + key_offset;
+            key_out.device.offset = output->device.offset + key_offset;
             run(*inputs[0], *inputs[2], query_heads, query_out);
             run(*inputs[1], *inputs[3], key_heads, key_out);
         }

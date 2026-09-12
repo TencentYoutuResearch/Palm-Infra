@@ -80,7 +80,7 @@ public:
                               bool cross_layer_prefetch) override;
 
     /// After register_weight_region, point a weight/constant tensor at the
-    /// shared weight buffer with the correct device_offset (from t.data).
+    /// shared weight buffer with the correct device.offset (from t.data).
     void wrap_weight(Tensor& t) override;
 
     /// Bind per-channel/group INT8 scales after quant metadata is available.
@@ -106,13 +106,13 @@ public:
     /// Upload host bytes into a REUSABLE device buffer identified by `key`
     /// (e.g. graph INPUT node name like "hidden"/"cos"). The buffer is owned by
     /// the backend and reused across graph runs, growing only when a larger
-    /// size is needed. Sets t.device_data / t.device_offset (t.data unchanged so
+    /// size is needed. Sets t.device.buffer / t.device.offset (t.data unchanged so
     /// host reads still work). Used for boundary inputs (hidden/mask/cos/sin).
     void upload_input(Tensor& t, const std::string& key,
                       const void* host_src, size_t nbytes) override;
 
     bool supports_lm_head(const Tensor& weight) const override {
-        return weight.device_data &&
+        return weight.device.buffer &&
             (weight.prec == Precision::FP16 ||
              weight.prec == Precision::INT8 ||
              weight.prec == Precision::INT4);
@@ -121,7 +121,7 @@ public:
         return supports_lm_head(weight);
     }
     bool supports_lm_head_small_batch(const Tensor& weight) const override {
-        return weight.device_data &&
+        return weight.device.buffer &&
             (weight.prec == Precision::INT8 ||
              weight.prec == Precision::INT4);
     }
@@ -133,7 +133,7 @@ public:
     /// Run a single GEMV on the GPU: out[N] = a[K] (fp32) * W[N,K] (fp16),
     /// used for the lm_head projection during decode. `a_host` is a host FP32
     /// vector of length K; `weight` is a device-resident FP16 weight tensor
-    /// (W.device_data set, shape[0]=N, shape[1]=K). Results written to
+    /// (W.device.buffer set, shape[0]=N, shape[1]=K). Results written to
     /// `out_host` (length N). Runs its own command buffer (commit+wait).
     void lm_head_gemv(const float* a_host, const Tensor& weight,
                       float* out_host, int N, int K,

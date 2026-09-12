@@ -422,10 +422,10 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.compute_strides();
             t.data = data;
             t.rowmajor_data = data;
-            t.device_data = nullptr;
-            t.device_offset = 0;
-            t.scales_device_data = nullptr;
-            t.scales_device_offset = 0;
+            t.device.buffer = nullptr;
+            t.device.offset = 0;
+            t.device.scales_buffer = nullptr;
+            t.device.scales_offset = 0;
             t.mem_type = MemoryType::EXTERNAL;
             t.is_interleaved = false;
             t.is_q4_repacked = false;
@@ -854,7 +854,7 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
         if (accelerator_backend_) {
             accelerator_backend_->alloc_persistent(
                 *t, total, host_access, host_prefix_bytes);
-            return t->data && t->device_data;
+            return t->data && t->device.buffer;
         }
         void* buf = persistent_pool_.acquire(total);
         t->data = buf;
