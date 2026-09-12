@@ -117,6 +117,14 @@ public:
              weight.prec == Precision::INT8 ||
              weight.prec == Precision::INT4);
     }
+    bool supports_lm_head_argmax(const Tensor& weight) const override {
+        return supports_lm_head(weight);
+    }
+    bool supports_lm_head_small_batch(const Tensor& weight) const override {
+        return weight.device_data &&
+            (weight.prec == Precision::INT8 ||
+             weight.prec == Precision::INT4);
+    }
 
     /// Bind a reusable all-zero boundary buffer.  Once cleared, repeated
     /// single-token causal masks require neither a host fill nor an upload.
@@ -136,20 +144,20 @@ public:
     /// verification; returns false for unsupported shapes or dispatch errors.
     bool lm_head_small_batch(const float* a_host, const Tensor& weight,
                              float* out_host, int M, int N, int K,
-                             int activation = 0);
+                             int activation = 0) override;
 
     /// Append the small-M lm_head projection to the currently open graph,
     /// reading the graph output directly and closing/waiting once at the end.
     bool lm_head_small_batch_device_and_end_graph(
         const Tensor& a, const Tensor& weight, float* out_host,
-        int M, int N, int K, int activation = 0);
+        int M, int N, int K, int activation = 0) override;
 
     /// Append a small-M projection and per-row GPU argmax to the open graph.
     /// Only M token IDs are copied to the host; intended for plain-greedy MTP
     /// verification. Returns false for unsupported shapes or dispatch errors.
     bool lm_head_small_batch_argmax_device_and_end_graph(
         const Tensor& a, const Tensor& weight, int* top1_out,
-        int M, int N, int K, int activation = 0);
+        int M, int N, int K, int activation = 0) override;
 
     /// Append lm_head GEMV to the currently open graph command stream, reading
     /// the graph output directly from its device buffer. This closes and waits

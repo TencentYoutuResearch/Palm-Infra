@@ -91,6 +91,24 @@ public:
         Tensor* = nullptr) {
         return -1;
     }
+    // Optional small-batch projection used by speculative verification.
+    // Backends advertise support before the engine leaves a graph open for
+    // one of the device-tail variants.
+    virtual bool supports_lm_head_small_batch(const Tensor&) const {
+        return false;
+    }
+    virtual bool lm_head_small_batch(
+        const float*, const Tensor&, float*, int, int, int, int = 0) {
+        return false;
+    }
+    virtual bool lm_head_small_batch_device_and_end_graph(
+        const Tensor&, const Tensor&, float*, int, int, int, int = 0) {
+        return false;
+    }
+    virtual bool lm_head_small_batch_argmax_device_and_end_graph(
+        const Tensor&, const Tensor&, int*, int, int, int, int = 0) {
+        return false;
+    }
 
     // Optional SSD-MoE hooks. They remain no-ops for accelerators that do not
     // implement direct expert streaming.
