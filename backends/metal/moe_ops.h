@@ -15,6 +15,7 @@ class MetalCommandContext;
 class MetalPipelineCache;
 class MetalSsdExpertCache;
 class MetalSsdSharedExpert;
+class ThreadPool;
 struct MoeSsdTensorSource;
 namespace mollm::detail {
 struct MoeRoutingParams;
