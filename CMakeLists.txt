@@ -470,6 +470,7 @@ if(MOLLM_CUDA)
     target_sources(mollm_lib PRIVATE
         backends/cuda/backend.cu
         backends/cuda/device_runtime.cu
+        backends/cuda/dispatch.cu
         kernels/cuda/attention.cu
         kernels/cuda/matmul.cu
         kernels/cuda/elementwise.cu
