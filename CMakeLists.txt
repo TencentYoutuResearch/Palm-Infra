@@ -341,10 +341,13 @@ if(MOLLM_METAL)
     find_library(METAL_LIBRARY Metal REQUIRED)
     find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
 
-    # Compile the shader library: .metal -> .air -> default.metallib
-    set(MOLLM_METAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/mollm.metal)
-    set(MOLLM_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/mollm.air)
-    set(MOLLM_METALLIB  ${CMAKE_CURRENT_BINARY_DIR}/default.metallib)
+    # Compile each shader domain independently, then link one metallib.
+    set(MOLLM_METAL_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/mollm.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/elementwise.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/layout.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/normalization.metal)
+    set(MOLLM_METALLIB ${CMAKE_CURRENT_BINARY_DIR}/default.metallib)
 
     # Probe: does the toolchain support the Metal 4 tensor API (mpp::tensor_ops)?
     # If so, compile with -std=metal4.0 -DMOLLM_METAL_TENSOR so the fast
@@ -367,19 +370,29 @@ if(MOLLM_METAL)
     else()
         message(STATUS "Metal 4 tensor API not available — simdgroup GEMM only")
     endif()
-    add_custom_command(
-        OUTPUT ${MOLLM_METAL_AIR}
-        COMMAND xcrun -sdk macosx metal ${MOLLM_METAL_FLAGS} -c ${MOLLM_METAL_SRC}
-                -I ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal
-                -o ${MOLLM_METAL_AIR}
-        DEPENDS ${MOLLM_METAL_SRC}
-                ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/metal_common.h
-        COMMENT "Compiling Metal shaders (mollm.metal -> mollm.air)"
-        VERBATIM)
+    set(MOLLM_METAL_AIR_FILES "")
+    foreach(MOLLM_METAL_SOURCE IN LISTS MOLLM_METAL_SOURCES)
+        get_filename_component(MOLLM_METAL_DOMAIN
+                               ${MOLLM_METAL_SOURCE} NAME_WE)
+        set(MOLLM_METAL_DOMAIN_AIR
+            ${CMAKE_CURRENT_BINARY_DIR}/${MOLLM_METAL_DOMAIN}.air)
+        add_custom_command(
+            OUTPUT ${MOLLM_METAL_DOMAIN_AIR}
+            COMMAND xcrun -sdk macosx metal ${MOLLM_METAL_FLAGS}
+                    -c ${MOLLM_METAL_SOURCE}
+                    -I ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal
+                    -o ${MOLLM_METAL_DOMAIN_AIR}
+            DEPENDS ${MOLLM_METAL_SOURCE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/metal_common.h
+            COMMENT "Compiling Metal shader domain: ${MOLLM_METAL_DOMAIN}"
+            VERBATIM)
+        list(APPEND MOLLM_METAL_AIR_FILES ${MOLLM_METAL_DOMAIN_AIR})
+    endforeach()
     add_custom_command(
         OUTPUT ${MOLLM_METALLIB}
-        COMMAND xcrun -sdk macosx metallib ${MOLLM_METAL_AIR} -o ${MOLLM_METALLIB}
-        DEPENDS ${MOLLM_METAL_AIR}
+        COMMAND xcrun -sdk macosx metallib ${MOLLM_METAL_AIR_FILES}
+                -o ${MOLLM_METALLIB}
+        DEPENDS ${MOLLM_METAL_AIR_FILES}
         COMMENT "Linking Metal library (default.metallib)"
         VERBATIM)
     add_custom_target(mollm_metallib ALL DEPENDS ${MOLLM_METALLIB})
