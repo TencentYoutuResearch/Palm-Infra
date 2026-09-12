@@ -78,6 +78,7 @@ set(SOURCES
     backends/cpu/backend.cpp
     backends/cpu/deepseek_v4_ops.cpp
     backends/cpu/layout_ops.cpp
+    backends/cpu/matmul_ops.cpp
     backends/cpu/normalization_ops.cpp
     backends/cpu/recurrent_ops.cpp
     graph/execute.cpp
