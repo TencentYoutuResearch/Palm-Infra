@@ -1,4 +1,5 @@
 #include "backends/cpu/backend.h"
+#include "graph/graph.h"
 #include "kernels/cpu/attention.h"
 #include "kernels/cpu/models/deepseek_v4_attention.h"
 #include "kernels/cpu/elementwise.h"
