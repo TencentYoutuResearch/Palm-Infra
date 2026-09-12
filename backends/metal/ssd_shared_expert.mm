@@ -30,8 +30,8 @@ struct MetalSsdSharedExpert::Impl {
             up.prec != Precision::INT4 ||
             down.prec != Precision::INT4 ||
             scale_weight.prec != Precision::FP16 ||
-            !x.device_data || !gate.device_data || !up.device_data ||
-            !down.device_data || !scale_weight.device_data) {
+            !x.device.buffer || !gate.device.buffer || !up.device.buffer ||
+            !down.device.buffer || !scale_weight.device.buffer) {
             return false;
         }
 
@@ -50,12 +50,12 @@ struct MetalSsdSharedExpert::Impl {
         work.scale = pool_->acquire(sizeof(float));
         work.output = pool_->acquire(work.output_bytes);
 
-        id<MTLBuffer> x_buffer = (__bridge id<MTLBuffer>)x.device_data;
-        id<MTLBuffer> gate_buffer = (__bridge id<MTLBuffer>)gate.device_data;
-        id<MTLBuffer> up_buffer = (__bridge id<MTLBuffer>)up.device_data;
-        id<MTLBuffer> down_buffer = (__bridge id<MTLBuffer>)down.device_data;
+        id<MTLBuffer> x_buffer = (__bridge id<MTLBuffer>)x.device.buffer;
+        id<MTLBuffer> gate_buffer = (__bridge id<MTLBuffer>)gate.device.buffer;
+        id<MTLBuffer> up_buffer = (__bridge id<MTLBuffer>)up.device.buffer;
+        id<MTLBuffer> down_buffer = (__bridge id<MTLBuffer>)down.device.buffer;
         id<MTLBuffer> scale_weight_buffer =
-            (__bridge id<MTLBuffer>)scale_weight.device_data;
+            (__bridge id<MTLBuffer>)scale_weight.device.buffer;
         id<MTLBuffer> qx = (__bridge id<MTLBuffer>)work.qx;
         id<MTLBuffer> sx = (__bridge id<MTLBuffer>)work.sx;
         id<MTLBuffer> hidden_values =
@@ -74,7 +74,7 @@ struct MetalSsdSharedExpert::Impl {
         params.up_groups_per_row = static_cast<int>(up.groups_per_row);
         params.down_groups_per_row = static_cast<int>(down.groups_per_row);
         params.hidden_offset =
-            static_cast<uint>(x.device_offset / sizeof(float));
+            static_cast<uint>(x.device.offset / sizeof(float));
 
         id<MTLCommandBuffer> shared_cmd =
             [ssd_shared_compute_queue commandBuffer];
@@ -102,18 +102,18 @@ struct MetalSsdSharedExpert::Impl {
         [shared_enc setComputePipelineState:
                         pipelines_->pipeline("moe_shared_gate_up_w4_i8")];
         [shared_enc setBuffer:qx offset:0 atIndex:0];
-        [shared_enc setBuffer:gate_buffer offset:gate.device_offset atIndex:1];
+        [shared_enc setBuffer:gate_buffer offset:gate.device.offset atIndex:1];
         [shared_enc setBuffer:hidden_values offset:0 atIndex:2];
         [shared_enc setBytes:&params length:sizeof(params) atIndex:3];
         [shared_enc
             setBuffer:gate_buffer
-               offset:gate.device_offset +
+               offset:gate.device.offset +
                       static_cast<size_t>(intermediate) * hidden / 2
               atIndex:4];
-        [shared_enc setBuffer:up_buffer offset:up.device_offset atIndex:5];
+        [shared_enc setBuffer:up_buffer offset:up.device.offset atIndex:5];
         [shared_enc
             setBuffer:up_buffer
-               offset:up.device_offset +
+               offset:up.device.offset +
                       static_cast<size_t>(intermediate) * hidden / 2
               atIndex:6];
         [shared_enc setBuffer:sx offset:0 atIndex:7];
@@ -124,7 +124,7 @@ struct MetalSsdSharedExpert::Impl {
                         pipelines_->pipeline("moe_shared_scale_f16")];
         [shared_enc setBuffer:x_buffer offset:0 atIndex:0];
         [shared_enc setBuffer:scale_weight_buffer
-                       offset:scale_weight.device_offset
+                       offset:scale_weight.device.offset
                       atIndex:1];
         [shared_enc setBuffer:scale offset:0 atIndex:2];
         [shared_enc setBytes:&params length:sizeof(params) atIndex:3];
@@ -148,12 +148,12 @@ struct MetalSsdSharedExpert::Impl {
         [shared_enc setComputePipelineState:
                         pipelines_->pipeline("moe_shared_down_w4_i8")];
         [shared_enc setBuffer:qhidden offset:0 atIndex:0];
-        [shared_enc setBuffer:down_buffer offset:down.device_offset atIndex:1];
+        [shared_enc setBuffer:down_buffer offset:down.device.offset atIndex:1];
         [shared_enc setBuffer:output offset:0 atIndex:2];
         [shared_enc setBytes:&params length:sizeof(params) atIndex:3];
         [shared_enc
             setBuffer:down_buffer
-               offset:down.device_offset +
+               offset:down.device.offset +
                       static_cast<size_t>(hidden) * intermediate / 2
               atIndex:4];
         [shared_enc setBuffer:scale offset:0 atIndex:5];

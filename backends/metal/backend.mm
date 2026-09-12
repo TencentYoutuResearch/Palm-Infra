@@ -194,13 +194,13 @@ namespace {
 // Resolve the MTLBuffer backing a tensor. Returns nil if the tensor has no
 // device buffer.
 id<MTLBuffer> buf_of(const Tensor* t) {
-    if (!t || !t->device_data) return nil;
-    return (__bridge id<MTLBuffer>)t->device_data;
+    if (!t || !t->device.buffer) return nil;
+    return (__bridge id<MTLBuffer>)t->device.buffer;
 }
 
 id<MTLBuffer> scales_buf_of(const Tensor* t) {
-    if (!t || !t->scales_device_data) return nil;
-    return (__bridge id<MTLBuffer>)t->scales_device_data;
+    if (!t || !t->device.scales_buffer) return nil;
+    return (__bridge id<MTLBuffer>)t->device.scales_buffer;
 }
 
 // element size in bytes for a precision, for offset math.
@@ -224,9 +224,9 @@ int estride(const Tensor& t, int dim) {
     return (int)(t.stride[dim] / esize(t.prec));
 }
 
-// element offset into the bound buffer (device_offset is in bytes)
+// element offset into the bound buffer (device.offset is in bytes)
 uint eoffset(const Tensor& t) {
-    return (uint)(t.device_offset / esize(t.prec));
+    return (uint)(t.device.offset / esize(t.prec));
 }
 
 int metal_cmd_chunk_ops() {
@@ -466,8 +466,8 @@ void MetalBackend::upload_zero_input(Tensor& t, const std::string& key,
 void* MetalBackend::alloc_output(Tensor& out, size_t nbytes, BufferPool* /*pool*/) {
     void* buf = impl_->pool->acquire(nbytes);
     if (!buf) return nullptr;
-    out.device_data = buf;
-    out.device_offset = 0;
+    out.device.buffer = buf;
+    out.device.offset = 0;
     out.mem_type = MemoryType::POOLED;
     out.owner_id = 0;   // device pool; executor skips host owner-id checks
     out.storage_id = 0;
@@ -482,7 +482,7 @@ void MetalBackend::free_output(Tensor& t, BufferPool* /*pool*/) {
     // end_graph(). Releasing a buffer to the pool now would let a later node
     // reacquire and overwrite it while earlier (not-yet-executed) kernels still
     // depend on its contents. Defer all frees until after waitUntilCompleted.
-    impl_->commands->release_or_defer(t.device_data, t.nbytes());
+    impl_->commands->release_or_defer(t.device.buffer, t.nbytes());
 }
 
 // ===========================================================================
@@ -558,16 +558,16 @@ void MetalBackend::dispatch(const GraphNode& node,
         if (src.is_contiguous()) {
             encoded_gpu_work = false;
             // zero-copy: alias device buffer + offset, keep new shape
-            void* dd = src.device_data;
-            size_t doff = src.device_offset;
+            void* dd = src.device.buffer;
+            size_t doff = src.device.offset;
             int64_t sh[4] = { output->shape[0], output->shape[1],
                               output->shape[2], output->shape[3] };
             *output = src;
             output->shape[0]=sh[0]; output->shape[1]=sh[1];
             output->shape[2]=sh[2]; output->shape[3]=sh[3];
             output->compute_strides();
-            output->device_data = dd;
-            output->device_offset = doff;
+            output->device.buffer = dd;
+            output->device.offset = doff;
         } else {
             // materialize via contiguous kernel (output buffer already allocated)
             TensorDesc d{};
@@ -603,23 +603,23 @@ void MetalBackend::dispatch(const GraphNode& node,
         ns[a3]=src.shape[3]; nst[a3]=src.stride[3];
         for(int i=0;i<4;i++){v.shape[i]=ns[i]; v.stride[i]=nst[i];}
         *output = v;
-        output->device_data = src.device_data;
-        output->device_offset = src.device_offset;
+        output->device.buffer = src.device.buffer;
+        output->device.offset = src.device.offset;
         break;
     }
 
     case OpType::SLICE: {
         encoded_gpu_work = false;
         // zero-copy: view of the parent along `dim`, preserving stride layout.
-        // Mirrors the CPU SLICE (execute.cpp): device_offset advances by
+        // Mirrors the CPU SLICE (execute.cpp): device.offset advances by
         // offset*stride[dim] (bytes), shape[dim] shrinks to size.
         const Tensor& src = *inputs[0];
         int dim    = params.i32.size()>0 ? params.i32[0] : 0;
         int offset = params.i32.size()>1 ? params.i32[1] : 0;
         int size   = params.i32.size()>2 ? params.i32[2] : (int)src.shape[dim];
         *output = src;
-        output->device_data = src.device_data;
-        output->device_offset = src.device_offset + (size_t)offset * src.stride[dim];
+        output->device.buffer = src.device.buffer;
+        output->device.offset = src.device.offset + (size_t)offset * src.stride[dim];
         output->shape[dim] = size;
         break;
     }
@@ -713,7 +713,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                      impl_->pipeline_small_m(
                          "gemv_small_m_f32a_f16b_f32c", p.M)];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
             [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
             [enc setBytes:&small length:sizeof(small) atIndex:3];
             const NSUInteger groups =
@@ -743,10 +743,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                      impl_->pipeline_small_m(
                          "gemv_w8_small_m_f32a_i8b_f32c", p.M)];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
             [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
             [enc setBuffer:scales_buf_of(&B)
-                     offset:B.scales_device_offset atIndex:4];
+                     offset:B.device.scales_offset atIndex:4];
             [enc setBytes:&w length:sizeof(w) atIndex:3];
             const NSUInteger groups =
                 ((NSUInteger)p.N + nsg - 1) / nsg;
@@ -769,7 +769,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
             w.group_size = (int)B.group_size;
             w.groups_per_row = (int)B.groups_per_row;
-            size_t scales_boff = B.scales_device_offset;
+            size_t scales_boff = B.device.scales_offset;
             const int NR0 = 2;
             const int NSG =
                 std::min(mollm::metal::gemv_nsg_cap(), (p.K + 127) / 128);
@@ -777,7 +777,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 impl_->pipeline("gemv_w8_f32a_i8b_f32c");
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
             [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
             [enc setBuffer:scales_buf_of(&B) offset:scales_boff atIndex:4];
             [enc setBytes:&w length:sizeof(w) atIndex:3];
@@ -810,7 +810,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     "gemv_w4_small_m_f32a_i4b_f32c", p.M);
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
             [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
             [enc setBuffer:buf_of(&B) offset:scales_boff atIndex:4];
             [enc setBytes:&w length:sizeof(w) atIndex:3];
@@ -843,7 +843,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             id<MTLComputePipelineState> ps = impl_->pipeline_gemv_w4(NR0);
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
             [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
             [enc setBuffer:buf_of(&B) offset:scales_boff atIndex:4];
             [enc setBytes:&w length:sizeof(w) atIndex:3];
@@ -867,7 +867,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             // overflow for late weights in the 8.8GB region (esp. lm_head).
             MatmulParams pv = p; pv.b_offset = 0;
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
             [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
             [enc setBytes:&pv length:sizeof(pv) atIndex:3];
             id<MTLComputePipelineState> gemv2_ps = gemv_old ? nil : impl_->pipeline_gemv2(NR0);
@@ -916,7 +916,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 {
                     QuantActParams q{};
                     q.M = p.M; q.K = p.K;
-                    q.a_offset = A.device_offset / sizeof(float);   // A bound at 0
+                    q.a_offset = A.device.offset / sizeof(float);   // A bound at 0
                     q.a_row_stride = p.a_row_stride;
                     id<MTLComputePipelineState> qps = impl_->pipeline("quantize_act_i8");
                     [enc setComputePipelineState:qps];
@@ -937,11 +937,11 @@ void MetalBackend::dispatch(const GraphNode& node,
                     w.c_row_stride = p.c_row_stride;
                     w.activation = p.activation;
                     w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
-                    size_t scales_boff = B.scales_device_offset;
+                    size_t scales_boff = B.device.scales_offset;
                     id<MTLComputePipelineState> ps = impl_->pipeline("gemm_w8a8_i8a_i8b_f32c");
                     [enc setComputePipelineState:ps];
                     [enc setBuffer:a_i8 offset:0 atIndex:0];
-                    [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                    [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
                     [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                     [enc setBytes:&w length:sizeof(w) atIndex:3];
                     [enc setBuffer:sa offset:0 atIndex:4];
@@ -965,7 +965,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
                 w.group_size = (int)B.group_size;
                 w.groups_per_row = (int)B.groups_per_row;
-                size_t scales_boff = B.scales_device_offset;
+                size_t scales_boff = B.device.scales_offset;
                 id<MTLBuffer> ah = cast_activation_to_f16();
                 w.a_row_stride = p.K;
                 // M64 improves occupancy for the smaller projection shapes.
@@ -978,7 +978,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                              : "gemm_tensor_w8_f16a_i8b_f32c_m64");
                 [enc setComputePipelineState:ps];
                 [enc setBuffer:ah offset:0 atIndex:0];
-                [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
                 [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                 [enc setBuffer:scales_buf_of(&B) offset:scales_boff atIndex:4];
                 [enc setBytes:&w length:sizeof(w) atIndex:3];
@@ -1051,8 +1051,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                             use_m128, specialize_g128);
                     [enc setComputePipelineState:ps];
                     [enc setBuffer:buf_of(&A)
-                           offset:A.device_offset atIndex:0];
-                    [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                           offset:A.device.offset atIndex:0];
+                    [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
                     [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                     [enc setBytes:&w length:sizeof(w) atIndex:3];
                     [enc setBuffer:buf_of(&B) offset:scales_boff atIndex:4];
@@ -1102,7 +1102,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 {
                     QuantActParams q{};
                     q.M = p.M; q.K = p.K;
-                    q.a_offset = A.device_offset / sizeof(float);
+                    q.a_offset = A.device.offset / sizeof(float);
                     q.a_row_stride = p.a_row_stride;
                     q.block_size =
                         block32 ? 32
@@ -1179,7 +1179,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                               atIndex:1];
                     } else {
                         [enc setBuffer:buf_of(&B)
-                               offset:B.device_offset
+                               offset:B.device.offset
                               atIndex:1];
                     }
                     [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
@@ -1244,7 +1244,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 // offsets; zero the in-shader element offsets accordingly.
                 MatmulParams ptt = pt; ptt.a_offset = 0; ptt.b_offset = 0;
                 id<MTLBuffer> activation_buffer = buf_of(&A);
-                NSUInteger activation_offset = A.device_offset;
+                NSUInteger activation_offset = A.device.offset;
                 if (!direct_weights) {
                     activation_buffer = cast_activation_to_f16();
                     activation_offset = 0;
@@ -1252,7 +1252,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 }
                 [enc setComputePipelineState:ps];
                 [enc setBuffer:activation_buffer offset:activation_offset atIndex:0];
-                [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
                 [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                 [enc setBytes:&ptt length:sizeof(ptt) atIndex:3];
                 MTLSize tgc = MTLSizeMake(((NSUInteger)p.M + 127)/128,
@@ -1265,7 +1265,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 id<MTLComputePipelineState> ps = impl_->pipeline("gemm_tiled_f32a_f16b_f32c");
                 [enc setComputePipelineState:ps];
                 [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-                [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:1];
                 [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                 [enc setBytes:&pt length:sizeof(pt) atIndex:3];
                 // Half-staged tiles, TK=8: (32*8 + 32*8) halves = 1KB; the FP32
@@ -1311,7 +1311,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         id<MTLComputePipelineState> ps = impl_->pipeline("rms_norm_f32");
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&W) offset:W.device_offset atIndex:1];
+        [enc setBuffer:buf_of(&W) offset:W.device.offset atIndex:1];
         [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         NSUInteger tg = 256;
@@ -1349,7 +1349,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             impl_->pipeline("rms_norm_rope_f32");
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&W) offset:W.device_offset atIndex:1];
+        [enc setBuffer:buf_of(&W) offset:W.device.offset atIndex:1];
         [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         [enc setBuffer:buf_of(&COS) offset:0 atIndex:4];
@@ -1402,9 +1402,9 @@ void MetalBackend::dispatch(const GraphNode& node,
         [enc setBuffer:buf_of(&query) offset:0 atIndex:0];
         [enc setBuffer:buf_of(&key) offset:0 atIndex:1];
         [enc setBuffer:buf_of(&query_weight)
-               offset:query_weight.device_offset atIndex:2];
+               offset:query_weight.device.offset atIndex:2];
         [enc setBuffer:buf_of(&key_weight)
-               offset:key_weight.device_offset atIndex:3];
+               offset:key_weight.device.offset atIndex:3];
         [enc setBuffer:buf_of(&out) offset:0 atIndex:4];
         [enc setBytes:&p length:sizeof(p) atIndex:5];
         [enc setBuffer:buf_of(&cos) offset:0 atIndex:6];
@@ -1442,7 +1442,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         [enc setBuffer:buf_of(&update) offset:0 atIndex:1];
         [enc setBuffer:buf_of(&out) offset:0 atIndex:2];
         [enc setBuffer:buf_of(&weight)
-               offset:weight.device_offset atIndex:4];
+               offset:weight.device.offset atIndex:4];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         NSUInteger tg = std::min<NSUInteger>(
             256, ps.maxTotalThreadsPerThreadgroup);
@@ -1467,10 +1467,10 @@ void MetalBackend::dispatch(const GraphNode& node,
         id<MTLComputePipelineState> ps = impl_->pipeline("layer_norm_f32");
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&W) offset:W.device_offset atIndex:1];
+        [enc setBuffer:buf_of(&W) offset:W.device.offset atIndex:1];
         [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:4];
+        [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:4];
         NSUInteger tg = std::min<NSUInteger>(
             256, ps.maxTotalThreadsPerThreadgroup);
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows, 1, 1)
@@ -1503,7 +1503,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.x_stride_pos = estride(X, 1);
         p.x_stride_head = estride(X, 2);
         // Copy input -> output buffer (rope in place), if different buffers.
-        if (buf_of(&in) != buf_of(&X) || in.device_offset != X.device_offset) {
+        if (buf_of(&in) != buf_of(&X) || in.device.offset != X.device.offset) {
             // use blit copy via contiguous kernel (contiguous input assumed)
             TensorDesc d{};
             for(int i=0;i<4;i++){d.shape[i]=(int)in.shape[i]; d.stride[i]=estride(in,i);}            
@@ -2126,10 +2126,10 @@ void MetalBackend::dispatch(const GraphNode& node,
 
         int dst_seqlen = past + cur_seqlen;
         // Cache data begins 64 bytes past the buffer base (CacheMetadata header).
-        // FP16 cache: element offset = (device_offset + 64) / 2.
+        // FP16 cache: element offset = (device.offset + 64) / 2.
         const size_t CACHE_HDR = 64;
-        uint k_cache_eoff = (uint)((K_cache ? K_cache->device_offset : 0) + CACHE_HDR) / 2;
-        uint v_cache_eoff = (uint)((V_cache ? V_cache->device_offset : 0) + CACHE_HDR) / 2;
+        uint k_cache_eoff = (uint)((K_cache ? K_cache->device.offset : 0) + CACHE_HDR) / 2;
+        uint v_cache_eoff = (uint)((V_cache ? V_cache->device.offset : 0) + CACHE_HDR) / 2;
 
         // 1) Append K_cur/V_cur (FP32) into the FP16 cache at position past+s.
         SdpaAppendKvParams ap{};
@@ -2344,7 +2344,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         [enc setComputePipelineState:ps];
         int dim_offset = 0;
         for (size_t i = 0; i < inputs.size(); i++) {
-            if (!inputs[i] || !inputs[i]->device_data) continue;
+            if (!inputs[i] || !inputs[i]->device.buffer) continue;
             const Tensor& src = *inputs[i];
             ConcatParams p{};
             for (int k=0;k<4;k++){ p.shape[k]=(int)src.shape[k]; p.stride[k]=estride(src,k); }
@@ -2425,8 +2425,8 @@ void MetalBackend::dispatch(const GraphNode& node,
             !ssd_gate && !ssd_down && !has_shared &&
             inputs[2]->prec == Precision::INT8 &&
             inputs[3]->prec == Precision::INT8 &&
-            inputs[2]->scales_device_data &&
-            inputs[3]->scales_device_data;
+            inputs[2]->device.scales_buffer &&
+            inputs[3]->device.scales_buffer;
         const bool resident_quant_prefill =
             moe_seq > 1 && !ssd_w4 && !has_shared;
         const bool gpu_quant_moe =
@@ -2490,14 +2490,14 @@ void MetalBackend::dispatch(const GraphNode& node,
                 if (next != impl_->ssd_moe_layers.end() &&
                     next->second.hidden == hidden_size &&
                     next->second.router &&
-                    next->second.router->device_data &&
+                    next->second.router->device.buffer &&
                     next->second.router->prec == Precision::FP16 &&
                     next->second.top_k > 0 &&
                     next->second.top_k <= 16 &&
                     (next->second.score_func == 0 ||
                      (next->second.score_func == 1 &&
                       next->second.bias &&
-                      next->second.bias->device_data))) {
+                      next->second.bias->device.buffer))) {
                     predicted_layer = &next->second;
                     predicted_idx_bytes =
                         (size_t)seq * predicted_layer->top_k * sizeof(int);
@@ -2555,7 +2555,7 @@ void MetalBackend::dispatch(const GraphNode& node,
 
                 const auto* input_bytes =
                     static_cast<const uint8_t*>([buf_of(&x) contents]) +
-                    x.device_offset;
+                    x.device.offset;
                 Tensor cpu_input = Tensor::create(
                     Precision::FP32, MemoryType::EXTERNAL,
                     hidden_size, seq, 1, 1,
@@ -2638,7 +2638,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                                         "moe_router_quantize_bg128"))];
                     [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
                     [enc setBuffer:buf_of(&router)
-                            offset:router.device_offset atIndex:1];
+                            offset:router.device.offset atIndex:1];
                     [enc setBuffer:logits offset:0 atIndex:2];
                     [enc setBytes:&mp length:sizeof(mp) atIndex:3];
                     [enc setBuffer:
@@ -2683,7 +2683,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     router_mp.act_n_len = -1;
                     [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
                     [enc setBuffer:buf_of(&router)
-                            offset:router.device_offset atIndex:1];
+                            offset:router.device.offset atIndex:1];
                     [enc setBuffer:logits offset:0 atIndex:2];
                     [enc setBytes:&router_mp
                            length:sizeof(router_mp) atIndex:3];
@@ -2727,7 +2727,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                                  "gemv_small_m_f32a_f16b_f32c", seq)];
                     [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
                     [enc setBuffer:buf_of(&router)
-                            offset:router.device_offset atIndex:1];
+                            offset:router.device.offset atIndex:1];
                     [enc setBuffer:logits offset:0 atIndex:2];
                     [enc setBytes:&router_mp
                            length:sizeof(router_mp) atIndex:3];
@@ -2770,7 +2770,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                         // so near-tied experts do not diverge solely because
                         // Metal rounded the router input to FP16.
                         activation = buf_of(&x);
-                        activation_offset = x.device_offset;
+                        activation_offset = x.device.offset;
                     } else {
                         const size_t activation_bytes =
                             (size_t)seq * (size_t)hidden_size *
@@ -2807,7 +2807,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setBuffer:activation
                             offset:activation_offset atIndex:0];
                     [enc setBuffer:buf_of(&router)
-                            offset:router.device_offset atIndex:1];
+                            offset:router.device.offset atIndex:1];
                     [enc setBuffer:logits offset:0 atIndex:2];
                     [enc setBytes:&tensor_mp
                            length:sizeof(tensor_mp) atIndex:3];
@@ -2851,7 +2851,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 [enc setBytes:&mp length:sizeof(mp) atIndex:3];
                 if (bias) {
                     [enc setBuffer:buf_of(bias)
-                            offset:bias->device_offset atIndex:4];
+                            offset:bias->device.offset atIndex:4];
                 } else if (parallel_select) {
                     // The softmax specialization does not read this binding,
                     // but Metal validation still requires every declared
@@ -3056,13 +3056,13 @@ void MetalBackend::dispatch(const GraphNode& node,
                                  impl_->pipeline(pipeline_name)];
                         [enc setBuffer:activation offset:0 atIndex:0];
                         [enc setBuffer:buf_of(&weight)
-                                offset:weight.device_offset atIndex:1];
+                                offset:weight.device.offset atIndex:1];
                         [enc setBuffer:destination offset:0 atIndex:2];
                         [enc setBytes:&gp length:sizeof(gp) atIndex:3];
                         [enc setBuffer:activation_scales
                                 offset:0 atIndex:4];
                         [enc setBuffer:scales_buf_of(&weight)
-                                offset:weight.scales_device_offset atIndex:5];
+                                offset:weight.device.scales_offset atIndex:5];
                         [enc setBuffer:counts offset:0 atIndex:6];
                         [enc setBuffer:routes offset:0 atIndex:7];
                         [enc setBuffer:jobs
@@ -3222,13 +3222,13 @@ void MetalBackend::dispatch(const GraphNode& node,
                                      "gemv_selected_experts_w8_i8a_i8b_f32c")];
                         [enc setBuffer:activation offset:0 atIndex:0];
                         [enc setBuffer:buf_of(&weight)
-                                offset:weight.device_offset atIndex:1];
+                                offset:weight.device.offset atIndex:1];
                         [enc setBuffer:dst offset:0 atIndex:2];
                         [enc setBytes:&sp length:sizeof(sp) atIndex:3];
                         [enc setBuffer:activation_scales
                                 offset:0 atIndex:4];
                         [enc setBuffer:scales_buf_of(&weight)
-                                offset:weight.scales_device_offset atIndex:5];
+                                offset:weight.device.scales_offset atIndex:5];
                         [enc setBuffer:idx offset:0 atIndex:6];
                         constexpr NSUInteger w8_nsg = 4;
                         constexpr NSUInteger rows_per_tg = w8_nsg * 8;
@@ -3308,11 +3308,11 @@ void MetalBackend::dispatch(const GraphNode& node,
                                         : "moe_gate_up_w8"))];
                 [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
                 [enc setBuffer:buf_of(&gu)
-                        offset:gu.device_offset atIndex:1];
+                        offset:gu.device.offset atIndex:1];
                 [enc setBuffer:merged offset:0 atIndex:2];
                 [enc setBytes:&mp length:sizeof(mp) atIndex:3];
                 [enc setBuffer:scales_buf_of(&gu)
-                        offset:gu.scales_device_offset atIndex:4];
+                        offset:gu.device.scales_offset atIndex:4];
                 [enc setBuffer:idx offset:0 atIndex:5];
                 if (exact_decode)
                     [enc setThreadgroupMemoryLength:
@@ -3349,11 +3349,11 @@ void MetalBackend::dispatch(const GraphNode& node,
                                         : "moe_down_combine_w8"))];
                 [enc setBuffer:merged offset:0 atIndex:0];
                 [enc setBuffer:buf_of(&down)
-                        offset:down.device_offset atIndex:1];
+                        offset:down.device.offset atIndex:1];
                 [enc setBuffer:buf_of(output) offset:0 atIndex:2];
                 [enc setBytes:&mp length:sizeof(mp) atIndex:3];
                 [enc setBuffer:scales_buf_of(&down)
-                        offset:down.scales_device_offset atIndex:4];
+                        offset:down.device.scales_offset atIndex:4];
                 [enc setBuffer:idx offset:0 atIndex:5];
                 [enc setBuffer:tw offset:0 atIndex:6];
                 if (exact_decode)
@@ -3742,7 +3742,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setComputePipelineState:
                              impl_->pipeline("add_inplace_f32")];
                     [enc setBuffer:buf_of(output)
-                            offset:output->device_offset
+                            offset:output->device.offset
                            atIndex:0];
                     [enc setBuffer:shared_output offset:0 atIndex:1];
                     [enc setBytes:&count length:sizeof(count) atIndex:3];
@@ -4037,7 +4037,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                                      "i8a_i4b_f32c")];
                         [enc setBuffer:a offset:0 atIndex:0];
                         [enc setBuffer:buf_of(&w)
-                                offset:w.device_offset atIndex:1];
+                                offset:w.device.offset atIndex:1];
                         [enc setBuffer:dst offset:0 atIndex:2];
                         [enc setBytes:&sp length:sizeof(sp) atIndex:3];
                         [enc setBuffer:sa offset:0 atIndex:4];
@@ -4059,7 +4059,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                                      "i8a_i4b_f32c")];
                         [enc setBuffer:a offset:0 atIndex:0];
                         [enc setBuffer:buf_of(&w)
-                                offset:w.device_offset atIndex:1];
+                                offset:w.device.offset atIndex:1];
                         [enc setBuffer:dst offset:0 atIndex:2];
                         [enc setBytes:&sp length:sizeof(sp) atIndex:3];
                         [enc setBuffer:sa offset:0 atIndex:4];
@@ -4078,12 +4078,12 @@ void MetalBackend::dispatch(const GraphNode& node,
                                      "gemm_selected_w4a8_i8a_i4b_f32c")];
                         [enc setBuffer:a offset:0 atIndex:0];
                         [enc setBuffer:buf_of(&w)
-                                offset:w.device_offset atIndex:1];
+                                offset:w.device.offset atIndex:1];
                         [enc setBuffer:dst offset:0 atIndex:2];
                         [enc setBytes:&sp length:sizeof(sp) atIndex:3];
                         [enc setBuffer:sa offset:0 atIndex:4];
                         [enc setBuffer:buf_of(&w)
-                                offset:w.device_offset+rows_total*(K/2)
+                                offset:w.device.offset+rows_total*(K/2)
                                atIndex:5];
                         [enc setBuffer:idx offset:0 atIndex:6];
                         [enc setThreadgroupMemoryLength:
@@ -4120,7 +4120,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setBuffer:activation
                             offset:0 atIndex:0];
                     [enc setBuffer:buf_of(&weight)
-                            offset:weight.device_offset atIndex:1];
+                            offset:weight.device.offset atIndex:1];
                     [enc setBuffer:destination
                             offset:0 atIndex:2];
                     [enc setBytes:&gp
@@ -4333,9 +4333,9 @@ void MetalBackend::dispatch(const GraphNode& node,
 
             [enc setComputePipelineState:impl_->pipeline("moe_gate_up_w4")];
             [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&gu) offset:gu.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&gu) offset:gu.device.offset atIndex:1];
             [enc setBuffer:merged offset:0 atIndex:2];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
-            [enc setBuffer:buf_of(&gu) offset:gu.device_offset+gu_rows*(hidden_size/2) atIndex:4];
+            [enc setBuffer:buf_of(&gu) offset:gu.device.offset+gu_rows*(hidden_size/2) atIndex:4];
             [enc setBuffer:idx offset:0 atIndex:5];
             [enc setThreadgroupMemoryLength:4*sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake((2*intermediate+3)/4,top_k,seq)
@@ -4349,9 +4349,9 @@ void MetalBackend::dispatch(const GraphNode& node,
 
             [enc setComputePipelineState:impl_->pipeline("moe_down_combine_w4")];
             [enc setBuffer:merged offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&down) offset:down.device_offset atIndex:1];
+            [enc setBuffer:buf_of(&down) offset:down.device.offset atIndex:1];
             [enc setBuffer:buf_of(output) offset:0 atIndex:2];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
-            [enc setBuffer:buf_of(&down) offset:down.device_offset+down_rows*(intermediate/2) atIndex:4];
+            [enc setBuffer:buf_of(&down) offset:down.device.offset+down_rows*(intermediate/2) atIndex:4];
             [enc setBuffer:idx offset:0 atIndex:5];[enc setBuffer:tw offset:0 atIndex:6];
             [enc setThreadgroupMemoryLength:4*sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake((hidden_size+3)/4,seq,1)

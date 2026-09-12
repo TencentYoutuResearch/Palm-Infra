@@ -53,25 +53,24 @@ enum class MemoryType : uint8_t {
 // data pointer and only adjust shape + stride.
 // ---------------------------------------------------------------------------
 
+struct DeviceStorage {
+    void* buffer = nullptr;
+    size_t offset = 0;
+    // Quantization scales may live in a different device buffer when a large
+    // package mapping is split at a backend-specific allocation boundary.
+    void* scales_buffer = nullptr;
+    size_t scales_offset = 0;
+};
+
 struct Tensor {
     Precision   prec     = Precision::FP32;
     MemoryType  mem_type = MemoryType::NONE;
     int64_t     shape[4] = {0, 1, 1, 1};
     size_t      stride[4] = {0, 0, 0, 0};  // stride in bytes
     void*       data     = nullptr;
-    // GPU backend (Metal) device storage. Inert on the CPU path (stay null/0),
-    // so all existing CPU logic and the default CPU build are unaffected.
-    //   device_data   = opaque id<MTLBuffer> handle backing this tensor.
-    //   device_offset = byte offset into that buffer's contents (views cannot
-    //     pointer-offset an MTLBuffer the way a char* can, so the handle stays
-    //     the same and the offset is carried separately).
-    void*       device_data   = nullptr;
-    size_t      device_offset = 0;
-    // Quantization scales may live in a different Metal buffer from the
-    // weight bytes when a very large package mmap is split at the device's
-    // maxBufferLength boundary.
-    void*       scales_device_data = nullptr;
-    size_t      scales_device_offset = 0;
+    // Opaque accelerator storage. Inert on the CPU path. Views retain the
+    // backing handle and advance the byte offset separately.
+    DeviceStorage device;
     uint32_t    owner_id = 0;  // debug owner for pooled storage; 0 = unknown/non-pooled
     uint64_t    storage_id = 0; // debug allocation identity; copied by borrowed views
     const float* scales = nullptr; // quant scales for INT8/INT4 weights; borrowed from weight file
@@ -298,7 +297,7 @@ struct Tensor {
         v.stride[2] = v.stride[1];
         v.stride[3] = v.stride[2];
         v.data = static_cast<char*>(data) + offset;
-        v.device_offset = device_offset + offset;  // inert on CPU (offset 0-based, data drives)
+        v.device.offset = device.offset + offset;  // inert on CPU (offset 0-based, data drives)
         return v;
     }
 
@@ -314,7 +313,7 @@ struct Tensor {
         v.stride[2] = v.stride[1] * ne1;
         v.stride[3] = v.stride[2];
         v.data = static_cast<char*>(data) + offset;
-        v.device_offset = device_offset + offset;  // inert on CPU
+        v.device.offset = device.offset + offset;  // inert on CPU
         return v;
     }
 

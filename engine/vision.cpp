@@ -737,8 +737,8 @@ bool LLMEngine::encode_vision_patches(
             continue;
         Tensor& tensor = graph_vision_.runtime.tensors[node.id];
         tensor.data = nullptr;
-        tensor.device_data = nullptr;
-        tensor.device_offset = 0;
+        tensor.device.buffer = nullptr;
+        tensor.device.offset = 0;
         tensor.mem_type = MemoryType::NONE;
         tensor.owner_id = 0;
         tensor.storage_id = 0;

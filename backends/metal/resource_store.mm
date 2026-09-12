@@ -125,8 +125,8 @@ void MetalResourceStore::wrap_weight(Tensor& tensor) {
             const size_t bytes = tensor.nbytes();
             auto found = impl_->copied_weights.find(source);
             if (found != impl_->copied_weights.end()) {
-                tensor.device_data = (__bridge void*)found->second;
-                tensor.device_offset = 0;
+                tensor.device.buffer = (__bridge void*)found->second;
+                tensor.device.offset = 0;
             } else {
                 @autoreleasepool {
                     id<MTLBuffer> buffer =
@@ -135,8 +135,8 @@ void MetalResourceStore::wrap_weight(Tensor& tensor) {
                     std::memcpy([buffer contents], source, bytes);
                     impl_->weight_copies.push_back(buffer);
                     impl_->copied_weights[source] = buffer;
-                    tensor.device_data = (__bridge void*)buffer;
-                    tensor.device_offset = 0;
+                    tensor.device.buffer = (__bridge void*)buffer;
+                    tensor.device.offset = 0;
                 }
             }
         }
@@ -169,8 +169,8 @@ void MetalResourceStore::wrap_weight(Tensor& tensor) {
         if (tensor.prec == Precision::INT8) wrap_weight_int8(tensor);
         return;
     }
-    tensor.device_data = buffer;
-    tensor.device_offset = offset;
+    tensor.device.buffer = buffer;
+    tensor.device.offset = offset;
     if (tensor.prec == Precision::INT8) wrap_weight_int8(tensor);
 }
 
@@ -183,8 +183,8 @@ void MetalResourceStore::wrap_weight_int8(Tensor& tensor) {
     size_t offset = 0;
     void* buffer_handle = nullptr;
     if (locate_weight(tensor.scales, scale_bytes, buffer_handle, offset)) {
-        tensor.scales_device_data = buffer_handle;
-        tensor.scales_device_offset = offset;
+        tensor.device.scales_buffer = buffer_handle;
+        tensor.device.scales_offset = offset;
         return;
     }
     @autoreleasepool {
@@ -194,8 +194,8 @@ void MetalResourceStore::wrap_weight_int8(Tensor& tensor) {
         if (!buffer) return;
         std::memcpy([buffer contents], tensor.scales, scale_bytes);
         impl_->persistent.push_back(buffer);
-        tensor.scales_device_data = (__bridge void*)buffer;
-        tensor.scales_device_offset = 0;
+        tensor.device.scales_buffer = (__bridge void*)buffer;
+        tensor.device.scales_offset = 0;
     }
 }
 
@@ -226,8 +226,8 @@ void MetalResourceStore::wrap_weight_int4(Tensor& tensor,
     const void* packed = bg32 ? tensor.q4_g32_data : tensor.q4_g128_data;
     auto cached = impl_->decoded_q4_weights.find(packed);
     if (cached != impl_->decoded_q4_weights.end()) {
-        tensor.device_data = (__bridge void*)cached->second;
-        tensor.device_offset = 0;
+        tensor.device.buffer = (__bridge void*)cached->second;
+        tensor.device.offset = 0;
         return;
     }
 
@@ -251,8 +251,8 @@ void MetalResourceStore::wrap_weight_int4(Tensor& tensor,
             impl_->weight_copies.push_back(buffer);
         else
             impl_->persistent.push_back(buffer);
-        tensor.device_data = (__bridge void*)buffer;
-        tensor.device_offset = 0;
+        tensor.device.buffer = (__bridge void*)buffer;
+        tensor.device.offset = 0;
         impl_->decoded_q4_weights[packed] = buffer;
     }
 }
@@ -263,8 +263,8 @@ void MetalResourceStore::alloc_persistent(Tensor& tensor, size_t bytes) {
             [impl_->device newBufferWithLength:bytes
                                        options:MTLResourceStorageModeShared];
         impl_->persistent.push_back(buffer);
-        tensor.device_data = (__bridge void*)buffer;
-        tensor.device_offset = 0;
+        tensor.device.buffer = (__bridge void*)buffer;
+        tensor.device.offset = 0;
         tensor.data = [buffer contents];
     }
 }
@@ -284,8 +284,8 @@ void MetalResourceStore::upload_input(Tensor& tensor, const std::string& key,
     }
     if (source) std::memcpy([buffer contents], source, bytes);
     impl_->input_is_zero[key] = false;
-    tensor.device_data = (__bridge void*)buffer;
-    tensor.device_offset = 0;
+    tensor.device.buffer = (__bridge void*)buffer;
+    tensor.device.offset = 0;
 }
 
 void MetalResourceStore::upload_zero_input(Tensor& tensor,
@@ -308,6 +308,6 @@ void MetalResourceStore::upload_zero_input(Tensor& tensor,
         std::memset([buffer contents], 0, impl_->input_capacity[key]);
         impl_->input_is_zero[key] = true;
     }
-    tensor.device_data = (__bridge void*)buffer;
-    tensor.device_offset = 0;
+    tensor.device.buffer = (__bridge void*)buffer;
+    tensor.device.offset = 0;
 }

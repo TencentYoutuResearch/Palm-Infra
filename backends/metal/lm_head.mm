@@ -19,13 +19,13 @@
 namespace {
 
 id<MTLBuffer> buffer_of(const Tensor& tensor) {
-    return tensor.device_data ? (__bridge id<MTLBuffer>)tensor.device_data
+    return tensor.device.buffer ? (__bridge id<MTLBuffer>)tensor.device.buffer
                               : nil;
 }
 
 id<MTLBuffer> scales_buffer_of(const Tensor& tensor) {
-    return tensor.scales_device_data
-               ? (__bridge id<MTLBuffer>)tensor.scales_device_data
+    return tensor.device.scales_buffer
+               ? (__bridge id<MTLBuffer>)tensor.device.scales_buffer
                : nil;
 }
 
@@ -71,7 +71,7 @@ bool MetalLmHead::small_batch_device_and_end_graph(const Tensor& a,
                                                    float* out_host, int M,
                                                    int N, int K,
                                                    int activation) {
-    return small_batch_impl(a.device_data, a.device_offset, weight, out_host, M,
+    return small_batch_impl(a.device.buffer, a.device.offset, weight, out_host, M,
                             N, K, activation, true);
 }
 
@@ -80,7 +80,7 @@ bool MetalLmHead::small_batch_argmax_device_and_end_graph(const Tensor& a,
                                                           int* top1_out, int M,
                                                           int N, int K,
                                                           int activation) {
-    return small_batch_impl(a.device_data, a.device_offset, weight, nullptr, M,
+    return small_batch_impl(a.device.buffer, a.device.offset, weight, nullptr, M,
                             N, K, activation, true, top1_out);
 }
 
@@ -91,10 +91,10 @@ bool MetalLmHead::small_batch_impl(void* a_device, size_t a_byte_offset,
     if (!a_device || (!out_host && !top1_out) || M < 2 || M > 4 || N <= 0 ||
         K <= 0 ||
         (weight.prec != Precision::INT4 && weight.prec != Precision::INT8) ||
-        !weight.device_data || weight.group_size == 0 ||
+        !weight.device.buffer || weight.group_size == 0 ||
         weight.groups_per_row == 0 ||
         (weight.prec == Precision::INT4 && (K & 1) != 0) ||
-        (weight.prec == Precision::INT8 && !weight.scales_device_data)) {
+        (weight.prec == Precision::INT8 && !weight.device.scales_buffer)) {
         if (finish_open_graph && commands_->cmd)
             commands_->end_graph(dispatch_failed_);
         return false;
@@ -177,13 +177,13 @@ bool MetalLmHead::small_batch_impl(void* a_device, size_t a_byte_offset,
                                         M)];
         [encoder setBuffer:abuf offset:a_byte_offset atIndex:0];
         [encoder setBuffer:buffer_of(weight)
-                    offset:weight.device_offset
+                    offset:weight.device.offset
                    atIndex:1];
         [encoder setBuffer:cbuf offset:0 atIndex:2];
         [encoder setBytes:&p length:sizeof(p) atIndex:3];
         if (is_w8) {
             [encoder setBuffer:scales_buffer_of(weight)
-                        offset:weight.scales_device_offset
+                        offset:weight.device.scales_offset
                        atIndex:4];
         } else {
             [encoder setBuffer:buffer_of(weight)
@@ -280,7 +280,7 @@ void MetalLmHead::gemv_device_and_end_graph(const Tensor& a,
                                             const Tensor& weight,
                                             float* out_host, int N, int K,
                                             int activation) {
-    gemv_impl(a.device_data, a.device_offset + a_element_offset * sizeof(float),
+    gemv_impl(a.device.buffer, a.device.offset + a_element_offset * sizeof(float),
               weight, out_host, N, K, activation, true);
 }
 
@@ -290,7 +290,7 @@ int MetalLmHead::argmax_device_and_end_graph(const Tensor& a,
                                              int activation,
                                              Tensor* hidden_copy) {
     int token = -1;
-    gemv_impl(a.device_data, a.device_offset + a_element_offset * sizeof(float),
+    gemv_impl(a.device.buffer, a.device.offset + a_element_offset * sizeof(float),
               weight, nullptr, N, K, activation, true, &token, hidden_copy);
     return token;
 }
@@ -340,7 +340,7 @@ void MetalLmHead::gemv_impl(void* a_device, size_t a_byte_offset,
             finish_open_graph ? commands_->enc : [cmd computeCommandEncoder];
         assert(cmd && enc);
         [enc setBuffer:A offset:a_byte_offset atIndex:0];
-        [enc setBuffer:B offset:weight.device_offset atIndex:1];
+        [enc setBuffer:B offset:weight.device.offset atIndex:1];
         [enc setBuffer:C offset:0 atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         id<MTLComputePipelineState> ps = nil;
@@ -356,7 +356,7 @@ void MetalLmHead::gemv_impl(void* a_device, size_t a_byte_offset,
             w.activation = activation;
             w.group_size = (int)weight.group_size;
             w.groups_per_row = (int)weight.groups_per_row;
-            const size_t scales_boff = weight.scales_device_offset;
+            const size_t scales_boff = weight.device.scales_offset;
             constexpr int NR0 = 2;
             const int NSG =
                 std::min(mollm::metal::gemv_nsg_cap(), (K + 127) / 128);
@@ -445,7 +445,7 @@ void MetalLmHead::gemv_impl(void* a_device, size_t a_byte_offset,
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(kArgMaxThreads, 1, 1)];
         }
-        if (finish_open_graph && hidden_copy && hidden_copy->device_data &&
+        if (finish_open_graph && hidden_copy && hidden_copy->device.buffer &&
             hidden_copy->nbytes() >= static_cast<size_t>(K) * sizeof(float)) {
             // Preserve the recursively predicted hidden state on GPU for the
             // next MTP depth.  The next graph consumes this buffer before its
@@ -456,8 +456,8 @@ void MetalLmHead::gemv_impl(void* a_device, size_t a_byte_offset,
             [blit copyFromBuffer:A
                      sourceOffset:a_byte_offset
                          toBuffer:(__bridge id<MTLBuffer>)
-                                      hidden_copy->device_data
-                destinationOffset:hidden_copy->device_offset
+                                      hidden_copy->device.buffer
+                destinationOffset:hidden_copy->device.offset
                              size:static_cast<size_t>(K) * sizeof(float)];
             [blit endEncoding];
         }

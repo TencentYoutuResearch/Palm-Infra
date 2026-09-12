@@ -18,6 +18,9 @@ int main() {
     CHECK(a.nbytes() == 24, "nbytes 4*3*2=24");
     CHECK(a.view_span_bytes() == 24, "contiguous view span is 24 bytes");
     CHECK(a.is_contiguous(), "contiguous after create");
+    CHECK(!a.device.buffer && a.device.offset == 0 &&
+              !a.device.scales_buffer && a.device.scales_offset == 0,
+          "device storage is empty after create");
 
     // ---- strides ----
     CHECK(a.stride[0] == 2, "stride[0] == 2 bytes");
@@ -53,6 +56,17 @@ int main() {
     other_pool.owner_id = 8;
     CHECK(!other_pool.shares_storage_with(pooled),
           "storage ids are scoped by pool owner");
+    pooled.device.buffer = storage;
+    pooled.device.offset = 16;
+    pooled.device.scales_buffer = storage + 1;
+    pooled.device.scales_offset = 32;
+    Tensor device_view = pooled.view_1d(3, sizeof(float));
+    CHECK(device_view.device.buffer == pooled.device.buffer &&
+              device_view.device.offset == 16 + sizeof(float),
+          "offset view retains device buffer and advances byte offset");
+    CHECK(device_view.device.scales_buffer == pooled.device.scales_buffer &&
+              device_view.device.scales_offset == 32,
+          "offset view retains separate device scale storage");
     Tensor external_a =
         Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 4, 1, 1, 1, storage);
     Tensor external_b = external_a;
