@@ -42,17 +42,17 @@ if(MOLLM_SANITIZERS)
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64|arm")
-    set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_arm.cpp)
+    set(MOLLM_CPU_PLATFORM_SOURCE backends/cpu/platform/arm.cpp)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(MOLLM_CPU_PLATFORM_SOURCE
-        kernels/cpu_platform_x86.cpp
+        backends/cpu/platform/x86.cpp
         kernels/cpu/x86/matmul_x86_avx2.cpp
         kernels/cpu/x86/matmul_x86_avx512.cpp
         kernels/cpu/x86/matmul_x86_vnni.cpp
         kernels/cpu/x86/gdn_x86_avx512.cpp
         kernels/cpu/x86/attention_x86_avx512.cpp)
 else()
-    set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_scalar.cpp)
+    set(MOLLM_CPU_PLATFORM_SOURCE backends/cpu/platform/scalar.cpp)
 endif()
 
 # ---------------------------------------------------------------------------
