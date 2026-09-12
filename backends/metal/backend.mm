@@ -1,5 +1,6 @@
 #include "backends/metal/backend.h"
 #include "backends/metal/buffer_pool.h"
+#include "backends/metal/pipeline_cache.h"
 #include "backends/metal/resource_store.h"
 #include "graph/graph.h"
 #include "storage/mapped_file.h"
@@ -40,10 +41,8 @@ struct MetalBackend::Impl {
     id<MTLLibrary>           library = nil;
 
     std::unique_ptr<MetalBufferPool> pool;
+    std::unique_ptr<MetalPipelineCache> pipeline_cache;
     std::unique_ptr<MetalResourceStore> resources;
-
-    // pipeline cache by kernel function name
-    std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
 
     bool                     dispatch_failed = false;
 
@@ -643,237 +642,47 @@ struct MetalBackend::Impl {
     }
 
     id<MTLComputePipelineState> pipeline(const char* name) {
-        std::string key(name);
-        auto it = pipelines.find(key);
-        if (it != pipelines.end()) return it->second;
-        id<MTLFunction> fn = [library newFunctionWithName:@(name)];
-        if (!fn) {
-            fprintf(stderr, "MetalBackend: kernel function '%s' not found\n", name);
-            return nil;
-        }
-        NSError* err = nil;
-        id<MTLComputePipelineState> ps =
-            [device newComputePipelineStateWithFunction:fn error:&err];
-        if (!ps) {
-            fprintf(stderr, "MetalBackend: pipeline '%s' failed: %s\n",
-                    name, err ? err.localizedDescription.UTF8String : "?");
-            return nil;
-        }
-        pipelines[key] = ps;
-        return ps;
+        return pipeline_cache->pipeline(name);
     }
 
     // Specialized-pipeline cache keyed by name + function-constant tuple. The
     // flash-attention prefill kernel bakes DK, DV, its SIMD-group split, and
     // query tile into the generated pipeline. A failed specialization returns
     // nil so the caller can use the generic prefill kernel.
-    std::unordered_map<std::string, id<MTLComputePipelineState>> spec_pipelines;
     id<MTLComputePipelineState> pipeline_fa2(
             int dk, int dv, int nsg, int qt) {
-        char keyc[64];
-        snprintf(
-            keyc, sizeof(keyc),
-            "fa2:dk%d:dv%d:nsg%d:qt%d",
-            dk, dv, nsg, qt);
-        std::string key(keyc);
-        auto it = spec_pipelines.find(key);
-        if (it != spec_pipelines.end()) return it->second;
-
-        MTLFunctionConstantValues* cv = [[MTLFunctionConstantValues alloc] init];
-        [cv setConstantValue:&dk type:MTLDataTypeInt atIndex:0];  // FC_SDPA_DK
-        [cv setConstantValue:&dv type:MTLDataTypeInt atIndex:1];  // FC_SDPA_DV
-        [cv setConstantValue:&nsg
-                       type:MTLDataTypeInt atIndex:9];
-        [cv setConstantValue:&qt
-                       type:MTLDataTypeInt atIndex:11];
-        NSError* err = nil;
-        id<MTLFunction> fn = [library newFunctionWithName:@"sdpa_prefill_fa2_f32"
-                                          constantValues:cv error:&err];
-        if (!fn) {
-            fprintf(stderr, "MetalBackend: fa2 specialized function failed: %s\n",
-                    err ? err.localizedDescription.UTF8String : "?");
-            spec_pipelines[key] = nil;
-            return nil;
-        }
-        id<MTLComputePipelineState> ps =
-            [device newComputePipelineStateWithFunction:fn error:&err];
-        if (!ps) {
-            fprintf(stderr, "MetalBackend: fa2 specialized pipeline failed: %s\n",
-                    err ? err.localizedDescription.UTF8String : "?");
-        }
-        spec_pipelines[key] = ps;
-        return ps;
+        return pipeline_cache->fa2(dk, dv, nsg, qt);
     }
 
     // GEMV specialized by NR0 (output rows per threadgroup) via function constant 5.
     id<MTLComputePipelineState> pipeline_gemv2(int nr0) {
-        char keyc[48];
-        snprintf(keyc, sizeof(keyc), "gemv2:nr0%d", nr0);
-        std::string key(keyc);
-        auto it = spec_pipelines.find(key);
-        if (it != spec_pipelines.end()) return it->second;
-
-        MTLFunctionConstantValues* cv = [[MTLFunctionConstantValues alloc] init];
-        [cv setConstantValue:&nr0 type:MTLDataTypeInt atIndex:5];  // FC_GEMV_NR0
-        NSError* err = nil;
-        id<MTLFunction> fn = [library newFunctionWithName:@"gemv2_f32a_f16b_f32c"
-                                          constantValues:cv error:&err];
-        id<MTLComputePipelineState> ps = fn
-            ? [device newComputePipelineStateWithFunction:fn error:&err] : nil;
-        if (!ps) fprintf(stderr, "MetalBackend: gemv2 nr0=%d pipeline failed: %s\n",
-                         nr0, err ? err.localizedDescription.UTF8String : "?");
-        spec_pipelines[key] = ps;
-        return ps;
+        return pipeline_cache->gemv2(nr0);
     }
 
     id<MTLComputePipelineState> pipeline_gemv_w4(int nr0) {
-        char keyc[48];
-        snprintf(keyc, sizeof(keyc), "gemv_w4:nr0%d", nr0);
-        std::string key(keyc);
-        auto it = spec_pipelines.find(key);
-        if (it != spec_pipelines.end()) return it->second;
-
-        MTLFunctionConstantValues* cv = [[MTLFunctionConstantValues alloc] init];
-        [cv setConstantValue:&nr0 type:MTLDataTypeInt atIndex:6];
-        NSError* err = nil;
-        id<MTLFunction> fn =
-            [library newFunctionWithName:@"gemv_w4_f32a_i4b_f32c"
-                          constantValues:cv error:&err];
-        id<MTLComputePipelineState> ps = fn
-            ? [device newComputePipelineStateWithFunction:fn error:&err] : nil;
-        if (!ps)
-            fprintf(stderr,
-                    "MetalBackend: W4 GEMV nr0=%d pipeline failed: %s\n",
-                    nr0, err ? err.localizedDescription.UTF8String : "?");
-        spec_pipelines[key] = ps;
-        return ps;
+        return pipeline_cache->gemv_w4(nr0);
     }
 
     id<MTLComputePipelineState> pipeline_small_m(
             const char* function_name, int m) {
-        const std::string key =
-            std::string("small_m:") + function_name + ":m" +
-            std::to_string(m);
-        auto it = spec_pipelines.find(key);
-        if (it != spec_pipelines.end()) return it->second;
-
-        MTLFunctionConstantValues* cv =
-            [[MTLFunctionConstantValues alloc] init];
-        [cv setConstantValue:&m type:MTLDataTypeInt atIndex:12];
-        NSError* err = nil;
-        id<MTLFunction> fn =
-            [library
-                newFunctionWithName:
-                    [NSString stringWithUTF8String:function_name]
-                      constantValues:cv
-                               error:&err];
-        id<MTLComputePipelineState> ps =
-            fn ? [device newComputePipelineStateWithFunction:fn error:&err]
-               : nil;
-        if (!ps)
-            fprintf(stderr,
-                    "MetalBackend: %s M=%d pipeline failed: %s\n",
-                    function_name, m,
-                    err ? err.localizedDescription.UTF8String : "?");
-        spec_pipelines[key] = ps;
-        return ps;
+        return pipeline_cache->small_m(function_name, m);
     }
 
     id<MTLComputePipelineState> pipeline_w4a16(
             bool use_m128, bool specialize_g128) {
-        const char* function_name =
-            use_m128
-                ? "gemm_tensor_w4_f32a_i4b_f32c"
-                : "gemm_tensor_w4_f32a_i4b_f32c_m64";
-        const std::string key =
-            std::string("w4a16:") +
-            (specialize_g128 ? "g128:" : "generic:") +
-            (use_m128 ? "m128" : "m64");
-        auto it = spec_pipelines.find(key);
-        if (it != spec_pipelines.end())
-            return it->second;
-
-        MTLFunctionConstantValues* cv =
-            [[MTLFunctionConstantValues alloc] init];
-        bool enabled = specialize_g128;
-        [cv setConstantValue:&enabled
-                       type:MTLDataTypeBool
-                    atIndex:10];
-        NSError* err = nil;
-        id<MTLFunction> fn =
-            [library
-                newFunctionWithName:
-                    [NSString stringWithUTF8String:function_name]
-                          constantValues:cv
-                                   error:&err];
-        id<MTLComputePipelineState> ps =
-            fn ? [device
-                     newComputePipelineStateWithFunction:fn
-                                                   error:&err]
-               : nil;
-        if (!ps)
-            fprintf(
-                stderr,
-                "MetalBackend: W4A16 G128 pipeline failed: %s\n",
-                err ? err.localizedDescription.UTF8String : "?");
-        spec_pipelines[key] = ps;
-        return ps;
+        return pipeline_cache->w4a16(use_m128, specialize_g128);
     }
 
     id<MTLComputePipelineState> pipeline_moe_select_parallel(
             bool sigmoid, bool grouped) {
-        const std::string key =
-            std::string("moe_select_parallel:") +
-            (sigmoid ? "sigmoid" : "softmax") +
-            (grouped ? ":grouped" : ":ungrouped");
-        auto it = spec_pipelines.find(key);
-        if (it != spec_pipelines.end()) return it->second;
-
-        MTLFunctionConstantValues* cv =
-            [[MTLFunctionConstantValues alloc] init];
-        [cv setConstantValue:&sigmoid
-                       type:MTLDataTypeBool
-                    atIndex:7];
-        [cv setConstantValue:&grouped
-                       type:MTLDataTypeBool
-                    atIndex:8];
-        NSError* err = nil;
-        id<MTLFunction> fn =
-            [library newFunctionWithName:@"moe_select_parallel"
-                          constantValues:cv error:&err];
-        id<MTLComputePipelineState> ps = fn
-            ? [device newComputePipelineStateWithFunction:fn error:&err]
-            : nil;
-        if (!ps)
-            fprintf(stderr,
-                    "MetalBackend: parallel %s MoE selector pipeline "
-                    "failed: %s\n",
-                    grouped ? "grouped sigmoid"
-                            : sigmoid ? "sigmoid" : "softmax",
-                    err ? err.localizedDescription.UTF8String : "?");
-        spec_pipelines[key] = ps;
-        return ps;
+        return pipeline_cache->moe_select_parallel(sigmoid, grouped);
     }
 
     id<MTLComputePipelineState> pipeline_grouped_moe(
             int group_size, bool paired_gate_up,
             bool large_route_tile) {
-        const char* layout =
-            group_size == 32 ? "bg32" : "bg128";
-        if (paired_gate_up) {
-            const std::string name =
-                std::string("gemm_grouped_experts_") + layout +
-                (large_route_tile
-                     ? "_gate_up_r32"
-                     : "_gate_up_r16");
-            return pipeline(name.c_str());
-        }
-        const std::string name =
-            std::string("gemm_grouped_experts_") + layout +
-            (large_route_tile
-                 ? "_down_r32"
-                 : "_down_r16");
-        return pipeline(name.c_str());
+        return pipeline_cache->grouped_moe(
+            group_size, paired_gate_up, large_route_tile);
     }
 
 };
@@ -1000,6 +809,9 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
                     path.c_str(), err ? err.localizedDescription.UTF8String : "no path");
             return;
         }
+        impl_->pipeline_cache.reset(new MetalPipelineCache(
+            (__bridge void*)impl_->device,
+            (__bridge void*)impl_->library));
         impl_->pool.reset(new MetalBufferPool((__bridge void*)impl_->device));
         impl_->resources.reset(
             new MetalResourceStore((__bridge void*)impl_->device));
@@ -1040,8 +852,7 @@ MetalBackend::~MetalBackend() {
                     impl_->ssd_bytes_read / 1e6,
                     impl_->ssd_resident_bytes / 1e6);
         }
-        impl_->pipelines.clear();
-        impl_->spec_pipelines.clear();
+        impl_->pipeline_cache.reset();
         impl_->resources.reset();
         impl_->pool.reset();
     }
