@@ -165,15 +165,15 @@ set(PUBLIC_GRAPH_HEADERS
     graph/execute.h
 )
 
-set(PUBLIC_KERNEL_HEADERS
-    kernels/cpu_platform.h
-    kernels/moe_ssd.h
-    kernels/prepared_weight.h
-    kernels/bf16.h
-    kernels/quant_layouts.h
-    kernels/tensor.h
-    kernels/threading.h
-    kernels/trace.h
+set(PUBLIC_KERNEL_COMPAT_HEADERS
+    compat/kernels/cpu_platform.h
+    compat/kernels/moe_ssd.h
+    compat/kernels/prepared_weight.h
+    compat/kernels/bf16.h
+    compat/kernels/quant_layouts.h
+    compat/kernels/tensor.h
+    compat/kernels/threading.h
+    compat/kernels/trace.h
 )
 
 add_library(mollm_lib STATIC ${SOURCES})
@@ -204,6 +204,7 @@ add_library(mollm::mollm ALIAS mollm_lib)
 set_target_properties(mollm_lib PROPERTIES EXPORT_NAME mollm)
 target_include_directories(mollm_lib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/compat>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/mollm>
 )
@@ -664,7 +665,7 @@ install(FILES storage/ssd_expert_cache/cache.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/storage/ssd_expert_cache)
 install(FILES ${PUBLIC_GRAPH_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/graph)
-install(FILES ${PUBLIC_KERNEL_HEADERS}
+install(FILES ${PUBLIC_KERNEL_COMPAT_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/kernels)
 
 configure_package_config_file(
