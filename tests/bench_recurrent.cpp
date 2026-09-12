@@ -1,6 +1,6 @@
-#include "kernels/gdn.h"
-#include "kernels/rwkv.h"
-#include "kernels/shortconv.h"
+#include "kernels/cpu/recurrent/gdn.h"
+#include "kernels/cpu/models/rwkv.h"
+#include "kernels/cpu/recurrent/shortconv.h"
 
 #include <algorithm>
 #include <chrono>

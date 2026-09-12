@@ -2,9 +2,9 @@
 // Only built when MOLLM_METAL is defined.
 
 #include "kernels/tensor.h"
-#include "kernels/matmul.h"
-#include "kernels/moe.h"
-#include "kernels/rwkv.h"
+#include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/moe/moe.h"
+#include "kernels/cpu/models/rwkv.h"
 #include "backends/metal/backend.h"
 #include "graph/graph.h"
 #include <algorithm>
@@ -519,7 +519,7 @@ int main() {
     run_shortconv(6144, 4, "SHORTCONV groups=6144 seq=4 (prod width)");
 
     // ---- GATED_DELTANET_DECODE (seq=1): GDN recurrence + RMSNormGated ----
-    // Scalar reference mirrors kernels/gdn_neon.h gdn_recurrence.
+    // Scalar reference mirrors kernels/cpu/arm/gdn_neon.h gdn_recurrence.
     {
         int H = 4, VH = 4, K = 128, Vd = 128;   // repeat=1
         float l2eps = 1e-6f, rmseps = 1e-6f, scale = 1.0f/std::sqrt((float)K);

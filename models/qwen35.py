@@ -579,7 +579,7 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
     """Build a linear attention (Gated Delta Rule) layer.
 
     Uses the fused `gated_deltanet` op for the GDN core + RMSNormGated.
-    See kernels/gdn.h for the op's data-layout contract — all matmul-derived
+    See kernels/cpu/recurrent/gdn.h for the op's data-layout contract — all matmul-derived
     inputs are consumed in their native [seq, dim] row-major data layout.
     """
     pfx = f'model_language_model_layers_{layer_idx}_linear_attn'

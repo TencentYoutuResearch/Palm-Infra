@@ -1,6 +1,6 @@
-#include "kernels/deepseek_v4_attention.h"
+#include "kernels/cpu/models/deepseek_v4_attention.h"
 #include "kernels/bf16.h"
-#include "kernels/matmul.h"
+#include "kernels/cpu/matmul/matmul.h"
 
 #include <cmath>
 #include <cstdio>

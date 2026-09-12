@@ -1,6 +1,6 @@
 #include "kernels/cpu_platform.h"
-#include "kernels/matmul.h"
-#include "kernels/matmul_internal.h"
+#include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/matmul/matmul_internal.h"
 
 #include <algorithm>
 #include <thread>

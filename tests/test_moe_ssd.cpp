@@ -1,5 +1,5 @@
 #include "graph/mmap_file.h"
-#include "kernels/matmul.h"
+#include "kernels/cpu/matmul/matmul.h"
 #include "kernels/moe_ssd.h"
 
 #include <chrono>

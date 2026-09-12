@@ -1,7 +1,7 @@
 #include "engine/weight_metadata.h"
 #include "kernels/cpu_platform.h"
 
-#include "kernels/matmul.h"
+#include "kernels/cpu/matmul/matmul.h"
 
 #include <cstdint>
 #include <cstdio>

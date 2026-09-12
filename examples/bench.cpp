@@ -6,7 +6,7 @@
 #include <fstream>
 #include <sstream>
 
-// Pack-A profiling counters (defined in kernels/matmul.cpp)
+// Pack-A profiling counters (defined in kernels/cpu/matmul/matmul.cpp)
 extern "C" {
 double mollm_pack_a_total_ms();
 long long mollm_pack_a_calls();

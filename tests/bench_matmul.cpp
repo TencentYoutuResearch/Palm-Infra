@@ -1,6 +1,6 @@
 #include "kernels/tensor.h"
-#include "kernels/deepseek_v4_attention.h"
-#include "kernels/matmul.h"
+#include "kernels/cpu/models/deepseek_v4_attention.h"
+#include "kernels/cpu/matmul/matmul.h"
 #include "runtime/threading.h"
 
 #include <algorithm>

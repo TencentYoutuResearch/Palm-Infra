@@ -1,4 +1,4 @@
-#include "kernels/moe_routing.h"
+#include "kernels/cpu/moe/moe_routing.h"
 
 #include <cmath>
 #include <cstdio>

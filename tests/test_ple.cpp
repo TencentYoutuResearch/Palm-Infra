@@ -1,5 +1,5 @@
-#include "kernels/matmul.h"
-#include "kernels/ple.h"
+#include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/ple.h"
 
 #include <cmath>
 #include <cstdint>

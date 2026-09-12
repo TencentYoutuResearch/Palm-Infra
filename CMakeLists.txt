@@ -46,11 +46,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64|arm")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(MOLLM_CPU_PLATFORM_SOURCE
         kernels/cpu_platform_x86.cpp
-        kernels/matmul_x86_avx2.cpp
-        kernels/matmul_x86_avx512.cpp
-        kernels/matmul_x86_vnni.cpp
-        kernels/gdn_x86_avx512.cpp
-        kernels/attention_x86_avx512.cpp)
+        kernels/cpu/x86/matmul_x86_avx2.cpp
+        kernels/cpu/x86/matmul_x86_avx512.cpp
+        kernels/cpu/x86/matmul_x86_vnni.cpp
+        kernels/cpu/x86/gdn_x86_avx512.cpp
+        kernels/cpu/x86/attention_x86_avx512.cpp)
 else()
     set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_scalar.cpp)
 endif()
@@ -70,36 +70,36 @@ set(SOURCES
     backends/cpu/backend.cpp
     graph/execute.cpp
     # kernels
-    kernels/matmul.cpp
-    kernels/matmul_dense.cpp
-    kernels/matmul_pack.cpp
-    kernels/matmul_profile.cpp
-    kernels/matmul_quant.cpp
-    kernels/matmul_sparse.cpp
-    kernels/matmul_w4.cpp
-    kernels/matmul_w8.cpp
-    kernels/matmul_mxfp4.cpp
-    kernels/matmul_nvfp4.cpp
+    kernels/cpu/matmul/matmul.cpp
+    kernels/cpu/matmul/matmul_dense.cpp
+    kernels/cpu/matmul/matmul_pack.cpp
+    kernels/cpu/matmul/matmul_profile.cpp
+    kernels/cpu/matmul/matmul_quant.cpp
+    kernels/cpu/matmul/matmul_sparse.cpp
+    kernels/cpu/matmul/matmul_w4.cpp
+    kernels/cpu/matmul/matmul_w8.cpp
+    kernels/cpu/matmul/matmul_mxfp4.cpp
+    kernels/cpu/matmul/matmul_nvfp4.cpp
     ${MOLLM_CPU_PLATFORM_SOURCE}
-    kernels/elementwise.cpp
-    kernels/layout.cpp
-    kernels/norm.cpp
-    kernels/rope.cpp
-    kernels/attention.cpp
-    kernels/shortconv.cpp
-    kernels/gdn.cpp
-    kernels/gdn_decode.cpp
-    kernels/gdn_prefill.cpp
-    kernels/gated_residual.cpp
-    kernels/ple.cpp
-    kernels/deepseek_v4_attention.cpp
-    kernels/hyper_connection.cpp
-    kernels/moe.cpp
-    kernels/moe_routing.cpp
+    kernels/cpu/elementwise.cpp
+    kernels/cpu/layout.cpp
+    kernels/cpu/norm.cpp
+    kernels/cpu/rope.cpp
+    kernels/cpu/attention.cpp
+    kernels/cpu/recurrent/shortconv.cpp
+    kernels/cpu/recurrent/gdn.cpp
+    kernels/cpu/recurrent/gdn_decode.cpp
+    kernels/cpu/recurrent/gdn_prefill.cpp
+    kernels/cpu/gated_residual.cpp
+    kernels/cpu/ple.cpp
+    kernels/cpu/models/deepseek_v4_attention.cpp
+    kernels/cpu/hyper_connection.cpp
+    kernels/cpu/moe/moe.cpp
+    kernels/cpu/moe/moe_routing.cpp
     kernels/moe_ssd.cpp
     kernels/moe_ssd_io.cpp
     kernels/moe_ssd_predict.cpp
-    kernels/rwkv.cpp
+    kernels/cpu/models/rwkv.cpp
     # engine
     engine/byte_ranges.cpp
     engine/engine.cpp
@@ -157,20 +157,20 @@ add_library(mollm_lib STATIC ${SOURCES})
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         set_source_files_properties(
-            kernels/matmul_x86_avx2.cpp
+            kernels/cpu/x86/matmul_x86_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
         set_source_files_properties(
-            kernels/matmul_x86_avx512.cpp
+            kernels/cpu/x86/matmul_x86_avx512.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma;-mf16c")
         set_source_files_properties(
-            kernels/matmul_x86_vnni.cpp
+            kernels/cpu/x86/matmul_x86_vnni.cpp
             PROPERTIES COMPILE_OPTIONS
                        "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mfma")
         set_source_files_properties(
-            kernels/gdn_x86_avx512.cpp
+            kernels/cpu/x86/gdn_x86_avx512.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
         set_source_files_properties(
-            kernels/attention_x86_avx512.cpp
+            kernels/cpu/x86/attention_x86_avx512.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
     else()
         message(FATAL_ERROR
@@ -234,8 +234,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
 
         if(MOLLM_ARM_I8MM_COMPILES)
             add_library(mollm_arm_i8mm OBJECT
-                kernels/matmul_w4_i8mm.cpp
-                kernels/matmul_w8.cpp)
+                kernels/cpu/arm/matmul_w4_i8mm.cpp
+                kernels/cpu/matmul/matmul_w8.cpp)
             target_include_directories(mollm_arm_i8mm PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}
                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann)

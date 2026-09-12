@@ -1,5 +1,5 @@
 #include "kernels/tensor.h"
-#include "kernels/matmul.h"
+#include "kernels/cpu/matmul/matmul.h"
 #include "runtime/threading.h"
 #include <algorithm>
 #include <cmath>

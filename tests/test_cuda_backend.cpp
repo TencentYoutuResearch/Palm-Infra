@@ -1,7 +1,7 @@
 #include "backends/cuda/backend.h"
 #include "engine/engine.h"
 #include "graph/execute.h"
-#include "kernels/gdn.h"
+#include "kernels/cpu/recurrent/gdn.h"
 #include "kernels/quant_layouts.h"
 
 #include <algorithm>

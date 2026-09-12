@@ -1,4 +1,4 @@
-#include "kernels/attention.h"
+#include "kernels/cpu/attention.h"
 #include "runtime/threading.h"
 #include "core/cache_layout.h"
 
