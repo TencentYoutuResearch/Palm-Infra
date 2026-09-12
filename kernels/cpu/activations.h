@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/activation.h"
 #include "kernels/tensor.h"  // for HAS_NEON
 
 #include <cmath>
@@ -18,22 +19,13 @@
 //   - apply_activation_f32_neon(float32x4_t, Activation)  — for vectorized paths
 //
 // Activation enum values must match Python's `Activation(IntEnum)` in
-// python/transpile.py.
+// models/transpile.py.
 //
 // To add a new activation:
-//   1. Add enum value here.
+//   1. Add enum value in core/activation.h.
 //   2. Add scalar + NEON branches in the apply_* functions.
 //   3. Add Python enum value in transpile.py.
 // ---------------------------------------------------------------------------
-
-enum class Activation : int32_t {
-    NONE = 0,   // identity — fast path, no per-column branch
-    SILU = 1,   // x * sigmoid(x) — SwiGLU gate
-    GELU = 2,   // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) — tanh approx
-    RELU = 3,   // max(0, x)
-    RELU_SQUARED = 4, // max(0, x)^2 — RWKV channel-mix
-    // Future: GELU_ERF, SIGMOID, TANH, ...
-};
 
 // ---------------------------------------------------------------------------
 // sigmoid (FP32, NEON). Also used by SILU.

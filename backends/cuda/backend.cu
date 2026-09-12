@@ -7,8 +7,8 @@
 #include "backends/cpu/backend.h"
 #include "core/cache_layout.h"
 
-#include "kernels/cpu/activations.h"
-#include "kernels/quant_layouts.h"
+#include "core/activation.h"
+#include "core/quant_layouts.h"
 
 #include <cublas_v2.h>
 

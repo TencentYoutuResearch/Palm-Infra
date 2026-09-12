@@ -1,6 +1,6 @@
 #include "kernels/cpu/hyper_connection.h"
 
-#include "kernels/bf16.h"
+#include "core/bf16.h"
 #include "runtime/threading.h"
 
 #include <algorithm>

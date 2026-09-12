@@ -1,6 +1,10 @@
 #include <engine/engine.h>
 #include <engine/sampler.h>
 #include <engine/tokenizer.h>
+#include <core/activation.h>
+#include <core/bf16.h>
+#include <core/prepared_weight.h>
+#include <core/quant_layouts.h>
 #include <runtime/host_buffer_pool.h>
 #include <runtime/threading.h>
 #include <runtime/trace.h>

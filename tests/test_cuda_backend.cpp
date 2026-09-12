@@ -2,7 +2,7 @@
 #include "engine/engine.h"
 #include "graph/execute.h"
 #include "kernels/cpu/recurrent/gdn.h"
-#include "kernels/quant_layouts.h"
+#include "core/quant_layouts.h"
 
 #include <algorithm>
 #include <cmath>

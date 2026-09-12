@@ -1,5 +1,5 @@
 #include "kernels/cpu/matmul/matmul_internal.h"
-#include "kernels/bf16.h"
+#include "core/bf16.h"
 #include "runtime/threading.h"
 
 #include <algorithm>

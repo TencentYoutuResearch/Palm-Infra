@@ -7,7 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "kernels/quant_layouts.h"
+#include "core/quant_layouts.h"
 
 // CUDA backend resources and kernel-launch declarations.
 namespace mollm_cuda {
