@@ -2,7 +2,7 @@
 
 #include "kernels/bf16.h"
 #include "kernels/matmul.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <cmath>

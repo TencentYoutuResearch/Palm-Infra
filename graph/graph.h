@@ -1,7 +1,7 @@
 #pragma once
 
 #include "kernels/tensor.h"
-#include "graph/buffer_pool.h"
+#include "runtime/host_buffer_pool.h"
 #include "graph/mmap_file.h"
 
 #include <cstdint>

@@ -1,7 +1,7 @@
 #include "kernels/cpu_platform.h"
 #include "kernels/matmul.h"
 #include "kernels/matmul_internal.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 #include "kernels/x86_avx2.h"
 #include "kernels/x86_avx512.h"
 #include "kernels/x86_vnni.h"

@@ -1,5 +1,5 @@
 #include "kernels/hyper_connection.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <cmath>
 #include <cstdio>

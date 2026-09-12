@@ -8,7 +8,7 @@
 #include "backends/cpu/backend.h"
 #include "engine/sampler.h"
 #include "kernels/tensor.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 #include "kernels/moe_ssd.h"
 
 #include <array>

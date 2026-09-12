@@ -1,6 +1,6 @@
 #include "kernels/matmul_internal.h"
 
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <array>

@@ -5,7 +5,7 @@
 #include "kernels/moe.h"
 #include "kernels/moe_ssd.h"
 #include "kernels/tensor.h"
-#include "kernels/trace.h"
+#include "runtime/trace.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>

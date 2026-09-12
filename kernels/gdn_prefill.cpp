@@ -4,7 +4,7 @@
 
 #include "kernels/gdn.h"
 #include "kernels/gdn_neon.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #if HAS_NEON
 #include <algorithm>

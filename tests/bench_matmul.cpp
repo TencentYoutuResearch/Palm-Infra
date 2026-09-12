@@ -1,7 +1,7 @@
 #include "kernels/tensor.h"
 #include "kernels/deepseek_v4_attention.h"
 #include "kernels/matmul.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <chrono>

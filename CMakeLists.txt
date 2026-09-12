@@ -60,8 +60,11 @@ endif()
 # ---------------------------------------------------------------------------
 
 set(SOURCES
+    # runtime
+    runtime/host_buffer_pool.cpp
+    runtime/threading.cpp
+    runtime/trace.cpp
     # graph
-    graph/buffer_pool.cpp
     graph/mmap_file.cpp
     graph/io.cpp
     backends/cpu/backend.cpp
@@ -96,9 +99,7 @@ set(SOURCES
     kernels/moe_ssd.cpp
     kernels/moe_ssd_io.cpp
     kernels/moe_ssd_predict.cpp
-    kernels/trace.cpp
     kernels/rwkv.cpp
-    kernels/threading.cpp
     # engine
     engine/byte_ranges.cpp
     engine/engine.cpp
@@ -127,6 +128,9 @@ set(PUBLIC_CORE_HEADERS
 set(PUBLIC_RUNTIME_HEADERS
     runtime/backend.h
     runtime/accelerator_backend.h
+    runtime/threading.h
+    runtime/trace.h
+    runtime/host_buffer_pool.h
 )
 
 set(PUBLIC_CPU_BACKEND_HEADERS
@@ -146,6 +150,7 @@ set(PUBLIC_KERNEL_HEADERS
     kernels/prepared_weight.h
     kernels/tensor.h
     kernels/threading.h
+    kernels/trace.h
 )
 
 add_library(mollm_lib STATIC ${SOURCES})

@@ -1,6 +1,13 @@
 #include <engine/engine.h>
 #include <engine/sampler.h>
 #include <engine/tokenizer.h>
+#include <runtime/host_buffer_pool.h>
+#include <runtime/threading.h>
+#include <runtime/trace.h>
+// Installed legacy paths remain usable alongside their canonical headers.
+#include <graph/buffer_pool.h>
+#include <kernels/threading.h>
+#include <kernels/trace.h>
 
 int main() {
     EngineConfig config;

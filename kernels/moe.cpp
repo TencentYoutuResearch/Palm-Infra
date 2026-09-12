@@ -4,8 +4,8 @@
 #include "kernels/matmul.h"
 #include "kernels/moe_routing.h"
 #include "kernels/moe_ssd.h"
-#include "kernels/trace.h"
-#include "kernels/threading.h"
+#include "runtime/trace.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <cassert>

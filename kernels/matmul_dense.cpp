@@ -1,7 +1,7 @@
 #include "kernels/matmul.h"
 #include "kernels/matmul_internal.h"
 #include "kernels/matmul_profile.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <chrono>

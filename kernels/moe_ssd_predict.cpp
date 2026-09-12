@@ -2,7 +2,7 @@
 
 #include "kernels/matmul.h"
 #include "kernels/moe_routing.h"
-#include "kernels/trace.h"
+#include "runtime/trace.h"
 
 #include <algorithm>
 #include <utility>

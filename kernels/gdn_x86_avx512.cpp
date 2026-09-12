@@ -1,6 +1,6 @@
 #include "kernels/gdn_x86.h"
 
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <cmath>

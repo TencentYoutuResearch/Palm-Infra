@@ -1,5 +1,5 @@
 #include "kernels/rwkv.h"
-#include "kernels/threading.h"
+#include "runtime/threading.h"
 
 #include <cmath>
 #include <cstring>
