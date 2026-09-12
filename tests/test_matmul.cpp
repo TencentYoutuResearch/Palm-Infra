@@ -1596,7 +1596,7 @@ int main() {
             const size_t vnni_bytes = pack_b_q4_vnni_bytes(N, K);
             prepared.layout(WeightLayout::X86_VNNI_Q4_G32)
                 .assign(q4_vnni, q4_vnni + vnni_bytes);
-            B.prepared_weight = &prepared;
+            B.prepared.weight = &prepared;
             kernel_matmul_fp32(A, B, C);
             CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
                   "INT4 Q8-dot GEMM BG32 x86 VNNI reference");

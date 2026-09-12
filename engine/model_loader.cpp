@@ -437,8 +437,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.q4_repack_data = nullptr;
             t.q4_g32_data = nullptr;
             t.q4_g128_data = nullptr;
-            t.prepared_weight = nullptr;
-            t.prepared_weight_row_offset = 0;
+            t.prepared = {};
             // Prepare accelerator storage while t.data still points at the raw
             // package bytes. CPU load-time packing may replace t.data later.
             if (accelerator_backend_ &&

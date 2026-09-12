@@ -2,6 +2,7 @@
 
 #include "kernels/cpu/activations.h" // for Activation enum
 #include "backends/cpu/platform.h"
+#include "core/prepared_weight.h"
 #include "core/tensor.h"
 
 #include <string>

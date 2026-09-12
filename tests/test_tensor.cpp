@@ -60,6 +60,8 @@ int main() {
     pooled.device.offset = 16;
     pooled.device.scales_buffer = storage + 1;
     pooled.device.scales_offset = 32;
+    pooled.prepared.weight = reinterpret_cast<const PreparedWeight*>(storage);
+    pooled.prepared.row_offset = 7;
     Tensor device_view = pooled.view_1d(3, sizeof(float));
     CHECK(device_view.device.buffer == pooled.device.buffer &&
               device_view.device.offset == 16 + sizeof(float),
@@ -67,6 +69,9 @@ int main() {
     CHECK(device_view.device.scales_buffer == pooled.device.scales_buffer &&
               device_view.device.scales_offset == 32,
           "offset view retains separate device scale storage");
+    CHECK(device_view.prepared.weight == pooled.prepared.weight &&
+              device_view.prepared.row_offset == 7,
+          "offset view retains prepared weight reference");
     Tensor external_a =
         Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 4, 1, 1, 1, storage);
     Tensor external_b = external_a;
