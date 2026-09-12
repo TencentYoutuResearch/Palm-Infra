@@ -171,13 +171,13 @@ static void fused_gdn_head(
 // ---------------------------------------------------------------------------
 
 #if HAS_NEON
-void kernel_gdn_prefill_neon(const OpParams& params,
+void kernel_gdn_prefill_neon(const GdnParams& params,
                               const std::vector<const Tensor*>& inputs,
                               std::vector<Tensor*>& outputs,
                               ThreadPool* thread_pool);
 #endif
 
-void kernel_gdn_prefill(const OpParams& params,
+void kernel_gdn_prefill(const GdnParams& params,
                         const std::vector<const Tensor*>& inputs,
                         std::vector<Tensor*>& outputs,
                         ThreadPool* thread_pool) {
@@ -191,19 +191,19 @@ void kernel_gdn_prefill(const OpParams& params,
         return;
     }
 #endif
-    int num_heads   = graph_params::get_i32(params, 0, 16);
-    int k_head_dim  = graph_params::get_i32(params, 1, 128);
-    int v_head_dim  = graph_params::get_i32(params, 2, 128);
-    int seq_len     = graph_params::get_i32(params, 3, 4);
-    int flags       = graph_params::get_i32(params, 4, 1);
+    int num_heads   = params.num_heads;
+    int k_head_dim  = params.k_head_dim;
+    int v_head_dim  = params.v_head_dim;
+    int seq_len     = params.seq_len;
+    int flags       = params.flags;
     bool use_l2norm = (flags & 1) != 0;
-    // params.i32[5] = conv_kernel (unused)
-    int n_real      = graph_params::get_i32(params, 6, seq_len);
-    int num_v_heads = graph_params::get_i32(params, 7, num_heads);
+    // conv_kernel is used only by the fused convolution/decode entry point.
+    int n_real      = params.real_tokens;
+    int num_v_heads = params.num_v_heads;
     bool sigmoid_output_gate = (flags & 2) != 0;
-    float rms_eps   = graph_params::get_f32(params, 0, 1e-6f);
-    float l2norm_eps= graph_params::get_f32(params, 1, 1e-6f);
-    float scale     = graph_params::get_f32(params, 2, 0.f);
+    float rms_eps   = params.rms_eps;
+    float l2norm_eps= params.l2norm_eps;
+    float scale     = params.scale;
     if (scale == 0.f) scale = 1.f / std::sqrt((float)k_head_dim);
 
     if (inputs.size() < 8 || outputs.empty()) return;
@@ -258,13 +258,13 @@ void kernel_gdn_prefill(const OpParams& params,
 
 #if HAS_NEON
 // NEON-optimised decode path (declared in gdn_decode.cpp)
-void kernel_gdn_decode_neon(const OpParams& params,
+void kernel_gdn_decode_neon(const GdnParams& params,
                              const std::vector<const Tensor*>& inputs,
                              std::vector<Tensor*>& outputs,
                              ThreadPool* thread_pool);
 #endif
 
-void kernel_gdn_decode(const OpParams& params,
+void kernel_gdn_decode(const GdnParams& params,
                        const std::vector<const Tensor*>& inputs,
                        std::vector<Tensor*>& outputs,
                        ThreadPool* thread_pool) {
@@ -276,17 +276,17 @@ void kernel_gdn_decode(const OpParams& params,
 #endif
 }
 
-void kernel_gdn_conv_decode(const OpParams& params,
+void kernel_gdn_conv_decode(const GdnParams& params,
                             const std::vector<const Tensor*>& inputs,
                             std::vector<Tensor*>& outputs,
                             ThreadPool* thread_pool) {
     if (inputs.size() < 10 || outputs.empty()) return;
 
-    const int num_heads = graph_params::get_i32(params, 0, 16);
-    const int k_dim = graph_params::get_i32(params, 1, 128);
-    const int v_dim = graph_params::get_i32(params, 2, 128);
+    const int num_heads = params.num_heads;
+    const int k_dim = params.k_head_dim;
+    const int v_dim = params.v_head_dim;
     const int num_v_heads =
-        graph_params::get_i32(params, 7, num_heads);
+        params.num_v_heads;
     const int qkv_total =
         2 * num_heads * k_dim + num_v_heads * v_dim;
 
@@ -294,7 +294,7 @@ void kernel_gdn_conv_decode(const OpParams& params,
     Tensor qkv_conv = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, qkv_total, 1, 1, 1,
         convolved.data());
-    ShortConvParams conv_params{graph_params::get_i32(params, 5, 4), 1};
+    ShortConvParams conv_params{params.conv_kernel, 1};
     kernel_shortconv(
         conv_params, {inputs[0], inputs[8], inputs[9]}, qkv_conv, thread_pool);
 

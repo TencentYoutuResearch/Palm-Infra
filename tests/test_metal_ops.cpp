@@ -1167,8 +1167,7 @@ int main() {
                                     state_n, 1, 1, 1, ref_state.data());
         Tensor o_h = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
                                     hidden, seq, 1, 1, ref.data());
-        OpParams cpu_params;
-        cpu_params.i32 = {heads, head_size, seq, real};
+        Rwkv7Params cpu_params{heads, head_size, seq, real};
         kernel_rwkv7(cpu_params, {&r_h, &d_h, &k_h, &v_h, &a_h, &b_h, &s_h},
                      o_h, nullptr);
 

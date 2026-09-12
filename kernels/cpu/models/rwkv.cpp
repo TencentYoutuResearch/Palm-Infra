@@ -26,12 +26,12 @@ static inline void rwkv_store_state_fp16(const float* src, __fp16* dst, int n) {
 }
 #endif
 
-void kernel_rwkv_token_shift(const OpParams& p,
+void kernel_rwkv_token_shift(const RwkvTokenShiftParams& p,
                              const std::vector<const Tensor*>& in, Tensor& out) {
     if (in.size() < 2) return;
-    const int hidden = graph_params::get_i32(p, 0, 0);
-    const int seq = graph_params::get_i32(p, 1, 1);
-    int real = graph_params::get_i32(p, 2, seq);
+    const int hidden = p.hidden;
+    const int seq = p.seq_len;
+    int real = p.real_tokens;
     if (real <= 0 || real > seq) real = seq;
     const float* x = in[0]->ptr<float>();
     const bool state_fp16 = in[1]->prec == Precision::FP16;
@@ -53,7 +53,7 @@ void kernel_rwkv_token_shift(const OpParams& p,
                     (size_t)(seq - real) * hidden * sizeof(float));
 }
 
-void kernel_rwkv_mix(const OpParams&, const std::vector<const Tensor*>& in, Tensor& out) {
+void kernel_rwkv_mix(const std::vector<const Tensor*>& in, Tensor& out) {
     if (in.size() < 3) return;
     const float* x = in[0]->ptr<float>();
     const float* shift = in[1]->ptr<float>();
@@ -80,12 +80,12 @@ void kernel_rwkv_mix(const OpParams&, const std::vector<const Tensor*>& in, Tens
     }
 }
 
-void kernel_rwkv_l2_norm(const OpParams& p,
+void kernel_rwkv_l2_norm(const RwkvL2NormParams& p,
                          const std::vector<const Tensor*>& in, Tensor& out) {
     if (in.empty()) return;
-    const int heads = graph_params::get_i32(p, 0, 0);
-    const int dhead = graph_params::get_i32(p, 1, 0);
-    const float eps = graph_params::get_f32(p, 0, 1e-12f);
+    const int heads = p.num_heads;
+    const int dhead = p.head_dim;
+    const float eps = p.epsilon;
     const int hidden = heads * dhead;
     const int tokens = (int)(in[0]->nelements() / hidden);
     const float* src = in[0]->ptr<float>();
@@ -118,13 +118,13 @@ void kernel_rwkv_l2_norm(const OpParams& p,
     }
 }
 
-void kernel_rwkv_post(const OpParams& p,
+void kernel_rwkv_post(const RwkvPostParams& p,
                       const std::vector<const Tensor*>& in, Tensor& out,
                       ThreadPool* thread_pool) {
     if (in.size() < 8) return;
-    const int heads = graph_params::get_i32(p, 0, 0);
-    const int dhead = graph_params::get_i32(p, 1, 0);
-    const float eps = graph_params::get_f32(p, 0, 64e-5f);
+    const int heads = p.num_heads;
+    const int dhead = p.head_dim;
+    const float eps = p.epsilon;
     const int hidden = heads * dhead;
     if (hidden <= 0) return;
     const int tokens = (int)(in[0]->nelements() / hidden);
@@ -195,13 +195,13 @@ void kernel_rwkv_post(const OpParams& p,
         process(0, 0, groups);
 }
 
-void kernel_rwkv7(const OpParams& p, const std::vector<const Tensor*>& in,
+void kernel_rwkv7(const Rwkv7Params& p, const std::vector<const Tensor*>& in,
                   Tensor& out, ThreadPool* thread_pool) {
     if (in.size() != 7) return;
-    const int heads = graph_params::get_i32(p, 0, 0);
-    const int dhead = graph_params::get_i32(p, 1, 0);
-    const int seq = graph_params::get_i32(p, 2, 1);
-    int real = graph_params::get_i32(p, 3, seq);
+    const int heads = p.num_heads;
+    const int dhead = p.head_dim;
+    const int seq = p.seq_len;
+    int real = p.real_tokens;
     if (real <= 0 || real > seq) real = seq;
     const int hidden = heads * dhead;
     const float* r = in[0]->ptr<float>();

@@ -123,6 +123,8 @@ set(PUBLIC_ENGINE_HEADERS
 )
 
 set(PUBLIC_CORE_HEADERS
+    core/rwkv_params.h
+    core/gdn_params.h
     core/attention_params.h
     core/shortconv_params.h
     core/activation.h
@@ -507,6 +509,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_shortconv     tests/test_shortconv.cpp)
     add_mollm_test(test_gdn           tests/test_gdn.cpp)
     add_mollm_test(test_rwkv_e2e      tests/test_rwkv_e2e.cpp)
+    add_mollm_test(test_rwkv_ops      tests/test_rwkv_ops.cpp)
     add_mollm_test(test_engine        tests/test_engine.cpp)
     add_mollm_test(test_tokenizer     tests/test_tokenizer.cpp)
     add_mollm_test(test_e2e           tests/test_e2e.cpp)

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "graph/graph.h"
+#include "core/gdn_params.h"
 #include "kernels/tensor.h"
 #include "runtime/threading.h"
 
@@ -45,30 +45,18 @@
 //   outputs[0] out         FP32  data [seq, num_v_heads*v_dim] row-major
 //                          (= RMSNormGated result, ready for out_proj matmul)
 //
-// Params:
-//   i32[0] = num_heads         (key heads, used for q/k/a/b)
-//   i32[1] = k_head_dim
-//   i32[2] = v_head_dim
-//   i32[3] = seq_len           (prefill: N, decode: 1)
-//   i32[4] = flags             (bit 0: q/k L2 norm; bit 1: sigmoid output gate)
-//   i32[5] = conv_kernel       (informational, unused — shortconv already done)
-//   i32[6] = n_real_tokens     (runtime-injected by engine, 0 = all)
-//   i32[7] = num_v_heads       (value heads, for z/out dim; defaults to num_heads)
-//
-//   f32[0] = rms_eps           (1e-6, RMSNorm eps)
-//   f32[1] = l2norm_eps        (1e-6, L2 norm eps)
-//   f32[2] = scale             (1/sqrt(k_dim))
+// Parameters are resolved by the backend into GdnParams.
 //
 // State (inputs[7]) is modified in-place through its data pointer (same pattern
 // as SDPA's KV cache). The engine allocates and persists the buffer.
 // ---------------------------------------------------------------------------
 
-void kernel_gdn_prefill(const OpParams& params,
+void kernel_gdn_prefill(const GdnParams& params,
                         const std::vector<const Tensor*>& inputs,
                         std::vector<Tensor*>& outputs,
                         ThreadPool* thread_pool = nullptr);
 
-void kernel_gdn_decode(const OpParams& params,
+void kernel_gdn_decode(const GdnParams& params,
                        const std::vector<const Tensor*>& inputs,
                        std::vector<Tensor*>& outputs,
                        ThreadPool* thread_pool = nullptr);
@@ -76,7 +64,7 @@ void kernel_gdn_decode(const OpParams& params,
 // Decode-only composition used by the CPU backend. Metal implements the same
 // contract as a single kernel to avoid materializing the post-convolution QKV.
 // Inputs append conv_weight and conv_state to the regular eight GDN inputs.
-void kernel_gdn_conv_decode(const OpParams& params,
+void kernel_gdn_conv_decode(const GdnParams& params,
                             const std::vector<const Tensor*>& inputs,
                             std::vector<Tensor*>& outputs,
                             ThreadPool* thread_pool = nullptr);

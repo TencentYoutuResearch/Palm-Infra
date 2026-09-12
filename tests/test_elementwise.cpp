@@ -1,4 +1,6 @@
-#include "kernels/cpu/elementwise.h"
+#include "backends/cpu/backend.h"
+#include "graph/graph.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <cmath>
@@ -8,6 +10,13 @@
 namespace {
 
 int failures = 0;
+
+void run_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
+                     Tensor* output, ThreadPool* pool) {
+    GraphNode node;
+    node.op_type = op;
+    CPUBackend{}.dispatch(node, inputs, output, pool);
+}
 
 void check(bool condition, const char* message) {
     if (!condition) {
@@ -35,14 +44,14 @@ void test_binary_broadcast(ThreadPool& pool) {
     Tensor out = external_tensor(output, 4, 3);
     std::vector<const Tensor*> inputs = {&ta, &tb};
 
-    kernel_elementwise(OpType::ADD, inputs, &out, &pool);
+    run_elementwise(OpType::ADD, inputs, &out, &pool);
     bool add_ok = true;
     for (int row = 0; row < 3; ++row)
         for (int col = 0; col < 4; ++col)
             add_ok &= output[row * 4 + col] == a[row * 4 + col] + b[col];
     check(add_ok, "ADD singleton broadcast");
 
-    kernel_elementwise(OpType::MUL, inputs, &out, &pool);
+    run_elementwise(OpType::MUL, inputs, &out, &pool);
     bool mul_ok = true;
     for (int row = 0; row < 3; ++row)
         for (int col = 0; col < 4; ++col)
@@ -59,7 +68,7 @@ void test_strided_mul(ThreadPool& pool) {
     Tensor right = base.view_2d(4, 3, 4 * sizeof(float));
     Tensor out = external_tensor(output, 4, 3);
     std::vector<const Tensor*> inputs = {&left, &right};
-    kernel_elementwise(OpType::MUL, inputs, &out, &pool);
+    run_elementwise(OpType::MUL, inputs, &out, &pool);
 
     bool matches = true;
     for (int row = 0; row < 3; ++row)
@@ -78,7 +87,7 @@ void test_unary(ThreadPool& pool) {
 
     auto run = [&](OpType op, auto reference, float tolerance,
                    const char* label) {
-        kernel_elementwise(op, inputs, &out, &pool);
+        run_elementwise(op, inputs, &out, &pool);
         bool matches = true;
         for (size_t i = 0; i < input.size(); ++i)
             matches &= close(output[i], reference(input[i]), tolerance);
@@ -124,7 +133,7 @@ void test_swiglu(ThreadPool& pool) {
     Tensor in = external_tensor(merged, 8, 2);
     Tensor out = external_tensor(output, 4, 2);
     std::vector<const Tensor*> inputs = {&in};
-    kernel_elementwise(OpType::SWIGLU, inputs, &out, &pool);
+    run_elementwise(OpType::SWIGLU, inputs, &out, &pool);
 
     bool matches = true;
     for (int row = 0; row < 2; ++row) {
@@ -148,7 +157,7 @@ void test_swiglu(ThreadPool& pool) {
             Precision::FP32, MemoryType::EXTERNAL, 8, 1, 1, 1, gate_data);
         Tensor out = Tensor::create(
             Precision::FP32, MemoryType::EXTERNAL, 8, 1, 1, 1, out_data);
-        kernel_elementwise(
+        run_elementwise(
             OpType::SIGMOID_MUL, {&value, &gate}, &out, nullptr);
         bool ok = true;
         for (int i = 0; i < 8; ++i) {
@@ -165,7 +174,7 @@ void test_parallel_exact(ThreadPool& pool) {
     Tensor in = external_tensor(input, input.size());
     Tensor out = external_tensor(output, output.size());
     std::vector<const Tensor*> inputs = {&in};
-    kernel_elementwise(OpType::EXP_EXACT, inputs, &out, &pool);
+    run_elementwise(OpType::EXP_EXACT, inputs, &out, &pool);
     check(close(output.front(), std::exp(0.25f), 1e-6f) &&
               close(output.back(), std::exp(0.25f), 1e-6f),
           "EXP exact parallel path");

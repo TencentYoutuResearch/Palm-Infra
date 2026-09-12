@@ -210,27 +210,27 @@ void process_heads(
 
 }  // namespace
 
-void kernel_gdn_x86_avx512(const OpParams& params,
+void kernel_gdn_x86_avx512(const GdnParams& params,
                            const std::vector<const Tensor*>& inputs,
                            std::vector<Tensor*>& outputs,
                            ThreadPool* thread_pool) {
     if (inputs.size() < 8 || outputs.empty())
         return;
-    const int num_heads = graph_params::get_i32(params, 0, 16);
-    const int k_dim = graph_params::get_i32(params, 1, 128);
-    const int v_dim = graph_params::get_i32(params, 2, 128);
-    const int seq_len = graph_params::get_i32(params, 3, 4);
-    const int flags = graph_params::get_i32(params, 4, 1);
+    const int num_heads = params.num_heads;
+    const int k_dim = params.k_head_dim;
+    const int v_dim = params.v_head_dim;
+    const int seq_len = params.seq_len;
+    const int flags = params.flags;
     const bool use_l2norm = (flags & 1) != 0;
-    const int n_real = graph_params::get_i32(params, 6, seq_len);
+    const int n_real = params.real_tokens;
     const int num_v_heads =
-        graph_params::get_i32(params, 7, num_heads);
+        params.num_v_heads;
     const bool sigmoid_output_gate = (flags & 2) != 0;
     const float rms_epsilon =
-        graph_params::get_f32(params, 0, 1e-6f);
+        params.rms_eps;
     const float l2_epsilon =
-        graph_params::get_f32(params, 1, 1e-6f);
-    float scale = graph_params::get_f32(params, 2, 0.0f);
+        params.l2norm_eps;
+    float scale = params.scale;
     if (scale == 0.0f)
         scale = 1.0f / std::sqrt(static_cast<float>(k_dim));
 

@@ -7,19 +7,19 @@
 
 #if HAS_NEON
 
-void kernel_gdn_decode_neon(const OpParams& params,
+void kernel_gdn_decode_neon(const GdnParams& params,
                              const std::vector<const Tensor*>& inputs,
                              std::vector<Tensor*>& outputs,
                              ThreadPool* thread_pool) {
-    int num_heads   = graph_params::get_i32(params, 0, 16);
-    int k_head_dim  = graph_params::get_i32(params, 1, 128);
-    int v_head_dim  = graph_params::get_i32(params, 2, 128);
-    int num_v_heads = graph_params::get_i32(params, 7, num_heads);
-    int flags       = graph_params::get_i32(params, 4, 1);
+    int num_heads   = params.num_heads;
+    int k_head_dim  = params.k_head_dim;
+    int v_head_dim  = params.v_head_dim;
+    int num_v_heads = params.num_v_heads;
+    int flags       = params.flags;
     bool sigmoid_output_gate = (flags & 2) != 0;
-    float rms_eps   = graph_params::get_f32(params, 0, 1e-6f);
-    float l2_eps    = graph_params::get_f32(params, 1, 1e-6f);
-    float scale     = graph_params::get_f32(params, 2, 0.f);
+    float rms_eps   = params.rms_eps;
+    float l2_eps    = params.l2norm_eps;
+    float scale     = params.scale;
     if (scale == 0.f) scale = 1.f / std::sqrt((float)k_head_dim);
 
     if (inputs.size() < 8 || outputs.empty()) return;

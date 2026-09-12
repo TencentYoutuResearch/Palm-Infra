@@ -56,7 +56,7 @@ static double bench_rwkv(int heads, int d, int seq, ThreadPool& pool) {
     Tensor ts=external(Precision::FP32,(int64_t)state_n,1,state.data());
     Tensor to=external(Precision::FP32,hidden,seq,out.data());
     std::vector<const Tensor*> inputs={&tr,&tw,&tk,&tv,&ta,&tb,&ts};
-    OpParams p; p.i32={heads,d,seq,seq};
+    Rwkv7Params p{heads,d,seq,seq};
     int repeats = seq == 1 ? 101 : 15;
     return median_ms(5,repeats,
         [&]{ kernel_rwkv7(p,inputs,to,&pool); },
@@ -83,8 +83,7 @@ static double bench_gdn(int heads, int d, int seq, ThreadPool& pool) {
     Tensor to=external(Precision::FP32,hidden,seq,out.data());
     std::vector<const Tensor*> inputs={&tq,&ta,&tb,&tz,&tA,&td,&tn,&ts};
     std::vector<Tensor*> outputs={&to};
-    OpParams p; p.i32={heads,d,d,seq,1,4,seq,heads};
-    p.f32={1e-6f,1e-6f,1.f/std::sqrt((float)d)};
+    GdnParams p{heads,d,d,seq,1,4,seq,heads,1e-6f,1e-6f,1.f/std::sqrt((float)d)};
     int repeats = seq == 1 ? 101 : 15;
     return median_ms(5,repeats,
         [&]{
