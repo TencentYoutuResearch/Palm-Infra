@@ -697,3 +697,5 @@ bool MetalMatmulOps::dispatch(const GraphNode &node,
   default:
     return false;
   }
+
+}
