@@ -1,4 +1,6 @@
-#include "backends/cuda/internal.h"
+#include "kernels/cuda/matmul.h"
+
+#include <cstdio>
 
 namespace {
 
@@ -609,13 +611,17 @@ bool run_dense_matmul(
     const float beta = 0.0f;
     // Row-major C[M,N] = A[M,K] * W[N,K]^T is the equivalent
     // column-major operation C_col[N,M] = W_col[K,N]^T * A_col[K,M].
-    return report_cublas(
-        cublasGemmEx(
-            cublas, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, weight,
-            weight_type, k, activation, activation_type, lda, &beta, output,
-            CUDA_R_32F, n, CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-        "cublasGemmEx");
+    const cublasStatus_t status = cublasGemmEx(
+        cublas, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, weight,
+        weight_type, k, activation, activation_type, lda, &beta, output,
+        CUDA_R_32F, n, CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status == CUBLAS_STATUS_SUCCESS)
+        return true;
+    std::fprintf(stderr,
+                 "CudaBackend: cublasGemmEx failed (cuBLAS status %d)\n",
+                 static_cast<int>(status));
+    return false;
 }
 
 }  // namespace mollm_cuda

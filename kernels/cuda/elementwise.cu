@@ -1,10 +1,24 @@
-#include "backends/cuda/internal.h"
+#include "kernels/cuda/elementwise.h"
 #include "kernels/cuda/reduction.cuh"
+
+#include <cuda_runtime.h>
 
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 
 namespace {
+
+__global__ void round_to_bf16_cuda(float* values, size_t count) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    uint32_t bits = __float_as_uint(values[index]);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16) & 1u);
+    values[index] = __uint_as_float(bits & 0xffff0000u);
+}
 
 __device__ float cuda_activation(float value, int kind) {
     switch (kind) {
@@ -251,6 +265,21 @@ __global__ void contiguous_cuda(
 }  // namespace
 
 namespace mollm_cuda {
+
+bool launch_round_to_bf16(float* values, size_t count) {
+    if (count == 0)
+        return true;
+    constexpr unsigned threads = 256;
+    round_to_bf16_cuda<<<
+        static_cast<unsigned>((count + threads - 1) / threads), threads>>>(
+        values, count);
+    const cudaError_t error = cudaGetLastError();
+    if (error == cudaSuccess)
+        return true;
+    std::fprintf(stderr, "CudaBackend: round_to_bf16_cuda failed: %s\n",
+                 cudaGetErrorString(error));
+    return false;
+}
 
 void launch_apply_activation(float* values, int rows, int columns, int kind,
                              int begin, int end) {

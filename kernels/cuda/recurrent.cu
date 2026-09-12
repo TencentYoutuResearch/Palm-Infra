@@ -1,4 +1,4 @@
-#include "backends/cuda/internal.h"
+#include "kernels/cuda/recurrent.h"
 #include "kernels/cuda/reduction.cuh"
 
 #include <cmath>

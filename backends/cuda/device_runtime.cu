@@ -1,25 +1,10 @@
-#include "backends/cuda/internal.h"
+#include "backends/cuda/device_runtime.h"
 
 #include <cstdio>
 #include <map>
 #include <new>
 #include <unordered_map>
 #include <vector>
-
-namespace {
-
-__global__ void round_to_bf16_cuda(float* values, size_t count) {
-    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
-        threadIdx.x;
-    if (index >= count)
-        return;
-    uint32_t bits = __float_as_uint(values[index]);
-    if ((bits & 0x7f800000u) != 0x7f800000u)
-        bits += 0x7fffu + ((bits >> 16) & 1u);
-    values[index] = __uint_as_float(bits & 0xffff0000u);
-}
-
-}  // namespace
 
 namespace mollm_cuda {
 
@@ -60,16 +45,6 @@ bool copy_memory(void* destination, const void* source, size_t bytes,
 
 bool zero_memory(void* destination, size_t bytes, const char* operation) {
     return report_cuda(cudaMemset(destination, 0, bytes), operation);
-}
-
-bool launch_round_to_bf16(float* values, size_t count) {
-    if (count == 0)
-        return true;
-    constexpr unsigned threads = 256;
-    round_to_bf16_cuda<<<
-        static_cast<unsigned>((count + threads - 1) / threads), threads>>>(
-        values, count);
-    return report_cuda(cudaGetLastError(), "round_to_bf16_cuda");
 }
 
 DeviceBufferPool* create_device_buffer_pool() {
