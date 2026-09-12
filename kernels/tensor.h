@@ -8,6 +8,8 @@
 #include "kernels/cpu_platform.h"
 #include "core/prepared_weight.h"
 
+struct ExpertSource;
+
 // ---------------------------------------------------------------------------
 // mollm — Tensor definition
 // ---------------------------------------------------------------------------
@@ -115,9 +117,9 @@ struct Tensor {
     const PreparedWeight* prepared_weight = nullptr;
     size_t prepared_weight_row_offset = 0;
     const void* sparse_data = nullptr; // optional [N/8,K,8] sparse-A GEMV layout
-    // Optional CPU MoE SSD source. Aggregate expert tensors use this instead
-    // of data when expert weights are paged in on demand.
-    const void* moe_ssd_source = nullptr;
+    // Provider-owned expert source. The historical field name is retained;
+    // compute uses ExpertProvider rather than a concrete SSD cache.
+    const ExpertSource* moe_ssd_source = nullptr;
 
     // -----------------------------------------------------------------------
     // factory

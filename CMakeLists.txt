@@ -67,6 +67,7 @@ set(SOURCES
     # storage
     storage/mapped_file.cpp
     storage/byte_ranges.cpp
+    storage/ssd_expert_cache/provider.cpp
     storage/ssd_expert_cache/cache.cpp
     storage/ssd_expert_cache/io.cpp
     storage/ssd_expert_cache/predict.cpp
@@ -135,6 +136,7 @@ set(PUBLIC_CORE_HEADERS
 )
 
 set(PUBLIC_RUNTIME_HEADERS
+    runtime/expert_provider.h
     runtime/backend.h
     runtime/accelerator_backend.h
     runtime/threading.h
@@ -495,6 +497,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_moe_routing  tests/test_moe_routing.cpp)
     add_mollm_test(test_moe           tests/test_moe.cpp)
     add_mollm_test(test_moe_ssd       tests/test_moe_ssd.cpp)
+    add_mollm_test(test_expert_provider tests/test_expert_provider.cpp)
     add_mollm_test(test_hyper_connection tests/test_hyper_connection.cpp)
     add_mollm_test(test_gated_residual tests/test_gated_residual.cpp)
     add_mollm_test(test_ple            tests/test_ple.cpp)

@@ -12,6 +12,7 @@
 #include <runtime/host_buffer_pool.h>
 #include <runtime/threading.h>
 #include <runtime/trace.h>
+#include <runtime/expert_provider.h>
 #include <storage/mapped_file.h>
 #include <storage/byte_ranges.h>
 #include <storage/ssd_expert_cache/cache.h>

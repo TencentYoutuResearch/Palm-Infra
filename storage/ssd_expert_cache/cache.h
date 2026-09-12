@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernels/tensor.h"
+#include "runtime/expert_provider.h"
 
 #include <cstddef>
 #include <condition_variable>
@@ -57,7 +58,7 @@ class MoeSsdCache;
 
 // Attached to an otherwise data-less aggregate expert Tensor.  It is owned by
 // MoeSsdCache and remains valid for the Engine lifetime.
-struct MoeSsdTensorSource {
+struct MoeSsdTensorSource : ExpertSource {
     MoeSsdTensorSpec spec;
     MoeSsdCache* cache = nullptr;
 };
@@ -93,8 +94,19 @@ bool schedule_moe_hash_cross_layer_prefetch(
     int top_k,
     bool demand_priority = false);
 
-class MoeSsdCache {
+class MoeSsdCache : public ExpertProvider {
 public:
+    bool borrow(const ExpertSource*, const ExpertSource*, int, ExpertLease&,
+                bool wait = true) override;
+    bool request_many(const ExpertSource*, const ExpertSource*,
+                      const std::vector<int>&) override;
+    bool retain_for_next_forward(const ExpertSource*, const ExpertSource*,
+                                 const std::vector<int>&, bool) override;
+    size_t resident_count(const ExpertSource*, const ExpertSource*,
+                          const std::vector<int>&) const override;
+    bool contains(const ExpertSource*, const ExpertSource*, int) const override;
+    bool is_ready(const ExpertSource*, const ExpertSource*, int) const override;
+    bool evict(const ExpertSource*, const ExpertSource*, int) override;
     struct LayerStats {
         int layer = -1;
         uint64_t demand_acquires = 0;
@@ -243,6 +255,9 @@ public:
 
 private:
     struct Entry;
+    void release_lease(void*) noexcept override;
+    bool acquire_impl(const MoeSsdTensorSource*, const MoeSsdTensorSource*, int,
+                      Tensor&, Tensor&, Entry** pinned_entry, bool wait);
     struct ByteBuffer;
     struct LayerLayout {
         int num_experts = 0;
