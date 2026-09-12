@@ -64,8 +64,13 @@ set(SOURCES
     runtime/host_buffer_pool.cpp
     runtime/threading.cpp
     runtime/trace.cpp
+    # storage
+    storage/mapped_file.cpp
+    storage/byte_ranges.cpp
+    storage/ssd_expert_cache/cache.cpp
+    storage/ssd_expert_cache/io.cpp
+    storage/ssd_expert_cache/predict.cpp
     # graph
-    graph/mmap_file.cpp
     graph/io.cpp
     backends/cpu/backend.cpp
     graph/execute.cpp
@@ -96,12 +101,8 @@ set(SOURCES
     kernels/cpu/hyper_connection.cpp
     kernels/cpu/moe/moe.cpp
     kernels/cpu/moe/moe_routing.cpp
-    kernels/moe_ssd.cpp
-    kernels/moe_ssd_io.cpp
-    kernels/moe_ssd_predict.cpp
     kernels/cpu/models/rwkv.cpp
     # engine
-    engine/byte_ranges.cpp
     engine/engine.cpp
     engine/input_prep.cpp
     engine/model_loader.cpp
@@ -141,6 +142,11 @@ set(PUBLIC_RUNTIME_HEADERS
 
 set(PUBLIC_CPU_BACKEND_HEADERS
     backends/cpu/backend.h
+)
+
+set(PUBLIC_STORAGE_HEADERS
+    storage/mapped_file.h
+    storage/byte_ranges.h
 )
 
 set(PUBLIC_GRAPH_HEADERS
@@ -627,6 +633,10 @@ install(FILES ${PUBLIC_RUNTIME_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/runtime)
 install(FILES ${PUBLIC_CPU_BACKEND_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/backends/cpu)
+install(FILES ${PUBLIC_STORAGE_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/storage)
+install(FILES storage/ssd_expert_cache/cache.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/storage/ssd_expert_cache)
 install(FILES ${PUBLIC_GRAPH_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/graph)
 install(FILES ${PUBLIC_KERNEL_HEADERS}

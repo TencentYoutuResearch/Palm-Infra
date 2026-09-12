@@ -1,11 +1,11 @@
 #include "backends/metal/backend.h"
 #include "backends/metal/buffer_pool.h"
 #include "graph/graph.h"
-#include "graph/mmap_file.h"
+#include "storage/mapped_file.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/moe/moe.h"
 #include "kernels/cpu/moe/moe_routing.h"
-#include "kernels/moe_ssd.h"
+#include "storage/ssd_expert_cache/cache.h"
 #include "kernels/metal/metal_common.h"
 #include "runtime/trace.h"
 

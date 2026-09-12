@@ -1,4 +1,4 @@
-#include "graph/mmap_file.h"
+#include "storage/mapped_file.h"
 #include "kernels/tensor.h"
 #include <cstdio>
 #include <cstring>

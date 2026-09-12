@@ -9,7 +9,7 @@
 #include "engine/sampler.h"
 #include "kernels/tensor.h"
 #include "runtime/threading.h"
-#include "kernels/moe_ssd.h"
+#include "storage/ssd_expert_cache/cache.h"
 
 #include <array>
 #include <memory>
