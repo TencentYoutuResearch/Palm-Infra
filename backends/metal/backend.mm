@@ -9,6 +9,7 @@
 #include "backends/metal/pipeline_cache.h"
 #include "backends/metal/recurrent_ops.h"
 #include "backends/metal/resource_store.h"
+#include "backends/metal/rotary_ops.h"
 #include "backends/metal/ssd_expert_cache.h"
 #include "backends/metal/ssd_shared_expert.h"
 #include "graph/graph.h"
@@ -53,6 +54,7 @@ struct MetalBackend::Impl {
     std::unique_ptr<MetalLmHead> lm_head;
     std::unique_ptr<MetalNormalizationOps> normalization_ops;
     std::unique_ptr<MetalRecurrentOps> recurrent_ops;
+    std::unique_ptr<MetalRotaryOps> rotary_ops;
     std::unique_ptr<MetalResourceStore> resources;
     std::unique_ptr<MetalSsdExpertCache> ssd_cache;
     std::unique_ptr<MetalSsdSharedExpert> ssd_shared_expert;
@@ -294,6 +296,8 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
         impl_->recurrent_ops.reset(new MetalRecurrentOps(
             impl_->pipeline_cache.get(), impl_->pool.get(),
             impl_->commands.get()));
+        impl_->rotary_ops.reset(
+            new MetalRotaryOps(impl_->pipeline_cache.get()));
         impl_->lm_head.reset(new MetalLmHead(
             impl_->pool.get(), impl_->commands.get(),
             impl_->pipeline_cache.get(), impl_->dispatch_failed));
@@ -338,6 +342,7 @@ MetalBackend::~MetalBackend() {
         impl_->layout_ops.reset();
         impl_->normalization_ops.reset();
         impl_->recurrent_ops.reset();
+        impl_->rotary_ops.reset();
         impl_->commands.reset();
         impl_->pipeline_cache.reset();
         impl_->resources.reset();
@@ -580,6 +585,9 @@ void MetalBackend::dispatch(const GraphNode& node,
     if (!handled && impl_->recurrent_ops) {
         handled = impl_->recurrent_ops->dispatch(
             node, inputs, output, enc, profile_label);
+    }
+    if (!handled && impl_->rotary_ops) {
+        handled = impl_->rotary_ops->dispatch(node, inputs, output, enc);
     }
     if (!handled) {
         switch (op) {
@@ -1217,60 +1225,6 @@ void MetalBackend::dispatch(const GraphNode& node,
                              ",N=" + std::to_string(p.N) +
                              ",K=" + std::to_string(p.K) + "]";
         }
-        break;
-    }
-
-    case OpType::ROTARY_EMBED: {
-        Tensor& X = *output;                 // rope is in-place on the copied input
-        const Tensor& in = *inputs[0];
-        // Ensure output holds the input data (rope mutates in place). If output
-        // is a fresh buffer we must copy input first via contiguous.
-        // For phase-1 the graph feeds a CONTIGUOUS output into ROPE; treat rope
-        // as reading inputs[0] and writing output, same layout.
-        const Tensor& COS = *inputs[1];
-        const Tensor& SIN = *inputs[2];
-        RopeParams p{};
-        p.head_dim = (int)in.shape[0];
-        int rope_dim = params.i32.size()>0 ? params.i32[0] : p.head_dim;
-        p.rope_dim = rope_dim;
-        p.seq_len = (int)in.shape[1];
-        p.heads   = (int)in.shape[2];
-        p.interleave = params.i32.size()>1 ? params.i32[1] : 1;
-        p.x_offset = eoffset(X);
-        p.cos_offset = eoffset(COS);
-        p.sin_offset = eoffset(SIN);
-        // RoPE operates on X. When `in` is a strided view, the copy below
-        // materializes it into dense X, so carrying the input strides into the
-        // in-place kernel would skip rows and eventually access past X.
-        p.x_stride_pos = estride(X, 1);
-        p.x_stride_head = estride(X, 2);
-        // Copy input -> output buffer (rope in place), if different buffers.
-        if (buf_of(&in) != buf_of(&X) || in.device.offset != X.device.offset) {
-            // use blit copy via contiguous kernel (contiguous input assumed)
-            TensorDesc d{};
-            for(int i=0;i<4;i++){d.shape[i]=(int)in.shape[i]; d.stride[i]=estride(in,i);}            
-            d.offset=eoffset(in);
-            id<MTLComputePipelineState> cps = impl_->pipeline("contiguous_f32");
-            [enc setComputePipelineState:cps];
-            [enc setBuffer:buf_of(&in) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&X) offset:0 atIndex:2];
-            [enc setBytes:&d length:sizeof(d) atIndex:3];
-            grid1d((int)X.nelements());
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        }
-        id<MTLComputePipelineState> ps = impl_->pipeline("rope_f32");
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&COS) offset:0 atIndex:1];
-        [enc setBuffer:buf_of(&SIN) offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        // 3-D grid over (pair, position, head) via bounds-checked threadgroups.
-        NSUInteger tx=8, ty=8, tz=4;
-        MTLSize tgs = MTLSizeMake(tx,ty,tz);
-        MTLSize tgc = MTLSizeMake(((NSUInteger)(rope_dim/2)+tx-1)/tx,
-                                  ((NSUInteger)p.seq_len+ty-1)/ty,
-                                  ((NSUInteger)p.heads+tz-1)/tz);
-        [enc dispatchThreadgroups:tgc threadsPerThreadgroup:tgs];
         break;
     }
 
