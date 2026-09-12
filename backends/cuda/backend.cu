@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 
 #include "backends/cuda/backend.h"
+#include "graph/graph.h"
 #include "backends/cuda/internal.h"
 
 #include "backends/cpu/backend.h"

@@ -1,13 +1,14 @@
 #pragma once
 
-#include "graph/graph.h"
 #include "kernels/tensor.h"
 #include "runtime/host_buffer_pool.h"
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 class ThreadPool;
+struct GraphNode;
 
 // ---------------------------------------------------------------------------
 // mollm — Backend abstraction
