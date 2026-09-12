@@ -75,6 +75,7 @@ set(SOURCES
     storage/ssd_expert_cache/predict.cpp
     # graph
     graph/io.cpp
+    backends/cpu/attention_ops.cpp
     backends/cpu/backend.cpp
     backends/cpu/deepseek_v4_ops.cpp
     backends/cpu/layout_ops.cpp

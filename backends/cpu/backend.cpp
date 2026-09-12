@@ -1,4 +1,5 @@
 #include "backends/cpu/backend.h"
+#include "backends/cpu/attention_ops.h"
 #include "backends/cpu/deepseek_v4_ops.h"
 #include "backends/cpu/layout_ops.h"
 #include "backends/cpu/matmul_ops.h"
@@ -6,7 +7,6 @@
 #include "backends/cpu/normalization_ops.h"
 #include "backends/cpu/recurrent_ops.h"
 #include "graph/graph.h"
-#include "kernels/cpu/attention.h"
 #include "kernels/cpu/elementwise.h"
 #include "kernels/cpu/gated_residual.h"
 #include "kernels/cpu/hyper_connection.h"
@@ -71,25 +71,10 @@ void CPUBackend::dispatch(const GraphNode& node,
         break;
 
     case OpType::SDPA:
-    case OpType::SDPA_MLA: {
-        const int cache_mode = graph_params::get_i32(params, 0, 2);
-        if (cache_mode == 2 && inputs.size() > 5 && inputs[4] && inputs[5] &&
-            inputs[4]->prec != inputs[5]->prec) {
+    case OpType::SDPA_MLA:
+        if (!dispatch_cpu_attention(node, inputs, output, thread_pool))
             reject();
-            break;
-        }
-        std::vector<Tensor*> sdpa_outs = { output };
-        const SdpaParams sdpa{
-            cache_mode,
-            graph_params::get_i32(params, 1, 1),
-            graph_params::get_i32(params, 2, 16),
-            graph_params::get_i32(params, 3, 16),
-            graph_params::get_i32(params, 4, 192),
-            graph_params::get_i32(params, 5, 128),
-            graph_params::get_f32(params, 0, 0.f)};
-        kernel_sdpa(sdpa, inputs, sdpa_outs, thread_pool);
         break;
-    }
     case OpType::GATED_DELTANET_PREFILL:
     case OpType::GATED_DELTANET_DECODE:
     case OpType::GATED_DELTANET_CONV_DECODE:
