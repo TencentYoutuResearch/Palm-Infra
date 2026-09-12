@@ -5,6 +5,7 @@
 #include "backends/metal/elementwise_ops.h"
 #include "backends/metal/layout_ops.h"
 #include "backends/metal/lm_head.h"
+#include "backends/metal/normalization_ops.h"
 #include "backends/metal/pipeline_cache.h"
 #include "backends/metal/resource_store.h"
 #include "backends/metal/ssd_expert_cache.h"
@@ -49,6 +50,7 @@ struct MetalBackend::Impl {
     std::unique_ptr<MetalElementwiseOps> elementwise_ops;
     std::unique_ptr<MetalLayoutOps> layout_ops;
     std::unique_ptr<MetalLmHead> lm_head;
+    std::unique_ptr<MetalNormalizationOps> normalization_ops;
     std::unique_ptr<MetalResourceStore> resources;
     std::unique_ptr<MetalSsdExpertCache> ssd_cache;
     std::unique_ptr<MetalSsdSharedExpert> ssd_shared_expert;
@@ -282,6 +284,8 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
             new MetalElementwiseOps(impl_->pipeline_cache.get()));
         impl_->layout_ops.reset(
             new MetalLayoutOps(impl_->pipeline_cache.get()));
+        impl_->normalization_ops.reset(
+            new MetalNormalizationOps(impl_->pipeline_cache.get()));
         impl_->pool.reset(new MetalBufferPool((__bridge void*)impl_->device));
         impl_->commands.reset(new MetalCommandContext(
             (__bridge void*)queue, impl_->pool.get()));
@@ -327,6 +331,7 @@ MetalBackend::~MetalBackend() {
         impl_->lm_head.reset();
         impl_->elementwise_ops.reset();
         impl_->layout_ops.reset();
+        impl_->normalization_ops.reset();
         impl_->commands.reset();
         impl_->pipeline_cache.reset();
         impl_->resources.reset();
@@ -562,7 +567,11 @@ void MetalBackend::dispatch(const GraphNode& node,
     const bool handled_elementwise = !handled_layout &&
         impl_->elementwise_ops &&
         impl_->elementwise_ops->dispatch(node, inputs, output, enc);
-    if (!handled_layout && !handled_elementwise) {
+    const bool handled_normalization =
+        !handled_layout && !handled_elementwise &&
+        impl_->normalization_ops &&
+        impl_->normalization_ops->dispatch(node, inputs, output, enc);
+    if (!handled_layout && !handled_elementwise && !handled_normalization) {
         switch (op) {
     case OpType::MATMUL:
     case OpType::GEMV_SPARSE_A: {
@@ -1198,191 +1207,6 @@ void MetalBackend::dispatch(const GraphNode& node,
                              ",N=" + std::to_string(p.N) +
                              ",K=" + std::to_string(p.K) + "]";
         }
-        break;
-    }
-
-    case OpType::RMS_NORM: {
-        const Tensor& X = *inputs[0];
-        const Tensor& W = *inputs[1];
-        Tensor& O = *output;
-        RmsNormParams p{};
-        p.dim0 = (int)X.shape[0];
-        p.rows = (int)(X.shape[1]*X.shape[2]*X.shape[3]);
-        p.x_offset = eoffset(X);
-        // Bind large-package weights at their 64-bit byte offset. A uint32
-        // element offset overflows once the shared region exceeds 16GB.
-        p.w_offset = 0;
-        p.out_offset = eoffset(O);
-        p.x_row_stride = estride(X, 1);
-        p.out_row_stride = estride(O, 1);
-        p.eps = params.f32.size()>0 ? params.f32[0] : 1e-6f;
-        id<MTLComputePipelineState> ps = impl_->pipeline("rms_norm_f32");
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&W) offset:W.device.offset atIndex:1];
-        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        NSUInteger tg = 256;
-        if (tg > ps.maxTotalThreadsPerThreadgroup) tg = ps.maxTotalThreadsPerThreadgroup;
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows,1,1)
-            threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
-        break;
-    }
-
-    case OpType::RMS_NORM_ROPE: {
-        const Tensor& X = *inputs[0];
-        const Tensor& W = *inputs[1];
-        const Tensor& COS = *inputs[2];
-        const Tensor& SIN = *inputs[3];
-        Tensor& O = *output;
-        RmsNormRopeParams p{};
-        p.dim0 = (int)O.shape[0];
-        p.seq_len = (int)O.shape[1];
-        p.heads = (int)O.shape[2];
-        p.rows = p.seq_len * p.heads;
-        p.rope_dim = params.i32.size()>0 ? params.i32[0] : p.dim0;
-        p.interleave = params.i32.size()>1 ? params.i32[1] : 1;
-        p.x_offset = eoffset(X);
-        // Bind package weights at their full 64-bit byte offset. Encoding the
-        // package-relative offset in the uint shader parameter wraps for
-        // FP32 constants beyond 16 GiB.
-        p.w_offset = 0;
-        p.cos_offset = eoffset(COS);
-        p.sin_offset = eoffset(SIN);
-        p.out_offset = eoffset(O);
-        p.x_row_stride = estride(X, 1);
-        p.out_row_stride = estride(O, 1);
-        p.eps = params.f32.size()>0 ? params.f32[0] : 1e-6f;
-        id<MTLComputePipelineState> ps =
-            impl_->pipeline("rms_norm_rope_f32");
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&W) offset:W.device.offset atIndex:1];
-        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        [enc setBuffer:buf_of(&COS) offset:0 atIndex:4];
-        [enc setBuffer:buf_of(&SIN) offset:0 atIndex:5];
-        const NSUInteger rope_threads =
-            p.seq_len > 1 &&
-                    p.dim0 == 128 &&
-                    p.rope_dim == 128
-                ? 32
-                : (NSUInteger)std::max(
-                      32, (p.rope_dim + 1) / 2);
-        NSUInteger tg = std::min<NSUInteger>(
-            256, ((rope_threads + 31) / 32) * 32);
-        tg = std::min(tg, ps.maxTotalThreadsPerThreadgroup);
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows,1,1)
-            threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
-        break;
-    }
-
-    case OpType::QK_RMS_NORM_ROPE: {
-        const Tensor& query = *inputs[0];
-        const Tensor& key = *inputs[1];
-        const Tensor& query_weight = *inputs[2];
-        const Tensor& key_weight = *inputs[3];
-        const Tensor& cos = *inputs[4];
-        const Tensor& sin = *inputs[5];
-        Tensor& out = *output;
-        QkRmsNormRopeParams p{};
-        p.dim0 = (int)out.shape[0];
-        p.seq_len = (int)out.shape[1];
-        p.query_heads =
-            params.i32.size()>2 ? params.i32[2] : (int)out.shape[2];
-        p.rows = p.seq_len * (int)out.shape[2];
-        p.rope_dim = params.i32.size()>0 ? params.i32[0] : p.dim0;
-        p.interleave = params.i32.size()>1 ? params.i32[1] : 1;
-        p.query_x_offset = eoffset(query);
-        p.key_x_offset = eoffset(key);
-        p.query_w_offset = 0;
-        p.key_w_offset = 0;
-        p.cos_offset = eoffset(cos);
-        p.sin_offset = eoffset(sin);
-        p.out_offset = eoffset(out);
-        p.query_x_row_stride = estride(query, 1);
-        p.key_x_row_stride = estride(key, 1);
-        p.out_row_stride = estride(out, 1);
-        p.eps = params.f32.size()>0 ? params.f32[0] : 1e-6f;
-        id<MTLComputePipelineState> ps =
-            impl_->pipeline("qk_rms_norm_rope_f32");
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&query) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&key) offset:0 atIndex:1];
-        [enc setBuffer:buf_of(&query_weight)
-               offset:query_weight.device.offset atIndex:2];
-        [enc setBuffer:buf_of(&key_weight)
-               offset:key_weight.device.offset atIndex:3];
-        [enc setBuffer:buf_of(&out) offset:0 atIndex:4];
-        [enc setBytes:&p length:sizeof(p) atIndex:5];
-        [enc setBuffer:buf_of(&cos) offset:0 atIndex:6];
-        [enc setBuffer:buf_of(&sin) offset:0 atIndex:7];
-        const NSUInteger rope_threads =
-            (NSUInteger)std::max(32, (p.rope_dim + 1) / 2);
-        NSUInteger tg = std::min<NSUInteger>(
-            256, ((rope_threads + 31) / 32) * 32);
-        tg = std::min(tg, ps.maxTotalThreadsPerThreadgroup);
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows,1,1)
-            threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
-        break;
-    }
-
-    case OpType::ADD_RMS_NORM: {
-        Tensor& residual = *const_cast<Tensor*>(inputs[0]);
-        const Tensor& update = *inputs[1];
-        const Tensor& weight = *inputs[2];
-        Tensor& out = *output;
-        AddRmsNormParams p{};
-        p.dim0 = (int)residual.shape[0];
-        p.rows = (int)(
-            residual.shape[1] * residual.shape[2] * residual.shape[3]);
-        p.residual_offset = eoffset(residual);
-        p.update_offset = eoffset(update);
-        p.out_offset = eoffset(out);
-        p.residual_row_stride = estride(residual, 1);
-        p.update_row_stride = estride(update, 1);
-        p.out_row_stride = estride(out, 1);
-        p.eps = params.f32.size() > 0 ? params.f32[0] : 1e-6f;
-        id<MTLComputePipelineState> ps =
-            impl_->pipeline("add_rms_norm_f32");
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&residual) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&update) offset:0 atIndex:1];
-        [enc setBuffer:buf_of(&out) offset:0 atIndex:2];
-        [enc setBuffer:buf_of(&weight)
-               offset:weight.device.offset atIndex:4];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        NSUInteger tg = std::min<NSUInteger>(
-            256, ps.maxTotalThreadsPerThreadgroup);
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows,1,1)
-            threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
-        break;
-    }
-
-    case OpType::LAYER_NORM: {
-        const Tensor& X = *inputs[0];
-        const Tensor& W = *inputs[1];
-        const Tensor& B = *inputs[2];
-        Tensor& O = *output;
-        LayerNormParams p{};
-        p.dim0 = (int)X.shape[0];
-        p.rows = (int)(X.shape[1] * X.shape[2] * X.shape[3]);
-        p.x_offset = eoffset(X);
-        p.out_offset = eoffset(O);
-        p.x_row_stride = estride(X, 1);
-        p.out_row_stride = estride(O, 1);
-        p.eps = params.f32.size() > 0 ? params.f32[0] : 1e-5f;
-        id<MTLComputePipelineState> ps = impl_->pipeline("layer_norm_f32");
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&W) offset:W.device.offset atIndex:1];
-        [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
-        [enc setBytes:&p length:sizeof(p) atIndex:3];
-        [enc setBuffer:buf_of(&B) offset:B.device.offset atIndex:4];
-        NSUInteger tg = std::min<NSUInteger>(
-            256, ps.maxTotalThreadsPerThreadgroup);
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         break;
     }
 
