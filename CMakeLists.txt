@@ -118,11 +118,14 @@ set(SOURCES
 )
 
 set(PUBLIC_ENGINE_HEADERS
-    engine/accelerator_backend.h
-    engine/backend.h
     engine/engine.h
     engine/sampler.h
     engine/tokenizer.h
+)
+
+set(PUBLIC_ENGINE_COMPAT_HEADERS
+    compat/engine/accelerator_backend.h
+    compat/engine/backend.h
 )
 
 set(PUBLIC_CORE_HEADERS
@@ -159,10 +162,13 @@ set(PUBLIC_STORAGE_HEADERS
 )
 
 set(PUBLIC_GRAPH_HEADERS
-    graph/buffer_pool.h
-    graph/mmap_file.h
     graph/graph.h
     graph/execute.h
+)
+
+set(PUBLIC_GRAPH_COMPAT_HEADERS
+    compat/graph/buffer_pool.h
+    compat/graph/mmap_file.h
 )
 
 set(PUBLIC_KERNEL_COMPAT_HEADERS
@@ -653,6 +659,8 @@ install(TARGETS mollm_lib
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm)
 install(FILES ${PUBLIC_ENGINE_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/engine)
+install(FILES ${PUBLIC_ENGINE_COMPAT_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/engine)
 install(FILES ${PUBLIC_CORE_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/core)
 install(FILES ${PUBLIC_RUNTIME_HEADERS}
@@ -664,6 +672,8 @@ install(FILES ${PUBLIC_STORAGE_HEADERS}
 install(FILES storage/ssd_expert_cache/cache.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/storage/ssd_expert_cache)
 install(FILES ${PUBLIC_GRAPH_HEADERS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/graph)
+install(FILES ${PUBLIC_GRAPH_COMPAT_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/graph)
 install(FILES ${PUBLIC_KERNEL_COMPAT_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/kernels)
