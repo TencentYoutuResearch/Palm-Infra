@@ -1,3 +1,5 @@
+#include "backends/cpu/backend.h"
+#include "graph/graph.h"
 #include "kernels/cpu/attention.h"
 #include "core/cache_layout.h"
 #include <cmath>
@@ -5,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+enum class TestPath { Kernel, Backend, BackendDefaults };
 
 static int failures = 0;
 #define CHECK(cond, msg) do { if(!(cond)){fprintf(stderr,"FAIL: %s\n",msg);failures++;}else{printf("  PASS: %s\n",msg);} } while(0)
@@ -61,8 +65,8 @@ static void ref_sdpa(const float* Q, const float* K_cache, const float* V_cache,
 // Run one SDPA test case
 static bool test_case(int H, int KV, int hd, int vd, int src, int cur,
                       int past, int cap, bool causal,
-                      bool fp16_cache = false) {
-    float scale = 1.f / sqrtf(hd);
+                      bool fp16_cache = false, TestPath path = TestPath::Kernel) {
+    float scale = path == TestPath::Backend ? 0.37f : 1.f / sqrtf(hd);
 
     float* qd = new float[H*src*hd]; fill_rand(qd, H*src*hd);
     float* kd = new float[KV*cur*hd]; fill_rand(kd, KV*cur*hd);
@@ -137,10 +141,20 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur,
     Tensor K_out = K_cache;
     Tensor V_out = V_cache;
 
-    OpParams p; p.i32={2, causal?1:0, H, KV, hd, vd}; p.f32={scale};
+    SdpaParams p{2, causal?1:0, H, KV, hd, vd, scale};
     std::vector<const Tensor*> ins = {&Q, &K_cur, &V_cur, nullptr, &K_cache, &V_cache};
     std::vector<Tensor*> outs = {&out, &K_out, &V_out};
-    kernel_sdpa(p, ins, outs);
+    if (path == TestPath::Kernel) {
+        kernel_sdpa(p, ins, outs);
+    } else {
+        GraphNode node;
+        node.op_type = OpType::SDPA;
+        if (path != TestPath::BackendDefaults) {
+            node.params.i32 = {2, causal ? 1 : 0, H, KV, hd, vd};
+            node.params.f32 = {scale};
+        }
+        CPUBackend{}.dispatch(node, ins, &out, nullptr);
+    }
 
     ref_sdpa(qd, kc, vc, reference_key.data(), reference_value.data(), ref,
              H, KV, hd, vd, src, cur, past, cap, scale, causal);
@@ -185,6 +199,11 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur,
 
 int main() {
     srand(42);
+    CHECK(test_case(8, 4, 32, 24, 4, 4, 3, 16, true, true, TestPath::Backend),
+          "backend SDPA: explicit dimensions/scale and FP16 cache append");
+    CHECK(test_case(16, 16, 192, 128, 2, 2, 1, 8, true, false,
+                    TestPath::BackendDefaults),
+          "backend SDPA: omitted graph parameters preserve defaults");
 
     CHECK(test_case(128, 16, 192, 128, 1, 1, 128, 512, false),
           "MLA decode: H=128 KV=16 src=1 past=128");

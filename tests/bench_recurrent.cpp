@@ -110,8 +110,7 @@ static double bench_shortconv_decode(int groups, ThreadPool& pool) {
         Precision::FP32, prefix, groups, state.data());
     Tensor to = external(Precision::FP32, groups, 1, out.data());
     std::vector<const Tensor*> inputs = {&tx, &tw, &ts};
-    OpParams params;
-    params.i32 = {kernel_size, 1};
+    ShortConvParams params{kernel_size, 1};
     return median_ms(
         5, 101,
         [&] { kernel_shortconv(params, inputs, to, &pool); },

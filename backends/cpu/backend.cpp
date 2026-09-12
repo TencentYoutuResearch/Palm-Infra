@@ -201,7 +201,15 @@ void CPUBackend::dispatch(const GraphNode& node,
             break;
         }
         std::vector<Tensor*> sdpa_outs = { output };
-        kernel_sdpa(params, inputs, sdpa_outs, thread_pool);
+        const SdpaParams sdpa{
+            cache_mode,
+            graph_params::get_i32(params, 1, 1),
+            graph_params::get_i32(params, 2, 16),
+            graph_params::get_i32(params, 3, 16),
+            graph_params::get_i32(params, 4, 192),
+            graph_params::get_i32(params, 5, 128),
+            graph_params::get_f32(params, 0, 0.f)};
+        kernel_sdpa(sdpa, inputs, sdpa_outs, thread_pool);
         break;
     }
     case OpType::GATED_DELTANET_PREFILL: {
@@ -556,7 +564,10 @@ void CPUBackend::dispatch(const GraphNode& node,
         break;
     case OpType::SHORTCONV:
         if (output)
-            kernel_shortconv(params, inputs, *output, thread_pool);
+            kernel_shortconv(
+                ShortConvParams{graph_params::get_i32(params, 0, 4),
+                                graph_params::get_i32(params, 1, 0)},
+                inputs, *output, thread_pool);
         break;
     case OpType::ROTARY_EMBED:
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {

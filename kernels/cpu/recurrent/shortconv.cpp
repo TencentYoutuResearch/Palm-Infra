@@ -7,7 +7,7 @@
 #include <arm_neon.h>
 #endif
 
-void kernel_shortconv(const OpParams& params,
+void kernel_shortconv(const ShortConvParams& params,
                       const std::vector<const Tensor*>& inputs, Tensor& output,
                       ThreadPool* thread_pool) {
     if (inputs.size() < 3 || !inputs[0] || !inputs[1] || !inputs[2])
@@ -15,7 +15,7 @@ void kernel_shortconv(const OpParams& params,
 
     const Tensor& x = *inputs[0];
     const Tensor& weight = *inputs[1];
-    const int kernel_size = graph_params::get_i32(params, 0, 4);
+    const int kernel_size = params.kernel_size;
     const int groups = static_cast<int>(x.shape[0]);
     const int seq_len = static_cast<int>(x.shape[1]);
     const size_t x_row_stride = x.stride[1] / sizeof(float);
@@ -58,7 +58,7 @@ void kernel_shortconv(const OpParams& params,
     }
 #endif
 
-    const int n_real = graph_params::get_i32(params, 1, seq_len);
+    const int n_real = params.real_tokens;
     const int prefix_len = kernel_size - 1;
     const int total_len = prefix_len + seq_len;
     const int process_len = (n_real > 0 && n_real < seq_len) ? n_real : seq_len;

@@ -1,3 +1,5 @@
+#include "backends/cpu/backend.h"
+#include "graph/graph.h"
 #include "kernels/cpu/recurrent/shortconv.h"
 
 #include <cmath>
@@ -5,6 +7,8 @@
 #include <vector>
 
 namespace {
+
+enum class TestPath { Kernel, Backend, BackendDefaults };
 
 int failures = 0;
 
@@ -47,7 +51,7 @@ void reference_shortconv(const std::vector<float>& input,
 
 void run_case(int groups, int seq_len, int kernel_size, int n_real,
               ThreadPool* thread_pool, const char* label,
-              int input_row_padding = 0) {
+              int input_row_padding = 0, TestPath path = TestPath::Kernel) {
     std::vector<float> input(groups * seq_len);
     const int input_row_stride = groups + input_row_padding;
     std::vector<float> input_storage(input_row_stride * seq_len, 123.f);
@@ -87,9 +91,16 @@ void run_case(int groups, int seq_len, int kernel_size, int n_real,
                                           groups, seq_len, 1, 1, output.data());
     std::vector<const Tensor*> inputs = {&input_tensor, &weight_tensor,
                                          &state_tensor};
-    OpParams params;
-    params.i32 = {kernel_size, n_real};
-    kernel_shortconv(params, inputs, output_tensor, thread_pool);
+    ShortConvParams params{kernel_size, n_real};
+    if (path == TestPath::Kernel) {
+        kernel_shortconv(params, inputs, output_tensor, thread_pool);
+    } else {
+        GraphNode node;
+        node.op_type = OpType::SHORTCONV;
+        if (path != TestPath::BackendDefaults)
+            node.params.i32 = {kernel_size, n_real};
+        CPUBackend{}.dispatch(node, inputs, &output_tensor, thread_pool);
+    }
 
     bool matches = true;
     for (size_t i = 0; i < output.size(); ++i)
@@ -103,6 +114,10 @@ void run_case(int groups, int seq_len, int kernel_size, int n_real,
 
 int main() {
     ThreadPool pool(4);
+    run_case(7, 5, 3, 3, &pool, "backend padded/strided shortconv", 5,
+             TestPath::Backend);
+    run_case(7, 5, 4, 5, &pool, "backend shortconv defaults", 0,
+             TestPath::BackendDefaults);
     run_case(8, 1, 4, 1, &pool, "decode k=4");
     run_case(7, 5, 4, 3, &pool, "padded prefill k=4");
     run_case(7, 5, 4, 3, &pool, "strided prefill input", 5);

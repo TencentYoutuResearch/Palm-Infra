@@ -1,7 +1,7 @@
 #pragma once
 
 #include "kernels/tensor.h"
-#include "graph/graph.h"
+#include "core/attention_params.h"
 #include <vector>
 
 class ThreadPool;
@@ -29,15 +29,7 @@ class ThreadPool;
 // ---------------------------------------------------------------------------
 
 /// Standard SDPA with in-place KV cache append.
-/// params layout:
-///   i32[0] = kv_cache mode (0/1/2)
-///   i32[1] = causal (0/1)
-///   i32[2] = num_heads
-///   i32[3] = num_kv_heads
-///   i32[4] = head_dim
-///   i32[5] = v_head_dim
-///   f32[0] = scale (0 → 1/sqrt(head_dim))
-void kernel_sdpa(const OpParams& params,
+void kernel_sdpa(const SdpaParams& params,
                  const std::vector<const Tensor*>& inputs,
                  std::vector<Tensor*>& outputs,
                  ThreadPool* thread_pool = nullptr);

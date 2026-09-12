@@ -122,6 +122,8 @@ set(PUBLIC_ENGINE_HEADERS
 )
 
 set(PUBLIC_CORE_HEADERS
+    core/attention_params.h
+    core/shortconv_params.h
     core/activation.h
     core/bf16.h
     core/quant_layouts.h
