@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/shortconv_params.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include "runtime/threading.h"
 
 #include <vector>

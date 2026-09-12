@@ -1,4 +1,4 @@
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include "kernels/cpu/rope.h"
 #include <cmath>
 #include <cstdio>

@@ -1,5 +1,5 @@
 #include "storage/mapped_file.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include <cstdio>
 #include <cstring>
 #include <limits>

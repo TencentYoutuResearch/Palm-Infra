@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include "core/attention_params.h"
 #include <vector>
 

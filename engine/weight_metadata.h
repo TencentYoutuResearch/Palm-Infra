@@ -1,7 +1,7 @@
 #pragma once
 
 #include "storage/mapped_file.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 
 namespace mollm::detail {
 

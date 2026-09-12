@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 
 class ThreadPool;
 

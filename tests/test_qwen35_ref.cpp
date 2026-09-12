@@ -9,7 +9,7 @@
 
 #include "kernels/cpu/recurrent/gdn.h"
 #include "graph/graph.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

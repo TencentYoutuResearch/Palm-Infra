@@ -1,7 +1,7 @@
 #include "engine/sampler.h"
 
 #include "backends/cpu/platform.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 
 #include <algorithm>
 #include <cmath>

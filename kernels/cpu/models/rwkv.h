@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/rwkv_params.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include "runtime/threading.h"
 
 void kernel_rwkv_token_shift(const RwkvTokenShiftParams&, const std::vector<const Tensor*>&,

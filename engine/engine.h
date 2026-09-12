@@ -7,7 +7,7 @@
 #include "runtime/accelerator_backend.h"
 #include "backends/cpu/backend.h"
 #include "engine/sampler.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include "runtime/threading.h"
 #include "storage/ssd_expert_cache/cache.h"
 

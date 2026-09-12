@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 
 #import <Metal/Metal.h>
 

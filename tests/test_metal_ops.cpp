@@ -1,7 +1,7 @@
 // Per-op parity tests for the Metal backend vs the CPU reference kernels.
 // Only built when MOLLM_METAL is defined.
 
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include "core/fp16.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/moe/moe.h"

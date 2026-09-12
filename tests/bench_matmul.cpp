@@ -1,4 +1,4 @@
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include "core/fp16.h"
 #include "kernels/cpu/models/deepseek_v4_attention.h"
 #include "kernels/cpu/matmul/matmul.h"
