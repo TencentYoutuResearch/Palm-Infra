@@ -4,6 +4,7 @@
 #include "backends/metal/pipeline_cache.h"
 #include "backends/metal/resource_store.h"
 #include "backends/metal/ssd_expert_cache.h"
+#include "backends/metal/ssd_shared_expert.h"
 #include "graph/graph.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/moe/moe.h"
@@ -43,12 +44,10 @@ struct MetalBackend::Impl {
     std::unique_ptr<MetalPipelineCache> pipeline_cache;
     std::unique_ptr<MetalResourceStore> resources;
     std::unique_ptr<MetalSsdExpertCache> ssd_cache;
+    std::unique_ptr<MetalSsdSharedExpert> ssd_shared_expert;
 
     bool                     dispatch_failed = false;
 
-    id<MTLCommandQueue> ssd_shared_compute_queue = nil;
-    id<MTLSharedEvent> ssd_shared_compute_event = nil;
-    uint64_t ssd_shared_compute_event_value = 0;
     bool ssd_cross_layer_prefetch = true;
     struct SsdMoeLayerInfo {
         const Tensor* router = nullptr;
@@ -134,186 +133,6 @@ struct MetalBackend::Impl {
                     indices.size() * sizeof(int));
         std::memcpy(MetalBufferPool::contents(weights_handle), weights.data(),
                     weights.size() * sizeof(float));
-        return true;
-    }
-
-    struct SsdSharedExpertWork {
-        void* qx = nullptr;
-        void* sx = nullptr;
-        void* intermediate = nullptr;
-        void* qintermediate = nullptr;
-        void* qintermediate_scale = nullptr;
-        void* scale = nullptr;
-        void* output = nullptr;
-        size_t qx_bytes = 0;
-        size_t sx_bytes = 0;
-        size_t intermediate_bytes = 0;
-        size_t qintermediate_bytes = 0;
-        size_t output_bytes = 0;
-        uint64_t ready_value = 0;
-    };
-
-    bool submit_ssd_shared_expert(
-        const Tensor& x, const Tensor& gate, const Tensor& up,
-        const Tensor& down, const Tensor& scale_weight, int hidden,
-        int intermediate, int seq, int layer, SsdSharedExpertWork& work) {
-        if (gate.prec != Precision::INT4 ||
-            up.prec != Precision::INT4 ||
-            down.prec != Precision::INT4 ||
-            scale_weight.prec != Precision::FP16 ||
-            !x.device_data || !gate.device_data || !up.device_data ||
-            !down.device_data || !scale_weight.device_data) {
-            return false;
-        }
-
-        work.qx_bytes = static_cast<size_t>(seq) * hidden;
-        work.sx_bytes = static_cast<size_t>(seq) * sizeof(float);
-        work.intermediate_bytes =
-            static_cast<size_t>(intermediate) * sizeof(float);
-        work.qintermediate_bytes =
-            static_cast<size_t>(intermediate) * sizeof(int8_t);
-        work.output_bytes = static_cast<size_t>(hidden) * sizeof(float);
-        work.qx = pool->acquire(work.qx_bytes);
-        work.sx = pool->acquire(work.sx_bytes);
-        work.intermediate = pool->acquire(work.intermediate_bytes);
-        work.qintermediate = pool->acquire(work.qintermediate_bytes);
-        work.qintermediate_scale = pool->acquire(sizeof(float));
-        work.scale = pool->acquire(sizeof(float));
-        work.output = pool->acquire(work.output_bytes);
-
-        id<MTLBuffer> x_buffer = (__bridge id<MTLBuffer>)x.device_data;
-        id<MTLBuffer> gate_buffer = (__bridge id<MTLBuffer>)gate.device_data;
-        id<MTLBuffer> up_buffer = (__bridge id<MTLBuffer>)up.device_data;
-        id<MTLBuffer> down_buffer = (__bridge id<MTLBuffer>)down.device_data;
-        id<MTLBuffer> scale_weight_buffer =
-            (__bridge id<MTLBuffer>)scale_weight.device_data;
-        id<MTLBuffer> qx = (__bridge id<MTLBuffer>)work.qx;
-        id<MTLBuffer> sx = (__bridge id<MTLBuffer>)work.sx;
-        id<MTLBuffer> hidden_values =
-            (__bridge id<MTLBuffer>)work.intermediate;
-        id<MTLBuffer> qhidden =
-            (__bridge id<MTLBuffer>)work.qintermediate;
-        id<MTLBuffer> qhidden_scale =
-            (__bridge id<MTLBuffer>)work.qintermediate_scale;
-        id<MTLBuffer> scale = (__bridge id<MTLBuffer>)work.scale;
-        id<MTLBuffer> output = (__bridge id<MTLBuffer>)work.output;
-
-        MoeSharedW4Params params{};
-        params.hidden = hidden;
-        params.intermediate = intermediate;
-        params.gate_groups_per_row = static_cast<int>(gate.groups_per_row);
-        params.up_groups_per_row = static_cast<int>(up.groups_per_row);
-        params.down_groups_per_row = static_cast<int>(down.groups_per_row);
-        params.hidden_offset =
-            static_cast<uint>(x.device_offset / sizeof(float));
-
-        id<MTLCommandBuffer> shared_cmd =
-            [ssd_shared_compute_queue commandBuffer];
-        shared_cmd.label = @"mollm shared SSD expert";
-        id<MTLComputeCommandEncoder> shared_enc =
-            [shared_cmd computeCommandEncoder];
-        shared_enc.label = @"mollm shared expert";
-
-        QuantActParams xq{};
-        xq.M = seq;
-        xq.K = hidden;
-        xq.a_offset = params.hidden_offset;
-        xq.a_row_stride =
-            static_cast<int>(x.stride[1] / sizeof(float));
-        [shared_enc setComputePipelineState:pipeline("quantize_act_i8")];
-        [shared_enc setBuffer:x_buffer offset:0 atIndex:0];
-        [shared_enc setBuffer:qx offset:0 atIndex:2];
-        [shared_enc setBytes:&xq length:sizeof(xq) atIndex:3];
-        [shared_enc setBuffer:sx offset:0 atIndex:4];
-        [shared_enc setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
-        [shared_enc dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
-
-        [shared_enc setComputePipelineState:
-                        pipeline("moe_shared_gate_up_w4_i8")];
-        [shared_enc setBuffer:qx offset:0 atIndex:0];
-        [shared_enc setBuffer:gate_buffer offset:gate.device_offset atIndex:1];
-        [shared_enc setBuffer:hidden_values offset:0 atIndex:2];
-        [shared_enc setBytes:&params length:sizeof(params) atIndex:3];
-        [shared_enc
-            setBuffer:gate_buffer
-               offset:gate.device_offset +
-                      static_cast<size_t>(intermediate) * hidden / 2
-              atIndex:4];
-        [shared_enc setBuffer:up_buffer offset:up.device_offset atIndex:5];
-        [shared_enc
-            setBuffer:up_buffer
-               offset:up.device_offset +
-                      static_cast<size_t>(intermediate) * hidden / 2
-              atIndex:6];
-        [shared_enc setBuffer:sx offset:0 atIndex:7];
-        [shared_enc dispatchThreadgroups:MTLSizeMake(intermediate, 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-
-        [shared_enc setComputePipelineState:
-                        pipeline("moe_shared_scale_f16")];
-        [shared_enc setBuffer:x_buffer offset:0 atIndex:0];
-        [shared_enc setBuffer:scale_weight_buffer
-                       offset:scale_weight.device_offset
-                      atIndex:1];
-        [shared_enc setBuffer:scale offset:0 atIndex:2];
-        [shared_enc setBytes:&params length:sizeof(params) atIndex:3];
-        [shared_enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-
-        QuantActParams iq{};
-        iq.M = 1;
-        iq.K = intermediate;
-        iq.a_row_stride = intermediate;
-        [shared_enc setComputePipelineState:pipeline("quantize_act_i8")];
-        [shared_enc setBuffer:hidden_values offset:0 atIndex:0];
-        [shared_enc setBuffer:qhidden offset:0 atIndex:2];
-        [shared_enc setBytes:&iq length:sizeof(iq) atIndex:3];
-        [shared_enc setBuffer:qhidden_scale offset:0 atIndex:4];
-        [shared_enc setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
-        [shared_enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
-
-        [shared_enc setComputePipelineState:
-                        pipeline("moe_shared_down_w4_i8")];
-        [shared_enc setBuffer:qhidden offset:0 atIndex:0];
-        [shared_enc setBuffer:down_buffer offset:down.device_offset atIndex:1];
-        [shared_enc setBuffer:output offset:0 atIndex:2];
-        [shared_enc setBytes:&params length:sizeof(params) atIndex:3];
-        [shared_enc
-            setBuffer:down_buffer
-               offset:down.device_offset +
-                      static_cast<size_t>(hidden) * intermediate / 2
-              atIndex:4];
-        [shared_enc setBuffer:scale offset:0 atIndex:5];
-        [shared_enc setBuffer:qhidden_scale offset:0 atIndex:6];
-        [shared_enc dispatchThreadgroups:MTLSizeMake(hidden, 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        [shared_enc endEncoding];
-
-        work.ready_value = ++ssd_shared_compute_event_value;
-        [shared_cmd encodeSignalEvent:ssd_shared_compute_event
-                                value:work.ready_value];
-        const uint64_t start = mollm_trace::now_ns();
-        [shared_cmd addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-            const uint64_t end = mollm_trace::now_ns();
-            const std::string args =
-                "{\"layer\":" + std::to_string(layer) + "}";
-            mollm_trace::record_duration(
-                "metal.ssd", "shared_expert", start, end, args,
-                "thread_state_running");
-            const double gpu_seconds =
-                completed.GPUEndTime - completed.GPUStartTime;
-            if (gpu_seconds > 0.0 && end != 0) {
-                const uint64_t gpu_ns =
-                    static_cast<uint64_t>(gpu_seconds * 1e9);
-                mollm_trace::record_duration(
-                    "metal.ssd", "shared_expert_gpu",
-                    end > gpu_ns ? end - gpu_ns : 0, end, args,
-                    "thread_state_running");
-            }
-        }];
-        [shared_cmd commit];
         return true;
     }
 
@@ -495,6 +314,9 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
             new MetalResourceStore((__bridge void*)impl_->device));
         impl_->ssd_cache.reset(
             new MetalSsdExpertCache((__bridge void*)impl_->device));
+        impl_->ssd_shared_expert.reset(new MetalSsdSharedExpert(
+            (__bridge void*)impl_->device, impl_->pool.get(),
+            impl_->pipeline_cache.get()));
 
         // Enable the tensor-API GEMM only if the kernel was compiled (metallib
         // built with -DMOLLM_METAL_TENSOR) AND the GPU is M5/A19+ (MTLGPUFamily
@@ -523,6 +345,7 @@ MetalBackend::~MetalBackend() {
     if (impl_) {
         dump_profile();  // report per-op GPU time table if MOLLM_METAL_PROFILE
         impl_->ssd_cache.reset();
+        impl_->ssd_shared_expert.reset();
         impl_->commands.reset();
         impl_->pipeline_cache.reset();
         impl_->resources.reset();
@@ -1031,20 +854,14 @@ bool MetalBackend::configure_moe_ssd_io(
         capacity_bytes == 0) {
         return false;
     }
-    impl_->ssd_shared_compute_queue = [impl_->device newCommandQueue];
-    impl_->ssd_shared_compute_event = [impl_->device newSharedEvent];
-    if (!impl_->ssd_shared_compute_queue ||
-        !impl_->ssd_shared_compute_event) {
+    if (!impl_->ssd_shared_expert ||
+        !impl_->ssd_shared_expert->configure()) {
         fprintf(stderr,
                 "MetalBackend: shared-expert command setup failed\n");
-        impl_->ssd_shared_compute_queue = nil;
-        impl_->ssd_shared_compute_event = nil;
         return false;
     }
     if (!impl_->ssd_cache->configure(
             package_path, capacity_bytes, max_commands_in_flight)) {
-        impl_->ssd_shared_compute_queue = nil;
-        impl_->ssd_shared_compute_event = nil;
         return false;
     }
     impl_->ssd_cross_layer_prefetch = cross_layer_prefetch;
@@ -3108,7 +2925,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             void* predicted_tw_h = nullptr;
             size_t predicted_idx_bytes = 0;
             size_t predicted_tw_bytes = 0;
-            Impl::SsdSharedExpertWork shared_work;
+            MetalSsdSharedExpert::Work shared_work;
             if (ssd_w4 && impl_->ssd_cross_layer_prefetch) {
                 auto next = impl_->ssd_moe_layers.find(
                     ssd_gate->spec.layer + 1);
@@ -3186,7 +3003,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     hidden_size, seq, 1, 1,
                     const_cast<uint8_t*>(input_bytes));
                 if (has_shared &&
-                    !impl_->submit_ssd_shared_expert(
+                    !impl_->ssd_shared_expert->submit(
                         x, *inputs[4], *inputs[5], *inputs[6], *inputs[7],
                         hidden_size, shared_intermediate, seq,
                         ssd_gate->spec.layer, shared_work)) {
@@ -4355,8 +4172,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                 if (has_shared) {
                     [enc endEncoding];
                     impl_->commands->enc = nil;
+                    id<MTLSharedEvent> shared_event =
+                        impl_->ssd_shared_expert->event();
                     [impl_->commands->cmd
-                        encodeWaitForEvent:impl_->ssd_shared_compute_event
+                        encodeWaitForEvent:shared_event
                                    value:shared_ready_value];
                     impl_->commands->enc = [impl_->commands->cmd computeCommandEncoder];
                     impl_->commands->enc.label = @"mollm combine SSD experts";
