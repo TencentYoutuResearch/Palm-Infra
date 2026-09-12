@@ -230,7 +230,7 @@ SEQ = _SeqSymbol()  # unbound; build_graph binds it to actual seq_len
 
 # ---------------------------------------------------------------------------
 # Activation functions (fused into MATMUL at writeback time).
-# Values must match `enum class Activation` in kernels/cpu/activations.h.
+# Values must match `enum class Activation` in core/activation.h.
 # ---------------------------------------------------------------------------
 class Activation(IntEnum):
     NONE = 0   # identity — fast path, no per-column branch

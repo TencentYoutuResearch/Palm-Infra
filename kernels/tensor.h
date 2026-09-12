@@ -6,7 +6,7 @@
 #include <cstring>
 
 #include "kernels/cpu_platform.h"
-#include "kernels/prepared_weight.h"
+#include "core/prepared_weight.h"
 
 // ---------------------------------------------------------------------------
 // mollm — Tensor definition

@@ -1,6 +1,6 @@
 #include "kernels/cpu/gated_residual.h"
 
-#include "kernels/bf16.h"
+#include "core/bf16.h"
 #include "runtime/threading.h"
 
 #include <cmath>

@@ -2,7 +2,7 @@
 
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/matmul/matmul_profile.h"
-#include "kernels/quant_layouts.h"
+#include "core/quant_layouts.h"
 
 #include <algorithm>
 #include <cstdint>

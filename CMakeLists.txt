@@ -122,6 +122,10 @@ set(PUBLIC_ENGINE_HEADERS
 )
 
 set(PUBLIC_CORE_HEADERS
+    core/activation.h
+    core/bf16.h
+    core/quant_layouts.h
+    core/prepared_weight.h
     core/cache_layout.h
 )
 
@@ -148,6 +152,8 @@ set(PUBLIC_KERNEL_HEADERS
     kernels/cpu_platform.h
     kernels/moe_ssd.h
     kernels/prepared_weight.h
+    kernels/bf16.h
+    kernels/quant_layouts.h
     kernels/tensor.h
     kernels/threading.h
     kernels/trace.h
