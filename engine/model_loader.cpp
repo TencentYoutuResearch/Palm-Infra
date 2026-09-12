@@ -2,7 +2,7 @@
 #include "engine/byte_ranges.h"
 #include "engine/weight_metadata.h"
 
-#include "kernels/matmul.h"
+#include "kernels/cpu/matmul/matmul.h"
 #include "kernels/moe_ssd.h"
 #include "runtime/trace.h"
 #include "kernels/cpu_platform.h"

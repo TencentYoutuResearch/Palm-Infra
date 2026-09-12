@@ -1,4 +1,4 @@
-#include "kernels/elementwise.h"
+#include "kernels/cpu/elementwise.h"
 
 #include <algorithm>
 #include <cmath>

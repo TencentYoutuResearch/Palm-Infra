@@ -1,4 +1,4 @@
-#include "kernels/shortconv.h"
+#include "kernels/cpu/recurrent/shortconv.h"
 
 #include <cmath>
 #include <cstdio>

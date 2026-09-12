@@ -12,7 +12,7 @@
 // which introduces ~1e-3 error vs the scalar std::exp path. This does not
 // affect end-to-end PPL (test_e2e confirms PPL 8.49 vs HF 8.50).
 
-#include "kernels/gdn.h"
+#include "kernels/cpu/recurrent/gdn.h"
 #include "graph/graph.h"
 #include "kernels/tensor.h"
 #include <cmath>

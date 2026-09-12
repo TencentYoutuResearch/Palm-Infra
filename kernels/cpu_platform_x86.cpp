@@ -1,10 +1,10 @@
 #include "kernels/cpu_platform.h"
-#include "kernels/matmul.h"
-#include "kernels/matmul_internal.h"
+#include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/matmul/matmul_internal.h"
 #include "runtime/threading.h"
-#include "kernels/x86_avx2.h"
-#include "kernels/x86_avx512.h"
-#include "kernels/x86_vnni.h"
+#include "kernels/cpu/x86/x86_avx2.h"
+#include "kernels/cpu/x86/x86_avx512.h"
+#include "kernels/cpu/x86/x86_vnni.h"
 
 #include <algorithm>
 #include <chrono>

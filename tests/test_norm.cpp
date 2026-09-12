@@ -1,5 +1,5 @@
 #include "kernels/tensor.h"
-#include "kernels/norm.h"
+#include "kernels/cpu/norm.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

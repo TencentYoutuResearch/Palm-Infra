@@ -1,4 +1,4 @@
-#include "kernels/gated_residual.h"
+#include "kernels/cpu/gated_residual.h"
 #include "kernels/bf16.h"
 
 #include <cmath>

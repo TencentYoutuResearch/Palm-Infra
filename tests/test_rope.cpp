@@ -1,5 +1,5 @@
 #include "kernels/tensor.h"
-#include "kernels/rope.h"
+#include "kernels/cpu/rope.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

@@ -1,4 +1,4 @@
-#include "kernels/layout.h"
+#include "kernels/cpu/layout.h"
 
 #include <cstdio>
 #include <vector>

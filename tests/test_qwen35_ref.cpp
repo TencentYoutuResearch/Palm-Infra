@@ -7,7 +7,7 @@
 // This validates the fused kernel's math against an independent numpy
 // implementation that uses the real Qwen3.5 layer-0 weights.
 
-#include "kernels/gdn.h"
+#include "kernels/cpu/recurrent/gdn.h"
 #include "graph/graph.h"
 #include "kernels/tensor.h"
 #include <cmath>

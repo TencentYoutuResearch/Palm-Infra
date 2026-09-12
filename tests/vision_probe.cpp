@@ -1,5 +1,5 @@
 #include "engine/engine.h"
-#include "kernels/matmul.h"
+#include "kernels/cpu/matmul/matmul.h"
 
 #include <cstdint>
 #include <cstdio>

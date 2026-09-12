@@ -1,7 +1,7 @@
 #include "kernels/moe_ssd.h"
 
-#include "kernels/matmul.h"
-#include "kernels/moe_routing.h"
+#include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/moe/moe_routing.h"
 #include "runtime/trace.h"
 
 #include <algorithm>
