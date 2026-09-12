@@ -471,6 +471,7 @@ if(MOLLM_CUDA)
         backends/cuda/backend.cu
         backends/cuda/device_runtime.cu
         backends/cuda/dispatch.cu
+        backends/cuda/lm_head.cu
         kernels/cuda/attention.cu
         kernels/cuda/matmul.cu
         kernels/cuda/elementwise.cu
