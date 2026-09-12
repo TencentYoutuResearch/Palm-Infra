@@ -2,7 +2,7 @@
 
 #include "kernels/cpu/activations.h" // for Activation enum
 #include "backends/cpu/platform.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 
 #include <string>
 #include <unordered_map>

@@ -5,7 +5,7 @@
 #include "backends/metal/dispatch_tuning.h"
 #include "backends/metal/pipeline_cache.h"
 #include "kernels/metal/metal_common.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>

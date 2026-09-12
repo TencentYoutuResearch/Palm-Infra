@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 
 #include <array>
 #include <vector>

@@ -3,7 +3,7 @@
 #include "core/bf16.h"
 #include "kernels/cpu/moe/moe.h"
 #include "storage/ssd_expert_cache/cache.h"
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include "runtime/trace.h"
 #include <algorithm>
 #include <cassert>
