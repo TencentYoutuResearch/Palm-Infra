@@ -114,6 +114,9 @@ public:
     // implement direct expert streaming.
     virtual void enable_weight_copy_mode() {}
     virtual bool has_weight_copies() const { return false; }
+    // Unified-memory backends may switch short SSD-MoE prefills to CPU while
+    // retaining or rebuilding dense accelerator weight copies for long runs.
+    virtual bool supports_moe_ssd_prefill_switching() const { return false; }
     virtual bool configure_moe_ssd_io(const std::string&, size_t, int, bool) {
         return false;
     }
