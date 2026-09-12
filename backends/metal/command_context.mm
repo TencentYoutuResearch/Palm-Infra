@@ -9,21 +9,12 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace {
-
-os_log_t signpost_log(os_log_t& storage) {
-    if (!storage)
-        storage = os_log_create("com.mollm.metal", "profiling");
-    return storage;
-}
-
-}  // namespace
-
 MetalCommandContext::MetalCommandContext(void* queue_handle,
                                          MetalBufferPool* pool)
     : queue((__bridge id<MTLCommandQueue>)queue_handle),
       profile(std::getenv("MOLLM_METAL_PROFILE") != nullptr),
-      pool_(pool) {}
+      pool_(pool),
+      signpost_log_(os_log_create("com.mollm.metal", "profiling")) {}
 
 MetalCommandContext::~MetalCommandContext() = default;
 
@@ -35,7 +26,7 @@ void MetalCommandContext::begin_graph() {
     ops_in_cmd = 0;
     chunk_graph = false;
     os_signpost_interval_begin(
-        signpost_log(signpost_log_), OS_SIGNPOST_ID_EXCLUSIVE, "graph");
+        signpost_log_, OS_SIGNPOST_ID_EXCLUSIVE, "graph");
 }
 
 id<MTLComputeCommandEncoder> MetalCommandContext::ensure_encoder() {
@@ -150,7 +141,7 @@ void MetalCommandContext::end_graph(bool& dispatch_failed) {
         pool_->release(pending.first, pending.second);
     pending_free.clear();
     os_signpost_interval_end(
-        signpost_log(signpost_log_), OS_SIGNPOST_ID_EXCLUSIVE, "graph");
+        signpost_log_, OS_SIGNPOST_ID_EXCLUSIVE, "graph");
 }
 
 void MetalCommandContext::release_or_defer(void* buffer, size_t bytes) {
