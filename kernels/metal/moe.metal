@@ -1814,6 +1814,66 @@ MOLLM_BG32_GROUPED_KERNEL(
 
 #endif // MOLLM_METAL_TENSOR
 
+// Small-M router kernels share the matmul specialization constant.
+constant int FC_SMALL_M [[function_constant(12)]];
+constant bool FC_SMALL_M_DEFINED =
+    is_function_constant_defined(FC_SMALL_M);
+
+inline void moe_select_sigmoid_token(
+    device const float* lp, device int* top_idx, device float* top_w,
+    constant MoeW4Params& p, device const float* bias, uint t) {
+    float chosen[16];int indices[16];for(int k=0;k<p.top_k;k++){chosen[k]=-INFINITY;indices[k]=0;}
+    const int epg=p.experts/max(p.n_group,1);float b0[16],b1[16];
+    for(int g=0;g<p.n_group;g++){b0[g]=-INFINITY;b1[g]=-INFINITY;}
+    for(int e=0;e<p.experts;e++){float s=1.0f/(1.0f+exp(-lp[e]))+bias[e];int g=e/max(epg,1);
+        if(s>b0[g]){b1[g]=b0[g];b0[g]=s;}else if(s>b1[g])b1[g]=s;}
+    bool keep[16];for(int g=0;g<p.n_group;g++)keep[g]=false;
+    for(int n=0;n<p.topk_group;n++){int bg=0;float bv=-INFINITY;for(int g=0;g<p.n_group;g++)
+        if(!keep[g]&&b0[g]+b1[g]>bv){bv=b0[g]+b1[g];bg=g;}keep[bg]=true;}
+    for(int e=0;e<p.experts;e++){if(!keep[e/max(epg,1)])continue;float c=1.0f/(1.0f+exp(-lp[e]))+bias[e];
+        for(int k=0;k<p.top_k;k++)if(c>chosen[k]){for(int j=p.top_k-1;j>k;j--){chosen[j]=chosen[j-1];indices[j]=indices[j-1];}
+            chosen[k]=c;indices[k]=e;break;}}
+    float sum=0.0f;for(int k=0;k<p.top_k;k++){chosen[k]=1.0f/(1.0f+exp(-lp[indices[k]]));sum+=chosen[k];}
+    float mul=p.routed_scale*((p.norm_topk&&sum>0.0f)?1.0f/sum:1.0f);
+    for(int k=0;k<p.top_k;k++){top_idx[t*p.top_k+k]=indices[k];top_w[t*p.top_k+k]=chosen[k]*mul;}
+}
+
+inline void moe_select_softmax_token(
+    device const float* lp, device int* top_idx, device float* top_w,
+    constant MoeW4Params& p, uint t) {
+    float chosen[16];
+    int indices[16];
+    for (int k = 0; k < p.top_k; ++k) {
+        chosen[k] = -INFINITY;
+        indices[k] = 0;
+    }
+    for (int e = 0; e < p.experts; ++e) {
+        const float value = lp[e];
+        for (int k = 0; k < p.top_k; ++k) {
+            if (value > chosen[k]) {
+                for (int j = p.top_k - 1; j > k; --j) {
+                    chosen[j] = chosen[j - 1];
+                    indices[j] = indices[j - 1];
+                }
+                chosen[k] = value;
+                indices[k] = e;
+                break;
+            }
+        }
+    }
+    const float maximum = chosen[0];
+    float sum = 0.0f;
+    for (int k = 0; k < p.top_k; ++k) {
+        chosen[k] = exp(chosen[k] - maximum);
+        sum += chosen[k];
+    }
+    const float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+    for (int k = 0; k < p.top_k; ++k) {
+        top_idx[t * p.top_k + k] = indices[k];
+        top_w[t * p.top_k + k] = chosen[k] * inverse;
+    }
+}
+
 // Resident-MoE decode preparation. Router GEMV and BG128 input quantization
 // are independent, so schedule both kinds of work in one dispatch. Router
 // threadgroups retain the same 8-SIMD-group parallelism as gemv2; the trailing
