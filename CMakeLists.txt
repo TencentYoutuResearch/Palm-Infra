@@ -346,7 +346,8 @@ if(MOLLM_METAL)
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/mollm.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/elementwise.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/layout.metal
-        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/normalization.metal)
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/normalization.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/recurrent.metal)
     set(MOLLM_METALLIB ${CMAKE_CURRENT_BINARY_DIR}/default.metallib)
 
     # Probe: does the toolchain support the Metal 4 tensor API (mpp::tensor_ops)?
