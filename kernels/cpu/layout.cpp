@@ -55,32 +55,18 @@ static inline void materialize_strided(const Tensor& src, void* dst) {
     }
 }
 
-void kernel_layout(const GraphNode& node,
+void kernel_layout(const LayoutParams& params,
                    const std::vector<const Tensor*>& inputs, Tensor* output) {
-    const OpType op = node.op_type;
-    const OpParams& params = node.params;
-    switch (op) {
-    case OpType::RESHAPE:
+    switch (params.op) {
+    case LayoutOp::RESHAPE:
         // Reshape preserves logical element order. For contiguous inputs this
         // is a zero-copy metadata change; for non-contiguous views we
         // materialize a contiguous output.
         //
-        // Output shape priority for each dim d:
-        //   - if node.dim_expr[d].is_dynamic(): use output->shape[d] (already
-        //     filled by execute_graph main loop via eval_dim)
-        //   - else: use params.i32[d] (build-time literal)
+        // Shape has already been resolved by the backend.
         if (!inputs.empty() && inputs[0] && output) {
             const Tensor& src = *inputs[0];
-            int64_t new_shape[4] = {output->shape[0], output->shape[1],
-                                    output->shape[2], output->shape[3]};
-            if (params.i32.size() >= 4) {
-                for (int d = 0; d < 4; d++) {
-                    if (!node.dim_expr[d].is_dynamic()) {
-                        new_shape[d] = params.i32[d];
-                    }
-                    // dynamic dims: preserve output->shape[d] (runtime-filled)
-                }
-            }
+            const auto& new_shape = params.shape;
 
             if (src.is_contiguous()) {
                 *output = src;
@@ -99,7 +85,7 @@ void kernel_layout(const GraphNode& node,
             }
         }
         break;
-    case OpType::CONCAT:
+    case LayoutOp::CONCAT:
         // Concatenate inputs along specified dimension. Materializes output and
         // respects input strides, so view inputs remain correct.
         //
@@ -112,7 +98,7 @@ void kernel_layout(const GraphNode& node,
         // This is correct regardless of whether the outer dims are contiguous
         // — we still iterate i1/i2/i3 with their respective strides.
         if (!inputs.empty() && output) {
-            int dim = graph_params::get_i32(params, 0, 0);
+            int dim = params.axis;
             size_t es = output->element_size();
             int64_t dim_offset = 0;
             char* dst_base = static_cast<char*>(output->data);
@@ -182,14 +168,13 @@ void kernel_layout(const GraphNode& node,
             }
         }
         break;
-    case OpType::SLICE:
+    case LayoutOp::SLICE:
         // zero-copy: slice produces a view of the parent and must preserve the
         // parent's stride layout.
         if (!inputs.empty() && inputs[0] && output) {
-            int dim = graph_params::get_i32(params, 0, 0);
-            int offset = graph_params::get_i32(params, 1, 0);
-            int size =
-                graph_params::get_i32(params, 2, (int)output->shape[dim]);
+            int dim = params.axis;
+            int offset = params.offset;
+            int size = params.size;
             *output = *inputs[0];
             if (offset >= 0) {
                 size_t byte_off = (size_t)offset * inputs[0]->stride[dim];
@@ -199,7 +184,7 @@ void kernel_layout(const GraphNode& node,
         }
         break;
 
-    case OpType::TILE:
+    case LayoutOp::TILE:
         // Tile: replicate input along each dimension by the given multipliers.
         //
         // Fast path for dim=2-only tile (common MLA case:
@@ -212,10 +197,7 @@ void kernel_layout(const GraphNode& node,
         if (!inputs.empty() && inputs[0] && output) {
             const Tensor& src = *inputs[0];
             size_t es = src.element_size();
-            int reps[4] = {1, 1, 1, 1};
-            for (int d = 0; d < 4 && d < (int)params.i32.size(); d++) {
-                reps[d] = params.i32[d];
-            }
+            const auto& reps = params.repeats;
             char* dst = static_cast<char*>(output->data);
             const char* s = static_cast<const char*>(src.data);
 
@@ -258,14 +240,14 @@ void kernel_layout(const GraphNode& node,
         }
         break;
 
-    case OpType::PERMUTE:
-        if (!inputs.empty() && inputs[0] && output && params.i32.size() >= 4) {
-            *output = inputs[0]->permute(params.i32[0], params.i32[1],
-                                         params.i32[2], params.i32[3]);
+    case LayoutOp::PERMUTE:
+        if (!inputs.empty() && inputs[0] && output) {
+            *output = inputs[0]->permute(params.order[0], params.order[1],
+                                         params.order[2], params.order[3]);
         }
         break;
 
-    case OpType::CONTIGUOUS:
+    case LayoutOp::CONTIGUOUS:
         // Materialize to row-major contiguous buffer.
         if (!inputs.empty() && inputs[0] && inputs[0]->data && output &&
             output->data) {
@@ -274,7 +256,7 @@ void kernel_layout(const GraphNode& node,
         break;
     default:
         std::fprintf(stderr, "layout: unsupported op_type %u\n",
-                     static_cast<unsigned>(op));
+                     static_cast<unsigned>(params.op));
         break;
     }
 }
