@@ -6,7 +6,6 @@
 #include "core/prepared_weight.h"
 #include "runtime/backend.h"
 #include "runtime/accelerator_backend.h"
-#include "backends/cpu/backend.h"
 #include "engine/sampler.h"
 #include "core/tensor.h"
 #include "runtime/threading.h"
@@ -137,6 +136,7 @@ struct VisionEmbedding {
 
 class LLMEngine {
 public:
+    LLMEngine();
     ~LLMEngine();
 
     /// Load prefill and decode graphs, initialise shared weights and KV caches.
@@ -290,7 +290,7 @@ private:
     ExecContext exec_ctx_vision_;
     ExecContext exec_ctx_mtp_;
     ThreadPool thread_pool_;
-    CPUBackend cpu_backend_;     // owned by engine; assigned to ExecContexts
+    std::unique_ptr<Backend> cpu_backend_;  // owned by engine; assigned to ExecContexts
     // Active graph-resident accelerator. The engine is deliberately unaware
     // of backend-specific resource types.
     std::unique_ptr<AcceleratorBackend> accelerator_backend_;

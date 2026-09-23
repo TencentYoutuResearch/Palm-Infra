@@ -1,6 +1,7 @@
 #include "backends/factory.h"
 
 #include "runtime/accelerator_backend.h"
+#include "backends/cpu/backend.h"
 
 #ifdef MOLLM_METAL
 #include "backends/metal/backend.h"
@@ -8,6 +9,10 @@
 #ifdef MOLLM_CUDA
 #include "backends/cuda/backend.h"
 #endif
+
+std::unique_ptr<Backend> create_cpu_backend() {
+    return std::make_unique<CPUBackend>();
+}
 
 std::unique_ptr<AcceleratorBackend> create_accelerator_backend(
     AcceleratorBackendKind kind, std::string& reason) {

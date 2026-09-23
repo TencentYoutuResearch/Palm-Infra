@@ -4,6 +4,9 @@
 #include <string>
 
 class AcceleratorBackend;
+class Backend;
+
+std::unique_ptr<Backend> create_cpu_backend();
 
 enum class AcceleratorBackendKind {
     METAL,

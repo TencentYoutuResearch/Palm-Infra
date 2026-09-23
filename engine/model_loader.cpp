@@ -89,6 +89,8 @@ volatile uint8_t g_package_warmup_sink = 0;
 
 }  // namespace
 
+LLMEngine::LLMEngine() : cpu_backend_(create_cpu_backend()) {}
+
 LLMEngine::~LLMEngine() {
     clear_model_state();
 }
@@ -1043,10 +1045,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         cfg_.moe_ssd_cross_layer_prefetch;
     exec_ctx_decode_.moe_hash_cross_layer_prefetch =
         exec_ctx_decode_.moe_cross_layer_prefetch;
-    exec_ctx_prefill_.backend = &cpu_backend_;
-    exec_ctx_decode_.backend = &cpu_backend_;
-    exec_ctx_vision_.backend = &cpu_backend_;
-    exec_ctx_mtp_.backend = &cpu_backend_;
+    exec_ctx_prefill_.backend = cpu_backend_.get();
+    exec_ctx_decode_.backend = cpu_backend_.get();
+    exec_ctx_vision_.backend = cpu_backend_.get();
+    exec_ctx_mtp_.backend = cpu_backend_.get();
     exec_ctx_prefill_.moe_backend = nullptr;
     exec_ctx_decode_.moe_backend = nullptr;
     exec_ctx_vision_.moe_backend = nullptr;
@@ -1084,7 +1086,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             // (including cross-layer prefetch) for token generation.
             exec_ctx_decode_.backend =
                 cfg_.moe_ssd_cache_bytes != 0 && !cfg_.metal_ssd_full
-                ? static_cast<Backend*>(&cpu_backend_)
+                ? cpu_backend_.get()
                 : accelerator_backend_.get();
             exec_ctx_mtp_.backend = exec_ctx_decode_.backend;
         }
@@ -1189,10 +1191,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                         "--metal-ssd-full\n");
                 return false;
             }
-            exec_ctx_prefill_.backend = &cpu_backend_;
-            exec_ctx_decode_.backend = &cpu_backend_;
-            exec_ctx_vision_.backend = &cpu_backend_;
-            exec_ctx_mtp_.backend = &cpu_backend_;
+            exec_ctx_prefill_.backend = cpu_backend_.get();
+            exec_ctx_decode_.backend = cpu_backend_.get();
+            exec_ctx_vision_.backend = cpu_backend_.get();
+            exec_ctx_mtp_.backend = cpu_backend_.get();
             const bool metal_hybrid =
                 cfg_.device == Device::METAL &&
                 cfg_.moe_ssd_cache_bytes != 0;
