@@ -1,5 +1,7 @@
 #include "backends/cpu/deepseek_v4_ops.h"
 
+#include "graph/graph.h"
+
 #include "kernels/cpu/models/deepseek_v4_attention.h"
 
 #include <algorithm>

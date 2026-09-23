@@ -1,5 +1,7 @@
 #include "backends/cpu/recurrent_ops.h"
 
+#include "graph/graph.h"
+
 #include "kernels/cpu/models/rwkv.h"
 #include "kernels/cpu/recurrent/gdn.h"
 #include "kernels/cpu/recurrent/shortconv.h"

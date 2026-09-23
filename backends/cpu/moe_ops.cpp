@@ -1,5 +1,7 @@
 #include "backends/cpu/moe_ops.h"
 
+#include "graph/graph.h"
+
 #include "kernels/cpu/moe/moe.h"
 
 bool dispatch_cpu_moe(

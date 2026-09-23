@@ -1,5 +1,7 @@
 #include "backends/cpu/normalization_ops.h"
 
+#include "graph/graph.h"
+
 #include "kernels/cpu/gated_residual.h"
 #include "kernels/cpu/norm.h"
 #include "kernels/cpu/rope.h"

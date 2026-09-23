@@ -1,4 +1,5 @@
 #include "backends/cpu/platform.h"
+#include "runtime/threading.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -54,9 +55,15 @@ const char* isa_name() {
     return capabilities().arm_i8mm ? "arm-neon-i8mm" : "arm-neon";
 }
 
-void relax() {
+}  // namespace mollm::cpu
+
+// Implemented at global scope: the contract is declared by runtime/threading.h,
+// which ThreadPool uses and which must not depend on a CPU-backend namespace.
+void worker_relax() {
     __asm__ __volatile__("yield" ::: "memory");
 }
+
+namespace mollm::cpu {
 
 bool matmul_int4_packed(const Tensor&, const Tensor&, Tensor&, int, int,
                         ThreadPool*) {

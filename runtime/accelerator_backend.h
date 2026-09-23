@@ -42,6 +42,15 @@ enum class PersistentHostAccess {
     NONE,
 };
 
+// NOTE on implementation status: these modes describe the capability a caller
+// needs, not a guarantee that every backend currently differentiates them.
+// A backend whose persistent storage is host-shared (Metal, via
+// MTLResourceStorageModeShared) satisfies all four identically and may ignore
+// host_access/host_prefix_bytes. Callers must still route every update through
+// the Backend transfer/zero methods: that is correct for both a shared
+// allocation and a future discrete one, and keeps storage policy a backend
+// decision.
+
 // Common lifecycle for graph-resident accelerator backends. LLMEngine only
 // talks to this interface; Metal and future device backends own their
 // resource representation and transfer policy behind it.

@@ -14,6 +14,13 @@
 // CLI/API thread counts continue to override this value.
 int default_worker_threads();
 
+// Hint emitted while a worker spin-waits for its peers. The instruction is
+// architecture-specific (ARM `yield`, x86 `_mm_pause`) and is therefore
+// implemented by the CPU platform providers rather than here, so that no
+// foreign assembly reaches an unrelated target compiler. Declared in the
+// runtime layer because ThreadPool is the only consumer.
+void worker_relax();
+
 class ThreadPool {
 public:
     using ParallelForFn = std::function<void(int thread_id, int begin, int end)>;

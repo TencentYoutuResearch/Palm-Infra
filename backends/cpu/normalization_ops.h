@@ -1,7 +1,10 @@
 #pragma once
 
-#include "graph/graph.h"
+#include "core/tensor.h"
 
+#include <vector>
+
+struct GraphNode;
 class ThreadPool;
 
 bool dispatch_cpu_normalization(
