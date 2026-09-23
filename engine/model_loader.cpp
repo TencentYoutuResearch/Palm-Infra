@@ -3,7 +3,7 @@
 #include "storage/byte_ranges.h"
 #include "engine/weight_metadata.h"
 
-#include "kernels/cpu/matmul/matmul.h"
+#include "runtime/host_compute.h"
 #include "storage/ssd_expert_cache/cache.h"
 #include "runtime/trace.h"
 #include <algorithm>
@@ -643,12 +643,12 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                 // their own prepared layouts. Avoid duplicating CPU sidecars
                 // unless the selected backend still needs reference fallback.
                 if (build_cpu_weight_sidecars) {
-                    prepare_matmul_weight(
+                    host_prepare_matmul_weight(
                         t, wref, data, packed_weights_, prepared_weights_,
                         !lookup_table,
                         native_fp8_weight_nodes.count(node.id) == 0);
                     if (native_fp8_weight_nodes.count(node.id) != 0)
-                        prepare_fp8_bf16_fp16_weight(
+                        host_prepare_fp8_bf16_fp16_weight(
                             t, wref, data, packed_weights_);
                 }
                 // Once a CPU sidecar owns every value needed by the selected
@@ -718,12 +718,12 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             node.params.str[0].find("vision_pos_embed.weights") !=
                 std::string::npos;
         if (build_cpu_weight_sidecars) {
-            prepare_matmul_weight(
+            host_prepare_matmul_weight(
                 t, wpath, t.data, packed_weights_, prepared_weights_,
                 !lookup_table,
                 native_fp8_weight_nodes.count(node.id) == 0);
             if (native_fp8_weight_nodes.count(node.id) != 0)
-                prepare_fp8_bf16_fp16_weight(
+                host_prepare_fp8_bf16_fp16_weight(
                     t, wpath, t.data, packed_weights_);
         }
         finalize_accelerator_weight();
