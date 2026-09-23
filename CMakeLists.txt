@@ -60,7 +60,8 @@ endif()
 # ---------------------------------------------------------------------------
 
 set(SOURCES
-    # portable backend helpers
+    # Metal-specific weight conversion is written in portable C++ so it can
+    # also be validated by the CPU-only test target.
     backends/metal/weight_layout.cpp
     # runtime
     runtime/host_buffer_pool.cpp
@@ -72,7 +73,6 @@ set(SOURCES
     storage/ssd_expert_cache/provider.cpp
     storage/ssd_expert_cache/cache.cpp
     storage/ssd_expert_cache/io.cpp
-    storage/ssd_expert_cache/predict.cpp
     # graph
     graph/io.cpp
     backends/cpu/attention_ops.cpp
@@ -84,6 +84,7 @@ set(SOURCES
     backends/cpu/moe_ops.cpp
     backends/cpu/normalization_ops.cpp
     backends/cpu/recurrent_ops.cpp
+    backends/cpu/ssd_prefetch.cpp
     graph/execute.cpp
     # kernels
     kernels/cpu/matmul/matmul.cpp
