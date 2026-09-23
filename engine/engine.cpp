@@ -2,7 +2,7 @@
 #include "engine/input_prep.h"
 #include "engine/sampler.h"
 #include "core/fp16.h"
-#include "kernels/cpu/matmul/matmul.h"
+#include "runtime/host_compute.h"
 #include "runtime/trace.h"
 #include <algorithm>
 #include <cassert>
@@ -459,7 +459,7 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
             activation, *lm_head_weight_, C.ptr<float>(), vocab_size,
             hidden_dim);
     } else {
-        kernel_matmul_fp32(A, *lm_head_weight_, C,
+        host_matmul_fp32(A, *lm_head_weight_, C,
                            exec_ctx_decode_.thread_pool);
     }
 
@@ -543,7 +543,7 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
                 activation, *lm_head_weight_, C.ptr<float>(), vocab_size,
                 hidden_dim);
         } else {
-            kernel_matmul_fp32(A, *lm_head_weight_, C,
+            host_matmul_fp32(A, *lm_head_weight_, C,
                                exec_ctx_decode_.thread_pool);
         }
     }
@@ -1138,7 +1138,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
         return Tensor();
     }
 
-    mollm_set_matmul_profile_phase("prefill_graph");
+    host_set_matmul_profile_phase("prefill_graph");
     std::vector<int32_t> graph_token_ids(
         static_cast<size_t>(h.shape[1]), 0);
     std::copy(token_ids.begin(), token_ids.end(), graph_token_ids.begin());
@@ -1190,7 +1190,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
             accelerator_backend_->end_graph();
         }
     }
-    mollm_set_matmul_profile_phase("unscoped");
+    host_set_matmul_profile_phase("unscoped");
     Tensor copied;
     if (out.data && !exec_ctx_prefill_.backend->dispatch_failed())
         copied = copy_tensor_contiguous(
@@ -1301,7 +1301,7 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
         return -1;
     }
 
-    mollm_set_matmul_profile_phase("prefill_graph");
+    host_set_matmul_profile_phase("prefill_graph");
     std::vector<int32_t> graph_token_ids(
         static_cast<size_t>(h.shape[1]), 0);
     std::copy(token_ids.begin(), token_ids.end(), graph_token_ids.begin());
@@ -1348,9 +1348,9 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     // Cache migration (prefill→decode graph) is done once at load time.
     // Both graphs share the same physical cache buffers.
 
-    mollm_set_matmul_profile_phase("prefill_lmhead");
+    host_set_matmul_profile_phase("prefill_lmhead");
     int token = run_lmhead(out, n);
-    mollm_set_matmul_profile_phase("unscoped");
+    host_set_matmul_profile_phase("unscoped");
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
@@ -1383,7 +1383,7 @@ int LLMEngine::decode(int token_id) {
         lm_head_weight_ &&
         accelerator_backend_->supports_lm_head(*lm_head_weight_);
 
-    mollm_set_matmul_profile_phase("decode_graph");
+    host_set_matmul_profile_phase("decode_graph");
     int32_t graph_token_id = token_id;
     Tensor token_tensor = Tensor::create(
         Precision::INT32, MemoryType::EXTERNAL,
@@ -1426,10 +1426,10 @@ int LLMEngine::decode(int token_id) {
     }
     past_len_ = next_past;
 
-    mollm_set_matmul_profile_phase("decode_lmhead");
+    host_set_matmul_profile_phase("decode_lmhead");
     sampler_.accept(token_id);
     int token = run_lmhead(out, 1, defer_accelerator_lmhead);
-    mollm_set_matmul_profile_phase("unscoped");
+    host_set_matmul_profile_phase("unscoped");
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
@@ -1668,7 +1668,7 @@ Tensor LLMEngine::decode_hidden(int token_id) {
 
     Tensor mask = build_causal_mask(1, past_len_);
 
-    mollm_set_matmul_profile_phase("decode_graph");
+    host_set_matmul_profile_phase("decode_graph");
     int32_t graph_token_id = token_id;
     Tensor token_tensor = Tensor::create(
         Precision::INT32, MemoryType::EXTERNAL,
@@ -1676,7 +1676,7 @@ Tensor LLMEngine::decode_hidden(int token_id) {
     Tensor out = run_graph(
         graph_decode_, exec_ctx_decode_, h, mask, cos, sin,
         &token_tensor);
-    mollm_set_matmul_profile_phase("unscoped");
+    host_set_matmul_profile_phase("unscoped");
     Tensor copied;
     if (out.data)
         copied = copy_tensor_contiguous(

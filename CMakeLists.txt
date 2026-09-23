@@ -77,6 +77,7 @@ set(SOURCES
     graph/io.cpp
     backends/cpu/attention_ops.cpp
     backends/cpu/backend.cpp
+    backends/cpu/host_compute.cpp
     backends/cpu/deepseek_v4_ops.cpp
     backends/cpu/layout_ops.cpp
     backends/cpu/matmul_ops.cpp
@@ -158,6 +159,7 @@ set(PUBLIC_RUNTIME_HEADERS
     runtime/threading.h
     runtime/trace.h
     runtime/host_buffer_pool.h
+    runtime/host_compute.h
 )
 
 set(PUBLIC_CPU_BACKEND_HEADERS
