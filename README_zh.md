@@ -285,13 +285,20 @@ tower 带来的包体与常驻内存开销。
 ## 项目结构
 
 ```text
-mollm/
-├── kernels/    matmul、attention、MoE、norm、rope 的 ARM kernel
-├── graph/      计算图格式、执行器、mmap 包加载、BufferPool
-├── engine/     LLMEngine、tokenizer、对话/生成生命周期
+Palm-Infra/
+├── core/       Tensor、量化布局与跨后端算子参数
+├── runtime/    Backend 接口、线程池、主机计算接口与缓冲池
+├── storage/    mmap、文件区间与 SSD expert 缓存
+├── graph/      计算图格式、序列化与执行器
+├── engine/     LLMEngine、模型加载、tokenizer 与生成流程
+├── backends/   CPU、CUDA、Metal 的资源管理与算子调度
+├── kernels/    按 cpu/、cuda/、metal/ 划分的数值实现
 ├── models/     Python 转换器与计算图构建器
-├── examples/   mollm_chat、mollm_server、mollm_bench、mollm_ppl
-└── tests/      单元、压力与端到端测试
+├── examples/   CLI、服务端和性能评估程序
+├── tools/      独立开发工具
+├── tests/      单元、后端与端到端测试
+├── compat/     旧 include 路径的转发头文件
+└── cmake/      安装包与下游项目构建支持
 ```
 
 ## 路线图
