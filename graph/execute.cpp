@@ -1,7 +1,6 @@
 #include "graph/execute.h"
 #include "runtime/backend.h"
 #include "core/bf16.h"
-#include "kernels/cpu/moe/moe.h"
 #include "storage/ssd_expert_cache/cache.h"
 #include "core/tensor.h"
 #include "runtime/trace.h"

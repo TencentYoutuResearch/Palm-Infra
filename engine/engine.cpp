@@ -984,7 +984,7 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         // later long prompt can reuse them without VM/allocation churn.
         release_graph_temporaries(graph_prefill_, saved_prefill_backend);
         invalidate_workspace_key(exec_ctx_prefill_);
-        exec_ctx_prefill_.backend = &cpu_backend_;
+        exec_ctx_prefill_.backend = cpu_backend_.get();
     } else {
         prepare_accelerator_prefill_weights();
     }
@@ -1078,7 +1078,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     if (short_ssd_cpu_prefill) {
         release_graph_temporaries(graph_prefill_, saved_prefill_backend);
         invalidate_workspace_key(exec_ctx_prefill_);
-        exec_ctx_prefill_.backend = &cpu_backend_;
+        exec_ctx_prefill_.backend = cpu_backend_.get();
     } else {
         prepare_accelerator_prefill_weights();
     }
