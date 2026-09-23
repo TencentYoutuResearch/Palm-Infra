@@ -1,4 +1,5 @@
 #include "backends/cpu/platform.h"
+#include "runtime/threading.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/matmul/matmul_internal.h"
 
@@ -16,12 +17,18 @@ const char* isa_name() {
     return "scalar";
 }
 
-void relax() {
-    // Correctness-first backend: yielding avoids embedding an architecture
-    // instruction in common worker-pool code.  An x86 microkernel provider
-    // can replace this with pause later without changing callers.
+}  // namespace mollm::cpu
+
+// Implemented at global scope: the contract is declared by runtime/threading.h,
+// which ThreadPool uses and which must not depend on a CPU-backend namespace.
+void worker_relax() {
+    // Correctness-first provider: yielding avoids embedding an architecture
+    // instruction in common worker-pool code. The x86 provider overrides this
+    // with pause without changing callers.
     std::this_thread::yield();
 }
+
+namespace mollm::cpu {
 
 namespace {
 

@@ -1,5 +1,7 @@
 #include "backends/cpu/matmul_ops.h"
 
+#include "graph/graph.h"
+
 #include "kernels/cpu/matmul/matmul.h"
 
 void dispatch_cpu_matmul(

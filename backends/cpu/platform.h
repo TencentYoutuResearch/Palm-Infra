@@ -55,10 +55,8 @@ struct Capabilities {
 const Capabilities& capabilities();
 const char* isa_name();
 
-// Hint while polling a CPU worker.  The ARM and scalar implementations live
-// in separately selected translation units so no foreign assembly reaches a
-// target compiler.
-void relax();
+// worker_relax() is declared by runtime/threading.h: the CPU providers
+// implement it, but its contract belongs to the worker pool that calls it.
 
 // Handle a package-native packed INT4 matrix when the selected CPU provider
 // has a portable decoder.  Returning false leaves the normal matmul dispatch

@@ -122,9 +122,15 @@ const char* isa_name() {
     return dispatch().name;
 }
 
-void relax() {
+}  // namespace mollm::cpu
+
+// Implemented at global scope: the contract is declared by runtime/threading.h,
+// which ThreadPool uses and which must not depend on a CPU-backend namespace.
+void worker_relax() {
     _mm_pause();
 }
+
+namespace mollm::cpu {
 
 bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
                         int ldc, ThreadPool* thread_pool) {

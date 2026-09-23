@@ -292,6 +292,17 @@ void MetalBackend::wrap_weight_int4(Tensor& t, bool keep_native_experts) {
 void MetalBackend::alloc_persistent(
     Tensor& t, size_t nbytes, PersistentHostAccess host_access,
     size_t host_prefix_bytes) {
+    // Metal currently backs every persistent allocation with a
+    // MTLResourceStorageModeShared buffer, and MetalResourceStore::alloc_persistent
+    // exposes its contents through t.data. The host can therefore read and write
+    // any part of the allocation, which satisfies all PersistentHostAccess modes
+    // equally. host_access and host_prefix_bytes are deliberately unused rather
+    // than forgotten: the transfer methods below still keep the host and device
+    // views coherent, so callers must go through them regardless.
+    //
+    // If a future backend moves KV/state storage to Private or Managed mode,
+    // this is the place that must start honouring host_prefix_bytes (to size a
+    // host mirror) and must stop publishing t.data for NONE.
     (void)host_access;
     (void)host_prefix_bytes;
     if (impl_->resources) impl_->resources->alloc_persistent(t, nbytes);

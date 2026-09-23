@@ -1,5 +1,7 @@
 #include "backends/cpu/attention_ops.h"
 
+#include "graph/graph.h"
+
 #include "kernels/cpu/attention.h"
 
 bool dispatch_cpu_attention(

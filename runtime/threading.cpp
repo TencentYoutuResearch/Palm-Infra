@@ -1,5 +1,4 @@
 #include "runtime/threading.h"
-#include "backends/cpu/platform.h"
 
 #include <algorithm>
 #include <chrono>
@@ -191,7 +190,7 @@ void ThreadPool::parallel_for_impl(int begin, int end, int grain_size, ParallelF
 
     // Spin-wait for workers to finish.
     while (pending_workers_.load(std::memory_order_acquire) > 0) {
-        mollm::cpu::relax();
+        worker_relax();
     }
     job_.fn = nullptr;
 }
@@ -270,7 +269,7 @@ void ThreadPool::parallel_for_2d_impl(int m_total, int m_tile_size,
 
     // Spin-wait for workers
     while (pending_workers_.load(std::memory_order_acquire) > 0) {
-        mollm::cpu::relax();
+        worker_relax();
     }
     job_.fn_2d = nullptr;
 }
@@ -293,7 +292,7 @@ void ThreadPool::worker_loop(int thread_id) {
                 });
                 continue;
             }
-            mollm::cpu::relax();
+            worker_relax();
         }
 
         // Read job

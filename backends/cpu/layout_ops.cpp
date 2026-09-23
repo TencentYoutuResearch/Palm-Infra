@@ -1,5 +1,7 @@
 #include "backends/cpu/layout_ops.h"
 
+#include "graph/graph.h"
+
 #include "kernels/cpu/layout.h"
 
 #include <algorithm>
