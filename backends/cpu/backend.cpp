@@ -122,6 +122,44 @@ void CPUBackend::dispatch(const GraphNode& node,
             reject();
         }
         break;
+    case OpType::HC_HEAD_ID:
+        if (has_inputs(4) && output) {
+            if (!kernel_hc_head_id(
+                *inputs[0], *inputs[1], *inputs[2], *inputs[3], *output,
+                graph_params::get_i32(params, 0, 0),
+                graph_params::get_i32(params, 1, 4),
+                graph_params::get_f32(params, 0, 1e-6f),
+                graph_params::get_f32(params, 1, 1e-6f), thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::HC_PRE_ID:
+        if (has_inputs(4) && output) {
+            if (!kernel_hc_pre_id(
+                *inputs[0], *inputs[1], *inputs[2], *inputs[3], *output,
+                graph_params::get_i32(params, 0, 0),
+                graph_params::get_i32(params, 1, 4),
+                graph_params::get_f32(params, 0, 2.0f),
+                graph_params::get_f32(params, 1, 1e-6f),
+                graph_params::get_f32(params, 2, 1e-6f), thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::HC_POST_ID:
+        if (has_inputs(3) && output) {
+            if (!kernel_hc_post_id(
+                *inputs[0], *inputs[1], *inputs[2], *output,
+                graph_params::get_i32(params, 0, 0),
+                graph_params::get_i32(params, 1, 4), thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
     case OpType::GR_REDUCE:
         if (has_inputs(2) && output) {
             if (!kernel_gr_reduce(

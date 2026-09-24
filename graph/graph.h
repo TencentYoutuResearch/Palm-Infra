@@ -128,6 +128,11 @@ enum class OpType : uint32_t {
     PLE_LOOKUP           = 135,
     PLE_GATE             = 136,
     PLE_DILATED_CONV     = 137,
+    // Hy4 identity Hyper-Connections. Same tensor layouts as HC_PRE/POST/HEAD
+    // but no Sinkhorn mixing matrix; see kernels/cpu/hyper_connection.h.
+    HC_PRE_ID            = 138,
+    HC_POST_ID           = 139,
+    HC_HEAD_ID           = 141,
     DSV4_COMPRESSOR      = 160,
     DSV4_INDEXER         = 161,
     DSV4_SPARSE_ATTN     = 162,
@@ -188,6 +193,9 @@ inline const char* op_type_name(OpType op) {
     case OpType::PLE_LOOKUP: return "PLE_LOOKUP";
     case OpType::PLE_GATE: return "PLE_GATE";
     case OpType::PLE_DILATED_CONV: return "PLE_DILATED_CONV";
+    case OpType::HC_PRE_ID: return "HC_PRE_ID";
+    case OpType::HC_POST_ID: return "HC_POST_ID";
+    case OpType::HC_HEAD_ID: return "HC_HEAD_ID";
     case OpType::DSV4_COMPRESSOR: return "DSV4_COMPRESSOR";
     case OpType::DSV4_INDEXER: return "DSV4_INDEXER";
     case OpType::DSV4_SPARSE_ATTN: return "DSV4_SPARSE_ATTN";
