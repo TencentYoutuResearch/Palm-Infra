@@ -84,11 +84,14 @@ static inline float dot_fp32_neon(const float* a, const float* b, int d) {
 // Decode kernel: M=1, Bc=32, online softmax
 static void flash_attn_fp32_decode(
     const float* Q, const float* K, const float* V, float* O,
-    int N, int d_k, int d_v, float scale, const float* mask)
+    int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink = nullptr)
 {
     const int Bc = 32;
-    float m = -FLT_MAX;
-    float l = 0.f;
+    // A per-head sink is one extra logit appended to the score vector. It has
+    // no value row, so it seeds the running max but never the numerator.
+    float m = sink ? *sink : -FLT_MAX;
+    float l = sink ? fast_exp_f32(*sink - m) : 0.f;
     memset(O, 0, d_v * sizeof(float));
 
     for (int jb = 0; jb < N; jb += Bc) {
@@ -143,14 +146,21 @@ static void flash_attn_fp32_decode(
 // Prefill kernel: Br=4, Bc=32, 2D tiled with online softmax
 static void flash_attn_fp32_prefill(
     const float* Q, const float* K, const float* V, float* O,
-    int M, int N, int d_k, int d_v, float scale, const float* mask)
+    int M, int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink = nullptr)
 {
     const int Br = 4;
     const int Bc = 32;
     float* row_m = (float*)malloc(M * sizeof(float));
     float* row_l = (float*)malloc(M * sizeof(float));
     memset(O, 0, M * d_v * sizeof(float));
-    for (int i = 0; i < M; i++) { row_m[i] = -FLT_MAX; row_l[i] = 0.f; }
+    // Seed the running max and denominator with the per-head sink logit, which
+    // behaves as a virtual extra key with no value row. With the sink as the
+    // initial max, its own contribution to the denominator is exp(0) = 1.
+    for (int i = 0; i < M; i++) {
+        row_m[i] = sink ? *sink : -FLT_MAX;
+        row_l[i] = sink ? 1.f : 0.f;
+    }
 
     for (int jb = 0; jb < N; jb += Bc) {
         const int bc = (jb + Bc <= N) ? Bc : (N - jb);
@@ -464,12 +474,15 @@ static inline void dot_fp16_8x(const __fp16* Q,
 // Q/K/V are FP16 (caller converts from FP32). O is FP32 output.
 static void flash_attn_fp16_decode(
     const __fp16* Q, const __fp16* K, const __fp16* V, float* O,
-    int N, int d_k, int d_v, float scale, const float* mask)
+    int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink = nullptr)
 {
     const int Bc = 64;
 
-    float m = -FLT_MAX;
-    float l = 0.f;
+    // A per-head sink is a virtual extra key logit: it seeds the running max
+    // and denominator but has no value row, so it never enters the numerator.
+    float m = sink ? *sink : -FLT_MAX;
+    float l = sink ? 1.f : 0.f;
 
     // O accumulator in FP32 (stays in registers for inner PV loop)
     float O_buf[256];
@@ -678,7 +691,8 @@ static void flash_attn_fp16_decode(
 // but uses FP16FML for dot product and PV accumulation.
 static void flash_attn_fp16_prefill(
     const __fp16* Q, const __fp16* K, const __fp16* V, float* O,
-    int M, int N, int d_k, int d_v, float scale, const float* mask)
+    int M, int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink = nullptr)
 {
     // Rewritten kernel (尝试 27): Br=8, Bc=64, register-tiled PV.
     //
@@ -699,7 +713,12 @@ static void flash_attn_fp16_prefill(
     float* row_m = (float*)malloc(M * sizeof(float));
     float* row_l = (float*)malloc(M * sizeof(float));
     memset(O, 0, M * d_v * sizeof(float));
-    for (int i = 0; i < M; i++) { row_m[i] = -FLT_MAX; row_l[i] = 0.f; }
+    // Seed the running max/denominator with the per-head sink logit; as the
+    // initial max its own denominator contribution is exp(0) = 1.
+    for (int i = 0; i < M; i++) {
+        row_m[i] = sink ? *sink : -FLT_MAX;
+        row_l[i] = sink ? 1.f : 0.f;
+    }
 
     for (int jb = 0; jb < N; jb += Bc) {
         const int bc = (jb + Bc <= N) ? Bc : (N - jb);
@@ -1183,13 +1202,17 @@ void kernel_sdpa(const SdpaParams& params,
                     for (; i < q_size; i++) Q_h16[i] = (__fp16)Q_head[i];
                 }
 
+                // Sinks are per query head, not per KV head.
+                const float* head_sink = params.sink ? &params.sink[h] : nullptr;
+
                 if (src_seqlen == 1) {
                     flash_attn_fp16_decode(Q_h16, K_head, V_head, O_head,
-                                           dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);
+                                           dst_seqlen, head_dim, v_head_dim, scale, mask_ptr,
+                                           head_sink);
                 } else {
                     flash_attn_fp16_prefill(Q_h16, K_head, V_head, O_head,
                                             src_seqlen, dst_seqlen, head_dim, v_head_dim,
-                                            scale, mask_ptr);
+                                            scale, mask_ptr, head_sink);
                 }
             } else {
                 // FP32 cache fallback
@@ -1197,13 +1220,17 @@ void kernel_sdpa(const SdpaParams& params,
                 const float* K_head = (const float*)get_k_ptr(kv_h);
                 const float* V_head = (const float*)get_v_ptr(kv_h);
 
+                // Sinks are per query head, not per KV head.
+                const float* head_sink = params.sink ? &params.sink[h] : nullptr;
+
                 if (src_seqlen == 1) {
                     flash_attn_fp32_decode(Q_head, K_head, V_head, O_head,
-                                           dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);
+                                           dst_seqlen, head_dim, v_head_dim, scale, mask_ptr,
+                                           head_sink);
                 } else {
                     flash_attn_fp32_prefill(Q_head, K_head, V_head, O_head,
                                             src_seqlen, dst_seqlen, head_dim, v_head_dim,
-                                            scale, mask_ptr);
+                                            scale, mask_ptr, head_sink);
                 }
             }
         }
