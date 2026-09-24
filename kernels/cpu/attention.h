@@ -33,3 +33,22 @@ void kernel_sdpa(const SdpaParams& params,
                  const std::vector<const Tensor*>& inputs,
                  std::vector<Tensor*>& outputs,
                  ThreadPool* thread_pool = nullptr);
+
+/// Sparse SDPA driven by a precomputed key selection.
+///
+/// Identical to kernel_sdpa in every respect except that each query position
+/// attends only to the cache positions named by `selection`. This is Hy4's
+/// Gated DeepSeek Sparse Attention consumer: the selection comes from
+/// kernel_hy4_indexer and is shared across consecutive layers by IndexCache.
+///
+/// Inputs match kernel_sdpa, plus one trailing entry:
+///   [.. , K_cache, V_cache, selection]
+/// where `selection` is INT32 [top_k, seq]; -1 marks an unused slot and rank
+/// order is by descending score.
+///
+/// kernel_sdpa itself is untouched, so the dense path carries no risk from
+/// this addition. The two share the underlying flash-attention kernels.
+void kernel_sdpa_sparse(const SdpaParams& params,
+                        const std::vector<const Tensor*>& inputs,
+                        std::vector<Tensor*>& outputs,
+                        ThreadPool* thread_pool = nullptr);

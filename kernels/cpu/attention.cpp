@@ -1018,6 +1018,63 @@ static void naive_sdpa_head_fp16_cache(
 // kernel_sdpa
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Sparse SDPA (Hy4 Gated DeepSeek Sparse Attention)
+//
+// A selection is INT32 [width, seq]: one ranked list of cache positions per
+// query position, descending by score, with -1 padding the unused tail.
+//
+// The selection is per query position, which rules out a flat membership
+// table, and the lists are long (Hy4: 2048), so testing each of the N cache
+// positions for membership would cost more than dense attention. The only
+// workable shape is index-driven: visit the selected positions directly.
+//
+// flash_attn_* walks a contiguous 0..N-1 key range, so the selected keys are
+// gathered into compact per-head buffers first and the existing kernels then
+// run unmodified over width entries instead of N. That keeps the numerical
+// path identical to the dense one and lets the two be validated separately.
+//
+// Cost note: the gather copies width keys per query position. For decode
+// (seq 1) that is negligible; for prefill it is width * head_dim * seq bytes,
+// which is why prefill sparse is the expensive direction.
+// ---------------------------------------------------------------------------
+
+// Gather the selected keys/values for one query position and head into
+// contiguous scratch, in rank order. Returns the number of entries written.
+// `mask_out`, when given, receives the additive causal mask for the gathered
+// entries: 0 for a visible position and -inf for one that is not. Causality is
+// re-applied here rather than assumed, because the selection may name future
+// positions (the kernel must not silently attend to them).
+inline int gather_selected_kv(
+    const int32_t* token_selection, int width, int capacity,
+    int visible_limit,
+    const void* k_head, const void* v_head, size_t element_bytes,
+    int head_dim, int v_head_dim,
+    std::vector<uint8_t>& k_out, std::vector<uint8_t>& v_out,
+    std::vector<float>* mask_out) {
+    const uint8_t* k_src = static_cast<const uint8_t*>(k_head);
+    const uint8_t* v_src = static_cast<const uint8_t*>(v_head);
+    const size_t k_row = static_cast<size_t>(head_dim) * element_bytes;
+    const size_t v_row = static_cast<size_t>(v_head_dim) * element_bytes;
+    int count = 0;
+    for (int rank = 0; rank < width; ++rank) {
+        const int position = token_selection[rank];
+        if (position < 0)
+            break;                       // -1 marks the start of the tail
+        if (position >= capacity)
+            continue;                    // beyond the valid cache range
+        std::memcpy(k_out.data() + static_cast<size_t>(count) * k_row,
+                    k_src + static_cast<size_t>(position) * k_row, k_row);
+        std::memcpy(v_out.data() + static_cast<size_t>(count) * v_row,
+                    v_src + static_cast<size_t>(position) * v_row, v_row);
+        if (mask_out)
+            (*mask_out)[static_cast<size_t>(count)] =
+                (position <= visible_limit) ? 0.0f : -INFINITY;
+        ++count;
+    }
+    return count;
+}
+
 void kernel_sdpa(const SdpaParams& params,
                  const std::vector<const Tensor*>& inputs,
                  std::vector<Tensor*>& outputs,
@@ -1305,5 +1362,226 @@ void kernel_sdpa(const SdpaParams& params,
         V_cache_out->shape[1] = dst_seqlen;
         V_cache_out->stride[2] = V_cache_out->stride[1] * dst_seqlen;
         V_cache_out->stride[3] = V_cache_out->stride[2];
+    }
+}
+
+void kernel_sdpa_sparse(const SdpaParams& params,
+                        const std::vector<const Tensor*>& inputs,
+                        std::vector<Tensor*>& outputs,
+                        ThreadPool* thread_pool) {
+    const int kv_cache     = params.kv_cache;
+    const int num_heads    = params.num_heads;
+    const int num_kv_heads = params.num_kv_heads;
+    const int head_dim     = params.head_dim;
+    const int v_head_dim   = params.v_head_dim;
+    float scale = params.scale;
+    if (scale == 0.f) scale = 1.f / std::sqrt(static_cast<float>(head_dim));
+    if (num_kv_heads <= 0 || num_heads % num_kv_heads != 0) {
+        std::fprintf(stderr, "SDPA_SPARSE: invalid head counts\n");
+        return;
+    }
+    const int heads_per_group = num_heads / num_kv_heads;
+
+    // The selection is the trailing input; without it this entry has no
+    // reason to exist, so fall back to the dense kernel rather than guess.
+    const Tensor* selection =
+        (inputs.size() > 6 && inputs[6] && inputs[6]->data) ? inputs[6] : nullptr;
+    if (!selection) {
+        kernel_sdpa(params, inputs, outputs, thread_pool);
+        return;
+    }
+    if (selection->prec != Precision::INT32) {
+        std::fprintf(stderr, "SDPA_SPARSE: selection must be INT32\n");
+        return;
+    }
+    const int width = static_cast<int>(selection->shape[0]);
+
+    const Tensor& Q     = *inputs[0];
+    const Tensor& K_cur = *inputs[1];
+    const Tensor& V_cur = *inputs[2];
+    // The indexer already applied causality when ranking, so the gathered
+    // key set needs no further mask; inputs[3] is deliberately unused here.
+    const Tensor* K_cache =
+        (inputs.size() > 4 && inputs[4] && inputs[4]->data) ? inputs[4] : nullptr;
+    const Tensor* V_cache =
+        (inputs.size() > 5 && inputs[5] && inputs[5]->data) ? inputs[5] : nullptr;
+    if (kv_cache == 2 && K_cache && V_cache &&
+        K_cache->prec != V_cache->prec) {
+        std::fprintf(stderr, "SDPA_SPARSE: K/V cache precision must match\n");
+        return;
+    }
+
+    Tensor& out = *outputs[0];
+    Tensor* K_cache_out = outputs.size() > 1 ? outputs[1] : nullptr;
+    Tensor* V_cache_out = outputs.size() > 2 ? outputs[2] : nullptr;
+
+    const int src_seqlen = static_cast<int>(Q.shape[1]);
+    const int cur_seqlen = static_cast<int>(K_cur.shape[1]);
+    int past_seqlen = 0;
+
+    const bool cache_is_fp16 =
+        (kv_cache == 2 && K_cache && K_cache->data &&
+         K_cache->prec == Precision::FP16);
+    // ---- KV cache append, identical to the dense path ----
+    if (kv_cache == 2 && K_cache && K_cache->data) {
+        const CacheMetadata* meta = cache_meta(K_cache->data);
+        past_seqlen = static_cast<int>(meta->current_seq_len);
+        const size_t cache_es = K_cache->element_size();
+        void* k_cache_data = cache_data(K_cache->data);
+        void* v_cache_data = V_cache ? cache_data(V_cache->data) : nullptr;
+        for (int g = 0; g < num_kv_heads; g++) {
+            unsigned char* kd = static_cast<unsigned char*>(k_cache_data) +
+                g * (static_cast<size_t>(head_dim) * meta->max_seq_len * cache_es);
+            unsigned char* vd = static_cast<unsigned char*>(v_cache_data) +
+                g * (static_cast<size_t>(v_head_dim) * meta->max_seq_len * cache_es);
+            for (int s = 0; s < cur_seqlen; s++) {
+                const float* ks = K_cur.ptr<float>() +
+                    static_cast<size_t>(s) * K_cur.stride[1] / sizeof(float) +
+                    static_cast<size_t>(g) * K_cur.stride[2] / sizeof(float);
+                const float* vs = V_cur.ptr<float>() +
+                    static_cast<size_t>(s) * V_cur.stride[1] / sizeof(float) +
+                    static_cast<size_t>(g) * V_cur.stride[2] / sizeof(float);
+                unsigned char* dk = kd + static_cast<size_t>(past_seqlen + s) *
+                    head_dim * cache_es;
+                unsigned char* dv = vd + static_cast<size_t>(past_seqlen + s) *
+                    v_head_dim * cache_es;
+                if (cache_is_fp16) {
+                    __fp16* dk16 = reinterpret_cast<__fp16*>(dk);
+                    __fp16* dv16 = reinterpret_cast<__fp16*>(dv);
+                    for (int d = 0; d < head_dim; d++)
+                        dk16[d] = (__fp16)ks[d];
+                    for (int d = 0; d < v_head_dim; d++)
+                        dv16[d] = (__fp16)vs[d];
+                } else {
+                    std::memcpy(dk, ks, head_dim * sizeof(float));
+                    std::memcpy(dv, vs, v_head_dim * sizeof(float));
+                }
+            }
+        }
+    }
+    const int dst_seqlen = past_seqlen + cur_seqlen;
+
+    // K_cache/V_cache are const here, but the cache payload is addressed
+    // through the same helpers the dense path uses.
+    auto get_k_ptr = [&](int kv_h) -> const void* {
+        if (kv_cache == 2 && K_cache && K_cache->data) {
+            const char* base = static_cast<const char*>(
+                cache_data(const_cast<void*>(K_cache->data)));
+            return base + kv_h *
+                (head_dim * cache_meta(K_cache->data)->max_seq_len) *
+                K_cache->element_size();
+        }
+        return static_cast<const void*>(K_cur.channel<unsigned char>(kv_h));
+    };
+    auto get_v_ptr = [&](int kv_h) -> const void* {
+        if (kv_cache == 2 && V_cache && V_cache->data) {
+            const char* base = static_cast<const char*>(
+                cache_data(const_cast<void*>(V_cache->data)));
+            return base + kv_h *
+                (v_head_dim * cache_meta(V_cache->data)->max_seq_len) *
+                V_cache->element_size();
+        }
+        return static_cast<const void*>(V_cur.channel<unsigned char>(kv_h));
+    };
+
+    const int32_t* selection_data = selection->ptr<int32_t>();
+    const size_t element_bytes =
+        cache_is_fp16 ? sizeof(__fp16) : sizeof(float);
+
+    // One scratch set per thread: gathered K/V plus a single contiguous query
+    // row. The prefill kernels index Q as Q + row*d_k, so a strided query row
+    // has to be staged the same way the keys are.
+    auto run_head = [&](int, int h_begin, int h_end) {
+        std::vector<uint8_t> k_gather(
+            static_cast<size_t>(width) * head_dim * element_bytes);
+        std::vector<uint8_t> v_gather(
+            static_cast<size_t>(width) * v_head_dim * element_bytes);
+        std::vector<float> q_stage(static_cast<size_t>(head_dim));
+        std::vector<float> causal_mask(static_cast<size_t>(width));
+        for (int h = h_begin; h < h_end; h++) {
+            const int kv_h = h / heads_per_group;
+            const void* k_head = get_k_ptr(kv_h);
+            const void* v_head = get_v_ptr(kv_h);
+            float* o_head = out.ptr<float>() +
+                static_cast<size_t>(h) * out.stride[2] / sizeof(float);
+
+            // Decode has one query position; prefill has src_seqlen of them.
+            for (int s = 0; s < src_seqlen; s++) {
+                const int32_t* token_selection =
+                    selection_data + static_cast<size_t>(s) * width;
+                // A query at position past+s may see cache positions up to
+                // and including past+s. Enforcing it here keeps the sparse
+                // result equal to dense when the selection names wider keys.
+                const int visible_limit = past_seqlen + s;
+                const int count = gather_selected_kv(
+                    token_selection, width, dst_seqlen, visible_limit,
+                    k_head, v_head, element_bytes, head_dim, v_head_dim,
+                    k_gather, v_gather, &causal_mask);
+                if (count <= 0)
+                    continue;
+
+                const float* q_head = Q.ptr<float>() +
+                    static_cast<size_t>(s) * Q.stride[1] / sizeof(float) +
+                    static_cast<size_t>(h) * Q.stride[2] / sizeof(float);
+                float* o_row = o_head + static_cast<size_t>(s) *
+                    out.stride[1] / sizeof(float);
+
+                // Stage the query row contiguously for the prefill kernels.
+                for (int d = 0; d < head_dim; d++)
+                    q_stage[d] = q_head[d];
+
+                if (cache_is_fp16) {
+                    std::vector<__fp16> q16(static_cast<size_t>(head_dim));
+                    for (int d = 0; d < head_dim; d++)
+                        q16[d] = (__fp16)q_stage[d];
+                    if (src_seqlen == 1) {
+                        flash_attn_fp16_decode(
+                            q16.data(),
+                            reinterpret_cast<const __fp16*>(k_gather.data()),
+                            reinterpret_cast<const __fp16*>(v_gather.data()),
+                            o_row, count, head_dim, v_head_dim, scale,
+                            causal_mask.data(), nullptr);
+                    } else {
+                        flash_attn_fp16_prefill(
+                            q16.data(),
+                            reinterpret_cast<const __fp16*>(k_gather.data()),
+                            reinterpret_cast<const __fp16*>(v_gather.data()),
+                            o_row, 1, count, head_dim, v_head_dim, scale,
+                            causal_mask.data(), nullptr);
+                    }
+                } else {
+                    if (src_seqlen == 1) {
+                        flash_attn_fp32_decode(
+                            q_head,
+                            reinterpret_cast<const float*>(k_gather.data()),
+                            reinterpret_cast<const float*>(v_gather.data()),
+                            o_row, count, head_dim, v_head_dim, scale,
+                            causal_mask.data(), nullptr);
+                    } else {
+                        flash_attn_fp32_prefill(
+                            q_stage.data(),
+                            reinterpret_cast<const float*>(k_gather.data()),
+                            reinterpret_cast<const float*>(v_gather.data()),
+                            o_row, 1, count, head_dim, v_head_dim, scale,
+                            causal_mask.data(), nullptr);
+                    }
+                }
+            }
+        }
+    };
+
+    if (thread_pool && num_heads >= 2) {
+        thread_pool->parallel_for(0, num_heads, 1, run_head);
+    } else {
+        run_head(0, 0, num_heads);
+    }
+
+    // Cache length is advanced by the kernel exactly as the dense path does,
+    // so the next call sees the positions this one appended.
+    if (kv_cache == 2 && K_cache_out && V_cache_out) {
+        CacheMetadata* k_meta = cache_meta(K_cache_out->data);
+        CacheMetadata* v_meta = cache_meta(V_cache_out->data);
+        k_meta->current_seq_len = static_cast<uint64_t>(dst_seqlen);
+        v_meta->current_seq_len = static_cast<uint64_t>(dst_seqlen);
     }
 }
