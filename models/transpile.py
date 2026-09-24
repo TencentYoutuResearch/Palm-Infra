@@ -693,11 +693,17 @@ class GraphBuilder:
              kv_cache: int = 2, causal: bool = True,
              scale: float = 0.0,
              num_heads: int = 16, num_kv_heads: int = 16,
-             head_dim: int = 192, v_head_dim: int = 128
+             head_dim: int = 192, v_head_dim: int = 128,
+             sink: int | None = None
              ) -> tuple[int, int, int]:
         sq = self._nodes[q].out_shape
         out_shape = (v_head_dim, sq[1], num_heads)
-        attn = self._add(OpType.SDPA, [q, k_cur, v_cur, mask, k_cache, v_cache],
+        # `sink` is an optional [num_heads] FP32 input holding one logit per
+        # query head, appended to the softmax denominator.
+        sdpa_inputs = [q, k_cur, v_cur, mask, k_cache, v_cache]
+        if sink is not None:
+            sdpa_inputs.append(sink)
+        attn = self._add(OpType.SDPA, sdpa_inputs,
                          out_shape, prec=self._nodes[q].out_prec,
                          i32=[kv_cache, 1 if causal else 0,
                               num_heads, num_kv_heads, head_dim, v_head_dim],

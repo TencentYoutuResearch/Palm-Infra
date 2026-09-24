@@ -19,7 +19,7 @@ static void fill_rand(float* d, int n) { for(int i=0;i<n;i++) d[i]=static_cast<f
 static void ref_sdpa(const float* Q, const float* K_cache, const float* V_cache,
                      const float* K_cur, const float* V_cur, float* out,
                      int H, int KV, int hd, int vd, int src, int cur, int past, int cap,
-                     float scale, bool causal) {
+                     float scale, bool causal, const float* sink = nullptr) {
     int hpg = H / KV;
     int dst = past + cur;
 
@@ -46,9 +46,11 @@ static void ref_sdpa(const float* Q, const float* K_cache, const float* V_cache,
             if (causal) {
                 for (int j = past + s + 1; j < dst; j++) qk[j] = -INFINITY;
             }
-            float mx = -INFINITY;
+            // A sink is an extra logit with no value row: it joins the max and
+            // the denominator but contributes nothing to the numerator.
+            float mx = sink ? sink[h] : -INFINITY;
             for (int j = 0; j < dst; j++) if (qk[j] > mx) mx = qk[j];
-            float sm = 0;
+            float sm = sink ? expf(sink[h] - mx) : 0.f;
             for (int j = 0; j < dst; j++) { qk[j] = expf(qk[j] - mx); sm += qk[j]; }
             for (int j = 0; j < dst; j++) qk[j] /= sm;
             float* o = out + h*src*vd + s*vd;
@@ -65,7 +67,8 @@ static void ref_sdpa(const float* Q, const float* K_cache, const float* V_cache,
 // Run one SDPA test case
 static bool test_case(int H, int KV, int hd, int vd, int src, int cur,
                       int past, int cap, bool causal,
-                      bool fp16_cache = false, TestPath path = TestPath::Kernel) {
+                      bool fp16_cache = false, TestPath path = TestPath::Kernel,
+                      const float* sink = nullptr) {
     float scale = path == TestPath::Backend ? 0.37f : 1.f / sqrtf(hd);
 
     float* qd = new float[H*src*hd]; fill_rand(qd, H*src*hd);
@@ -142,7 +145,15 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur,
     Tensor V_out = V_cache;
 
     SdpaParams p{2, causal?1:0, H, KV, hd, vd, scale};
+    p.sink = sink;
+    // The backend path receives the sink as a 7th input tensor; the direct
+    // kernel path gets it through SdpaParams.
+    Tensor sink_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        sink ? H : 0, 1, 1, 1,
+        sink ? const_cast<float*>(sink) : nullptr);
     std::vector<const Tensor*> ins = {&Q, &K_cur, &V_cur, nullptr, &K_cache, &V_cache};
+    if (sink) ins.push_back(&sink_tensor);
     std::vector<Tensor*> outs = {&out, &K_out, &V_out};
     if (path == TestPath::Kernel) {
         kernel_sdpa(p, ins, outs);
@@ -157,7 +168,7 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur,
     }
 
     ref_sdpa(qd, kc, vc, reference_key.data(), reference_value.data(), ref,
-             H, KV, hd, vd, src, cur, past, cap, scale, causal);
+             H, KV, hd, vd, src, cur, past, cap, scale, causal, sink);
 
     // Debug first mismatch
     bool ok = true;
@@ -230,6 +241,49 @@ int main() {
     // MLA prefill with past > 0 (exercises cache append + prefill).
     CHECK(test_case(16, 16, 192, 128, 128, 128, 128, 512, true),
           "MLA prefill: H=16 KV=16 src=128 past=128 causal");
+
+    // ---- per-head attention sink (Hy4 / gpt-oss) ----
+    // The sink is a virtual extra logit with no value row. A strongly negative
+    // sink must leave the result indistinguishable from no sink, since
+    // exp(sink - max) underflows and the denominator reverts to the keys.
+    {
+        const int sink_heads = 8;
+        std::vector<float> small(sink_heads, -100.0f);
+        CHECK(test_case(16, 16, 64, 64, 1, 1, 0, 256, false,
+                        false, TestPath::Kernel, small.data()),
+              "sink: strongly negative sink matches the no-sink result");
+        CHECK(test_case(16, 16, 192, 128, 32, 32, 0, 64, true,
+                        false, TestPath::Kernel, small.data()),
+              "sink: negative sink on the prefill path");
+        CHECK(test_case(16, 16, 64, 64, 1, 1, 0, 256, false,
+                        true, TestPath::Kernel, small.data()),
+              "sink: negative sink with FP16 KV cache");
+
+        // A dominant sink suppresses every real attention weight, so the
+        // output must collapse toward zero (all V weighted by ~0).
+        std::vector<float> huge(sink_heads, 1.0e4f);
+        CHECK(test_case(16, 16, 64, 64, 1, 1, 0, 256, false,
+                        false, TestPath::Kernel, huge.data()),
+              "sink: dominant sink collapses the output");
+
+        // Distinct positive sinks exercise the max-stability path, where the
+        // sink and the real scores compete for the running maximum.
+        std::vector<float> mixed(sink_heads);
+        for (int h = 0; h < sink_heads; ++h)
+            mixed[h] = -0.5f + 0.25f * static_cast<float>(h);
+        CHECK(test_case(16, 16, 64, 64, 1, 1, 0, 256, false,
+                        false, TestPath::Kernel, mixed.data()),
+              "sink: mixed per-head sinks (decode)");
+        CHECK(test_case(16, 16, 192, 128, 64, 64, 32, 128, true,
+                        false, TestPath::Kernel, mixed.data()),
+              "sink: mixed per-head sinks (prefill with past)");
+        CHECK(test_case(16, 16, 64, 64, 1, 1, 0, 256, false,
+                        true, TestPath::Kernel, mixed.data()),
+              "sink: mixed per-head sinks with FP16 KV cache");
+        CHECK(test_case(16, 16, 64, 64, 1, 1, 0, 256, false,
+                        false, TestPath::Backend, mixed.data()),
+              "sink: mixed per-head sinks through the backend dispatch");
+    }
 
     printf(failures ? "\n%d FAILED\n" : "\nAll attention tests passed!\n", failures);
     return failures;
