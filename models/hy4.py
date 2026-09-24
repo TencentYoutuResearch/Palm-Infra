@@ -257,15 +257,20 @@ def _add_ffn_branch(
         gate, up = graph.slice(merged, [intermediate, intermediate], dim=0)
         return graph.matmul(graph.mul(gate, up), down)
 
-    # Routed experts are stored fused as [experts, 2*moe_i, hidden].
+    # Routed experts are a single fused 3-D checkpoint tensor, but the graph
+    # must declare the flattened [experts*rows, K] form: the loader takes
+    # shape[0]/shape[1] straight from the node and the MoE kernel addresses
+    # expert e at row e*rows with row stride K. Declaring [experts, rows, K]
+    # would set shape[1]=rows instead of K and index wrongly. The bytes are
+    # identical either way, so this is a metadata contract, not a layout one.
     experts_gate_up = _dense_weight(
         graph, streamed, index, f"layer_{layer}_ffn_experts_gate_up",
         f"{prefix}.experts.gate_up_proj",
-        (experts, 2 * moe_intermediate, hidden_size))
+        (experts * 2 * moe_intermediate, hidden_size))
     experts_down = _dense_weight(
         graph, streamed, index, f"layer_{layer}_ffn_experts_down",
         f"{prefix}.experts.down_proj",
-        (experts, hidden_size, moe_intermediate))
+        (experts * hidden_size, moe_intermediate))
     router = _dense_weight(
         graph, streamed, index, f"layer_{layer}_ffn_router",
         f"{prefix}.gate.weight", (experts, hidden_size))
