@@ -93,6 +93,7 @@ class OpType(IntEnum):
     HC_PRE_ID      = 138
     HC_POST_ID     = 139
     HC_HEAD_ID     = 141
+    HY4_INDEXER    = 142
     DSV4_COMPRESSOR = 160
     DSV4_INDEXER = 161
     DSV4_SPARSE_ATTN = 162
@@ -1165,6 +1166,30 @@ class GraphBuilder:
             OpType.HC_HEAD_ID, [x, fn, scale, base],
             (hidden_size, sx[1]), prec=Precision.FP32,
             i32=[hidden_size, hc_mult], f32=[norm_eps, hc_eps])
+
+    def hy4_indexer(self, hidden: int, q_lora: int, wq_b: int, wk: int,
+                    weights_proj: int, k_norm_w: int, k_norm_b: int,
+                    key_cache: int, start_pos: int,
+                    hidden_size: int, q_lora_rank: int, num_heads: int,
+                    head_dim: int, rope_dim: int, top_k: int,
+                    capacity: int, theta: float = 1e7,
+                    factor: float = 1.0, original_context: int = 0,
+                    beta_fast: float = 32.0,
+                    beta_slow: float = 1.0) -> int:
+        """Hy4 Gated-DSA indexer: emits INT32 [top_k, seq] key indices.
+
+        Unlike the DeepSeek-V4 indexer there is no compressor; keys come
+        straight from `wk @ hidden`. `q_lora` must already be normed.
+        """
+        sx = self._nodes[hidden].out_shape
+        return self._add(
+            OpType.HY4_INDEXER,
+            [hidden, q_lora, wq_b, wk, weights_proj, k_norm_w,
+             k_norm_b, key_cache, start_pos],
+            (top_k, sx[1]), prec=Precision.INT32,
+            i32=[hidden_size, q_lora_rank, num_heads, head_dim,
+                 rope_dim, top_k, capacity, original_context],
+            f32=[theta, factor, beta_fast, beta_slow])
 
     def gr_reduce(self, normalized: int, gates: int,
                   hidden_size: int, hc_count: int = 4) -> int:

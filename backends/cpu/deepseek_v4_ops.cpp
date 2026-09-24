@@ -182,6 +182,57 @@ bool dispatch_cpu_deepseek_v4(
         }
         break;
     }
+    case OpType::HY4_INDEXER: {
+        // Inputs: hidden, q_lora, wq_b, wk, weights_proj, k_norm_w,
+        //         k_norm_b, key_cache, start_pos, n_tokens.
+        if (!has_inputs(10) || !output) {
+            reject();
+            break;
+        }
+        Hy4IndexerConfig config;
+        config.hidden_size = graph_params::get_i32(params, 0, 6144);
+        config.q_lora_rank = graph_params::get_i32(params, 1, 2048);
+        config.num_heads = graph_params::get_i32(params, 2, 32);
+        config.head_dim = graph_params::get_i32(params, 3, 128);
+        config.rope_dim = graph_params::get_i32(params, 4, 64);
+        config.top_k = graph_params::get_i32(params, 5, 2048);
+        config.capacity = graph_params::get_i32(params, 6, 0);
+        config.rope.rope_dim = config.rope_dim;
+        config.rope.theta = graph_params::get_f32(params, 0, 10000000.0f);
+        config.rope.factor = graph_params::get_f32(params, 1, 1.0f);
+        config.rope.original_context =
+            graph_params::get_i32(params, 7, 0);
+        config.rope.beta_fast = graph_params::get_f32(params, 2, 32.0f);
+        config.rope.beta_slow = graph_params::get_f32(params, 3, 1.0f);
+        const int start_pos = inputs[8] && inputs[8]->data
+            ? inputs[8]->ptr<int32_t>()[0] : 0;
+        const int n_tokens = inputs[9] && inputs[9]->data
+            ? inputs[9]->ptr<int32_t>()[0]
+            : static_cast<int>(inputs[0]->shape[1]);
+        const int sequence = std::min<int64_t>(
+            inputs[0]->shape[1], std::max(n_tokens, 0));
+        Tensor hidden = *inputs[0];
+        Tensor q_lora = *inputs[1];
+        Tensor indices = *output;
+        hidden.shape[1] = sequence;
+        q_lora.shape[1] = sequence;
+        indices.shape[1] = sequence;
+        hidden.compute_strides();
+        q_lora.compute_strides();
+        indices.compute_strides();
+        std::fill(
+            output->ptr<int32_t>(),
+            output->ptr<int32_t>() + output->nelements(),
+            static_cast<int32_t>(-1));
+        if (!kernel_hy4_indexer(
+                hidden, q_lora, *inputs[2], *inputs[3], *inputs[4],
+                *inputs[5], *inputs[6],
+                *const_cast<Tensor*>(inputs[7]), indices, start_pos,
+                config, thread_pool)) {
+            reject();
+        }
+        break;
+    }
     case OpType::DSV4_GROUPED_LINEAR:
         if (has_inputs(2) && output) {
             if (!kernel_dsv4_grouped_linear(

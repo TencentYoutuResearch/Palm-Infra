@@ -103,15 +103,60 @@ def _hc_branch(graph: GraphBuilder, streamed: dict,
     return graph.hc_post_id(branch, residual, packed, hidden, hc_mult)
 
 
+def _add_indexer(
+        graph: GraphBuilder, streamed: dict, index: SafeTensorIndex,
+        cfg: dict, layer: int, hidden: int, q_lora: int, position: int,
+        key_cache: int, n_ctx: int) -> int:
+    """Run the Hy4 Gated-DSA indexer for one layer.
+
+    `hidden` is the normed hidden state and `q_lora` the normed low-rank
+    query the attention branch produced; both are reused rather than
+    recomputed. Returns the INT32 [top_k, seq] selection that the sparse
+    attention consumes.
+    """
+    hidden_size = int(cfg["hidden_size"])
+    heads = int(cfg["index_n_heads"])
+    head_dim = int(cfg["index_head_dim"])
+    q_rank = int(cfg["q_lora_rank"])
+    rope_dim = int(cfg["qk_rope_head_dim"])
+    top_k = int(cfg["index_topk"])
+    theta = float(cfg.get("rope_parameters", {}).get("rope_theta", 1e7))
+    prefix = f"layers.{layer}.self_attn"
+
+    def weight(suffix: str, shape: tuple[int, ...]) -> int:
+        label = f"layer_{layer}_indexer_{suffix.replace('.', '_')}"
+        return _dense_weight(
+            graph, streamed, index, label, f"{prefix}.{suffix}", shape)
+
+    wq_b = weight("indexer.wq_b.weight", (heads * head_dim, q_rank))
+    wk = weight("indexer.wk.weight", (head_dim, hidden_size))
+    weights_proj = weight(
+        "indexer.weights_proj.weight", (heads, hidden_size))
+    k_norm_w = _fp32_weight(
+        graph, streamed, index, f"layer_{layer}_indexer_k_norm",
+        f"{prefix}.indexer.k_norm.weight", (head_dim,))
+    k_norm_b = _fp32_weight(
+        graph, streamed, index, f"layer_{layer}_indexer_k_norm_b",
+        f"{prefix}.indexer.k_norm.bias", (head_dim,))
+
+    return graph.hy4_indexer(
+        hidden, q_lora, wq_b, wk, weights_proj, k_norm_w, k_norm_b,
+        key_cache, position,
+        hidden_size=hidden_size, q_lora_rank=q_rank, num_heads=heads,
+        head_dim=head_dim, rope_dim=rope_dim, top_k=top_k,
+        capacity=n_ctx, theta=theta)
+
+
 def _add_attention_branch(
         graph: GraphBuilder, streamed: dict, index: SafeTensorIndex,
-        cfg: dict, layer: int, hidden: int, position: int,
+        cfg: dict, layer: int, hidden: int, q_lora: int, position: int,
         cos: int, sin: int, mask: int, ck_in: int, cv_in: int,
         top_k: int | None) -> int:
     """MLA + sink + gate for one layer.
 
-    `top_k` is the key selection owned by the enclosing DSA indexer. Pass
-    None to build without sparse selection (dense attention over the cache).
+    `q_lora` is the already-normed low-rank query, built by the caller so the
+    indexer can share it. `top_k` is the key selection owned by the DSA
+    indexer; pass None for dense attention over the cache.
     """
     hidden_size = int(cfg["hidden_size"])
     heads = int(cfg["num_attention_heads"])
@@ -129,10 +174,6 @@ def _add_attention_branch(
         return _dense_weight(
             graph, streamed, index, label, f"{prefix}.{suffix}", shape)
 
-    wq_a = weight("q_a_proj.weight", (q_rank, hidden_size))
-    q_a_norm = _fp32_weight(
-        graph, streamed, index, f"layer_{layer}_attn_q_a_norm",
-        f"{prefix}.q_a_layernorm.weight", (q_rank,))
     wq_b = weight("q_b_proj.weight", (heads * head_dim, q_rank))
     wkv_a = weight(
         "kv_a_proj_with_mqa.weight", (kv_rank + rope_dim, hidden_size))
@@ -148,10 +189,7 @@ def _add_attention_branch(
         graph, streamed, index, f"layer_{layer}_attn_sink",
         f"{prefix}.learnable_sink_param", (heads,))
 
-    # MLA query path. The normed q_lora is also the indexer's query source,
-    # so it is returned alongside nothing here but kept in the same order as
-    # the reference graph.
-    q_lora = graph.rms_norm(graph.matmul(hidden, wq_a), q_a_norm, eps)
+    # MLA query path; q_lora arrives already normed from the caller.
     query = graph.matmul(q_lora, wq_b)
     query = graph.reshape(query, (head_dim, heads, _S))
     query = graph.permute(query, (0, 2, 1, 3))       # [head_dim, seq, heads]
@@ -281,8 +319,22 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
     hc_mult = int(cfg["hc_mult"])
     rope_dim = int(cfg["qk_rope_head_dim"])
     heads = int(cfg["num_attention_heads"])
+    q_rank = int(cfg["q_lora_rank"])
     layers = int(cfg["num_hidden_layers"])
+    # Per-layer indexer role: only "full" layers ship indexer weights and run
+    # the selector; "shared" layers reuse the previous full layer's top-k.
+    indexer_types = list(cfg["indexer_types"])
     eps = float(cfg["rms_norm_eps"])
+
+    if len(indexer_types) != layers:
+        raise ValueError(
+            f"indexer_types has {len(indexer_types)} entries but the model "
+            f"has {layers} layers")
+    if indexer_types[0] != INDEXER_FULL:
+        raise ValueError(
+            "layer 0 must run the indexer: shared layers reuse the previous "
+            "full layer's selection, so a leading shared layer has nothing "
+            "to reuse")
 
     if is_prefill:
         seq_dyn = DimExpr.seq()
@@ -311,22 +363,61 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
     # Expand the single embedding into hc_mult parallel residual streams.
     state = graph.tile(hidden, (hc_mult, 1))
 
+    # IndexCache: the most recent "full" indexer layer's top-k selection is
+    # reused by every following "shared" layer, which skips its own indexer
+    # entirely. Only `full` layers ship indexer weights, so this is both a
+    # compute saving and the mechanism the checkpoint expects.
+    last_top_k: int | None = None
+
     for layer in range(layers):
         attn_norm = _fp32_weight(
             graph, streamed, index, f"layer_{layer}_attn_norm",
             f"layers.{layer}.input_layernorm.weight", (hidden_size,))
         ck_in, cv_in = caches[layer]
+        is_full = indexer_types[layer] == INDEXER_FULL
+
+        # q_a norm weight is shared by the attention branch and the indexer,
+        # which both consume the same normed low-rank query.
+        q_a_norm = _fp32_weight(
+            graph, streamed, index, f"layer_{layer}_attn_q_a_norm",
+            f"layers.{layer}.self_attn.q_a_layernorm.weight", (q_rank,))
+        wq_a = _dense_weight(
+            graph, streamed, index, f"layer_{layer}_attn_q_a_proj_weight",
+            f"layers.{layer}.self_attn.q_a_proj.weight",
+            (q_rank, hidden_size))
+
+        # `selected` carries the indexer result back out of the branch
+        # closure so the next layer can reuse it.
+        selected: list[int] = []
 
         def attention_branch(reduced: int, *, current=layer,
-                             norm=attn_norm, ck=ck_in, cv=cv_in) -> int:
+                             norm=attn_norm, ck=ck_in, cv=cv_in,
+                             full=is_full, wq=wq_a, qn=q_a_norm) -> int:
             normalized = graph.rms_norm(reduced, norm, eps)
+            q_lora = graph.rms_norm(graph.matmul(normalized, wq), qn, eps)
+            if full:
+                top_k = _add_indexer(
+                    graph, streamed, index, cfg, current, normalized,
+                    q_lora, position, ck, n_ctx)
+                selected.append(top_k)
+            else:
+                # A shared layer reuses the previous full layer's selection.
+                # Hy4 marks layer 0 full, so last_top_k is set before any
+                # shared layer unless the config is malformed.
+                if last_top_k is None:
+                    raise ValueError(
+                        f"layer {current} is marked 'shared' but no earlier "
+                        f"layer ran the indexer")
+                top_k = last_top_k
             return _add_attention_branch(
                 graph, streamed, index, cfg, current, normalized,
-                position, cos, sin, mask, ck, cv, None)
+                q_lora, position, cos, sin, mask, ck, cv, top_k)
 
         state = _hc_branch(
             graph, streamed, index, cfg, layer, "attn", state,
             attention_branch)
+        if selected:
+            last_top_k = selected[0]
 
         ffn_norm = _fp32_weight(
             graph, streamed, index, f"layer_{layer}_ffn_norm",
