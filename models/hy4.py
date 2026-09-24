@@ -219,7 +219,7 @@ def _add_attention_branch(
         kv_cache=2, causal=True, scale=1.0 / (head_dim ** 0.5),
         num_heads=heads, num_kv_heads=heads,
         head_dim=head_dim, v_head_dim=v_head_dim,
-        sink=attn_sink)
+        sink=attn_sink, selection=top_k)
 
     # Gated MLA: elementwise sigmoid gate on the decompressed attention
     # output, applied BEFORE o_proj.

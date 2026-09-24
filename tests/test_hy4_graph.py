@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""Graph-structure tests for the Hy4-preview builder.
+
+These run without a checkpoint: the weight loaders are replaced with recorders
+that return correctly-shaped placeholder nodes, so what is asserted is the
+*shape of the graph* — which ops are emitted, how many, with what shapes.
+
+That is the level at which Hy4's structure can be checked before weights
+exist. In particular the IndexCache contract (only "full" layers run the
+indexer and carry its weights) is a property of the emitted graph, not of any
+numerical result, so it is fully testable here.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "models"))
+
+import hy4
+from transpile import OpType
+
+
+def check(cond, msg):
+    if not cond:
+        raise AssertionError(msg)
+
+
+class _RecordingIndex:
+    """Stand-in for SafeTensorIndex: every tensor is considered present."""
+
+    def contains(self, name):
+        return True
+
+
+def install_stubs():
+    """Capture weight requests and return plausibly-shaped nodes."""
+    captured = []
+
+    def fp32(graph, streamed, index, label, source, shape):
+        captured.append((label, source, tuple(shape), "fp32"))
+        return graph.input(f"w_{label}", tuple(shape), prec=hy4.Precision.FP32)
+
+    def dense(graph, streamed, index, label, source, shape):
+        captured.append((label, source, tuple(shape), "dense"))
+        return graph.input(f"w_{label}", tuple(shape), prec=hy4.Precision.FP16)
+
+    hy4._fp32_weight = fp32
+    hy4._dense_weight = dense
+    hy4.SafeTensorIndex = lambda path: _RecordingIndex()
+    return captured
+
+
+def tiny_cfg(layers=4, indexer_types=None):
+    return {
+        "model_type": "hy_v4",
+        "hidden_size": 32,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "qk_nope_head_dim": 8,
+        "qk_rope_head_dim": 4,
+        "v_head_dim": 8,
+        "q_lora_rank": 16,
+        "kv_lora_rank": 8,
+        "rms_norm_eps": 1e-5,
+        "hc_mult": 4,
+        "hc_eps": 1e-6,
+        "hc_magnitude": 2.0,
+        "num_hidden_layers": layers,
+        "first_k_dense_replace": 1,
+        "intermediate_size": 64,
+        "moe_intermediate_size": 16,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "norm_topk_prob": True,
+        "routed_scaling_factor": 2.827,
+        "swiglu_limit": 10.0,
+        "indexer_types": indexer_types or ["full"] * layers,
+        "index_n_heads": 2,
+        "index_head_dim": 8,
+        "index_topk": 8,
+    }
+
+
+def count_ops(graph):
+    tally = {}
+    for node in graph._nodes:
+        tally[node.op_type] = tally.get(node.op_type, 0) + 1
+    return tally
+
+
+def build(cfg, **kwargs):
+    captured = install_stubs()
+    graph, _ = hy4.build_graph(".", cfg, **kwargs)
+    return graph, captured
+
+
+def test_layer_counts():
+    """One attention + FFN branch per layer, each wrapped in iHC."""
+    layers = 4
+    graph, _ = build(tiny_cfg(layers=layers), seq_len=4, n_ctx=64,
+                     is_prefill=True)
+    tally = count_ops(graph)
+
+    check(tally.get(OpType.SDPA) == layers,
+          f"one SDPA per layer, got {tally.get(OpType.SDPA)}")
+    check(tally.get(OpType.SIGMOID) == layers,
+          f"one attention gate per layer, got {tally.get(OpType.SIGMOID)}")
+    # iHC wraps both branches of every layer.
+    check(tally.get(OpType.HC_PRE_ID) == 2 * layers,
+          f"hc_pre_id per branch, got {tally.get(OpType.HC_PRE_ID)}")
+    check(tally.get(OpType.HC_POST_ID) == 2 * layers,
+          f"hc_post_id per branch, got {tally.get(OpType.HC_POST_ID)}")
+    check(tally.get(OpType.HC_HEAD_ID) == 1,
+          f"one head collapse, got {tally.get(OpType.HC_HEAD_ID)}")
+    # The first layer keeps a dense FFN; the rest are MoE.
+    dense_lead = 1
+    check(tally.get(OpType.MOE) == layers - dense_lead,
+          f"MoE on all but the dense-lead layers, got {tally.get(OpType.MOE)}")
+    print("  PASS: per-layer op counts")
+
+
+def test_indexer_only_on_full_layers():
+    """IndexCache: shared layers must not run the indexer or carry weights.
+
+    This is the property the whole IndexCache saving depends on, so it is
+    asserted both on the emitted op count and on the requested weights.
+    """
+    types = ["full", "shared", "shared", "full", "shared"]
+    graph, captured = build(tiny_cfg(layers=len(types), indexer_types=types),
+                            seq_len=4, n_ctx=64, is_prefill=True)
+    tally = count_ops(graph)
+
+    expected = types.count("full")
+    check(tally.get(OpType.HY4_INDEXER) == expected,
+          f"HY4_INDEXER emitted {tally.get(OpType.HY4_INDEXER)} times, "
+          f"expected one per full layer ({expected})")
+
+    for layer, kind in enumerate(types):
+        has_weights = any(
+            label.startswith(f"layer_{layer}_indexer_")
+            for label, _, _, _ in captured)
+        want = kind == "full"
+        check(has_weights == want,
+              f"layer {layer} ({kind}): indexer weights={has_weights}, "
+              f"expected {want}")
+    print("  PASS: indexer restricted to full layers")
+
+
+def test_shared_layer_reuses_selection():
+    """A shared layer must consume the same node the full layer produced."""
+    types = ["full", "shared", "shared"]
+    graph, _ = build(tiny_cfg(layers=3, indexer_types=types),
+                     seq_len=4, n_ctx=64, is_prefill=True)
+
+    indexer_nodes = [
+        node.id for node in graph._nodes
+        if node.op_type == OpType.HY4_INDEXER]
+    check(len(indexer_nodes) == 1, "exactly one indexer for one full layer")
+
+    # Every sparse attention in the graph should take that one node as its
+    # top-k input; otherwise the shared layers are not actually reusing.
+    producer = indexer_nodes[0]
+    consumers = 0
+    for node in graph._nodes:
+        if node.op_type != OpType.SDPA:
+            continue
+        if producer in node.inputs:
+            consumers += 1
+    check(consumers == len(types),
+          f"all {len(types)} attention layers consume the cached selection, "
+          f"got {consumers}")
+    print("  PASS: shared layers reuse one cached selection")
+
+
+def test_weight_shapes():
+    """Shapes that differ from the DeepSeek-V4 iHC variant."""
+    cfg = tiny_cfg(layers=2)
+    cfg["indexer_types"] = ["full", "shared"]
+    graph, captured = build(cfg, seq_len=4, n_ctx=64, is_prefill=True)
+    by_label = {label: shape for label, _, shape, _ in captured}
+
+    hidden = cfg["hidden_size"]
+    hc = cfg["hc_mult"]
+    heads = cfg["num_attention_heads"]
+    v_head = cfg["v_head_dim"]
+    moe_i = cfg["moe_intermediate_size"]
+    experts = cfg["n_routed_experts"]
+
+    expected = {
+        # 2*hc mixing rows: no Sinkhorn combination block.
+        "layer_0_hc_attn_fn": (2 * hc, hc * hidden),
+        "layer_0_hc_attn_scale": (2,),
+        "layer_0_hc_attn_base": (2 * hc,),
+        "layer_1_hc_mlp_fn": (2 * hc, hc * hidden),
+        # hc rows for the head collapse.
+        "hc_head_fn": (hc, hc * hidden),
+        "hc_head_scale": (1,),
+        "hc_head_base": (hc,),
+        # one logit per attention head
+        "layer_0_attn_sink": (heads,),
+        "layer_0_attn_linear_gate_weight": (heads * v_head, hidden),
+        # routed experts are stored fused and 3-D
+        "layer_1_ffn_experts_gate_up": (experts, 2 * moe_i, hidden),
+        "layer_1_ffn_experts_down": (experts, hidden, moe_i),
+        "layer_1_ffn_router_bias": (experts,),
+    }
+    for label, want in expected.items():
+        got = by_label.get(label)
+        check(got == want,
+              f"{label}: shape {got}, expected {want}")
+
+    # The indexer carries no compressor tensors, unlike DeepSeek-V4.
+    indexer_sources = [s for _, s, _, _ in captured if ".indexer." in s]
+    check(len(indexer_sources) == 5,
+          f"five indexer tensors on a full layer, got {len(indexer_sources)}")
+    check(not any("compress" in s for s in indexer_sources),
+          "Hy4's indexer must not reference compressor tensors")
+    print("  PASS: Hy4-specific weight shapes")
+
+
+def test_dense_lead_is_dense():
+    """Layer 0 uses a dense FFN; later layers route."""
+    cfg = tiny_cfg(layers=2)
+    cfg["indexer_types"] = ["full", "shared"]
+    _, captured = build(cfg, seq_len=4, n_ctx=64, is_prefill=True)
+    labels = [label for label, _, _, _ in captured]
+
+    check(any(l.startswith("layer_0_ffn_gate_up") for l in labels),
+          "layer 0 has a dense gate_up weight")
+    check(not any(l.startswith("layer_0_ffn_experts") for l in labels),
+          "layer 0 has no routed experts")
+    check(any(l.startswith("layer_1_ffn_experts") for l in labels),
+          "layer 1 has routed experts")
+    check(not any(l.startswith("layer_1_ffn_gate_up") for l in labels),
+          "layer 1 has no dense gate_up weight")
+    print("  PASS: dense lead layer")
+
+
+def test_decode_path_builds():
+    """The decode graph must assemble without the dynamic seq dimension."""
+    cfg = tiny_cfg(layers=2)
+    cfg["indexer_types"] = ["full", "shared"]
+    graph, _ = build(cfg, seq_len=1, n_ctx=64, is_prefill=False)
+    tally = count_ops(graph)
+    check(tally.get(OpType.SDPA) == 2, "decode builds one SDPA per layer")
+    check(tally.get(OpType.HY4_INDEXER) == 1,
+          "decode builds one indexer for the single full layer")
+    print("  PASS: decode path")
+
+
+def test_bad_config_rejected():
+    """Malformed indexer_types fail loudly instead of building a wrong graph."""
+    cfg = tiny_cfg(layers=3, indexer_types=["full", "shared"])
+    try:
+        build(cfg, seq_len=4, n_ctx=64, is_prefill=True)
+        raise AssertionError("short indexer_types should be rejected")
+    except ValueError:
+        pass
+
+    # A leading shared layer would have nothing to reuse.
+    cfg = tiny_cfg(layers=2, indexer_types=["shared", "full"])
+    try:
+        build(cfg, seq_len=4, n_ctx=64, is_prefill=True)
+        raise AssertionError("leading shared layer should be rejected")
+    except ValueError:
+        pass
+    print("  PASS: malformed config rejected")
+
+
+def test_convert_refuses():
+    """convert() must not emit a package while DSA is partially wired.
+
+    It reads config.json first, so write a minimal Hy4 config to a temp dir
+    and assert it then refuses for the right reason rather than failing on
+    a missing file.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "config.json"), "w") as f:
+            json.dump({"model_type": "hy_v4"}, f)
+        try:
+            hy4.convert(tmp, os.path.join(tmp, "out.mollm"))
+            raise AssertionError("convert() should refuse")
+        except NotImplementedError:
+            pass
+    print("  PASS: convert() refuses while incomplete")
+
+
+def main():
+    test_layer_counts()
+    test_indexer_only_on_full_layers()
+    test_shared_layer_reuses_selection()
+    test_weight_shapes()
+    test_dense_lead_is_dense()
+    test_decode_path_builds()
+    test_bad_config_rejected()
+    test_convert_refuses()
+    print("\nAll Hy4 graph tests passed!")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
