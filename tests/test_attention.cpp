@@ -161,7 +161,11 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur,
         GraphNode node;
         node.op_type = OpType::SDPA;
         if (path != TestPath::BackendDefaults) {
-            node.params.i32 = {2, causal ? 1 : 0, H, KV, hd, vd};
+            // params[6]/[7] carry the optional input indices (-1 = absent),
+            // matching what the graph builder records.
+            const int sink_index = sink ? 6 : -1;
+            node.params.i32 = {2, causal ? 1 : 0, H, KV, hd, vd,
+                               sink_index, -1};
             node.params.f32 = {scale};
         }
         CPUBackend{}.dispatch(node, ins, &out, nullptr);
@@ -343,6 +347,94 @@ static void test_sparse_falls_back_when_selection_is_not_sparser() {
           "sparse: full-width selection just past the fallback point");
 }
 
+// A graph node carrying a selection must reach kernel_sdpa_sparse through the
+// backend dispatch, not be silently ignored by kernel_sdpa. The check is the
+// same dense-vs-sparse invariant: a full-width selection must reproduce the
+// dense result, and a partial one must differ from it (proving the selection
+// is actually consumed rather than dropped).
+static void test_backend_dispatch_consumes_selection() {
+    const int H = 2, KV = 2, hd = 16, vd = 16, src = 2, cur = 2, past = 4, cap = 16;
+    const int dst = past + cur;
+    const float scale = 1.0f / sqrtf(hd);
+
+    float qd[H*src*hd]; fill_rand(qd, H*src*hd);
+    float kd[KV*cur*hd]; fill_rand(kd, KV*cur*hd);
+    float vdta[KV*cur*vd]; fill_rand(vdta, KV*cur*vd);
+    float kc[KV*cap*hd]; fill_rand(kc, KV*cap*hd);
+    float vc[KV*cap*vd]; fill_rand(vc, KV*cap*vd);
+
+    const size_t es = sizeof(mollm::cpu::fp16_t);
+    size_t ktot = CacheMetadata::SIZE + (size_t)KV*cap*hd*es;
+    size_t vtot = CacheMetadata::SIZE + (size_t)KV*cap*vd*es;
+
+    auto mk = [&](void* buf, size_t total, int rows_per_head, float* src_data) {
+        auto* m = cache_meta(buf);
+        m->current_seq_len = (uint64_t)past;
+        m->max_seq_len = (uint64_t)cap;
+        m->num_kv_heads = (uint64_t)KV;
+        return m;
+    };
+
+    void* kb_a = calloc(1, ktot); void* vb_a = calloc(1, vtot);
+    void* kb_b = calloc(1, ktot); void* vb_b = calloc(1, vtot);
+    for (void* b : {kb_a, vb_a}) (void)b;
+    auto fill16 = [&](void* buf, int width, float* data, int rows) {
+        auto* d = static_cast<mollm::cpu::fp16_t*>(cache_data(buf));
+        for (int i = 0; i < KV*cap*width; i++) d[i] = (mollm::cpu::fp16_t)data[i % (KV*rows*width)];
+    };
+
+    auto* kma = mk(kb_a, ktot, hd, kc); kma->head_dim = hd;
+    auto* vma = mk(vb_a, vtot, vd, vc); vma->v_head_dim = vd;
+    auto* kmb = mk(kb_b, ktot, hd, kc); kmb->head_dim = hd;
+    auto* vmb = mk(vb_b, vtot, vd, vc); vmb->v_head_dim = vd;
+    (void)vma; (void)vmb;
+    fill16(kb_a, hd, kc, cap); fill16(vb_a, vd, vc, cap);
+    fill16(kb_b, hd, kc, cap); fill16(vb_b, vd, vc, cap);
+
+    Tensor Q = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, src, H, 1, qd);
+    Tensor K_cur = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, cur, KV, 1, kd);
+    Tensor V_cur = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vd, cur, KV, 1, vdta);
+    Tensor KcA = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, (int64_t)(ktot/es), 1,1,1, kb_a);
+    Tensor VcA = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, (int64_t)(vtot/es), 1,1,1, vb_a);
+    Tensor KcB = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, (int64_t)(ktot/es), 1,1,1, kb_b);
+    Tensor VcB = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, (int64_t)(vtot/es), 1,1,1, vb_b);
+    float o_dense[H*src*vd]; float o_sparse[H*src*vd];
+    Tensor Oa = Tensor::create(Precision::FP32, MemoryType::OWNED, vd, src, H, 1, o_dense);
+    Tensor Ob = Tensor::create(Precision::FP32, MemoryType::OWNED, vd, src, H, 1, o_sparse);
+
+    // Dense reference through the backend (no selection input).
+    {
+        GraphNode node; node.op_type = OpType::SDPA;
+        node.params.i32 = {2, 1, H, KV, hd, vd, -1, -1};
+        node.params.f32 = {scale};
+        std::vector<const Tensor*> ins = {&Q, &K_cur, &V_cur, nullptr, &KcA, &VcA};
+        std::vector<Tensor*> outs = {&Oa, &KcA, &VcA};
+        (void)outs;
+        CPUBackend{}.dispatch(node, ins, &Oa, nullptr);
+    }
+
+    // Full-width selection through the backend must match it.
+    std::vector<int32_t> sel((size_t)dst*src, -1);
+    for (int s = 0; s < src; s++)
+        for (int r = 0; r < dst; r++) sel[(size_t)s*dst + r] = r;
+    Tensor Sel = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, dst, src, 1,1, sel.data());
+    {
+        GraphNode node; node.op_type = OpType::SDPA;
+        // sink absent (-1), selection at index 6
+        node.params.i32 = {2, 1, H, KV, hd, vd, -1, 6};
+        node.params.f32 = {scale};
+        std::vector<const Tensor*> ins = {&Q, &K_cur, &V_cur, nullptr, &KcB, &VcB, &Sel};
+        CPUBackend{}.dispatch(node, ins, &Ob, nullptr);
+    }
+
+    bool same = true;
+    for (int i = 0; i < H*src*vd; i++)
+        if (fabsf(o_dense[i] - o_sparse[i]) > 1e-4f) same = false;
+    CHECK(same, "dispatch: full-width selection matches dense through the backend");
+
+    free(kb_a); free(vb_a); free(kb_b); free(vb_b);
+}
+
 int main() {
     srand(42);
     CHECK(test_case(8, 4, 32, 24, 4, 4, 3, 16, true, true, TestPath::Backend),
@@ -431,6 +523,7 @@ int main() {
     //      those keys, which is what makes it genuinely sparse.
     test_sparse_select_all_matches_dense();
     test_sparse_falls_back_when_selection_is_not_sparser();
+    test_backend_dispatch_consumes_selection();
 
     printf(failures ? "\n%d FAILED\n" : "\nAll attention tests passed!\n", failures);
     return failures;

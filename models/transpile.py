@@ -706,20 +706,27 @@ class GraphBuilder:
         out_shape = (v_head_dim, sq[1], num_heads)
         # `sink` is an optional [num_heads] FP32 input holding one logit per
         # query head, appended to the softmax denominator.
+        # Optional inputs are appended in a fixed order and their indices are
+        # recorded in params, matching the MOE convention (an absent optional
+        # input is simply a shorter list, not a placeholder).
         sdpa_inputs = [q, k_cur, v_cur, mask, k_cache, v_cache]
+        # `sink` is an optional [num_heads] FP32 tensor: one learned logit per
+        # query head, added to the softmax denominator.
+        sink_input = -1
         if sink is not None:
+            sink_input = len(sdpa_inputs)
             sdpa_inputs.append(sink)
         # `selection` is an optional INT32 [top_k, seq] key selection from the
-        # Hy4 Gated-DSA indexer. When present the attention should restrict
-        # itself to those keys, which is what makes DSA sparse; the CPU kernel
-        # does not consume it yet, so a graph carrying one will currently
-        # compute dense attention over the cache.
+        # Hy4 Gated-DSA indexer; attention then visits only those keys.
+        selection_input = -1
         if selection is not None:
+            selection_input = len(sdpa_inputs)
             sdpa_inputs.append(selection)
         attn = self._add(OpType.SDPA, sdpa_inputs,
                          out_shape, prec=self._nodes[q].out_prec,
                          i32=[kv_cache, 1 if causal else 0,
-                              num_heads, num_kv_heads, head_dim, v_head_dim],
+                              num_heads, num_kv_heads, head_dim, v_head_dim,
+                              sink_input, selection_input],
                          f32=[scale])
         # cache outputs are views of the same cache buffers
         kc_out = self._add(OpType.RESHAPE, [k_cache],
