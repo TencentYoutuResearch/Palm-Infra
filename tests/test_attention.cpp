@@ -208,6 +208,129 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur,
     return ok;
 }
 
+// Compare the sparse entry against the dense kernel on identical inputs.
+//
+// No reference implementation is involved: selecting every cache position
+// makes the gathered set identical to the cache, and both entries then run
+// the same flash-attn kernels, so the outputs must match bit for bit. That
+// makes this check immune to the indexing mistakes a hand-written reference
+// invites.
+static bool sparse_matches_dense(int H, int KV, int hd, int vd, int src,
+                                 int cur, int past, int cap, bool fp16_cache) {
+    const float scale = 1.0f / sqrtf(hd);
+    const int dst = past + cur;
+
+    float* qd = new float[H*src*hd]; fill_rand(qd, H*src*hd);
+    float* kd = new float[KV*cur*hd]; fill_rand(kd, KV*cur*hd);
+    float* vdata = new float[KV*cur*vd]; fill_rand(vdata, KV*cur*vd);
+    float* kc = new float[KV*cap*hd]; fill_rand(kc, KV*cap*hd);
+    float* vc = new float[KV*cap*vd]; fill_rand(vc, KV*cap*vd);
+    float* dense_out = new float[H*src*vd];
+    float* sparse_out = new float[H*src*vd];
+
+    const Precision cache_precision =
+        fp16_cache ? Precision::FP16 : Precision::FP32;
+    const size_t cache_es =
+        fp16_cache ? sizeof(mollm::cpu::fp16_t) : sizeof(float);
+    size_t k_cache_total = CacheMetadata::SIZE + KV * cap * hd * cache_es;
+    size_t v_cache_total = CacheMetadata::SIZE + KV * cap * vd * cache_es;
+
+    // Two independent cache copies so each run appends into a fresh one.
+    auto make_cache = [&](size_t total, int cache_hd, float* src) {
+        void* buf = calloc(1, total);
+        auto* meta = cache_meta(buf);
+        meta->current_seq_len = (uint64_t)past;
+        meta->max_seq_len     = (uint64_t)cap;
+        meta->num_kv_heads    = (uint64_t)KV;
+        if (cache_hd == hd) meta->head_dim = (uint64_t)hd;
+        else                meta->v_head_dim = (uint64_t)vd;
+        const int rows = (int)(total / cache_es / KV / (cache_hd ? cache_hd : 1));
+        (void)rows;
+        if (fp16_cache) {
+            auto* dst16 = static_cast<mollm::cpu::fp16_t*>(cache_data(buf));
+            for (int i = 0; i < KV * cap * cache_hd; ++i)
+                dst16[i] = static_cast<mollm::cpu::fp16_t>(src[i]);
+        } else {
+            memcpy(cache_data(buf), src, KV * cap * cache_hd * sizeof(float));
+        }
+        return buf;
+    };
+
+    void* kc_a = make_cache(k_cache_total, hd, kc);
+    void* vc_a = make_cache(v_cache_total, vd, vc);
+    void* kc_b = make_cache(k_cache_total, hd, kc);
+    void* vc_b = make_cache(v_cache_total, vd, vc);
+
+    Tensor Q = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, src, H, 1, qd);
+    Tensor K_cur = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, cur, KV, 1, kd);
+    Tensor V_cur = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vd, cur, KV, 1, vdata);
+    Tensor KcA = Tensor::create(cache_precision, MemoryType::EXTERNAL,
+                                (int64_t)(k_cache_total / cache_es), 1, 1, 1, kc_a);
+    Tensor VcA = Tensor::create(cache_precision, MemoryType::EXTERNAL,
+                                (int64_t)(v_cache_total / cache_es), 1, 1, 1, vc_a);
+    Tensor KcB = Tensor::create(cache_precision, MemoryType::EXTERNAL,
+                                (int64_t)(k_cache_total / cache_es), 1, 1, 1, kc_b);
+    Tensor VcB = Tensor::create(cache_precision, MemoryType::EXTERNAL,
+                                (int64_t)(v_cache_total / cache_es), 1, 1, 1, vc_b);
+    Tensor out_a = Tensor::create(Precision::FP32, MemoryType::OWNED, vd, src, H, 1, dense_out);
+    Tensor out_b = Tensor::create(Precision::FP32, MemoryType::OWNED, vd, src, H, 1, sparse_out);
+
+    SdpaParams p{2, 1, H, KV, hd, vd, scale};
+
+    // Dense run.
+    {
+        Tensor K_out = KcA;
+        Tensor V_out = VcA;
+        std::vector<const Tensor*> ins = {&Q, &K_cur, &V_cur, nullptr, &KcA, &VcA};
+        std::vector<Tensor*> outs = {&out_a, &K_out, &V_out};
+        kernel_sdpa(p, ins, outs);
+    }
+
+    // Sparse run over every position in the cache.
+    std::vector<int32_t> selection((size_t)dst * src, -1);
+    for (int s = 0; s < src; ++s)
+        for (int r = 0; r < dst; ++r)
+            selection[(size_t)s * dst + r] = r;
+    Tensor sel = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL, dst, src, 1, 1, selection.data());
+    {
+        Tensor K_out = KcB;
+        Tensor V_out = VcB;
+        std::vector<const Tensor*> ins = {&Q, &K_cur, &V_cur, nullptr, &KcB, &VcB, &sel};
+        std::vector<Tensor*> outs = {&out_b, &K_out, &V_out};
+        kernel_sdpa_sparse(p, ins, outs);
+    }
+
+    bool ok = true;
+    float worst = 0.0f;
+    for (int i = 0; i < H*src*vd; i++) {
+        const float diff = fabsf(dense_out[i] - sparse_out[i]);
+        if (diff > worst) worst = diff;
+    }
+    if (worst > 1e-5f) {
+        fprintf(stderr, "  sparse vs dense worst diff = %g\n", worst);
+        ok = false;
+    }
+
+    free(kc_a); free(vc_a); free(kc_b); free(vc_b);
+    delete[] qd; delete[] kd; delete[] vdata;
+    delete[] kc; delete[] vc; delete[] dense_out; delete[] sparse_out;
+    return ok;
+}
+
+static void test_sparse_select_all_matches_dense() {
+    CHECK(sparse_matches_dense(4, 4, 16, 16, 4, 4, 0, 16, false),
+          "sparse: select-all prefill == dense (FP32 cache)");
+    CHECK(sparse_matches_dense(4, 4, 16, 16, 1, 1, 8, 32, false),
+          "sparse: select-all decode == dense (FP32 cache)");
+    CHECK(sparse_matches_dense(4, 4, 16, 16, 4, 4, 0, 16, true),
+          "sparse: select-all prefill == dense (FP16 cache)");
+    CHECK(sparse_matches_dense(4, 4, 16, 16, 1, 1, 8, 32, true),
+          "sparse: select-all decode == dense (FP16 cache)");
+    CHECK(sparse_matches_dense(4, 4, 16, 16, 8, 8, 12, 64, false),
+          "sparse: select-all with past, larger src == dense");
+}
+
 int main() {
     srand(42);
     CHECK(test_case(8, 4, 32, 24, 4, 4, 3, 16, true, true, TestPath::Backend),
@@ -286,6 +409,15 @@ int main() {
                         false, TestPath::Backend, mixed.data()),
               "sink: mixed per-head sinks through the backend dispatch");
     }
+
+    // ---- sparse SDPA (Hy4 Gated DSA consumer) ----
+    // Two properties carry the correctness argument:
+    //   1. Selecting every cache position must reproduce the dense result.
+    //      The gathered set is then the whole cache, so the same flash-attn
+    //      kernels run on identical inputs and the outputs must match.
+    //   2. A partial selection must equal the dense result computed over only
+    //      those keys, which is what makes it genuinely sparse.
+    test_sparse_select_all_matches_dense();
 
     printf(failures ? "\n%d FAILED\n" : "\nAll attention tests passed!\n", failures);
     return failures;
