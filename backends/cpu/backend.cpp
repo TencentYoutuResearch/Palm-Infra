@@ -235,6 +235,8 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::DSV4_INDEXER:
     case OpType::DSV4_SPARSE_ATTN:
     case OpType::DSV4_GROUPED_LINEAR:
+    // The Hy4 indexer shares this dispatcher and the DSV4 config types.
+    case OpType::HY4_INDEXER:
         if (!dispatch_cpu_deepseek_v4(
                 node, inputs, output, thread_pool))
             reject();

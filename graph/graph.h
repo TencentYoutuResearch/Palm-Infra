@@ -133,6 +133,8 @@ enum class OpType : uint32_t {
     HC_PRE_ID            = 138,
     HC_POST_ID           = 139,
     HC_HEAD_ID           = 141,
+    // Hy4 Gated-DSA indexer; selects the top-k keys a later SDPA attends to.
+    HY4_INDEXER          = 142,
     DSV4_COMPRESSOR      = 160,
     DSV4_INDEXER         = 161,
     DSV4_SPARSE_ATTN     = 162,
@@ -196,6 +198,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::HC_PRE_ID: return "HC_PRE_ID";
     case OpType::HC_POST_ID: return "HC_POST_ID";
     case OpType::HC_HEAD_ID: return "HC_HEAD_ID";
+    case OpType::HY4_INDEXER: return "HY4_INDEXER";
     case OpType::DSV4_COMPRESSOR: return "DSV4_COMPRESSOR";
     case OpType::DSV4_INDEXER: return "DSV4_INDEXER";
     case OpType::DSV4_SPARSE_ATTN: return "DSV4_SPARSE_ATTN";
