@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -38,6 +39,7 @@ from transpile import (
     GraphBuilder,
     Precision,
     SEQ,
+    save_package,
 )
 from safetensors_stream import (
     SafeTensorIndex,
@@ -456,22 +458,86 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
         graph, streamed, index, "final_norm", "model.norm.weight",
         (hidden_size,))
     output = graph.rms_norm(collapsed, final_norm, eps)
+
+    # Engine boundary weights. Every graph needs both, and the loader resolves
+    # them by name, so they are registered once per graph even though the
+    # prefill and decode graphs share the same streamed entry.
+    vocab = int(cfg["vocab_size"])
+    embed_ref = "embed_tokens"
+    head_ref = "lm_head"
+    _dense_weight(
+        graph, streamed, index, embed_ref,
+        "model.embed_tokens.weight", (vocab, hidden_size))
+    _dense_weight(
+        graph, streamed, index, head_ref,
+        "lm_head.weight", (vocab, hidden_size))
     return graph, streamed
 
 
-def convert(model_dir: str, output_path: str, **kwargs) -> None:
-    """Converter registry entry point.
+def convert(model_dir: str, output_path: str,
+            prefill_seq_len: int = 32, n_ctx: int = 16384) -> None:
+    """Convert a Hy4-preview checkpoint into a .mollm package.
 
-    Deliberately not implemented yet: build_graph still needs the DSA
-    indexer + IndexCache wiring, and the export path needs the streamed
-    writers for the 3-D fused expert tensors. Fail loudly rather than
-    produce a package that would silently skip sparse attention.
+    FP16 only for now: no quantization, so this does not need
+    mollm-quantize and keeps the first end-to-end run as simple as
+    possible. Quantized packages follow once this path is known good.
     """
-    cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    model_dir_path = Path(model_dir)
+    cfg = json.loads((model_dir_path / "config.json").read_text())
     if cfg.get("model_type") != "hy_v4":
         raise ValueError(
-            f"not a Hy4 config: model_type={cfg.get('model_type')!r}")
-    raise NotImplementedError(
-        "Hy4 conversion is incomplete: the graph builder covers MLA, the "
-        "attention sink, the gating and the MoE branches, but DSA indexer "
-        "and IndexCache wiring plus the expert export path are still to do.")
+            f"checkpoint is not Hy4: model_type={cfg.get('model_type')!r}")
+
+    # One graph per execution shape. The weight registry is shared, so a
+    # weight requested by both graphs is streamed into the package once.
+    prefill, prefill_weights = build_graph(
+        model_dir_path, cfg, prefill_seq_len, n_ctx, is_prefill=True)
+    decode, decode_weights = build_graph(
+        model_dir_path, cfg, 1, n_ctx, is_prefill=False)
+    streamed = dict(prefill_weights)
+    streamed.update(decode_weights)
+
+    num_layers = int(cfg["num_hidden_layers"])
+    metadata = {
+        "model_name": "Hy4-preview",
+        "architecture": "hy-v4",
+        "num_layers": num_layers,
+        "hidden_size": int(cfg["hidden_size"]),
+        "num_heads": int(cfg["num_attention_heads"]),
+        "num_kv_heads": int(cfg["num_attention_heads"]),
+        "head_dim": int(cfg["qk_head_dim"]),
+        "rope_dim": int(cfg["qk_rope_head_dim"]),
+        "rope_theta": float(
+            cfg.get("rope_parameters", {}).get("rope_theta", 1e7)),
+        "prefill_seq_len": prefill_seq_len,
+        "n_ctx": n_ctx,
+        "vocab_size": int(cfg["vocab_size"]),
+        "num_experts": int(cfg["n_routed_experts"]),
+        "num_experts_per_tok": int(cfg["num_experts_per_tok"]),
+        "first_k_dense_replace": int(cfg.get("first_k_dense_replace", 1)),
+        "n_shared_experts": int(cfg.get("n_shared_experts", 0) or 0),
+        "hc_mult": int(cfg["hc_mult"]),
+        "indexer_types": list(cfg["indexer_types"]),
+        "quantization": "fp16",
+    }
+
+    # A directory is required by save_package even when every weight is
+    # streamed: the graphs' weight nodes carry their own names.
+    with tempfile.TemporaryDirectory(prefix="mollm_hy4_") as empty_dir:
+        save_package(
+            output_path, prefill, decode, empty_dir, metadata,
+            tokenizer_path=str(model_dir_path / "tokenizer.json"),
+            jinja_path=str(model_dir_path / "chat_template.jinja"),
+            streamed_weights=streamed)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("model_dir")
+    parser.add_argument("output")
+    parser.add_argument("--prefill-seq-len", type=int, default=32)
+    parser.add_argument("--n-ctx", type=int, default=16384)
+    args = parser.parse_args()
+    convert(args.model_dir, args.output,
+            args.prefill_seq_len, args.n_ctx)

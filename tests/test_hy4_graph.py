@@ -74,6 +74,7 @@ def tiny_cfg(layers=4, indexer_types=None):
         "num_experts_per_tok": 2,
         "norm_topk_prob": True,
         "routed_scaling_factor": 2.827,
+        "vocab_size": 128,
         "swiglu_limit": 10.0,
         "indexer_types": indexer_types or ["full"] * layers,
         "index_n_heads": 2,
@@ -226,6 +227,12 @@ def test_weight_shapes():
           f"five indexer tensors on a full layer, got {len(indexer_sources)}")
     check(not any("compress" in s for s in indexer_sources),
           "Hy4's indexer must not reference compressor tensors")
+
+    # Boundary weights: without these the graph cannot embed or produce logits.
+    check(by_label.get("embed_tokens") == (cfg["vocab_size"], hidden),
+          f"embed_tokens shape, got {by_label.get('embed_tokens')}")
+    check(by_label.get("lm_head") == (cfg["vocab_size"], hidden),
+          f"lm_head shape, got {by_label.get('lm_head')}")
     print("  PASS: Hy4-specific weight shapes")
 
 
@@ -278,25 +285,24 @@ def test_bad_config_rejected():
     print("  PASS: malformed config rejected")
 
 
-def test_convert_refuses():
-    """convert() must not emit a package while DSA is partially wired.
+def test_convert_rejects_non_hy4():
+    """convert() must refuse a checkpoint that is not Hy4.
 
-    It reads config.json first, so write a minimal Hy4 config to a temp dir
-    and assert it then refuses for the right reason rather than failing on
-    a missing file.
+    It reads config.json first, so write a non-Hy4 config and assert it
+    fails on the model type rather than on a missing file.
     """
     import json
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, "config.json"), "w") as f:
-            json.dump({"model_type": "hy_v4"}, f)
+            json.dump({"model_type": "qwen3"}, f)
         try:
             hy4.convert(tmp, os.path.join(tmp, "out.mollm"))
-            raise AssertionError("convert() should refuse")
-        except NotImplementedError:
+            raise AssertionError("convert() should reject a non-Hy4 config")
+        except ValueError:
             pass
-    print("  PASS: convert() refuses while incomplete")
+    print("  PASS: convert() rejects a non-Hy4 checkpoint")
 
 
 def main():
@@ -307,7 +313,7 @@ def main():
     test_dense_lead_is_dense()
     test_decode_path_builds()
     test_bad_config_rejected()
-    test_convert_refuses()
+    test_convert_rejects_non_hy4()
     print("\nAll Hy4 graph tests passed!")
     return 0
 
