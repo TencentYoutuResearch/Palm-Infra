@@ -16,12 +16,6 @@
 #include <storage/mapped_file.h>
 #include <storage/byte_ranges.h>
 #include <storage/ssd_expert_cache/cache.h>
-// Installed legacy paths remain usable alongside their canonical headers.
-#include <graph/buffer_pool.h>
-#include <kernels/threading.h>
-#include <kernels/trace.h>
-#include <graph/mmap_file.h>
-#include <kernels/moe_ssd.h>
 
 int main() {
     EngineConfig config;

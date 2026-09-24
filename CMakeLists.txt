@@ -134,11 +134,6 @@ set(PUBLIC_ENGINE_HEADERS
     engine/tokenizer.h
 )
 
-set(PUBLIC_ENGINE_COMPAT_HEADERS
-    compat/engine/accelerator_backend.h
-    compat/engine/backend.h
-)
-
 set(PUBLIC_CORE_HEADERS
     core/tensor.h
     core/fp16.h
@@ -178,22 +173,6 @@ set(PUBLIC_GRAPH_HEADERS
     graph/execute.h
 )
 
-set(PUBLIC_GRAPH_COMPAT_HEADERS
-    compat/graph/buffer_pool.h
-    compat/graph/mmap_file.h
-)
-
-set(PUBLIC_KERNEL_COMPAT_HEADERS
-    compat/kernels/cpu_platform.h
-    compat/kernels/moe_ssd.h
-    compat/kernels/prepared_weight.h
-    compat/kernels/bf16.h
-    compat/kernels/quant_layouts.h
-    compat/kernels/tensor.h
-    compat/kernels/threading.h
-    compat/kernels/trace.h
-)
-
 add_library(mollm_lib STATIC ${SOURCES})
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -222,7 +201,6 @@ add_library(mollm::mollm ALIAS mollm_lib)
 set_target_properties(mollm_lib PROPERTIES EXPORT_NAME mollm)
 target_include_directories(mollm_lib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/compat>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/mollm>
 )
@@ -711,8 +689,6 @@ install(TARGETS mollm_lib
         INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm)
 install(FILES ${PUBLIC_ENGINE_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/engine)
-install(FILES ${PUBLIC_ENGINE_COMPAT_HEADERS}
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/engine)
 install(FILES ${PUBLIC_CORE_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/core)
 install(FILES ${PUBLIC_RUNTIME_HEADERS}
@@ -725,10 +701,6 @@ install(FILES storage/ssd_expert_cache/cache.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/storage/ssd_expert_cache)
 install(FILES ${PUBLIC_GRAPH_HEADERS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/graph)
-install(FILES ${PUBLIC_GRAPH_COMPAT_HEADERS}
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/graph)
-install(FILES ${PUBLIC_KERNEL_COMPAT_HEADERS}
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/mollm/kernels)
 
 configure_package_config_file(
     cmake/mollmConfig.cmake.in

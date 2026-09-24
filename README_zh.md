@@ -297,7 +297,6 @@ Palm-Infra/
 ├── examples/   CLI、服务端和性能评估程序
 ├── tools/      独立开发工具
 ├── tests/      单元、后端与端到端测试
-├── compat/     旧 include 路径的转发头文件
 └── cmake/      安装包与下游项目构建支持
 ```
 

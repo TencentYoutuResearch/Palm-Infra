@@ -1,4 +1,4 @@
-#include "kernels/tensor.h"
+#include "core/tensor.h"
 #include <cstdio>
 #include <cstdlib>
 
