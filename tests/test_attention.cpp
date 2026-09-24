@@ -331,6 +331,18 @@ static void test_sparse_select_all_matches_dense() {
           "sparse: select-all with past, larger src == dense");
 }
 
+// A selection that names every visible position carries no sparsity, so the
+// entry must fall back to the dense kernel rather than pay lookup overhead.
+// The fallback is exact, so the result is the dense result either way; what
+// this pins is that a full-width selection still produces correct output and
+// does not read past the cache.
+static void test_sparse_falls_back_when_selection_is_not_sparser() {
+    CHECK(sparse_matches_dense(4, 4, 16, 16, 4, 4, 0, 16, true),
+          "sparse: full-width selection at short context (FP16)");
+    CHECK(sparse_matches_dense(4, 4, 16, 16, 2, 2, 2, 16, false),
+          "sparse: full-width selection just past the fallback point");
+}
+
 int main() {
     srand(42);
     CHECK(test_case(8, 4, 32, 24, 4, 4, 3, 16, true, true, TestPath::Backend),
@@ -418,6 +430,7 @@ int main() {
     //   2. A partial selection must equal the dense result computed over only
     //      those keys, which is what makes it genuinely sparse.
     test_sparse_select_all_matches_dense();
+    test_sparse_falls_back_when_selection_is_not_sparser();
 
     printf(failures ? "\n%d FAILED\n" : "\nAll attention tests passed!\n", failures);
     return failures;
