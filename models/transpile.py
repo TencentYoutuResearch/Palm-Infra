@@ -699,7 +699,8 @@ class GraphBuilder:
              scale: float = 0.0,
              num_heads: int = 16, num_kv_heads: int = 16,
              head_dim: int = 192, v_head_dim: int = 128,
-             sink: int | None = None
+             sink: int | None = None,
+             selection: int | None = None
              ) -> tuple[int, int, int]:
         sq = self._nodes[q].out_shape
         out_shape = (v_head_dim, sq[1], num_heads)
@@ -708,6 +709,13 @@ class GraphBuilder:
         sdpa_inputs = [q, k_cur, v_cur, mask, k_cache, v_cache]
         if sink is not None:
             sdpa_inputs.append(sink)
+        # `selection` is an optional INT32 [top_k, seq] key selection from the
+        # Hy4 Gated-DSA indexer. When present the attention should restrict
+        # itself to those keys, which is what makes DSA sparse; the CPU kernel
+        # does not consume it yet, so a graph carrying one will currently
+        # compute dense attention over the cache.
+        if selection is not None:
+            sdpa_inputs.append(selection)
         attn = self._add(OpType.SDPA, sdpa_inputs,
                          out_shape, prec=self._nodes[q].out_prec,
                          i32=[kv_cache, 1 if causal else 0,
