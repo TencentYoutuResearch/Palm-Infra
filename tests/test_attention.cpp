@@ -247,7 +247,9 @@ int main() {
     // sink must leave the result indistinguishable from no sink, since
     // exp(sink - max) underflows and the denominator reverts to the keys.
     {
-        const int sink_heads = 8;
+        // Must match the head count of every case below (H=16): the kernel
+        // indexes the sink per query head.
+        const int sink_heads = 16;
         std::vector<float> small(sink_heads, -100.0f);
         CHECK(test_case(16, 16, 64, 64, 1, 1, 0, 256, false,
                         false, TestPath::Kernel, small.data()),

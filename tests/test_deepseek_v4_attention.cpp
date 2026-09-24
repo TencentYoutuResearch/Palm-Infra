@@ -370,6 +370,170 @@ int main() {
               "optimized grouped FP8 projection matches exact reference");
     }
 
+
+    // ---------------------------------------------------------------------
+    // Hy4 indexer (Gated DSA)
+    //
+    // Unlike the DeepSeek-V4 indexer, Hy4 has no learned compressor: keys are
+    // `wk @ hidden` directly, so there is no compressor state and no ratio.
+    //
+    // Fixture (num_heads=1, head_dim=2, rope_dim=0 so scores stay exact):
+    //   hidden columns  t0 = (1,0), t1 = (0,1)
+    //   wk, wq_b        identity  ->  keys = hidden, queries = q_lora
+    //   q_lora          = hidden
+    //   weights_proj    [1,1]     ->  weight = h0 + h1 = 1 for both tokens
+    //   k_norm          weight 1, bias 0
+    //   weight_scale    = 1/sqrt(head_dim * num_heads) = 1/sqrt(2) = 0.7071
+    //
+    //   token 0 sees only key 0: q.k = 1 -> score 0.7071, selects key 0
+    //   token 1 sees keys 0,1:   key0 scores 0 (orthogonal), key1 scores
+    //                            0.7071, so key 1 must rank STRICTLY first
+    //                            and key 0 second.
+    // ---------------------------------------------------------------------
+    {
+        Hy4IndexerConfig cfg;
+        cfg.hidden_size = 2;
+        cfg.q_lora_rank = 2;
+        cfg.num_heads = 1;
+        cfg.head_dim = 2;
+        cfg.rope_dim = 0;
+        cfg.top_k = 2;
+        cfg.capacity = 4;
+        cfg.rope.rope_dim = 0;
+
+        float hidden_data[4] = {1, 0, 0, 1};
+        float q_lora_data[4] = {1, 0, 0, 1};
+        float wk_data[4] = {1, 0, 0, 1};
+        float wq_b_data[4] = {1, 0, 0, 1};
+        float weights_proj_data[2] = {1, 1};
+        float k_norm_w[2] = {1, 1};
+        float k_norm_b[2] = {0, 0};
+        std::vector<float> key_cache(2 * 4, -7.0f);
+        int32_t index_data[4] = {9, 9, 9, 9};
+
+        Tensor hidden = tensor(hidden_data, 2, 2);
+        Tensor q_lora = tensor(q_lora_data, 2, 2);
+        Tensor wk = tensor(wk_data, 2, 2);
+        Tensor wq_b = tensor(wq_b_data, 2, 2);
+        Tensor weights_proj = tensor(weights_proj_data, 1, 2);
+        Tensor k_norm_weight = tensor(k_norm_w, 2);
+        Tensor k_norm_bias = tensor(k_norm_b, 2);
+        Tensor key_cache_t = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            2, 4, 1, 1, key_cache.data());
+        Tensor indices = Tensor::create(
+            Precision::INT32, MemoryType::EXTERNAL,
+            2, 2, 1, 1, index_data);
+
+        CHECK(kernel_hy4_indexer(
+                  hidden, q_lora, wq_b, wk, weights_proj,
+                  k_norm_weight, k_norm_bias, key_cache_t, indices,
+                  0, cfg),
+              "Hy4 indexer executes");
+
+        // Keys land in the cache at their absolute positions.
+        CHECK(close(key_cache[0], 1.0f) && close(key_cache[1], 0.0f),
+              "Hy4 indexer caches token 0 key at position 0");
+        CHECK(close(key_cache[2], 0.0f) && close(key_cache[3], 1.0f),
+              "Hy4 indexer caches token 1 key at position 1");
+
+        // token 0 has one available key, so slot 1 stays at the -1 sentinel.
+        CHECK(index_data[0] == 0 && index_data[1] == -1,
+              "Hy4 indexer selects key 0 for token 0 and leaves the rest -1");
+
+        // token 1 must rank key 1 above key 0 (strict, not a tie).
+        CHECK(index_data[2] == 1 && index_data[3] == 0,
+              "Hy4 indexer ranks key 1 strictly above key 0 for token 1");
+    }
+
+    // top_k smaller than the visible window must truncate, not overflow.
+    {
+        Hy4IndexerConfig cfg;
+        cfg.hidden_size = 2;
+        cfg.q_lora_rank = 2;
+        cfg.num_heads = 1;
+        cfg.head_dim = 2;
+        cfg.rope_dim = 0;
+        cfg.top_k = 1;
+        cfg.capacity = 4;
+        cfg.rope.rope_dim = 0;
+
+        float hidden_data[4] = {1, 0, 0, 1};
+        float q_lora_data[4] = {1, 0, 0, 1};
+        float wk_data[4] = {1, 0, 0, 1};
+        float wq_b_data[4] = {1, 0, 0, 1};
+        float weights_proj_data[2] = {1, 1};
+        float k_norm_w[2] = {1, 1};
+        float k_norm_b[2] = {0, 0};
+        std::vector<float> key_cache(2 * 4, 0.0f);
+        int32_t index_data[2] = {9, 9};
+
+        Tensor hidden = tensor(hidden_data, 2, 2);
+        Tensor q_lora = tensor(q_lora_data, 2, 2);
+        Tensor wk = tensor(wk_data, 2, 2);
+        Tensor wq_b = tensor(wq_b_data, 2, 2);
+        Tensor weights_proj = tensor(weights_proj_data, 1, 2);
+        Tensor k_norm_weight = tensor(k_norm_w, 2);
+        Tensor k_norm_bias = tensor(k_norm_b, 2);
+        Tensor key_cache_t = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            2, 4, 1, 1, key_cache.data());
+        Tensor indices = Tensor::create(
+            Precision::INT32, MemoryType::EXTERNAL,
+            1, 2, 1, 1, index_data);
+
+        CHECK(kernel_hy4_indexer(
+                  hidden, q_lora, wq_b, wk, weights_proj,
+                  k_norm_weight, k_norm_bias, key_cache_t, indices,
+                  0, cfg),
+              "Hy4 indexer honours a smaller top_k");
+        CHECK(index_data[0] == 0 && index_data[1] == 1,
+              "Hy4 indexer writes one index per position when top_k is 1");
+    }
+
+    // A wrong-shaped wk must be rejected rather than read out of bounds.
+    {
+        Hy4IndexerConfig cfg;
+        cfg.hidden_size = 2;
+        cfg.q_lora_rank = 2;
+        cfg.num_heads = 1;
+        cfg.head_dim = 2;
+        cfg.rope_dim = 0;
+        cfg.top_k = 1;
+        cfg.capacity = 4;
+        cfg.rope.rope_dim = 0;
+
+        float hidden_data[4] = {1, 0, 0, 1};
+        float q_lora_data[4] = {1, 0, 0, 1};
+        float wrong_wk[4] = {1, 0, 0, 1};   // declared as [3, 2], not [2, 2]
+        float wq_b_data[4] = {1, 0, 0, 1};
+        float weights_proj_data[2] = {1, 1};
+        float k_norm_w[2] = {1, 1};
+        float k_norm_b[2] = {0, 0};
+        std::vector<float> key_cache(2 * 4, 0.0f);
+        int32_t index_data[1] = {9};
+
+        Tensor hidden = tensor(hidden_data, 2, 2);
+        Tensor q_lora = tensor(q_lora_data, 2, 2);
+        Tensor wk_bad = tensor(wrong_wk, 3, 2);
+        Tensor wq_b = tensor(wq_b_data, 2, 2);
+        Tensor weights_proj = tensor(weights_proj_data, 1, 2);
+        Tensor k_norm_weight = tensor(k_norm_w, 2);
+        Tensor k_norm_bias = tensor(k_norm_b, 2);
+        Tensor key_cache_t = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            2, 4, 1, 1, key_cache.data());
+        Tensor indices = Tensor::create(
+            Precision::INT32, MemoryType::EXTERNAL,
+            1, 1, 1, 1, index_data);
+
+        CHECK(!kernel_hy4_indexer(
+                  hidden, q_lora, wq_b, wk_bad, weights_proj,
+                  k_norm_weight, k_norm_bias, key_cache_t, indices,
+                  0, cfg),
+              "Hy4 indexer rejects a mis-shaped wk");
+    }
+
     if (failures) {
         std::fprintf(stderr, "%d DeepSeek-V4 attention test(s) failed\n",
                      failures);
