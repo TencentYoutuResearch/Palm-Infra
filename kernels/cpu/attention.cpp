@@ -144,11 +144,128 @@ static void flash_attn_fp32_decode(
 }
 
 // Prefill kernel: Br=4, Bc=32, 2D tiled with online softmax
+// Indirect variant of flash_attn_fp32_prefill: same online softmax, keys
+// addressed through `selected`. M is always 1 from the sparse entry.
+static void flash_attn_fp32_prefill_selected(
+    const float* Q, const float* K, const float* V, float* O,
+    const int32_t* selected, int n, int d_k, int d_v, float scale,
+    int visible_limit, const float* sink = nullptr)
+{
+    float m = sink ? *sink : -FLT_MAX;
+    float l = sink ? 1.f : 0.f;
+    memset(O, 0, d_v * sizeof(float));
+    for (int j = 0; j < n; j++) {
+        const int pos = selected[j];
+        if (pos < 0 || pos > visible_limit) continue;
+        const float s = dot_fp32_neon(Q, K + (size_t)pos * d_k, d_k) * scale;
+        const float m_new = fmaxf(m, s);
+        const float alpha = fast_exp_f32(m - m_new);
+        const float p = fast_exp_f32(s - m_new);
+        float32x4_t va = vdupq_n_f32(alpha);
+        float32x4_t vp = vdupq_n_f32(p);
+        const float* vj = V + (size_t)pos * d_v;
+        int d = 0;
+        for (; d + 7 < d_v; d += 8) {
+            vst1q_f32(O + d, vfmaq_f32(vmulq_f32(vld1q_f32(O + d), va), vp, vld1q_f32(vj + d)));
+            vst1q_f32(O + d + 4, vfmaq_f32(vmulq_f32(vld1q_f32(O + d + 4), va), vp, vld1q_f32(vj + d + 4)));
+        }
+        for (; d + 3 < d_v; d += 4)
+            vst1q_f32(O + d, vfmaq_f32(vmulq_f32(vld1q_f32(O + d), va), vp, vld1q_f32(vj + d)));
+        for (; d < d_v; d++) O[d] = O[d] * alpha + p * vj[d];
+        l = l * alpha + p;
+        m = m_new;
+    }
+    if (l > 0.f) {
+        const float inv = 1.f / l;
+        float32x4_t vi = vdupq_n_f32(inv);
+        int d = 0;
+        for (; d + 3 < d_v; d += 4)
+            vst1q_f32(O + d, vmulq_f32(vld1q_f32(O + d), vi));
+        for (; d < d_v; d++) O[d] *= inv;
+    }
+}
+
+// Indirect variant of flash_attn_fp32_decode: identical control flow and
+// online softmax, except each key is addressed through `selected` rather than
+// by contiguity. `n` is the number of selected entries, not the cache length.
+static void flash_attn_fp32_decode_selected(
+    const float* Q, const float* K, const float* V, float* O,
+    const int32_t* selected, int n, int d_k, int d_v, float scale,
+    int visible_limit, const float* sink = nullptr)
+{
+    const int Bc = 32;
+    const bool sparse = selected != nullptr;
+    float m = sink ? *sink : -FLT_MAX;
+    float l = sink ? 1.f : 0.f;
+    memset(O, 0, d_v * sizeof(float));
+
+    for (int jb = 0; jb < n; jb += Bc) {
+        const int bc = (jb + Bc <= n) ? Bc : (n - jb);
+        float scores[32];
+        for (int j = 0; j < bc; j++) {
+            const int pos = sparse ? selected[jb + j] : (jb + j);
+            // Causality is re-applied here: the selection may name positions
+            // the query cannot see yet.
+            if (pos < 0 || pos > visible_limit) {
+                scores[j] = -INFINITY;
+                continue;
+            }
+            scores[j] = dot_fp32_neon(Q, K + (size_t)pos * d_k, d_k) * scale;
+        }
+        float m_block = scores[0];
+        for (int j = 1; j < bc; j++) m_block = fmaxf(m_block, scores[j]);
+        float m_new = fmaxf(m, m_block);
+        float alpha = (m_new == m) ? 1.f : fast_exp_f32(m - m_new);
+        if (l != 0.f && alpha != 1.f) {
+            float32x4_t valpha = vdupq_n_f32(alpha);
+            int d = 0;
+            for (; d + 7 < d_v; d += 8) {
+                vst1q_f32(O + d, vmulq_f32(vld1q_f32(O + d), valpha));
+                vst1q_f32(O + d + 4, vmulq_f32(vld1q_f32(O + d + 4), valpha));
+            }
+            for (; d + 3 < d_v; d += 4)
+                vst1q_f32(O + d, vmulq_f32(vld1q_f32(O + d), valpha));
+            for (; d < d_v; d++) O[d] *= alpha;
+        }
+        l *= alpha;
+        for (int j = 0; j < bc; j++) {
+            const int pos = sparse ? selected[jb + j] : (jb + j);
+            if (pos < 0 || pos > visible_limit) continue;
+            const float p = fast_exp_f32(scores[j] - m_new);
+            l += p;
+            const float* vj = V + (size_t)pos * d_v;
+            float32x4_t vp = vdupq_n_f32(p);
+            int d = 0;
+            for (; d + 7 < d_v; d += 8) {
+                vst1q_f32(O + d, vfmaq_f32(vld1q_f32(O + d), vp, vld1q_f32(vj + d)));
+                vst1q_f32(O + d + 4, vfmaq_f32(vld1q_f32(O + d + 4), vp, vld1q_f32(vj + d + 4)));
+            }
+            for (; d + 3 < d_v; d += 4)
+                vst1q_f32(O + d, vfmaq_f32(vld1q_f32(O + d), vp, vld1q_f32(vj + d)));
+            for (; d < d_v; d++) O[d] += p * vj[d];
+        }
+        m = m_new;
+    }
+    if (l > 0.f) {
+        const float inv_l = 1.f / l;
+        float32x4_t vinv = vdupq_n_f32(inv_l);
+        int d = 0;
+        for (; d + 3 < d_v; d += 4)
+            vst1q_f32(O + d, vmulq_f32(vld1q_f32(O + d), vinv));
+        for (; d < d_v; d++) O[d] *= inv_l;
+    }
+}
+
 static void flash_attn_fp32_prefill(
     const float* Q, const float* K, const float* V, float* O,
     int M, int N, int d_k, int d_v, float scale, const float* mask,
     const float* sink = nullptr)
 {
+    // FP32 prefill keeps contiguous addressing; the sparse entry uses the
+    // dedicated indirect variant below.
+    const int32_t* selected = nullptr;
+    const int visible_limit = INT32_MAX;
+    (void)selected; (void)visible_limit;
     const int Br = 4;
     const int Bc = 32;
     float* row_m = (float*)malloc(M * sizeof(float));
@@ -472,12 +589,24 @@ static inline void dot_fp16_8x(const __fp16* Q,
 
 // FP16 decode kernel: M=1, Bc=64, online softmax, FP16FML PV accumulation.
 // Q/K/V are FP16 (caller converts from FP32). O is FP32 output.
+// `selected`, when given, names the cache position for each visited key, so
+// `N` becomes the number of selected entries rather than the cache length.
+// `visible_limit` re-applies causality against those positions.
 static void flash_attn_fp16_decode(
     const __fp16* Q, const __fp16* K, const __fp16* V, float* O,
     int N, int d_k, int d_v, float scale, const float* mask,
-    const float* sink = nullptr)
+    const float* sink = nullptr,
+    const int32_t* selected = nullptr, int visible_limit = INT32_MAX)
 {
     const int Bc = 64;
+    const bool sparse = selected != nullptr;
+    // Cache position for a block-local slot.
+    auto key_pos = [&](int slot) -> int {
+        if (!sparse) return slot;
+        const int pos = selected[slot];
+        if (pos < 0 || pos > visible_limit) return -1;
+        return pos;
+    };
 
     // A per-head sink is a virtual extra key logit: it seeds the running max
     // and denominator but has no value row, so it never enters the numerator.
@@ -493,8 +622,22 @@ static void flash_attn_fp16_decode(
         const int bc = (jb + Bc <= N) ? Bc : (N - jb);
 
         // 1. QK scores: 4-way batched FP16FML dot product
+        //
+        // Selecting permutes the keys, so the 4-wide batch can only be used
+        // when addressing stays contiguous. In sparse mode the batched dot is
+        // skipped in favour of single-key dots: measurements on real indexer
+        // output show selected positions are essentially never adjacent
+        // (mean run length 1.00), so there is nothing to batch anyway.
         float scores[64];
-        {
+        if (sparse) {
+            for (int j = 0; j < bc; j++) {
+                const int pos = key_pos(jb + j);
+                scores[j] = (pos < 0)
+                    ? -INFINITY
+                    : dot_fp16_neon(Q, K + (size_t)pos * d_k, d_k) * scale;
+                if (pos >= 0 && mask) scores[j] += mask[jb + j];
+            }
+        } else {
             int j = 0;
             for (; j + 3 < bc; j += 4) {
                 dot_fp16_4x(Q,
@@ -580,7 +723,9 @@ static void flash_attn_fp16_decode(
 
                 for (int j = 0; j < bc; j++) {
                     float16x4_t vp = vdup_n_f16((__fp16)scores[j]);
-                    const __fp16* vj = V + (jb + j) * d_v + d_start;
+                    const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
 
                     float16x8_t v01 = vld1q_f16(vj + 0);
                     float16x8_t v23 = vld1q_f16(vj + 8);
@@ -633,7 +778,9 @@ static void flash_attn_fp16_decode(
                 float32x4_t o1 = vld1q_f32(O_fp32 + d_start + 4);
                 for (int j = 0; j < bc; j++) {
                     float16x4_t vp = vdup_n_f16((__fp16)scores[j]);
-                    const __fp16* vj = V + (jb + j) * d_v + d_start;
+                    const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                     float16x8_t v = vld1q_f16(vj);
                     o0 = vfmlalq_lane_low_f16(o0, v, vp, 0);
                     o1 = vfmlalq_lane_high_f16(o1, v, vp, 0);
@@ -647,7 +794,9 @@ static void flash_attn_fp16_decode(
                 float32x4_t o0 = vld1q_f32(O_fp32 + d_start);
                 for (int j = 0; j < bc; j++) {
                     float16x4_t vp = vdup_n_f16((__fp16)scores[j]);
-                    const __fp16* vj = V + (jb + j) * d_v + d_start;
+                    const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                     float16x4_t v = vld1_f16(vj);
                     o0 = vfmlalq_lane_low_f16(o0, vcombine_f16(v, v), vp, 0);
                 }
@@ -692,8 +841,16 @@ static void flash_attn_fp16_decode(
 static void flash_attn_fp16_prefill(
     const __fp16* Q, const __fp16* K, const __fp16* V, float* O,
     int M, int N, int d_k, int d_v, float scale, const float* mask,
-    const float* sink = nullptr)
+    const float* sink = nullptr,
+    const int32_t* selected = nullptr, int visible_limit = INT32_MAX)
 {
+    const bool sparse = selected != nullptr;
+    auto key_pos = [&](int slot) -> int {
+        if (!sparse) return slot;
+        const int pos = selected[slot];
+        if (pos < 0 || pos > visible_limit) return -1;
+        return pos;
+    };
     // Rewritten kernel (尝试 27): Br=8, Bc=64, register-tiled PV.
     //
     // Why: previous Br=4 Bc=32 with non-tiled PV was issue-bound at ~34 GF/s/head
@@ -728,6 +885,21 @@ static void flash_attn_fp16_prefill(
             float S[8][64];
 
             // ---- QK: 8 K rows × 1 Q row per dot_fp16_8x call ----
+            // Sparse selection permutes the keys, so the batched dots only
+            // apply when addressing stays contiguous (see the decode note).
+            if (sparse) {
+                for (int i = 0; i < br; i++) {
+                    const __fp16* qi = Q + (ib + i) * d_k;
+                    for (int j = 0; j < bc; j++) {
+                        const int pos = key_pos(jb + j);
+                        S[i][j] = (pos < 0)
+                            ? -INFINITY
+                            : dot_fp16_neon(qi, K + (size_t)pos * d_k, d_k) * scale;
+                        if (pos >= 0 && mask)
+                            S[i][j] += mask[(ib + i) * N + jb + j];
+                    }
+                }
+            } else {
             for (int i = 0; i < br; i++) {
                 const __fp16* qi = Q + (ib + i) * d_k;
                 int j = 0;
@@ -760,6 +932,7 @@ static void flash_attn_fp16_prefill(
                     S[i][j] = dot_fp16_neon(qi, K + (jb + j) * d_k, d_k) * scale;
                     if (mask) S[i][j] += mask[(ib + i) * N + jb + j];
                 }
+            }
             }
 
             // ---- Online softmax + register-tiled PV (per Q row) ----
@@ -835,7 +1008,9 @@ static void flash_attn_fp16_prefill(
 
                     for (int j = 0; j < bc; j++) {
                         float p = P[j];
-                        const __fp16* vj = V + (jb + j) * d_v + d_start;
+                        const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                         float16x4_t vp = vdup_n_f16((__fp16)p);
                         float16x8_t v01 = vld1q_f16(vj + 0);
                         float16x8_t v23 = vld1q_f16(vj + 8);
@@ -887,7 +1062,9 @@ static void flash_attn_fp16_prefill(
                     float32x4_t o1 = vld1q_f32(oi + d_start + 4);
                     for (int j = 0; j < bc; j++) {
                         float p = P[j];
-                        const __fp16* vj = V + (jb + j) * d_v + d_start;
+                        const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                         float16x4_t vp = vdup_n_f16((__fp16)p);
                         float16x8_t v0 = vld1q_f16(vj);
                         o0 = vfmlalq_lane_low_f16 (o0, v0, vp, 0);
@@ -901,7 +1078,9 @@ static void flash_attn_fp16_prefill(
                     float32x4_t o0 = vld1q_f32(oi + d_start);
                     for (int j = 0; j < bc; j++) {
                         float p = P[j];
-                        const __fp16* vj = V + (jb + j) * d_v + d_start;
+                        const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                         float16x4_t vp = vdup_n_f16((__fp16)p);
                         // Load 4 FP16 values into low half of a FP16x8 for FMLAL.
                         float16x8_t v0 = vld1q_f16(vj);
@@ -1397,6 +1576,23 @@ void kernel_sdpa_sparse(const SdpaParams& params,
     const int width = static_cast<int>(selection->shape[0]);
 
     const Tensor& Q     = *inputs[0];
+    const Tensor& K_cur_probe = *inputs[1];
+    // Exact dense fallback: if the selection names at least as many keys as
+    // there are visible ones, sparse can only add lookup overhead. This
+    // covers short contexts automatically (a fresh cache has few positions)
+    // without a tuned threshold, and never costs correctness because the
+    // dense path is the reference the sparse one must match.
+    if (K_cur_probe.data) {
+        const Tensor* kc =
+            (inputs.size() > 4 && inputs[4] && inputs[4]->data) ? inputs[4] : nullptr;
+        const int past = kc ? static_cast<int>(cache_meta(kc->data)->current_seq_len) : 0;
+        const int visible = past + static_cast<int>(K_cur_probe.shape[1]);
+        if (width >= visible) {
+            kernel_sdpa(params, inputs, outputs, thread_pool);
+            return;
+        }
+    }
+
     const Tensor& K_cur = *inputs[1];
     const Tensor& V_cur = *inputs[2];
     // The indexer already applied causality when ranking, so the gathered
@@ -1509,61 +1705,51 @@ void kernel_sdpa_sparse(const SdpaParams& params,
             for (int s = 0; s < src_seqlen; s++) {
                 const int32_t* token_selection =
                     selection_data + static_cast<size_t>(s) * width;
-                // A query at position past+s may see cache positions up to
-                // and including past+s. Enforcing it here keeps the sparse
-                // result equal to dense when the selection names wider keys.
+                // Each kernel re-applies causality against the positions the
+                // selection names, so pass the query's visibility limit.
                 const int visible_limit = past_seqlen + s;
-                const int count = gather_selected_kv(
-                    token_selection, width, dst_seqlen, visible_limit,
-                    k_head, v_head, element_bytes, head_dim, v_head_dim,
-                    k_gather, v_gather, &causal_mask);
-                if (count <= 0)
-                    continue;
-
-                const float* q_head = Q.ptr<float>() +
+                const float* q_row = Q.ptr<float>() +
                     static_cast<size_t>(s) * Q.stride[1] / sizeof(float) +
                     static_cast<size_t>(h) * Q.stride[2] / sizeof(float);
                 float* o_row = o_head + static_cast<size_t>(s) *
                     out.stride[1] / sizeof(float);
-
-                // Stage the query row contiguously for the prefill kernels.
-                for (int d = 0; d < head_dim; d++)
-                    q_stage[d] = q_head[d];
+                const int width_for_query = width;
 
                 if (cache_is_fp16) {
                     std::vector<__fp16> q16(static_cast<size_t>(head_dim));
                     for (int d = 0; d < head_dim; d++)
-                        q16[d] = (__fp16)q_stage[d];
+                        q16[d] = (__fp16)q_row[d];
                     if (src_seqlen == 1) {
                         flash_attn_fp16_decode(
                             q16.data(),
-                            reinterpret_cast<const __fp16*>(k_gather.data()),
-                            reinterpret_cast<const __fp16*>(v_gather.data()),
-                            o_row, count, head_dim, v_head_dim, scale,
-                            causal_mask.data(), nullptr);
+                            static_cast<const __fp16*>(k_head),
+                            static_cast<const __fp16*>(v_head), o_row,
+                            width_for_query, head_dim, v_head_dim, scale,
+                            nullptr, nullptr,
+                            token_selection, visible_limit);
                     } else {
+                        // One query row per call; the prefill kernel walks M=1.
                         flash_attn_fp16_prefill(
                             q16.data(),
-                            reinterpret_cast<const __fp16*>(k_gather.data()),
-                            reinterpret_cast<const __fp16*>(v_gather.data()),
-                            o_row, 1, count, head_dim, v_head_dim, scale,
-                            causal_mask.data(), nullptr);
+                            static_cast<const __fp16*>(k_head),
+                            static_cast<const __fp16*>(v_head), o_row,
+                            1, width_for_query, head_dim, v_head_dim, scale,
+                            nullptr, nullptr,
+                            token_selection, visible_limit);
                     }
                 } else {
                     if (src_seqlen == 1) {
-                        flash_attn_fp32_decode(
-                            q_head,
-                            reinterpret_cast<const float*>(k_gather.data()),
-                            reinterpret_cast<const float*>(v_gather.data()),
-                            o_row, count, head_dim, v_head_dim, scale,
-                            causal_mask.data(), nullptr);
+                        flash_attn_fp32_decode_selected(
+                            q_row, static_cast<const float*>(k_head),
+                            static_cast<const float*>(v_head), o_row,
+                            token_selection, width_for_query, head_dim,
+                            v_head_dim, scale, visible_limit, nullptr);
                     } else {
-                        flash_attn_fp32_prefill(
-                            q_stage.data(),
-                            reinterpret_cast<const float*>(k_gather.data()),
-                            reinterpret_cast<const float*>(v_gather.data()),
-                            o_row, 1, count, head_dim, v_head_dim, scale,
-                            causal_mask.data(), nullptr);
+                        flash_attn_fp32_prefill_selected(
+                            q_row, static_cast<const float*>(k_head),
+                            static_cast<const float*>(v_head), o_row,
+                            token_selection, width_for_query, head_dim,
+                            v_head_dim, scale, visible_limit, nullptr);
                     }
                 }
             }
