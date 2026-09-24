@@ -1036,6 +1036,11 @@ void kernel_sdpa(const SdpaParams& params,
     const Tensor& Q      = *inputs[0];
     const Tensor& K_cur  = *inputs[1];
     const Tensor& V_cur  = *inputs[2];
+    // A per-head sink is indexed by query head, so the caller must supply
+    // num_heads entries. Reject an impossible count rather than read past it.
+    if (params.sink && params.num_heads <= 0) {
+        return;
+    }
     const Tensor* mask   = (inputs.size() > 3 && inputs[3] && inputs[3]->data) ? inputs[3] : nullptr;
     const Tensor* K_cache= (inputs.size() > 4 && inputs[4] && inputs[4]->data) ? inputs[4] : nullptr;
     const Tensor* V_cache= (inputs.size() > 5 && inputs[5] && inputs[5]->data) ? inputs[5] : nullptr;
