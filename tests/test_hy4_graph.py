@@ -174,7 +174,15 @@ def test_shared_layer_reuses_selection():
 
 
 def test_weight_shapes():
-    """Shapes that differ from the DeepSeek-V4 iHC variant."""
+    """Shapes that differ from the DeepSeek-V4 iHC variant.
+
+    The expert aggregates are the subtle one: the checkpoint stores them 3-D
+    as [experts, rows, K], but the graph must declare [experts*rows, K]
+    because the loader assigns shape[0]/shape[1] straight from the node and
+    the kernel then indexes by row with stride K. Declaring the 3-D form
+    compiles and produces the same byte count, but sets shape[1] to `rows`
+    instead of K and reads the wrong elements.
+    """
     cfg = tiny_cfg(layers=2)
     cfg["indexer_types"] = ["full", "shared"]
     graph, captured = build(cfg, seq_len=4, n_ctx=64, is_prefill=True)
@@ -200,9 +208,11 @@ def test_weight_shapes():
         # one logit per attention head
         "layer_0_attn_sink": (heads,),
         "layer_0_attn_linear_gate_weight": (heads * v_head, hidden),
-        # routed experts are stored fused and 3-D
-        "layer_1_ffn_experts_gate_up": (experts, 2 * moe_i, hidden),
-        "layer_1_ffn_experts_down": (experts, hidden, moe_i),
+        # Routed experts are fused in the checkpoint but the graph declares
+        # the flattened form: the loader reads shape[0]/shape[1] from the node
+        # and the MoE kernel indexes expert e at row e*rows with row stride K.
+        "layer_1_ffn_experts_gate_up": (experts * 2 * moe_i, hidden),
+        "layer_1_ffn_experts_down": (experts * hidden, moe_i),
         "layer_1_ffn_router_bias": (experts,),
     }
     for label, want in expected.items():
