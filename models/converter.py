@@ -10,6 +10,7 @@ The converter reads <model_dir>/config.json to determine the model type:
     - model_type "qwen3_5"  → Qwen3.5 converter (qwen35.py)
     - model_type "qwen3_5_moe" → Qwen3.5-MoE text converter (qwen35_moe.py)
     - model_type "hy_v3"       → HY-V3 MoE converter (qwen3_moe.py)
+    - model_type "hy_v4"       → Hy4-preview converter (hy4.py)
     - model_type "youtu"    → Youtu-LLM MLA converter (mla.py)
     Others → error with supported types list.
 """
@@ -27,6 +28,7 @@ SUPPORTED_MODELS = {
     "qwen3_5":     ("qwen35",     "convert_qwen35"),
     "qwen3_5_moe": ("qwen35_moe", "convert_qwen35_moe"),
     "hy_v3":       ("qwen3_moe",  "convert_hy_v3"),
+    "hy_v4":       ("hy4",        "convert"),
     "qwen4_exp":    ("qwen4_exp",   "convert_qwen4_exp"),
     "youtu":       ("mla",        "convert_mla"),
 }

@@ -89,6 +89,10 @@ class OpType(IntEnum):
     PLE_LOOKUP     = 135
     PLE_GATE       = 136
     PLE_DILATED_CONV = 137
+    # Hy4 identity Hyper-Connections; values must match graph/graph.h.
+    HC_PRE_ID      = 138
+    HC_POST_ID     = 139
+    HC_HEAD_ID     = 141
     DSV4_COMPRESSOR = 160
     DSV4_INDEXER = 161
     DSV4_SPARSE_ATTN = 162
@@ -1123,6 +1127,42 @@ class GraphBuilder:
         sx = self._nodes[x].out_shape
         return self._add(
             OpType.HC_HEAD, [x, fn, scale, base],
+            (hidden_size, sx[1]), prec=Precision.FP32,
+            i32=[hidden_size, hc_mult], f32=[norm_eps, hc_eps])
+
+    def hc_pre_id(self, x: int, fn: int, scale: int, base: int,
+                  hidden_size: int, hc_mult: int = 4,
+                  hc_magnitude: float = 2.0, norm_eps: float = 1e-6,
+                  hc_eps: float = 1e-6) -> int:
+        """Hy4 identity Hyper-Connections: reduce hc streams to one.
+
+        Unlike hc_pre there is no Sinkhorn mixing matrix, so `fn` is
+        [2*hc_mult, hc_mult*hidden_size] and the packed output carries only
+        the reduced state plus the per-stream post gate.
+        """
+        sx = self._nodes[x].out_shape
+        packed_size = hidden_size + hc_mult
+        return self._add(
+            OpType.HC_PRE_ID, [x, fn, scale, base],
+            (packed_size, sx[1]), prec=Precision.FP32,
+            i32=[hidden_size, hc_mult],
+            f32=[hc_magnitude, norm_eps, hc_eps])
+
+    def hc_post_id(self, branch: int, residual: int, packed: int,
+                   hidden_size: int, hc_mult: int = 4) -> int:
+        """Hy4 iHC: apply each stream's gate to its own residual."""
+        sr = self._nodes[residual].out_shape
+        return self._add(
+            OpType.HC_POST_ID, [branch, residual, packed], sr,
+            prec=Precision.FP32, i32=[hidden_size, hc_mult])
+
+    def hc_head_id(self, x: int, fn: int, scale: int, base: int,
+                   hidden_size: int, hc_mult: int = 4,
+                   norm_eps: float = 1e-6, hc_eps: float = 1e-6) -> int:
+        """Hy4 iHC: collapse the hc streams once before the output head."""
+        sx = self._nodes[x].out_shape
+        return self._add(
+            OpType.HC_HEAD_ID, [x, fn, scale, base],
             (hidden_size, sx[1]), prec=Precision.FP32,
             i32=[hidden_size, hc_mult], f32=[norm_eps, hc_eps])
 
