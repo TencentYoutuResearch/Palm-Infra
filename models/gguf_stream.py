@@ -1,10 +1,10 @@
-"""Blockwise GGUF-to-XMAP conversion for small Hy4 correctness packages.
+"""GGUF-to-XMAP conversion for small Hy4 correctness packages.
 
 The official gguf-py decoder supplies K-quant and IQ codebooks. Its location
 is explicit so the converter does not silently depend on a sibling checkout.
-Each XMAP transform receives complete quantization blocks and writes FP16;
-no whole GGUF tensor is materialized in RAM. Full-model low-bit packaging
-will use native quantized storage instead of this diagnostic path.
+The diagnostic path decodes complete quantization blocks to FP16 without
+materializing whole tensors. Native K-quant weights are copied as raw blocks;
+other types still use the FP16 path until their CPU kernels are implemented.
 """
 
 from __future__ import annotations
@@ -18,6 +18,33 @@ import numpy as np
 from gguf_quants import dequantize_for_shape, ggml_type_info
 from gguf_reader import GgufIndex
 from transpile import Precision, StreamedWeight, WeightByteRange
+
+_NATIVE_PRECISION = {
+    "q8_0": Precision.GGUF_Q8_0,
+    "q4_K": Precision.GGUF_Q4_K,
+    "q5_K": Precision.GGUF_Q5_K,
+    "q6_K": Precision.GGUF_Q6_K,
+}
+
+
+def gguf_native_streamed_weight(index: GgufIndex, name: str) -> StreamedWeight:
+    """Keep a GGUF matrix in its original quantized block layout."""
+    tensor = index.tensor(name)
+    info = index.info(name)
+    quant = ggml_type_info(info.type_id)
+    precision = _NATIVE_PRECISION.get(quant.name)
+    if precision is None:
+        raise ValueError(f"{name}: no native kernel for {quant.name}")
+    if (len(info.logical_shape) not in (2, 3) or
+            info.logical_shape[-1] % quant.block_values or
+            (len(info.logical_shape) == 3 and quant.name != "q8_0")):
+        raise ValueError(
+            f"{name}: native quantization needs aligned 2-D rows, or "
+            "3-D Q8_0 rows")
+    return StreamedWeight(
+        precision=precision,
+        logical_shape=info.logical_shape,
+        data_ranges=[tensor.source])
 
 
 def _official_decoder(gguf_py_path: str | None):

@@ -96,6 +96,7 @@ set(SOURCES
     kernels/cpu/matmul/matmul_w4.cpp
     kernels/cpu/matmul/matmul_w8.cpp
     kernels/cpu/matmul/stq1_0.cpp
+    kernels/cpu/matmul/gguf_k.cpp
     kernels/cpu/matmul/matmul_mxfp4.cpp
     kernels/cpu/matmul/matmul_nvfp4.cpp
     ${MOLLM_CPU_PLATFORM_SOURCE}
@@ -570,6 +571,8 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_rope          tests/test_rope.cpp)
     add_mollm_test(test_attention     tests/test_attention.cpp)
     add_mollm_test(test_stq1_0        tests/test_stq1_0.cpp)
+    add_executable(gguf_k_decode_dump tests/gguf_k_decode_dump.cpp)
+    target_link_libraries(gguf_k_decode_dump PRIVATE mollm_lib)
     add_mollm_test(stq1_0_crosscheck  tests/stq1_0_crosscheck.cpp)
     # Not a test but a decoder dump the Python GGUF reader is diffed against
     # (see models/verify_gguf_reader.py). It takes a block file as an argument,

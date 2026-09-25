@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <limits>
+#include <utility>
 
 namespace {
 
@@ -58,6 +59,35 @@ int main() {
                   !weight.is_q4_repacked && !weight.is_q4_g32_packed &&
                   !weight.is_q4_g128_packed,
               "non-quantized weight clears stale quantization state");
+    }
+
+    {
+        for (auto [precision, block_bytes] : {
+                 std::pair{Precision::GGUF_Q4_K, 144},
+                 std::pair{Precision::GGUF_Q5_K, 176},
+                 std::pair{Precision::GGUF_Q6_K, 210}}) {
+            Tensor weight = make_weight(precision, 2, 512);
+            MappedFile::Header header =
+                make_header(4 * block_bytes, 0, 0, 0);
+            CHECK(mollm::detail::configure_weight_metadata(
+                      weight, header, nullptr, "gguf-k"),
+                  "accept raw GGUF K-quant blocks");
+            header.data_size--;
+            CHECK(!mollm::detail::configure_weight_metadata(
+                      weight, header, nullptr, "gguf-k-short"),
+                  "reject truncated GGUF K-quant blocks");
+        }
+        Tensor q8 = make_weight(Precision::GGUF_Q8_0, 2, 64);
+        MappedFile::Header q8_header = make_header(4 * 34, 0, 0, 0);
+        CHECK(mollm::detail::configure_weight_metadata(
+                  q8, q8_header, nullptr, "gguf-q8"),
+              "accept raw GGUF Q8_0 blocks");
+        Tensor q8_3d = Tensor::create(
+            Precision::GGUF_Q8_0, MemoryType::EXTERNAL, 2, 3, 64);
+        MappedFile::Header q8_3d_header = make_header(12 * 34, 0, 0, 0);
+        CHECK(mollm::detail::configure_weight_metadata(
+                  q8_3d, q8_3d_header, nullptr, "gguf-q8-3d"),
+              "accept raw GGUF Q8_0 head matrices");
     }
 
     {

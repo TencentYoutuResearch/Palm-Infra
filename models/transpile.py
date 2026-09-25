@@ -118,6 +118,10 @@ class Precision(IntEnum):
     # NVIDIA NVFP4: packed E2M1, one E4M3 block scale per 16 values, and a
     # per-matrix FP32 global scale. Currently used by SSD-backed MoE experts.
     NVFP4 = 8
+    GGUF_Q4_K = 9
+    GGUF_Q5_K = 10
+    GGUF_Q6_K = 11
+    GGUF_Q8_0 = 12
 
 
 # ---------------------------------------------------------------------------

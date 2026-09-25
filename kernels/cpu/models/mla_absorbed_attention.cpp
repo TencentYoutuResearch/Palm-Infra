@@ -3,6 +3,7 @@
 #include "core/cache_layout.h"
 #include "graph/graph.h"
 #include "runtime/threading.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 
 #include <algorithm>
 #include <cmath>
@@ -43,7 +44,10 @@ bool kernel_mla_absorbed_attention(
         graph_params::get_i32(p, 1, 0) != 1 ||
         q_nope.prec != Precision::FP32 || q_rope.prec != Precision::FP32 ||
         kv_cur.prec != Precision::FP32 || rope_cur.prec != Precision::FP32 ||
-        k_b.prec != Precision::FP16 || v_b.prec != Precision::FP16 ||
+        (k_b.prec != Precision::FP16 &&
+         k_b.prec != Precision::GGUF_Q8_0) ||
+        (v_b.prec != Precision::FP16 &&
+         v_b.prec != Precision::GGUF_Q8_0) ||
         cache.prec != Precision::FP16 || output->prec != Precision::FP32 ||
         mask.prec != Precision::FP32 ||
         q_rope.shape[0] != rope || q_rope.shape[1] != seq ||
@@ -94,14 +98,35 @@ bool kernel_mla_absorbed_attention(
         for (int c = 0; c < rope; ++c) dest[rank + c] = (__fp16)kr[c];
     }
 
-    const auto* kb = k_b.ptr<__fp16>();
-    const auto* vb = v_b.ptr<__fp16>();
+    const auto* kb = k_b.prec == Precision::FP16 ? k_b.ptr<__fp16>() : nullptr;
+    const auto* vb = v_b.prec == Precision::FP16 ? v_b.ptr<__fp16>() : nullptr;
+    const auto* kb_q8 = static_cast<const uint8_t*>(k_b.data);
+    const auto* vb_q8 = static_cast<const uint8_t*>(v_b.data);
     auto run_heads = [&](int, int first, int end) {
         std::vector<float> q_abs(rank);
         std::vector<float> weighted(rank);
+        std::vector<float> k_decoded, v_decoded;
+        if (!kb) k_decoded.resize((size_t)rank * nope);
+        if (!vb) v_decoded.resize((size_t)vdim * rank);
         for (int h = first; h < end; ++h) {
-            const __fp16* kh = kb + (size_t)h * rank * nope;
-            const __fp16* vh = vb + (size_t)h * vdim * rank;
+            const __fp16* kh = kb ? kb + (size_t)h * rank * nope : nullptr;
+            const __fp16* vh = vb ? vb + (size_t)h * vdim * rank : nullptr;
+            if (!kb) {
+                const size_t blocks = (size_t)rank * nope / 32;
+                const uint8_t* source = kb_q8 + (size_t)h * blocks * 34;
+                for (size_t b = 0; b < blocks; ++b)
+                    gguf_k_dequantize_block(
+                        Precision::GGUF_Q8_0, source + b * 34,
+                        k_decoded.data() + b * 32);
+            }
+            if (!vb) {
+                const size_t blocks = (size_t)vdim * rank / 32;
+                const uint8_t* source = vb_q8 + (size_t)h * blocks * 34;
+                for (size_t b = 0; b < blocks; ++b)
+                    gguf_k_dequantize_block(
+                        Precision::GGUF_Q8_0, source + b * 34,
+                        v_decoded.data() + b * 32);
+            }
             for (int s = 0; s < seq; ++s) {
                 const float* mask_row = reinterpret_cast<const float*>(
                     static_cast<const char*>(mask.data) +
@@ -114,8 +139,15 @@ bool kernel_mla_absorbed_attention(
                     (size_t)h * q_rope.stride[2] + (size_t)s * q_rope.stride[1]);
                 for (int c = 0; c < rank; ++c) {
                     float sum = 0.f;
-                    const __fp16* row = kh + (size_t)c * nope;
-                    for (int d = 0; d < nope; ++d) sum += qn[d] * (float)row[d];
+                    if (kh) {
+                        const __fp16* row = kh + (size_t)c * nope;
+                        for (int d = 0; d < nope; ++d)
+                            sum += qn[d] * (float)row[d];
+                    } else {
+                        const float* row = k_decoded.data() + (size_t)c * nope;
+                        for (int d = 0; d < nope; ++d)
+                            sum += qn[d] * row[d];
+                    }
                     q_abs[c] = sum;
                 }
                 std::fill(weighted.begin(), weighted.end(), 0.f);
@@ -166,10 +198,16 @@ bool kernel_mla_absorbed_attention(
                     continue;
                 }
                 for (int d = 0; d < vdim; ++d) {
-                    const __fp16* row = vh + (size_t)d * rank;
                     float sum = 0.f;
-                    for (int c = 0; c < rank; ++c)
-                        sum += (weighted[c] / denominator) * (float)row[c];
+                    if (vh) {
+                        const __fp16* row = vh + (size_t)d * rank;
+                        for (int c = 0; c < rank; ++c)
+                            sum += (weighted[c] / denominator) * (float)row[c];
+                    } else {
+                        const float* row = v_decoded.data() + (size_t)d * rank;
+                        for (int c = 0; c < rank; ++c)
+                            sum += (weighted[c] / denominator) * row[c];
+                    }
                     out[d] = sum;
                 }
             }

@@ -50,13 +50,16 @@ from safetensors_stream import (
 )
 from qwen3_moe import ROUTER_SCORE_SIGMOID
 from gguf_reader import GgufIndex, config_from_gguf, open_gguf
-from gguf_stream import gguf_fp16_streamed_weight
+from gguf_stream import gguf_fp16_streamed_weight, gguf_native_streamed_weight
+from gguf_quants import (GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+                         GGML_TYPE_Q6_K, GGML_TYPE_Q8_0)
 
 INDEXER_FULL = "full"
 
 # Resolved per graph inside build_graph; Hy4 always uses a prefill/decode pair.
 _S = 1
 _GGUF_PY_PATH: str | None = None
+_NATIVE_GGUF_K = False
 
 
 def _fp32_weight(graph: GraphBuilder, streamed: dict,
@@ -71,14 +74,19 @@ def _dense_weight(graph: GraphBuilder, streamed: dict,
                   index: SafeTensorIndex, label: str, source: str,
                   shape: tuple[int, ...]) -> int:
     if isinstance(index, GgufIndex):
-        streamed[label] = gguf_fp16_streamed_weight(
-            index, source, gguf_py_path=_GGUF_PY_PATH)
+        if _NATIVE_GGUF_K and index.info(source).type_id in (
+                GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+                GGML_TYPE_Q8_0):
+            streamed[label] = gguf_native_streamed_weight(index, source)
+        else:
+            streamed[label] = gguf_fp16_streamed_weight(
+                index, source, gguf_py_path=_GGUF_PY_PATH)
     else:
         streamed[label] = dense_streamed_weight(index, source)
     if tuple(streamed[label].logical_shape) != tuple(shape):
         raise ValueError(
             f"{source}: weight shape {streamed[label].logical_shape} != {shape}")
-    return graph.weight(label, shape, Precision.FP16)
+    return graph.weight(label, shape, streamed[label].precision)
 
 
 def _fused_experts(graph: GraphBuilder, streamed: dict,
@@ -211,10 +219,11 @@ def _add_attention_branch(
         f"{prefix}.kv_a_layernorm.weight", (kv_rank,))
     if absorbed:
         if isinstance(index, GgufIndex):
-            k_stream = gguf_fp16_streamed_weight(
-                index, f"{prefix}.k_b.weight", gguf_py_path=_GGUF_PY_PATH)
-            v_stream = gguf_fp16_streamed_weight(
-                index, f"{prefix}.v_b.weight", gguf_py_path=_GGUF_PY_PATH)
+            stream_fn = (gguf_native_streamed_weight if _NATIVE_GGUF_K else
+                         lambda idx, name: gguf_fp16_streamed_weight(
+                             idx, name, gguf_py_path=_GGUF_PY_PATH))
+            k_stream = stream_fn(index, f"{prefix}.k_b.weight")
+            v_stream = stream_fn(index, f"{prefix}.v_b.weight")
         else:
             k_stream, v_stream = split_mla_kv_b(
                 index, f"{prefix}.kv_b_proj.weight", num_heads=heads,
@@ -223,8 +232,10 @@ def _add_attention_branch(
         v_label = f"layer_{layer}_attn_v_b"
         streamed[k_label] = k_stream
         streamed[v_label] = v_stream
-        k_b = graph.weight(k_label, (heads, kv_rank, nope_dim), Precision.FP16)
-        v_b = graph.weight(v_label, (heads, v_head_dim, kv_rank), Precision.FP16)
+        k_b = graph.weight(k_label, (heads, kv_rank, nope_dim),
+                           getattr(k_stream, "precision", Precision.FP16))
+        v_b = graph.weight(v_label, (heads, v_head_dim, kv_rank),
+                           getattr(v_stream, "precision", Precision.FP16))
     else:
         wk_b = weight(
             "kv_b_proj.weight", (heads * (nope_dim + v_head_dim), kv_rank))
@@ -580,13 +591,14 @@ def convert(model_dir: str, output_path: str,
             prefill_seq_len: int = 32, n_ctx: int = 16384,
             absorbed: bool = False, layers: int | None = None,
             tokenizer_dir: str | None = None,
-            gguf_py_path: str | None = None) -> None:
+            gguf_py_path: str | None = None,
+            native_gguf_k: bool = False) -> None:
     """Convert a Hy4-preview checkpoint into a .mollm package.
 
     Safetensors and one-layer GGUF diagnostic packages use FP16 weights.
     The GGUF route decodes quantized blocks while writing the package.
     """
-    global _GGUF_PY_PATH
+    global _GGUF_PY_PATH, _NATIVE_GGUF_K
     model_dir_path = Path(model_dir)
     is_gguf = model_dir_path.is_file() and model_dir_path.suffix == ".gguf"
     if is_gguf:
@@ -597,7 +609,10 @@ def convert(model_dir: str, output_path: str,
         if tokenizer_dir is None:
             raise ValueError("GGUF packages require --tokenizer-dir")
         _GGUF_PY_PATH = gguf_py_path
+        _NATIVE_GGUF_K = native_gguf_k
     else:
+        if native_gguf_k:
+            raise ValueError("--native-gguf-k requires a GGUF checkpoint")
         index = None
         cfg = json.loads((model_dir_path / "config.json").read_text())
     if cfg.get("model_type") != "hy_v4":
@@ -649,7 +664,8 @@ def convert(model_dir: str, output_path: str,
         "n_shared_experts": int(cfg.get("n_shared_experts", 0) or 0),
         "hc_mult": int(cfg["hc_mult"]),
         "indexer_types": list(cfg["indexer_types"]),
-        "quantization": "gguf-dequant-fp16" if is_gguf else "fp16",
+        "quantization": ("gguf-native-blocks" if native_gguf_k else
+                         "gguf-dequant-fp16" if is_gguf else "fp16"),
     }
 
     # A directory is required by save_package even when every weight is
@@ -677,7 +693,11 @@ if __name__ == "__main__":
                         help="tokenizer and chat template directory for GGUF")
     parser.add_argument("--gguf-py",
                         help="path to llama.cpp/gguf-py for K-quant decoding")
+    parser.add_argument("--native-gguf", "--native-gguf-k",
+                        dest="native_gguf_k", action="store_true",
+                        help="retain Q4_K/Q5_K/Q6_K/Q8_0 blocks for CPU inference")
     args = parser.parse_args()
     convert(args.model_dir, args.output,
             args.prefill_seq_len, args.n_ctx, args.absorbed,
-            args.layers, args.tokenizer_dir, args.gguf_py)
+            args.layers, args.tokenizer_dir, args.gguf_py,
+            args.native_gguf_k)

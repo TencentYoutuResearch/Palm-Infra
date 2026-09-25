@@ -1,5 +1,6 @@
 #include "engine/weight_metadata.h"
 #include "runtime/host_compute.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -37,6 +38,37 @@ bool configure_weight_metadata(Tensor& tensor,
     tensor.q4_g32_data = nullptr;
     tensor.q4_g128_data = nullptr;
     tensor.prepared = {};
+
+    const size_t k_block_bytes = gguf_k_block_bytes(tensor.prec);
+    if (k_block_bytes) {
+        const uint64_t values_per_block = gguf_k_block_values(tensor.prec);
+        const bool q8_3d = tensor.prec == Precision::GGUF_Q8_0 &&
+                           tensor.shape[2] > 1 && tensor.shape[3] == 1;
+        uint64_t rows = static_cast<uint64_t>(tensor.shape[0]);
+        const bool valid_rows = !q8_3d ||
+            checked_multiply(rows, static_cast<uint64_t>(tensor.shape[1]),
+                             rows);
+        const uint64_t cols = q8_3d
+            ? static_cast<uint64_t>(tensor.shape[2])
+            : static_cast<uint64_t>(tensor.shape[1]);
+        uint64_t block_count = 0;
+        uint64_t expected_bytes = 0;
+        if (tensor.shape[0] <= 0 || tensor.shape[1] <= 0 ||
+            !valid_rows ||
+            (!q8_3d && (tensor.shape[2] != 1 || tensor.shape[3] != 1)) ||
+            cols % values_per_block ||
+            !checked_multiply(rows, cols / values_per_block, block_count) ||
+            !checked_multiply(block_count, k_block_bytes, expected_bytes) ||
+            header.data_size != expected_bytes || header.scales_size != 0 ||
+            header.group_size != 0 || header.num_groups != 0 ||
+            header.flags != 0) {
+            std::fprintf(stderr,
+                         "Engine: GGUF quantized weight %s has invalid layout\n",
+                         label);
+            return false;
+        }
+        return true;
+    }
 
     const bool is_quantized =
         tensor.prec == Precision::INT8 || tensor.prec == Precision::INT4 ||
