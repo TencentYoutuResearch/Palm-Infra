@@ -56,6 +56,23 @@ void scale_min(int group, const uint8_t* packed,
     }
 }
 
+#if defined(__aarch64__)
+void store_q5_values(uint8x16_t quantized, float scale, float minimum,
+                     float* output) {
+    const uint16x8_t low = vmovl_u8(vget_low_u8(quantized));
+    const uint16x8_t high = vmovl_u8(vget_high_u8(quantized));
+    const float32x4_t min_vec = vdupq_n_f32(minimum);
+    vst1q_f32(output, vsubq_f32(vmulq_n_f32(
+        vcvtq_f32_u32(vmovl_u16(vget_low_u16(low))), scale), min_vec));
+    vst1q_f32(output + 4, vsubq_f32(vmulq_n_f32(
+        vcvtq_f32_u32(vmovl_u16(vget_high_u16(low))), scale), min_vec));
+    vst1q_f32(output + 8, vsubq_f32(vmulq_n_f32(
+        vcvtq_f32_u32(vmovl_u16(vget_low_u16(high))), scale), min_vec));
+    vst1q_f32(output + 12, vsubq_f32(vmulq_n_f32(
+        vcvtq_f32_u32(vmovl_u16(vget_high_u16(high))), scale), min_vec));
+}
+#endif
+
 void decode_q4_or_q5(const uint8_t* block, float* out, bool five_bit) {
     const float d = half_value(block);
     const float dmin = half_value(block + 2);
@@ -67,6 +84,29 @@ void decode_q4_or_q5(const uint8_t* block, float* out, bool five_bit) {
         scale_min(quarter * 2, scales, s0, m0);
         scale_min(quarter * 2 + 1, scales, s1, m1);
         const int offset = quarter * 64;
+#if defined(__aarch64__)
+        if (five_bit) {
+            const float ds0 = d * s0;
+            const float ds1 = d * s1;
+            const float dm0 = dmin * m0;
+            const float dm1 = dmin * m1;
+            for (int lane = 0; lane < 32; lane += 16) {
+                const uint8x16_t q = vld1q_u8(low + quarter * 32 + lane);
+                const uint8x16_t h = vld1q_u8(high + lane);
+                const uint8x16_t q0 = vaddq_u8(
+                    vandq_u8(q, vdupq_n_u8(15)),
+                    vandq_u8(vtstq_u8(h, vdupq_n_u8(1 << (quarter * 2))),
+                                 vdupq_n_u8(16)));
+                const uint8x16_t q1 = vaddq_u8(
+                    vshrq_n_u8(q, 4),
+                    vandq_u8(vtstq_u8(h, vdupq_n_u8(2 << (quarter * 2))),
+                                 vdupq_n_u8(16)));
+                store_q5_values(q0, ds0, dm0, out + offset + lane);
+                store_q5_values(q1, ds1, dm1, out + offset + 32 + lane);
+            }
+            continue;
+        }
+#endif
         for (int lane = 0; lane < 32; ++lane) {
             const uint8_t q = low[quarter * 32 + lane];
             const uint8_t h = five_bit ? high[lane] : 0;
