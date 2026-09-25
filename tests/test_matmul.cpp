@@ -183,7 +183,8 @@ static float reference_half_to_float(uint16_t bits) {
 
 static bool gguf_half_scales_match_reference() {
     uint8_t block[34] = {};
-    block[2] = 1;
+    for (int i = 0; i < 32; ++i)
+        block[i + 2] = static_cast<uint8_t>((i * 37) - 128);
     float decoded[32];
     for (uint32_t bits = 0; bits < 65536; ++bits) {
         if ((bits & 0x7c00) == 0x7c00) continue;  // non-finite scale
@@ -191,9 +192,12 @@ static bool gguf_half_scales_match_reference() {
         block[1] = static_cast<uint8_t>(bits >> 8);
         if (!gguf_k_dequantize_block(Precision::GGUF_Q8_0, block, decoded))
             return false;
-        const float expected = reference_half_to_float(bits);
-        if (std::memcmp(&decoded[0], &expected, sizeof(float)) != 0)
-            return false;
+        const float scale = reference_half_to_float(bits);
+        for (int i = 0; i < 32; ++i) {
+            const float expected = scale * static_cast<int8_t>(block[i + 2]);
+            if (std::memcmp(&decoded[i], &expected, sizeof(float)) != 0)
+                return false;
+        }
     }
     return true;
 }
