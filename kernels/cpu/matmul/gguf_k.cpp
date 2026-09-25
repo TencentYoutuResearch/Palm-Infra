@@ -429,7 +429,27 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
                         sums[m] = sum0; sums[m + 1] = sum1;
                         sums[m + 2] = sum2; sums[m + 3] = sum3;
                     }
-                    for (int m = (M / 4) * 4; m + 2 <= M; m += 2) {
+                    int m = (M / 4) * 4;
+                    if (M - m == 3) {
+                        float sum0 = sums[m], sum1 = sums[m + 1];
+                        float sum2 = sums[m + 2];
+                        const float* a0 = input + size_t(m) * K + block * block_values;
+                        const float* a1 = a0 + K;
+                        const float* a2 = a1 + K;
+                        {
+#pragma clang fp contract(off)
+                            for (int k = 0; k < block_values; ++k) {
+                                const float weight = values[k];
+                                sum0 += a0[k] * weight;
+                                sum1 += a1[k] * weight;
+                                sum2 += a2[k] * weight;
+                            }
+                        }
+                        sums[m] = sum0; sums[m + 1] = sum1;
+                        sums[m + 2] = sum2;
+                        m += 3;
+                    }
+                    if (M - m >= 2) {
                         float sum0 = sums[m], sum1 = sums[m + 1];
                         const float* a0 = input + size_t(m) * K + block * block_values;
                         const float* a1 = a0 + K;
@@ -442,8 +462,9 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
                             }
                         }
                         sums[m] = sum0; sums[m + 1] = sum1;
+                        m += 2;
                     }
-                    for (int m = (M / 2) * 2; m < M; ++m) {
+                    if (m < M) {
                         const float* a = input + size_t(m) * K + block * block_values;
                         float sum = sums[m];
                         for (int k = 0; k < block_values; ++k)
