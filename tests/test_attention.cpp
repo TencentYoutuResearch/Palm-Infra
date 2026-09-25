@@ -280,6 +280,11 @@ static bool sparse_matches_dense(int H, int KV, int hd, int vd, int src,
     Tensor out_b = Tensor::create(Precision::FP32, MemoryType::OWNED, vd, src, H, 1, sparse_out);
 
     SdpaParams p{2, 1, H, KV, hd, vd, scale};
+    // The kernel locates the selection through this index rather than a
+    // fixed slot, so the test must declare where it put it. Without this the
+    // sparse entry falls back to the dense kernel and every assertion below
+    // compares dense against dense -- green, but testing nothing.
+    p.selection_input = 6;
 
     // Dense run.
     {
@@ -345,6 +350,145 @@ static void test_sparse_falls_back_when_selection_is_not_sparser() {
           "sparse: full-width selection at short context (FP16)");
     CHECK(sparse_matches_dense(4, 4, 16, 16, 2, 2, 2, 16, false),
           "sparse: full-width selection just past the fallback point");
+}
+
+// Every test above uses a full-width selection, which the kernel answers with
+// `kernel_sdpa` on its first check -- so none of them exercise the sparse
+// indexing loop. This one makes the selection strictly narrower than the
+// visible keys, which is the only configuration that reaches it.
+//
+// Two things are asserted. First, a narrow selection must DIFFER from dense:
+// if it does not, the selection was ignored and the comparison above proves
+// nothing. Second, the sparse result must equal a hand-computed attention over
+// exactly the selected keys -- so the test pins the arithmetic, not just that
+// something happened.
+static bool sparse_narrow_selects_only_listed_keys() {
+    const int H = 2, KV = 2, hd = 16, vd = 16, cap = 16;
+    const int past = 6, cur = 2;
+    const int dst = past + cur;
+    const int width = 3;                       // strictly fewer than dst
+    const float scale = 1.0f / sqrtf((float)hd);
+
+    float* qd = new float[H*cur*hd];  fill_rand(qd, H*cur*hd);
+    float* kd = new float[KV*cur*hd]; fill_rand(kd, KV*cur*hd);
+    float* vdata = new float[KV*cur*vd]; fill_rand(vdata, KV*cur*vd);
+    float* kc = new float[KV*cap*hd];
+    float* vc = new float[KV*cap*vd];
+    for (int h = 0; h < KV; ++h) {
+        for (int t = 0; t < past; ++t) {
+            for (int d = 0; d < hd; ++d)
+                kc[(h*cap + t)*hd + d] = sinf((float)(h*97 + t*13 + d)*0.017f);
+            for (int d = 0; d < vd; ++d)
+                vc[(h*cap + t)*vd + d] = cosf((float)(h*61 + t*29 + d)*0.013f);
+        }
+    }
+
+    const size_t es = sizeof(mollm::cpu::fp16_t);
+    const size_t ktot = CacheMetadata::SIZE + (size_t)KV*cap*hd*es;
+    const size_t vtot = CacheMetadata::SIZE + (size_t)KV*cap*vd*es;
+    void* kbuf = calloc(1, ktot); void* vbuf = calloc(1, vtot);
+    auto* kmeta = (CacheMetadata*)kbuf;
+    auto* vmeta = (CacheMetadata*)vbuf;
+    kmeta->max_seq_len = cap; kmeta->num_kv_heads = KV; kmeta->head_dim = hd;
+    kmeta->current_seq_len = past;
+    vmeta->max_seq_len = cap; vmeta->num_kv_heads = KV; vmeta->v_head_dim = vd;
+    vmeta->current_seq_len = past;
+    auto* kstore = (mollm::cpu::fp16_t*)((char*)kbuf + CacheMetadata::SIZE);
+    auto* vstore = (mollm::cpu::fp16_t*)((char*)vbuf + CacheMetadata::SIZE);
+    for (int h = 0; h < KV; ++h) {
+        for (int t = 0; t < past; ++t) {
+            for (int d = 0; d < hd; ++d)
+                kstore[(h*cap + t)*hd + d] =
+                    mollm::cpu::fp16_t(kc[(h*cap + t)*hd + d]);
+            for (int d = 0; d < vd; ++d)
+                vstore[(h*cap + t)*vd + d] =
+                    mollm::cpu::fp16_t(vc[(h*cap + t)*vd + d]);
+        }
+    }
+
+    auto Q  = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, cur, H, 1, qd);
+    auto Kc = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, cur, KV, 1, kd);
+    auto Vc = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vd, cur, KV, 1, vdata);
+    // The tensor data pointer must start at the metadata header, not the
+    // payload: the kernels read CacheMetadata from `data` and reach the
+    // payload via cache_data(). Passing `kstore` here would make the kernels
+    // reinterpret the first payload bytes as a header.
+    auto Kt = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, hd, cap, KV, 1, kbuf);
+    auto Vt = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, vd, cap, KV, 1, vbuf);
+    float* out = new float[H*cur*vd];
+    auto Ob = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vd, cur, H, 1, out);
+
+    // Select a fixed, known set of key positions: the last `width` of the
+    // visible window, in descending rank order (as the indexer emits them).
+    std::vector<int32_t> selection((size_t)width*cur, -1);
+    std::vector<int> chosen;
+    for (int r = 0; r < width; ++r) chosen.push_back(dst - 1 - r);
+    for (int s = 0; s < cur; ++s)
+        for (int r = 0; r < width; ++r)
+            selection[(size_t)s*width + r] = chosen[r];
+    auto St = Tensor::create(Precision::INT32, MemoryType::EXTERNAL,
+                             width, cur, 1, 1, selection.data());
+
+    Tensor Ko = Kt, Vo = Vt;
+    std::vector<const Tensor*> ins = {&Q, &Kc, &Vc, nullptr, &Kt, &Vt, &St};
+    std::vector<Tensor*> outs = {&Ob, &Ko, &Vo};
+    SdpaParams p{2, 1, H, KV, hd, vd, scale};
+    p.selection_input = 6;
+    kernel_sdpa_sparse(p, ins, outs);
+
+    // Reference: softmax over the selected keys only, per query position,
+    // with the same visibility limit the kernel applies.
+    bool ok = true;
+    float worst = 0.0f;
+    for (int s = 0; s < cur; ++s) {
+        const int visible_limit = past + s;
+        for (int h = 0; h < H; ++h) {
+            const int kvh = h / (H / KV);
+            std::vector<float> scores;
+            std::vector<int> keys;
+            for (int r = 0; r < width; ++r) {
+                const int key = chosen[r];
+                if (key < 0 || key > visible_limit) continue;   // causality
+                float dot = 0.0f;
+                for (int d = 0; d < hd; ++d) {
+                    const float kk = key < past
+                        ? kc[(kvh*cap + key)*hd + d]
+                        : kd[(kvh*cur + (key - past))*hd + d];
+                    dot += qd[(h*cur + s)*hd + d] * kk;
+                }
+                scores.push_back(dot * scale);
+                keys.push_back(key);
+            }
+            float mx = -INFINITY;
+            for (float v : scores) mx = fmaxf(mx, v);
+            float sum = 0.0f;
+            for (float& v : scores) { v = expf(v - mx); sum += v; }
+            for (int d = 0; d < vd; ++d) {
+                float acc = 0.0f;
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    const int key = keys[i];
+                    const float vv = key < past
+                        ? vc[(kvh*cap + key)*vd + d]
+                        : vdata[(kvh*cur + (key - past))*vd + d];
+                    acc += scores[i] / sum * vv;
+                }
+                const float got = out[(h*cur + s)*vd + d];
+                worst = fmaxf(worst, fabsf(got - acc));
+                if (fabsf(got - acc) > 2e-3f) ok = false;
+            }
+        }
+    }
+    if (!ok) fprintf(stderr, "  narrow sparse vs reference worst diff = %g\n", worst);
+
+    free(kbuf); free(vbuf);
+    delete[] qd; delete[] kd; delete[] vdata; delete[] kc; delete[] vc;
+    delete[] out;
+    return ok;
+}
+
+static void test_sparse_narrow_selection() {
+    CHECK(sparse_narrow_selects_only_listed_keys(),
+          "sparse: narrow selection matches softmax over exactly those keys");
 }
 
 // A graph node carrying a selection must reach kernel_sdpa_sparse through the
@@ -523,6 +667,7 @@ int main() {
     //      those keys, which is what makes it genuinely sparse.
     test_sparse_select_all_matches_dense();
     test_sparse_falls_back_when_selection_is_not_sparser();
+    test_sparse_narrow_selection();
     test_backend_dispatch_consumes_selection();
 
     printf(failures ? "\n%d FAILED\n" : "\nAll attention tests passed!\n", failures);

@@ -360,6 +360,14 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
         std::fprintf(stderr, "[error] prompt is empty after tokenization\n");
         return false;
     }
+    // Optional: echo the exact token ids so a reference implementation can be
+    // fed the identical sequence. Numerical alignment is meaningless if the
+    // two sides tokenize differently.
+    if (std::getenv("MOLLM_DUMP_IDS")) {
+        std::fprintf(stderr, "PROMPT_IDS");
+        for (int id : prompt_ids) std::fprintf(stderr, " %d", id);
+        std::fprintf(stderr, "\n");
+    }
     // No length check here — engine.prefill() handles chunked prefill for
     // prompts longer than graph_seq_len.
 

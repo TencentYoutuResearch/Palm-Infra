@@ -308,6 +308,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.RWKV_L2_NORM, OpType.RWKV_POST,
               OpType.MOE,
               OpType.HC_PRE, OpType.HC_POST, OpType.HC_HEAD,
+              OpType.HC_PRE_ID, OpType.HC_POST_ID, OpType.HC_HEAD_ID,
               OpType.GR_REDUCE, OpType.GR_INJECT,
               OpType.PLE_GATE, OpType.PLE_DILATED_CONV):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
@@ -324,7 +325,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
 
     if op in (OpType.MATMUL, OpType.MATMUL_BATCH, OpType.GEMV_SPARSE_A,
               OpType.DSV4_INDEXER, OpType.DSV4_SPARSE_ATTN,
-              OpType.DSV4_GROUPED_LINEAR):
+              OpType.DSV4_GROUPED_LINEAR, OpType.HY4_INDEXER):
         a = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, a[1], _CONST, _CONST)
 
@@ -1184,7 +1185,7 @@ class GraphBuilder:
 
     def hy4_indexer(self, hidden: int, q_lora: int, wq_b: int, wk: int,
                     weights_proj: int, k_norm_w: int, k_norm_b: int,
-                    key_cache: int, start_pos: int,
+                    key_cache: int, position: int, n_tokens: int,
                     hidden_size: int, q_lora_rank: int, num_heads: int,
                     head_dim: int, rope_dim: int, top_k: int,
                     capacity: int, theta: float = 1e7,
@@ -1195,12 +1196,13 @@ class GraphBuilder:
 
         Unlike the DeepSeek-V4 indexer there is no compressor; keys come
         straight from `wk @ hidden`. `q_lora` must already be normed.
+        `n_tokens` bounds the valid positions, as in the DSV4 indexer.
         """
         sx = self._nodes[hidden].out_shape
         return self._add(
             OpType.HY4_INDEXER,
             [hidden, q_lora, wq_b, wk, weights_proj, k_norm_w,
-             k_norm_b, key_cache, start_pos],
+             k_norm_b, key_cache, position, n_tokens],
             (top_k, sx[1]), prec=Precision.INT32,
             i32=[hidden_size, q_lora_rank, num_heads, head_dim,
                  rope_dim, top_k, capacity, original_context],

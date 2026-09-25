@@ -720,6 +720,46 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
         // Node dumping is an opt-in diagnostic.  Do not probe the process
         // environment for every graph node in normal inference.
         static const bool dump_nodes_enabled = getenv("MOLLM_DUMP_NODES") != nullptr;
+        // Raw dumps additionally cover INT32 nodes, because the DSA indexer's
+        // output is exactly what a selection mismatch would show up in.
+        static const char* raw_dump_dir = getenv("MOLLM_DUMP_TENSORS");
+        if (raw_dump_dir && *raw_dump_dir && out.data &&
+            (out.prec == Precision::FP32 || out.prec == Precision::INT32)) {
+            char rpath[1024];
+            snprintf(rpath, sizeof(rpath), "%s/raw_%03u_op_%d.%s",
+                     raw_dump_dir, node.id, (int)node.op_type,
+                     out.prec == Precision::INT32 ? "i32" : "f32");
+            if (FILE* rfp = fopen(rpath, "wb")) {
+                const void* src = out.data;
+                std::vector<int32_t> host_i32;
+                if (device_resident) {
+                    if (out.prec == Precision::INT32) {
+                        host_i32.resize(
+                            static_cast<size_t>(out.nelements()));
+                        ctx.backend->copy_to_host(
+                            out, host_i32.data(),
+                            host_i32.size() * sizeof(int32_t));
+                        src = host_i32.data();
+                    } else {
+                        src = nullptr;
+                    }
+                }
+                if (src) {
+                    fwrite(src, out.prec == Precision::INT32
+                                    ? sizeof(int32_t) : sizeof(float),
+                           static_cast<size_t>(out.nelements()), rfp);
+                }
+                fclose(rfp);
+                snprintf(rpath, sizeof(rpath), "%s/raw_%03u_op_%d.shape",
+                         raw_dump_dir, node.id, (int)node.op_type);
+                if (FILE* sp = fopen(rpath, "w")) {
+                    fprintf(sp, "%lld %lld %lld %lld\n",
+                            (long long)out.shape[0], (long long)out.shape[1],
+                            (long long)out.shape[2], (long long)out.shape[3]);
+                    fclose(sp);
+                }
+            }
+        }
         if (dump_nodes_enabled && out.data && out.prec == Precision::FP32) {
             std::vector<float> host_dump;
             const float* d = out.ptr<float>();

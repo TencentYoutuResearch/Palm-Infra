@@ -19,4 +19,11 @@ struct SdpaParams {
     //
     // Kept last so existing aggregate initialisation still compiles.
     const float* sink = nullptr;
+
+    // Index of the optional INT32 key-selection input in the node's input
+    // list, or -1 when absent (Hy4 Gated-DSA). An absent optional input
+    // shortens the input list instead of leaving a placeholder, so the index
+    // is recorded in params and must be honoured rather than assumed: `sink`
+    // may occupy an earlier slot.
+    int selection_input = -1;
 };
