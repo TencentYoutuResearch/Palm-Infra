@@ -296,7 +296,14 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
             }
         }
     };
-    if (pool) pool->parallel_for(0, N, 16, process);
+    if (pool) {
+        // Rows are independent. Let faster cores take more work on Macs with
+        // mixed core speeds, without changing the reduction order per row.
+        pool->parallel_for_2d(1, 1, N, 64,
+                              [&](int thread_id, int, int, int begin, int end) {
+                                  process(thread_id, begin, end);
+                              });
+    }
     else process(0, 0, N);
     matmul_apply_activation(output, M, N, N, 0, M, act,
                             act_n_begin, act_n_len);
