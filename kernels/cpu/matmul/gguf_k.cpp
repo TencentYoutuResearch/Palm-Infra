@@ -9,6 +9,10 @@
 #include <array>
 #include <cstring>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace {
 
 float half_value(const uint8_t* bytes) {
@@ -105,6 +109,24 @@ uint32_t load_u32(const uint8_t* bytes) {
            (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
 }
 
+#if defined(__aarch64__)
+void decode_signed_iq_grid8(uint64_t packed_grid, uint8_t signs,
+                            float scale, float* out) {
+    static constexpr uint8_t lane_bits[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x8_t grid = vcreate_u8(packed_grid);
+    const uint8x8_t negative = vtst_u8(
+        vdup_n_u8(signs), vld1_u8(lane_bits));
+    const uint8x8_t signed_bits = vsub_u8(veor_u8(grid, negative), negative);
+    const int16x8_t signed_values = vmovl_s8(vreinterpret_s8_u8(signed_bits));
+    const float32x4_t low = vcvtq_f32_s32(
+        vmovl_s16(vget_low_s16(signed_values)));
+    const float32x4_t high = vcvtq_f32_s32(
+        vmovl_s16(vget_high_s16(signed_values)));
+    vst1q_f32(out, vmulq_n_f32(low, scale));
+    vst1q_f32(out + 4, vmulq_n_f32(high, scale));
+}
+#endif
+
 void decode_iq2_xxs(const uint8_t* block, float* out) {
     const float d = half_value(block);
     const uint8_t* qs = block + 2;
@@ -116,10 +138,16 @@ void decode_iq2_xxs(const uint8_t* block, float* out) {
             const uint8_t* grid = iq2_grid + packed[part] * 8;
             const uint8_t signs = iq_signs[(signs_scale >> (7 * part)) & 127];
             float* y = out + group * 32 + part * 8;
+#if defined(__aarch64__)
+            uint64_t grid_bits;
+            std::memcpy(&grid_bits, grid, sizeof(grid_bits));
+            decode_signed_iq_grid8(grid_bits, signs, scale, y);
+#else
             for (int lane = 0; lane < 8; ++lane) {
                 const int sign = 1 - 2 * int((signs >> lane) & 1);
                 y[lane] = scale * (int(grid[lane]) * sign);
             }
+#endif
         }
     }
 }
@@ -136,12 +164,20 @@ void decode_iq3_xxs(const uint8_t* block, float* out) {
             const uint8_t* grid0 = iq3_grid + qs[group * 8 + part * 2] * 4;
             const uint8_t* grid1 = iq3_grid + qs[group * 8 + part * 2 + 1] * 4;
             float* y = out + group * 32 + part * 8;
+#if defined(__aarch64__)
+            uint32_t low, high;
+            std::memcpy(&low, grid0, sizeof(low));
+            std::memcpy(&high, grid1, sizeof(high));
+            decode_signed_iq_grid8(uint64_t(low) | (uint64_t(high) << 32),
+                                   signs, scale, y);
+#else
             for (int lane = 0; lane < 4; ++lane) {
                 const int sign0 = 1 - 2 * int((signs >> lane) & 1);
                 const int sign1 = 1 - 2 * int((signs >> (lane + 4)) & 1);
                 y[lane] = scale * (int(grid0[lane]) * sign0);
                 y[lane + 4] = scale * (int(grid1[lane]) * sign1);
             }
+#endif
         }
     }
 }
