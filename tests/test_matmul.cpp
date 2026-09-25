@@ -173,6 +173,63 @@ static bool gguf_half_scales_match_reference() {
     return true;
 }
 
+static bool gguf_q5_block_matches_scalar() {
+    constexpr uint16_t scales[] = {0x3c00, 0x3555, 0xbc00, 0x0400};
+    uint32_t state = 1;
+    for (uint16_t scale_bits : scales) {
+        uint8_t block[176];
+        for (auto& byte : block) {
+            state = state * 1664525u + 1013904223u;
+            byte = static_cast<uint8_t>(state >> 24);
+        }
+        block[0] = static_cast<uint8_t>(scale_bits);
+        block[1] = static_cast<uint8_t>(scale_bits >> 8);
+        block[2] = 0x55;
+        block[3] = 0x35;
+        float decoded[256];
+        if (!gguf_k_dequantize_block(Precision::GGUF_Q5_K, block, decoded))
+            return false;
+        const float d = reference_half_to_float(scale_bits);
+        const float dmin = reference_half_to_float(0x3555);
+        const uint8_t* packed_scales = block + 4;
+        const uint8_t* high = block + 16;
+        const uint8_t* low = block + 48;
+        for (int quarter = 0; quarter < 4; ++quarter) {
+            uint8_t group_scale[2], group_min[2];
+            for (int half = 0; half < 2; ++half) {
+                const int group = quarter * 2 + half;
+                if (group < 4) {
+                    group_scale[half] = packed_scales[group] & 63;
+                    group_min[half] = packed_scales[group + 4] & 63;
+                } else {
+                    group_scale[half] =
+                        (packed_scales[group + 4] & 15) |
+                        ((packed_scales[group - 4] >> 6) << 4);
+                    group_min[half] =
+                        (packed_scales[group + 4] >> 4) |
+                        ((packed_scales[group] >> 6) << 4);
+                }
+            }
+            for (int lane = 0; lane < 32; ++lane) {
+                const uint8_t q = low[quarter * 32 + lane];
+                const uint8_t h = high[lane];
+                const int q0 = (q & 15) + ((h >> (quarter * 2)) & 1) * 16;
+                const int q1 = (q >> 4) + ((h >> (quarter * 2 + 1)) & 1) * 16;
+                const float expected0 = (d * group_scale[0]) * q0 -
+                                        dmin * group_min[0];
+                const float expected1 = (d * group_scale[1]) * q1 -
+                                        dmin * group_min[1];
+                if (std::memcmp(&decoded[quarter * 64 + lane],
+                                &expected0, sizeof(float)) != 0 ||
+                    std::memcmp(&decoded[quarter * 64 + 32 + lane],
+                                &expected1, sizeof(float)) != 0)
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 static uint8_t reference_encode_fp8(float value) {
     if (std::isnan(value)) return 0x7f;
     const uint8_t sign = std::signbit(value) ? 0x80 : 0;
@@ -224,6 +281,8 @@ int main() {
           "all GGUF native matmul formats match blockwise reference");
     CHECK(gguf_half_scales_match_reference(),
           "GGUF FP16 scales match reference for every finite bit pattern");
+    CHECK(gguf_q5_block_matches_scalar(),
+          "GGUF Q5_K block matches independent scalar decoding");
 
     // ---- FP8/MXFP4 scalar format decoding ----
     {
