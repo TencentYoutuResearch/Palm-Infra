@@ -280,6 +280,42 @@ def test_decode_path_builds():
     print("  PASS: decode path")
 
 
+def test_absorbed_dense_cache():
+    """The latent cache is shared across heads and DSA selection is wired."""
+    cfg = tiny_cfg(layers=2, indexer_types=["full", "shared"])
+    original = hy4.split_mla_kv_b
+    hy4.split_mla_kv_b = lambda *args, **kwargs: (object(), object())
+    try:
+        graph, _ = build(cfg, seq_len=4, n_ctx=8,
+                         is_prefill=True, absorbed=True)
+        tally = count_ops(graph)
+        check(tally.get(OpType.SDPA_MLA_ABSORB) == 2,
+              "one absorbed attention op per layer")
+        caches = [node for node in graph._nodes
+                  if node.params_str and
+                  node.params_str[0].startswith("latent_cache")]
+        check(len(caches) == 2, "one latent cache per layer")
+        for cache in caches:
+            check(cache.out_shape == (12, 8, 1, 1),
+                  f"head-less latent shape, got {cache.out_shape}")
+        check(not any(node.params_str and
+                      node.params_str[0].startswith(("cache_k", "cache_v"))
+                      for node in graph._nodes),
+              "absorbed graph must not allocate explicit KV caches")
+        sparse_graph, _ = build(cfg, seq_len=4, n_ctx=16,
+                                is_prefill=True, absorbed=True)
+        for node in sparse_graph._nodes:
+            if node.op_type == OpType.SDPA_MLA_ABSORB:
+                selection_idx = node.params_i32[7]
+                check(selection_idx >= 0 and
+                      sparse_graph._nodes[node.inputs[selection_idx]].op_type ==
+                      OpType.HY4_INDEXER,
+                      "absorbed attention must consume DSA selection")
+    finally:
+        hy4.split_mla_kv_b = original
+    print("  PASS: absorbed cache has no head axis and carries DSA selection")
+
+
 def test_bad_config_rejected():
     """Malformed indexer_types fail loudly instead of building a wrong graph."""
     cfg = tiny_cfg(layers=3, indexer_types=["full", "shared"])
@@ -326,6 +362,7 @@ def main():
     test_weight_shapes()
     test_dense_lead_is_dense()
     test_decode_path_builds()
+    test_absorbed_dense_cache()
     test_bad_config_rejected()
     test_convert_rejects_non_hy4()
     print("\nAll Hy4 graph tests passed!")

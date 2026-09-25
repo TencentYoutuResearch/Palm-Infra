@@ -10,6 +10,7 @@
 #include "kernels/cpu/elementwise.h"
 #include "kernels/cpu/gated_residual.h"
 #include "kernels/cpu/hyper_connection.h"
+#include "kernels/cpu/models/mla_absorbed_attention.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/ple.h"
 #include "kernels/cpu/rope.h"
@@ -73,6 +74,10 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::SDPA:
     case OpType::SDPA_MLA:
         if (!dispatch_cpu_attention(node, inputs, output, thread_pool))
+            reject();
+        break;
+    case OpType::SDPA_MLA_ABSORB:
+        if (!kernel_mla_absorbed_attention(node, inputs, output, thread_pool))
             reject();
         break;
     case OpType::GATED_DELTANET_PREFILL:

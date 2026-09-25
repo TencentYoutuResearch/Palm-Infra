@@ -510,6 +510,18 @@ def split_mla_kv_b(index: SafeTensorIndex, name: str, *,
     transform = _bf16_to_fp16 if tensor.dtype == "BF16" else None
     item = 2  # FP16 bytes per element after the transform
 
+    def transpose_k_head(chunk: bytes) -> bytes:
+        """Convert one [nope, kv_lora] head into [kv_lora, nope]."""
+        expected = nope_dim * kv_lora_rank * item
+        if len(chunk) != expected:
+            raise ValueError(f"incomplete MLA K head: {len(chunk)} != {expected}")
+        if tensor.dtype == "BF16":
+            bits = np.frombuffer(chunk, dtype="<u2").astype(np.uint32) << 16
+            values = bits.view(np.float32).astype("<f2")
+        else:
+            values = np.frombuffer(chunk, dtype="<f2")
+        return values.reshape(nope_dim, kv_lora_rank).T.copy().tobytes()
+
     # Every head's k block starts at head * stride, and the k rows are the
     # first `nope_dim` of that block; v follows immediately. Element offsets
     # are per-row, so one range per head per output.
@@ -521,7 +533,8 @@ def split_mla_kv_b(index: SafeTensorIndex, name: str, *,
         k_ranges.append(WeightByteRange(
             tensor.source.path,
             tensor.source.offset + k_row_begin * fused_cols * item,
-            nope_dim * fused_cols * item, transform))
+            nope_dim * fused_cols * item, transpose_k_head,
+            transform_alignment=nope_dim * fused_cols * item))
         v_ranges.append(WeightByteRange(
             tensor.source.path,
             tensor.source.offset + v_row_begin * fused_cols * item,

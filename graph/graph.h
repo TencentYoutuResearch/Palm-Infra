@@ -87,6 +87,7 @@ enum class OpType : uint32_t {
     // attention
     SDPA     = 50,
     SDPA_MLA = 51,
+    SDPA_MLA_ABSORB = 52,
 
     // shape (zero-copy views)
     RESHAPE  = 60,
@@ -165,6 +166,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::ROTARY_EMBED: return "ROTARY_EMBED";
     case OpType::SDPA: return "SDPA";
     case OpType::SDPA_MLA: return "SDPA_MLA";
+    case OpType::SDPA_MLA_ABSORB: return "SDPA_MLA_ABSORB";
     case OpType::RESHAPE: return "RESHAPE";
     case OpType::PERMUTE: return "PERMUTE";
     case OpType::CONCAT: return "CONCAT";

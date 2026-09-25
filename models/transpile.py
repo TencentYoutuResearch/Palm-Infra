@@ -59,6 +59,7 @@ class OpType(IntEnum):
     ROTARY_EMBED   = 40
     SDPA           = 50
     SDPA_MLA       = 51
+    SDPA_MLA_ABSORB = 52
     RESHAPE        = 60
     PERMUTE        = 61
     CONCAT         = 62
@@ -329,7 +330,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
         a = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, a[1], _CONST, _CONST)
 
-    if op in (OpType.SDPA, OpType.SDPA_MLA):
+    if op in (OpType.SDPA, OpType.SDPA_MLA, OpType.SDPA_MLA_ABSORB):
         q = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, q[1], _CONST, _CONST)
 
@@ -739,6 +740,36 @@ class GraphBuilder:
                            prec=self._nodes[v_cache].out_prec,
                            i32=list(self._nodes[v_cache].out_shape))
         return attn, kc_out, vc_out
+
+    def sdpa_mla_absorb(
+            self, q_nope: int, q_rope: int, kv_cur: int, rope_cur: int,
+            k_b: int, v_b: int, mask: int, latent_cache: int, *,
+            num_heads: int, qk_head_dim: int, v_head_dim: int,
+            kv_rank: int, rope_dim: int, sink: int | None = None,
+            selection: int | None = None) -> int:
+        """Hy4 MLA with one shared latent cache and per-head K/V projections.
+
+        Selection entries are absolute cache positions per query; the CPU
+        kernel uses dense attention when every visible key can be selected.
+        """
+        inputs = [q_nope, q_rope, kv_cur, rope_cur, k_b, v_b, mask,
+                  latent_cache]
+        sink_idx = -1
+        if sink is not None:
+            sink_idx = len(inputs)
+            inputs.append(sink)
+        selection_idx = -1
+        if selection is not None:
+            selection_idx = len(inputs)
+            inputs.append(selection)
+        sq = self._nodes[q_nope].out_shape
+        return self._add(
+            OpType.SDPA_MLA_ABSORB, inputs,
+            (v_head_dim, sq[1], num_heads),
+            prec=self._nodes[q_nope].out_prec,
+            i32=[2, 1, num_heads, 1, qk_head_dim, v_head_dim,
+                 sink_idx, selection_idx, kv_rank, rope_dim],
+            f32=[1.0 / (qk_head_dim ** 0.5)])
 
     def sdpa_no_cache(self, q: int, k: int, v: int,
                       causal: bool = False, scale: float = 0.0,
