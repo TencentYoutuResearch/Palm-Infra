@@ -46,10 +46,12 @@ bool dispatch_cpu_attention(
     if (selection) {
         // Hy4 Gated DSA: attend only to the indexed keys. kernel_sdpa_sparse
         // shares the flash-attention kernels and falls back to the dense path
-        // when the selection carries no sparsity.
+        // when the selection carries no sparsity. Record where it lives so
+        // the kernel reads the same slot rather than assuming a fixed one.
         if (selection->prec != Precision::INT32) {
             return false;
         }
+        sdpa.selection_input = graph_params::get_i32(params, 7, -1);
         kernel_sdpa_sparse(sdpa, inputs, outputs, thread_pool);
         return true;
     }

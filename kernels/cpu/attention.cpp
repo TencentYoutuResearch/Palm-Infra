@@ -1561,10 +1561,18 @@ void kernel_sdpa_sparse(const SdpaParams& params,
     }
     const int heads_per_group = num_heads / num_kv_heads;
 
-    // The selection is the trailing input; without it this entry has no
-    // reason to exist, so fall back to the dense kernel rather than guess.
-    const Tensor* selection =
-        (inputs.size() > 6 && inputs[6] && inputs[6]->data) ? inputs[6] : nullptr;
+    // The selection's position is recorded in params (an absent optional
+    // input shortens the list rather than leaving a placeholder), so read the
+    // recorded index instead of assuming a fixed slot -- `sink` may occupy an
+    // earlier one. Without a selection this entry has no reason to exist, so
+    // fall back to the dense kernel rather than guess.
+    const int selection_index = params.selection_input;
+    const Tensor* selection = nullptr;
+    if (selection_index >= 0 &&
+        static_cast<size_t>(selection_index) < inputs.size() &&
+        inputs[selection_index] && inputs[selection_index]->data) {
+        selection = inputs[selection_index];
+    }
     if (!selection) {
         kernel_sdpa(params, inputs, outputs, thread_pool);
         return;
@@ -1595,8 +1603,10 @@ void kernel_sdpa_sparse(const SdpaParams& params,
 
     const Tensor& K_cur = *inputs[1];
     const Tensor& V_cur = *inputs[2];
-    // The indexer already applied causality when ranking, so the gathered
-    // key set needs no further mask; inputs[3] is deliberately unused here.
+    // Causality is re-applied per entry inside the kernels below
+    // (`visible_limit`); it is NOT inherited from the indexer, whose ranking
+    // is a heuristic the attention math must not depend on. inputs[3] is
+    // deliberately unused -- the mask is folded into the visibility limit.
     const Tensor* K_cache =
         (inputs.size() > 4 && inputs[4] && inputs[4]->data) ? inputs[4] : nullptr;
     const Tensor* V_cache =
@@ -1656,7 +1666,6 @@ void kernel_sdpa_sparse(const SdpaParams& params,
         }
     }
     const int dst_seqlen = past_seqlen + cur_seqlen;
-
     // K_cache/V_cache are const here, but the cache payload is addressed
     // through the same helpers the dense path uses.
     auto get_k_ptr = [&](int kv_h) -> const void* {

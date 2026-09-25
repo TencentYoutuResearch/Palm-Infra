@@ -45,8 +45,13 @@ def install_stubs():
         captured.append((label, source, tuple(shape), "dense"))
         return graph.input(f"w_{label}", tuple(shape), prec=hy4.Precision.FP16)
 
+    def fused(graph, streamed, index, label, source, shape, rows_per_expert):
+        captured.append((label, source, tuple(shape), "fused"))
+        return graph.input(f"w_{label}", tuple(shape), prec=hy4.Precision.FP16)
+
     hy4._fp32_weight = fp32
     hy4._dense_weight = dense
+    hy4._fused_experts = fused
     hy4.SafeTensorIndex = lambda path: _RecordingIndex()
     return captured
 
@@ -237,18 +242,27 @@ def test_weight_shapes():
 
 
 def test_dense_lead_is_dense():
-    """Layer 0 uses a dense FFN; later layers route."""
+    """Layer 0 uses a dense FFN; later layers route.
+
+    The dense lead layer ships gate_proj and up_proj as separate tensors (the
+    checkpoint has no fused gate_up_proj for it), unlike the routed experts
+    which are fused and flattened.
+    """
     cfg = tiny_cfg(layers=2)
     cfg["indexer_types"] = ["full", "shared"]
     _, captured = build(cfg, seq_len=4, n_ctx=64, is_prefill=True)
     labels = [label for label, _, _, _ in captured]
 
-    check(any(l.startswith("layer_0_ffn_gate_up") for l in labels),
-          "layer 0 has a dense gate_up weight")
+    check(any(l.startswith("layer_0_ffn_gate") for l in labels),
+          "layer 0 has a dense gate_proj weight")
+    check(any(l.startswith("layer_0_ffn_up") for l in labels),
+          "layer 0 has a dense up_proj weight")
     check(not any(l.startswith("layer_0_ffn_experts") for l in labels),
           "layer 0 has no routed experts")
     check(any(l.startswith("layer_1_ffn_experts") for l in labels),
           "layer 1 has routed experts")
+    check(not any(l.startswith("layer_1_ffn_gate") for l in labels),
+          "layer 1 has no dense gate weight")
     check(not any(l.startswith("layer_1_ffn_gate_up") for l in labels),
           "layer 1 has no dense gate_up weight")
     print("  PASS: dense lead layer")

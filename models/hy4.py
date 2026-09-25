@@ -43,9 +43,11 @@ from transpile import (
 )
 from safetensors_stream import (
     SafeTensorIndex,
+    aggregate_dense_experts,
     dense_streamed_weight,
     fp32_streamed_weight,
 )
+from qwen3_moe import ROUTER_SCORE_SIGMOID
 
 INDEXER_FULL = "full"
 
@@ -68,6 +70,20 @@ def _dense_weight(graph: GraphBuilder, streamed: dict,
     return graph.weight(label, shape, Precision.FP16)
 
 
+def _fused_experts(graph: GraphBuilder, streamed: dict,
+                   index: SafeTensorIndex, label: str, source: str,
+                   shape: tuple[int, ...], rows_per_expert: int) -> int:
+    """Declare a fused 3-D expert tensor as flattened expert-major rows.
+
+    `shape` is the flattened form the MoE kernel indexes; the checkpoint
+    stores [experts, rows_per_expert, K] and the row order is already
+    expert-major, so the payload streams verbatim.
+    """
+    streamed[label] = aggregate_dense_experts(
+        index, source, rows_per_expert=rows_per_expert)
+    return graph.weight(label, shape, Precision.FP16)
+
+
 def _hc_branch(graph: GraphBuilder, streamed: dict,
                index: SafeTensorIndex, cfg: dict, layer: int, kind: str,
                residual: int, branch_builder) -> int:
@@ -83,7 +99,7 @@ def _hc_branch(graph: GraphBuilder, streamed: dict,
     hc_mult = int(cfg["hc_mult"])
     wide = hidden * hc_mult
     mix = 2 * hc_mult
-    prefix = f"layers.{layer}.hc_{kind}_layer.hc_pre"
+    prefix = f"model.layers.{layer}.hc_{kind}_layer.hc_pre"
     label = f"layer_{layer}_hc_{kind}"
 
     fn = _fp32_weight(
@@ -108,7 +124,7 @@ def _hc_branch(graph: GraphBuilder, streamed: dict,
 def _add_indexer(
         graph: GraphBuilder, streamed: dict, index: SafeTensorIndex,
         cfg: dict, layer: int, hidden: int, q_lora: int, position: int,
-        key_cache: int, n_ctx: int) -> int:
+        n_tokens: int, key_cache: int, n_ctx: int) -> int:
     """Run the Hy4 Gated-DSA indexer for one layer.
 
     `hidden` is the normed hidden state and `q_lora` the normed low-rank
@@ -123,7 +139,7 @@ def _add_indexer(
     rope_dim = int(cfg["qk_rope_head_dim"])
     top_k = int(cfg["index_topk"])
     theta = float(cfg.get("rope_parameters", {}).get("rope_theta", 1e7))
-    prefix = f"layers.{layer}.self_attn"
+    prefix = f"model.layers.{layer}.self_attn"
 
     def weight(suffix: str, shape: tuple[int, ...]) -> int:
         label = f"layer_{layer}_indexer_{suffix.replace('.', '_')}"
@@ -143,7 +159,7 @@ def _add_indexer(
 
     return graph.hy4_indexer(
         hidden, q_lora, wq_b, wk, weights_proj, k_norm_w, k_norm_b,
-        key_cache, position,
+        key_cache, position, n_tokens,
         hidden_size=hidden_size, q_lora_rank=q_rank, num_heads=heads,
         head_dim=head_dim, rope_dim=rope_dim, top_k=top_k,
         capacity=n_ctx, theta=theta)
@@ -169,7 +185,7 @@ def _add_attention_branch(
     q_rank = int(cfg["q_lora_rank"])
     kv_rank = int(cfg["kv_lora_rank"])
     eps = float(cfg["rms_norm_eps"])
-    prefix = f"layers.{layer}.self_attn"
+    prefix = f"model.layers.{layer}.self_attn"
 
     def weight(suffix: str, shape: tuple[int, ...]) -> int:
         label = f"layer_{layer}_attn_{suffix.replace('.', '_')}"
@@ -196,14 +212,21 @@ def _add_attention_branch(
     query = graph.reshape(query, (head_dim, heads, _S))
     query = graph.permute(query, (0, 2, 1, 3))       # [head_dim, seq, heads]
     q_nope, q_rope = graph.slice(query, [nope_dim, rope_dim], dim=0)
-    q_rope = graph.rope(q_rope, cos, sin, rope_dim=rope_dim)
+    # Non-interleaved RoPE: the reference composes it with `rotate_half`, which
+    # pairs dimension i with i + rope_dim/2 rather than with i+1. The two
+    # styles agree at position 0 (cos=1, sin=0 makes both the identity) and
+    # diverge everywhere else, so an interleaved build looks correct on the
+    # first token and drifts after -- exactly the signature the engine showed.
+    q_rope = graph.rope(q_rope, cos, sin, rope_dim=rope_dim,
+                        interleave=False)
 
     # MLA KV path.
     kv = graph.matmul(hidden, wkv_a)
     kv_cmpr, k_rope = graph.slice(kv, [kv_rank, rope_dim], dim=0)
     kv_cmpr = graph.rms_norm(kv_cmpr, kv_a_norm, eps)
     k_rope = graph.reshape(k_rope, (rope_dim, _S, 1))
-    k_rope = graph.rope(k_rope, cos, sin, rope_dim=rope_dim)
+    k_rope = graph.rope(k_rope, cos, sin, rope_dim=rope_dim,
+                        interleave=False)
     k_rope = graph.tile(k_rope, (1, 1, heads))
 
     # Expand the compressed KV through wk_b and split into k_nope / v.
@@ -242,22 +265,22 @@ def _add_ffn_branch(
     moe_intermediate = int(cfg["moe_intermediate_size"])
     experts = int(cfg["n_routed_experts"])
     top_k = int(cfg["num_experts_per_tok"])
-    prefix = f"layers.{layer}.mlp"
+    prefix = f"model.layers.{layer}.mlp"
     dense_lead = int(cfg.get("first_k_dense_replace", 1))
 
     if layer < dense_lead:
-        gate_up = _dense_weight(
-            graph, streamed, index, f"layer_{layer}_ffn_gate_up",
-            f"{prefix}.gate_up_proj.weight", (2 * intermediate, hidden_size))
+        # The dense lead layer ships gate_proj and up_proj separately.
+        gate = _dense_weight(
+            graph, streamed, index, f"layer_{layer}_ffn_gate",
+            f"{prefix}.gate_proj.weight", (intermediate, hidden_size))
+        up = _dense_weight(
+            graph, streamed, index, f"layer_{layer}_ffn_up",
+            f"{prefix}.up_proj.weight", (intermediate, hidden_size))
         down = _dense_weight(
             graph, streamed, index, f"layer_{layer}_ffn_down",
             f"{prefix}.down_proj.weight", (hidden_size, intermediate))
-        # Fused gate_up matmul with SILU folded into the gate half.
-        merged = graph.matmul(
-            hidden, gate_up, activation=Activation.SILU,
-            act_n_begin=0, act_n_len=intermediate)
-        gate, up = graph.slice(merged, [intermediate, intermediate], dim=0)
-        return graph.matmul(graph.mul(gate, up), down)
+        gate = graph.matmul(hidden, gate, activation=Activation.SILU)
+        return graph.matmul(graph.mul(gate, graph.matmul(hidden, up)), down)
 
     # Routed experts are a single fused 3-D checkpoint tensor, but the graph
     # must declare the flattened [experts*rows, K] form: the loader takes
@@ -265,18 +288,21 @@ def _add_ffn_branch(
     # expert e at row e*rows with row stride K. Declaring [experts, rows, K]
     # would set shape[1]=rows instead of K and index wrongly. The bytes are
     # identical either way, so this is a metadata contract, not a layout one.
-    experts_gate_up = _dense_weight(
+    experts_gate_up = _fused_experts(
         graph, streamed, index, f"layer_{layer}_ffn_experts_gate_up",
         f"{prefix}.experts.gate_up_proj",
-        (experts * 2 * moe_intermediate, hidden_size))
-    experts_down = _dense_weight(
+        (experts * 2 * moe_intermediate, hidden_size), 2 * moe_intermediate)
+    experts_down = _fused_experts(
         graph, streamed, index, f"layer_{layer}_ffn_experts_down",
         f"{prefix}.experts.down_proj",
-        (experts * hidden_size, moe_intermediate))
+        (experts * hidden_size, moe_intermediate), hidden_size)
     router = _dense_weight(
         graph, streamed, index, f"layer_{layer}_ffn_router",
         f"{prefix}.gate.weight", (experts, hidden_size))
     router_bias = None
+    # The reference checkpoint names this parameter without a `.weight` suffix
+    # (it is a bare bias, not a Linear child), so probing for the suffixed form
+    # silently skips it and the router loses the bias it selects on.
     if index.contains(f"{prefix}.gate.e_score_correction_bias"):
         router_bias = _fp32_weight(
             graph, streamed, index, f"layer_{layer}_ffn_router_bias",
@@ -303,8 +329,12 @@ def _add_ffn_branch(
         intermediate_size=moe_intermediate,
         shared_intermediate_size=moe_intermediate,
         router_bias=router_bias,
-        # Hy4 scores experts with a sigmoid over the full expert set.
-        router_score_func=0,
+        # Hy4 scores experts with a sigmoid over the full expert set, and
+        # selects on sigmoid(logit) + e_score_correction_bias while weighting
+        # by the un-biased sigmoid. That is ROUTER_SCORE_SIGMOID (= 1), not the
+        # 0 default, which would run softmax and pick different experts -- the
+        # router is the whole point of having the bias at all.
+        router_score_func=ROUTER_SCORE_SIGMOID,
         norm_topk_prob=bool(cfg["norm_topk_prob"]),
         has_shared_expert=True,
         shared_expert_has_gate=False,
@@ -358,14 +388,41 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
     cos = graph.input("cos", (rope_dim // 2, seq_len), dynamic=cos_dyn)
     sin = graph.input("sin", (rope_dim // 2, seq_len), dynamic=sin_dyn)
     position = graph.input("position", (1,), prec=Precision.INT32)
+    n_tokens = graph.input("n_tokens", (1,), prec=Precision.INT32)
 
+    # MLA caches are [head_width, n_ctx, heads], dim0-fast, matching the
+    # layout the SDPA kernels and the engine's CacheMetadata expect. Dim 0
+    # must be the real per-head width: the loader reads shape[0] as the head
+    # dimension when sizing each cache, so a zero there yields a zero-length
+    # buffer and the kernel faults past the mapping.
+    qk_head_dim = int(cfg["qk_nope_head_dim"]) + rope_dim
+    v_head_dim = int(cfg["v_head_dim"])
     caches = []
     for layer in range(layers):
         ck = graph.input(
-            f"cache_k{layer}", (0, n_ctx, heads), prec=Precision.FP16)
+            f"cache_k{layer}", (qk_head_dim, n_ctx, heads),
+            prec=Precision.FP16)
         cv = graph.input(
-            f"cache_v{layer}", (0, n_ctx, heads), prec=Precision.FP16)
+            f"cache_v{layer}", (v_head_dim, n_ctx, heads),
+            prec=Precision.FP16)
         caches.append([ck, cv])
+
+    # The DSA indexer keeps its own key cache of `wk @ hidden` rows: FP32 and
+    # indexed by index_head_dim, not the attention heads. It is a persistent
+    # state input (like DeepSeek-V4's aux_state*), not a graph output, and is
+    # only materialised on layers that run the indexer.
+    #
+    # Named `index_state*` rather than `aux_state*`: the loader keys
+    # auxiliary states purely by the trailing digit (see
+    # parse_persistent_input / auxiliary_states_), so `aux_state{layer}` would
+    # collide with DeepSeek-V4's `layer * 16` numbering.
+    index_dim = int(cfg["index_head_dim"])
+    indexer_caches = {}
+    for layer in range(layers):
+        if indexer_types[layer] != INDEXER_FULL:
+            continue
+        indexer_caches[layer] = graph.input(
+            f"index_state{layer}", (index_dim, n_ctx), prec=Precision.FP32)
 
     # Expand the single embedding into hc_mult parallel residual streams.
     state = graph.tile(hidden, (hc_mult, 1))
@@ -379,7 +436,7 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
     for layer in range(layers):
         attn_norm = _fp32_weight(
             graph, streamed, index, f"layer_{layer}_attn_norm",
-            f"layers.{layer}.input_layernorm.weight", (hidden_size,))
+            f"model.layers.{layer}.input_layernorm.weight", (hidden_size,))
         ck_in, cv_in = caches[layer]
         is_full = indexer_types[layer] == INDEXER_FULL
 
@@ -387,10 +444,10 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
         # which both consume the same normed low-rank query.
         q_a_norm = _fp32_weight(
             graph, streamed, index, f"layer_{layer}_attn_q_a_norm",
-            f"layers.{layer}.self_attn.q_a_layernorm.weight", (q_rank,))
+            f"model.layers.{layer}.self_attn.q_a_layernorm.weight", (q_rank,))
         wq_a = _dense_weight(
             graph, streamed, index, f"layer_{layer}_attn_q_a_proj_weight",
-            f"layers.{layer}.self_attn.q_a_proj.weight",
+            f"model.layers.{layer}.self_attn.q_a_proj.weight",
             (q_rank, hidden_size))
 
         # `selected` carries the indexer result back out of the branch
@@ -399,13 +456,14 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
 
         def attention_branch(reduced: int, *, current=layer,
                              norm=attn_norm, ck=ck_in, cv=cv_in,
-                             full=is_full, wq=wq_a, qn=q_a_norm) -> int:
+                             full=is_full, wq=wq_a, qn=q_a_norm,
+                             icache=indexer_caches.get(layer)) -> int:
             normalized = graph.rms_norm(reduced, norm, eps)
             q_lora = graph.rms_norm(graph.matmul(normalized, wq), qn, eps)
             if full:
                 top_k = _add_indexer(
                     graph, streamed, index, cfg, current, normalized,
-                    q_lora, position, ck, n_ctx)
+                    q_lora, position, n_tokens, icache, n_ctx)
                 selected.append(top_k)
             else:
                 # A shared layer reuses the previous full layer's selection.
@@ -428,7 +486,7 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
 
         ffn_norm = _fp32_weight(
             graph, streamed, index, f"layer_{layer}_ffn_norm",
-            f"layers.{layer}.post_attention_layernorm.weight",
+            f"model.layers.{layer}.post_attention_layernorm.weight",
             (hidden_size,))
 
         def ffn_branch(reduced: int, *, current=layer,

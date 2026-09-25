@@ -74,6 +74,11 @@ PersistentInput parse_persistent_input(const std::string& name) {
         input.kind = PersistentInputKind::FFN_SHIFT;
     } else if (parse_indexed_input_name(name, "aux_state", input.layer)) {
         input.kind = PersistentInputKind::AUX_STATE;
+    } else if (parse_indexed_input_name(name, "index_state", input.layer)) {
+        // The DSA indexer's key cache (Hy4). Shares the auxiliary-state
+        // storage path but keeps its own name so it cannot collide with
+        // DeepSeek-V4's aux_state numbering.
+        input.kind = PersistentInputKind::AUX_STATE;
     }
     return input;
 }
