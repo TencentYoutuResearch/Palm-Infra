@@ -145,6 +145,31 @@ static void test_encoder_decoder_consistency() {
     CHECK(rel < 0.9, "decode: beats zero predictor on random data");
 }
 
+static void test_fp16_scales() {
+    block_stq1_0 block{};
+    block.d = 0x3c00;  // 1.0
+    float output[QK_STQ_K];
+    stq1_0_dequantize_block(block, output);
+    int nonzero = 0;
+    while (nonzero < QK_STQ_K && output[nonzero] == 0.0f) ++nonzero;
+    bool exact = nonzero < QK_STQ_K;
+    const float unit = exact ? output[nonzero] : 0.0f;
+    for (uint32_t bits = 0; exact && bits < 65536; ++bits) {
+        const int exponent = (bits >> 10) & 31;
+        if (exponent == 31) continue;
+        const int mantissa = bits & 1023;
+        float reference = exponent == 0
+            ? std::ldexp(static_cast<float>(mantissa), -24)
+            : std::ldexp(static_cast<float>(1024 + mantissa), exponent - 25);
+        if ((bits & 0x7fff) != 0 && (bits & 0x8000)) reference = -reference;
+        block.d = static_cast<uint16_t>(bits);
+        stq1_0_dequantize_block(block, output);
+        const float expected = reference * unit;
+        exact = std::memcmp(&output[nonzero], &expected, sizeof(float)) == 0;
+    }
+    CHECK(exact, "decode: every finite FP16 scale matches scalar reference");
+}
+
 static void test_dot_matches_dequantize() {
     // The fused dot must equal the dot against an explicitly dequantized row.
     // This is the check that catches a decode-path bug independent of the
@@ -183,6 +208,7 @@ int main() {
     test_group_lanes_roundtrip();
     test_element_index_coverage();
     test_encoder_decoder_consistency();
+    test_fp16_scales();
     test_dot_matches_dequantize();
 
     if (g_failures) {
