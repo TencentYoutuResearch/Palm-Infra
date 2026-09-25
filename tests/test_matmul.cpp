@@ -342,6 +342,48 @@ static bool gguf_iq2_block_matches_scalar() {
     return true;
 }
 
+static bool gguf_iq3_block_matches_scalar() {
+    constexpr uint16_t scales[] = {0x3c00, 0x3555, 0xbc00, 0x0400};
+    uint32_t state = 13;
+    for (uint16_t scale_bits : scales) {
+        uint8_t block[98];
+        for (auto& byte : block) {
+            state = state * 1664525u + 1013904223u;
+            byte = static_cast<uint8_t>(state >> 24);
+        }
+        block[0] = static_cast<uint8_t>(scale_bits);
+        block[1] = static_cast<uint8_t>(scale_bits >> 8);
+        float decoded[256];
+        if (!gguf_k_dequantize_block(Precision::GGUF_IQ3_XXS,
+                                     block, decoded))
+            return false;
+        const float d = reference_half_to_float(scale_bits);
+        const uint8_t* qs = block + 2;
+        const uint8_t* scales_signs = qs + 64;
+        for (int group = 0; group < 8; ++group) {
+            const uint8_t* p = scales_signs + group * 4;
+            const uint32_t packed =
+                uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+                (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+            const float scale = d * (0.5f + (packed >> 28)) * 0.5f;
+            for (int part = 0; part < 4; ++part) {
+                const uint8_t signs = iq_signs[(packed >> (7 * part)) & 127];
+                for (int lane = 0; lane < 8; ++lane) {
+                    const int grid_index =
+                        qs[group * 8 + part * 2 + lane / 4];
+                    const int value = iq3_grid[grid_index * 4 + lane % 4];
+                    const int sign = (signs & (1 << lane)) ? -1 : 1;
+                    const float expected = scale * (value * sign);
+                    const float actual = decoded[group * 32 + part * 8 + lane];
+                    if (std::memcmp(&actual, &expected, sizeof(float)) != 0)
+                        return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static uint8_t reference_encode_fp8(float value) {
     if (std::isnan(value)) return 0x7f;
     const uint8_t sign = std::signbit(value) ? 0x80 : 0;
@@ -399,6 +441,8 @@ int main() {
           "GGUF Q6_K block matches independent scalar decoding");
     CHECK(gguf_iq2_block_matches_scalar(),
           "GGUF IQ2_XXS block matches independent scalar decoding");
+    CHECK(gguf_iq3_block_matches_scalar(),
+          "GGUF IQ3_XXS block matches independent scalar decoding");
 
     // ---- FP8/MXFP4 scalar format decoding ----
     {

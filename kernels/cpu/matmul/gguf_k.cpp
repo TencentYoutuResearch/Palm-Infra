@@ -205,16 +205,6 @@ void store_signed_iq_grid8(int8x8_t signed_grid, float scale, float* out) {
     vst1q_f32(out + 4, vmulq_n_f32(high, scale));
 }
 
-void decode_signed_iq_grid8(uint64_t packed_grid, uint8_t signs,
-                            float scale, float* out) {
-    static constexpr uint8_t lane_bits[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-    const uint8x8_t grid = vcreate_u8(packed_grid);
-    const uint8x8_t negative = vtst_u8(
-        vdup_n_u8(signs), vld1_u8(lane_bits));
-    const uint8x8_t signed_bits = vsub_u8(veor_u8(grid, negative), negative);
-    store_signed_iq_grid8(vreinterpret_s8_u8(signed_bits), scale, out);
-}
-
 const std::array<int8_t, 256 * 128 * 8>& signed_iq2_grid_table() {
     static const auto table = [] {
         std::array<int8_t, 256 * 128 * 8> result{};
@@ -224,6 +214,23 @@ const std::array<int8_t, 256 * 128 * 8>& signed_iq2_grid_table() {
                 for (int lane = 0; lane < 8; ++lane) {
                     const int value = iq2_grid[grid * 8 + lane];
                     result[(grid * 128 + sign_index) * 8 + lane] =
+                        static_cast<int8_t>((signs & (1 << lane)) ? -value : value);
+                }
+            }
+        }
+        return result;
+    }();
+    return table;
+}
+
+const std::array<int8_t, 256 * 16 * 4>& signed_iq3_grid_table() {
+    static const auto table = [] {
+        std::array<int8_t, 256 * 16 * 4> result{};
+        for (int grid = 0; grid < 256; ++grid) {
+            for (int signs = 0; signs < 16; ++signs) {
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int value = iq3_grid[grid * 4 + lane];
+                    result[(grid * 16 + signs) * 4 + lane] =
                         static_cast<int8_t>((signs & (1 << lane)) ? -value : value);
                 }
             }
@@ -267,21 +274,29 @@ void decode_iq3_xxs(const uint8_t* block, float* out) {
     const float d = half_value(block);
     const uint8_t* qs = block + 2;
     const uint8_t* scales_signs = qs + 64;
+#if defined(__aarch64__)
+    const auto& signed_grids = signed_iq3_grid_table();
+#endif
     for (int group = 0; group < 8; ++group) {
         const uint32_t packed = load_u32(scales_signs + group * 4);
         const float scale = d * (0.5f + (packed >> 28)) * 0.5f;
         for (int part = 0; part < 4; ++part) {
             const uint8_t signs = iq_signs[(packed >> (7 * part)) & 127];
-            const uint8_t* grid0 = iq3_grid + qs[group * 8 + part * 2] * 4;
-            const uint8_t* grid1 = iq3_grid + qs[group * 8 + part * 2 + 1] * 4;
             float* y = out + group * 32 + part * 8;
 #if defined(__aarch64__)
+            const int8_t* grid0 = signed_grids.data() +
+                (qs[group * 8 + part * 2] * 16 + (signs & 15)) * 4;
+            const int8_t* grid1 = signed_grids.data() +
+                (qs[group * 8 + part * 2 + 1] * 16 + (signs >> 4)) * 4;
             uint32_t low, high;
             std::memcpy(&low, grid0, sizeof(low));
             std::memcpy(&high, grid1, sizeof(high));
-            decode_signed_iq_grid8(uint64_t(low) | (uint64_t(high) << 32),
-                                   signs, scale, y);
+            store_signed_iq_grid8(vreinterpret_s8_u8(
+                vcreate_u8(uint64_t(low) | (uint64_t(high) << 32))),
+                scale, y);
 #else
+            const uint8_t* grid0 = iq3_grid + qs[group * 8 + part * 2] * 4;
+            const uint8_t* grid1 = iq3_grid + qs[group * 8 + part * 2 + 1] * 4;
             for (int lane = 0; lane < 4; ++lane) {
                 const int sign0 = 1 - 2 * int((signs >> lane) & 1);
                 const int sign1 = 1 - 2 * int((signs >> (lane + 4)) & 1);
