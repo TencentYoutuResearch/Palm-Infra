@@ -131,6 +131,48 @@ static bool gguf_native_matmul_matches_block_decoder() {
     return true;
 }
 
+static float reference_half_to_float(uint16_t bits) {
+    const uint32_t sign = uint32_t(bits & 0x8000) << 16;
+    int exponent = (bits >> 10) & 31;
+    uint32_t mantissa = bits & 1023;
+    uint32_t result;
+    if (exponent == 0) {
+        if (mantissa == 0) result = sign;
+        else {
+            exponent = 1;
+            while ((mantissa & 1024) == 0) {
+                mantissa <<= 1;
+                --exponent;
+            }
+            result = sign | (uint32_t(exponent + 112) << 23) |
+                     ((mantissa & 1023) << 13);
+        }
+    } else {
+        result = sign | (uint32_t(exponent + 112) << 23) |
+                 (mantissa << 13);
+    }
+    float value;
+    std::memcpy(&value, &result, sizeof(value));
+    return value;
+}
+
+static bool gguf_half_scales_match_reference() {
+    uint8_t block[34] = {};
+    block[2] = 1;
+    float decoded[32];
+    for (uint32_t bits = 0; bits < 65536; ++bits) {
+        if ((bits & 0x7c00) == 0x7c00) continue;  // non-finite scale
+        block[0] = static_cast<uint8_t>(bits);
+        block[1] = static_cast<uint8_t>(bits >> 8);
+        if (!gguf_k_dequantize_block(Precision::GGUF_Q8_0, block, decoded))
+            return false;
+        const float expected = reference_half_to_float(bits);
+        if (std::memcmp(&decoded[0], &expected, sizeof(float)) != 0)
+            return false;
+    }
+    return true;
+}
+
 static uint8_t reference_encode_fp8(float value) {
     if (std::isnan(value)) return 0x7f;
     const uint8_t sign = std::signbit(value) ? 0x80 : 0;
@@ -180,6 +222,8 @@ int main() {
     srand(42);
     CHECK(gguf_native_matmul_matches_block_decoder(),
           "all GGUF native matmul formats match blockwise reference");
+    CHECK(gguf_half_scales_match_reference(),
+          "GGUF FP16 scales match reference for every finite bit pattern");
 
     // ---- FP8/MXFP4 scalar format decoding ----
     {
