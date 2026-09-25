@@ -2,11 +2,28 @@
 #include "kernels/cpu/matmul/matmul_internal.h"
 #include "kernels/cpu/matmul/matmul_profile.h"
 #include "kernels/cpu/matmul/gguf_k.h"
+#include "runtime/threading.h"
 
 MatmulConfig g_matmul_config;
 
 // Debug override used by precision-comparison tests and tools.
 bool g_mollm_force_fp32_acc = false;
+
+namespace {
+const char* gguf_profile_path(Precision precision) {
+    switch (precision) {
+    case Precision::GGUF_Q4_K: return "gguf_q4_k";
+    case Precision::GGUF_Q5_K: return "gguf_q5_k";
+    case Precision::GGUF_Q6_K: return "gguf_q6_k";
+    case Precision::GGUF_Q8_0: return "gguf_q8_0";
+    case Precision::GGUF_IQ2_XXS: return "gguf_iq2_xxs";
+    case Precision::GGUF_IQ3_XXS: return "gguf_iq3_xxs";
+    case Precision::GGUF_STQ1_0: return "gguf_stq1_0";
+    case Precision::GGUF_IQ4_XS: return "gguf_iq4_xs";
+    default: return "gguf_unknown";
+    }
+}
+}  // namespace
 
 void kernel_matmul_batch(const std::vector<const Tensor*>& pairs,
                          Tensor& output, ThreadPool* thread_pool) {
@@ -87,6 +104,13 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     case Precision::GGUF_IQ3_XXS:
     case Precision::GGUF_STQ1_0:
     case Precision::GGUF_IQ4_XS:
+        timer.set_shape(gguf_profile_path(B.prec),
+                        static_cast<int>(A.shape[1]),
+                        static_cast<int>(B.shape[0]),
+                        static_cast<int>(B.shape[1]),
+                        static_cast<int>(gguf_k_block_values(B.prec)), 0,
+                        false, false,
+                        thread_pool ? thread_pool->num_threads() : 1);
         kernel_matmul_gguf_k(A, B, C, thread_pool, act,
                              act_n_begin, act_n_len);
         return;
