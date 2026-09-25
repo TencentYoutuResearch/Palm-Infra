@@ -1,4 +1,6 @@
 #include "kernels/cpu/matmul/gguf_k.h"
+#include "kernels/cpu/matmul/gguf_iq_tables.h"
+#include "kernels/cpu/matmul/stq1_0.h"
 #include "kernels/cpu/matmul/matmul_internal.h"
 #include "runtime/threading.h"
 
@@ -91,11 +93,81 @@ void decode_q6(const uint8_t* block, float* out) {
     }
 }
 
+uint32_t load_u32(const uint8_t* bytes) {
+    return uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8) |
+           (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+}
+
+void decode_iq2_xxs(const uint8_t* block, float* out) {
+    const float d = half_value(block);
+    const uint8_t* qs = block + 2;
+    for (int group = 0; group < 8; ++group) {
+        const uint8_t* packed = qs + group * 8;
+        const uint32_t signs_scale = load_u32(packed + 4);
+        const float scale = d * (0.5f + (signs_scale >> 28)) * 0.25f;
+        for (int part = 0; part < 4; ++part) {
+            const uint8_t* grid = iq2_grid + packed[part] * 8;
+            const uint8_t signs = iq_signs[(signs_scale >> (7 * part)) & 127];
+            float* y = out + group * 32 + part * 8;
+            for (int lane = 0; lane < 8; ++lane)
+                y[lane] = scale * grid[lane] *
+                    ((signs & (1 << lane)) ? -1.0f : 1.0f);
+        }
+    }
+}
+
+void decode_iq3_xxs(const uint8_t* block, float* out) {
+    const float d = half_value(block);
+    const uint8_t* qs = block + 2;
+    const uint8_t* scales_signs = qs + 64;
+    for (int group = 0; group < 8; ++group) {
+        const uint32_t packed = load_u32(scales_signs + group * 4);
+        const float scale = d * (0.5f + (packed >> 28)) * 0.5f;
+        for (int part = 0; part < 4; ++part) {
+            const uint8_t signs = iq_signs[(packed >> (7 * part)) & 127];
+            const uint8_t* grid0 = iq3_grid + qs[group * 8 + part * 2] * 4;
+            const uint8_t* grid1 = iq3_grid + qs[group * 8 + part * 2 + 1] * 4;
+            float* y = out + group * 32 + part * 8;
+            for (int lane = 0; lane < 4; ++lane) {
+                y[lane] = scale * grid0[lane] *
+                    ((signs & (1 << lane)) ? -1.0f : 1.0f);
+                y[lane + 4] = scale * grid1[lane] *
+                    ((signs & (1 << (lane + 4))) ? -1.0f : 1.0f);
+            }
+        }
+    }
+}
+
+void decode_iq4_xs(const uint8_t* block, float* out) {
+    static constexpr int8_t values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113};
+    const float d = half_value(block);
+    const uint16_t high = uint16_t(block[2]) | (uint16_t(block[3]) << 8);
+    const uint8_t* low = block + 4;
+    const uint8_t* qs = block + 8;
+    for (int group = 0; group < 8; ++group) {
+        const int scale_bits = ((low[group / 2] >> (4 * (group % 2))) & 15) |
+                               (((high >> (2 * group)) & 3) << 4);
+        const float scale = d * (scale_bits - 32);
+        float* y = out + group * 32;
+        for (int lane = 0; lane < 16; ++lane) {
+            const uint8_t q = qs[group * 16 + lane];
+            y[lane] = scale * values[q & 15];
+            y[lane + 16] = scale * values[q >> 4];
+        }
+    }
+}
+
 }  // namespace
 
 size_t gguf_k_block_bytes(Precision precision) {
     switch (precision) {
     case Precision::GGUF_Q8_0: return 34;
+    case Precision::GGUF_IQ2_XXS: return 66;
+    case Precision::GGUF_IQ3_XXS: return 98;
+    case Precision::GGUF_STQ1_0: return STQ_BLOCK_BYTES;
+    case Precision::GGUF_IQ4_XS: return 136;
     case Precision::GGUF_Q4_K: return 144;
     case Precision::GGUF_Q5_K: return 176;
     case Precision::GGUF_Q6_K: return 210;
@@ -112,6 +184,16 @@ bool gguf_k_dequantize_block(Precision precision, const uint8_t* block,
                              float* output) {
     if (!block || !output) return false;
     switch (precision) {
+    case Precision::GGUF_IQ2_XXS:
+        decode_iq2_xxs(block, output); return true;
+    case Precision::GGUF_IQ3_XXS:
+        decode_iq3_xxs(block, output); return true;
+    case Precision::GGUF_STQ1_0:
+        stq1_0_dequantize_block(
+            *reinterpret_cast<const block_stq1_0*>(block), output);
+        return true;
+    case Precision::GGUF_IQ4_XS:
+        decode_iq4_xs(block, output); return true;
     case Precision::GGUF_Q8_0: {
         const float scale = half_value(block);
         const auto* values = reinterpret_cast<const int8_t*>(block + 2);

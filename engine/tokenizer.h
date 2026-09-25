@@ -62,6 +62,7 @@ private:
         ROLE_MIDDLE,
         DEEPSEEK_V4,
         HY_V3,
+        HY_V4,
     };
     ChatTemplateStyle chat_template_style_ = ChatTemplateStyle::AUTO;
 

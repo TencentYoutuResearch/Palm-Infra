@@ -65,7 +65,11 @@ int main() {
         for (auto [precision, block_bytes] : {
                  std::pair{Precision::GGUF_Q4_K, 144},
                  std::pair{Precision::GGUF_Q5_K, 176},
-                 std::pair{Precision::GGUF_Q6_K, 210}}) {
+                 std::pair{Precision::GGUF_Q6_K, 210},
+                 std::pair{Precision::GGUF_IQ2_XXS, 66},
+                 std::pair{Precision::GGUF_IQ3_XXS, 98},
+                 std::pair{Precision::GGUF_STQ1_0, 42},
+                 std::pair{Precision::GGUF_IQ4_XS, 136}}) {
             Tensor weight = make_weight(precision, 2, 512);
             MappedFile::Header header =
                 make_header(4 * block_bytes, 0, 0, 0);

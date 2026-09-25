@@ -122,6 +122,10 @@ class Precision(IntEnum):
     GGUF_Q5_K = 10
     GGUF_Q6_K = 11
     GGUF_Q8_0 = 12
+    GGUF_IQ2_XXS = 13
+    GGUF_IQ3_XXS = 14
+    GGUF_STQ1_0 = 15
+    GGUF_IQ4_XS = 16
 
 
 # ---------------------------------------------------------------------------

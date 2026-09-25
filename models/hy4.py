@@ -21,13 +21,14 @@ was cross-checked against tencent/Hy4-preview config.json plus safetensors
 headers, and against the reference graph in the AngelSlim GGUF patch.
 
 Status: the layer stack, DSA indexer, latent-cache MLA, and FFN branches are
-built here. GGUF can produce a one-layer FP16 diagnostic package; low-bit
-full-model export is still in progress.
+built here. GGUF can produce one- to three-layer CPU packages with native
+Q/K/IQ/STQ blocks; full-model export is still in progress.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -50,9 +51,12 @@ from safetensors_stream import (
 )
 from qwen3_moe import ROUTER_SCORE_SIGMOID
 from gguf_reader import GgufIndex, config_from_gguf, open_gguf
-from gguf_stream import gguf_fp16_streamed_weight, gguf_native_streamed_weight
+from gguf_stream import (gguf_fp16_streamed_weight,
+                         gguf_native_streamed_weight,
+                         gguf_native_experts_streamed_weight)
 from gguf_quants import (GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
                          GGML_TYPE_Q6_K, GGML_TYPE_Q8_0)
+from hy4_tokenizer import tokenizer_from_gguf
 
 INDEXER_FULL = "full"
 
@@ -98,9 +102,22 @@ def _fused_experts(graph: GraphBuilder, streamed: dict,
     stores [experts, rows_per_expert, K] and the row order is already
     expert-major, so the payload streams verbatim.
     """
-    streamed[label] = aggregate_dense_experts(
-        index, source, rows_per_expert=rows_per_expert)
-    return graph.weight(label, shape, Precision.FP16)
+    if isinstance(index, GgufIndex):
+        layer = int(label.split("_")[1])
+        kind = "gate_up" if source.endswith("gate_up_proj") else "down"
+        if _NATIVE_GGUF_K:
+            streamed[label] = gguf_native_experts_streamed_weight(
+                index, layer, kind, shape[0] // rows_per_expert,
+                rows_per_expert, shape[1])
+        else:
+            from gguf_stream import gguf_fp16_experts_streamed_weight
+            streamed[label] = gguf_fp16_experts_streamed_weight(
+                index, layer, kind, shape[0] // rows_per_expert,
+                rows_per_expert, shape[1], _GGUF_PY_PATH)
+    else:
+        streamed[label] = aggregate_dense_experts(
+            index, source, rows_per_expert=rows_per_expert)
+    return graph.weight(label, shape, streamed[label].precision)
 
 
 def _hc_branch(graph: GraphBuilder, streamed: dict,
@@ -595,8 +612,8 @@ def convert(model_dir: str, output_path: str,
             native_gguf_k: bool = False) -> None:
     """Convert a Hy4-preview checkpoint into a .mollm package.
 
-    Safetensors and one-layer GGUF diagnostic packages use FP16 weights.
-    The GGUF route decodes quantized blocks while writing the package.
+    Safetensors and GGUF diagnostic packages use FP16 weights. With
+    --native-gguf, supported GGUF blocks are copied into a CPU package.
     """
     global _GGUF_PY_PATH, _NATIVE_GGUF_K
     model_dir_path = Path(model_dir)
@@ -606,8 +623,6 @@ def convert(model_dir: str, output_path: str,
         cfg = config_from_gguf(index.gguf)
         if not absorbed:
             raise ValueError("GGUF diagnostic packages require --absorbed")
-        if tokenizer_dir is None:
-            raise ValueError("GGUF packages require --tokenizer-dir")
         _GGUF_PY_PATH = gguf_py_path
         _NATIVE_GGUF_K = native_gguf_k
     else:
@@ -625,12 +640,19 @@ def convert(model_dir: str, output_path: str,
         cfg["num_hidden_layers"] = layers
         cfg["indexer_types"] = cfg["indexer_types"][:layers]
         cfg["mlp_layer_types"] = cfg["mlp_layer_types"][:layers]
-    if is_gguf and int(cfg["num_hidden_layers"]) != 1:
-        raise ValueError("GGUF FP16 diagnostic conversion currently supports --layers 1")
-    assets_dir = Path(tokenizer_dir) if tokenizer_dir else model_dir_path
-    for asset in ("tokenizer.json", "chat_template.jinja"):
-        if not (assets_dir / asset).is_file():
-            raise FileNotFoundError(assets_dir / asset)
+    if is_gguf and layers is None:
+        raise ValueError("GGUF conversion requires an explicit --layers count")
+    if is_gguf and int(cfg["num_hidden_layers"]) > 2 and not native_gguf_k:
+        raise ValueError("GGUF conversion above two layers requires --native-gguf")
+    tokenizer_json = chat_template = None
+    assets_dir = Path(tokenizer_dir) if tokenizer_dir else (
+        None if is_gguf else model_dir_path)
+    if assets_dir is None:
+        tokenizer_json, chat_template = tokenizer_from_gguf(index.gguf)
+    else:
+        for asset in ("tokenizer.json", "chat_template.jinja"):
+            if not (assets_dir / asset).is_file():
+                raise FileNotFoundError(assets_dir / asset)
 
     # One graph per execution shape. The weight registry is shared, so a
     # weight requested by both graphs is streamed into the package once.
@@ -642,6 +664,24 @@ def convert(model_dir: str, output_path: str,
         is_prefill=False, absorbed=absorbed, index=index)
     streamed = dict(prefill_weights)
     streamed.update(decode_weights)
+    # A full GGUF package is about 228 GB. Fail before creating an incomplete
+    # output when the destination cannot hold the streamed weight payload.
+    output_parent = Path(output_path).resolve().parent
+    output_parent.mkdir(parents=True, exist_ok=True)
+    required_bytes = sum(weight.size for weight in streamed.values())
+    if assets_dir is None:
+        required_bytes += len(json.dumps(tokenizer_json, ensure_ascii=False).encode())
+        required_bytes += len(chat_template.encode())
+    else:
+        required_bytes += sum((assets_dir / name).stat().st_size for name in (
+            "tokenizer.json", "chat_template.jinja"))
+    required_bytes += 128 * 1024 * 1024  # graph, JSON, alignment, and margin
+    free_bytes = shutil.disk_usage(output_parent).free
+    if free_bytes < required_bytes:
+        raise OSError(
+            f"{output_parent}: package needs about "
+            f"{required_bytes / 1e9:.1f} GB free, has "
+            f"{free_bytes / 1e9:.1f} GB")
 
     num_layers = int(cfg["num_hidden_layers"])
     metadata = {
@@ -671,6 +711,11 @@ def convert(model_dir: str, output_path: str,
     # A directory is required by save_package even when every weight is
     # streamed: the graphs' weight nodes carry their own names.
     with tempfile.TemporaryDirectory(prefix="mollm_hy4_") as empty_dir:
+        if assets_dir is None:
+            assets_dir = Path(empty_dir)
+            (assets_dir / "tokenizer.json").write_text(
+                json.dumps(tokenizer_json, ensure_ascii=False))
+            (assets_dir / "chat_template.jinja").write_text(chat_template)
         save_package(
             output_path, prefill, decode, empty_dir, metadata,
             tokenizer_path=str(assets_dir / "tokenizer.json"),
@@ -690,7 +735,7 @@ if __name__ == "__main__":
     parser.add_argument("--layers", type=int,
                         help="export only the first N layers")
     parser.add_argument("--tokenizer-dir",
-                        help="tokenizer and chat template directory for GGUF")
+                        help="override GGUF tokenizer and chat template assets")
     parser.add_argument("--gguf-py",
                         help="path to llama.cpp/gguf-py for K-quant decoding")
     parser.add_argument("--native-gguf", "--native-gguf-k",

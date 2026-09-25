@@ -155,7 +155,7 @@ private:
 };
 
 bool valid_precision(uint32_t value) {
-    return value <= static_cast<uint32_t>(Precision::GGUF_Q8_0);
+    return value <= static_cast<uint32_t>(Precision::GGUF_IQ4_XS);
 }
 
 bool valid_dim_expr(int8_t kind) {
