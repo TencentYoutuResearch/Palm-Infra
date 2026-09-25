@@ -104,12 +104,14 @@ inline uint16_t fp32_to_fp16(float value) {
 
 void stq1_0_dequantize_block(const block_stq1_0& blk, float* out) {
     const float d = fp16_to_fp32(blk.d);
-    std::memset(out, 0, QK_STQ_K * sizeof(float));
+    // (group, lane) visits every one of the 256 positions exactly once.
     for (int g = 0; g < STQ_GROUPS; ++g) {
-        int8_t lanes[4];
-        stq1_0_group_lanes(blk, g, lanes);
+        const uint8_t code = (blk.qs[g / 2] >> (4 * (g & 1))) & 0x0F;
+        const uint8_t sign = (blk.sign[g / 8] >> (g % 8)) & 0x01;
+        const uint8_t packed = stq1_0_codebook[(sign << 4) | code];
         for (int p = 0; p < 4; ++p)
-            out[stq1_0_element_index(g, p)] = d * static_cast<float>(lanes[p]);
+            out[stq1_0_element_index(g, p)] =
+                d * static_cast<float>(int((packed >> (2 * p)) & 3) - 1);
     }
 }
 

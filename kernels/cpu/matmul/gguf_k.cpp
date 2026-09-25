@@ -109,9 +109,10 @@ void decode_iq2_xxs(const uint8_t* block, float* out) {
             const uint8_t* grid = iq2_grid + packed[part] * 8;
             const uint8_t signs = iq_signs[(signs_scale >> (7 * part)) & 127];
             float* y = out + group * 32 + part * 8;
-            for (int lane = 0; lane < 8; ++lane)
-                y[lane] = scale * grid[lane] *
-                    ((signs & (1 << lane)) ? -1.0f : 1.0f);
+            for (int lane = 0; lane < 8; ++lane) {
+                const int sign = 1 - 2 * int((signs >> lane) & 1);
+                y[lane] = scale * (int(grid[lane]) * sign);
+            }
         }
     }
 }
@@ -129,10 +130,10 @@ void decode_iq3_xxs(const uint8_t* block, float* out) {
             const uint8_t* grid1 = iq3_grid + qs[group * 8 + part * 2 + 1] * 4;
             float* y = out + group * 32 + part * 8;
             for (int lane = 0; lane < 4; ++lane) {
-                y[lane] = scale * grid0[lane] *
-                    ((signs & (1 << lane)) ? -1.0f : 1.0f);
-                y[lane + 4] = scale * grid1[lane] *
-                    ((signs & (1 << (lane + 4))) ? -1.0f : 1.0f);
+                const int sign0 = 1 - 2 * int((signs >> lane) & 1);
+                const int sign1 = 1 - 2 * int((signs >> (lane + 4)) & 1);
+                y[lane] = scale * (int(grid0[lane]) * sign0);
+                y[lane + 4] = scale * (int(grid1[lane]) * sign1);
             }
         }
     }
@@ -157,6 +158,65 @@ void decode_iq4_xs(const uint8_t* block, float* out) {
             y[lane + 16] = scale * values[q >> 4];
         }
     }
+}
+
+template <Precision P>
+void decode_native_block(const uint8_t* block, float* out) {
+    if constexpr (P == Precision::GGUF_IQ2_XXS) {
+        decode_iq2_xxs(block, out);
+    } else if constexpr (P == Precision::GGUF_IQ3_XXS) {
+        decode_iq3_xxs(block, out);
+    } else if constexpr (P == Precision::GGUF_STQ1_0) {
+        stq1_0_dequantize_block(
+            *reinterpret_cast<const block_stq1_0*>(block), out);
+    } else if constexpr (P == Precision::GGUF_IQ4_XS) {
+        decode_iq4_xs(block, out);
+    } else if constexpr (P == Precision::GGUF_Q8_0) {
+        const float scale = half_value(block);
+        const auto* values = reinterpret_cast<const int8_t*>(block + 2);
+        for (int i = 0; i < 32; ++i) out[i] = scale * values[i];
+    } else if constexpr (P == Precision::GGUF_Q4_K) {
+        decode_q4_or_q5(block, out, false);
+    } else if constexpr (P == Precision::GGUF_Q5_K) {
+        decode_q4_or_q5(block, out, true);
+    } else if constexpr (P == Precision::GGUF_Q6_K) {
+        decode_q6(block, out);
+    }
+}
+
+template <Precision P>
+void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
+                          ThreadPool* pool, Activation act,
+                          int act_n_begin, int act_n_len,
+                          int block_values, size_t bytes) {
+    const int K = static_cast<int>(B.shape[1]);
+    const int N = static_cast<int>(B.shape[0]);
+    const int M = static_cast<int>(A.shape[1]);
+    const int blocks = K / block_values;
+    const auto* encoded = static_cast<const uint8_t*>(B.data);
+    const float* input = A.ptr<float>();
+    float* output = C.ptr<float>();
+    auto process = [&](int, int begin, int end) {
+        std::array<float, 256> values;
+        for (int n = begin; n < end; ++n) {
+            for (int m = 0; m < M; ++m) output[m * N + n] = 0.0f;
+            const uint8_t* row = encoded + size_t(n) * blocks * bytes;
+            for (int block = 0; block < blocks; ++block) {
+                decode_native_block<P>(row + block * bytes, values.data());
+                for (int m = 0; m < M; ++m) {
+                    const float* a = input + size_t(m) * K + block * block_values;
+                    float sum = output[m * N + n];
+                    for (int k = 0; k < block_values; ++k)
+                        sum += a[k] * values[k];
+                    output[m * N + n] = sum;
+                }
+            }
+        }
+    };
+    if (pool) pool->parallel_for(0, N, 16, process);
+    else process(0, 0, N);
+    matmul_apply_activation(output, M, N, N, 0, M, act,
+                            act_n_begin, act_n_len);
 }
 
 }  // namespace
@@ -185,24 +245,21 @@ bool gguf_k_dequantize_block(Precision precision, const uint8_t* block,
     if (!block || !output) return false;
     switch (precision) {
     case Precision::GGUF_IQ2_XXS:
-        decode_iq2_xxs(block, output); return true;
+        decode_native_block<Precision::GGUF_IQ2_XXS>(block, output); return true;
     case Precision::GGUF_IQ3_XXS:
-        decode_iq3_xxs(block, output); return true;
+        decode_native_block<Precision::GGUF_IQ3_XXS>(block, output); return true;
     case Precision::GGUF_STQ1_0:
-        stq1_0_dequantize_block(
-            *reinterpret_cast<const block_stq1_0*>(block), output);
-        return true;
+        decode_native_block<Precision::GGUF_STQ1_0>(block, output); return true;
     case Precision::GGUF_IQ4_XS:
-        decode_iq4_xs(block, output); return true;
-    case Precision::GGUF_Q8_0: {
-        const float scale = half_value(block);
-        const auto* values = reinterpret_cast<const int8_t*>(block + 2);
-        for (int i = 0; i < 32; ++i) output[i] = scale * values[i];
-        return true;
-    }
-    case Precision::GGUF_Q4_K: decode_q4_or_q5(block, output, false); return true;
-    case Precision::GGUF_Q5_K: decode_q4_or_q5(block, output, true); return true;
-    case Precision::GGUF_Q6_K: decode_q6(block, output); return true;
+        decode_native_block<Precision::GGUF_IQ4_XS>(block, output); return true;
+    case Precision::GGUF_Q8_0:
+        decode_native_block<Precision::GGUF_Q8_0>(block, output); return true;
+    case Precision::GGUF_Q4_K:
+        decode_native_block<Precision::GGUF_Q4_K>(block, output); return true;
+    case Precision::GGUF_Q5_K:
+        decode_native_block<Precision::GGUF_Q5_K>(block, output); return true;
+    case Precision::GGUF_Q6_K:
+        decode_native_block<Precision::GGUF_Q6_K>(block, output); return true;
     default: return false;
     }
 }
@@ -219,30 +276,31 @@ void kernel_matmul_gguf_k(const Tensor& A, const Tensor& B, Tensor& C,
         C.prec != Precision::FP32 || A.shape[0] != K || C.shape[0] != N ||
         C.shape[1] != M || !A.data || !B.data || !C.data)
         return;
-    const int blocks = K / block_values;
-    const auto* encoded = static_cast<const uint8_t*>(B.data);
-    const float* input = A.ptr<float>();
-    float* output = C.ptr<float>();
-    auto process = [&](int, int begin, int end) {
-        std::array<float, 256> values;
-        for (int n = begin; n < end; ++n) {
-            for (int m = 0; m < M; ++m) output[m * N + n] = 0.0f;
-            const uint8_t* row = encoded + size_t(n) * blocks * bytes;
-            for (int block = 0; block < blocks; ++block) {
-                gguf_k_dequantize_block(B.prec, row + block * bytes,
-                                        values.data());
-                for (int m = 0; m < M; ++m) {
-                    const float* a = input + size_t(m) * K + block * block_values;
-                    float sum = output[m * N + n];
-                    for (int k = 0; k < block_values; ++k)
-                        sum += a[k] * values[k];
-                    output[m * N + n] = sum;
-                }
-            }
-        }
-    };
-    if (pool) pool->parallel_for(0, N, 16, process);
-    else process(0, 0, N);
-    matmul_apply_activation(output, M, N, N, 0, M, act,
-                            act_n_begin, act_n_len);
+    switch (B.prec) {
+    case Precision::GGUF_IQ2_XXS:
+        matmul_native_blocks<Precision::GGUF_IQ2_XXS>(
+            A, B, C, pool, act, act_n_begin, act_n_len, block_values, bytes); break;
+    case Precision::GGUF_IQ3_XXS:
+        matmul_native_blocks<Precision::GGUF_IQ3_XXS>(
+            A, B, C, pool, act, act_n_begin, act_n_len, block_values, bytes); break;
+    case Precision::GGUF_STQ1_0:
+        matmul_native_blocks<Precision::GGUF_STQ1_0>(
+            A, B, C, pool, act, act_n_begin, act_n_len, block_values, bytes); break;
+    case Precision::GGUF_IQ4_XS:
+        matmul_native_blocks<Precision::GGUF_IQ4_XS>(
+            A, B, C, pool, act, act_n_begin, act_n_len, block_values, bytes); break;
+    case Precision::GGUF_Q8_0:
+        matmul_native_blocks<Precision::GGUF_Q8_0>(
+            A, B, C, pool, act, act_n_begin, act_n_len, block_values, bytes); break;
+    case Precision::GGUF_Q4_K:
+        matmul_native_blocks<Precision::GGUF_Q4_K>(
+            A, B, C, pool, act, act_n_begin, act_n_len, block_values, bytes); break;
+    case Precision::GGUF_Q5_K:
+        matmul_native_blocks<Precision::GGUF_Q5_K>(
+            A, B, C, pool, act, act_n_begin, act_n_len, block_values, bytes); break;
+    case Precision::GGUF_Q6_K:
+        matmul_native_blocks<Precision::GGUF_Q6_K>(
+            A, B, C, pool, act, act_n_begin, act_n_len, block_values, bytes); break;
+    default: break;
+    }
 }

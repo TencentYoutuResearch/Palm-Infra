@@ -1,6 +1,7 @@
 #include "core/tensor.h"
 #include "core/fp16.h"
 #include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 #include "runtime/threading.h"
 #include <algorithm>
 #include <cmath>
@@ -62,6 +63,74 @@ static float relative_l2_error(const float* got, const float* ref, int n) {
         : 0.0f;
 }
 
+static bool gguf_native_matmul_matches_block_decoder() {
+    constexpr Precision formats[] = {
+        Precision::GGUF_Q4_K, Precision::GGUF_Q5_K,
+        Precision::GGUF_Q6_K, Precision::GGUF_Q8_0,
+        Precision::GGUF_IQ2_XXS, Precision::GGUF_IQ3_XXS,
+        Precision::GGUF_STQ1_0, Precision::GGUF_IQ4_XS,
+    };
+    constexpr int M = 2;
+    constexpr int N = 32;
+    ThreadPool pool(4);
+    for (Precision format : formats) {
+        const int values_per_block = static_cast<int>(gguf_k_block_values(format));
+        const size_t bytes_per_block = gguf_k_block_bytes(format);
+        const int K = 2 * values_per_block;
+        std::vector<uint8_t> encoded(N * 2 * bytes_per_block);
+        std::vector<float> input(M * K), output(M * N), reference(M * N);
+        for (int i = 0; i < M * K; ++i)
+            input[i] = static_cast<float>((i * 7) % 23 - 11) * 0.01f;
+        for (size_t i = 0; i < encoded.size(); ++i)
+            encoded[i] = static_cast<uint8_t>(i * 37 + 11);
+        for (int block = 0; block < N * 2; ++block) {
+            uint8_t* data = encoded.data() + block * bytes_per_block;
+            size_t scale_offset = 0;
+            if (format == Precision::GGUF_Q6_K) scale_offset = 208;
+            if (format == Precision::GGUF_STQ1_0) scale_offset = 40;
+            data[scale_offset] = 0x00;
+            data[scale_offset + 1] = 0x3c;  // fp16 1.0
+            if (format == Precision::GGUF_Q4_K ||
+                format == Precision::GGUF_Q5_K) {
+                data[2] = 0x00;
+                data[3] = 0x38;  // fp16 0.5 minimum scale
+            }
+        }
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  K, M, 1, 1, input.data());
+        Tensor B = Tensor::create(format, MemoryType::EXTERNAL,
+                                  N, K, 1, 1, encoded.data());
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  N, M, 1, 1, output.data());
+        kernel_matmul_fp32(A, B, C, &pool);
+        std::vector<float> decoded(values_per_block);
+        for (int n = 0; n < N; ++n) {
+            for (int m = 0; m < M; ++m) {
+                float sum = 0.0f;
+                for (int block = 0; block < 2; ++block) {
+                    const uint8_t* data = encoded.data() +
+                        (n * 2 + block) * bytes_per_block;
+                    if (!gguf_k_dequantize_block(format, data, decoded.data()))
+                        return false;
+                    for (int k = 0; k < values_per_block; ++k)
+                        sum += input[m * K + block * values_per_block + k] *
+                               decoded[k];
+                }
+                reference[m * N + n] = sum;
+            }
+        }
+        for (int i = 0; i < M * N; ++i) {
+            if (!std::isfinite(output[i]) || output[i] != reference[i]) {
+                std::fprintf(stderr,
+                             "  GGUF format %d output %d: got %.9g expected %.9g\n",
+                             static_cast<int>(format), i, output[i], reference[i]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static uint8_t reference_encode_fp8(float value) {
     if (std::isnan(value)) return 0x7f;
     const uint8_t sign = std::signbit(value) ? 0x80 : 0;
@@ -109,6 +178,8 @@ static void reference_fp8_ue8m0_activation(const float* input, float* output,
 
 int main() {
     srand(42);
+    CHECK(gguf_native_matmul_matches_block_decoder(),
+          "all GGUF native matmul formats match blockwise reference");
 
     // ---- FP8/MXFP4 scalar format decoding ----
     {
