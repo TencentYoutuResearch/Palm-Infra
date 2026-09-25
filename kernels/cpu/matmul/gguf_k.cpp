@@ -413,15 +413,17 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
             return;
         }
         if (M == 1) {
-            // Four independent rows hide the scalar reduction dependency.
+            // Independent rows hide the scalar reduction dependency.
             // Clang otherwise fuses the interleaved multiply/add operations,
             // changing Hy4 logits; the original kernel rounds each product.
-            std::array<std::array<float, 256>, 4> row_values;
-            for (; begin + 4 <= end; begin += 4) {
+            std::array<std::array<float, 256>, 8> row_values;
+            for (; begin + 8 <= end; begin += 8) {
                 float sum0 = 0.0f, sum1 = 0.0f;
                 float sum2 = 0.0f, sum3 = 0.0f;
+                float sum4 = 0.0f, sum5 = 0.0f;
+                float sum6 = 0.0f, sum7 = 0.0f;
                 for (int block = 0; block < blocks; ++block) {
-                    for (int lane = 0; lane < 4; ++lane) {
+                    for (int lane = 0; lane < 8; ++lane) {
                         const uint8_t* row = encoded +
                             (size_t(begin + lane) * blocks + block) * bytes;
                         decode_native_block<P>(row, row_values[lane].data());
@@ -435,6 +437,10 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
                             sum1 += x * row_values[1][k];
                             sum2 += x * row_values[2][k];
                             sum3 += x * row_values[3][k];
+                            sum4 += x * row_values[4][k];
+                            sum5 += x * row_values[5][k];
+                            sum6 += x * row_values[6][k];
+                            sum7 += x * row_values[7][k];
                         }
                     }
                 }
@@ -442,6 +448,10 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
                 output[begin + 1] = sum1;
                 output[begin + 2] = sum2;
                 output[begin + 3] = sum3;
+                output[begin + 4] = sum4;
+                output[begin + 5] = sum5;
+                output[begin + 6] = sum6;
+                output[begin + 7] = sum7;
             }
         }
         if (M >= 2 && M <= 4) {
