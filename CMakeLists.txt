@@ -567,6 +567,14 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_attention     tests/test_attention.cpp)
     add_mollm_test(test_stq1_0        tests/test_stq1_0.cpp)
     add_mollm_test(stq1_0_crosscheck  tests/stq1_0_crosscheck.cpp)
+    # Not a test but a decoder dump the Python GGUF reader is diffed against
+    # (see models/verify_gguf_reader.py). It takes a block file as an argument,
+    # so it is added as a plain executable rather than through add_mollm_test,
+    # which would register it with ctest and fail on a missing argument. Living
+    # in the build keeps the cross-check reproducible instead of depending on a
+    # hand-typed command that silently rots.
+    add_executable(stq_decode_dump tests/stq_decode_dump.cpp)
+    target_link_libraries(stq_decode_dump PRIVATE mollm_lib)
     add_mollm_test(test_shortconv     tests/test_shortconv.cpp)
     add_mollm_test(test_gdn           tests/test_gdn.cpp)
     add_mollm_test(test_rwkv_e2e      tests/test_rwkv_e2e.cpp)
