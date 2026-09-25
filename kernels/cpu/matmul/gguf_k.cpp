@@ -120,6 +120,25 @@ void decode_q4_or_q5(const uint8_t* block, float* out, bool five_bit) {
     }
 }
 
+#if defined(__aarch64__)
+void store_q6_values(uint8x16_t quantized, float scale, float* output) {
+    const int16x8_t low = vsubq_s16(
+        vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(quantized))),
+        vdupq_n_s16(32));
+    const int16x8_t high = vsubq_s16(
+        vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(quantized))),
+        vdupq_n_s16(32));
+    vst1q_f32(output, vmulq_n_f32(vcvtq_f32_s32(
+        vmovl_s16(vget_low_s16(low))), scale));
+    vst1q_f32(output + 4, vmulq_n_f32(vcvtq_f32_s32(
+        vmovl_s16(vget_high_s16(low))), scale));
+    vst1q_f32(output + 8, vmulq_n_f32(vcvtq_f32_s32(
+        vmovl_s16(vget_low_s16(high))), scale));
+    vst1q_f32(output + 12, vmulq_n_f32(vcvtq_f32_s32(
+        vmovl_s16(vget_high_s16(high))), scale));
+}
+#endif
+
 void decode_q6(const uint8_t* block, float* out) {
     const uint8_t* low = block;
     const uint8_t* high = block + 128;
@@ -130,6 +149,31 @@ void decode_q6(const uint8_t* block, float* out) {
         const uint8_t* h = high + half * 32;
         const int8_t* s = scales + half * 8;
         float* y = out + half * 128;
+#if defined(__aarch64__)
+        for (int lane = 0; lane < 32; lane += 16) {
+            const uint8x16_t l0 = vld1q_u8(l + lane);
+            const uint8x16_t l1 = vld1q_u8(l + 32 + lane);
+            const uint8x16_t h0 = vld1q_u8(h + lane);
+            const uint8x16_t q0 = vorrq_u8(
+                vandq_u8(l0, vdupq_n_u8(15)),
+                vshlq_n_u8(vandq_u8(h0, vdupq_n_u8(3)), 4));
+            const uint8x16_t q1 = vorrq_u8(
+                vandq_u8(l1, vdupq_n_u8(15)),
+                vshlq_n_u8(vandq_u8(vshrq_n_u8(h0, 2),
+                                       vdupq_n_u8(3)), 4));
+            const uint8x16_t q2 = vorrq_u8(
+                vshrq_n_u8(l0, 4),
+                vandq_u8(h0, vdupq_n_u8(48)));
+            const uint8x16_t q3 = vorrq_u8(
+                vshrq_n_u8(l1, 4),
+                vshlq_n_u8(vshrq_n_u8(h0, 6), 4));
+            const int si = lane / 16;
+            store_q6_values(q0, d * s[si], y + lane);
+            store_q6_values(q1, d * s[si + 2], y + 32 + lane);
+            store_q6_values(q2, d * s[si + 4], y + 64 + lane);
+            store_q6_values(q3, d * s[si + 6], y + 96 + lane);
+        }
+#else
         for (int lane = 0; lane < 32; ++lane) {
             const int si = lane / 16;
             y[lane] = d * s[si] *
@@ -141,6 +185,7 @@ void decode_q6(const uint8_t* block, float* out) {
             y[96 + lane] = d * s[si + 6] *
                 (int((l[32 + lane] >> 4) | (((h[lane] >> 6) & 3) << 4)) - 32);
         }
+#endif
     }
 }
 
