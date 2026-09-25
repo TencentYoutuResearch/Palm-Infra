@@ -1220,11 +1220,13 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         architecture_it != package_metadata_.end()
             ? architecture_it->second
             : std::string();
-    if (architecture == "deepseek-v4") {
+    if (architecture == "deepseek-v4" || architecture == "hy-v4") {
+        const bool hy4 = architecture == "hy-v4";
         const auto context_it = package_metadata_.find("n_ctx");
         if (context_it == package_metadata_.end()) {
             fprintf(stderr,
-                    "Engine: DeepSeek-V4 package is missing n_ctx metadata\n");
+                    "Engine: %s package is missing n_ctx metadata\n",
+                    hy4 ? "Hy4" : "DeepSeek-V4");
             return false;
         }
         char* context_end = nullptr;
@@ -1232,19 +1234,22 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             std::strtol(context_it->second.c_str(), &context_end, 10);
         if (!context_end || *context_end != '\0' || package_context <= 0) {
             fprintf(stderr,
-                    "Engine: DeepSeek-V4 package has invalid n_ctx metadata\n");
+                    "Engine: %s package has invalid n_ctx metadata\n",
+                    hy4 ? "Hy4" : "DeepSeek-V4");
             return false;
         }
         if (cfg_.n_ctx > package_context) {
             fprintf(
                 stderr,
-                "Engine: requested n_ctx=%d exceeds this DeepSeek-V4 "
+                "Engine: requested n_ctx=%d exceeds this %s "
                 "package's auxiliary-cache capacity (%ld); reconvert with "
                 "a larger --n-ctx or lower --n-ctx\n",
-                cfg_.n_ctx, package_context);
+                cfg_.n_ctx, hy4 ? "Hy4" : "DeepSeek-V4", package_context);
             return false;
         }
+    }
 
+    if (architecture == "deepseek-v4") {
         // Metal uses a CPU graph, but may delegate routed MXFP4 experts
         // through its dedicated SSD cache.
         const bool unsupported_accelerator = cfg_.device == Device::METAL;
