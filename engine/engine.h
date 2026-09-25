@@ -83,9 +83,12 @@ struct EngineConfig {
     // Shared capacity across all MoE layers. Disable to reproduce the legacy
     // equal-per-layer cache.
     bool moe_ssd_global_cache = true;
-    // Wire dense mmap pages so a large expert cache cannot evict them.
-    // Ignored unless SSD offload uses mmap weights.
+    // Wire dense mmap pages so expert traffic cannot evict them. Used by SSD
+    // offload and by the explicit native-GGUF dense pinning option below.
     bool lock_dense_weights = true;
+    // Opt in to pinning native GGUF dense weights even without SSD expert
+    // offload. Routed expert tensors remain pageable.
+    bool pin_gguf_dense_weights = false;
     // Expert buffers are anonymous memory. On macOS, wiring them prevents the
     // VM compressor from turning old cache hits into expensive decompressions.
     bool lock_moe_ssd_cache = kDefaultLockMoeSsdCache;
