@@ -95,6 +95,7 @@ set(SOURCES
     kernels/cpu/matmul/matmul_sparse.cpp
     kernels/cpu/matmul/matmul_w4.cpp
     kernels/cpu/matmul/matmul_w8.cpp
+    kernels/cpu/matmul/stq1_0.cpp
     kernels/cpu/matmul/matmul_mxfp4.cpp
     kernels/cpu/matmul/matmul_nvfp4.cpp
     ${MOLLM_CPU_PLATFORM_SOURCE}
@@ -564,6 +565,8 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_norm          tests/test_norm.cpp)
     add_mollm_test(test_rope          tests/test_rope.cpp)
     add_mollm_test(test_attention     tests/test_attention.cpp)
+    add_mollm_test(test_stq1_0        tests/test_stq1_0.cpp)
+    add_mollm_test(stq1_0_crosscheck  tests/stq1_0_crosscheck.cpp)
     add_mollm_test(test_shortconv     tests/test_shortconv.cpp)
     add_mollm_test(test_gdn           tests/test_gdn.cpp)
     add_mollm_test(test_rwkv_e2e      tests/test_rwkv_e2e.cpp)
