@@ -3,6 +3,7 @@
 #include "core/bf16.h"
 #include "backends/cpu/platform.h"
 #include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 #include "kernels/cpu/moe/moe_routing.h"
 #include "runtime/expert_provider.h"
 #include "runtime/trace.h"
@@ -248,6 +249,15 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
             view.data = static_cast<char*>(src.data) +
                         (size_t)row0 * (size_t)K * elem;
         }
+        return true;
+    }
+
+    const size_t gguf_bytes = gguf_k_block_bytes(src.prec);
+    const size_t gguf_values = gguf_k_block_values(src.prec);
+    if (gguf_bytes) {
+        if (K % gguf_values) return false;
+        const size_t row_bytes = (size_t)K / gguf_values * gguf_bytes;
+        view.data = static_cast<char*>(src.data) + (size_t)row0 * row_bytes;
         return true;
     }
 

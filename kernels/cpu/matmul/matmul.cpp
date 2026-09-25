@@ -83,6 +83,10 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     case Precision::GGUF_Q5_K:
     case Precision::GGUF_Q6_K:
     case Precision::GGUF_Q8_0:
+    case Precision::GGUF_IQ2_XXS:
+    case Precision::GGUF_IQ3_XXS:
+    case Precision::GGUF_STQ1_0:
+    case Precision::GGUF_IQ4_XS:
         kernel_matmul_gguf_k(A, B, C, thread_pool, act,
                              act_n_begin, act_n_len);
         return;
