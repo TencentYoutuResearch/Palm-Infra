@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <vector>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -365,9 +366,52 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
     const auto* encoded = static_cast<const uint8_t*>(B.data);
     const float* input = A.ptr<float>();
     float* output = C.ptr<float>();
+#if defined(__APPLE__) && defined(__clang__) && defined(__aarch64__)
+    const int token_stride = (M + 3) & ~3;
+    std::vector<float> token_major;
+    if (M >= 5 && M <= 32) {
+        // Make adjacent tokens contiguous so NEON can update four independent
+        // sums while each token still visits k in the original order.
+        token_major.resize(size_t(K) * token_stride, 0.0f);
+        for (int k = 0; k < K; ++k)
+            for (int m = 0; m < M; ++m)
+                token_major[size_t(k) * token_stride + m] =
+                    input[size_t(m) * K + k];
+    }
+#endif
     auto process = [&](int, int begin, int end) {
         std::array<float, 256> values;
 #if defined(__APPLE__) && defined(__clang__) && defined(__aarch64__)
+        if (!token_major.empty()) {
+            const int groups = token_stride / 4;
+            for (int n = begin; n < end; ++n) {
+                std::array<float32x4_t, 8> sums;
+                for (int g = 0; g < groups; ++g)
+                    sums[g] = vdupq_n_f32(0.0f);
+                const uint8_t* row = encoded + size_t(n) * blocks * bytes;
+                for (int block = 0; block < blocks; ++block) {
+                    decode_native_block<P>(row + block * bytes, values.data());
+                    {
+#pragma clang fp contract(off)
+                        for (int k = 0; k < block_values; ++k) {
+                            const float weight = values[k];
+                            const float* a = token_major.data() +
+                                (size_t(block) * block_values + k) * token_stride;
+                            for (int g = 0; g < groups; ++g) {
+                                sums[g] = vaddq_f32(sums[g], vmulq_n_f32(
+                                    vld1q_f32(a + g * 4), weight));
+                            }
+                        }
+                    }
+                }
+                float row_sums[32];
+                for (int g = 0; g < groups; ++g)
+                    vst1q_f32(row_sums + g * 4, sums[g]);
+                for (int m = 0; m < M; ++m)
+                    output[m * N + n] = row_sums[m];
+            }
+            return;
+        }
         if (M == 1) {
             // Four independent rows hide the scalar reduction dependency.
             // Clang otherwise fuses the interleaved multiply/add operations,
@@ -400,7 +444,7 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
                 output[begin + 3] = sum3;
             }
         }
-        if (M >= 2 && M <= 32) {
+        if (M >= 2 && M <= 4) {
             // Reuse each decoded block across prefill tokens. Independent
             // accumulators retain the original per-token rounding order.
             std::array<float, 32> sums;
