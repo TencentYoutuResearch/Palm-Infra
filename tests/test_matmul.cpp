@@ -255,6 +255,49 @@ static bool gguf_q5_block_matches_scalar() {
     return true;
 }
 
+static bool gguf_q6_block_matches_scalar() {
+    constexpr uint16_t scales[] = {0x3c00, 0x3555, 0xbc00, 0x0400};
+    uint32_t state = 7;
+    for (uint16_t scale_bits : scales) {
+        uint8_t block[210];
+        for (auto& byte : block) {
+            state = state * 1664525u + 1013904223u;
+            byte = static_cast<uint8_t>(state >> 24);
+        }
+        block[208] = static_cast<uint8_t>(scale_bits);
+        block[209] = static_cast<uint8_t>(scale_bits >> 8);
+        float decoded[256];
+        if (!gguf_k_dequantize_block(Precision::GGUF_Q6_K, block, decoded))
+            return false;
+        const float d = reference_half_to_float(scale_bits);
+        const auto* scales_ptr = reinterpret_cast<const int8_t*>(block + 192);
+        for (int half = 0; half < 2; ++half) {
+            const uint8_t* low = block + half * 64;
+            const uint8_t* high = block + 128 + half * 32;
+            const int8_t* s = scales_ptr + half * 8;
+            for (int lane = 0; lane < 32; ++lane) {
+                const int si = lane / 16;
+                const int q[4] = {
+                    int((low[lane] & 15) | ((high[lane] & 3) << 4)) - 32,
+                    int((low[32 + lane] & 15) |
+                        (((high[lane] >> 2) & 3) << 4)) - 32,
+                    int((low[lane] >> 4) |
+                        (((high[lane] >> 4) & 3) << 4)) - 32,
+                    int((low[32 + lane] >> 4) |
+                        (((high[lane] >> 6) & 3) << 4)) - 32,
+                };
+                for (int group = 0; group < 4; ++group) {
+                    const float expected = d * s[si + group * 2] * q[group];
+                    const float actual = decoded[half * 128 + group * 32 + lane];
+                    if (std::memcmp(&actual, &expected, sizeof(float)) != 0)
+                        return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static uint8_t reference_encode_fp8(float value) {
     if (std::isnan(value)) return 0x7f;
     const uint8_t sign = std::signbit(value) ? 0x80 : 0;
@@ -308,6 +351,8 @@ int main() {
           "GGUF FP16 scales match reference for every finite bit pattern");
     CHECK(gguf_q5_block_matches_scalar(),
           "GGUF Q5_K block matches independent scalar decoding");
+    CHECK(gguf_q6_block_matches_scalar(),
+          "GGUF Q6_K block matches independent scalar decoding");
 
     // ---- FP8/MXFP4 scalar format decoding ----
     {
