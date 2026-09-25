@@ -4,6 +4,7 @@
 #include "core/fp16.h"
 #include "runtime/host_compute.h"
 #include "runtime/trace.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -320,7 +321,25 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids, int pad_to) {
         // Zero-init so padding positions (if any) are well-defined zeros.
         std::memset(t.data, 0, nbytes);
 
-        if (embed_weight_->prec == Precision::FP16) {
+        if (embed_weight_->prec == Precision::GGUF_Q4_K ||
+            embed_weight_->prec == Precision::GGUF_Q5_K ||
+            embed_weight_->prec == Precision::GGUF_Q6_K ||
+            embed_weight_->prec == Precision::GGUF_Q8_0) {
+            const size_t block_bytes = gguf_k_block_bytes(embed_weight_->prec);
+            const size_t block_values = gguf_k_block_values(embed_weight_->prec);
+            const size_t row_bytes = size_t(hidden_dim / block_values) * block_bytes;
+            const auto* encoded = static_cast<const uint8_t*>(embed_weight_->data);
+            for (int s = 0; s < n; ++s) {
+                int tid = token_ids[s];
+                if (tid < 0 || tid >= vocab_size) tid = 0;
+                float* dst = t.ptr<float>() + s * hidden_dim;
+                const uint8_t* row = encoded + size_t(tid) * row_bytes;
+                for (size_t b = 0; b < size_t(hidden_dim) / block_values; ++b)
+                    gguf_k_dequantize_block(embed_weight_->prec,
+                                            row + b * block_bytes,
+                                            dst + b * block_values);
+            }
+        } else if (embed_weight_->prec == Precision::FP16) {
             // Row-major FP16 — simple direct access
             const __fp16* embed_data =
                 reinterpret_cast<const __fp16*>(embed_weight_->data);

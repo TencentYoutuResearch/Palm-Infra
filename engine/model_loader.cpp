@@ -2,6 +2,7 @@
 #include "backends/factory.h"
 #include "storage/byte_ranges.h"
 #include "engine/weight_metadata.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 
 #include "runtime/host_compute.h"
 #include "storage/ssd_expert_cache/cache.h"
@@ -516,6 +517,13 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     ? blob + weight_header.scales_offset : nullptr;
                 const Precision precision =
                     static_cast<Precision>(weight_header.precision);
+                if (gguf_k_block_bytes(precision) && accelerator_backend_ &&
+                    exec_ctx.backend == accelerator_backend_.get()) {
+                    fprintf(stderr,
+                            "Engine: GGUF quantized weight %s currently requires CPU execution\n",
+                            wref.c_str());
+                    return false;
+                }
                 const bool cpu_weight = build_cpu_weight_sidecars;
                 auto align_package_region =
                     [&](const void* source, uint64_t size, size_t alignment,
@@ -710,6 +718,15 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         }
 
         const MappedFile& mapped = shared_weights_[weight_index];
+        if (gguf_k_block_bytes(
+                static_cast<Precision>(mapped.header().precision)) &&
+            accelerator_backend_ &&
+            exec_ctx.backend == accelerator_backend_.get()) {
+            fprintf(stderr,
+                    "Engine: GGUF quantized weight %s currently requires CPU execution\n",
+                    wref.c_str());
+            return false;
+        }
         setup_weight(
             const_cast<void*>(mapped.data()),
             static_cast<Precision>(mapped.header().precision));

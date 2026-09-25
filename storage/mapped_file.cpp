@@ -109,7 +109,7 @@ bool valid_header(const MappedFile::Header& header, size_t file_size) {
     if ((header.flags & ~known_flags) != 0 ||
         header.ndim == 0 || header.ndim > 4 ||
         header.precision >
-            static_cast<uint32_t>(Precision::NVFP4)) {
+            static_cast<uint32_t>(Precision::GGUF_Q8_0)) {
         return false;
     }
     for (uint32_t dim = 0; dim < header.ndim; ++dim) {

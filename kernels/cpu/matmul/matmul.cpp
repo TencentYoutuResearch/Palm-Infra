@@ -1,6 +1,7 @@
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/matmul/matmul_internal.h"
 #include "kernels/cpu/matmul/matmul_profile.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 
 MatmulConfig g_matmul_config;
 
@@ -78,6 +79,13 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     MatmulTimer timer;
 
     switch (B.prec) {
+    case Precision::GGUF_Q4_K:
+    case Precision::GGUF_Q5_K:
+    case Precision::GGUF_Q6_K:
+    case Precision::GGUF_Q8_0:
+        kernel_matmul_gguf_k(A, B, C, thread_pool, act,
+                             act_n_begin, act_n_len);
+        return;
     case Precision::INT4:
         matmul_dispatch_int4(A, B, C, thread_pool, act, act_n_begin, act_n_len,
                              timer);
