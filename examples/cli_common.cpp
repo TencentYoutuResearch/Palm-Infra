@@ -195,6 +195,9 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.lock_dense_weights = true;
         } else if (arg == "--no-lock-dense-weights") {
             opts.lock_dense_weights = false;
+        } else if (arg == "--pin-gguf-dense") {
+            opts.pin_gguf_dense_weights = true;
+            opts.weight_loading = WeightLoadingMode::MMAP;
         } else if (arg == "--lock-expert-cache") {
             opts.lock_expert_cache = true;
         } else if (arg == "--no-lock-expert-cache") {
@@ -282,6 +285,10 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         error = "--require-native requires an accelerator device";
         return false;
     }
+    if (opts.pin_gguf_dense_weights && !opts.lock_dense_weights) {
+        error = "--pin-gguf-dense conflicts with --no-lock-dense-weights";
+        return false;
+    }
     if (!validate_sampling_params(opts.sampling, &error))
         return false;
     if (opts.ssd_cache_mb > 0) {
@@ -329,6 +336,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
     std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
     std::printf("  --no-lock-dense-weights Keep dense mmap weights pageable\n");
+    std::printf("  --pin-gguf-dense       Pin GGUF dense mmap weights without SSD offload\n");
     std::printf("  --lock-expert-cache     Pin the expert RAM cache (default on macOS)\n");
     std::printf("  --no-lock-expert-cache  Allow the OS to compress/page expert cache entries\n");
     std::printf("  --no-load-warmup        Skip mmap page-in warmup\n");
@@ -377,6 +385,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.trace_path = opts.trace_path;
     cfg.mtp_draft_tokens = opts.mtp_draft_tokens;
     cfg.lock_dense_weights = opts.lock_dense_weights;
+    cfg.pin_gguf_dense_weights = opts.pin_gguf_dense_weights;
     cfg.lock_moe_ssd_cache = opts.lock_expert_cache;
     return cfg;
 }

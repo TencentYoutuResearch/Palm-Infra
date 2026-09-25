@@ -31,8 +31,9 @@ struct CliCommonOptions {
     // but an explicit --load-warmup can still warm only dense mmap weights.
     bool load_warmup_explicit = false;
     // SSD expert offload benefits from keeping the always-used dense weights
-    // resident. Users on constrained systems can opt out explicitly.
+    // resident. Native GGUF can opt in separately when memory permits.
     bool lock_dense_weights = true;
+    bool pin_gguf_dense_weights = false;
     bool lock_expert_cache = kDefaultLockMoeSsdCache;
     int ssd_cache_mb = 0;        // >0: page routed MoE experts from package
     int ssd_io_workers = 8;      // dedicated pread workers for MoE SSD cache

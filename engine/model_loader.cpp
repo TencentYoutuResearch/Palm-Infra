@@ -227,7 +227,8 @@ size_t LLMEngine::warmup_package_weights() {
 }
 
 size_t LLMEngine::lock_dense_package_weights() {
-    if (!package_weights_mmap_backed() || !moe_ssd_cache_ ||
+    if (!package_weights_mmap_backed() ||
+        (!moe_ssd_cache_ && !cfg_.pin_gguf_dense_weights) ||
         !locked_dense_ranges_.empty()) {
         return 0;
     }
@@ -668,9 +669,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                             t, wref, data, packed_weights_);
                 }
                 // Sidecar-backed weights no longer need their original pages.
-                // Native GGUF blocks still need their pages, but fetching the
-                // 228 GB full package eagerly would evict the useful working
-                // set before inference. Let mmap fault those blocks on demand.
+                // Native GGUF expert blocks stay pageable. The optional dense
+                // pinning mode keeps only the always-used GGUF blocks resident.
                 const bool complete_cpu_sidecar =
                     (t.prec == Precision::FP8_E4M3 &&
                      (t.q8_repack_data || t.fp8_bf16_fp16_data)) ||
@@ -679,7 +679,11 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     (t.prec == Precision::FP32 && t.fp32_bf16_data) ||
                     (t.prec == Precision::FP16 && t.is_interleaved &&
                      t.data != data);
-                if (complete_cpu_sidecar || gguf_k_block_bytes(t.prec)) {
+                const bool gguf_source_to_skip =
+                    gguf_k_block_bytes(t.prec) &&
+                    (!cfg_.pin_gguf_dense_weights ||
+                     mollm::detail::is_routed_expert_aggregate_ref(wref));
+                if (complete_cpu_sidecar || gguf_source_to_skip) {
                     mmap_weight_exclusion_ranges_.push_back(
                         {pit->second.first, pit->second.second});
                 }
@@ -1200,6 +1204,16 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 "Engine: --mtp-draft-tokens requires a package with an MTP graph\n");
         return false;
     }
+    const auto quantization_it = package_metadata_.find("quantization");
+    if (cfg_.pin_gguf_dense_weights &&
+        (cfg_.weight_loading != WeightLoadingMode::MMAP ||
+         !cfg_.lock_dense_weights ||
+         quantization_it == package_metadata_.end() ||
+         quantization_it->second != "gguf-native-blocks")) {
+        std::fprintf(stderr,
+                     "Engine: --pin-gguf-dense requires a native GGUF mmap package\n");
+        return false;
+    }
 
     const auto architecture_it = package_metadata_.find("architecture");
     const std::string architecture =
@@ -1365,8 +1379,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     // records their source blobs as exclusions. Lock only after both graphs
     // have been prepared so those now-unused raw package pages are not pulled
     // into RAM and pinned alongside their sidecars.
-    if (cfg_.lock_dense_weights && moe_ssd_cache_) {
-        lock_dense_package_weights();
+    if (cfg_.lock_dense_weights &&
+        (moe_ssd_cache_ || cfg_.pin_gguf_dense_weights)) {
+        const size_t locked = lock_dense_package_weights();
+        if (cfg_.pin_gguf_dense_weights && locked == 0)
+            return false;
     }
 
     if (!embed_weight_ || !embed_weight_->data) {

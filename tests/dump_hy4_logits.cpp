@@ -10,15 +10,23 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    if (argc != 4 && argc != 5) {
-        std::fprintf(stderr, "usage: %s PACKAGE N_CTX OUTPUT_PREFIX [--prefill-only]\n", argv[0]);
+    if (argc < 4 || argc > 6) {
+        std::fprintf(stderr, "usage: %s PACKAGE N_CTX OUTPUT_PREFIX [--prefill-only] [--pin-gguf-dense]\n", argv[0]);
         return 2;
+    }
+    bool prefill_only = false;
+    bool pin_gguf_dense = false;
+    for (int i = 4; i < argc; ++i) {
+        if (std::string(argv[i]) == "--prefill-only") prefill_only = true;
+        else if (std::string(argv[i]) == "--pin-gguf-dense") pin_gguf_dense = true;
+        else return 2;
     }
     EngineConfig cfg;
     cfg.package_path = argv[1];
     cfg.n_ctx = std::atoi(argv[2]);
     cfg.num_threads = 4;
     cfg.weight_loading = WeightLoadingMode::MMAP;
+    cfg.pin_gguf_dense_weights = pin_gguf_dense;
     LLMEngine engine;
     if (!engine.load(cfg)) return 1;
     const std::vector<int> tokens = {120000, 100, 200};
@@ -38,7 +46,7 @@ int main(int argc, char** argv) {
     };
     Tensor prefill = engine.prefill_hidden(tokens);
     if (!dump("_prefill.f32", prefill, (int)tokens.size())) return 1;
-    if (argc == 5) return 0;
+    if (prefill_only) return 0;
     Tensor decode = engine.decode_hidden(100);
     if (!dump("_decode.f32", decode, 1)) return 1;
     engine.reset();
