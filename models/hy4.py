@@ -20,9 +20,9 @@ Layouts and formulas are documented in docs_internal/HY4_OPS_SPEC.md, which
 was cross-checked against tencent/Hy4-preview config.json plus safetensors
 headers, and against the reference graph in the AngelSlim GGUF patch.
 
-Status: the layer stack, attention (MLA + sink + gate) and FFN branches are
-built here. The DSA indexer and IndexCache wiring and the weight
-export/quantisation path are not finished — see the notes at `build_graph`.
+Status: the layer stack, DSA indexer, latent-cache MLA, and FFN branches are
+built here. GGUF can produce a one-layer FP16 diagnostic package; low-bit
+full-model export is still in progress.
 """
 
 from __future__ import annotations
@@ -49,11 +49,14 @@ from safetensors_stream import (
     split_mla_kv_b,
 )
 from qwen3_moe import ROUTER_SCORE_SIGMOID
+from gguf_reader import GgufIndex, config_from_gguf, open_gguf
+from gguf_stream import gguf_fp16_streamed_weight
 
 INDEXER_FULL = "full"
 
 # Resolved per graph inside build_graph; Hy4 always uses a prefill/decode pair.
 _S = 1
+_GGUF_PY_PATH: str | None = None
 
 
 def _fp32_weight(graph: GraphBuilder, streamed: dict,
@@ -67,7 +70,14 @@ def _fp32_weight(graph: GraphBuilder, streamed: dict,
 def _dense_weight(graph: GraphBuilder, streamed: dict,
                   index: SafeTensorIndex, label: str, source: str,
                   shape: tuple[int, ...]) -> int:
-    streamed[label] = dense_streamed_weight(index, source)
+    if isinstance(index, GgufIndex):
+        streamed[label] = gguf_fp16_streamed_weight(
+            index, source, gguf_py_path=_GGUF_PY_PATH)
+    else:
+        streamed[label] = dense_streamed_weight(index, source)
+    if tuple(streamed[label].logical_shape) != tuple(shape):
+        raise ValueError(
+            f"{source}: weight shape {streamed[label].logical_shape} != {shape}")
     return graph.weight(label, shape, Precision.FP16)
 
 
@@ -200,9 +210,15 @@ def _add_attention_branch(
         graph, streamed, index, f"layer_{layer}_attn_kv_a_norm",
         f"{prefix}.kv_a_layernorm.weight", (kv_rank,))
     if absorbed:
-        k_stream, v_stream = split_mla_kv_b(
-            index, f"{prefix}.kv_b_proj.weight", num_heads=heads,
-            nope_dim=nope_dim, v_head_dim=v_head_dim, kv_lora_rank=kv_rank)
+        if isinstance(index, GgufIndex):
+            k_stream = gguf_fp16_streamed_weight(
+                index, f"{prefix}.k_b.weight", gguf_py_path=_GGUF_PY_PATH)
+            v_stream = gguf_fp16_streamed_weight(
+                index, f"{prefix}.v_b.weight", gguf_py_path=_GGUF_PY_PATH)
+        else:
+            k_stream, v_stream = split_mla_kv_b(
+                index, f"{prefix}.kv_b_proj.weight", num_heads=heads,
+                nope_dim=nope_dim, v_head_dim=v_head_dim, kv_lora_rank=kv_rank)
         k_label = f"layer_{layer}_attn_k_b"
         v_label = f"layer_{layer}_attn_v_b"
         streamed[k_label] = k_stream
@@ -362,13 +378,15 @@ def _add_ffn_branch(
 
 def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
                 n_ctx: int = 4096, is_prefill: bool = False,
-                absorbed: bool = False
+                absorbed: bool = False,
+                index: SafeTensorIndex | GgufIndex | None = None
                 ) -> tuple[GraphBuilder, dict]:
     """Build one Hy4 graph (prefill when is_prefill, else decode)."""
     global _S
     _S = SEQ.bind(seq_len) if is_prefill else seq_len
 
-    index = SafeTensorIndex(Path(model_dir))
+    if index is None:
+        index = SafeTensorIndex(Path(model_dir))
     streamed: dict = {}
     graph = GraphBuilder()
     hidden_size = int(cfg["hidden_size"])
@@ -560,33 +578,59 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
 
 def convert(model_dir: str, output_path: str,
             prefill_seq_len: int = 32, n_ctx: int = 16384,
-            absorbed: bool = False) -> None:
+            absorbed: bool = False, layers: int | None = None,
+            tokenizer_dir: str | None = None,
+            gguf_py_path: str | None = None) -> None:
     """Convert a Hy4-preview checkpoint into a .mollm package.
 
-    FP16 only for now: no quantization, so this does not need
-    mollm-quantize and keeps the first end-to-end run as simple as
-    possible. Quantized packages follow once this path is known good.
+    Safetensors and one-layer GGUF diagnostic packages use FP16 weights.
+    The GGUF route decodes quantized blocks while writing the package.
     """
+    global _GGUF_PY_PATH
     model_dir_path = Path(model_dir)
-    cfg = json.loads((model_dir_path / "config.json").read_text())
+    is_gguf = model_dir_path.is_file() and model_dir_path.suffix == ".gguf"
+    if is_gguf:
+        _, index = open_gguf(model_dir_path)
+        cfg = config_from_gguf(index.gguf)
+        if not absorbed:
+            raise ValueError("GGUF diagnostic packages require --absorbed")
+        if tokenizer_dir is None:
+            raise ValueError("GGUF packages require --tokenizer-dir")
+        _GGUF_PY_PATH = gguf_py_path
+    else:
+        index = None
+        cfg = json.loads((model_dir_path / "config.json").read_text())
     if cfg.get("model_type") != "hy_v4":
         raise ValueError(
             f"checkpoint is not Hy4: model_type={cfg.get('model_type')!r}")
+    full_layers = int(cfg["num_hidden_layers"])
+    if layers is not None:
+        if not 1 <= layers <= full_layers:
+            raise ValueError(f"--layers must be in 1..{full_layers}")
+        cfg["num_hidden_layers"] = layers
+        cfg["indexer_types"] = cfg["indexer_types"][:layers]
+        cfg["mlp_layer_types"] = cfg["mlp_layer_types"][:layers]
+    if is_gguf and int(cfg["num_hidden_layers"]) != 1:
+        raise ValueError("GGUF FP16 diagnostic conversion currently supports --layers 1")
+    assets_dir = Path(tokenizer_dir) if tokenizer_dir else model_dir_path
+    for asset in ("tokenizer.json", "chat_template.jinja"):
+        if not (assets_dir / asset).is_file():
+            raise FileNotFoundError(assets_dir / asset)
 
     # One graph per execution shape. The weight registry is shared, so a
     # weight requested by both graphs is streamed into the package once.
     prefill, prefill_weights = build_graph(
         model_dir_path, cfg, prefill_seq_len, n_ctx,
-        is_prefill=True, absorbed=absorbed)
+        is_prefill=True, absorbed=absorbed, index=index)
     decode, decode_weights = build_graph(
         model_dir_path, cfg, 1, n_ctx,
-        is_prefill=False, absorbed=absorbed)
+        is_prefill=False, absorbed=absorbed, index=index)
     streamed = dict(prefill_weights)
     streamed.update(decode_weights)
 
     num_layers = int(cfg["num_hidden_layers"])
     metadata = {
-        "model_name": "Hy4-preview",
+        "model_name": "Hy4-preview-GGUF-diagnostic" if is_gguf else "Hy4-preview",
         "architecture": "hy-v4",
         "num_layers": num_layers,
         "hidden_size": int(cfg["hidden_size"]),
@@ -605,7 +649,7 @@ def convert(model_dir: str, output_path: str,
         "n_shared_experts": int(cfg.get("n_shared_experts", 0) or 0),
         "hc_mult": int(cfg["hc_mult"]),
         "indexer_types": list(cfg["indexer_types"]),
-        "quantization": "fp16",
+        "quantization": "gguf-dequant-fp16" if is_gguf else "fp16",
     }
 
     # A directory is required by save_package even when every weight is
@@ -613,8 +657,8 @@ def convert(model_dir: str, output_path: str,
     with tempfile.TemporaryDirectory(prefix="mollm_hy4_") as empty_dir:
         save_package(
             output_path, prefill, decode, empty_dir, metadata,
-            tokenizer_path=str(model_dir_path / "tokenizer.json"),
-            jinja_path=str(model_dir_path / "chat_template.jinja"),
+            tokenizer_path=str(assets_dir / "tokenizer.json"),
+            jinja_path=str(assets_dir / "chat_template.jinja"),
             streamed_weights=streamed)
 
 
@@ -627,6 +671,13 @@ if __name__ == "__main__":
     parser.add_argument("--n-ctx", type=int, default=16384)
     parser.add_argument("--absorbed", action="store_true",
                         help="use latent-cache MLA attention")
+    parser.add_argument("--layers", type=int,
+                        help="export only the first N layers")
+    parser.add_argument("--tokenizer-dir",
+                        help="tokenizer and chat template directory for GGUF")
+    parser.add_argument("--gguf-py",
+                        help="path to llama.cpp/gguf-py for K-quant decoding")
     args = parser.parse_args()
     convert(args.model_dir, args.output,
-            args.prefill_seq_len, args.n_ctx, args.absorbed)
+            args.prefill_seq_len, args.n_ctx, args.absorbed,
+            args.layers, args.tokenizer_dir, args.gguf_py)
