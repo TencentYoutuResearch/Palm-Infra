@@ -367,6 +367,40 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
     float* output = C.ptr<float>();
     auto process = [&](int, int begin, int end) {
         std::array<float, 256> values;
+#if defined(__APPLE__) && defined(__clang__) && defined(__aarch64__)
+        if (M == 1) {
+            // Four independent rows hide the scalar reduction dependency.
+            // Clang otherwise fuses the interleaved multiply/add operations,
+            // changing Hy4 logits; the original kernel rounds each product.
+            std::array<std::array<float, 256>, 4> row_values;
+            for (; begin + 4 <= end; begin += 4) {
+                float sum0 = 0.0f, sum1 = 0.0f;
+                float sum2 = 0.0f, sum3 = 0.0f;
+                for (int block = 0; block < blocks; ++block) {
+                    for (int lane = 0; lane < 4; ++lane) {
+                        const uint8_t* row = encoded +
+                            (size_t(begin + lane) * blocks + block) * bytes;
+                        decode_native_block<P>(row, row_values[lane].data());
+                    }
+                    const float* a = input + block * block_values;
+                    {
+#pragma clang fp contract(off)
+                        for (int k = 0; k < block_values; ++k) {
+                            const float x = a[k];
+                            sum0 += x * row_values[0][k];
+                            sum1 += x * row_values[1][k];
+                            sum2 += x * row_values[2][k];
+                            sum3 += x * row_values[3][k];
+                        }
+                    }
+                }
+                output[begin] = sum0;
+                output[begin + 1] = sum1;
+                output[begin + 2] = sum2;
+                output[begin + 3] = sum3;
+            }
+        }
+#endif
         for (int n = begin; n < end; ++n) {
             for (int m = 0; m < M; ++m) output[m * N + n] = 0.0f;
             const uint8_t* row = encoded + size_t(n) * blocks * bytes;

@@ -130,6 +130,18 @@ static bool gguf_native_matmul_matches_block_decoder() {
             }
         }
 
+        std::vector<float> single_output(N);
+        Tensor single_input = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1, input.data());
+        Tensor single_result = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+            single_output.data());
+        kernel_matmul_fp32(single_input, B, single_result, &pool);
+        for (int n = 0; n < N; ++n) {
+            if (single_output[n] != reference[n])
+                return false;
+        }
+
         std::vector<std::vector<float>> batch_data(3, std::vector<float>(N));
         std::vector<std::vector<float>> sequential_data(3, std::vector<float>(N));
         std::vector<Tensor> batch_inputs, batch_weights, batch_outputs;
