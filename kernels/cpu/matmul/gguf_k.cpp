@@ -2,6 +2,7 @@
 #include "kernels/cpu/matmul/gguf_iq_tables.h"
 #include "kernels/cpu/matmul/stq1_0.h"
 #include "kernels/cpu/matmul/matmul_internal.h"
+#include "core/fp16.h"
 #include "runtime/threading.h"
 
 #include <algorithm>
@@ -11,6 +12,11 @@
 namespace {
 
 float half_value(const uint8_t* bytes) {
+#if defined(__aarch64__)
+    mollm::fp16_t value;
+    std::memcpy(&value, bytes, sizeof(value));
+    return static_cast<float>(value);
+#else
     const uint16_t bits = uint16_t(bytes[0]) | (uint16_t(bytes[1]) << 8);
     const uint32_t sign = uint32_t(bits & 0x8000) << 16;
     int exponent = (bits >> 10) & 31;
@@ -30,6 +36,7 @@ float half_value(const uint8_t* bytes) {
     float value;
     std::memcpy(&value, &result, sizeof(value));
     return value;
+#endif
 }
 
 void scale_min(int group, const uint8_t* packed,
