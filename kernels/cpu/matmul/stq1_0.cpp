@@ -4,6 +4,10 @@
 #include <cstring>
 #include <algorithm>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 // Codebook from the patch's GGML_TABLE_BEGIN(uint8_t, stq1_0_codebook, 32).
 // Entries 0..15 are sign = 0 (first non-zero lane is +1), 16..31 are sign = 1
 // (every non-zero lane negated).
@@ -36,6 +40,60 @@ struct ReverseTables {
     }
 };
 const ReverseTables g_reverse;
+
+#if defined(__aarch64__)
+struct DecodeTables {
+    int8_t lane[4][32];
+    DecodeTables() {
+        for (int code = 0; code < 32; ++code) {
+            const uint8_t packed = stq1_0_codebook[code];
+            for (int p = 0; p < 4; ++p)
+                lane[p][code] = static_cast<int8_t>(
+                    int((packed >> (2 * p)) & 3) - 1);
+        }
+    }
+};
+const DecodeTables g_decode;
+
+void decode_stq_chunk16(const block_stq1_0& blk, int chunk,
+                        float scale, float* out) {
+    // Sixteen groups form four contiguous 16-element output lanes.
+    const uint8x8_t qs = vld1_u8(blk.qs + chunk * 8);
+    const uint8x8_t low = vand_u8(qs, vdup_n_u8(15));
+    const uint8x8_t high = vshr_n_u8(qs, 4);
+    const uint8x8x2_t codes = vzip_u8(low, high);
+    const uint8x16_t code = vcombine_u8(codes.val[0], codes.val[1]);
+    static const int8_t shifts[16] = {
+        0, -1, -2, -3, -4, -5, -6, -7,
+        0, -1, -2, -3, -4, -5, -6, -7,
+    };
+    const uint8x16_t sign_bytes = vcombine_u8(
+        vdup_n_u8(blk.sign[chunk * 2]),
+        vdup_n_u8(blk.sign[chunk * 2 + 1]));
+    const uint8x16_t signs = vandq_u8(
+        vshlq_u8(sign_bytes, vld1q_s8(shifts)), vdupq_n_u8(1));
+    const uint8x16_t indexes = vorrq_u8(code, vshlq_n_u8(signs, 4));
+
+    for (int p = 0; p < 4; ++p) {
+        const int8x16x2_t table = {
+            vld1q_s8(g_decode.lane[p]),
+            vld1q_s8(g_decode.lane[p] + 16),
+        };
+        const int8x16_t lanes = vqtbl2q_s8(table, indexes);
+        const int16x8_t lo = vmovl_s8(vget_low_s8(lanes));
+        const int16x8_t hi = vmovl_s8(vget_high_s8(lanes));
+        float* y = out + chunk * 64 + p * 16;
+        vst1q_f32(y, vmulq_n_f32(
+            vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))), scale));
+        vst1q_f32(y + 4, vmulq_n_f32(
+            vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))), scale));
+        vst1q_f32(y + 8, vmulq_n_f32(
+            vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))), scale));
+        vst1q_f32(y + 12, vmulq_n_f32(
+            vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))), scale));
+    }
+}
+#endif
 
 // Pack four lane values in {-1, 0, +1} into a codebook byte.
 inline uint8_t qpack_from_lanes(const int8_t lanes[4]) {
@@ -104,6 +162,10 @@ inline uint16_t fp32_to_fp16(float value) {
 
 void stq1_0_dequantize_block(const block_stq1_0& blk, float* out) {
     const float d = fp16_to_fp32(blk.d);
+#if defined(__aarch64__)
+    for (int chunk = 0; chunk < 4; ++chunk)
+        decode_stq_chunk16(blk, chunk, d, out);
+#else
     // (group, lane) visits every one of the 256 positions exactly once.
     for (int g = 0; g < STQ_GROUPS; ++g) {
         const uint8_t code = (blk.qs[g / 2] >> (4 * (g & 1))) & 0x0F;
@@ -113,6 +175,7 @@ void stq1_0_dequantize_block(const block_stq1_0& blk, float* out) {
             out[stq1_0_element_index(g, p)] =
                 d * static_cast<float>(int((packed >> (2 * p)) & 3) - 1);
     }
+#endif
 }
 
 void stq1_0_dequantize_row(const block_stq1_0* src, int k, float* out) {
