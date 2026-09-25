@@ -570,7 +570,9 @@ int main(int argc, char** argv) {
         // may otherwise terminate a run early on a generated "\n\n".
         tokenizer.set_rwkv_legacy_chat_template(false);
     } else {
-        prompt_ids = tokenizer.apply_chat(opts.prompt);
+        prompt_ids = tokenizer.apply_chat(
+            std::vector<ChatMessage>{{"user", opts.prompt}},
+            opts.enable_thinking);
     }
     if (prompt_ids.empty()) {
         std::fprintf(stderr, "bench: prompt is empty after tokenization\n");
