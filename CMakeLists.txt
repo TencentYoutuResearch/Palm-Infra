@@ -111,6 +111,7 @@ set(SOURCES
     kernels/cpu/gated_residual.cpp
     kernels/cpu/ple.cpp
     kernels/cpu/models/deepseek_v4_attention.cpp
+    kernels/cpu/models/mla_absorbed_attention.cpp
     kernels/cpu/hyper_connection.cpp
     kernels/cpu/moe/moe.cpp
     kernels/cpu/moe/moe_routing.cpp
@@ -558,6 +559,9 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_gated_residual tests/test_gated_residual.cpp)
     add_mollm_test(test_ple            tests/test_ple.cpp)
     add_mollm_test(test_deepseek_v4_attention tests/test_deepseek_v4_attention.cpp)
+    add_mollm_test(test_mla_absorbed_attention tests/test_mla_absorbed_attention.cpp)
+    add_executable(dump_hy4_logits tests/dump_hy4_logits.cpp)
+    target_link_libraries(dump_hy4_logits PRIVATE mollm_lib)
     add_mollm_test(test_trace         tests/test_trace.cpp)
     add_mollm_test(bench_matmul       tests/bench_matmul.cpp)
     add_mollm_test(bench_sdpa         tests/bench_sdpa.cpp)

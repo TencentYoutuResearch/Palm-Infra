@@ -82,6 +82,7 @@ void prepare_execution(ExecContext& ctx) {
     // borrowed-view inference.
     for (const auto& node : nodes) {
         if (node.op_type == OpType::SDPA || node.op_type == OpType::SDPA_MLA ||
+            node.op_type == OpType::SDPA_MLA_ABSORB ||
             node.op_type == OpType::GATED_DELTANET_PREFILL ||
             node.op_type == OpType::GATED_DELTANET_DECODE ||
             node.op_type == OpType::GATED_DELTANET_CONV_DECODE ||

@@ -46,6 +46,7 @@ from safetensors_stream import (
     aggregate_dense_experts,
     dense_streamed_weight,
     fp32_streamed_weight,
+    split_mla_kv_b,
 )
 from qwen3_moe import ROUTER_SCORE_SIGMOID
 
@@ -168,8 +169,8 @@ def _add_indexer(
 def _add_attention_branch(
         graph: GraphBuilder, streamed: dict, index: SafeTensorIndex,
         cfg: dict, layer: int, hidden: int, q_lora: int, position: int,
-        cos: int, sin: int, mask: int, ck_in: int, cv_in: int,
-        top_k: int | None) -> int:
+        cos: int, sin: int, mask: int, ck_in: int | None, cv_in: int | None,
+        top_k: int | None, absorbed: bool = False) -> int:
     """MLA + sink + gate for one layer.
 
     `q_lora` is the already-normed low-rank query, built by the caller so the
@@ -198,8 +199,19 @@ def _add_attention_branch(
     kv_a_norm = _fp32_weight(
         graph, streamed, index, f"layer_{layer}_attn_kv_a_norm",
         f"{prefix}.kv_a_layernorm.weight", (kv_rank,))
-    wk_b = weight(
-        "kv_b_proj.weight", (heads * (nope_dim + v_head_dim), kv_rank))
+    if absorbed:
+        k_stream, v_stream = split_mla_kv_b(
+            index, f"{prefix}.kv_b_proj.weight", num_heads=heads,
+            nope_dim=nope_dim, v_head_dim=v_head_dim, kv_lora_rank=kv_rank)
+        k_label = f"layer_{layer}_attn_k_b"
+        v_label = f"layer_{layer}_attn_v_b"
+        streamed[k_label] = k_stream
+        streamed[v_label] = v_stream
+        k_b = graph.weight(k_label, (heads, kv_rank, nope_dim), Precision.FP16)
+        v_b = graph.weight(v_label, (heads, v_head_dim, kv_rank), Precision.FP16)
+    else:
+        wk_b = weight(
+            "kv_b_proj.weight", (heads * (nope_dim + v_head_dim), kv_rank))
     wo = weight("o_proj.weight", (hidden_size, heads * v_head_dim))
     gate_w = weight(
         "linear_gate.weight", (heads * v_head_dim, hidden_size))
@@ -227,24 +239,30 @@ def _add_attention_branch(
     k_rope = graph.reshape(k_rope, (rope_dim, _S, 1))
     k_rope = graph.rope(k_rope, cos, sin, rope_dim=rope_dim,
                         interleave=False)
-    k_rope = graph.tile(k_rope, (1, 1, heads))
+    if absorbed:
+        attn_out = graph.sdpa_mla_absorb(
+            q_nope, q_rope, kv_cmpr, k_rope, k_b, v_b, mask, ck_in,
+            num_heads=heads, qk_head_dim=head_dim, v_head_dim=v_head_dim,
+            kv_rank=kv_rank, rope_dim=rope_dim, sink=attn_sink,
+            selection=top_k)
+    else:
+        k_rope = graph.tile(k_rope, (1, 1, heads))
+        # Expand the compressed KV through wk_b and split into k_nope / v.
+        kv_expanded = graph.matmul(kv_cmpr, wk_b)
+        kv_expanded = graph.reshape(
+            kv_expanded, (nope_dim + v_head_dim, heads, _S))
+        kv_expanded = graph.permute(kv_expanded, (0, 2, 1, 3))
+        k_nope, v = graph.slice(kv_expanded, [nope_dim, v_head_dim], dim=0)
 
-    # Expand the compressed KV through wk_b and split into k_nope / v.
-    kv_expanded = graph.matmul(kv_cmpr, wk_b)
-    kv_expanded = graph.reshape(
-        kv_expanded, (nope_dim + v_head_dim, heads, _S))
-    kv_expanded = graph.permute(kv_expanded, (0, 2, 1, 3))
-    k_nope, v = graph.slice(kv_expanded, [nope_dim, v_head_dim], dim=0)
+        q_full = graph.concat([q_nope, q_rope], dim=0)
+        k_full = graph.concat([k_nope, k_rope], dim=0)
 
-    q_full = graph.concat([q_nope, q_rope], dim=0)
-    k_full = graph.concat([k_nope, k_rope], dim=0)
-
-    attn_out, _, _ = graph.sdpa(
-        q_full, k_full, v, mask, ck_in, cv_in,
-        kv_cache=2, causal=True, scale=1.0 / (head_dim ** 0.5),
-        num_heads=heads, num_kv_heads=heads,
-        head_dim=head_dim, v_head_dim=v_head_dim,
-        sink=attn_sink, selection=top_k)
+        attn_out, _, _ = graph.sdpa(
+            q_full, k_full, v, mask, ck_in, cv_in,
+            kv_cache=2, causal=True, scale=1.0 / (head_dim ** 0.5),
+            num_heads=heads, num_kv_heads=heads,
+            head_dim=head_dim, v_head_dim=v_head_dim,
+            sink=attn_sink, selection=top_k)
 
     # Gated MLA: elementwise sigmoid gate on the decompressed attention
     # output, applied BEFORE o_proj.
@@ -343,7 +361,8 @@ def _add_ffn_branch(
 
 
 def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
-                n_ctx: int = 4096, is_prefill: bool = False
+                n_ctx: int = 4096, is_prefill: bool = False,
+                absorbed: bool = False
                 ) -> tuple[GraphBuilder, dict]:
     """Build one Hy4 graph (prefill when is_prefill, else decode)."""
     global _S
@@ -399,12 +418,19 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
     v_head_dim = int(cfg["v_head_dim"])
     caches = []
     for layer in range(layers):
-        ck = graph.input(
-            f"cache_k{layer}", (qk_head_dim, n_ctx, heads),
-            prec=Precision.FP16)
-        cv = graph.input(
-            f"cache_v{layer}", (v_head_dim, n_ctx, heads),
-            prec=Precision.FP16)
+        if absorbed:
+            ck = graph.input(
+                f"latent_cache{layer}",
+                (int(cfg["kv_lora_rank"]) + rope_dim, n_ctx),
+                prec=Precision.FP16)
+            cv = None
+        else:
+            ck = graph.input(
+                f"cache_k{layer}", (qk_head_dim, n_ctx, heads),
+                prec=Precision.FP16)
+            cv = graph.input(
+                f"cache_v{layer}", (v_head_dim, n_ctx, heads),
+                prec=Precision.FP16)
         caches.append([ck, cv])
 
     # The DSA indexer keeps its own key cache of `wk @ hidden` rows: FP32 and
@@ -476,7 +502,7 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
                 top_k = last_top_k
             return _add_attention_branch(
                 graph, streamed, index, cfg, current, normalized,
-                q_lora, position, cos, sin, mask, ck, cv, top_k)
+                q_lora, position, cos, sin, mask, ck, cv, top_k, absorbed)
 
         state = _hc_branch(
             graph, streamed, index, cfg, layer, "attn", state,
@@ -533,7 +559,8 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
 
 
 def convert(model_dir: str, output_path: str,
-            prefill_seq_len: int = 32, n_ctx: int = 16384) -> None:
+            prefill_seq_len: int = 32, n_ctx: int = 16384,
+            absorbed: bool = False) -> None:
     """Convert a Hy4-preview checkpoint into a .mollm package.
 
     FP16 only for now: no quantization, so this does not need
@@ -549,9 +576,11 @@ def convert(model_dir: str, output_path: str,
     # One graph per execution shape. The weight registry is shared, so a
     # weight requested by both graphs is streamed into the package once.
     prefill, prefill_weights = build_graph(
-        model_dir_path, cfg, prefill_seq_len, n_ctx, is_prefill=True)
+        model_dir_path, cfg, prefill_seq_len, n_ctx,
+        is_prefill=True, absorbed=absorbed)
     decode, decode_weights = build_graph(
-        model_dir_path, cfg, 1, n_ctx, is_prefill=False)
+        model_dir_path, cfg, 1, n_ctx,
+        is_prefill=False, absorbed=absorbed)
     streamed = dict(prefill_weights)
     streamed.update(decode_weights)
 
@@ -562,7 +591,7 @@ def convert(model_dir: str, output_path: str,
         "num_layers": num_layers,
         "hidden_size": int(cfg["hidden_size"]),
         "num_heads": int(cfg["num_attention_heads"]),
-        "num_kv_heads": int(cfg["num_attention_heads"]),
+        "num_kv_heads": 1 if absorbed else int(cfg["num_attention_heads"]),
         "head_dim": int(cfg["qk_head_dim"]),
         "rope_dim": int(cfg["qk_rope_head_dim"]),
         "rope_theta": float(
@@ -596,6 +625,8 @@ if __name__ == "__main__":
     parser.add_argument("output")
     parser.add_argument("--prefill-seq-len", type=int, default=32)
     parser.add_argument("--n-ctx", type=int, default=16384)
+    parser.add_argument("--absorbed", action="store_true",
+                        help="use latent-cache MLA attention")
     args = parser.parse_args()
     convert(args.model_dir, args.output,
-            args.prefill_seq_len, args.n_ctx)
+            args.prefill_seq_len, args.n_ctx, args.absorbed)

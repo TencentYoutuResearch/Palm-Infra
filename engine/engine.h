@@ -353,6 +353,8 @@ private:
         // Standard KV cache (full attention layers)
         Tensor* k = nullptr;
         Tensor* v = nullptr;
+        Tensor* latent = nullptr;  // Hy4 MLA: one shared [kv_rank + rope, n_ctx]
+        int latent_width = 0;
         int k_head_dim = 0;
         int k_num_heads = 0;
         int v_head_dim = 0;

@@ -228,7 +228,7 @@ bool LLMEngine::set_cache_lengths(
     if (!backend)
         return false;
     for (auto& cache : caches) {
-        for (Tensor* tensor : {cache.k, cache.v}) {
+        for (Tensor* tensor : {cache.k, cache.v, cache.latent}) {
             if (tensor && !backend->copy_from_host(
                     &length, *tensor, sizeof(length),
                     offsetof(CacheMetadata, current_seq_len)))

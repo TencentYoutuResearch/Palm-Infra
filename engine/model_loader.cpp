@@ -26,6 +26,7 @@ enum class PersistentInputKind {
     NONE,
     KV_KEY,
     KV_VALUE,
+    LATENT_CACHE,
     GDN_STATE,
     GDN_CONV,
     STATE,
@@ -62,6 +63,8 @@ PersistentInput parse_persistent_input(const std::string& name) {
         input.kind = PersistentInputKind::KV_KEY;
     } else if (parse_indexed_input_name(name, "cache_v", input.layer)) {
         input.kind = PersistentInputKind::KV_VALUE;
+    } else if (parse_indexed_input_name(name, "latent_cache", input.layer)) {
+        input.kind = PersistentInputKind::LATENT_CACHE;
     } else if (parse_indexed_input_name(name, "gdn_state", input.layer)) {
         input.kind = PersistentInputKind::GDN_STATE;
     } else if (parse_indexed_input_name(name, "gdn_conv", input.layer)) {
@@ -805,6 +808,12 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
             cache.v_head_dim = (int)node.out_shape[0];
             cache.v_num_heads = (int)node.out_shape[2];
             break;
+        case PersistentInputKind::LATENT_CACHE:
+            cache.latent = &tensor;
+            cache.latent_width = (int)node.out_shape[0];
+            if (node.out_shape[2] != 1 || node.out_shape[3] != 1)
+                return false;
+            break;
         case PersistentInputKind::GDN_STATE:
             cache.gdn_state = &tensor;
             cache.gdn_v_dim = (int)node.out_shape[0];
@@ -864,6 +873,27 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
     };
 
     for (auto& cp : caches) {
+        if (cp.latent) {
+            const size_t es = cp.latent->element_size();
+            const size_t data_bytes = (size_t)cp.latent_width * n_ctx * es;
+            const size_t total = CacheMetadata::SIZE + data_bytes;
+            cp.latent->mem_type = MemoryType::POOLED;
+            cp.latent->shape[0] = (int64_t)total / (int64_t)es;
+            cp.latent->shape[1] = cp.latent->shape[2] = cp.latent->shape[3] = 1;
+            cp.latent->compute_strides();
+            if (!alloc_cache_buf(
+                    cp.latent, total,
+                    PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX,
+                    CacheMetadata::SIZE))
+                return false;
+            CacheMetadata metadata;
+            metadata.max_seq_len = (uint64_t)n_ctx;
+            metadata.num_kv_heads = 1;
+            metadata.head_dim = (uint64_t)cp.latent_width;
+            if (!storage_backend->copy_from_host(
+                    &metadata, *cp.latent, sizeof(metadata)))
+                return false;
+        }
         // Standard KV cache
         if (cp.k) {
             int hd = cp.k_head_dim;
@@ -1365,6 +1395,9 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             break;
         case PersistentInputKind::KV_VALUE:
             source = cache.v;
+            break;
+        case PersistentInputKind::LATENT_CACHE:
+            source = cache.latent;
             break;
         case PersistentInputKind::GDN_STATE:
             source = cache.gdn_state;

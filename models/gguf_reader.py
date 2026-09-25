@@ -379,6 +379,8 @@ _LAYER_SUFFIX_RENAMES = {
     "self_attn.q_b_proj.weight": "attn_q_b.weight",
     "self_attn.kv_a_proj_with_mqa.weight": "attn_kv_a_mqa.weight",
     "self_attn.kv_a_layernorm.weight": "attn_kv_a_norm.weight",
+    "self_attn.k_b.weight": "attn_k_b.weight",
+    "self_attn.v_b.weight": "attn_v_b.weight",
     "self_attn.o_proj.weight": "attn_output.weight",
     "self_attn.linear_gate.weight": "attn_gate.weight",
     "self_attn.learnable_sink_param": "attn_sinks.weight",
