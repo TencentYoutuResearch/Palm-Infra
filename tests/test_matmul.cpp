@@ -71,7 +71,8 @@ static bool gguf_native_matmul_matches_block_decoder() {
         Precision::GGUF_STQ1_0, Precision::GGUF_IQ4_XS,
     };
     constexpr int M = 2;
-    constexpr int N = 32;
+    // Cross several dynamic scheduling blocks, including an incomplete tail.
+    constexpr int N = 257;
     ThreadPool pool(4);
     for (Precision format : formats) {
         const int values_per_block = static_cast<int>(gguf_k_block_values(format));
