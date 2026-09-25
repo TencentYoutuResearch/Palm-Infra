@@ -18,9 +18,10 @@
 #include <vector>
 
 // CPU-side, demand-paged storage for the two matrices belonging to a routed
-// MoE expert.  The package converter emits byte-accurate slices for these
-// matrices in `moe_expert_storage`; this class reads only selected slices with
-// pread(2) and retains recently used expert pairs in an LRU cache.
+// MoE expert. The package converter emits byte-accurate slices in
+// `moe_expert_storage`; the loader can derive them for older native-GGUF Hy4
+// packages. This class reads selected slices with pread(2) and retains
+// recently used expert pairs in an LRU cache.
 struct MoeSsdTensorSpec {
     std::string weight_ref;
     int layer = -1;

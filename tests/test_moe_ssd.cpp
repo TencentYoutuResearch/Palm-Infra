@@ -1,11 +1,13 @@
 #include "storage/mapped_file.h"
 #include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 #include "storage/ssd_expert_cache/cache.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <thread>
@@ -126,6 +128,57 @@ int main() {
         short_stride.expert_stride = short_stride.data_bytes - 1;
         check(!cache.add_source(short_stride),
               "reject expert stride shorter than its data");
+    }
+
+    // Native GGUF blocks have no scale sidecar. Expert-major Q8_0 rows must
+    // retain their exact bytes when read into the asynchronous cache.
+    {
+        const std::string gguf_path = "/tmp/mollm_test_moe_ssd_gguf.bin";
+        std::vector<uint8_t> bytes(4 * 34, 0);
+        for (int block = 0; block < 4; ++block) {
+            bytes[block * 34 + 1] = 0x3c; // fp16 scale = 1
+            for (int col = 0; col < 32; ++col)
+                bytes[block * 34 + 2 + col] =
+                    static_cast<uint8_t>(block * 8 + col);
+        }
+        {
+            std::ofstream out(gguf_path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        }
+        auto gguf_spec = [](const char* name, uint64_t offset) {
+            MoeSsdTensorSpec out;
+            out.weight_ref = name;
+            out.layer = 0;
+            out.num_experts = 2;
+            out.rows = 1;
+            out.cols = 32;
+            out.precision = Precision::GGUF_Q8_0;
+            out.data_offset = offset;
+            out.data_bytes = 34;
+            return out;
+        };
+        MoeSsdCache cache;
+        check(cache.open(gguf_path, bytes.size()), "open native GGUF cache");
+        check(cache.add_source(gguf_spec("gguf_gate", 0)) &&
+                  cache.add_source(gguf_spec("gguf_down", 68)),
+              "register native GGUF expert sources");
+        Tensor gate, down;
+        check(cache.acquire(cache.find_source("gguf_gate"),
+                            cache.find_source("gguf_down"), 1, gate, down),
+              "load native GGUF expert one");
+        float decoded[32];
+        check(gate.prec == Precision::GGUF_Q8_0 &&
+                  down.prec == Precision::GGUF_Q8_0 &&
+                  std::memcmp(gate.data, bytes.data() + 34, 34) == 0 &&
+                  std::memcmp(down.data, bytes.data() + 102, 34) == 0 &&
+                  gguf_k_dequantize_block(
+                      gate.prec, static_cast<const uint8_t*>(gate.data), decoded) &&
+                  decoded[0] == 8.0f,
+              "native GGUF cache preserves exact expert blocks");
+        auto invalid = gguf_spec("gguf_wrong_size", 0);
+        invalid.data_bytes = 33;
+        check(!cache.add_source(invalid), "reject malformed GGUF block span");
     }
 
     // Direct BG128 blocks carry their own scales. The SSD cache should accept

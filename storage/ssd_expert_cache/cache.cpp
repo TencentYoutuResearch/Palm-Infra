@@ -2,6 +2,7 @@
 #include "storage/ssd_expert_cache/internal.h"
 
 #include "storage/mapped_file.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 #include "runtime/trace.h"
 
 #include <algorithm>
@@ -243,12 +244,33 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
         spec.precision != Precision::INT8 &&
         spec.precision != Precision::INT4 &&
         spec.precision != Precision::MXFP4 &&
-        spec.precision != Precision::NVFP4) {
+        spec.precision != Precision::NVFP4 &&
+        !gguf_k_block_bytes(spec.precision)) {
         std::fprintf(stderr, "MoE SSD: unsupported precision for %s\n",
                      spec.weight_ref.c_str());
         return false;
     }
     bool has_embedded_scales = false;
+    const size_t gguf_bytes = gguf_k_block_bytes(spec.precision);
+    if (gguf_bytes) {
+        const size_t block_values = gguf_k_block_values(spec.precision);
+        const uint64_t blocks_per_row =
+            static_cast<uint64_t>(spec.cols) / block_values;
+        uint64_t expected_bytes = 0;
+        if (spec.flags != 0 || spec.scales_bytes != 0 ||
+            spec.group_size != 0 || spec.groups_per_row != 0 ||
+            spec.cols % block_values != 0 ||
+            blocks_per_row > std::numeric_limits<uint64_t>::max() /
+                                 static_cast<uint64_t>(spec.rows) ||
+            (expected_bytes = blocks_per_row * spec.rows) >
+                std::numeric_limits<uint64_t>::max() / gguf_bytes ||
+            (expected_bytes *= gguf_bytes) != spec.data_bytes) {
+            std::fprintf(stderr,
+                         "MoE SSD: GGUF expert %s has invalid block metadata\n",
+                         spec.weight_ref.c_str());
+            return false;
+        }
+    }
     if (spec.precision == Precision::NVFP4) {
         const uint64_t rows = static_cast<uint64_t>(spec.rows);
         const uint64_t cols = static_cast<uint64_t>(spec.cols);
