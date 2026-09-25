@@ -886,6 +886,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                 !kernel_matmul_mxfp4_gemv_batch(
                     gate_inputs, gate_up_weights, gate_outputs, thread_pool) &&
                 !kernel_matmul_nvfp4_gemv_batch(
+                    gate_inputs, gate_up_weights, gate_outputs, thread_pool) &&
+                !kernel_matmul_gguf_k_gemv_batch(
                     gate_inputs, gate_up_weights, gate_outputs, thread_pool)) {
                 for (size_t i = 0; i < batch; ++i) {
                     kernel_matmul_fp32(
@@ -948,6 +950,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                 !kernel_matmul_mxfp4_gemv_batch(
                     down_inputs, down_weights, down_outputs, thread_pool) &&
                 !kernel_matmul_nvfp4_gemv_batch(
+                    down_inputs, down_weights, down_outputs, thread_pool) &&
+                !kernel_matmul_gguf_k_gemv_batch(
                     down_inputs, down_weights, down_outputs, thread_pool)) {
                 for (size_t i = 0; i < batch; ++i) {
                     kernel_matmul_fp32(

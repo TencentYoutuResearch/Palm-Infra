@@ -128,6 +128,30 @@ static bool gguf_native_matmul_matches_block_decoder() {
                 return false;
             }
         }
+
+        std::vector<std::vector<float>> batch_data(3, std::vector<float>(N));
+        std::vector<std::vector<float>> sequential_data(3, std::vector<float>(N));
+        std::vector<Tensor> batch_inputs, batch_weights, batch_outputs;
+        for (int expert = 0; expert < 3; ++expert) {
+            batch_inputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
+                input.data() + (expert % M) * K));
+            batch_weights.push_back(B);
+            batch_outputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                batch_data[expert].data()));
+            Tensor sequential = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                sequential_data[expert].data());
+            kernel_matmul_fp32(batch_inputs.back(), B, sequential, &pool);
+        }
+        if (!kernel_matmul_gguf_k_gemv_batch(
+                batch_inputs, batch_weights, batch_outputs, &pool))
+            return false;
+        for (int expert = 0; expert < 3; ++expert) {
+            if (batch_data[expert] != sequential_data[expert])
+                return false;
+        }
     }
     return true;
 }

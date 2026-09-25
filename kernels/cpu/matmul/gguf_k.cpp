@@ -394,3 +394,47 @@ void kernel_matmul_gguf_k(const Tensor& A, const Tensor& B, Tensor& C,
     default: break;
     }
 }
+
+bool kernel_matmul_gguf_k_gemv_batch(const std::vector<Tensor>& inputs,
+                                     const std::vector<Tensor>& weights,
+                                     std::vector<Tensor>& outputs,
+                                     ThreadPool* pool) {
+    if (!pool || inputs.size() < 2 || inputs.size() != weights.size() ||
+        inputs.size() != outputs.size())
+        return false;
+    const Precision precision = weights[0].prec;
+    const int K = static_cast<int>(weights[0].shape[1]);
+    const int N = static_cast<int>(weights[0].shape[0]);
+    const size_t bytes = gguf_k_block_bytes(precision);
+    const size_t block_values = gguf_k_block_values(precision);
+    if (!bytes || !block_values || K <= 0 || N <= 0 ||
+        K % block_values != 0)
+        return false;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (weights[i].prec != precision || weights[i].shape[0] != N ||
+            weights[i].shape[1] != K || inputs[i].prec != Precision::FP32 ||
+            inputs[i].shape[0] != K || inputs[i].shape[1] != 1 ||
+            outputs[i].prec != Precision::FP32 || outputs[i].shape[0] != N ||
+            outputs[i].shape[1] != 1 || !inputs[i].data ||
+            !weights[i].data || !outputs[i].data)
+            return false;
+    }
+
+    const size_t row_bytes = static_cast<size_t>(K) / block_values * bytes;
+    pool->parallel_for_2d(static_cast<int>(inputs.size()), 1, N, 64,
+                          [&](int, int expert, int expert_end,
+                              int begin, int end) {
+        for (; expert < expert_end; ++expert) {
+            Tensor weight = weights[expert];
+            Tensor output = outputs[expert];
+            weight.shape[0] = end - begin;
+            output.shape[0] = end - begin;
+            weight.data = static_cast<uint8_t*>(weight.data) +
+                          static_cast<size_t>(begin) * row_bytes;
+            output.data = static_cast<float*>(output.data) + begin;
+            kernel_matmul_gguf_k(inputs[expert], weight, output, nullptr,
+                                 Activation::NONE, 0, 0);
+        }
+    });
+    return true;
+}
