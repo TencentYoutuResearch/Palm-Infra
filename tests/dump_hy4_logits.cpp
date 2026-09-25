@@ -10,15 +10,18 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    if (argc < 4 || argc > 6) {
-        std::fprintf(stderr, "usage: %s PACKAGE N_CTX OUTPUT_PREFIX [--prefill-only] [--pin-gguf-dense]\n", argv[0]);
+    if (argc < 4 || argc > 8) {
+        std::fprintf(stderr, "usage: %s PACKAGE N_CTX OUTPUT_PREFIX [--prefill-only] [--pin-gguf-dense] [--ssd-cache-mb N]\n", argv[0]);
         return 2;
     }
     bool prefill_only = false;
     bool pin_gguf_dense = false;
+    int ssd_cache_mb = 0;
     for (int i = 4; i < argc; ++i) {
         if (std::string(argv[i]) == "--prefill-only") prefill_only = true;
         else if (std::string(argv[i]) == "--pin-gguf-dense") pin_gguf_dense = true;
+        else if (std::string(argv[i]) == "--ssd-cache-mb" && i + 1 < argc)
+            ssd_cache_mb = std::atoi(argv[++i]);
         else return 2;
     }
     EngineConfig cfg;
@@ -27,6 +30,9 @@ int main(int argc, char** argv) {
     cfg.num_threads = 4;
     cfg.weight_loading = WeightLoadingMode::MMAP;
     cfg.pin_gguf_dense_weights = pin_gguf_dense;
+    cfg.moe_ssd_cache_bytes = static_cast<size_t>(std::max(0, ssd_cache_mb)) *
+                              1024 * 1024;
+    cfg.moe_ssd_cross_layer_prefetch = false;
     LLMEngine engine;
     if (!engine.load(cfg)) return 1;
     const std::vector<int> tokens = {120000, 100, 200};

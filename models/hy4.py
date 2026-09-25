@@ -707,6 +707,33 @@ def convert(model_dir: str, output_path: str,
         "quantization": ("gguf-native-blocks" if native_gguf_k else
                          "gguf-dequant-fp16" if is_gguf else "fp16"),
     }
+    if native_gguf_k:
+        experts = int(cfg["n_routed_experts"])
+        hidden = int(cfg["hidden_size"])
+        intermediate = int(cfg["moe_intermediate_size"])
+        metadata["moe_expert_storage"] = {
+            "version": 1,
+            "layout": "aggregate_rows_v1",
+            "num_experts": experts,
+            "layers": [
+                {
+                    "layer": layer,
+                    "num_experts": experts,
+                    "gate_up": {
+                        "weight": f"layer_{layer}_ffn_experts_gate_up",
+                        "rows_per_expert": 2 * intermediate,
+                        "cols": hidden,
+                    },
+                    "down": {
+                        "weight": f"layer_{layer}_ffn_experts_down",
+                        "rows_per_expert": hidden,
+                        "cols": intermediate,
+                    },
+                }
+                for layer in range(int(cfg.get("first_k_dense_replace", 1)),
+                                   num_layers)
+            ],
+        }
 
     # A directory is required by save_package even when every weight is
     # streamed: the graphs' weight nodes carry their own names.

@@ -681,7 +681,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                      t.data != data);
                 const bool gguf_source_to_skip =
                     gguf_k_block_bytes(t.prec) &&
-                    (!cfg_.pin_gguf_dense_weights ||
+                    (!(cfg_.pin_gguf_dense_weights || moe_ssd_cache_) ||
                      mollm::detail::is_routed_expert_aggregate_ref(wref));
                 if (complete_cpu_sidecar || gguf_source_to_skip) {
                     mmap_weight_exclusion_ranges_.push_back(

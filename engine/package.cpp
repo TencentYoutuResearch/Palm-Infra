@@ -1,8 +1,11 @@
 #include "engine/engine.h"
+#include "kernels/cpu/matmul/gguf_k.h"
+#include "storage/mapped_file.h"
 #include "storage/ssd_expert_cache/cache.h"
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -213,6 +216,87 @@ bool checked_add(uint64_t a, uint64_t b, uint64_t& result) {
     return true;
 }
 
+bool derive_native_gguf_expert_storage(int fd, const PackageHeaderInfo& package,
+                                       json& metadata) {
+    // Older Hy4 packages predate moe_expert_storage. Their native GGUF expert
+    // tensors are contiguous expert-major rows, so their XMAP headers are
+    // enough to reconstruct the same byte ranges without repacking the model.
+    if (!metadata.contains("weights") || !metadata["weights"].is_object())
+        return false;
+    const int num_experts = metadata.value("num_experts", 0);
+    const int num_layers = metadata.value("num_layers", 0);
+    const int first_moe_layer = metadata.value("first_k_dense_replace", 1);
+    if (num_experts <= 0 || num_layers <= first_moe_layer ||
+        first_moe_layer < 0)
+        return false;
+
+    json layers = json::array();
+    const auto& weights = metadata["weights"];
+    for (int layer = first_moe_layer; layer < num_layers; ++layer) {
+        json layer_storage = {
+            {"layer", layer}, {"num_experts", num_experts},
+        };
+        for (const char* part : {"gate_up", "down"}) {
+            const std::string reference = "layer_" + std::to_string(layer) +
+                                          "_ffn_experts_" + part;
+            const auto weight = weights.find(reference);
+            if (weight == weights.end() || !weight->is_array() ||
+                weight->size() < 2)
+                return false;
+            const uint64_t weight_offset = (*weight)[0].get<uint64_t>();
+            const uint64_t weight_size = (*weight)[1].get<uint64_t>();
+            if (weight_offset > package.w_len ||
+                weight_size > package.w_len - weight_offset)
+                return false;
+            uint8_t raw_header[sizeof(MappedFile::Header)];
+            if (!read_exact_at(fd, package.w_off + weight_offset,
+                               raw_header, sizeof(raw_header), reference.c_str()))
+                return false;
+            MappedFile::Header header;
+            if (!MappedFile::parse_header(raw_header,
+                                          static_cast<size_t>(weight_size), header))
+                return false;
+            const Precision precision = static_cast<Precision>(header.precision);
+            const size_t values_per_block = gguf_k_block_values(precision);
+            const size_t bytes_per_block = gguf_k_block_bytes(precision);
+            if (!values_per_block || !bytes_per_block || header.flags != 0 ||
+                header.scales_size != 0 || header.ndim < 2 ||
+                header.ndim > 4 ||
+                header.shape[0] % static_cast<uint64_t>(num_experts) != 0 ||
+                header.shape[0] > static_cast<uint64_t>(INT_MAX) * num_experts ||
+                header.shape[1] > INT_MAX ||
+                header.shape[1] % values_per_block != 0 ||
+                header.shape[2] != 1 || header.shape[3] != 1)
+                return false;
+            const uint64_t rows = header.shape[0] / num_experts;
+            const uint64_t cols = header.shape[1];
+            uint64_t expected_bytes = 0;
+            if (!checked_multiply(header.shape[0],
+                                  cols / values_per_block, expected_bytes) ||
+                !checked_multiply(expected_bytes, bytes_per_block,
+                                  expected_bytes) ||
+                expected_bytes != header.data_size)
+                return false;
+            layer_storage[part] = {
+                {"weight", reference},
+                {"weight_offset", weight_offset},
+                {"precision", header.precision},
+                {"flags", header.flags},
+                {"rows_per_expert", rows},
+                {"cols", cols},
+                {"data_offset", header.data_offset},
+                {"expert_data_bytes", header.data_size / num_experts},
+                {"expert_scales_bytes", 0},
+            };
+        }
+        layers.push_back(std::move(layer_storage));
+    }
+    metadata["moe_expert_storage"] = {
+        {"num_experts", num_experts}, {"layers", std::move(layers)},
+    };
+    return true;
+}
+
 bool parse_package_header(const uint8_t* header, size_t file_size,
                           PackageHeaderInfo& out) {
     if (file_size < PACKAGE_HEADER_SIZE) {
@@ -384,6 +468,16 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 }
             }
             if (cfg_.moe_ssd_cache_bytes != 0) {
+                if (!meta.contains("moe_expert_storage") &&
+                    meta.value("architecture", std::string()) == "hy-v4" &&
+                    meta.value("quantization", std::string()) ==
+                        "gguf-native-blocks" &&
+                    !derive_native_gguf_expert_storage(
+                        package_file.get(), ph, meta)) {
+                    fprintf(stderr,
+                            "Engine: failed to derive native GGUF expert storage\n");
+                    return false;
+                }
                 auto storage_it = meta.find("moe_expert_storage");
                 if (storage_it == meta.end() || !storage_it->is_object() ||
                     !storage_it->contains("layers") ||
@@ -499,7 +593,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                         if (layer_index < 0 || num_experts <= 0 ||
                             spec.rows <= 0 || spec.cols <= 0 ||
                             static_cast<uint32_t>(spec.precision) >
-                                static_cast<uint32_t>(Precision::NVFP4) ||
+                                static_cast<uint32_t>(Precision::GGUF_IQ4_XS) ||
                             !valid_spans ||
                             weight_offset > ph.w_len ||
                             data_offset > ph.w_len - weight_offset ||
