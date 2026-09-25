@@ -15,6 +15,7 @@ struct CliCommonOptions {
     int image_max_pixels = EngineConfig::kDefaultImageMaxPixels;
     int prompt_tokens = 0;   // >0: use N dummy tokens instead of --prompt text
     int max_new_tokens = 2048;
+    bool enable_thinking = true;
     int n_ctx = 16384;
     int rope_dim = 64;
     float rope_theta = 10000000.f;

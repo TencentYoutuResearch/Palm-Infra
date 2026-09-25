@@ -59,6 +59,8 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         } else if (arg == "--prompt-file") {
             if (!require_value(argc, argv, i, "--prompt-file", value, error)) return false;
             opts.prompt_file = value;
+        } else if (arg == "--no-think") {
+            opts.enable_thinking = false;
         } else if (arg == "--image") {
             if (!require_value(argc, argv, i, "--image", value, error)) return false;
             opts.image_path = value;
@@ -299,6 +301,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --package <file.mollm>    Single-file model package (required)\n");
     std::printf("  --prompt <text>           Run one prompt and exit\n");
     std::printf("  --prompt-file <path>      Read prompt text from file, run and exit\n");
+    std::printf("  --no-think                Request a direct answer in chat mode\n");
     std::printf("  --image <path>            Attach one image (Qwen3.5-VL, single-shot)\n");
     std::printf("  --image-max-pixels <int>  Resize budget; default 262144, max 1048576\n");
     std::printf("  --prompt-tokens <int>     Use N dummy tokens (skip chat template)\n");
