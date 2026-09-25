@@ -71,7 +71,7 @@ static bool gguf_native_matmul_matches_block_decoder() {
         Precision::GGUF_IQ2_XXS, Precision::GGUF_IQ3_XXS,
         Precision::GGUF_STQ1_0, Precision::GGUF_IQ4_XS,
     };
-    constexpr int M = 2;
+    constexpr int M = 5;
     // Cross several dynamic scheduling blocks, including an incomplete tail.
     constexpr int N = 257;
     ThreadPool pool(4);
@@ -127,6 +127,24 @@ static bool gguf_native_matmul_matches_block_decoder() {
                              "  GGUF format %d output %d: got %.9g expected %.9g\n",
                              static_cast<int>(format), i, output[i], reference[i]);
                 return false;
+            }
+        }
+
+        // Exercise the two- and three-token prefill tails against the same
+        // blockwise reference used for the five-token path.
+        for (int small_m : {2, 3}) {
+            std::vector<float> small_output(small_m * N);
+            Tensor small_input = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, small_m, 1, 1,
+                input.data());
+            Tensor small_result = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, small_m, 1, 1,
+                small_output.data());
+            kernel_matmul_fp32(small_input, B, small_result, &pool);
+            for (int i = 0; i < small_m * N; ++i) {
+                if (!std::isfinite(small_output[i]) ||
+                    small_output[i] != reference[i])
+                    return false;
             }
         }
 

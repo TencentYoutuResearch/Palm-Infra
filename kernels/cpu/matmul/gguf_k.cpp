@@ -400,6 +400,61 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
                 output[begin + 3] = sum3;
             }
         }
+        if (M >= 2 && M <= 32) {
+            // Reuse each decoded block across prefill tokens. Independent
+            // accumulators retain the original per-token rounding order.
+            std::array<float, 32> sums;
+            for (int n = begin; n < end; ++n) {
+                sums.fill(0.0f);
+                const uint8_t* row = encoded + size_t(n) * blocks * bytes;
+                for (int block = 0; block < blocks; ++block) {
+                    decode_native_block<P>(row + block * bytes, values.data());
+                    for (int m = 0; m + 4 <= M; m += 4) {
+                        float sum0 = sums[m], sum1 = sums[m + 1];
+                        float sum2 = sums[m + 2], sum3 = sums[m + 3];
+                        const float* a0 = input + size_t(m) * K + block * block_values;
+                        const float* a1 = a0 + K;
+                        const float* a2 = a1 + K;
+                        const float* a3 = a2 + K;
+                        {
+#pragma clang fp contract(off)
+                            for (int k = 0; k < block_values; ++k) {
+                                const float weight = values[k];
+                                sum0 += a0[k] * weight;
+                                sum1 += a1[k] * weight;
+                                sum2 += a2[k] * weight;
+                                sum3 += a3[k] * weight;
+                            }
+                        }
+                        sums[m] = sum0; sums[m + 1] = sum1;
+                        sums[m + 2] = sum2; sums[m + 3] = sum3;
+                    }
+                    for (int m = (M / 4) * 4; m + 2 <= M; m += 2) {
+                        float sum0 = sums[m], sum1 = sums[m + 1];
+                        const float* a0 = input + size_t(m) * K + block * block_values;
+                        const float* a1 = a0 + K;
+                        {
+#pragma clang fp contract(off)
+                            for (int k = 0; k < block_values; ++k) {
+                                const float weight = values[k];
+                                sum0 += a0[k] * weight;
+                                sum1 += a1[k] * weight;
+                            }
+                        }
+                        sums[m] = sum0; sums[m + 1] = sum1;
+                    }
+                    for (int m = (M / 2) * 2; m < M; ++m) {
+                        const float* a = input + size_t(m) * K + block * block_values;
+                        float sum = sums[m];
+                        for (int k = 0; k < block_values; ++k)
+                            sum += a[k] * values[k];
+                        sums[m] = sum;
+                    }
+                }
+                for (int m = 0; m < M; ++m) output[m * N + n] = sums[m];
+            }
+            return;
+        }
 #endif
         for (int n = begin; n < end; ++n) {
             for (int m = 0; m < M; ++m) output[m * N + n] = 0.0f;
