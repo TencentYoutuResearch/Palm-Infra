@@ -197,16 +197,21 @@ size_t LLMEngine::warmup_package_weights() {
             mmap_weight_exclusion_ranges_, len);
 
 #if defined(MADV_WILLNEED)
-    // Preserve the eager readahead behaviour for ordinary mmap packages. In
-    // SSD mode it would pull aggregate expert tensors into the kernel cache,
-    // so dense-only warmup below intentionally relies on page touches alone.
-    if (expert_ranges.empty()) {
-        uintptr_t start = reinterpret_cast<uintptr_t>(package_weights_base_);
-        uintptr_t aligned_start = (start / page_size) * page_size;
-        size_t prefix = static_cast<size_t>(start - aligned_start);
+    // Read ahead only the dense spans. Advising the entire package in SSD
+    // mode would also pull the much larger expert aggregates into RAM.
+    auto advise_dense = [&](size_t begin, size_t end) {
+        if (begin >= end) return;
+        const uintptr_t start = reinterpret_cast<uintptr_t>(p) + begin;
+        const uintptr_t aligned_start = (start / page_size) * page_size;
         madvise(reinterpret_cast<void*>(aligned_start),
-                prefix + package_weights_size_, MADV_WILLNEED);
+                end - begin + (start - aligned_start), MADV_WILLNEED);
+    };
+    size_t cursor = 0;
+    for (const auto& range : expert_ranges) {
+        advise_dense(cursor, range.begin);
+        cursor = range.end;
     }
+    advise_dense(cursor, len);
 #endif
 
     uint8_t sink = 0;
