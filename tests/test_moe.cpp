@@ -4,10 +4,13 @@
 #include "kernels/cpu/moe/moe.h"
 #include "storage/ssd_expert_cache/cache.h"
 #include "core/tensor.h"
+#include "runtime/threading.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <vector>
@@ -164,7 +167,69 @@ static std::vector<__fp16> interleave_fp16_rows(
     return dst;
 }
 
+static bool gguf_router_prefill_matches_single_token() {
+    constexpr int H = 256, M = 33, E = 8, I = 256, TOP_K = 2;
+    constexpr int Q8_ROW_BYTES = (H / 32) * 34;
+    std::vector<float> hidden(H * M), router_fp32(E * H);
+    for (size_t i = 0; i < hidden.size(); ++i)
+        hidden[i] = fill_value(static_cast<int>(i) + 101);
+    for (size_t i = 0; i < router_fp32.size(); ++i)
+        router_fp32[i] = fill_value(static_cast<int>(i) + 701);
+    std::vector<__fp16> router_packed = interleave_fp16_rows(
+        to_fp16(router_fp32), E, H);
+    auto make_q8 = [](size_t rows) {
+        std::vector<uint8_t> bytes(rows * Q8_ROW_BYTES);
+        for (size_t block = 0; block < rows * (H / 32); ++block) {
+            uint8_t* dst = bytes.data() + block * 34;
+            dst[0] = 0;
+            dst[1] = 0x2c;  // FP16 scale 1/16.
+            for (int lane = 0; lane < 32; ++lane)
+                dst[2 + lane] = static_cast<uint8_t>(
+                    static_cast<int>((block * 5 + lane * 3) % 7) - 3);
+        }
+        return bytes;
+    };
+    std::vector<uint8_t> gate_up = make_q8(E * 2 * I);
+    std::vector<uint8_t> down = make_q8(E * H);
+    std::vector<float> all_output(H * M), single_output(H);
+    Tensor all_hidden = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, H, M, 1, 1, hidden.data());
+    Tensor last_hidden = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, H, 1, 1, 1,
+        hidden.data() + (M - 1) * H);
+    Tensor router = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, E, H, 1, 1,
+        router_packed.data());
+    router.is_interleaved = true;
+    Tensor gate_up_weight = Tensor::create(
+        Precision::GGUF_Q8_0, MemoryType::EXTERNAL, E * 2 * I, H, 1, 1,
+        gate_up.data());
+    Tensor down_weight = Tensor::create(
+        Precision::GGUF_Q8_0, MemoryType::EXTERNAL, E * H, I, 1, 1,
+        down.data());
+    Tensor all_result = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, H, M, 1, 1,
+        all_output.data());
+    Tensor single_result = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, H, 1, 1, 1,
+        single_output.data());
+    std::vector<const Tensor*> inputs = {
+        &all_hidden, &router, &gate_up_weight, &down_weight};
+    ThreadPool pool(4);
+    if (!kernel_qwen3_moe(inputs, all_result, &pool,
+                          H, E, TOP_K, I, 0, 0, true, false))
+        return false;
+    inputs[0] = &last_hidden;
+    if (!kernel_qwen3_moe(inputs, single_result, &pool,
+                          H, E, TOP_K, I, 0, 0, true, false))
+        return false;
+    return std::memcmp(all_output.data() + (M - 1) * H,
+                       single_output.data(), H * sizeof(float)) == 0;
+}
+
 int main() {
+    CHECK(gguf_router_prefill_matches_single_token(),
+          "GGUF MoE router agrees between 33-token prefill and one token");
     const int H = 8;
     const int M = 3;
     const int E = 5;

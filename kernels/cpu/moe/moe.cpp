@@ -691,7 +691,27 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     if (profile) stage_start = moe_profile_now();
     {
         mollm_trace::ScopedEvent trace_router("compute", "moe.router", trace_layer_args);
-        kernel_matmul_fp32(hidden, router_b, router_out, thread_pool);
+        // Hy4's FP16 router can change expert order when a multi-token
+        // GEMM and a single-token GEMV use different FP16 reduction trees.
+        // Accumulate each token in FP32 so routing is independent of chunk
+        // size and stays close to the checkpoint's original FP32 router.
+        const bool accurate_hy4_router =
+            router_b.prec == Precision::FP16 &&
+            gguf_k_block_bytes(experts_gate_up.prec) != 0;
+        if (accurate_hy4_router) {
+            for (int token = 0; token < seq_len; ++token) {
+                Tensor row_input = make_fp32_tensor(
+                    const_cast<float*>(x_data + (int64_t)token * ldx),
+                    hidden_size, 1);
+                Tensor row_output = make_fp32_tensor(
+                    router_logits.data() + (size_t)token * num_experts,
+                    num_experts, 1);
+                kernel_matmul_fp32(row_input, router_b, row_output,
+                                   thread_pool, Activation::NONE, 0, -1, true);
+            }
+        } else {
+            kernel_matmul_fp32(hidden, router_b, router_out, thread_pool);
+        }
     }
     if (profile) moe_profile_add(MoeProfileStage::Router, stage_start);
 
