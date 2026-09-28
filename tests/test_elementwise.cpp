@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -180,6 +181,39 @@ void test_parallel_exact(ThreadPool& pool) {
           "EXP exact parallel path");
 }
 
+void test_sigmoid_accuracy(ThreadPool& pool) {
+    // Cover the transition, tails, SIMD lanes, and an incomplete final vector.
+    std::vector<float> input(16387), output(input.size());
+    for (size_t i = 0; i < input.size(); ++i)
+        input[i] = -30.f + 60.f * i / (input.size() - 1);
+    input[0] = -std::numeric_limits<float>::infinity();
+    input[1] = std::numeric_limits<float>::infinity();
+    input[2] = 0.f;
+    Tensor in = external_tensor(input, input.size());
+    Tensor out = external_tensor(output, output.size());
+    run_elementwise(OpType::SIGMOID, {&in}, &out, &pool);
+    bool accurate = true;
+    for (size_t i = 0; i < input.size(); ++i) {
+        const double reference = 1. / (1. + std::exp(-double(input[i])));
+        accurate &= std::abs(output[i] - reference) <=
+                    5e-7 * reference + 1e-38;
+    }
+    check(accurate, "SIGMOID FP32 accuracy over transition and tails");
+    check(output[0] == 0.f && output[1] == 1.f && output[2] == 0.5f,
+          "SIGMOID infinities and zero");
+
+    input[0] = -30.f;
+    input[1] = 30.f;
+    run_elementwise(OpType::SILU, {&in}, &out, &pool);
+    accurate = true;
+    for (size_t i = 0; i < input.size(); ++i) {
+        const double reference = input[i] / (1. + std::exp(-double(input[i])));
+        accurate &= std::abs(output[i] - reference) <=
+                    6e-7 * std::abs(reference) + 1e-38;
+    }
+    check(accurate, "SILU FP32 accuracy over transition and tails");
+}
+
 } // namespace
 
 int main() {
@@ -189,6 +223,7 @@ int main() {
     test_unary(pool);
     test_swiglu(pool);
     test_parallel_exact(pool);
+    test_sigmoid_accuracy(pool);
 
     if (failures == 0)
         std::printf("All elementwise tests passed!\n");

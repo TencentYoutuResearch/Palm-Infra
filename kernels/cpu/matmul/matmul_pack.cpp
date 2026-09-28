@@ -8,6 +8,25 @@
 
 namespace {
 
+void pack_fp16_into(const __fp16* B_original, __fp16* dst, int N, int K,
+                    int K_weight) {
+    const int N_padded = ((N + 7) / 8) * 8;
+    for (int n_tile = 0; n_tile < N_padded; n_tile += 8) {
+        int tile_valid = std::min(8, N - n_tile);
+        if (tile_valid < 0)
+            tile_valid = 0;
+        for (int k = 0; k < K; k++) {
+            for (int j = 0; j < tile_valid; j++) {
+                dst[n_tile * K + k * 8 + j] =
+                    B_original[(n_tile + j) * K_weight + k];
+            }
+            for (int j = tile_valid; j < 8; j++) {
+                dst[n_tile * K + k * 8 + j] = (__fp16)0.f;
+            }
+        }
+    }
+}
+
 bool is_2d_linear_weight(const Tensor& weight) {
     return weight.shape[2] == 1 && weight.shape[3] == 1;
 }
@@ -67,11 +86,11 @@ void maybe_pack_fp16_weight(Tensor& weight, const std::string& key,
         const int N = (int)weight.shape[0];
         const int K = (int)weight.shape[1];
         const auto* b_orig = reinterpret_cast<const __fp16*>(rowmajor_data);
-        __fp16* b_packed = pack_b_interleaved_full(b_orig, N, K, K);
         const size_t buf_size = (size_t)((N + 7) / 8) * 8 * K * sizeof(__fp16);
-        std::vector<uint8_t> buf((uint8_t*)b_packed,
-                                 (uint8_t*)b_packed + buf_size);
-        delete[] b_packed;
+        // Fill the final sidecar directly: large lm_head weights otherwise
+        // require a second full packed allocation during preparation.
+        std::vector<uint8_t> buf(buf_size);
+        pack_fp16_into(b_orig, reinterpret_cast<__fp16*>(buf.data()), N, K, K);
         it = packed_weights.emplace(key, std::move(buf)).first;
     }
     weight.data = it->second.data();
@@ -692,20 +711,7 @@ __fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K,
                                 int K_weight) {
     int N_padded = ((N + 7) / 8) * 8; // round up to multiple of 8
     __fp16* dst = new __fp16[(size_t)N_padded * K];
-    for (int n_tile = 0; n_tile < N_padded; n_tile += 8) {
-        int tile_valid = std::min(8, N - n_tile);
-        if (tile_valid < 0)
-            tile_valid = 0;
-        for (int k = 0; k < K; k++) {
-            for (int j = 0; j < tile_valid; j++) {
-                dst[n_tile * K + k * 8 + j] =
-                    B_original[(n_tile + j) * K_weight + k];
-            }
-            for (int j = tile_valid; j < 8; j++) {
-                dst[n_tile * K + k * 8 + j] = (__fp16)0.f;
-            }
-        }
-    }
+    pack_fp16_into(B_original, dst, N, K, K_weight);
     return dst;
 }
 

@@ -27,21 +27,22 @@ bool kernel_hc_head(const Tensor& x, const Tensor& fn, const Tensor& scale,
 // Same tensor layouts as the DeepSeek-V4 kernels above, but a different
 // formula: the inter-stream mixing matrix is dropped, so `fn` supplies only
 // 2*hc coefficients instead of (2+hc)*hc, and no Sinkhorn iteration runs.
-// The reduced pre-activation is scaled by `hc_magnitude` before the post
-// gate. See docs_internal/HY4_OPS_SPEC.md section 3.
+// The sigmoid post gate is scaled by `hc_magnitude` before adding hc_eps.
+// See docs_internal/HY4_OPS_SPEC.md section 3.
 //
+// round_bf16 preserves the HF BF16 materialization; GGUF uses FP32 (false).
 // HC_PRE_ID packs [reduced_hidden, post] (no combination block), because
 // HC_POST_ID applies the gate per stream instead of mixing streams.
 bool kernel_hc_pre_id(const Tensor& x, const Tensor& fn, const Tensor& scale,
                       const Tensor& base, Tensor& packed, int hidden_size,
                       int hc_mult, float hc_magnitude, float norm_eps,
-                      float hc_eps, ThreadPool* thread_pool);
+                      float hc_eps, ThreadPool* thread_pool, bool round_bf16 = true);
 
 bool kernel_hc_post_id(const Tensor& branch, const Tensor& residual,
                        const Tensor& packed, Tensor& output, int hidden_size,
-                       int hc_mult, ThreadPool* thread_pool);
+                       int hc_mult, ThreadPool* thread_pool, bool round_bf16 = true);
 
 bool kernel_hc_head_id(const Tensor& x, const Tensor& fn, const Tensor& scale,
                        const Tensor& base, Tensor& output, int hidden_size,
                        int hc_mult, float norm_eps, float hc_eps,
-                       ThreadPool* thread_pool);
+                       ThreadPool* thread_pool, bool round_bf16 = true);

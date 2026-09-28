@@ -5,12 +5,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <vector>
 
 namespace {
 
-constexpr int H = 2, C = 3, D = 2, R = 2, V = 2, CAP = 4;
+// Exercise eight/four-row projections, a V tail, and score batch boundaries.
+constexpr int H = 2, C = 8, D = 2, R = 4, V = 13, CAP = 13;
 
 Tensor fp32(float* data, int a, int b = 1, int c = 1) {
     return Tensor::create(Precision::FP32, MemoryType::EXTERNAL, a, b, c, 1, data);
@@ -65,23 +67,128 @@ float explicit_output(
 
 bool close(float a, float b) { return std::fabs(a - b) < 0.003f; }
 
+template <typename CacheValue, int Seq = 3, int Nope = 4>
+bool q8_weights_match_fp16() {
+    constexpr int heads = 2, rank = 32, nope = Nope, rope = 4;
+    constexpr int vdim = 5, seq = Seq, past = 7, capacity = past + seq;
+    std::vector<__fp16> kb(heads * rank * nope), vb(heads * vdim * rank);
+    auto encode = [](std::vector<__fp16>& weights) {
+        std::vector<uint8_t> bytes(weights.size() / 32 * 34);
+        for (size_t b = 0; b < weights.size() / 32; ++b) {
+            const __fp16 scale = (__fp16)(b % 2 ? -0.125f : 0.0625f);
+            std::memcpy(bytes.data() + b * 34, &scale, sizeof(scale));
+            for (int k = 0; k < 32; ++k) {
+                const int8_t q = static_cast<int8_t>(int((b * 13 + k * 7) % 255) - 127);
+                std::memcpy(bytes.data() + b * 34 + 2 + k, &q, sizeof(q));
+                // Powers-of-two scales make both representations exact.
+                weights[b * 32 + k] = (__fp16)((float)scale * q);
+            }
+        }
+        return bytes;
+    };
+    auto kb_bytes = encode(kb), vb_bytes = encode(vb);
+    Tensor kb_half = fp16(kb.data(), heads, rank, nope);
+    Tensor vb_half = fp16(vb.data(), heads, vdim, rank);
+    Tensor kb_q8 = Tensor::create(Precision::GGUF_Q8_0, MemoryType::EXTERNAL,
+                                  heads, rank, nope, 1, kb_bytes.data());
+    Tensor vb_q8 = Tensor::create(Precision::GGUF_Q8_0, MemoryType::EXTERNAL,
+                                  heads, vdim, rank, 1, vb_bytes.data());
+    std::vector<float> qn(heads * seq * nope), qr(heads * seq * rope);
+    std::vector<float> kv(seq * rank), kr(seq * rope), mask(seq * capacity, 0.f);
+    for (auto* values : {&qn, &qr, &kv, &kr})
+        for (size_t i = 0; i < values->size(); ++i)
+            (*values)[i] = (int(i * 7 % 19) - 9) * 0.1f;
+    for (int s = 0; s < seq; ++s)
+        mask[s * capacity + 2] = -std::numeric_limits<float>::infinity();
+    std::vector<unsigned char> initial(CacheMetadata::SIZE + capacity * (rank + rope) * sizeof(CacheValue));
+    *cache_meta(initial.data()) = CacheMetadata{};
+    cache_meta(initial.data())->max_seq_len = capacity;
+    cache_meta(initial.data())->current_seq_len = past;
+    cache_meta(initial.data())->head_dim = rank + rope;
+    cache_meta(initial.data())->num_kv_heads = 1;
+    auto* latent = static_cast<CacheValue*>(cache_data(initial.data()));
+    for (int i = 0; i < past * (rank + rope); ++i)
+        latent[i] = (CacheValue)((i * 3 % 17 - 8) * 0.125f);
+    float sink_data[heads] = {0.3f, -0.4f};
+    int32_t indices[15] = {7, 2, -1, capacity, 0,
+                               8, 2, 3, 0, 1,
+                               9, 7, 2, 1, 0};
+    Tensor qn_t = fp32(qn.data(), nope, seq, heads);
+    Tensor qr_t = fp32(qr.data(), rope, seq, heads);
+    Tensor kv_t = fp32(kv.data(), rank, seq), kr_t = fp32(kr.data(), rope, seq);
+    Tensor mask_t = fp32(mask.data(), capacity, seq), sink_t = fp32(sink_data, heads);
+    Tensor selection = Tensor::create(Precision::INT32, MemoryType::EXTERNAL,
+                                      5, seq, 1, 1, indices);
+    GraphNode node;
+    node.op_type = OpType::SDPA_MLA_ABSORB;
+    node.params.f32 = {0.5f};
+    for (bool sparse : {false, true}) {
+        node.params.i32 = {2, 1, heads, 1, nope + rope, vdim, 8,
+                           sparse ? 9 : -1, rank, rope};
+        std::vector<float> expected;
+        for (int format = 0; format < 4; ++format) {
+            auto storage = initial;
+            std::vector<float> result(heads * seq * vdim);
+            Tensor cache = Tensor::create(
+                sizeof(CacheValue) == 4 ? Precision::FP32 : Precision::FP16,
+                MemoryType::EXTERNAL, storage.size() / sizeof(CacheValue),
+                1, 1, 1, storage.data());
+            Tensor out = fp32(result.data(), vdim, seq, heads);
+            std::vector<const Tensor*> inputs = {
+                &qn_t, &qr_t, &kv_t, &kr_t,
+                format & 1 ? &kb_q8 : &kb_half,
+                format & 2 ? &vb_q8 : &vb_half,
+                &mask_t, &cache, &sink_t, &selection};
+            if (!kernel_mla_absorbed_attention(node, inputs, &out, nullptr) ||
+                cache_meta(storage.data())->current_seq_len != capacity)
+                return false;
+            const auto* saved = static_cast<const CacheValue*>(cache_data(storage.data()));
+            for (int t = 0; t < seq; ++t) {
+                for (int c = 0; c < rank; ++c)
+                    if (saved[(past + t) * (rank + rope) + c] !=
+                        (CacheValue)kv[t * rank + c]) return false;
+                for (int c = 0; c < rope; ++c)
+                    if (saved[(past + t) * (rank + rope) + rank + c] !=
+                        (CacheValue)kr[t * rope + c]) return false;
+            }
+            if (format == 0) expected = result;
+            for (size_t i = 0; i < result.size(); ++i) {
+                if (!std::isfinite(result[i])) return false;
+                // Q8 block-scale GEMV keeps the exact encoded weights but
+                // changes the FP32 reduction order relative to FP16 GEMV.
+                const bool match = format == 0 ||
+                    std::fabs(result[i] - expected[i]) <=
+                        1e-5f * std::max(1.f, std::fabs(expected[i]));
+                if (!match) {
+                    std::fprintf(stderr, "Q8 mismatch cache=%zu seq=%d nope=%d sparse=%d format=%d index=%zu got=%g want=%g diff=%g\n",
+                                 sizeof(CacheValue), seq, nope, int(sparse), format, i,
+                                 result[i], expected[i], result[i] - expected[i]);
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
-    __fp16 k_b[H * C * D] = {
-        0.5f, -0.25f, 0.125f, 0.75f, -0.5f, 0.25f,
-        -0.125f, 0.5f, 0.375f, -0.25f, 0.75f, -0.5f};
-    __fp16 v_b[H * V * C] = {
-        0.5f, 0.25f, -0.25f, -0.5f, 0.125f, 0.75f,
-        0.25f, -0.375f, 0.5f, 0.625f, 0.125f, -0.25f};
+    __fp16 k_b[H * C * D], v_b[H * V * C];
+    for (int i = 0; i < H * C * D; ++i)
+        k_b[i] = (__fp16)((i * 7 % 13 - 6) * 0.125f);
+    for (int i = 0; i < H * V * C; ++i)
+        v_b[i] = (__fp16)((i * 3 % 11 - 5) * 0.125f);
     float q_nope[H * 3 * D] = {
         1, -2, 0.5f, 1.5f, -1, 0.25f,
         -0.5f, 2, 1, -1, 0.75f, 1.25f};
-    float q_rope[H * 3 * R] = {
-        0.25f, -0.5f, 1, 0.25f, -0.75f, 0.5f,
-        0.5f, 0.25f, -1, 0.5f, 0.25f, -0.75f};
-    float kv[3 * C] = {1, 0.5f, -1, -0.5f, 1.5f, 0.25f, 0.75f, -0.25f, 1};
-    float kr[3 * R] = {0.25f, 1, -0.5f, 0.75f, 1, -0.25f};
+    float q_rope[H * 3 * R], kv[3 * C], kr[3 * R];
+    for (int i = 0; i < H * 3 * R; ++i)
+        q_rope[i] = (i * 3 % 9 - 4) * 0.25f;
+    for (int i = 0; i < 3 * C; ++i)
+        kv[i] = (i * 5 % 13 - 6) * 0.25f;
+    for (int i = 0; i < 3 * R; ++i)
+        kr[i] = (i * 7 % 9 - 4) * 0.25f;
     float sink[H] = {0.3f, -0.4f};
     std::vector<unsigned char> cache_storage(CacheMetadata::SIZE + CAP * (C + R) * 2);
     auto* meta = cache_meta(cache_storage.data());
@@ -214,6 +321,56 @@ int main() {
                 if (!close(out_dec[h * V + d], want)) return 7;
             }
     }
-    std::puts("absorbed MLA dense/sparse prefill/decode matches explicit reference");
+    // A longer cache exercises batched scores, masking, invalid sparse
+    // indices, and a partial final batch against explicit attention.
+    std::vector<float> long_latent(CAP * (C + R));
+    auto* latent_data = static_cast<__fp16*>(cache_data(cache.data));
+    for (int t = 0; t < CAP; ++t) {
+        const int source = t == CAP - 1 ? 2 : t % 3;
+        for (int c = 0; c < C + R; ++c) {
+            const float value = all_latent[source * (C + R) + c];
+            long_latent[t * (C + R) + c] = value;
+            latent_data[t * (C + R) + c] = (__fp16)value;
+        }
+    }
+    float long_mask[CAP] = {};
+    long_mask[6] = -std::numeric_limits<float>::infinity();
+    Tensor long_mask_t = fp32(long_mask, CAP);
+    int32_t selected_long[9] = {6, 2, -1, CAP, 0, 8, 10, 3, 12};
+    Tensor long_selection = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL, 9, 1, 1, 1, selected_long);
+    sparse_inputs[6] = &long_mask_t;
+    sparse_inputs[9] = &long_selection;
+    for (int selection_width : {0, 4, 5, 9}) {
+        node.params.i32[7] = selection_width ? 9 : -1;
+        long_selection.shape[0] = selection_width;
+        meta->current_seq_len = CAP - 1;
+        if (!kernel_mla_absorbed_attention(
+                node, sparse_inputs, &out_dec_t, nullptr)) return 8;
+        // Position 6 has zero softmax mass due to its -inf mask.
+        std::vector<int> positions;
+        for (int i = 0; i < (selection_width ? selection_width : CAP); ++i) {
+            const int t = selection_width ? selected_long[i] : i;
+            if (t != 6) positions.push_back(t);
+        }
+        for (int h = 0; h < H; ++h)
+            for (int d = 0; d < V; ++d) {
+                const float want = explicit_output(
+                    h, 2, d, CAP, q_nope, q_rope,
+                    k_b, v_b, long_latent, sink[h], &positions);
+                if (!close(out_dec[h * V + d], want)) return 9;
+            }
+    }
+    // Decode covers both an unaligned K fallback and native Q8 projections,
+    // with mixed K/V formats, both cache types, and a five-row V tail.
+    if (!q8_weights_match_fp16<__fp16>() || !q8_weights_match_fp16<float>() ||
+        !q8_weights_match_fp16<__fp16, 1, 4>() ||
+        !q8_weights_match_fp16<float, 1, 4>() ||
+        !q8_weights_match_fp16<__fp16, 1, 32>() ||
+        !q8_weights_match_fp16<float, 1, 32>()) {
+        std::fprintf(stderr, "MLA Q8_0 weights differ from exact FP16 weights\n");
+        return 12;
+    }
+    std::puts("absorbed MLA dense/sparse prefill/decode matches explicit reference; Q8_0 matches FP16 within tolerance");
     return 0;
 }
