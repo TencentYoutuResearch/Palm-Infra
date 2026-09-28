@@ -49,6 +49,7 @@ bool MetalMoeOps::dispatch_host(
     const int hash_input = graph_params::get_i32(params, 13, -1);
     const float routed_scale = graph_params::get_f32(params, 0, 1.0f);
     const float swiglu_limit = graph_params::get_f32(params, 1, 0.0f);
+    const float shared_swiglu_limit = graph_params::get_f32(params, 2, swiglu_limit);
 
     const auto* gate_source = dynamic_cast<const MoeSsdTensorSource*>(
         inputs[2]->moe_ssd_source);
@@ -507,7 +508,7 @@ bool MetalMoeOps::dispatch_host(
     const bool shared_ok = kernel_moe_shared_expert(
         hidden, *inputs[4], *inputs[5], *inputs[6], nullptr,
         shared_output, thread_pool, shared_intermediate, true,
-        swiglu_limit);
+        shared_swiglu_limit < 0.0f ? swiglu_limit : shared_swiglu_limit);
 
     [command waitUntilCompleted];
     const uint64_t gpu_end = mollm_trace::now_ns();

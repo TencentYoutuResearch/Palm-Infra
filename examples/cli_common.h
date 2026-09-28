@@ -23,6 +23,7 @@ struct CliCommonOptions {
     bool profile = false;
     int warmup = 1;
     bool static_padded = false;  // pad short prompts to graph_seq_len (A/B vs DYNAMIC)
+    int prefill_chunk_size = 0;  // 0: package default; larger sizes require dynamic shapes
     Device device = Device::CPU;  // compute backend (--device cpu|metal|cuda)
     bool require_native = false;  // reject accelerator operator fallback
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
@@ -40,6 +41,8 @@ struct CliCommonOptions {
     bool ssd_cross_layer_prefetch = true;   // next-layer predictor (with global pool)
     int ssd_shallow_cache_layers = 0;  // early MoE layers with priority cache quota
     bool ssd_global_cache = true;   // dynamically shared cache capacity across layers
+    bool metal_dense = false;       // selected Hy4 Q5 projections, CPU graph
+    bool metal_moe_ffn = false;     // resident IQ2/IQ3 decode batches
     bool metal_ssd_full = false;    // full-Metal decode with direct Metal I/O
     std::string trace_path;      // optional Chrome Trace / Perfetto JSON output
     int mtp_draft_tokens = 0;    // >0: use packaged single-head MTP

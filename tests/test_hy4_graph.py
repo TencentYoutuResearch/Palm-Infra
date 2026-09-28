@@ -123,6 +123,10 @@ def test_layer_counts():
     dense_lead = 1
     check(tally.get(OpType.MOE) == layers - dense_lead,
           f"MoE on all but the dense-lead layers, got {tally.get(OpType.MOE)}")
+    for node in graph._nodes:
+        if node.op_type == OpType.MOE:
+            check(node.params_f32 == [2.827, 10.0, 0.0],
+                  "Hy4 clamps routed experts only, with explicit shared override")
     print("  PASS: per-layer op counts")
 
 
@@ -133,7 +137,9 @@ def test_indexer_only_on_full_layers():
     asserted both on the emitted op count and on the requested weights.
     """
     types = ["full", "shared", "shared", "full", "shared"]
-    graph, captured = build(tiny_cfg(layers=len(types), indexer_types=types),
+    cfg = tiny_cfg(layers=len(types), indexer_types=types)
+    cfg["rms_norm_eps"] = 0.002
+    graph, captured = build(cfg,
                             seq_len=4, n_ctx=64, is_prefill=True)
     tally = count_ops(graph)
 
@@ -141,6 +147,10 @@ def test_indexer_only_on_full_layers():
     check(tally.get(OpType.HY4_INDEXER) == expected,
           f"HY4_INDEXER emitted {tally.get(OpType.HY4_INDEXER)} times, "
           f"expected one per full layer ({expected})")
+
+    check(all(node.params_f32[4] == cfg["rms_norm_eps"]
+              for node in graph._nodes if node.op_type == OpType.HY4_INDEXER),
+          "indexer key LayerNorm carries the configured RMS norm epsilon")
 
     for layer, kind in enumerate(types):
         has_weights = any(
@@ -280,6 +290,39 @@ def test_decode_path_builds():
     print("  PASS: decode path")
 
 
+def test_rope_checkpoint_convention():
+    """GGUF weights use adjacent pairs; our Transformers path uses halves."""
+    class RecordingGgufIndex(hy4.GgufIndex):
+        def __init__(self):
+            pass
+
+        def contains(self, name):
+            return True
+
+    cfg = tiny_cfg(layers=2, indexer_types=["full", "shared"])
+    cfg["rope_parameters"] = {"rope_theta": 12500000.0}
+    for prefill in (False, True):
+        for index, expected in ((_RecordingIndex(), 0), (RecordingGgufIndex(), 1)):
+            graph, _ = build(cfg, seq_len=4 if prefill else 1, n_ctx=64,
+                             is_prefill=prefill, index=index)
+            check(int(graph.metadata["rope_dim"]) == cfg["qk_rope_head_dim"] and
+                  float(graph.metadata["rope_theta"]) == 12500000.0,
+                  "runtime RoPE configuration must reach the serialized graph")
+            rotary = [node for node in graph._nodes
+                      if node.op_type == OpType.ROTARY_EMBED]
+            check(len(rotary) == 4, "query and key rotation in each layer")
+            check(all(node.params_i32 == [4, expected] for node in rotary),
+                  "rotary pairing must follow the checkpoint reference")
+            hc = [node for node in graph._nodes if node.op_type in
+                  (OpType.HC_PRE_ID, OpType.HC_POST_ID, OpType.HC_HEAD_ID)]
+            check(len(hc) == 9 and all(node.params_i32[2] == 1 - expected for node in hc),
+                  "GGUF HC keeps FP32 while HF HC retains BF16 emulation")
+            check(all(node.params_i32[8] == 1 - expected for node in graph._nodes
+                      if node.op_type == OpType.HY4_INDEXER),
+                  "GGUF indexer keeps FP32 while HF retains legacy BF16 emulation")
+    print("  PASS: checkpoint-specific RoPE in prefill and decode")
+
+
 def test_absorbed_dense_cache():
     """The latent cache is shared across heads and DSA selection is wired."""
     cfg = tiny_cfg(layers=2, indexer_types=["full", "shared"])
@@ -313,6 +356,32 @@ def test_absorbed_dense_cache():
                       "absorbed attention must consume DSA selection")
     finally:
         hy4.split_mla_kv_b = original
+    class RecordingGgufIndex(hy4.GgufIndex):
+        def __init__(self):
+            pass
+
+        def contains(self, name):
+            return True
+
+    original_gguf = hy4.gguf_fp16_streamed_weight
+    hy4.gguf_fp16_streamed_weight = lambda *args, **kwargs: object()
+    hy4.split_mla_kv_b = lambda *args, **kwargs: (object(), object())
+    try:
+        for prefill in (False, True):
+            for index, precision in ((_RecordingIndex(), hy4.Precision.FP16),
+                                     (RecordingGgufIndex(), hy4.Precision.FP32)):
+                graph, _ = build(cfg, seq_len=4 if prefill else 1, n_ctx=16,
+                                 is_prefill=prefill, absorbed=True, index=index)
+                caches = [node for node in graph._nodes if node.params_str and
+                          node.params_str[0].startswith("latent_cache")]
+                check(len(caches) == 2 and all(node.out_prec == precision for node in caches),
+                      "latent cache precision follows the checkpoint reference")
+                check(graph.metadata["lm_head_fp32_acc"] ==
+                      ("1" if precision == hy4.Precision.FP32 else "0"),
+                      "GGUF logits request FP32 accumulation")
+    finally:
+        hy4.split_mla_kv_b = original
+        hy4.gguf_fp16_streamed_weight = original_gguf
     print("  PASS: absorbed cache has no head axis and carries DSA selection")
 
 
@@ -362,6 +431,7 @@ def main():
     test_weight_shapes()
     test_dense_lead_is_dense()
     test_decode_path_builds()
+    test_rope_checkpoint_convention()
     test_absorbed_dense_cache()
     test_bad_config_rejected()
     test_convert_rejects_non_hy4()

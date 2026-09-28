@@ -114,6 +114,12 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.profile = true;
         } else if (arg == "--static-padded") {
             opts.static_padded = true;
+        } else if (arg == "--prefill-chunk-size") {
+            if (!require_value(argc, argv, i, "--prefill-chunk-size", value, error)) return false;
+            if (!parse_int(value, opts.prefill_chunk_size) || opts.prefill_chunk_size < 0) {
+                error = "invalid value for --prefill-chunk-size";
+                return false;
+            }
         } else if (arg == "--device") {
             if (!require_value(argc, argv, i, "--device", value, error)) return false;
             std::string dev(value);
@@ -169,6 +175,10 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.ssd_global_cache = true;
         } else if (arg == "--no-ssd-global-cache") {
             opts.ssd_global_cache = false;
+        } else if (arg == "--metal-dense") {
+            opts.metal_dense = true;
+        } else if (arg == "--metal-moe-ffn") {
+            opts.metal_moe_ffn = true;
         } else if (arg == "--metal-ssd-full") {
             opts.metal_ssd_full = true;
         } else if (arg == "--trace") {
@@ -320,6 +330,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
                 default_worker_threads());
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
+    std::printf("  --prefill-chunk-size <int> Prefill batch (0: package default; larger needs dynamic shapes)\n");
     std::printf("  --device <cpu|metal|cuda> Compute backend (GPU backends require their build option)\n");
     std::printf("  --require-native         Reject accelerator operator fallback\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
@@ -330,6 +341,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --ssd-shallow-cache-layers <int>  Favor the first N MoE layers in the RAM cache\n");
     std::printf("  --ssd-global-cache      Shared capacity pool across MoE layers (default)\n");
     std::printf("  --no-ssd-global-cache   Use legacy equal per-layer cache (also disables prefetch)\n");
+    std::printf("  --metal-dense           Accelerate large Hy4 Q5 decode projections; --device cpu\n");
+    std::printf("  --metal-moe-ffn         Accelerate ready 8-expert Hy4 IQ2/IQ3 batches; --device cpu\n");
     std::printf("  --metal-ssd-full        Experimental full-Metal decode with direct Metal I/O\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --mtp-draft-tokens <int>  Experimental packaged MTP speculation (0..16)\n");
@@ -366,6 +379,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.num_threads = opts.num_threads;
     cfg.sampling = opts.sampling;
     cfg.static_padded = opts.static_padded;
+    cfg.prefill_chunk_size = opts.prefill_chunk_size;
     cfg.image_max_pixels = opts.image_max_pixels;
     cfg.device = opts.device;
     cfg.device_fallback = opts.device == Device::CPU
@@ -382,6 +396,8 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.moe_ssd_shallow_cache_layers = opts.ssd_shallow_cache_layers;
     cfg.moe_ssd_global_cache = opts.ssd_global_cache;
     cfg.metal_ssd_full = opts.metal_ssd_full;
+    cfg.metal_dense = opts.metal_dense;
+    cfg.metal_moe_ffn = opts.metal_moe_ffn;
     cfg.trace_path = opts.trace_path;
     cfg.mtp_draft_tokens = opts.mtp_draft_tokens;
     cfg.lock_dense_weights = opts.lock_dense_weights;

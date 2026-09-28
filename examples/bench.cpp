@@ -245,12 +245,16 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
         }
         std::printf("\n");
         uint64_t total_wait_ns = 0;
+        uint64_t total_acquires = 0, total_ready_at_lookup = 0, total_waited_acquires = 0;
         uint64_t total_prediction_attempts = 0;
         uint64_t total_prediction_matches = 0;
         uint64_t total_unused_prefetch_evictions = 0;
         uint64_t total_short_term_reloads = 0;
         for (const auto& layer : ssd.layers) {
             total_wait_ns += layer.acquire_wait_ns;
+            total_acquires += layer.demand_acquires;
+            total_ready_at_lookup += layer.acquires_ready_at_lookup;
+            total_waited_acquires += layer.acquires_waited;
             total_prediction_attempts += layer.prediction_attempts;
             total_prediction_matches += layer.prediction_matches;
             total_unused_prefetch_evictions += layer.unused_prefetch_evictions;
@@ -266,6 +270,14 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                       total_prediction_attempts,
             (unsigned long long)total_unused_prefetch_evictions,
             (unsigned long long)total_short_term_reloads);
+        std::printf(
+            "moe_ssd_decode_acquires=%llu ready_at_lookup=%llu waited_acquires=%llu "
+            "ready_fraction=%.6f waited_fraction=%.6f\n",
+            (unsigned long long)total_acquires,
+            (unsigned long long)total_ready_at_lookup,
+            (unsigned long long)total_waited_acquires,
+            total_acquires ? double(total_ready_at_lookup) / total_acquires : 0.0,
+            total_acquires ? double(total_waited_acquires) / total_acquires : 0.0);
         std::printf("moe_ssd_decode_layer_stats=");
         for (size_t index = 0; index < ssd.layers.size(); ++index) {
             if (index != 0) std::printf(";");

@@ -151,10 +151,12 @@ def _hc_branch(graph: GraphBuilder, streamed: dict,
     packed = graph.hc_pre_id(
         residual, fn, scale, base, hidden, hc_mult,
         float(cfg.get("hc_magnitude", 2.0)),
-        float(cfg["rms_norm_eps"]), float(cfg["hc_eps"]))
+        float(cfg["rms_norm_eps"]), float(cfg["hc_eps"]),
+        round_bf16=not isinstance(index, GgufIndex))
     reduced = graph.slice_range(packed, 0, hidden, dim=0)
     branch = branch_builder(reduced)
-    return graph.hc_post_id(branch, residual, packed, hidden, hc_mult)
+    return graph.hc_post_id(branch, residual, packed, hidden, hc_mult,
+                            round_bf16=not isinstance(index, GgufIndex))
 
 
 def _add_indexer(
@@ -198,7 +200,8 @@ def _add_indexer(
         key_cache, position, n_tokens,
         hidden_size=hidden_size, q_lora_rank=q_rank, num_heads=heads,
         head_dim=head_dim, rope_dim=rope_dim, top_k=top_k,
-        capacity=n_ctx, theta=theta)
+        capacity=n_ctx, theta=theta, norm_eps=float(cfg["rms_norm_eps"]),
+        round_bf16=not isinstance(index, GgufIndex))
 
 
 def _add_attention_branch(
@@ -268,13 +271,12 @@ def _add_attention_branch(
     query = graph.reshape(query, (head_dim, heads, _S))
     query = graph.permute(query, (0, 2, 1, 3))       # [head_dim, seq, heads]
     q_nope, q_rope = graph.slice(query, [nope_dim, rope_dim], dim=0)
-    # Non-interleaved RoPE: the reference composes it with `rotate_half`, which
-    # pairs dimension i with i + rope_dim/2 rather than with i+1. The two
-    # styles agree at position 0 (cos=1, sin=0 makes both the identity) and
-    # diverge everywhere else, so an interleaved build looks correct on the
-    # first token and drifts after -- exactly the signature the engine showed.
+    # The GGUF reference uses consecutive pairs (LLAMA_ROPE_TYPE_NORM) and
+    # exports q_b/kv_a without a rotary weight permutation. The Transformers
+    # reference used by our safetensors path instead uses rotate_half.
+    rope_interleave = isinstance(index, GgufIndex)
     q_rope = graph.rope(q_rope, cos, sin, rope_dim=rope_dim,
-                        interleave=False)
+                        interleave=rope_interleave)
 
     # MLA KV path.
     kv = graph.matmul(hidden, wkv_a)
@@ -282,7 +284,7 @@ def _add_attention_branch(
     kv_cmpr = graph.rms_norm(kv_cmpr, kv_a_norm, eps)
     k_rope = graph.reshape(k_rope, (rope_dim, _S, 1))
     k_rope = graph.rope(k_rope, cos, sin, rope_dim=rope_dim,
-                        interleave=False)
+                        interleave=rope_interleave)
     if absorbed:
         attn_out = graph.sdpa_mla_absorb(
             q_nope, q_rope, kv_cmpr, k_rope, k_b, v_b, mask, ck_in,
@@ -401,7 +403,9 @@ def _add_ffn_branch(
         has_shared_expert=True,
         shared_expert_has_gate=False,
         routed_scaling_factor=float(cfg["routed_scaling_factor"]),
-        swiglu_limit=float(cfg.get("swiglu_limit", 0.0)))
+        swiglu_limit=float(cfg.get("swiglu_limit", 0.0)),
+        # Hy4 clamps routed experts only; shared and dense FFNs are unclipped.
+        shared_swiglu_limit=0.0)
 
 
 def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
@@ -423,6 +427,12 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
     heads = int(cfg["num_attention_heads"])
     q_rank = int(cfg["q_lora_rank"])
     layers = int(cfg["num_hidden_layers"])
+    graph.set_model_config(
+        rope_dim=rope_dim,
+        rope_theta=float(cfg.get("rope_parameters", {}).get("rope_theta", 1e7)),
+        hidden_size=hidden_size, num_layers=layers,
+        vocab_size=int(cfg["vocab_size"]), model_type="hy-v4")
+    graph.metadata["lm_head_fp32_acc"] = "1" if isinstance(index, GgufIndex) else "0"
     # Per-layer indexer role: only "full" layers ship indexer weights and run
     # the selector; "shared" layers reuse the previous full layer's top-k.
     indexer_types = list(cfg["indexer_types"])
@@ -468,7 +478,7 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
             ck = graph.input(
                 f"latent_cache{layer}",
                 (int(cfg["kv_lora_rank"]) + rope_dim, n_ctx),
-                prec=Precision.FP16)
+                prec=Precision.FP32 if isinstance(index, GgufIndex) else Precision.FP16)
             cv = None
         else:
             ck = graph.input(
@@ -582,7 +592,7 @@ def build_graph(model_dir: str | Path, cfg: dict, seq_len: int = 1,
         "model.hc_head.hc_head_base", (hc_mult,))
     collapsed = graph.hc_head_id(
         state, head_fn, head_scale, head_base, hidden_size, hc_mult,
-        eps, float(cfg["hc_eps"]))
+        eps, float(cfg["hc_eps"]), round_bf16=not isinstance(index, GgufIndex))
 
     final_norm = _fp32_weight(
         graph, streamed, index, "final_norm", "model.norm.weight",
@@ -693,6 +703,7 @@ def convert(model_dir: str, output_path: str,
         "num_kv_heads": 1 if absorbed else int(cfg["num_attention_heads"]),
         "head_dim": int(cfg["qk_head_dim"]),
         "rope_dim": int(cfg["qk_rope_head_dim"]),
+        "rope_interleave": is_gguf,
         "rope_theta": float(
             cfg.get("rope_parameters", {}).get("rope_theta", 1e7)),
         "prefill_seq_len": prefill_seq_len,

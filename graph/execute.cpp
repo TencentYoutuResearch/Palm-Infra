@@ -1,5 +1,6 @@
 #include "graph/execute.h"
 #include "runtime/backend.h"
+#include "runtime/host_matmul_backend.h"
 #include "core/bf16.h"
 #include "storage/ssd_expert_cache/cache.h"
 #include "core/tensor.h"
@@ -81,8 +82,19 @@ void prepare_execution(ExecContext& ctx) {
     // cleanup until TensorStorage/storage-id tracking replaces pointer-based
     // borrowed-view inference.
     for (const auto& node : nodes) {
+        if (node.op_type == OpType::SDPA_MLA_ABSORB ||
+            node.op_type == OpType::HY4_INDEXER) {
+            // These CPU kernels copy updates into input 7 and never make
+            // their output alias that state. A persistent INPUT is excluded
+            // from the release queue, so ordinary intermediate liveness is
+            // safe. Keep other state layouts and device execution conservative.
+            if (!ctx.backend || ctx.backend->is_device_resident() ||
+                node.inputs.size() <= 7 || node.inputs[7] >= nodes.size() ||
+                nodes[node.inputs[7]].op_type != OpType::INPUT)
+                return;
+            continue;
+        }
         if (node.op_type == OpType::SDPA || node.op_type == OpType::SDPA_MLA ||
-            node.op_type == OpType::SDPA_MLA_ABSORB ||
             node.op_type == OpType::GATED_DELTANET_PREFILL ||
             node.op_type == OpType::GATED_DELTANET_DECODE ||
             node.op_type == OpType::GATED_DELTANET_CONV_DECODE ||
@@ -103,47 +115,39 @@ void prepare_execution(ExecContext& ctx) {
     for (const auto& node : nodes) max_id = std::max(max_id, node.id);
     const size_t M = (size_t)max_id + 1;
 
-    std::vector<uint32_t> owner_root(M, 0);
-    std::vector<int> node_index(M, -1);
-    std::vector<int> last_direct_use(M, -1);
-    std::vector<int> last_storage_use(M, -1);
+    std::vector<int> last_use(M, -1);
     std::vector<uint8_t> keep(M, 0);
 
-    auto is_view_like = [](OpType op) {
-        // RESHAPE may materialize at runtime for non-contiguous inputs, but it
-        // may also borrow. Treating it as view-like for owner propagation keeps
-        // producers alive for the borrowed case; runtime release skips it when
-        // it actually borrowed and releases it when it materialized.
-        return op == OpType::RESHAPE || op == OpType::PERMUTE || op == OpType::SLICE;
+    auto is_view_like = [&](OpType op) {
+        return op == OpType::RESHAPE || op == OpType::PERMUTE ||
+               op == OpType::SLICE ||
+               (op == OpType::CONTIGUOUS && ctx.backend &&
+                ctx.backend->is_device_resident());
     };
 
-    for (size_t i = 0; i < N; i++) {
+    for (size_t i = 0; i < N; ++i) {
         const auto& node = nodes[i];
-        if (node.id >= M) continue;
-        node_index[node.id] = (int)i;
-
-        if (is_view_like(node.op_type) && !node.inputs.empty() && node.inputs[0] < M) {
-            owner_root[node.id] = owner_root[node.inputs[0]];
-        } else {
-            owner_root[node.id] = node.id;
-        }
-        if (owner_root[node.id] >= M) owner_root[node.id] = node.id;
-
-        for (uint32_t inp_id : node.inputs) {
-            if (inp_id >= M) continue;
-            last_direct_use[inp_id] = (int)i;
-            uint32_t root = owner_root[inp_id];
-            if (root < M) last_storage_use[root] = std::max(last_storage_use[root], (int)i);
-        }
+        // Dead materialized outputs can be released at their creation.
+        last_use[node.id] = std::max(last_use[node.id], static_cast<int>(i));
+        for (uint32_t input_id : node.inputs)
+            if (input_id < M)
+                last_use[input_id] = std::max(last_use[input_id], static_cast<int>(i));
     }
+    for (uint32_t output_id : ctx.graph->graph_outputs)
+        if (output_id < M) keep[output_id] = 1;
 
-    // Graph outputs are returned to the caller. If the output is a borrowed
-    // view, its storage owner must also stay alive past execute_graph().
-    for (uint32_t out_id : ctx.graph->graph_outputs) {
-        if (out_id >= M) continue;
-        keep[out_id] = 1;
-        uint32_t root = owner_root[out_id];
-        if (root < M) keep[root] = 1;
+    // Propagate lifetime through EVERY link, in reverse topological order.
+    // RESHAPE can materialize, so an intermediate view may itself own storage;
+    // jumping straight to the original root would release that owner early.
+    // Retaining intermediate metadata also lets runtime cleanup distinguish
+    // borrowed reshapes from materialized ones after the last consumer.
+    for (size_t i = N; i-- > 0;) {
+        const auto& node = nodes[i];
+        if (!is_view_like(node.op_type) || node.inputs.empty()) continue;
+        const uint32_t source = node.inputs[0];
+        if (source >= M) continue;
+        last_use[source] = std::max(last_use[source], last_use[node.id]);
+        keep[source] |= keep[node.id];
     }
 
     for (const auto& node : nodes) {
@@ -151,8 +155,7 @@ void prepare_execution(ExecContext& ctx) {
         if (node.op_type == OpType::INPUT || node.op_type == OpType::CONSTANT) continue;
         if (keep[node.id]) continue;
 
-        int rel_at = std::max(last_direct_use[node.id], last_storage_use[node.id]);
-        if (rel_at < 0) rel_at = node_index[node.id];  // dead materialized output
+        const int rel_at = last_use[node.id];
         if (rel_at >= 0 && (size_t)rel_at < ctx.release_queue.size()) {
             ctx.release_queue[rel_at].push_back(node.id);
         }
@@ -673,6 +676,19 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
                     ctx.execution_failed = true;
                     return;
                 }
+            }
+            if (!delegated && ctx.matmul_backend &&
+                node.op_type == OpType::MATMUL) {
+                const auto result = ctx.matmul_backend->dispatch(
+                    node, inputs, &out, ctx.thread_pool);
+                if (result == HostMatmulResult::Failed) {
+                    std::fprintf(stderr,
+                        "execute: host matmul accelerator failed at node %u\n",
+                        node.id);
+                    ctx.execution_failed = true;
+                    return;
+                }
+                delegated = result == HostMatmulResult::Completed;
             }
             if (!delegated)
                 ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);

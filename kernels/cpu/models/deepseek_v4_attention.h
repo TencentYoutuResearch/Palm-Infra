@@ -157,6 +157,8 @@ struct Hy4IndexerConfig {
     int rope_dim = 64;      // leading-none split: nope then rope
     int top_k = 2048;
     int capacity = 0;       // capacity of key_cache
+    float norm_eps = 1e-5f; // key LayerNorm uses the model's rms_norm_eps
+    bool round_bf16 = true; // legacy HF emulation; GGUF uses FP32 compute/cache
     Dsv4RopeConfig rope;
 };
 
