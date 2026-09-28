@@ -1,10 +1,14 @@
 #include "graph/execute.h"
 #include "backends/cpu/backend.h"
+#include "backends/cpu/moe_ops.h"
 #include "core/fp16.h"
 #include "kernels/cpu/moe/moe.h"
 #include "storage/ssd_expert_cache/cache.h"
 #include "core/tensor.h"
 #include "runtime/threading.h"
+#include "runtime/expert_provider.h"
+#include <thread>
+#include <chrono>
 
 #include <algorithm>
 #include <cmath>
@@ -108,6 +112,7 @@ static void ref_moe(const std::vector<float>& hidden,
             }
         }
 
+        if (SI == 0) continue;
         for (int j = 0; j < SI; j++) {
             s_gate[j] = dot(shared_gate, j * H, x, H);
             s_up[j] = dot(shared_up, j * H, x, H);
@@ -223,11 +228,155 @@ static bool gguf_router_prefill_matches_single_token() {
     if (!kernel_qwen3_moe(inputs, single_result, &pool,
                           H, E, TOP_K, I, 0, 0, true, false))
         return false;
-    return std::memcmp(all_output.data() + (M - 1) * H,
-                       single_output.data(), H * sizeof(float)) == 0;
+    // Q8 singleton GEMV and multi-token kernels use different reduction
+    // orders. Validate both against independently decoded expert weights and
+    // the scalar MoE reference, using the existing FP32 MoE tolerance.
+    auto decode_q8 = [](const std::vector<uint8_t>& encoded) {
+        std::vector<float> decoded(encoded.size() / 34 * 32);
+        for (size_t block = 0; block < encoded.size() / 34; ++block) {
+            __fp16 scale;
+            std::memcpy(&scale, encoded.data() + block * 34, sizeof(scale));
+            for (int k = 0; k < 32; ++k) {
+                int8_t value;
+                std::memcpy(&value, encoded.data() + block * 34 + 2 + k, 1);
+                decoded[block * 32 + k] = float(scale) * float(value);
+            }
+        }
+        return decoded;
+    };
+    std::vector<float> reference(H * M);
+    ref_moe(hidden, fp16_to_float(to_fp16(router_fp32)),
+            decode_q8(gate_up), decode_q8(down), {}, {}, {}, {}, reference,
+            H, M, E, TOP_K, I, 0);
+    float max_error = 0.f;
+    for (size_t i = 0; i < all_output.size(); ++i) {
+        if (!std::isfinite(all_output[i]) || !std::isfinite(reference[i])) return false;
+        max_error = std::max(max_error, std::abs(all_output[i] - reference[i]));
+    }
+    for (int i = 0; i < H; ++i) {
+        if (!std::isfinite(single_output[i])) return false;
+        max_error = std::max(max_error,
+            std::abs(single_output[i] - reference[(M - 1) * H + i]));
+        max_error = std::max(max_error,
+            std::abs(single_output[i] - all_output[(M - 1) * H + i]));
+    }
+    std::printf("  Q8 MoE prefill/single reference maximum error: %.9g\n", max_error);
+    return max_error <= 1e-5f;
+}
+
+// A controlled provider exercises the wait path without SSD timing races.
+struct DelayedProvider : ExpertProvider {
+    ExpertSource gate, down;
+    Tensor gate_weight, down_weight;
+    bool fail = false, ready = false;
+    int probes = 0, waits = 0, releases = 0, live = 0;
+
+    DelayedProvider(Tensor gate_tensor, Tensor down_tensor)
+        : gate_weight(gate_tensor), down_weight(down_tensor) {
+        gate.provider = down.provider = this;
+    }
+    bool borrow(const ExpertSource*, const ExpertSource*, int,
+                ExpertLease& out, bool wait) override {
+        out.reset();
+        if (!wait) {
+            ++probes;
+            if (!ready) return false;
+        } else {
+            ++waits;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if (fail) return false;
+        }
+        ++live;
+        out = ExpertLease(*this, this, gate_weight, down_weight);
+        return true;
+    }
+    bool request_many(const ExpertSource*, const ExpertSource*,
+                      const std::vector<int>&) override { return true; }
+    bool retain_for_next_forward(const ExpertSource*, const ExpertSource*,
+                                 const std::vector<int>&, bool) override {
+        return true;
+    }
+    size_t resident_count(const ExpertSource*, const ExpertSource*,
+                          const std::vector<int>& experts) const override {
+        return experts.size();
+    }
+    bool contains(const ExpertSource*, const ExpertSource*, int) const override {
+        return true;
+    }
+    bool is_ready(const ExpertSource*, const ExpertSource*, int) const override {
+        return ready;
+    }
+    bool evict(const ExpertSource*, const ExpertSource*, int) override {
+        return false;
+    }
+    void release_lease(void*) noexcept override {
+        --live;
+        ++releases;
+    }
+};
+
+static int test_delayed_provider_wait() {
+    constexpr int H = 128, I = 128, E = 1;
+    auto tensor = [](int a, int b, int c, void* data) {
+        return Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                              a, b, c, 1, data);
+    };
+    std::vector<float> x(H), router(H), gate(2 * I * H), down(H * I);
+    std::vector<float> reference(H), output(H);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin(float(i)) * 0.1f;
+    for (size_t i = 0; i < gate.size(); ++i) gate[i] = std::cos(float(i)) * 0.02f;
+    for (size_t i = 0; i < down.size(); ++i) down[i] = std::sin(float(i)) * 0.03f;
+    auto hidden = tensor(H, 1, 1, x.data());
+    auto router_tensor = tensor(E, H, 1, router.data());
+    auto gate_tensor = tensor(E, 2 * I, H, gate.data());
+    auto down_tensor = tensor(E, H, I, down.data());
+    auto output_tensor = tensor(H, 1, 1, output.data());
+    auto reference_tensor = tensor(H, 1, 1, reference.data());
+    std::vector<const Tensor*> inputs{
+        &hidden, &router_tensor, &gate_tensor, &down_tensor};
+    ThreadPool pool(4);
+    pool.resize(4, 1024);  // Combine idle yields with provider park/resume.
+    if (!kernel_qwen3_moe(inputs, reference_tensor, &pool,
+                          H, E, 1, I, 0, 0, true, false)) return 1;
+
+    DelayedProvider provider(tensor(2 * I, H, 1, gate.data()),
+                             tensor(H, I, 1, down.data()));
+    gate_tensor.data = down_tensor.data = nullptr;
+    gate_tensor.moe_ssd_source = &provider.gate;
+    down_tensor.moe_ssd_source = &provider.down;
+    // Missing, already ready, and failed I/O; every call must leave the pool usable.
+    for (int mode = 0; mode < 3; ++mode) {
+        provider.ready = mode == 1;
+        provider.fail = mode == 2;
+        const int old_waits = provider.waits;
+        for (int iteration = 0; iteration < 20; ++iteration) {
+            const bool ok = kernel_qwen3_moe(inputs, output_tensor, &pool,
+                                             H, E, 1, I, 0, 0, true, false);
+            if (ok == provider.fail || provider.live) return 2;
+            if (ok) {
+                for (int i = 0; i < H; ++i) {
+                    if (std::abs(output[i] - reference[i]) > 1e-7f) return 3;
+                }
+            }
+            std::vector<int> seen(256);
+            pool.parallel_for(0, 256, 1, [&](int, int begin, int end) {
+                for (int i = begin; i < end; ++i) seen[i] = i + 1;
+            });
+            for (int i = 0; i < 256; ++i) {
+                if (seen[i] != i + 1) return 4;
+            }
+        }
+        const int expected_waits = mode == 1 ? 0 : 20;
+        if (provider.waits - old_waits != expected_waits) return 5;
+    }
+    if (provider.probes != 60 || provider.releases != 40) return 6;
+    pool.park();  // Destruction must also wake and join parked workers.
+    return 0;
 }
 
 int main() {
+    CHECK(test_delayed_provider_wait() == 0,
+          "delayed/ready/failed expert borrow preserves output and worker recovery");
     CHECK(gguf_router_prefill_matches_single_token(),
           "GGUF MoE router agrees between 33-token prefill and one token");
     const int H = 8;
@@ -492,6 +641,25 @@ int main() {
             10.0f / (1.0f + std::exp(-10.0f)) * 10.0f;
         CHECK(std::abs(output_data[0] - 2.0f * clipped) < 1e-3f,
               "DeepSeek hash MoE applies ungated shared expert and SwiGLU limit");
+
+        // Hy4 clips routed gate/up logits, but its shared branch must retain
+        // values above that threshold. Exercise the serialized graph fields.
+        GraphNode hy4;
+        hy4.op_type = OpType::MOE;
+        hy4.params.i32 = {1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0, -1, -1, -1};
+        hy4.params.f32 = {1.0f, 10.0f, 0.0f};
+        CHECK(dispatch_cpu_moe(hy4, deepseek_inputs, &output, nullptr),
+              "Hy4 MoE accepts independent shared clamp");
+        CHECK(std::abs(output_data[0] - (clipped + 160000.0f)) < 1e-3f,
+              "Hy4 clips routed experts without clipping shared expert");
+        hy4.params.f32[2] = 20.0f;
+        CHECK(dispatch_cpu_moe(hy4, deepseek_inputs, &output, nullptr) &&
+                  std::abs(output_data[0] - (clipped + 400.0f)) < 1e-3f,
+              "shared clamp has its own positive threshold");
+        hy4.params.f32.resize(2);
+        CHECK(dispatch_cpu_moe(hy4, deepseek_inputs, &output, nullptr) &&
+                  std::abs(output_data[0] - 2.0f * clipped) < 1e-3f,
+              "legacy generic MoE retains inherited clamp semantics");
     }
 
     return failures == 0 ? 0 : 1;

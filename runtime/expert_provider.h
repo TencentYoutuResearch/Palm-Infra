@@ -6,6 +6,7 @@
 #include <vector>
 
 class ExpertProvider;
+class MoeSsdCache;
 
 // Stable source identity. The provider owns sources and outlives all leases.
 // Storage-specific descriptors belong to the provider, not to compute code.
@@ -44,6 +45,7 @@ public:
     void reset() noexcept;
 
 private:
+    friend class MoeSsdCache;
     ExpertProvider* owner_ = nullptr;
     void* token_ = nullptr;
 };

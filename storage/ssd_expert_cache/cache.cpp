@@ -66,12 +66,25 @@ bool components_fit_expert_stride(const MoeSsdTensorSpec& spec) {
            relative <= spec.expert_stride - spec.data_bytes;
 }
 
+bool source_capacity_bytes(const MoeSsdTensorSpec& spec, size_t alignment,
+                           size_t& bytes) {
+    if (!source_bytes(spec, bytes)) return false;
+    if (alignment == 0) return true;
+    // Alignment is at most one page and each registered component is a page
+    // multiple. Reserve one extra active page for each nonempty read window.
+    const size_t padding = static_cast<size_t>(getpagesize()) *
+        (size_t(spec.data_bytes != 0) + size_t(spec.scales_bytes != 0));
+    if (bytes > std::numeric_limits<size_t>::max() - padding) return false;
+    bytes += padding;
+    return true;
+}
+
 bool expert_pair_bytes(const MoeSsdTensorSource* gate_up,
-                       const MoeSsdTensorSource* down, size_t& bytes) {
+                       const MoeSsdTensorSource* down, size_t& bytes, size_t alignment) {
     size_t gate_up_bytes = 0;
     size_t down_bytes = 0;
-    if (!source_bytes(gate_up->spec, gate_up_bytes) ||
-        !source_bytes(down->spec, down_bytes) ||
+    if (!source_capacity_bytes(gate_up->spec, alignment, gate_up_bytes) ||
+        !source_capacity_bytes(down->spec, alignment, down_bytes) ||
         down_bytes > std::numeric_limits<size_t>::max() - gate_up_bytes) {
         return false;
     }
@@ -100,7 +113,9 @@ bool MoeSsdCache::clear_resident() {
     for (const auto& entry : entries_) {
         if (entry->is_loading() || entry->pins != 0) return false;
     }
+    eviction_entries_.clear();
     entries_.clear();
+    if (buffer_pool_) buffer_pool_->clear();
     entry_locations_.clear();
     layer_entries_.clear();
     layer_resident_bytes_.clear();
@@ -160,11 +175,10 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         return false;
     }
 #if defined(__APPLE__)
-    // The application cache below is the residency policy for routed
-    // experts.  Letting pread() also populate the kernel file cache would
-    // silently retain much more than --ssd-cache-mb and make a warm process
-    // look like a faster SSD.  This only applies to the dedicated SSD fd;
-    // regular (non-expert) package mmap weights retain their normal policy.
+    // Request uncached expert reads on this dedicated fd; keep the dense
+    // mmap descriptor's policy unchanged. F_NOCACHE does not guarantee that
+    // every logical read reaches the device: existing UBC pages and alignment
+    // can still affect the path. Cache byte counters remain logical traffic.
     if (fcntl(fd, F_NOCACHE, 1) != 0) {
         std::fprintf(stderr, "MoE SSD: warning: could not disable macOS file cache: %s\n",
                      std::strerror(errno));
@@ -197,7 +211,11 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         layers_.clear();
         layer_layouts_.clear();
         layer_capacity_bytes_.clear();
+        eviction_entries_.clear();
         entries_.clear();
+        buffer_pool_.reset();
+        buffer_reserve_bytes_ = 0;
+        read_alignment_ = 0;
         entry_locations_.clear();
         layer_entries_.clear();
         layer_resident_bytes_.clear();
@@ -220,6 +238,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
 
 bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (buffer_pool_ || read_alignment_) return false;  // Layout is frozen.
     if (fd_ < 0 || spec.weight_ref.empty() || spec.layer < 0 ||
         spec.num_experts <= 0 || spec.rows <= 0 || spec.cols <= 0 ||
         spec.data_bytes == 0) {
@@ -439,6 +458,7 @@ bool MoeSsdCache::set_global_capacity_pool(bool enabled) {
         std::fprintf(stderr, "MoE SSD: cache policy must be configured before expert I/O\n");
         return false;
     }
+    if (!enabled && (buffer_pool_ || read_alignment_)) return false;
     global_capacity_pool_ = enabled;
     if (enabled) {
         layer_capacity_bytes_.clear();
@@ -446,6 +466,68 @@ bool MoeSsdCache::set_global_capacity_pool(bool enabled) {
         shallow_favoring_layers_ = 0;
     }
     return true;
+}
+
+bool MoeSsdCache::set_read_alignment(size_t alignment) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!entries_.empty() || !io_jobs_.empty() || !low_priority_io_jobs_.empty() ||
+        buffer_pool_) return false;
+#if defined(__APPLE__)
+    if (fd_ < 0 || !global_capacity_pool_ || sources_.empty()) return false;
+    const size_t page = static_cast<size_t>(getpagesize());
+    if (alignment > page || (alignment && (alignment & (alignment - 1))))
+        return false;
+    auto layouts = layer_layouts_;
+    for (auto& layout : layouts) layout.second.pair_bytes = 0;
+    for (const auto& source : sources_) {
+        const auto& spec = source.second.spec;
+        if (alignment && (spec.data_bytes % page || spec.scales_bytes % page))
+            return false;
+        size_t bytes = 0;
+        size_t& pair = layouts.at(spec.layer).pair_bytes;
+        if (!source_capacity_bytes(spec, alignment, bytes) ||
+            bytes > std::numeric_limits<size_t>::max() - pair) return false;
+        pair += bytes;
+    }
+    layer_layouts_ = std::move(layouts);
+    read_alignment_ = alignment;
+    return true;
+#else
+    return alignment == 0;
+#endif
+}
+
+bool MoeSsdCache::set_buffer_reuse_capacity(size_t bytes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!entries_.empty() || !io_jobs_.empty() || !low_priority_io_jobs_.empty())
+        return false;
+    if (bytes == 0) {
+        buffer_pool_.reset();
+        buffer_reserve_bytes_ = 0;
+        return true;
+    }
+#if defined(__APPLE__)
+    if (fd_ < 0 || !global_capacity_pool_ || sources_.empty()) return false;
+    const size_t page = static_cast<size_t>(getpagesize());
+    if (bytes % page != 0) return false;
+    // Page-multiple payloads have exact capacity charges, including any
+    // read-window padding. Reject layouts with unaccounted rounding overhead.
+    for (const auto& source : sources_) {
+        if (source.second.spec.data_bytes % page != 0 ||
+            source.second.spec.scales_bytes % page != 0) return false;
+    }
+    size_t largest_pair = 0;
+    for (const auto& layout : layer_layouts_)
+        largest_pair = std::max(largest_pair, layout.second.pair_bytes);
+    if (largest_pair == 0 || bytes >= capacity_bytes_ ||
+        largest_pair > (capacity_bytes_ - bytes) / 2) return false;
+    auto pool = std::make_unique<BufferPool>(bytes);
+    buffer_pool_ = std::move(pool);
+    buffer_reserve_bytes_ = bytes + largest_pair;
+    return true;
+#else
+    return false;
+#endif
 }
 
 void MoeSsdCache::begin_forward_pass() {
@@ -472,7 +554,8 @@ const MoeSsdTensorSource* MoeSsdCache::find_source(const std::string& weight_ref
 bool MoeSsdCache::valid_pair(const MoeSsdTensorSource* gate_up,
                              const MoeSsdTensorSource* down,
                              int expert) const {
-    return gate_up && down && gate_up->cache == this && down->cache == this &&
+    return gate_up && down && (!buffer_pool_ || gate_up != down) &&
+           gate_up->cache == this && down->cache == this &&
            gate_up->spec.layer == down->spec.layer &&
            gate_up->spec.num_experts == down->spec.num_experts &&
            expert >= 0 && expert < gate_up->spec.num_experts;
@@ -519,13 +602,17 @@ std::unique_ptr<MoeSsdCache::Entry> MoeSsdCache::remove_entry_locked(
     const auto in_layer =
         std::find(layer_entries->second.begin(), layer_entries->second.end(),
                   entry);
-    const size_t bytes = entry->bytes();
+    const auto in_eviction_order =
+        std::find(eviction_entries_.begin(), eviction_entries_.end(), entry);
+    const size_t bytes = entry->capacity_bytes();
     if (in_layer == layer_entries->second.end() ||
+        in_eviction_order == eviction_entries_.end() ||
         layer_resident->second < bytes || resident_bytes_ < bytes) {
         return nullptr;
     }
 
     std::unique_ptr<Entry> removed = std::move(*location->second);
+    eviction_entries_.erase(in_eviction_order);
     entries_.erase(location->second);
     entry_locations_.erase(location);
     layer_entries->second.erase(in_layer);
@@ -536,7 +623,7 @@ std::unique_ptr<MoeSsdCache::Entry> MoeSsdCache::remove_entry_locked(
         LayerCounters& counters = layer_stats_[layer];
         if (entry->speculative) {
             ++counters.unused_prefetch_evictions;
-            unused_prefetch_bytes_ += bytes;
+            unused_prefetch_bytes_ += entry->bytes();
         }
         const uint64_t key =
             (static_cast<uint64_t>(static_cast<uint32_t>(layer)) << 32) |
@@ -550,10 +637,10 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     const MoeSsdTensorSource* gate_up, const MoeSsdTensorSource* down, int expert,
     bool speculative, float prediction_confidence) {
     size_t required = 0;
-    if (!expert_pair_bytes(gate_up, down, required))
+    if (!expert_pair_bytes(gate_up, down, required, read_alignment_))
         return nullptr;
     const size_t layer_capacity = layer_capacity_bytes_locked(gate_up->spec.layer);
-    const size_t capacity = global_capacity_pool_ ? capacity_bytes_ : layer_capacity;
+    const size_t capacity = global_capacity_pool_ ? expert_capacity_bytes() : layer_capacity;
     if (required > capacity) {
         std::fprintf(stderr,
                      "MoE SSD: one expert pair needs %.1f MB but cache holds %.1f MB\n",
@@ -581,10 +668,17 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
             break;
         Entry* victim_entry = nullptr;
         if (global_capacity_pool_) {
-            for (const auto& entry : entries_) {
+            // The cache mutex keeps the route and capacity policy stable
+            // throughout this scan; compute its preference once per victim.
+            const bool prefer_left = prefer_left_layer_eviction_locked();
+            VictimKey best_key{};
+            for (auto* entry : eviction_entries_) {
                 if (entry->is_loading() || entry->pins != 0) continue;
-                if (!victim_entry || global_victim_before_locked(entry.get(), victim_entry)) {
-                    victim_entry = entry.get();
+                const auto key = victim_key_locked(entry, prefer_left);
+                if (!victim_entry || global_victim_before_locked(
+                        entry, key, victim_entry, best_key)) {
+                    victim_entry = entry;
+                    best_key = key;
                 }
             }
         } else {
@@ -624,6 +718,15 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     }
 
     auto entry = recycled ? std::move(recycled) : std::make_unique<Entry>();
+#if defined(__APPLE__)
+    entry->gate_up_data.pool = buffer_pool_.get();
+    entry->gate_up_scales.pool = buffer_pool_.get();
+    entry->down_data.pool = buffer_pool_.get();
+    entry->down_scales.pool = buffer_pool_.get();
+    for (ByteBuffer* buffer : {&entry->gate_up_data, &entry->gate_up_scales,
+                               &entry->down_data, &entry->down_scales})
+        buffer->read_alignment = read_alignment_;
+#endif
     entry->gate_up = gate_up;
     entry->down = down;
     entry->expert = expert;
@@ -645,10 +748,11 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     entry->gate_up_scales.resize(static_cast<size_t>(gate_up->spec.scales_bytes));
     entry->down_data.resize(static_cast<size_t>(down->spec.data_bytes));
     entry->down_scales.resize(static_cast<size_t>(down->spec.scales_bytes));
-    resident_bytes_ += entry->bytes();
-    layer_resident += entry->bytes();
+    resident_bytes_ += entry->capacity_bytes();
+    layer_resident += entry->capacity_bytes();
     Entry* raw = entry.get();
     entries_.push_back(std::move(entry));
+    eviction_entries_.push_back(raw);
     auto location = std::prev(entries_.end());
     entry_locations_.emplace(raw, location);
     layer_entries.push_back(raw);
@@ -664,52 +768,41 @@ bool MoeSsdCache::prefer_left_layer_eviction_locked() const {
         route == layer_route_widths_.end() || route->second == 0) {
         return false;
     }
-    const size_t fair_share = capacity_bytes_ / layers_.size();
+    const size_t fair_share = expert_capacity_bytes() / layers_.size();
     const size_t fair_share_pairs = fair_share / layout->second.pair_bytes;
     return fair_share_pairs < route->second;
 }
 
-bool MoeSsdCache::global_victim_before_locked(const Entry* candidate,
-                                              const Entry* current) const {
-    const bool prefer_left = prefer_left_layer_eviction_locked();
-    auto rank = [&](const Entry* entry) {
-        const bool stale = entry->forward_epoch != forward_epoch_;
-        const int layer = entry->gate_up->spec.layer;
-        const bool shallow = shallow_favoring_layers_ > 0 && layer < shallow_favoring_layers_;
-        const bool left = active_layer_ >= 0 && layer < active_layer_;
-        int value = 0;
-        // A streaming-sized cache cannot preserve one complete route per
-        // layer, so recycle finished layers before displacing entries which
-        // may still be used later in this pass. Once every layer's fair share
-        // can hold the current route, least-stale ordering instead preserves
-        // the stronger cross-token locality.
-        if ((prefer_left && left) || (!prefer_left && stale))
-            value = shallow ? 1 : 0;
-        else if ((prefer_left && stale) || (!prefer_left && left))
-            value = shallow ? 3 : 2;
-        else value = shallow ? 5 : 4;
-        return value + (entry->retained ? 6 : 0);
-    };
-    const int candidate_rank = rank(candidate);
-    const int current_rank = rank(current);
-    if (candidate_rank != current_rank) return candidate_rank < current_rank;
-    const bool candidate_stale =
-        candidate->forward_epoch != forward_epoch_;
-    const bool current_stale =
-        current->forward_epoch != forward_epoch_;
-    const int candidate_layer = candidate->gate_up->spec.layer;
-    const int current_layer = current->gate_up->spec.layer;
-    const bool candidate_future =
-        candidate_stale && active_layer_ >= 0 &&
-        candidate_layer >= active_layer_;
-    const bool current_future =
-        current_stale && active_layer_ >= 0 &&
-        current_layer >= active_layer_;
-    if (candidate_future && current_future &&
-        candidate_layer != current_layer) {
+MoeSsdCache::VictimKey MoeSsdCache::victim_key_locked(
+    const Entry* entry, bool prefer_left) const {
+    const bool stale = entry->forward_epoch != forward_epoch_;
+    const int layer = entry->gate_up->spec.layer;
+    const bool shallow = shallow_favoring_layers_ > 0 && layer < shallow_favoring_layers_;
+    const bool left = active_layer_ >= 0 && layer < active_layer_;
+    int rank;
+    // A streaming-sized cache recycles finished layers first. Once each
+    // layer's fair share can hold its route, stale entries take precedence
+    // to preserve stronger cross-token locality.
+    if ((prefer_left && left) || (!prefer_left && stale))
+        rank = shallow ? 1 : 0;
+    else if ((prefer_left && stale) || (!prefer_left && left))
+        rank = shallow ? 3 : 2;
+    else
+        rank = shallow ? 5 : 4;
+    return {rank + (entry->retained ? 6 : 0), layer,
+            stale && active_layer_ >= 0 && layer >= active_layer_};
+}
+
+bool MoeSsdCache::global_victim_before_locked(
+    const Entry* candidate, VictimKey candidate_key,
+    const Entry* current, VictimKey current_key) const {
+    if (candidate_key.rank != current_key.rank)
+        return candidate_key.rank < current_key.rank;
+    if (candidate_key.future && current_key.future &&
+        candidate_key.layer != current_key.layer) {
         // If future residency must be sacrificed, evict the entry whose next
         // possible use is farthest away.
-        return candidate_layer > current_layer;
+        return candidate_key.layer > current_key.layer;
     }
     const bool candidate_predicted = candidate->prediction_epoch == forward_epoch_;
     const bool current_predicted = current->prediction_epoch == forward_epoch_;
@@ -736,7 +829,7 @@ bool MoeSsdCache::retain_for_next_forward(
     if (layout == layer_layouts_.end() || layout->second.pair_bytes == 0)
         return false;
     const size_t layer_share =
-        layers_.empty() ? capacity_bytes_ : capacity_bytes_ / layers_.size();
+        layers_.empty() ? expert_capacity_bytes() : expert_capacity_bytes() / layers_.size();
     size_t retain_limit =
         std::max<size_t>(1, layer_share / layout->second.pair_bytes);
     // Do not let a large per-layer fair share pin a long tail of nearly cold
@@ -1114,10 +1207,10 @@ bool MoeSsdCache::can_prefetch_pairs(const MoeSsdTensorSource* gate_up,
                                      size_t pairs) const {
     if (!valid_pair(gate_up, down, 0) || pairs == 0) return false;
     size_t pair_bytes = 0;
-    if (!expert_pair_bytes(gate_up, down, pair_bytes))
+    if (!expert_pair_bytes(gate_up, down, pair_bytes, read_alignment_))
         return false;
     std::lock_guard<std::mutex> lock(mutex_);
-    const size_t capacity = global_capacity_pool_ ? capacity_bytes_
+    const size_t capacity = global_capacity_pool_ ? expert_capacity_bytes()
                                                    : layer_capacity_bytes_locked(gate_up->spec.layer);
     return pair_bytes <= capacity / pairs;
 }
@@ -1130,7 +1223,7 @@ size_t MoeSsdCache::layer_capacity_bytes(int layer) const {
 size_t MoeSsdCache::layer_capacity_bytes_locked(int layer) const {
     const auto configured = layer_capacity_bytes_.find(layer);
     if (configured != layer_capacity_bytes_.end()) return configured->second;
-    return layers_.empty() ? capacity_bytes_ : capacity_bytes_ / layers_.size();
+    return layers_.empty() ? expert_capacity_bytes() : expert_capacity_bytes() / layers_.size();
 }
 
 size_t MoeSsdCache::resident_count(const MoeSsdTensorSource* gate_up,
@@ -1209,9 +1302,9 @@ bool MoeSsdCache::acquire_impl(const MoeSsdTensorSource* gate_up,
     };
     std::unique_lock<std::mutex> lock(mutex_);
     size_t required = 0;
-    if (!expert_pair_bytes(gate_up, down, required))
+    if (!expert_pair_bytes(gate_up, down, required, read_alignment_))
         return false;
-    const size_t capacity = global_capacity_pool_ ? capacity_bytes_
+    const size_t capacity = global_capacity_pool_ ? expert_capacity_bytes()
                                                    : layer_capacity_bytes_locked(gate_up->spec.layer);
     if (required > capacity) {
         std::fprintf(stderr,
@@ -1221,7 +1314,8 @@ bool MoeSsdCache::acquire_impl(const MoeSsdTensorSource* gate_up,
     }
     if (global_capacity_pool_) active_layer_ = gate_up->spec.layer;
     Entry* entry = find_entry_locked(gate_up, down, expert);
-    if (!wait && (!entry || !entry->is_ready())) return false;
+    const bool ready_at_lookup = entry && entry->is_ready();
+    if (!wait && !ready_at_lookup) return false;
     if (entry && entry->state == Entry::State::Failed) {
         if (remove_entry_locked(entry, false))
             entry = nullptr;
@@ -1296,6 +1390,8 @@ bool MoeSsdCache::acquire_impl(const MoeSsdTensorSource* gate_up,
         *down, entry->down_data.data(), entry->down_scales.data());
     LayerCounters& layer_counters = layer_stats_[gate_up->spec.layer];
     ++layer_counters.demand_acquires;
+    if (ready_at_lookup) ++layer_counters.acquires_ready_at_lookup;
+    if (waited) ++layer_counters.acquires_waited;
     if (fresh_miss) ++layer_counters.demand_misses;
     else ++layer_counters.demand_hits;
     if (waited) {
@@ -1320,6 +1416,13 @@ bool MoeSsdCache::acquire_impl(const MoeSsdTensorSource* gate_up,
 MoeSsdCache::Stats MoeSsdCache::stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     Stats result;
+    result.buffer_reserve_bytes = buffer_reserve_bytes_;
+#if defined(__APPLE__)
+    if (buffer_pool_) {
+        result.reusable_buffer_bytes = buffer_pool_->bytes;
+        result.buffer_reuses = buffer_pool_->reuses;
+    }
+#endif
     result.hits = hits_;
     result.misses = misses_;
     result.evictions = evictions_;
@@ -1355,6 +1458,8 @@ MoeSsdCache::Stats MoeSsdCache::stats() const {
             counters.prefetch_admitted,
             counters.unused_prefetch_evictions,
             counters.short_term_reloads,
+            counters.acquires_ready_at_lookup,
+            counters.acquires_waited,
         });
     }
     std::sort(result.layers.begin(), result.layers.end(),
@@ -1366,6 +1471,9 @@ MoeSsdCache::Stats MoeSsdCache::stats() const {
 
 void MoeSsdCache::reset_stats() {
     std::lock_guard<std::mutex> lock(mutex_);
+#if defined(__APPLE__)
+    if (buffer_pool_) buffer_pool_->reuses = 0;
+#endif
     hits_ = 0;
     misses_ = 0;
     evictions_ = 0;
