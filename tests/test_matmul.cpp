@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <limits>
 
 static int failures = 0;
 
@@ -65,13 +66,16 @@ static float relative_l2_error(const float* got, const float* ref, int n) {
 }
 
 static bool gguf_native_matmul_matches_block_decoder() {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
     constexpr Precision formats[] = {
         Precision::GGUF_Q4_K, Precision::GGUF_Q5_K,
         Precision::GGUF_Q6_K, Precision::GGUF_Q8_0,
         Precision::GGUF_IQ2_XXS, Precision::GGUF_IQ3_XXS,
         Precision::GGUF_STQ1_0, Precision::GGUF_IQ4_XS,
     };
-    constexpr int M = 32;
+    constexpr int M = 128;
     // Cross several dynamic scheduling blocks, including an incomplete tail.
     constexpr int N = 257;
     ThreadPool pool(4);
@@ -81,6 +85,7 @@ static bool gguf_native_matmul_matches_block_decoder() {
         const int K = 2 * values_per_block;
         std::vector<uint8_t> encoded(N * 2 * bytes_per_block);
         std::vector<float> input(M * K), output(M * N), reference(M * N);
+        std::vector<double> precise(M * N), magnitude(M * N);
         for (int i = 0; i < M * K; ++i)
             input[i] = static_cast<float>((i * 7) % 23 - 11) * 0.01f;
         for (size_t i = 0; i < encoded.size(); ++i)
@@ -109,16 +114,23 @@ static bool gguf_native_matmul_matches_block_decoder() {
         for (int n = 0; n < N; ++n) {
             for (int m = 0; m < M; ++m) {
                 float sum = 0.0f;
+                double sum64 = 0.0, abs64 = 0.0;
                 for (int block = 0; block < 2; ++block) {
                     const uint8_t* data = encoded.data() +
                         (n * 2 + block) * bytes_per_block;
                     if (!gguf_k_dequantize_block(format, data, decoded.data()))
                         return false;
-                    for (int k = 0; k < values_per_block; ++k)
-                        sum += input[m * K + block * values_per_block + k] *
-                               decoded[k];
+                    for (int k = 0; k < values_per_block; ++k) {
+                        const float x = input[m * K + block * values_per_block + k];
+                        sum += x * decoded[k];
+                        const double product = double(x) * double(decoded[k]);
+                        sum64 += product;
+                        abs64 += std::abs(product);
+                    }
                 }
                 reference[m * N + n] = sum;
+                precise[m * N + n] = sum64;
+                magnitude[m * N + n] = abs64;
             }
         }
         for (int i = 0; i < M * N; ++i) {
@@ -130,9 +142,11 @@ static bool gguf_native_matmul_matches_block_decoder() {
             }
         }
 
-        // Cover scalar and transposed-token paths, including incomplete
-        // SIMD groups and the largest supported token batch.
-        for (int small_m : {2, 3, 4, 5, 6, 7, 20, 25}) {
+        // Cover every transposed-token group count, including incomplete
+        // SIMD groups, 32-token tile boundaries and output rows (N is odd).
+        for (int small_m : {2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 16,
+                           17, 20, 21, 24, 25, 28, 29, 32, 33,
+                           63, 64, 65, 96, 127}) {
             std::vector<float> small_output(small_m * N);
             Tensor small_input = Tensor::create(
                 Precision::FP32, MemoryType::EXTERNAL, K, small_m, 1, 1,
@@ -142,8 +156,20 @@ static bool gguf_native_matmul_matches_block_decoder() {
                 small_output.data());
             kernel_matmul_fp32(small_input, B, small_result, &pool);
             for (int i = 0; i < small_m * N; ++i) {
+                // A final one-token tile uses the GEMV reduction, whose
+                // rounding differs from the ordered multi-token kernel.
+                const bool gemv_tail = (format == Precision::GGUF_Q8_0 ||
+                                        format == Precision::GGUF_Q5_K ||
+                                        format == Precision::GGUF_Q6_K ||
+                                        format == Precision::GGUF_IQ2_XXS ||
+                                        format == Precision::GGUF_IQ3_XXS ||
+                                        format == Precision::GGUF_STQ1_0) &&
+                                       small_m > 32 && small_m % 32 == 1 &&
+                                       i / N == small_m - 1;
                 if (!std::isfinite(small_output[i]) ||
-                    small_output[i] != reference[i])
+                    (gemv_tail ? std::abs(small_output[i] - precise[i]) >
+                                     2e-6 * magnitude[i]
+                               : small_output[i] != reference[i]))
                     return false;
             }
         }
@@ -156,7 +182,15 @@ static bool gguf_native_matmul_matches_block_decoder() {
             single_output.data());
         kernel_matmul_fp32(single_input, B, single_result, &pool);
         for (int n = 0; n < N; ++n) {
-            if (single_output[n] != reference[n])
+            if (!std::isfinite(single_output[n]) ||
+                ((format == Precision::GGUF_Q8_0 ||
+                  format == Precision::GGUF_Q5_K ||
+                  format == Precision::GGUF_Q6_K ||
+                  format == Precision::GGUF_IQ2_XXS ||
+                  format == Precision::GGUF_IQ3_XXS ||
+                  format == Precision::GGUF_STQ1_0)
+                    ? std::abs(single_output[n] - precise[n]) > 2e-6 * magnitude[n]
+                    : single_output[n] != reference[n]))
                 return false;
         }
 
@@ -183,6 +217,65 @@ static bool gguf_native_matmul_matches_block_decoder() {
             if (batch_data[expert] != sequential_data[expert])
                 return false;
         }
+    }
+    return true;
+}
+
+// Long reductions exercise error accumulation and output-row scheduling tails.
+// The oracle decodes weights and accumulates products in double precision.
+static bool gguf_gemv_long_reduction_accuracy() {
+    constexpr int K = 6144, N = 67;
+    ThreadPool pool(4);
+    uint32_t state = 19471;
+    auto random = [&] {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        return state;
+    };
+    for (Precision format : {Precision::GGUF_Q4_K, Precision::GGUF_Q5_K,
+            Precision::GGUF_Q6_K, Precision::GGUF_Q8_0,
+            Precision::GGUF_IQ2_XXS, Precision::GGUF_IQ3_XXS,
+            Precision::GGUF_STQ1_0, Precision::GGUF_IQ4_XS}) {
+        const int width = gguf_k_block_values(format);
+        const size_t bytes = gguf_k_block_bytes(format);
+        std::vector<uint8_t> weights(size_t(N) * K / width * bytes);
+        for (auto& value : weights) value = static_cast<uint8_t>(random());
+        for (size_t block = 0; block < weights.size() / bytes; ++block) {
+            const size_t scale_offset = format == Precision::GGUF_Q6_K ? 208 :
+                format == Precision::GGUF_STQ1_0 ? 40 : 0;
+            uint16_t scale = uint16_t((8 + random() % 6) * 1024 +
+                                      random() % 1024 + (random() % 2) * 32768);
+            std::memcpy(weights.data() + block * bytes + scale_offset, &scale, 2);
+            if (format == Precision::GGUF_Q4_K || format == Precision::GGUF_Q5_K) {
+                scale = 0x3555;
+                std::memcpy(weights.data() + block * bytes + 2, &scale, 2);
+            }
+        }
+        std::vector<float> input(K), output(N), serial(N), decoded(width);
+        for (auto& x : input) x = float(int(random() % 20001) - 10000) * 0.0001f;
+        Tensor a = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  K, 1, 1, 1, input.data());
+        Tensor b = Tensor::create(format, MemoryType::EXTERNAL,
+                                  N, K, 1, 1, weights.data());
+        Tensor c = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  N, 1, 1, 1, output.data());
+        kernel_matmul_fp32(a, b, c, &pool);
+        c.data = serial.data();
+        kernel_matmul_fp32(a, b, c, nullptr);
+        double error = 0.0, norm = 0.0;
+        for (int n = 0; n < N; ++n) {
+            if (!std::isfinite(output[n]) || output[n] != serial[n]) return false;
+            double reference = 0.0;
+            for (int block = 0; block < K / width; ++block) {
+                if (!gguf_k_dequantize_block(format, weights.data() +
+                        (size_t(n) * K / width + block) * bytes, decoded.data()))
+                    return false;
+                for (int k = 0; k < width; ++k)
+                    reference += double(input[block * width + k]) * decoded[k];
+            }
+            error += (output[n] - reference) * (output[n] - reference);
+            norm += reference * reference;
+        }
+        if (!(error <= 1e-10 * norm)) return false;
     }
     return true;
 }
@@ -229,6 +322,37 @@ static bool gguf_half_scales_match_reference() {
             if (std::memcmp(&decoded[i], &expected, sizeof(float)) != 0)
                 return false;
         }
+    }
+    return true;
+}
+
+// Unit activations make these ternary rows sum to exact integer multiples
+// of the scale. This oracle covers subnormal/negative scales without using
+// the optimized decoder or reproducing its accumulation order.
+static bool gguf_stq_gemv_finite_scales() {
+    constexpr int K = 256, N = 3, bytes = 42;
+    uint8_t weights[N * bytes] = {};
+    std::fill_n(weights + bytes + 32, 8, uint8_t(255));
+    std::fill_n(weights + 2 * bytes, 32, uint8_t(0x55));
+    const float coefficients[N] = {192.f, -192.f, 64.f};
+    float input[K], output[N];
+    std::fill_n(input, K, 1.f);
+    Tensor a = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                              K, 1, 1, 1, input);
+    Tensor b = Tensor::create(Precision::GGUF_STQ1_0, MemoryType::EXTERNAL,
+                              N, K, 1, 1, weights);
+    Tensor c = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                              N, 1, 1, 1, output);
+    for (uint32_t bits = 0; bits < 65536; ++bits) {
+        if ((bits & 0x7c00) == 0x7c00) continue;
+        for (int row = 0; row < N; ++row) {
+            weights[row * bytes + 40] = static_cast<uint8_t>(bits);
+            weights[row * bytes + 41] = static_cast<uint8_t>(bits >> 8);
+        }
+        kernel_matmul_gguf_k(a, b, c, nullptr, Activation::NONE, 0, 0);
+        const float scale = reference_half_to_float(static_cast<uint16_t>(bits));
+        for (int row = 0; row < N; ++row)
+            if (output[row] != coefficients[row] * scale) return false;
     }
     return true;
 }
@@ -333,6 +457,87 @@ static bool gguf_q6_block_matches_scalar() {
     return true;
 }
 
+// Check Q6 GEMV against a double accumulation reference at SIMD and scheduler
+// boundaries. Parallel dispatch must not change results; signed scales, tails
+// and partial activation ranges remain covered independently of K reduction order.
+static bool gguf_q6_gemv_numeric_tails() {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    ThreadPool pool(4);
+    uint32_t state = 8173;
+    auto random = [&] {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        return state;
+    };
+    for (int K : {256, 768, 6144}) for (int N : {7, 8, 9, 63, 64, 65, 137}) {
+        const int blocks = K / 256;
+        std::vector<uint8_t> weights(size_t(N) * blocks * 210);
+        for (auto& byte : weights) byte = uint8_t(random());
+        for (int b = 0; b < N * blocks; ++b) {
+            const uint16_t d = uint16_t((8 + random() % 6) * 1024 +
+                                        random() % 1024 + (random() % 2) * 32768);
+            std::memcpy(weights.data() + size_t(b) * 210 + 208, &d, 2);
+        }
+        std::vector<float> input(K), output(N + 16, -12345.f);
+        std::vector<double> reference(N), magnitude(N);
+        std::vector<float> serial[2];
+        for (auto& x : input) x = float(int(random() % 20001) - 10000) * 0.0001f;
+        for (int n = 0; n < N; ++n) {
+            double sum = 0.;
+            for (int b = 0; b < blocks; ++b) {
+                float decoded[256];
+                if (!gguf_k_dequantize_block(Precision::GGUF_Q6_K,
+                        weights.data() + (size_t(n) * blocks + b) * 210, decoded))
+                    return false;
+                for (int k = 0; k < 256; ++k) {
+                    const double product = double(decoded[k]) * input[b * 256 + k];
+                    sum += product;
+                    magnitude[n] += std::abs(product);
+                }
+            }
+            reference[n] = sum;
+        }
+        Tensor a = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                   K, 1, 1, 1, input.data());
+        Tensor b = Tensor::create(Precision::GGUF_Q6_K, MemoryType::EXTERNAL,
+                                   N, K, 1, 1, weights.data());
+        Tensor c = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                   N, 1, 1, 1, output.data());
+        for (ThreadPool* threads : {static_cast<ThreadPool*>(nullptr), &pool}) {
+            for (Activation act : {Activation::NONE, Activation::RELU}) {
+                kernel_matmul_gguf_k(a, b, c, threads, act, 2, N - 4);
+                // Absolute-product scaling remains meaningful for cancellation
+                // near zero; the vector relative-L2 gate below is independent.
+                double error2 = 0., norm2 = 0.;
+                for (int n = 0; n < N; ++n) {
+                    double expected = reference[n];
+                    if (act == Activation::RELU && n >= 2 && n < N - 2)
+                        expected = std::max(0., expected);
+                    if (!std::isfinite(output[n]) ||
+                        std::abs(double(output[n]) - expected) > 2e-6 * magnitude[n]) {
+                        std::fprintf(stderr, "Q6 numeric mismatch K=%d N=%d row=%d\n", K, N, n);
+                        return false;
+                    }
+                    const double delta = double(output[n]) - expected;
+                    error2 += delta * delta;
+                    norm2 += expected * expected;
+                }
+                if (std::sqrt(error2 / std::max(norm2, 1e-300)) > 1e-5)
+                    return false;
+                for (size_t n = N; n < output.size(); ++n)
+                    if (output[n] != -12345.f) return false;
+                const int slot = act == Activation::NONE ? 0 : 1;
+                if (!threads) serial[slot] = output;
+                else if (std::memcmp(serial[slot].data(), output.data(),
+                                     output.size() * sizeof(float)) != 0)
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool gguf_iq2_block_matches_scalar() {
     constexpr uint16_t scales[] = {0x3c00, 0x3555, 0xbc00, 0x0400};
     uint32_t state = 11;
@@ -414,6 +619,43 @@ static bool gguf_iq3_block_matches_scalar() {
     return true;
 }
 
+static bool gguf_iq4_block_matches_scalar() {
+    constexpr int values[] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113};
+    uint32_t state = 17;
+    // Include every finite FP16 scale, signed zero and subnormals; vary the
+    // packed subgroup scales and both nibbles independently of the decoder.
+    for (uint32_t bits = 0; bits <= 0xffff; ++bits) {
+        if ((bits & 0x7c00) == 0x7c00) continue;
+        uint8_t block[136];
+        for (auto& byte : block) {
+            state = state * 1664525u + 1013904223u;
+            byte = static_cast<uint8_t>(state >> 24);
+        }
+        block[0] = static_cast<uint8_t>(bits);
+        block[1] = static_cast<uint8_t>(bits >> 8);
+        float decoded[256];
+        if (!gguf_k_dequantize_block(Precision::GGUF_IQ4_XS, block, decoded))
+            return false;
+        const float d = reference_half_to_float(static_cast<uint16_t>(bits));
+        const unsigned high = unsigned(block[2]) | (unsigned(block[3]) << 8);
+        for (int group = 0; group < 8; ++group) {
+            const int low = (block[4 + group / 2] >> (4 * (group % 2))) & 15;
+            const int scale = low + int((high >> (2 * group)) & 3) * 16 - 32;
+            for (int lane = 0; lane < 32; ++lane) {
+                const int packed = block[8 + group * 16 + lane % 16];
+                const int index = (packed >> (lane < 16 ? 0 : 4)) & 15;
+                const float expected = (d * scale) * values[index];
+                const float actual = decoded[group * 32 + lane];
+                if (std::memcmp(&actual, &expected, sizeof(float)) != 0)
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 static uint8_t reference_encode_fp8(float value) {
     if (std::isnan(value)) return 0x7f;
     const uint8_t sign = std::signbit(value) ? 0x80 : 0;
@@ -459,20 +701,166 @@ static void reference_fp8_ue8m0_activation(const float* input, float* output,
     }
 }
 
+static bool q8_block_scale_boundaries() {
+    ThreadPool pool(4);
+    unsigned rng = 997;
+    auto random = [&] {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        return rng;
+    };
+    int cases = 0;
+    double worst = 0;
+    for (int K : {32, 64, 256})
+        for (int N : {1, 3, 4, 5, 63, 65})
+            for (int M : {1, 2, 33})
+                for (int mode = 0; mode < 12; ++mode) {
+                    std::vector<unsigned char> w(size_t(K / 32) * N * 34);
+                    for (auto &v : w)
+                        v = random();
+                    uint16_t scales[] = {0, 0x8000, 1, 0x3ff, 0x400, 0x3c00, 0xbc00, 0x7bff};
+                    for (size_t b = 0; b < w.size() / 34; ++b) {
+                        uint16_t d = scales[random() % 8];
+                        if (mode == 6 && b % 3 == 0)
+                            d = b % 2 ? 0xfc00 : 0x7c00;
+                        if (mode == 7 && b % 3 == 0)
+                            d = 0x7e00;
+                        std::memcpy(w.data() + b * 34, &d, 2);
+                    }
+                    std::vector<float> x(K * M), y(N * M + 16, 98765), ref, serial;
+                    for (size_t i = 0; i < x.size(); ++i)
+                        x[i] = std::sin(float(i)) * .1f;
+                    if (mode == 8)
+                        std::fill(x.begin(), x.end(), 0x1p-60f);
+                    if (mode == 9)
+                        std::fill(x.begin(), x.end(), std::nextafter(0x1p-60f, 0.f));
+                    if (mode == 10)
+                        std::fill(x.begin(), x.end(), 0x1p60f);
+                    if (mode == 11)
+                        std::fill(x.begin(), x.end(),
+                                  std::nextafter(0x1p60f, std::numeric_limits<float>::infinity()));
+                    if (mode == 1)
+                        std::fill(x.begin(), x.end(), -0.f);
+                    if (mode == 2)
+                        std::fill(x.begin(), x.end(), 1e-37f);
+                    if (mode == 3)
+                        std::fill(x.begin(), x.end(), 1e37f);
+                    if (mode == 4)
+                        for (int m = 0; m < M; ++m)
+                            x[m * K] = std::numeric_limits<float>::infinity();
+                    if (mode == 5)
+                        for (int m = 0; m < M; ++m)
+                            x[m * K] = std::numeric_limits<float>::quiet_NaN();
+                    auto a =
+                        Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, x.data());
+                    auto b = Tensor::create(Precision::GGUF_Q8_0, MemoryType::EXTERNAL, N, K, 1, 1,
+                                            w.data());
+                    auto c =
+                        Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, y.data());
+                    // Independent ordered scalar reference, with explicit float rounding.
+                    ref = y;
+                    for (int m = 0; m < M; ++m)
+                        for (int n = 0; n < N; ++n) {
+                            volatile float sum = 0.f;
+                            for (int k = 0; k < K; ++k) {
+                                const auto *p = w.data() + (size_t(n) * (K / 32) + k / 32) * 34;
+                                mollm::fp16_t scale;
+                                std::memcpy(&scale, p, 2);
+                                int8_t q;
+                                std::memcpy(&q, p + 2 + k % 32, 1);
+                                volatile float weight = float(scale) * float(q);
+                                volatile float product = weight * x[m * K + k];
+                                sum = sum + product;
+                            }
+                            ref[m * N + n] = sum;
+                        }
+                    kernel_matmul_gguf_k(a, b, c, nullptr, Activation::NONE, 0, 0);
+                    serial = y;
+                    kernel_matmul_gguf_k(a, b, c, &pool, Activation::NONE, 0, 0);
+                    double err = 0, den = 0, ma = 0, mr = 0;
+                    for (int i = 0; i < N * M; ++i) {
+                        if (std::isnan(ref[i])) {
+                            if (!std::isnan(y[i]))
+                                return false;
+                            continue;
+                        }
+                        if (std::isinf(ref[i])) {
+                            if (y[i] != ref[i])
+                                return false;
+                            continue;
+                        }
+                        if (!std::isfinite(y[i])) {
+                            printf("nonfinite K=%d N=%d M=%d mode=%d\n", K, N, M, mode);
+                            return false;
+                        }
+                        if (std::memcmp(&serial[i], &y[i], 4))
+                            return false;
+                        if ((M == 2 || (M == 33 && i < 32 * N) || mode == 2 || mode == 3 ||
+                             mode == 9 || mode == 11) &&
+                            std::memcmp(&ref[i], &y[i], 4))
+                            return false;
+                        double d = double(ref[i]) - y[i];
+                        err += d * d;
+                        den += double(ref[i]) * ref[i];
+                        ma = std::max(ma, std::abs(d));
+                        mr = std::max(mr, std::abs(double(ref[i])));
+                    }
+                    double l2 = std::sqrt(err / std::max(den, 1e-30));
+                    worst = std::max(worst, l2);
+                    // Cancellation-sensitive gate uses the independent double result and sum of
+                    // absolute products, matching the existing GGUF reduction test's error model.
+                    for (int i = 0; i < N * M; ++i)
+                        if (std::isfinite(ref[i])) {
+                            double exact = 0, mag = 0;
+                            for (int k = 0; k < K; ++k) {
+                                const auto *p = w.data() + ((i % N) * (K / 32) + k / 32) * 34;
+                                __fp16 d;
+                                std::memcpy(&d, p, 2);
+                                int8_t q;
+                                std::memcpy(&q, p + 2 + k % 32, 1);
+                                double v = double(d) * q * double(x[(i / N) * K + k]);
+                                exact += v;
+                                mag += std::abs(v);
+                            }
+                            if (std::abs(double(y[i]) - exact) > 2e-6 * mag + 1e-35) {
+                                printf("ORACLE_FAIL K=%d N=%d M=%d mode=%d row=%d\n", K, N, M, mode,
+                                       i);
+                                return false;
+                            }
+                        }
+                    for (size_t i = N * M; i < y.size(); ++i)
+                        if (y[i] != 98765)
+                            return false;
+                    ++cases;
+                }
+    printf("  Q8 boundaries: %d cases, baseline relative difference %.9g\n", cases, worst);
+    return cases == 648;
+}
+
 int main() {
+    CHECK(q8_block_scale_boundaries(), "Q8 block reduction boundaries and scalar fallback");
     srand(42);
     CHECK(gguf_native_matmul_matches_block_decoder(),
           "all GGUF native matmul formats match blockwise reference");
+    CHECK(gguf_gemv_long_reduction_accuracy(),
+          "GGUF long GEMV matches double oracle and is scheduling-independent");
     CHECK(gguf_half_scales_match_reference(),
           "GGUF FP16 scales match reference for every finite bit pattern");
+    CHECK(gguf_stq_gemv_finite_scales(),
+          "STQ GEMV pair and tail match exact sums for every finite FP16 scale");
     CHECK(gguf_q5_block_matches_scalar(),
           "GGUF Q5_K block matches independent scalar decoding");
+    CHECK(gguf_q6_gemv_numeric_tails(),
+          "Q6 GEMV double reference, deterministic dispatch, tails and partial activation");
     CHECK(gguf_q6_block_matches_scalar(),
           "GGUF Q6_K block matches independent scalar decoding");
     CHECK(gguf_iq2_block_matches_scalar(),
           "GGUF IQ2_XXS block matches independent scalar decoding");
     CHECK(gguf_iq3_block_matches_scalar(),
           "GGUF IQ3_XXS block matches independent scalar decoding");
+    CHECK(gguf_iq4_block_matches_scalar(),
+          "GGUF IQ4_XS block matches scalar decoding for all finite FP16 scales");
 
     // ---- FP8/MXFP4 scalar format decoding ----
     {

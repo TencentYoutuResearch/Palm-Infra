@@ -9,6 +9,10 @@
 #include <functional>
 #include <vector>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace {
 
 inline float sigmoid(float value) {
@@ -48,7 +52,7 @@ void reduce_hidden(const float* wide, const float* coefficients,
 }
 
 void project_hc(const Tensor& x, const Tensor& fn, float* output,
-                int rows, ThreadPool* pool) {
+                int rows, ThreadPool* pool, bool vector_decode = false) {
     const int tokens = static_cast<int>(x.shape[1]);
     const int width = static_cast<int>(x.shape[0]);
     const int x_stride = static_cast<int>(x.stride[1] / sizeof(float));
@@ -63,9 +67,29 @@ void project_hc(const Tensor& x, const Tensor& fn, float* output,
             const float* weight =
                 weight_data + static_cast<size_t>(row) * width;
             float sum = 0.0f;
-            // Preserve the checkpoint-validated accumulation order exactly.
-            for (int index = 0; index < width; ++index)
-                sum += token_x[index] * weight[index];
+#if defined(__aarch64__)
+            if (vector_decode && tokens == 1) {
+                // FP32 iHC decode: eight independent FMA lanes shorten the
+                // reduction chain. This intentionally changes rounding order.
+                float32x4_t sum0 = vdupq_n_f32(0.0f);
+                float32x4_t sum1 = vdupq_n_f32(0.0f);
+                int index = 0;
+                for (; index + 8 <= width; index += 8) {
+                    sum0 = vfmaq_f32(sum0, vld1q_f32(token_x + index),
+                                    vld1q_f32(weight + index));
+                    sum1 = vfmaq_f32(sum1, vld1q_f32(token_x + index + 4),
+                                    vld1q_f32(weight + index + 4));
+                }
+                sum = vaddvq_f32(vaddq_f32(sum0, sum1));
+                for (; index < width; ++index)
+                    sum += token_x[index] * weight[index];
+            } else
+#endif
+            {
+                // Other HC paths retain their original scalar reduction.
+                for (int index = 0; index < width; ++index)
+                    sum += token_x[index] * weight[index];
+            }
             token_output[row] = sum;
         }
     };
@@ -359,14 +383,15 @@ bool validate_id(const Tensor& x, const Tensor& fn, const Tensor& scale,
 // Hy4 reduces the hc streams with the same weighted sum as DeepSeek-V4, but
 // the caller supplies the coefficients and no Sinkhorn normalisation applies.
 void reduce_hidden_id(const float* wide, const float* coefficients,
-                      float* output, int hidden_size, int hc_mult) {
+                      float* output, int hidden_size, int hc_mult,
+                      bool round_bf16) {
     for (int dim = 0; dim < hidden_size; ++dim) {
         float sum = 0.0f;
         for (int h = 0; h < hc_mult; ++h) {
             sum += coefficients[h] *
                    wide[static_cast<size_t>(h) * hidden_size + dim];
         }
-        output[dim] = mollm_round_to_bf16(sum);
+        output[dim] = round_bf16 ? mollm_round_to_bf16(sum) : sum;
     }
 }
 
@@ -375,7 +400,7 @@ void reduce_hidden_id(const float* wide, const float* coefficients,
 bool kernel_hc_pre_id(const Tensor& x, const Tensor& fn, const Tensor& scale,
                       const Tensor& base, Tensor& packed, int hidden_size,
                       int hc_mult, float hc_magnitude, float norm_eps,
-                      float hc_eps, ThreadPool* thread_pool) {
+                      float hc_eps, ThreadPool* thread_pool, bool round_bf16) {
     const int mix_size = 2 * hc_mult;
     const int packed_size = hidden_size + hc_mult;
     if (!validate_id(x, fn, scale, base, hidden_size, hc_mult, mix_size) ||
@@ -397,7 +422,7 @@ bool kernel_hc_pre_id(const Tensor& x, const Tensor& fn, const Tensor& scale,
 
     static thread_local std::vector<float> projected;
     projected.resize(static_cast<size_t>(mix_size) * tokens);
-    project_hc(x, fn, projected.data(), mix_size, thread_pool);
+    project_hc(x, fn, projected.data(), mix_size, thread_pool, !round_bf16);
     // Resolve TLS on the caller; worker lambdas would otherwise see an empty
     // thread-local vector.
     float* projected_data = projected.data();
@@ -427,7 +452,7 @@ bool kernel_hc_pre_id(const Tensor& x, const Tensor& fn, const Tensor& scale,
                     base_data[hc_mult + h]) + hc_eps;
             }
             reduce_hidden_id(
-                token_x, pre.data(), token_out, hidden_size, hc_mult);
+                token_x, pre.data(), token_out, hidden_size, hc_mult, round_bf16);
         }
     });
     return true;
@@ -435,7 +460,7 @@ bool kernel_hc_pre_id(const Tensor& x, const Tensor& fn, const Tensor& scale,
 
 bool kernel_hc_post_id(const Tensor& branch, const Tensor& residual,
                        const Tensor& packed, Tensor& output, int hidden_size,
-                       int hc_mult, ThreadPool* thread_pool) {
+                       int hc_mult, ThreadPool* thread_pool, bool round_bf16) {
     const int packed_size = hidden_size + hc_mult;
     if (branch.prec != Precision::FP32 ||
         residual.prec != Precision::FP32 ||
@@ -483,8 +508,10 @@ bool kernel_hc_post_id(const Tensor& branch, const Tensor& residual,
                 for (int dim = 0; dim < hidden_size; ++dim) {
                     // No cross-stream mixing: each output stream is the gate
                     // applied to the branch update plus its own residual.
-                    output_stream[dim] = mollm_round_to_bf16(
-                        gate * branch_row[dim] + residual_stream[dim]);
+                    const float value =
+                        gate * branch_row[dim] + residual_stream[dim];
+                    output_stream[dim] =
+                        round_bf16 ? mollm_round_to_bf16(value) : value;
                 }
             }
         }
@@ -495,7 +522,7 @@ bool kernel_hc_post_id(const Tensor& branch, const Tensor& residual,
 bool kernel_hc_head_id(const Tensor& x, const Tensor& fn, const Tensor& scale,
                        const Tensor& base, Tensor& output, int hidden_size,
                        int hc_mult, float norm_eps, float hc_eps,
-                       ThreadPool* thread_pool) {
+                       ThreadPool* thread_pool, bool round_bf16) {
     if (!validate_id(x, fn, scale, base, hidden_size, hc_mult, hc_mult) ||
         output.prec != Precision::FP32 || !output.data ||
         output.shape[0] != hidden_size || output.shape[1] != x.shape[1]) {
@@ -530,7 +557,7 @@ bool kernel_hc_head_id(const Tensor& x, const Tensor& fn, const Tensor& scale,
                 output.ptr<float>() + static_cast<size_t>(token) *
                                           output_stride;
             reduce_hidden_id(
-                token_x, pre.data(), output_row, hidden_size, hc_mult);
+                token_x, pre.data(), output_row, hidden_size, hc_mult, round_bf16);
         }
     });
     return true;

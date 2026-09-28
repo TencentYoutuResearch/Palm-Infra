@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #if defined(__aarch64__)
@@ -322,11 +324,22 @@ void decode_iq4_xs(const uint8_t* block, float* out) {
                                (((high >> (2 * group)) & 3) << 4);
         const float scale = d * (scale_bits - 32);
         float* y = out + group * 32;
+#if defined(__aarch64__)
+        const uint8x16_t q = vld1q_u8(qs + group * 16);
+        const int8x16_t table = vld1q_s8(values);
+        const int8x16_t q0 = vqtbl1q_s8(table, vandq_u8(q, vdupq_n_u8(15)));
+        const int8x16_t q1 = vqtbl1q_s8(table, vshrq_n_u8(q, 4));
+        store_signed_iq_grid8(vget_low_s8(q0), scale, y);
+        store_signed_iq_grid8(vget_high_s8(q0), scale, y + 8);
+        store_signed_iq_grid8(vget_low_s8(q1), scale, y + 16);
+        store_signed_iq_grid8(vget_high_s8(q1), scale, y + 24);
+#else
         for (int lane = 0; lane < 16; ++lane) {
             const uint8_t q = qs[group * 16 + lane];
             y[lane] = scale * values[q & 15];
             y[lane + 16] = scale * values[q >> 4];
         }
+#endif
     }
 }
 
@@ -354,22 +367,490 @@ void decode_native_block(const uint8_t* block, float* out) {
     }
 }
 
+#if defined(__APPLE__) && defined(__clang__) && defined(__aarch64__)
+// IQ2 grid values are positive integers exactly representable in FP16.
+// Keep magnitudes (4 KiB) separate from sign masks (2 KiB), replacing the
+// 512 KiB signed-half table. XOR preserves the exact signed value before
+// FP32 scaling and accumulation, including the original rounding order.
+const std::array<__fp16, 256 * 8>& half_iq2_grid_table() {
+    static const auto table = [] {
+        std::array<__fp16, 256 * 8> result{};
+        for (size_t i = 0; i < result.size(); ++i)
+            result[i] = static_cast<__fp16>(iq2_grid[i]);
+        return result;
+    }();
+    return table;
+}
+const std::array<uint16_t, 128 * 8>& half_iq_sign_table() {
+    static const auto table = [] {
+        std::array<uint16_t, 128 * 8> result{};
+        for (int sign = 0; sign < 128; ++sign)
+            for (int lane = 0; lane < 8; ++lane)
+                result[sign * 8 + lane] = (iq_signs[sign] & (1 << lane)) ? 0x8000 : 0;
+        return result;
+    }();
+    return table;
+}
+
+// IQ3 magnitudes need only 2 KiB; both formats share the sign-mask table.
+const std::array<__fp16, 256 * 4>& half_iq3_grid_table() {
+    static const auto table = [] {
+        std::array<__fp16, 256 * 4> result{};
+        const auto& integers = iq3_grid;
+        for (size_t i = 0; i < result.size(); ++i)
+            result[i] = static_cast<__fp16>(integers[i]);
+        return result;
+    }();
+    return table;
+}
+
+// Decode IQ2/IQ3 directly into the eight-lane GEMV accumulators, avoiding a
+// materialized FP32 block. Keep scale multiplication before the FMA so the
+// rounding matches the generic parallel reduction below.
+template <Precision P, int Rows>
+void matmul_iq_gemv_rows(const uint8_t* encoded, const float* input,
+                         float* output, int blocks, size_t bytes,
+                         int begin, int end) {
+    const uint16_t* half_signs = half_iq_sign_table().data();
+    const __fp16* half_grids;
+    if constexpr (P == Precision::GGUF_IQ2_XXS)
+        half_grids = half_iq2_grid_table().data();
+    else
+        half_grids = half_iq3_grid_table().data();
+    for (; begin < end; begin += Rows) {
+        float32x4_t sum0[Rows], sum1[Rows];
+        for (int r = 0; r < Rows; ++r)
+            sum0[r] = sum1[r] = vdupq_n_f32(0.f);
+        for (int block = 0; block < blocks; ++block) {
+            const uint8_t* data[Rows];
+            float d[Rows];
+            for (int r = 0; r < Rows; ++r) {
+                data[r] = encoded + (size_t(begin + r) * blocks + block) * bytes;
+                d[r] = half_value(data[r]);
+            }
+            for (int group = 0; group < 8; ++group) {
+                uint32_t packed[Rows];
+                float scale[Rows];
+                for (int r = 0; r < Rows; ++r) {
+                    if constexpr (P == Precision::GGUF_IQ2_XXS) {
+                        packed[r] = load_u32(data[r] + 2 + group * 8 + 4);
+                        scale[r] = d[r] * (0.5f + (packed[r] >> 28)) * 0.25f;
+                    } else {
+                        packed[r] = load_u32(data[r] + 66 + group * 4);
+                        scale[r] = d[r] * (0.5f + (packed[r] >> 28)) * 0.5f;
+                    }
+                }
+                for (int part = 0; part < 4; ++part) {
+                    const float* a = input + block * 256 + group * 32 + part * 8;
+                    const float32x4_t x0 = vld1q_f32(a), x1 = vld1q_f32(a + 4);
+#pragma unroll
+                    for (int r = 0; r < Rows; ++r) {
+                        const int sign = (packed[r] >> (7 * part)) & 127;
+                        float32x4_t v0, v1;
+                        if constexpr (P == Precision::GGUF_IQ2_XXS) {
+                            const int code = data[r][2 + group * 8 + part];
+                            const float16x8_t halves = vreinterpretq_f16_u16(veorq_u16(
+                                vreinterpretq_u16_f16(vld1q_f16(half_grids + code * 8)),
+                                vld1q_u16(half_signs + sign * 8)));
+                            v0 = vmulq_n_f32(vcvt_f32_f16(
+                                vget_low_f16(halves)), scale[r]);
+                            v1 = vmulq_n_f32(vcvt_f32_f16(
+                                vget_high_f16(halves)), scale[r]);
+                        } else {
+                            const uint8_t* qs = data[r] + 2 + group * 8 + part * 2;
+                            const float16x8_t halves = vreinterpretq_f16_u16(veorq_u16(
+                                vreinterpretq_u16_f16(vcombine_f16(
+                                    vld1_f16(half_grids + qs[0] * 4),
+                                    vld1_f16(half_grids + qs[1] * 4))),
+                                vld1q_u16(half_signs + sign * 8)));
+                            v0 = vmulq_n_f32(vcvt_f32_f16(vget_low_f16(halves)), scale[r]);
+                            v1 = vmulq_n_f32(vcvt_f32_f16(vget_high_f16(halves)), scale[r]);
+                        }
+                        sum0[r] = vfmaq_f32(sum0[r], x0, v0);
+                        sum1[r] = vfmaq_f32(sum1[r], x1, v1);
+                    }
+                }
+            }
+        }
+        for (int r = 0; r < Rows; ++r)
+            output[begin + r] = vaddvq_f32(vaddq_f32(sum0[r], sum1[r]));
+    }
+}
+
+// STQ groups are interleaved across four 16-element lanes. For ordinary
+// decode inputs, accumulate each 256-value block before applying its shared
+// scale. The original per-value scale order remains available for exceptions.
+template <int Rows, bool BlockScale>
+void matmul_stq_gemv_rows(const uint8_t* encoded, const float* input,
+                          float* output, int blocks, size_t bytes,
+                          int begin, int end) {
+    const uint8x16x2_t book = {
+        vld1q_u8(stq1_0_codebook), vld1q_u8(stq1_0_codebook + 16)};
+    static const int8_t shifts[16] = {
+        0, -1, -2, -3, -4, -5, -6, -7,
+        0, -1, -2, -3, -4, -5, -6, -7};
+    for (; begin < end; begin += Rows) {
+        float32x4_t sum0[Rows], sum1[Rows];
+        for (int r = 0; r < Rows; ++r)
+            sum0[r] = sum1[r] = vdupq_n_f32(0.f);
+        bool fallback = false;
+        for (int block = 0; block < blocks; ++block) {
+            float32x4_t block0[Rows], block1[Rows];
+            if constexpr (BlockScale) {
+                for (int r = 0; r < Rows; ++r)
+                    block0[r] = block1[r] = vdupq_n_f32(0.f);
+            }
+            const uint8_t* data[Rows];
+            float scale[Rows];
+            for (int r = 0; r < Rows; ++r) {
+                data[r] = encoded + (size_t(begin + r) * blocks + block) * bytes;
+                scale[r] = half_value(data[r] + 40);
+                // Match the STQ decoder's normalization of negative zero.
+                if (scale[r] == 0.f) scale[r] = 0.f;
+                if constexpr (BlockScale)
+                    fallback |= !std::isfinite(scale[r]);
+            }
+            if constexpr (BlockScale) {
+                if (fallback) {
+                    matmul_stq_gemv_rows<Rows, false>(encoded, input, output,
+                        blocks, bytes, begin, begin + Rows);
+                    break;
+                }
+            }
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                uint8x16_t packed[Rows];
+                for (int r = 0; r < Rows; ++r) {
+                    const uint8x8_t q = vld1_u8(data[r] + chunk * 8);
+                    const uint8x8x2_t codes = vzip_u8(
+                        vand_u8(q, vdup_n_u8(15)), vshr_n_u8(q, 4));
+                    const uint8x16_t signs = vcombine_u8(
+                        vdup_n_u8(data[r][32 + chunk * 2]),
+                        vdup_n_u8(data[r][33 + chunk * 2]));
+                    const uint8x16_t bits = vandq_u8(
+                        vshlq_u8(signs, vld1q_s8(shifts)), vdupq_n_u8(1));
+                    packed[r] = vqtbl2q_u8(book, vorrq_u8(
+                        vcombine_u8(codes.val[0], codes.val[1]),
+                        vshlq_n_u8(bits, 4)));
+                }
+                for (int lane = 0; lane < 4; ++lane) {
+                    const float* a = input + block * 256 + chunk * 64 + lane * 16;
+                    const float32x4_t x0 = vld1q_f32(a), x1 = vld1q_f32(a + 4);
+                    const float32x4_t x2 = vld1q_f32(a + 8), x3 = vld1q_f32(a + 12);
+#pragma unroll
+                    for (int r = 0; r < Rows; ++r) {
+                        const uint8x16_t codes = vandq_u8(
+                            vshlq_u8(packed[r], vdupq_n_s8(-2 * lane)),
+                            vdupq_n_u8(3));
+                        // FP16 encodings of -1, 0, 1, 2 have zero low bytes.
+                        // Look up their high bytes, then widen to exact FP32
+                        // values before the original scale multiplication.
+                        const uint8x16_t hi = vqtbl1q_u8(
+                            vreinterpretq_u8_u32(vdupq_n_u32(0x403c00bc)), codes);
+                        const float16x8_t low = vreinterpretq_f16_u16(
+                            vshll_n_u8(vget_low_u8(hi), 8));
+                        const float16x8_t high = vreinterpretq_f16_u16(
+                            vshll_n_u8(vget_high_u8(hi), 8));
+                        const auto v0 = vcvt_f32_f16(vget_low_f16(low));
+                        const auto v1 = vcvt_f32_f16(vget_high_f16(low));
+                        const auto v2 = vcvt_f32_f16(vget_low_f16(high));
+                        const auto v3 = vcvt_f32_f16(vget_high_f16(high));
+                        if constexpr (BlockScale) {
+                            block0[r] = vfmaq_f32(block0[r], x0, v0);
+                            block1[r] = vfmaq_f32(block1[r], x1, v1);
+                            block0[r] = vfmaq_f32(block0[r], x2, v2);
+                            block1[r] = vfmaq_f32(block1[r], x3, v3);
+                        } else {
+                            sum0[r] = vfmaq_f32(sum0[r], x0,
+                                                 vmulq_n_f32(v0, scale[r]));
+                            sum1[r] = vfmaq_f32(sum1[r], x1,
+                                                 vmulq_n_f32(v1, scale[r]));
+                            sum0[r] = vfmaq_f32(sum0[r], x2,
+                                                 vmulq_n_f32(v2, scale[r]));
+                            sum1[r] = vfmaq_f32(sum1[r], x3,
+                                                 vmulq_n_f32(v3, scale[r]));
+                        }
+                    }
+                }
+            }
+            if constexpr (BlockScale) {
+                for (int r = 0; r < Rows; ++r) {
+                    sum0[r] = vfmaq_n_f32(sum0[r], block0[r], scale[r]);
+                    sum1[r] = vfmaq_n_f32(sum1[r], block1[r], scale[r]);
+                }
+            }
+        }
+        if (fallback) continue;
+        for (int r = 0; r < Rows; ++r)
+            output[begin + r] = vaddvq_f32(vaddq_f32(sum0[r], sum1[r]));
+    }
+}
+
+// Finite FP16 d * 6-bit scale * 5-bit q needs at most 22 significant bits,
+// within FP32's 24 bits, and cannot overflow or underflow FP32. Its product
+// is therefore exact: fusing only the final subtraction preserves rounding.
+// Nonfinite block scales retain separate operations and their NaN behavior.
+template <bool Fused>
+inline float32x4_t q5_reconstruct(float32x4_t q, float scale, float32x4_t minimum) {
+    if constexpr (Fused)
+        return vfmaq_n_f32(vnegq_f32(minimum), q, scale);
+    else
+        return vsubq_f32(vmulq_n_f32(q, scale), minimum);
+}
+
+// Q5 uses the same eight-lane reduction as the parallel GEMV path, but
+// decodes each 16-value slice directly into the FMA instead of an FP32 block.
+template <int Rows>
+void matmul_q5_gemv_rows(const uint8_t* encoded, const float* input, float* output, int blocks,
+                         size_t bytes, int begin, int end) {
+    for (; begin < end; begin += Rows) {
+        float32x4_t sum0[Rows], sum1[Rows];
+        for (int r = 0; r < Rows; ++r)
+            sum0[r] = sum1[r] = vdupq_n_f32(0.f);
+        for (int block = 0; block < blocks; ++block) {
+            const uint8_t* data[Rows];
+            float d[Rows], dmin[Rows];
+            bool finite_scales = true;
+            for (int r = 0; r < Rows; ++r) {
+                data[r] = encoded + (size_t(begin + r) * blocks + block) * bytes;
+                d[r] = half_value(data[r]);
+                dmin[r] = half_value(data[r] + 2);
+                finite_scales &= (data[r][1] & 0x7c) != 0x7c && (data[r][3] & 0x7c) != 0x7c;
+            }
+            auto accumulate = [&](auto tag) {
+                constexpr bool fuse = decltype(tag)::value;
+                // Fixed groups let shifts and packed scale extraction specialize.
+#pragma unroll
+                for (int group = 0; group < 8; ++group) {
+                    float scale[Rows], minimum[Rows];
+                    for (int r = 0; r < Rows; ++r) {
+                        uint8_t sc, mn;
+                        scale_min(group, data[r] + 4, sc, mn);
+                        scale[r] = d[r] * sc;
+                        minimum[r] = dmin[r] * mn;
+                    }
+                    for (int lane = 0; lane < 32; lane += 16) {
+                        const float* a = input + block * 256 + group * 32 + lane;
+                        const float32x4_t x0 = vld1q_f32(a), x1 = vld1q_f32(a + 4);
+                        const float32x4_t x2 = vld1q_f32(a + 8), x3 = vld1q_f32(a + 12);
+#pragma unroll
+                        for (int r = 0; r < Rows; ++r) {
+                            const uint8x16_t q = vld1q_u8(data[r] + 48 + (group / 2) * 32 + lane);
+                            const uint8x16_t hi = vld1q_u8(data[r] + 16 + lane);
+                            const uint8x16_t low = vandq_u8(
+                                vshlq_u8(q, vdupq_n_s8((group & 1) ? -4 : 0)), vdupq_n_u8(15));
+                            const uint8x16_t values =
+                                vaddq_u8(low, vandq_u8(vtstq_u8(hi, vdupq_n_u8(1 << group)),
+                                                       vdupq_n_u8(16)));
+                            const uint16x8_t v0 = vmovl_u8(vget_low_u8(values));
+                            const uint16x8_t v1 = vmovl_u8(vget_high_u8(values));
+                            const float32x4_t mn = vdupq_n_f32(minimum[r]);
+                            sum0[r] = vfmaq_f32(
+                                sum0[r], x0,
+                                q5_reconstruct<fuse>(vcvtq_f32_u32(vmovl_u16(vget_low_u16(v0))),
+                                                     scale[r], mn));
+                            sum1[r] = vfmaq_f32(
+                                sum1[r], x1,
+                                q5_reconstruct<fuse>(vcvtq_f32_u32(vmovl_u16(vget_high_u16(v0))),
+                                                     scale[r], mn));
+                            sum0[r] = vfmaq_f32(
+                                sum0[r], x2,
+                                q5_reconstruct<fuse>(vcvtq_f32_u32(vmovl_u16(vget_low_u16(v1))),
+                                                     scale[r], mn));
+                            sum1[r] = vfmaq_f32(
+                                sum1[r], x3,
+                                q5_reconstruct<fuse>(vcvtq_f32_u32(vmovl_u16(vget_high_u16(v1))),
+                                                     scale[r], mn));
+                        }
+                    }
+                    // Keep expanded groups from overlapping register lifetimes.
+                    // Clang otherwise spills decoded vectors across groups. This
+                    // compiler-only boundary emits no CPU fence; the accumulators
+                    // preserve the existing FMA order. The surrounding helper is
+                    // restricted to Apple Clang on ARM64.
+                    if constexpr (Rows == 2) {
+                        asm volatile(""
+                                     : "+w"(sum0[0]), "+w"(sum1[0]), "+w"(sum0[1]), "+w"(sum1[1])
+                                     :
+                                     : "memory");
+                    } else {
+                        asm volatile("" : "+w"(sum0[0]), "+w"(sum1[0]) : : "memory");
+                    }
+                }
+            };
+            if (finite_scales)
+                accumulate(std::true_type{});
+            else
+                accumulate(std::false_type{});
+        }
+        for (int r = 0; r < Rows; ++r)
+            output[begin + r] = vaddvq_f32(vaddq_f32(sum0[r], sum1[r]));
+    }
+}
+
+template <Precision P, int Groups>
+void matmul_token_rows(const uint8_t* encoded, const float* input, float* output,
+                       int M, int N, int blocks, int block_values, size_t bytes,
+                       int begin, int end) {
+    // Keep independent output sums in registers. Small token batches need
+    // more output rows in flight to hide the floating-point add latency.
+    // SIMD lanes hold independent tokens: preserve each output's k order
+    // and round products separately from additions, as in the scalar path.
+    constexpr int Rows = Groups <= 2 ? 4 : 2;
+    constexpr int Stride = Groups * 4;
+    std::array<std::array<float, 256>, Rows> values;
+    for (; begin + Rows <= end; begin += Rows) {
+        float32x4_t sums[Rows][Groups];
+        for (int r = 0; r < Rows; ++r)
+            for (int g = 0; g < Groups; ++g)
+                sums[r][g] = vdupq_n_f32(0.0f);
+        for (int block = 0; block < blocks; ++block) {
+            for (int r = 0; r < Rows; ++r) {
+                const uint8_t* row = encoded +
+                    (size_t(begin + r) * blocks + block) * bytes;
+                decode_native_block<P>(row, values[r].data());
+            }
+            const float* a = input + size_t(block) * block_values * Stride;
+            {
+#pragma clang fp contract(off)
+                for (int k = 0; k < block_values; ++k) {
+#pragma unroll
+                    for (int g = 0; g < Groups; ++g) {
+                        const float32x4_t x = vld1q_f32(a + k * Stride + g * 4);
+#pragma unroll
+                        for (int r = 0; r < Rows; ++r)
+                            sums[r][g] = vaddq_f32(sums[r][g],
+                                vmulq_n_f32(x, values[r][k]));
+                    }
+                }
+            }
+        }
+        for (int r = 0; r < Rows; ++r) {
+            float row_sums[Stride];
+            for (int g = 0; g < Groups; ++g)
+                vst1q_f32(row_sums + g * 4, sums[r][g]);
+            for (int m = 0; m < M; ++m)
+                output[m * N + begin + r] = row_sums[m];
+        }
+    }
+    for (; begin < end; ++begin) {
+        float32x4_t sums[Groups];
+        for (int g = 0; g < Groups; ++g)
+            sums[g] = vdupq_n_f32(0.0f);
+        const uint8_t* row = encoded + size_t(begin) * blocks * bytes;
+        for (int block = 0; block < blocks; ++block) {
+            decode_native_block<P>(row + block * bytes, values[0].data());
+            const float* a = input + size_t(block) * block_values * Stride;
+            {
+#pragma clang fp contract(off)
+                for (int k = 0; k < block_values; ++k) {
+#pragma unroll
+                    for (int g = 0; g < Groups; ++g)
+                        sums[g] = vaddq_f32(sums[g], vmulq_n_f32(
+                            vld1q_f32(a + k * Stride + g * 4), values[0][k]));
+                }
+            }
+        }
+        float row_sums[Stride];
+        for (int g = 0; g < Groups; ++g)
+            vst1q_f32(row_sums + g * 4, sums[g]);
+        for (int m = 0; m < M; ++m)
+            output[m * N + begin] = row_sums[m];
+    }
+}
+#endif
+
+#if defined(__APPLE__) && defined(__clang__) && defined(__aarch64__)
+// Sum each Q8 block before applying its shared scale. This changes reduction
+// rounding, but avoids materializing dequantized weights. The caller excludes
+// extreme/non-finite activations; exceptional scales retain scalar IEEE order.
+template <int Rows>
+void q8_block_scale(const uint8_t *w, const float *x, float *y, int blocks, int begin, int end) {
+#pragma clang fp contract(off)
+    for (; begin < end; begin += Rows) {
+        float totals[Rows]{};
+        bool exceptional_scale[Rows]{};
+        for (int b = 0; b < blocks; ++b) {
+            float32x4_t s0[Rows], s1[Rows];
+            for (int r = 0; r < Rows; ++r)
+                s0[r] = s1[r] = vdupq_n_f32(0.f);
+            for (int k = 0; k < 32; k += 16) {
+                auto x0 = vld1q_f32(x + b * 32 + k), x1 = vld1q_f32(x + b * 32 + k + 4);
+                auto x2 = vld1q_f32(x + b * 32 + k + 8), x3 = vld1q_f32(x + b * 32 + k + 12);
+#pragma unroll
+                for (int r = 0; r < Rows; ++r) {
+                    const auto *p = w + (size_t(begin + r) * blocks + b) * 34 + 2 + k;
+                    auto q = vld1q_s8(reinterpret_cast<const int8_t *>(p));
+                    auto lo = vmovl_s8(vget_low_s8(q)), hi = vmovl_s8(vget_high_s8(q));
+                    s0[r] = vfmaq_f32(s0[r], x0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))));
+                    s1[r] = vfmaq_f32(s1[r], x1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))));
+                    s0[r] = vfmaq_f32(s0[r], x2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))));
+                    s1[r] = vfmaq_f32(s1[r], x3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))));
+                }
+            }
+            for (int r = 0; r < Rows; ++r) {
+                const auto *p = w + (size_t(begin + r) * blocks + b) * 34;
+                uint16_t bits;
+                std::memcpy(&bits, p, sizeof(bits));
+                exceptional_scale[r] |= (bits & 0x7c00) == 0x7c00;
+                totals[r] += half_value(p) * vaddvq_f32(vaddq_f32(s0[r], s1[r]));
+            }
+        }
+        for (int r = 0; r < Rows; ++r) {
+            if (exceptional_scale[r]) {
+                // Preserve scalar-k IEEE behavior for non-finite scales.
+                float sum = 0.f;
+                for (int b = 0; b < blocks; ++b) {
+                    const auto *p = w + (size_t(begin + r) * blocks + b) * 34;
+                    const float d = half_value(p);
+                    for (int k = 0; k < 32; ++k) {
+                        int8_t q;
+                        std::memcpy(&q, p + 2 + k, 1);
+                        const float weight = d * float(q);
+                        sum += weight * x[b * 32 + k];
+                    }
+                }
+                totals[r] = sum;
+            }
+            y[begin + r] = totals[r];
+        }
+    }
+}
+
+#endif
+
 template <Precision P>
-void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
-                          ThreadPool* pool, Activation act,
-                          int act_n_begin, int act_n_len,
-                          int block_values, size_t bytes) {
+void matmul_native_blocks(const Tensor &A, const Tensor &B, Tensor &C, ThreadPool *pool,
+                          Activation act, int act_n_begin, int act_n_len, int block_values,
+                          size_t bytes) {
     const int K = static_cast<int>(B.shape[1]);
     const int N = static_cast<int>(B.shape[0]);
     const int M = static_cast<int>(A.shape[1]);
     const int blocks = K / block_values;
+#if defined(__APPLE__) && defined(__clang__) && defined(__aarch64__)
+    if (M > 32) {
+        // Reuse the SIMD token tiles for larger prefill batches. A final
+        // singleton tile uses the format-specific GEMV reduction.
+        for (int start = 0; start < M; start += 32) {
+            Tensor input_tile = A;
+            Tensor output_tile = C;
+            input_tile.shape[1] = output_tile.shape[1] = std::min(32, M - start);
+            input_tile.compute_strides();
+            output_tile.compute_strides();
+            input_tile.data = static_cast<float*>(A.data) + size_t(start) * K;
+            output_tile.data = C.ptr<float>() + size_t(start) * N;
+            matmul_native_blocks<P>(input_tile, B, output_tile, pool, act,
+                                    act_n_begin, act_n_len, block_values, bytes);
+        }
+        return;
+    }
+#endif
     const auto* encoded = static_cast<const uint8_t*>(B.data);
     const float* input = A.ptr<float>();
     float* output = C.ptr<float>();
 #if defined(__APPLE__) && defined(__clang__) && defined(__aarch64__)
     const int token_stride = (M + 3) & ~3;
     std::vector<float> token_major;
-    if (M >= 5 && M <= 32) {
+    if (M >= 2 && M <= 32) {
         // Make adjacent tokens contiguous so NEON can update four independent
         // sums while each token still visits k in the original order.
         token_major.resize(size_t(K) * token_stride, 0.0f);
@@ -378,50 +859,141 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
                 token_major[size_t(k) * token_stride + m] =
                     input[size_t(m) * K + k];
     }
+    // Keep unscaled block products away from underflow/overflow. Values outside
+    // this conservative interval use the existing ordered implementation.
+    bool q8_scale_safe = false;
+    if constexpr (P == Precision::GGUF_Q8_0) {
+        if (M == 1) {
+            q8_scale_safe = true;
+            for (int k = 0; k < K; ++k) {
+                const float value = input[k];
+                const float magnitude = value < 0.f ? -value : value;
+                if (!(value == 0.f || (magnitude >= 0x1p-60f && magnitude <= 0x1p60f))) {
+                    q8_scale_safe = false;
+                    break;
+                }
+            }
+        }
+    }
+    bool stq_block_safe = false;
+    if constexpr (P == Precision::GGUF_STQ1_0) {
+        if (M == 1) {
+            stq_block_safe = true;
+            for (int k = 0; k < K; ++k) {
+                const float value = input[k];
+                const float magnitude = value < 0.f ? -value : value;
+                if (!(value == 0.f ||
+                      (magnitude >= 0x1p-60f && magnitude <= 0x1p60f))) {
+                    stq_block_safe = false;
+                    break;
+                }
+            }
+        }
+    }
 #endif
     auto process = [&](int, int begin, int end) {
         std::array<float, 256> values;
 #if defined(__APPLE__) && defined(__clang__) && defined(__aarch64__)
         if (!token_major.empty()) {
-            const int groups = token_stride / 4;
-            for (int n = begin; n < end; ++n) {
-                std::array<float32x4_t, 8> sums;
-                for (int g = 0; g < groups; ++g)
-                    sums[g] = vdupq_n_f32(0.0f);
-                const uint8_t* row = encoded + size_t(n) * blocks * bytes;
-                for (int block = 0; block < blocks; ++block) {
-                    decode_native_block<P>(row + block * bytes, values.data());
-                    {
-#pragma clang fp contract(off)
-                        for (int k = 0; k < block_values; ++k) {
-                            const float weight = values[k];
-                            const float* a = token_major.data() +
-                                (size_t(block) * block_values + k) * token_stride;
-                            for (int g = 0; g < groups; ++g) {
-                                sums[g] = vaddq_f32(sums[g], vmulq_n_f32(
-                                    vld1q_f32(a + g * 4), weight));
-                            }
-                        }
-                    }
-                }
-                float row_sums[32];
-                for (int g = 0; g < groups; ++g)
-                    vst1q_f32(row_sums + g * 4, sums[g]);
-                for (int m = 0; m < M; ++m)
-                    output[m * N + n] = row_sums[m];
+            switch (token_stride / 4) {
+            case 1:
+                matmul_token_rows<P, 1>(encoded, token_major.data(), output, M, N, blocks,
+                                        block_values, bytes, begin, end);
+                break;
+            case 2:
+                matmul_token_rows<P, 2>(encoded, token_major.data(), output, M, N, blocks,
+                                        block_values, bytes, begin, end);
+                break;
+            case 3:
+                matmul_token_rows<P, 3>(encoded, token_major.data(), output, M, N, blocks,
+                                        block_values, bytes, begin, end);
+                break;
+            case 4:
+                matmul_token_rows<P, 4>(encoded, token_major.data(), output, M, N, blocks,
+                                        block_values, bytes, begin, end);
+                break;
+            case 5:
+                matmul_token_rows<P, 5>(encoded, token_major.data(), output, M, N, blocks,
+                                        block_values, bytes, begin, end);
+                break;
+            case 6:
+                matmul_token_rows<P, 6>(encoded, token_major.data(), output, M, N, blocks,
+                                        block_values, bytes, begin, end);
+                break;
+            case 7:
+                matmul_token_rows<P, 7>(encoded, token_major.data(), output, M, N, blocks,
+                                        block_values, bytes, begin, end);
+                break;
+            case 8:
+                matmul_token_rows<P, 8>(encoded, token_major.data(), output, M, N, blocks,
+                                        block_values, bytes, begin, end);
+                break;
             }
             return;
         }
+        if (M == 1 && (P == Precision::GGUF_IQ2_XXS ||
+                       P == Precision::GGUF_IQ3_XXS)) {
+            const int aligned_end = begin + (end - begin) / 4 * 4;
+            matmul_iq_gemv_rows<P, 4>(encoded, input, output, blocks,
+                bytes, begin, aligned_end);
+            matmul_iq_gemv_rows<P, 1>(encoded, input, output, blocks,
+                bytes, aligned_end, end);
+            return;
+        }
+        if (M == 1 && P == Precision::GGUF_STQ1_0) {
+            const int aligned_end = begin + (end - begin) / 2 * 2;
+            if (stq_block_safe) {
+                matmul_stq_gemv_rows<2, true>(encoded, input, output, blocks,
+                    bytes, begin, aligned_end);
+                matmul_stq_gemv_rows<1, true>(encoded, input, output, blocks,
+                    bytes, aligned_end, end);
+            } else {
+                matmul_stq_gemv_rows<2, false>(encoded, input, output, blocks,
+                    bytes, begin, aligned_end);
+                matmul_stq_gemv_rows<1, false>(encoded, input, output, blocks,
+                    bytes, aligned_end, end);
+            }
+            return;
+        }
+        if (M == 1 && P == Precision::GGUF_Q5_K) {
+            const int aligned_end = begin + (end - begin) / 2 * 2;
+            matmul_q5_gemv_rows<2>(encoded, input, output, blocks,
+                bytes, begin, aligned_end);
+            matmul_q5_gemv_rows<1>(encoded, input, output, blocks,
+                bytes, aligned_end, end);
+            return;
+        }
+        // Eight independent K lanes shorten the Q6 decode reduction chain.
+        // Dequantization is unchanged; FP32 FMA and the final horizontal sum
+        // intentionally differ from the scalar K-order accumulation.
+        if (M == 1 && P == Precision::GGUF_Q6_K) {
+            for (int n = begin; n < end; ++n) {
+                float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+                for (int block = 0; block < blocks; ++block) {
+                    decode_native_block<P>(encoded + (size_t(n) * blocks + block) * bytes, values.data());
+                    const float* x = input + block * block_values;
+                    for (int k = 0; k < block_values; k += 8) {
+                        a0 = vfmaq_f32(a0, vld1q_f32(x + k), vld1q_f32(values.data() + k));
+                        a1 = vfmaq_f32(a1, vld1q_f32(x + k + 4), vld1q_f32(values.data() + k + 4));
+                    }
+                }
+                output[n] = vaddvq_f32(vaddq_f32(a0, a1));
+            }
+            return;
+        }
+        if (M == 1 && P == Precision::GGUF_Q8_0 && q8_scale_safe) {
+            const int mid = begin + (end - begin) / 4 * 4;
+            q8_block_scale<4>(encoded, input, output, blocks, begin, mid);
+            q8_block_scale<1>(encoded, input, output, blocks, mid, end);
+            return;
+        }
         if (M == 1) {
-            // Independent rows hide the scalar reduction dependency.
-            // Clang otherwise fuses the interleaved multiply/add operations,
-            // changing Hy4 logits; the original kernel rounds each product.
+            // Transpose four values from each row in registers so SIMD lanes
+            // hold independent output rows. Each lane keeps the original k
+            // order and rounds each product separately from the addition.
             std::array<std::array<float, 256>, 8> row_values;
             for (; begin + 8 <= end; begin += 8) {
-                float sum0 = 0.0f, sum1 = 0.0f;
-                float sum2 = 0.0f, sum3 = 0.0f;
-                float sum4 = 0.0f, sum5 = 0.0f;
-                float sum6 = 0.0f, sum7 = 0.0f;
+                float32x4_t sums[2] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
                 for (int block = 0; block < blocks; ++block) {
                     for (int lane = 0; lane < 8; ++lane) {
                         const uint8_t* row = encoded +
@@ -431,108 +1003,38 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
                     const float* a = input + block * block_values;
                     {
 #pragma clang fp contract(off)
-                        for (int k = 0; k < block_values; ++k) {
-                            const float x = a[k];
-                            sum0 += x * row_values[0][k];
-                            sum1 += x * row_values[1][k];
-                            sum2 += x * row_values[2][k];
-                            sum3 += x * row_values[3][k];
-                            sum4 += x * row_values[4][k];
-                            sum5 += x * row_values[5][k];
-                            sum6 += x * row_values[6][k];
-                            sum7 += x * row_values[7][k];
+                        for (int k = 0; k < block_values; k += 4) {
+                            const float32x4_t x = vld1q_f32(a + k);
+#pragma unroll
+                            for (int g = 0; g < 2; ++g) {
+                                const float32x4_t r0 = vld1q_f32(row_values[g * 4].data() + k);
+                                const float32x4_t r1 = vld1q_f32(row_values[g * 4 + 1].data() + k);
+                                const float32x4_t r2 = vld1q_f32(row_values[g * 4 + 2].data() + k);
+                                const float32x4_t r3 = vld1q_f32(row_values[g * 4 + 3].data() + k);
+                                const float32x4_t t0 = vtrn1q_f32(r0, r1);
+                                const float32x4_t t1 = vtrn2q_f32(r0, r1);
+                                const float32x4_t t2 = vtrn1q_f32(r2, r3);
+                                const float32x4_t t3 = vtrn2q_f32(r2, r3);
+                                const float32x4_t v0 = vcombine_f32(vget_low_f32(t0), vget_low_f32(t2));
+                                const float32x4_t v1 = vcombine_f32(vget_low_f32(t1), vget_low_f32(t3));
+                                const float32x4_t v2 = vcombine_f32(vget_high_f32(t0), vget_high_f32(t2));
+                                const float32x4_t v3 = vcombine_f32(vget_high_f32(t1), vget_high_f32(t3));
+                                sums[g] = vaddq_f32(sums[g], vmulq_laneq_f32(v0, x, 0));
+                                sums[g] = vaddq_f32(sums[g], vmulq_laneq_f32(v1, x, 1));
+                                sums[g] = vaddq_f32(sums[g], vmulq_laneq_f32(v2, x, 2));
+                                sums[g] = vaddq_f32(sums[g], vmulq_laneq_f32(v3, x, 3));
+                            }
                         }
                     }
                 }
-                output[begin] = sum0;
-                output[begin + 1] = sum1;
-                output[begin + 2] = sum2;
-                output[begin + 3] = sum3;
-                output[begin + 4] = sum4;
-                output[begin + 5] = sum5;
-                output[begin + 6] = sum6;
-                output[begin + 7] = sum7;
+                vst1q_f32(output + begin, sums[0]);
+                vst1q_f32(output + begin + 4, sums[1]);
             }
-        }
-        if (M >= 2 && M <= 4) {
-            // Reuse each decoded block across prefill tokens. Independent
-            // accumulators retain the original per-token rounding order.
-            std::array<float, 32> sums;
-            for (int n = begin; n < end; ++n) {
-                sums.fill(0.0f);
-                const uint8_t* row = encoded + size_t(n) * blocks * bytes;
-                for (int block = 0; block < blocks; ++block) {
-                    decode_native_block<P>(row + block * bytes, values.data());
-                    for (int m = 0; m + 4 <= M; m += 4) {
-                        float sum0 = sums[m], sum1 = sums[m + 1];
-                        float sum2 = sums[m + 2], sum3 = sums[m + 3];
-                        const float* a0 = input + size_t(m) * K + block * block_values;
-                        const float* a1 = a0 + K;
-                        const float* a2 = a1 + K;
-                        const float* a3 = a2 + K;
-                        {
-#pragma clang fp contract(off)
-                            for (int k = 0; k < block_values; ++k) {
-                                const float weight = values[k];
-                                sum0 += a0[k] * weight;
-                                sum1 += a1[k] * weight;
-                                sum2 += a2[k] * weight;
-                                sum3 += a3[k] * weight;
-                            }
-                        }
-                        sums[m] = sum0; sums[m + 1] = sum1;
-                        sums[m + 2] = sum2; sums[m + 3] = sum3;
-                    }
-                    int m = (M / 4) * 4;
-                    if (M - m == 3) {
-                        float sum0 = sums[m], sum1 = sums[m + 1];
-                        float sum2 = sums[m + 2];
-                        const float* a0 = input + size_t(m) * K + block * block_values;
-                        const float* a1 = a0 + K;
-                        const float* a2 = a1 + K;
-                        {
-#pragma clang fp contract(off)
-                            for (int k = 0; k < block_values; ++k) {
-                                const float weight = values[k];
-                                sum0 += a0[k] * weight;
-                                sum1 += a1[k] * weight;
-                                sum2 += a2[k] * weight;
-                            }
-                        }
-                        sums[m] = sum0; sums[m + 1] = sum1;
-                        sums[m + 2] = sum2;
-                        m += 3;
-                    }
-                    if (M - m >= 2) {
-                        float sum0 = sums[m], sum1 = sums[m + 1];
-                        const float* a0 = input + size_t(m) * K + block * block_values;
-                        const float* a1 = a0 + K;
-                        {
-#pragma clang fp contract(off)
-                            for (int k = 0; k < block_values; ++k) {
-                                const float weight = values[k];
-                                sum0 += a0[k] * weight;
-                                sum1 += a1[k] * weight;
-                            }
-                        }
-                        sums[m] = sum0; sums[m + 1] = sum1;
-                        m += 2;
-                    }
-                    if (m < M) {
-                        const float* a = input + size_t(m) * K + block * block_values;
-                        float sum = sums[m];
-                        for (int k = 0; k < block_values; ++k)
-                            sum += a[k] * values[k];
-                        sums[m] = sum;
-                    }
-                }
-                for (int m = 0; m < M; ++m) output[m * N + n] = sums[m];
-            }
-            return;
         }
 #endif
         for (int n = begin; n < end; ++n) {
-            for (int m = 0; m < M; ++m) output[m * N + n] = 0.0f;
+            for (int m = 0; m < M; ++m)
+                output[m * N + n] = 0.0f;
             const uint8_t* row = encoded + size_t(n) * blocks * bytes;
             for (int block = 0; block < blocks; ++block) {
                 decode_native_block<P>(row + block * bytes, values.data());
@@ -548,7 +1050,7 @@ void matmul_native_blocks(const Tensor& A, const Tensor& B, Tensor& C,
     };
     if (pool) {
         // Rows are independent. Let faster cores take more work on Macs with
-        // mixed core speeds, without changing the reduction order per row.
+        // mixed core speeds. Each row uses a scheduling-independent reduction.
         pool->parallel_for_2d(1, 1, N, 64,
                               [&](int thread_id, int, int, int begin, int end) {
                                   process(thread_id, begin, end);
