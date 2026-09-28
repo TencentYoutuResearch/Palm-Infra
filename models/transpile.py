@@ -1112,12 +1112,15 @@ class GraphBuilder:
             routed_scaling_factor: float = 1.0,
             swiglu_limit: float = 0.0,
             hash_token_ids: int | None = None,
-            hash_table: int | None = None) -> int:
+            hash_table: int | None = None,
+            shared_swiglu_limit: float | None = None) -> int:
         """Fused Qwen-style sparse MLP.
 
         The expert tensors keep HF row-major layout:
           experts_gate_up [num_experts, 2*intermediate, hidden]
           experts_down    [num_experts, hidden, intermediate]
+        shared_swiglu_limit=None inherits the routed clamp for older models;
+        an explicit zero leaves the shared branch unclipped.
         """
         sx = self._nodes[hidden].out_shape
         inputs = [hidden, router, experts_gate_up, experts_down]
@@ -1142,6 +1145,9 @@ class GraphBuilder:
             inputs.append(hash_token_ids)
             hash_table_input = len(inputs)
             inputs.append(hash_table)
+        moe_f32 = [float(routed_scaling_factor), float(swiglu_limit)]
+        if shared_swiglu_limit is not None:
+            moe_f32.append(float(shared_swiglu_limit))
         return self._add(OpType.MOE,
                          inputs,
                          sx,
@@ -1155,8 +1161,7 @@ class GraphBuilder:
                               1 if shared_expert_has_gate else 0,
                               router_bias_input, token_ids_input,
                               hash_table_input],
-                         f32=[float(routed_scaling_factor),
-                              float(swiglu_limit)])
+                         f32=moe_f32)
 
     def hc_pre(self, x: int, fn: int, scale: int, base: int,
                hidden_size: int, hc_mult: int = 4,
@@ -1189,7 +1194,7 @@ class GraphBuilder:
     def hc_pre_id(self, x: int, fn: int, scale: int, base: int,
                   hidden_size: int, hc_mult: int = 4,
                   hc_magnitude: float = 2.0, norm_eps: float = 1e-6,
-                  hc_eps: float = 1e-6) -> int:
+                  hc_eps: float = 1e-6, round_bf16: bool = True) -> int:
         """Hy4 identity Hyper-Connections: reduce hc streams to one.
 
         Unlike hc_pre there is no Sinkhorn mixing matrix, so `fn` is
@@ -1201,26 +1206,28 @@ class GraphBuilder:
         return self._add(
             OpType.HC_PRE_ID, [x, fn, scale, base],
             (packed_size, sx[1]), prec=Precision.FP32,
-            i32=[hidden_size, hc_mult],
+            i32=[hidden_size, hc_mult, int(round_bf16)],
             f32=[hc_magnitude, norm_eps, hc_eps])
 
     def hc_post_id(self, branch: int, residual: int, packed: int,
-                   hidden_size: int, hc_mult: int = 4) -> int:
+                   hidden_size: int, hc_mult: int = 4,
+                   round_bf16: bool = True) -> int:
         """Hy4 iHC: apply each stream's gate to its own residual."""
         sr = self._nodes[residual].out_shape
         return self._add(
             OpType.HC_POST_ID, [branch, residual, packed], sr,
-            prec=Precision.FP32, i32=[hidden_size, hc_mult])
+            prec=Precision.FP32, i32=[hidden_size, hc_mult, int(round_bf16)])
 
     def hc_head_id(self, x: int, fn: int, scale: int, base: int,
                    hidden_size: int, hc_mult: int = 4,
-                   norm_eps: float = 1e-6, hc_eps: float = 1e-6) -> int:
+                   norm_eps: float = 1e-6, hc_eps: float = 1e-6,
+                   round_bf16: bool = True) -> int:
         """Hy4 iHC: collapse the hc streams once before the output head."""
         sx = self._nodes[x].out_shape
         return self._add(
             OpType.HC_HEAD_ID, [x, fn, scale, base],
             (hidden_size, sx[1]), prec=Precision.FP32,
-            i32=[hidden_size, hc_mult], f32=[norm_eps, hc_eps])
+            i32=[hidden_size, hc_mult, int(round_bf16)], f32=[norm_eps, hc_eps])
 
     def hy4_indexer(self, hidden: int, q_lora: int, wq_b: int, wk: int,
                     weights_proj: int, k_norm_w: int, k_norm_b: int,
@@ -1230,7 +1237,8 @@ class GraphBuilder:
                     capacity: int, theta: float = 1e7,
                     factor: float = 1.0, original_context: int = 0,
                     beta_fast: float = 32.0,
-                    beta_slow: float = 1.0) -> int:
+                    beta_slow: float = 1.0,
+                    norm_eps: float = 1e-5, round_bf16: bool = True) -> int:
         """Hy4 Gated-DSA indexer: emits INT32 [top_k, seq] key indices.
 
         Unlike the DeepSeek-V4 indexer there is no compressor; keys come
@@ -1244,8 +1252,8 @@ class GraphBuilder:
              k_norm_b, key_cache, position, n_tokens],
             (top_k, sx[1]), prec=Precision.INT32,
             i32=[hidden_size, q_lora_rank, num_heads, head_dim,
-                 rope_dim, top_k, capacity, original_context],
-            f32=[theta, factor, beta_fast, beta_slow])
+                 rope_dim, top_k, capacity, original_context, int(round_bf16)],
+            f32=[theta, factor, beta_fast, beta_slow, norm_eps])
 
     def gr_reduce(self, normalized: int, gates: int,
                   hidden_size: int, hc_count: int = 4) -> int:

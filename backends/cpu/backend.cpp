@@ -134,7 +134,8 @@ void CPUBackend::dispatch(const GraphNode& node,
                 graph_params::get_i32(params, 0, 0),
                 graph_params::get_i32(params, 1, 4),
                 graph_params::get_f32(params, 0, 1e-6f),
-                graph_params::get_f32(params, 1, 1e-6f), thread_pool))
+                graph_params::get_f32(params, 1, 1e-6f), thread_pool,
+                graph_params::get_i32(params, 2, 1) != 0))
                 reject();
         } else {
             reject();
@@ -148,7 +149,8 @@ void CPUBackend::dispatch(const GraphNode& node,
                 graph_params::get_i32(params, 1, 4),
                 graph_params::get_f32(params, 0, 2.0f),
                 graph_params::get_f32(params, 1, 1e-6f),
-                graph_params::get_f32(params, 2, 1e-6f), thread_pool))
+                graph_params::get_f32(params, 2, 1e-6f), thread_pool,
+                graph_params::get_i32(params, 2, 1) != 0))
                 reject();
         } else {
             reject();
@@ -159,7 +161,8 @@ void CPUBackend::dispatch(const GraphNode& node,
             if (!kernel_hc_post_id(
                 *inputs[0], *inputs[1], *inputs[2], *output,
                 graph_params::get_i32(params, 0, 0),
-                graph_params::get_i32(params, 1, 4), thread_pool))
+                graph_params::get_i32(params, 1, 4), thread_pool,
+                graph_params::get_i32(params, 2, 1) != 0))
                 reject();
         } else {
             reject();

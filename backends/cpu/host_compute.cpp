@@ -4,8 +4,10 @@
 #include "kernels/cpu/matmul/matmul.h"
 
 void host_matmul_fp32(const Tensor& input, const Tensor& weight,
-                      Tensor& output, ThreadPool* thread_pool) {
-    kernel_matmul_fp32(input, weight, output, thread_pool);
+                      Tensor& output, ThreadPool* thread_pool,
+                      bool force_fp32_acc) {
+    kernel_matmul_fp32(input, weight, output, thread_pool,
+                      Activation::NONE, 0, -1, force_fp32_acc);
 }
 
 void host_prepare_matmul_weight(

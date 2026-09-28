@@ -17,7 +17,8 @@ using HostPackedWeightMap =
 // Host calculations used by model loading and accelerator fallback. The CPU
 // backend owns the implementation; engine code depends only on this contract.
 void host_matmul_fp32(const Tensor& input, const Tensor& weight,
-                      Tensor& output, ThreadPool* thread_pool);
+                      Tensor& output, ThreadPool* thread_pool,
+                      bool force_fp32_acc = false);
 void host_prepare_matmul_weight(
     Tensor& weight, const std::string& key, const void* data,
     HostPackedWeightMap& packed_weights, PreparedWeightMap& prepared_weights,

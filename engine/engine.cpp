@@ -479,7 +479,7 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
             hidden_dim);
     } else {
         host_matmul_fp32(A, *lm_head_weight_, C,
-                           exec_ctx_decode_.thread_pool);
+                           exec_ctx_decode_.thread_pool, lm_head_fp32_acc_);
     }
 
     if (accelerator_backend_ && accelerator_backend_->dispatch_failed()) {
@@ -563,7 +563,7 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
                 hidden_dim);
         } else {
             host_matmul_fp32(A, *lm_head_weight_, C,
-                               exec_ctx_decode_.thread_pool);
+                               exec_ctx_decode_.thread_pool, lm_head_fp32_acc_);
         }
     }
 
@@ -982,6 +982,28 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
             n, past_len_, cfg_.n_ctx);
         return -1;
     }
+    int graph_seq_len = 1;
+    bool dynamic_sequence = false;
+    for (const auto& node : graph_prefill_.nodes) {
+        if (node.op_type == OpType::INPUT && !node.params.str.empty() &&
+            node.params.str[0] == "hidden") {
+            graph_seq_len = static_cast<int>(node.out_shape[1]);
+            dynamic_sequence = node.dim_expr[1].kind == DIM_SEQ;
+            break;
+        }
+    }
+    const int chunk_limit = cfg_.prefill_chunk_size > 0
+        ? cfg_.prefill_chunk_size : graph_seq_len;
+    if (cfg_.prefill_chunk_size < 0 || chunk_limit <= 0 ||
+        (chunk_limit > graph_seq_len &&
+         (cfg_.static_padded || !dynamic_sequence))) {
+        std::fprintf(stderr,
+                     "prefill: invalid chunk size %d (package=%d); larger "
+                     "batches require a symbolic sequence dimension and "
+                     "dynamic execution\n",
+                     cfg_.prefill_chunk_size, graph_seq_len);
+        return -1;
+    }
     sampler_.accept(token_ids);
 
     Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
@@ -1024,20 +1046,8 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         exec_ctx_prefill_.backend = saved_prefill_backend;
     };
 
-    // Determine the graph's expected seq_len from its hidden input shape.
-    int graph_seq_len = 1;
-    for (auto& node : graph_prefill_.nodes) {
-        if (node.op_type == OpType::INPUT && !node.params.str.empty() &&
-            node.params.str[0] == "hidden") {
-            graph_seq_len = (int)node.out_shape[1];
-            break;
-        }
-    }
-
-    // Chunked prefill: split long prompts into graph_seq_len-sized chunks.
-    // Each chunk is processed independently, appending to the KV cache.
-    // past_len_ can exceed graph_seq_len (cache supports n_ctx); only each
-    // chunk's token count must be <= graph_seq_len.
+    // Split long prompts at the package size or the explicit dynamic limit.
+    // Each chunk appends to the same KV cache up to n_ctx.
     int offset = 0;
     int last_token = -1;
     while (offset < n) {
@@ -1051,7 +1061,7 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
             return -1;
         }
         int chunk_size =
-            std::min({remaining, graph_seq_len, cfg_.n_ctx - past_len_});
+            std::min({remaining, chunk_limit, cfg_.n_ctx - past_len_});
         std::vector<int> chunk(token_ids.begin() + offset,
                                token_ids.begin() + offset + chunk_size);
         last_token = prefill_chunk(chunk, past_len_);
@@ -1258,12 +1268,11 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
         }
     }
 
-    // Check that this chunk fits in the prefill graph's static seq_len.
-    // `past` can be >= graph_seq_len (cache supports n_ctx=4096); only the
-    // chunk size n must be <= graph_seq_len.
-    if (n > graph_seq_len) {
-        fprintf(stderr, "prefill_chunk: n=%d > graph_seq_len=%d\n", n,
-                graph_seq_len);
+    // prefill() validates that larger overrides have symbolic sequence dims.
+    // Static-padded execution must still fit the package's declared shape.
+    if (n > graph_seq_len &&
+        (cfg_.static_padded || n > cfg_.prefill_chunk_size)) {
+        fprintf(stderr, "prefill_chunk: n=%d exceeds the configured limit\n", n);
         return -1;
     }
 

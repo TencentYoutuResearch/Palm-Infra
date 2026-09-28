@@ -5,6 +5,7 @@
 
 class ThreadPool;
 class Backend;
+class HostMatmulBackend;
 
 // ---------------------------------------------------------------------------
 // mollm — Execution context
@@ -29,6 +30,8 @@ struct ExecContext {
     // Optional decode-only routed-MoE accelerator. All other graph operators
     // continue through `backend`, so host intermediates remain authoritative.
     Backend*      moe_backend = nullptr;
+    // Selected dense matmuls; tensors and persistent state remain host-owned.
+    HostMatmulBackend* matmul_backend = nullptr;
     bool          execution_failed = false;
     bool          profile_enabled = false;
     // DeepSeek-V4 activations are BF16 in the published inference graph.

@@ -204,6 +204,8 @@ bool dispatch_cpu_deepseek_v4(
             graph_params::get_i32(params, 7, 0);
         config.rope.beta_fast = graph_params::get_f32(params, 2, 32.0f);
         config.rope.beta_slow = graph_params::get_f32(params, 3, 1.0f);
+        config.norm_eps = graph_params::get_f32(params, 4, 1e-5f);
+        config.round_bf16 = graph_params::get_i32(params, 8, 1) != 0;
         const int start_pos = inputs[8] && inputs[8]->data
             ? inputs[8]->ptr<int32_t>()[0] : 0;
         const int n_tokens = inputs[9] && inputs[9]->data

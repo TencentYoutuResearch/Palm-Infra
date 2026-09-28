@@ -5,6 +5,7 @@
 #include "core/cache_layout.h"
 #include "core/prepared_weight.h"
 #include "runtime/backend.h"
+#include "runtime/host_matmul_backend.h"
 #include "runtime/accelerator_backend.h"
 #include "engine/sampler.h"
 #include "core/tensor.h"
@@ -95,6 +96,8 @@ struct EngineConfig {
     // Experimental full-Metal decode for SSD-offloaded MoE packages. Expert
     // weights are loaded directly into Shared Metal buffers.
     bool metal_ssd_full = false;
+    bool metal_dense = false; // selected Hy4 Q5 decode projections; CPU graph/KV/MoE
+    bool metal_moe_ffn = false; // selected resident IQ2/IQ3 decode batches
     // Optional Chrome Trace / Perfetto JSON path. Empty disables tracing.
     std::string trace_path;
     // Experimental single-head MTP speculation. Zero keeps the ordinary
@@ -119,6 +122,9 @@ struct EngineConfig {
     // Stateful ops still receive n_real_tokens to skip padding positions.
     // For A/B benchmark comparison against DYNAMIC mode.
     bool static_padded = false;
+    // 0 uses the package's prefill batch size. Larger overrides require a
+    // symbolic sequence dimension and dynamic (unpadded) execution.
+    int prefill_chunk_size = 0;
     // CPU vision attention is quadratic in the number of image patches.
     // Resize ordinary high-resolution photos to a practical default budget.
     int image_max_pixels = kDefaultImageMaxPixels;
@@ -266,6 +272,13 @@ public:
         return package_weights_base_ != nullptr && !package_weights_resident_;
     }
     bool moe_ssd_offload_enabled() const { return moe_ssd_cache_ != nullptr; }
+    uint64_t host_matmul_dispatches() const {
+        return host_matmul_backend_ ? host_matmul_backend_->completed_dispatches() : 0;
+    }
+    uint64_t host_moe_batches() const {
+        return metal_host_moe_backend_
+            ? metal_host_moe_backend_->completed_host_moe_batches() : 0;
+    }
     MoeSsdCache::Stats moe_ssd_stats() const {
         return moe_ssd_cache_ ? moe_ssd_cache_->stats() : MoeSsdCache::Stats{};
     }
@@ -297,6 +310,8 @@ private:
     // Active graph-resident accelerator. The engine is deliberately unaware
     // of backend-specific resource types.
     std::unique_ptr<AcceleratorBackend> accelerator_backend_;
+    std::unique_ptr<HostMatmulBackend> host_matmul_backend_;
+    std::unique_ptr<Backend> metal_host_moe_backend_;
     int past_len_ = 0;
     int mtp_past_len_ = 0;
     MtpStats mtp_stats_;
@@ -444,13 +459,14 @@ private:
     Backend* persistent_backend() const;
     bool set_cache_lengths(std::vector<CachePair>& caches, uint64_t length);
 
-    /// Process a single chunk of tokens (≤ graph_seq_len).
+    /// Process a chunk within the limit validated by prefill().
     /// Called by prefill() in a loop for chunked prefill.
     int prefill_chunk(const std::vector<int>& token_ids, int past);
 
     // weight tensors
     Tensor* embed_weight_ = nullptr;   // [vocab_size, hidden_dim], row-major FP16/FP32 for lookup
     Tensor* lm_head_weight_ = nullptr; // [vocab_size, hidden_dim], regular matmul weight
+    bool lm_head_fp32_acc_ = false;
     Tensor* vision_pos_embed_ = nullptr; // [positions, vision_hidden]
 
     const VisionEmbedding* active_vision_ = nullptr;

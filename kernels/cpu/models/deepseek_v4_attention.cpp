@@ -3,6 +3,7 @@
 #include "core/bf16.h"
 #include "backends/cpu/platform.h"
 #include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/norm.h"
 #include "runtime/threading.h"
 
 #include <algorithm>
@@ -1112,6 +1113,9 @@ bool kernel_hy4_indexer(
         weights_projection.shape[1] != config.hidden_size ||
         k_norm_weight.shape[0] != config.head_dim ||
         k_norm_bias.shape[0] != config.head_dim ||
+        k_norm_weight.prec != Precision::FP32 ||
+        k_norm_bias.prec != Precision::FP32 ||
+        !std::isfinite(config.norm_eps) || config.norm_eps <= 0.0f ||
         key_cache.prec != Precision::FP32 ||
         key_cache.shape[0] != config.head_dim ||
         key_cache.shape[1] != config.capacity ||
@@ -1143,6 +1147,10 @@ bool kernel_hy4_indexer(
         Precision::FP32, MemoryType::EXTERNAL,
         head_dim, sequence, 1, 1, keys.data());
     kernel_matmul_fp32(hidden, wk, keys_tensor, thread_pool);
+    // HY4's indexer uses LayerNorm (including mean subtraction), not RMSNorm
+    // or just an affine transform. Normalize before applying positional RoPE.
+    kernel_layer_norm(keys_tensor, k_norm_weight, k_norm_bias,
+                      config.norm_eps, keys_tensor, thread_pool);
 
     // Per-head selection weights, computed from the hidden state.
     std::vector<float> head_weights(
@@ -1152,16 +1160,14 @@ bool kernel_hy4_indexer(
         config.num_heads, sequence, 1, 1, head_weights.data());
     kernel_matmul_fp32(hidden, weights_projection, weights_tensor, thread_pool);
 
-    // The reference scales the weights by 1/sqrt(head_dim * num_heads) and
-    // rounds through BF16 before scoring.
+    // GGUF keeps projections, scoring, and our FP32 key cache in FP32.
+    // Retain the earlier HF BF16 emulation only when explicitly requested.
     const float weight_scale = 1.0f / std::sqrt(
         static_cast<float>(head_dim) * static_cast<float>(config.num_heads));
-    mollm_round_to_bf16(head_weights.data(), head_weights.size());
+    if (config.round_bf16)
+        mollm_round_to_bf16(head_weights.data(), head_weights.size());
     for (float& value : head_weights)
         value *= weight_scale;
-
-    const float* norm_weight = k_norm_weight.ptr<float>();
-    const float* norm_bias = k_norm_bias.ptr<float>();
 
     // Rotate q and k per position and write this chunk's keys into the cache,
     // so a later decode step can score without recomputing them.
@@ -1175,16 +1181,15 @@ bool kernel_hy4_indexer(
             // RoPE covers the trailing rope_dim values (nope first, rope last),
             // matching the reference split.
             dsv4_apply_rope(head_query, head_dim, position, config.rope);
-            mollm_round_to_bf16(head_query, static_cast<size_t>(head_dim));
+            if (config.round_bf16)
+                mollm_round_to_bf16(head_query, static_cast<size_t>(head_dim));
         }
 
         float* token_key =
             keys.data() + static_cast<size_t>(token) * head_dim;
-        // Indexer key norm, which unlike the MLA norms carries a bias.
-        for (int dim = 0; dim < head_dim; ++dim)
-            token_key[dim] = token_key[dim] * norm_weight[dim] + norm_bias[dim];
         dsv4_apply_rope(token_key, head_dim, position, config.rope);
-        mollm_round_to_bf16(token_key, static_cast<size_t>(head_dim));
+        if (config.round_bf16)
+            mollm_round_to_bf16(token_key, static_cast<size_t>(head_dim));
 
         if (capacity > 0 && position < capacity) {
             float* slot = key_cache.ptr<float>() +
@@ -1217,16 +1222,15 @@ bool kernel_hy4_indexer(
                 cache_data + static_cast<size_t>(cache_index) * head_dim;
             float score = 0.0f;
             for (int head = 0; head < config.num_heads; ++head) {
-                // einsum writes BF16 and the following relu/multiply stays in
-                // BF16 in the reference, so round each step.
-                const float dot = mollm_round_to_bf16(dot_product(
+                float dot = dot_product(
                     token_query + static_cast<size_t>(head) * head_dim,
-                    key, head_dim));
-                const float weighted = mollm_round_to_bf16(
-                    std::max(dot, 0.0f) * token_weights[head]);
+                    key, head_dim);
+                if (config.round_bf16) dot = mollm_round_to_bf16(dot);
+                float weighted = std::max(dot, 0.0f) * token_weights[head];
+                if (config.round_bf16) weighted = mollm_round_to_bf16(weighted);
                 score += weighted;
             }
-            scores[cache_index] = mollm_round_to_bf16(score);
+            scores[cache_index] = config.round_bf16 ? mollm_round_to_bf16(score) : score;
         }
 
         const int selected = std::min(config.top_k, available);

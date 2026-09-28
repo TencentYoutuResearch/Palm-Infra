@@ -123,6 +123,8 @@ void LLMEngine::clear_model_state() {
     exec_ctx_decode_ = ExecContext{};
     exec_ctx_vision_ = ExecContext{};
     exec_ctx_mtp_ = ExecContext{};
+    host_matmul_backend_.reset();
+    metal_host_moe_backend_.reset();
     accelerator_backend_.reset();
 
     caches_.clear();
@@ -168,6 +170,7 @@ void LLMEngine::clear_model_state() {
     temp_files_.clear();
 
     package_metadata_.clear();
+    lm_head_fp32_acc_ = false;
     past_len_ = 0;
     mtp_past_len_ = 0;
     rope_position_delta_ = 0;
@@ -383,6 +386,60 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
     if (!graph_load(g, path)) {
         fprintf(stderr, "Engine: failed to load graph %s\n", path);
         return false;
+    }
+
+    // Repair legacy Hy4 graph conventions in memory, without rewriting the
+    // weight package: GGUF rotary pairing and the shared-expert clamp.
+    const auto architecture = package_metadata_.find("architecture");
+    if (architecture != package_metadata_.end() && architecture->second == "hy-v4") {
+        // Older Hy4 exports recorded RoPE settings only in the package JSON.
+        // Input preparation reads graph metadata; retain explicit graph values
+        // and recover missing settings before configuring the runtime.
+        for (const char* key : {"rope_dim", "rope_theta"}) {
+            const auto value = package_metadata_.find(key);
+            if (value != package_metadata_.end())
+                g.metadata.emplace(key, value->second);
+        }
+        const auto quantization = package_metadata_.find("quantization");
+        // Earlier GGUF exports used the Transformers rotate_half convention,
+        // but their weights follow the GGUF reference's consecutive pairs.
+        // New exports record the convention explicitly and need no repair.
+        const bool hy4_gguf = quantization != package_metadata_.end() &&
+            (quantization->second == "gguf-native-blocks" ||
+             quantization->second == "gguf-dequant-fp16");
+        const bool legacy_gguf_rope = hy4_gguf &&
+            package_metadata_.find("rope_interleave") == package_metadata_.end();
+        if (hy4_gguf) g.metadata.emplace("lm_head_fp32_acc", "1");
+        for (auto& node : g.nodes) {
+            // GGUF reference MLA retains its latent K/V in FP32. Rounding
+            // this shared state to FP16 perturbs subsequent expert routing.
+            if (hy4_gguf && node.op_type == OpType::INPUT &&
+                !node.params.str.empty() &&
+                parse_persistent_input(node.params.str[0]).kind ==
+                    PersistentInputKind::LATENT_CACHE) {
+                node.out_prec = Precision::FP32;
+            }
+            if (hy4_gguf && node.op_type == OpType::HY4_INDEXER &&
+                node.params.i32.size() == 8) {
+                node.params.i32.push_back(0); // FP32 projections, cache, scores
+            }
+            // GGUF residual streams stay FP32; only older graphs omitted the
+            // explicit HF BF16-emulation flag. Preserve explicit new settings.
+            if (hy4_gguf && node.params.i32.size() == 2 &&
+                (node.op_type == OpType::HC_PRE_ID ||
+                 node.op_type == OpType::HC_POST_ID ||
+                 node.op_type == OpType::HC_HEAD_ID)) {
+                node.params.i32.push_back(0);
+            }
+            if (legacy_gguf_rope && node.op_type == OpType::ROTARY_EMBED &&
+                node.params.i32.size() >= 2) {
+                node.params.i32[1] = 1;
+            }
+            if (node.op_type == OpType::MOE && node.params.f32.size() < 3) {
+                node.params.f32 = {graph_params::get_f32(node.params, 0, 1.0f),
+                                   graph_params::get_f32(node.params, 1, 0.0f), 0.0f};
+            }
+        }
     }
 
     // Resolve graph directory for relative weight paths
@@ -688,7 +745,15 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     gguf_k_block_bytes(t.prec) &&
                     (!(cfg_.pin_gguf_dense_weights || moe_ssd_cache_) ||
                      mollm::detail::is_routed_expert_aggregate_ref(wref));
-                if (complete_cpu_sidecar || gguf_source_to_skip) {
+                // Offloaded decode only looks up a few embedding rows. Keep
+                // the table mapped, but avoid warming and wiring every row at
+                // the expense of memory available for expert reads. Explicit
+                // dense pinning still requests the original resident policy.
+                const bool pageable_lookup =
+                    moe_ssd_cache_ && lookup_table &&
+                    !cfg_.pin_gguf_dense_weights;
+                if (complete_cpu_sidecar || gguf_source_to_skip ||
+                    pageable_lookup) {
                     mmap_weight_exclusion_ranges_.push_back(
                         {pit->second.first, pit->second.second});
                 }
@@ -1078,6 +1143,33 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 "--ssd-cache-mb\n");
         return false;
     }
+    if (cfg_.metal_dense) {
+        if (cfg_.device != Device::CPU) {
+            std::fprintf(stderr, "Engine: --metal-dense requires --device cpu\n");
+            return false;
+        }
+        std::string reason;
+        host_matmul_backend_ = create_metal_host_matmul_backend(reason);
+        if (!host_matmul_backend_) {
+            std::fprintf(stderr, "Engine: --metal-dense unavailable: %s\n", reason.c_str());
+            return false;
+        }
+        cfg_.weight_loading = WeightLoadingMode::MMAP;
+    }
+    if (cfg_.metal_moe_ffn) {
+        if (cfg_.device != Device::CPU || cfg_.moe_ssd_cache_bytes == 0) {
+            std::fprintf(stderr,
+                         "Engine: --metal-moe-ffn requires --device cpu and --ssd-cache-mb\n");
+            return false;
+        }
+        std::string reason;
+        metal_host_moe_backend_ = create_metal_host_moe_ffn_backend(reason);
+        if (!metal_host_moe_backend_) {
+            std::fprintf(stderr, "Engine: --metal-moe-ffn unavailable: %s\n",
+                         reason.c_str());
+            return false;
+        }
+    }
     mollm_trace::start(cfg_.trace_path);
     mollm_trace::set_thread_name("main");
     if (cfg_.moe_ssd_cache_bytes != 0) {
@@ -1110,6 +1202,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_mtp_.backend = cpu_backend_.get();
     exec_ctx_prefill_.moe_backend = nullptr;
     exec_ctx_decode_.moe_backend = nullptr;
+    if (metal_host_moe_backend_)
+        exec_ctx_decode_.moe_backend = metal_host_moe_backend_.get();
     exec_ctx_vision_.moe_backend = nullptr;
     exec_ctx_mtp_.moe_backend = nullptr;
     accelerator_backend_.reset();
@@ -1225,6 +1319,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         architecture_it != package_metadata_.end()
             ? architecture_it->second
             : std::string();
+    if (cfg_.metal_dense && (architecture != "hy-v4" || !package_mmap_)) {
+        std::fprintf(stderr, "Engine: --metal-dense requires a Hy4 mmap package\n");
+        return false;
+    }
     if (architecture == "deepseek-v4" || architecture == "hy-v4") {
         const bool hy4 = architecture == "hy-v4";
         const auto context_it = package_metadata_.find("n_ctx");
@@ -1337,13 +1435,17 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         !load_graph(graph_vision_, exec_ctx_vision_, vi_path.c_str())) {
         return false;
     }
-    // RWKV state and token-shift buffers are persistent INPUT tensors, so the
-    // regular release queue can safely manage all materialized intermediates.
+    // RWKV state and verified CPU absorbed-MLA caches are persistent INPUTs,
+    // so the release queue can manage materialized prefill intermediates.
     // Keeping every same-shape node output resident defeats that liveness and
     // costs multiple gigabytes for a 256-token prefill graph.
     for (const auto& node : graph_prefill_.nodes) {
         if (node.op_type == OpType::RWKV7 ||
-            node.op_type == OpType::RWKV_TOKEN_SHIFT) {
+            node.op_type == OpType::RWKV_TOKEN_SHIFT ||
+            (node.op_type == OpType::SDPA_MLA_ABSORB &&
+             std::any_of(exec_ctx_prefill_.release_queue.begin(),
+                         exec_ctx_prefill_.release_queue.end(),
+                         [](const auto& batch) { return !batch.empty(); }))) {
             exec_ctx_prefill_.reuse_same_shape_workspace = false;
             break;
         }
@@ -1364,6 +1466,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     };
     cfg_.rope_dim = get_meta_int("rope_dim", cfg_.rope_dim);
     cfg_.rope_theta = get_meta_float("rope_theta", cfg_.rope_theta);
+    lm_head_fp32_acc_ = get_meta_int("lm_head_fp32_acc", 0) != 0;
 
     if (!allocate_caches(
             graph_prefill_, exec_ctx_prefill_, caches_, cfg.n_ctx)) {
@@ -1384,6 +1487,40 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             fprintf(stderr, "Engine: failed to allocate MTP persistent state\n");
             return false;
         }
+    }
+    if (host_matmul_backend_) {
+        size_t registered = 0;
+        for (const auto& node : graph_decode_.nodes) {
+            if (node.op_type != OpType::CONSTANT || node.params.str.empty()) continue;
+            std::string key = node.params.str[0];
+            const auto slash = key.find_last_of("/\\");
+            if (slash != std::string::npos) key.erase(0, slash + 1);
+            if (key.size() > 4 && key.compare(key.size()-4, 4, ".xmm") == 0)
+                key.resize(key.size()-4);
+            if (key.compare(0, 6, "layer_") != 0) continue;
+            const auto suffix = key.find('_', 6);
+            if (suffix == std::string::npos || suffix == 6 ||
+                key.find_first_not_of("0123456789", 6) != suffix) continue;
+            const std::string family = key.substr(suffix);
+            if (family != "_attn_o_proj_weight" &&
+                family != "_attn_linear_gate_weight") continue;
+            const auto& weight = graph_decode_.runtime.tensors[node.id];
+            if (weight.prec != Precision::GGUF_Q5_K) continue;
+            if (!host_matmul_backend_->register_weight(
+                    weight, package_mmap_, package_mmap_size_)) {
+                std::fprintf(stderr, "Engine: cannot register Metal dense weight %s\n", key.c_str());
+                return false;
+            }
+            ++registered;
+        }
+        if (!registered) {
+            std::fprintf(stderr, "Engine: --metal-dense found no eligible Hy4 Q5 projections\n");
+            return false;
+        }
+        exec_ctx_decode_.matmul_backend = host_matmul_backend_.get();
+        std::fprintf(stderr,
+            "Engine: Metal dense decode enabled for %zu Q5 projections; KV and MoE remain CPU\n",
+            registered);
     }
     // Graph loading builds the CPU sidecars used by FP8 dense weights and
     // records their source blobs as exclusions. Lock only after both graphs

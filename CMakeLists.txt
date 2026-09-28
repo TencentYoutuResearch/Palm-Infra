@@ -335,6 +335,8 @@ if(MOLLM_METAL)
     # Compile each shader domain independently, then link one metallib.
     set(MOLLM_METAL_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/matmul.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/gguf_matmul.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/iq_moe_ffn.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/moe.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/attention.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/elementwise.metal
@@ -372,9 +374,15 @@ if(MOLLM_METAL)
                                ${MOLLM_METAL_SOURCE} NAME_WE)
         set(MOLLM_METAL_DOMAIN_AIR
             ${CMAKE_CURRENT_BINARY_DIR}/${MOLLM_METAL_DOMAIN}.air)
+        # Q5 host delegation preserves the CPU FMA/reduction order.
+        set(MOLLM_METAL_DOMAIN_FLAGS ${MOLLM_METAL_FLAGS})
+        if(MOLLM_METAL_DOMAIN STREQUAL "gguf_matmul" OR
+           MOLLM_METAL_DOMAIN STREQUAL "iq_moe_ffn")
+            list(APPEND MOLLM_METAL_DOMAIN_FLAGS -fno-fast-math)
+        endif()
         add_custom_command(
             OUTPUT ${MOLLM_METAL_DOMAIN_AIR}
-            COMMAND xcrun -sdk macosx metal ${MOLLM_METAL_FLAGS}
+            COMMAND xcrun -sdk macosx metal ${MOLLM_METAL_DOMAIN_FLAGS}
                     -c ${MOLLM_METAL_SOURCE}
                     -I ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal
                     -o ${MOLLM_METAL_DOMAIN_AIR}
@@ -400,6 +408,8 @@ if(MOLLM_METAL)
         backends/metal/buffer_pool.mm
         backends/metal/command_context.mm
         backends/metal/elementwise_ops.mm
+        backends/metal/host_matmul.mm
+        backends/metal/host_moe_ffn.mm
         backends/metal/layout_ops.mm
         backends/metal/lm_head.mm
         backends/metal/matmul_ops.mm
@@ -419,6 +429,8 @@ if(MOLLM_METAL)
         backends/metal/backend.mm backends/metal/buffer_pool.mm
         backends/metal/command_context.mm
         backends/metal/elementwise_ops.mm
+        backends/metal/host_matmul.mm
+        backends/metal/host_moe_ffn.mm
         backends/metal/layout_ops.mm
         backends/metal/lm_head.mm
         backends/metal/matmul_ops.mm
@@ -561,6 +573,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_ple            tests/test_ple.cpp)
     add_mollm_test(test_deepseek_v4_attention tests/test_deepseek_v4_attention.cpp)
     add_mollm_test(test_mla_absorbed_attention tests/test_mla_absorbed_attention.cpp)
+    add_mollm_test(test_host_matmul_backend tests/test_host_matmul_backend.cpp)
     add_executable(dump_hy4_logits tests/dump_hy4_logits.cpp)
     target_link_libraries(dump_hy4_logits PRIVATE mollm_lib)
     add_mollm_test(test_trace         tests/test_trace.cpp)
