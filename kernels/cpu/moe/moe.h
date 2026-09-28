@@ -5,6 +5,7 @@
 #include <vector>
 
 class ThreadPool;
+class HostMoeFfn;
 
 // Compute only the dense/shared expert branch of an MoE layer. Keeping this
 // independent from routed execution lets SSD device backends overlap routed
@@ -35,6 +36,8 @@ bool kernel_moe_shared_expert(const Tensor& hidden,
 //   FP32 [hidden, seq]
 // Returns false instead of leaving a partial output when routing or SSD I/O
 // fails.
+// A negative shared_swiglu_limit inherits swiglu_limit for legacy callers;
+// zero disables shared clipping without affecting routed experts.
 bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       Tensor& output,
                       ThreadPool* thread_pool,
@@ -53,7 +56,9 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       int router_bias_input = -1,
                       int token_ids_input = -1,
                       int hash_table_input = -1,
-                      float swiglu_limit = 0.0f);
+                      float swiglu_limit = 0.0f,
+                      float shared_swiglu_limit = -1.0f,
+                      HostMoeFfn* host_moe_ffn = nullptr);
 
 extern "C" int mollm_moe_profile_enabled();
 extern "C" void mollm_reset_moe_profile();

@@ -126,9 +126,9 @@ void ThreadPool::resume() {
     park_cv_.notify_all();
 }
 
-void ThreadPool::resize(int num_threads) {
+void ThreadPool::resize(int num_threads, unsigned idle_yield_period) {
     num_threads = std::max(num_threads, 1);
-    if (num_threads == num_threads_) return;
+    if (num_threads == num_threads_ && idle_yield_period == idle_yield_period_) return;
 
     stop_workers();
     for (auto& worker : workers_) {
@@ -140,6 +140,7 @@ void ThreadPool::resize(int num_threads) {
     stop_.store(false, std::memory_order_release);
     pending_workers_.store(0, std::memory_order_release);
     num_threads_ = num_threads;
+    idle_yield_period_ = idle_yield_period;
     workers_started_ = false;
     job_.fn = nullptr;
     job_.generation.store(0, std::memory_order_release);
@@ -276,11 +277,12 @@ void ThreadPool::parallel_for_2d_impl(int m_total, int m_tile_size,
 
 void ThreadPool::worker_loop(int thread_id) {
     size_t seen_generation = 0;
+    unsigned idle_spins = 0;
 
     while (true) {
-        // Spin-wait for job: pure spin for minimum dispatch latency.
-        // Idle CPU is handled by explicit park()/resume() between generation
-        // steps, so workers only exist while inference is active.
+        // Keep short dispatch gaps cheap. Offload workloads can opt into
+        // periodic OS yields so idle workers do not crowd out I/O/prediction
+        // threads when the compute pool occupies every core.
         while (true) {
             if (stop_.load(std::memory_order_acquire)) return;
             if (worker_ready_[thread_id].load(std::memory_order_acquire)) break;
@@ -293,7 +295,13 @@ void ThreadPool::worker_loop(int thread_id) {
                 continue;
             }
             worker_relax();
+            if (idle_yield_period_ && ++idle_spins >= idle_yield_period_) {
+                idle_spins = 0;
+                std::this_thread::yield();
+            }
         }
+
+        idle_spins = 0;
 
         // Read job
         size_t gen = job_.generation.load(std::memory_order_acquire);

@@ -649,6 +649,27 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 }
                 if (!cache->set_global_capacity_pool(cfg_.moe_ssd_global_cache))
                     return false;
+#if defined(__APPLE__)
+                // Validated for the native Hy4 CPU offload path at 4 and 8 GiB.
+                // Keep the fixed reuse reservation away from small caches;
+                // unsupported component alignment retains the existing policy.
+                if (cfg_.device == Device::CPU && cfg_.moe_ssd_global_cache &&
+                    host_cache_bytes >= size_t{4} * 1024 * 1024 * 1024 &&
+                    meta.value("architecture", std::string()) == "hy-v4" &&
+                    meta.value("quantization", std::string()) == "gguf-native-blocks" &&
+                    cache->set_read_alignment(4096) &&
+                    cache->set_buffer_reuse_capacity(size_t{64} * 1024 * 1024)) {
+                    // Keep spare CPU time for the predictor and SSD workers
+                    // at high compute concurrency; lower thread counts retain
+                    // the existing spin policy. load() resets this on reuse.
+                    if (cfg_.num_threads >= 16)
+                        thread_pool_.resize(cfg_.num_threads, 1024);
+                    std::fprintf(stderr,
+                                 "Engine: aligned expert reads; buffer reuse reserves %.1f MB "
+                                 "within the cache budget\n",
+                                 cache->stats().buffer_reserve_bytes / 1e6);
+                }
+#endif
                 if (!cache->configure_shallow_favoring(
                         cfg_.moe_ssd_shallow_cache_layers)) {
                     return false;
@@ -679,6 +700,8 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 } else if (it->is_number_unsigned()) {
                     package_metadata_[key] =
                         std::to_string(it->get<uint64_t>());
+                } else if (it->is_number_float()) {
+                    package_metadata_[key] = it->dump();
                 } else if (it->is_boolean()) {
                     package_metadata_[key] = it->get<bool>() ? "true" : "false";
                 }
