@@ -1,5 +1,8 @@
 #include "engine/engine.h"
+#include "engine/logical_prefill.h"
+#include "runtime/cuda_host_memory_budget.h"
 #include "engine/input_prep.h"
+#include "engine/recurrent_checkpoint.h"
 #include "engine/sampler.h"
 #include "core/fp16.h"
 #include "runtime/host_compute.h"
@@ -7,6 +10,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -202,6 +206,35 @@ Tensor copy_tensor_contiguous(const Tensor& src,
     return dst;
 }
 
+// A retained output may be wider than the ordinary lm_head hidden state.
+bool copy_declared_mtp_state(Graph& graph, Backend* backend, int tokens,
+                             std::vector<uint8_t>& storage, Tensor& result) {
+    result = Tensor{};
+    const auto found = graph.metadata.find("mtp_state_output_node");
+    if (found == graph.metadata.end()) return true;
+    uint32_t id = 0;
+    const auto& value = found->second;
+    auto parsed = std::from_chars(value.data(), value.data() + value.size(), id);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+        id >= graph.runtime.tensors.size() ||
+        std::find(graph.graph_outputs.begin(), graph.graph_outputs.end(), id) ==
+            graph.graph_outputs.end()) {
+        fprintf(stderr, "MTP: invalid retained-state output metadata\n");
+        return false;
+    }
+    const Tensor& state = graph.runtime.tensors[id];
+    if ((!state.data && !state.device.buffer) || state.prec != Precision::FP32 ||
+        state.shape[0] <= 0 || state.shape[1] < tokens ||
+        state.shape[2] != 1 || state.shape[3] != 1) {
+        fprintf(stderr, "MTP: invalid retained-state tensor\n");
+        return false;
+    }
+    Tensor real_state = state;
+    real_state.shape[1] = tokens;
+    result = copy_tensor_contiguous(real_state, storage, backend);
+    return result.data != nullptr;
+}
+
 } // namespace
 
 void LLMEngine::set_profile_enabled(bool enabled) {
@@ -251,6 +284,8 @@ void LLMEngine::reset() {
     past_len_ = 0;
     mtp_past_len_ = 0;
     mtp_stats_ = MtpStats{};
+    target_mtp_state_ = Tensor{};
+    draft_mtp_state_ = Tensor{};
     std::fill(mtp_pending_hidden_.begin(), mtp_pending_hidden_.end(), 0.0f);
     rope_position_delta_ = 0;
     multimodal_position_ids_.clear();
@@ -728,6 +763,16 @@ bool LLMEngine::execute_mtp_tokens(
         target_hidden.shape[1] != static_cast<int64_t>(token_ids.size())) {
         return false;
     }
+    for (const auto& node : graph_mtp_.nodes) {
+        if (node.op_type == OpType::INPUT && !node.params.str.empty() &&
+            node.params.str[0] == "target_hidden" &&
+            (target_hidden.prec != Precision::FP32 ||
+             target_hidden.shape[0] != node.out_shape[0] ||
+             target_hidden.shape[2] != 1 || target_hidden.shape[3] != 1)) {
+            fprintf(stderr, "MTP: target state does not match draft input width\n");
+            return false;
+        }
+    }
     if (draft_token)
         *draft_token = -1;
 
@@ -757,9 +802,14 @@ bool LLMEngine::execute_mtp_tokens(
     Tensor mask = build_causal_mask(n, position);
     set_cache_length(mtp_caches_, position);
 
+    static const bool cuda_mtp_device_argmax = [] {
+        const char* value = std::getenv("MOLLM_CUDA_MTP_DEVICE_ARGMAX");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     const bool fuse_accelerator_lm_head =
         !cache_only && draft_token &&
-        cfg_.device == Device::METAL && accelerator_backend_ &&
+        (cfg_.device == Device::METAL ||
+         (cfg_.device == Device::CUDA && cuda_mtp_device_argmax)) && accelerator_backend_ &&
         exec_ctx_mtp_.backend == accelerator_backend_.get() &&
         lm_head_weight_ &&
         accelerator_backend_->supports_lm_head_argmax(*lm_head_weight_);
@@ -793,14 +843,18 @@ bool LLMEngine::execute_mtp_tokens(
                 out, static_cast<size_t>(n - 1) * hidden,
                 *lm_head_weight_, vocab, hidden, 0, device_hidden_copy);
         } else {
-            // run_graph() deliberately left the Metal graph open for the
+            // run_graph() deliberately left the accelerator graph open for the
             // fused tail; close it even on a malformed/failed graph output.
             accelerator_backend_->end_graph();
         }
     }
     Tensor copied;
+    bool retained_state_ok = true;
     if (!cache_only && out.data &&
         !exec_ctx_mtp_.backend->dispatch_failed()) {
+        retained_state_ok = copy_declared_mtp_state(
+                graph_mtp_, exec_ctx_mtp_.backend, n,
+                draft_mtp_state_copy_, draft_mtp_state_);
         if (fuse_accelerator_lm_head && device_hidden_copy &&
             device_hidden_copy->device.buffer)
             copied = *device_hidden_copy;
@@ -808,7 +862,7 @@ bool LLMEngine::execute_mtp_tokens(
             copied = copy_tensor_contiguous(
                 out, mtp_hidden_output_copy_, exec_ctx_mtp_.backend);
     }
-    const bool succeeded = out.data &&
+    const bool succeeded = out.data && retained_state_ok &&
         !exec_ctx_mtp_.backend->dispatch_failed() &&
         (cache_only || copied.data);
 
@@ -955,6 +1009,17 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0)
         return -1;
+    if(cfg_.cuda_prefill_logical_batch&&
+        (!mollm_prefill::logical_length_supported(n,past_len_,cfg_.n_ctx)||active_vision_||
+         exec_ctx_prefill_.profile_enabled||
+         (std::getenv("MOLLM_TEST_CUDA_PREFILL_WINDOW_SCHEDULE")&&
+          std::strcmp(std::getenv("MOLLM_TEST_CUDA_PREFILL_WINDOW_SCHEDULE"),"0"))||
+         !mollm_memory::cuda_host_allocation_allowed(size_t(4)<<30,"logical prefill extra transient admission"))) {
+        std::fprintf(stderr,"prefill: logical batch requires inputs fitting remaining context, no vision/profile/window scheduling, and4GiB transient headroom above the host guard\n");
+        return -1;
+    }
+    mollm_prefill::LogicalBatchScope logical_scope(exec_ctx_prefill_.backend,cfg_.cuda_prefill_logical_batch);
+    if(!logical_scope.entered){std::fprintf(stderr,"prefill: backend rejected logical batch admission\n");return -1;}
     if (past_len_ > cfg_.n_ctx || n > cfg_.n_ctx - past_len_) {
         fprintf(
             stderr,
@@ -1015,10 +1080,51 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         }
     }
 
-    // Chunked prefill: split long prompts into graph_seq_len-sized chunks.
+    int chunk_limit = cfg_.cuda_prefill_logical_batch?mollm_prefill::logical_chunk_limit(cfg_):cfg_.prefill_chunk_size > 0
+        ? cfg_.prefill_chunk_size : graph_seq_len;
+    if (chunk_limit > graph_seq_len) {
+        bool dynamic_hidden = false;
+        for (const auto& node : graph_prefill_.nodes) {
+            if (node.op_type == OpType::INPUT && !node.params.str.empty() &&
+                node.params.str[0] == "hidden") {
+                dynamic_hidden = node.dim_expr[1].kind == DIM_SEQ;
+                break;
+            }
+        }
+        if (cfg_.static_padded || !dynamic_hidden) {
+            fprintf(stderr, "prefill: larger chunk size requires dynamic hidden SEQ and no static padding\n");
+            finish_prefill_phase();
+            return -1;
+        }
+    }
+
+    const char* window_selector = std::getenv("MOLLM_TEST_CUDA_PREFILL_WINDOW_SCHEDULE");
+    if (window_selector && std::strcmp(window_selector, "0")) {
+        if (std::strcmp(window_selector, "1") && std::strcmp(window_selector, "2")) {
+            std::fprintf(stderr, "prefill: window schedule selector must be exact0/1/2\n");
+            finish_prefill_phase(); return -1;
+        }
+        if (cfg_.device != Device::CUDA || !cfg_.offload_ple || !cfg_.cuda_prefill_reclaim ||
+            // Resident CUDA uses mmap host weights and the same provider object
+            // as SSD offload. The load-time readonly-last-use contract already
+            // validates resident device ownership; neither is an SSD indicator.
+            cfg_.moe_ssd_cache_bytes != 0 ||
+            active_vision_ || cfg_.mtp_draft_tokens || !cfg_.mtp_companion_dir.empty() ||
+            cfg_.static_padded || cfg_.use_decode_as_prefill ||
+            cfg_.n_ctx > 4096 || chunk_limit != 1024 || n <= chunk_limit || n > 2048 ||
+            !exec_ctx_prefill_.stateful_readonly_last_use || exec_ctx_prefill_.profile_enabled ||
+            exec_ctx_prefill_.backend != accelerator_backend_.get()) {
+            std::fprintf(stderr, "prefill: test-only window scheduling requires bounded CUDA resident+offload-PLE+reclaim+readonly-last-use, two windows (1025..2048 tokens), chunk1024/context<=4096, no MTP/vision/padding/SSD/profile\n");
+            finish_prefill_phase(); return -1;
+        }
+        const int token = prefill_window_schedule(token_ids, past_len_, !std::strcmp(window_selector, "2"));
+        finish_prefill_phase(); return token;
+    }
+
+    // Chunked prefill: default to the package length unless explicitly overridden.
     // Each chunk is processed independently, appending to the KV cache.
     // past_len_ can exceed graph_seq_len (cache supports n_ctx); only each
-    // chunk's token count must be <= graph_seq_len.
+    // chunk's token count must be <= chunk_limit.
     int offset = 0;
     int last_token = -1;
     while (offset < n) {
@@ -1032,7 +1138,7 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
             return -1;
         }
         int chunk_size =
-            std::min({remaining, graph_seq_len, cfg_.n_ctx - past_len_});
+            std::min({remaining, chunk_limit, cfg_.n_ctx - past_len_});
         std::vector<int> chunk(token_ids.begin() + offset,
                                token_ids.begin() + offset + chunk_size);
         last_token = prefill_chunk(chunk, past_len_);
@@ -1053,6 +1159,14 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     int n = (int)token_ids.size();
     if (n == 0)
         return Tensor();
+    if(cfg_.cuda_prefill_logical_batch&&
+        (!mollm_prefill::logical_length_supported(n,past_len_,cfg_.n_ctx)||n>mollm_prefill::logical_chunk_limit(cfg_)||active_vision_||
+         exec_ctx_prefill_.profile_enabled||
+         !mollm_memory::cuda_host_allocation_allowed(size_t(4)<<30,"logical hidden prefill extra transient admission"))) {
+        std::fprintf(stderr,"prefill_hidden: logical batch length/mode/headroom admission rejected\n");return Tensor();
+    }
+    mollm_prefill::LogicalBatchScope logical_scope(exec_ctx_prefill_.backend,cfg_.cuda_prefill_logical_batch);
+    if(!logical_scope.entered){std::fprintf(stderr,"prefill_hidden: backend rejected logical batch admission\n");return Tensor();}
     if (past_len_ > cfg_.n_ctx || n > cfg_.n_ctx - past_len_) {
         fprintf(
             stderr,
@@ -1150,8 +1264,9 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     if (all_top1)
         all_top1->clear();
     const bool fuse_accelerator_lm_head = (all_logits || all_top1) &&
-        !use_padding && n >= 2 && n <= 4 &&
-        cfg_.device == Device::METAL && accelerator_backend_ &&
+        !use_padding && n >= 2 &&
+        ((cfg_.device == Device::METAL && n <= 4) ||
+         (cfg_.device == Device::CUDA && all_top1 && n <= 8)) && accelerator_backend_ &&
         exec_ctx_prefill_.backend == accelerator_backend_.get() &&
         lm_head_weight_ &&
         accelerator_backend_->supports_lm_head_small_batch(
@@ -1192,9 +1307,14 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     }
     host_set_matmul_profile_phase("unscoped");
     Tensor copied;
-    if (out.data && !exec_ctx_prefill_.backend->dispatch_failed())
+    if (out.data && !exec_ctx_prefill_.backend->dispatch_failed()) {
         copied = copy_tensor_contiguous(
             out, hidden_output_copy_, exec_ctx_prefill_.backend);
+        if (has_mtp() && cfg_.mtp_draft_tokens > 0 &&
+            !copy_declared_mtp_state(graph_prefill_, exec_ctx_prefill_.backend,
+                                     n, target_mtp_state_copy_, target_mtp_state_))
+            copied = Tensor{};
+    }
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
@@ -1224,10 +1344,267 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     return copied;
 }
 
+int LLMEngine::prefill_window_schedule(const std::vector<int>& token_ids, int past,
+                                      bool chunk_major_reference) {
+    const char* merge_selector = std::getenv("MOLLM_TEST_CUDA_MOE_WINDOW_MERGE");
+    const bool merge_moe = merge_selector && !std::strcmp(merge_selector, "1");
+    const char* fusion_selector = std::getenv("MOLLM_TEST_CUDA_WINDOW_SEGMENT_FUSIONS");
+    const bool segment_fusions = fusion_selector && !std::strcmp(fusion_selector, "1");
+    const char* inject_selector=std::getenv("MOLLM_TEST_CUDA_WINDOW_DEFER_MOE_INJECT");
+    const bool defer_moe_inject=inject_selector&&!std::strcmp(inject_selector,"1");
+    if(inject_selector&&std::strcmp(inject_selector,"0")&&!defer_moe_inject) {
+        std::fprintf(stderr,"window schedule: deferred MoE inject selector must be exact0/1\n");return -1;
+    }
+    if(defer_moe_inject&&(!merge_moe||!segment_fusions||chunk_major_reference)) {
+        std::fprintf(stderr,"window schedule: deferred MoE inject requires merged layer-major segment fusions\n");return -1;
+    }
+    const char* metadata_selector = std::getenv("MOLLM_TEST_CUDA_WINDOW_SELECTIVE_KV_METADATA");
+    const bool selective_metadata = metadata_selector && !std::strcmp(metadata_selector, "1");
+    const char* graph_selector = std::getenv("MOLLM_TEST_CUDA_WINDOW_SINGLE_GRAPH");
+    const bool single_graph = graph_selector && !std::strcmp(graph_selector, "1");
+    if (graph_selector && std::strcmp(graph_selector, "0") && !single_graph) {
+        std::fprintf(stderr, "window schedule: single graph selector must be exact0/1\n"); return -1;
+    }
+    if (metadata_selector && std::strcmp(metadata_selector, "0") && !selective_metadata) {
+        std::fprintf(stderr, "window schedule: selective metadata selector must be exact0/1\n"); return -1;
+    }
+    if (fusion_selector && std::strcmp(fusion_selector, "0") && !segment_fusions) {
+        std::fprintf(stderr, "window schedule: segment fusion selector must be exact0/1\n"); return -1;
+    }
+    if (merge_selector && std::strcmp(merge_selector, "0") && !merge_moe) {
+        std::fprintf(stderr, "window schedule: MoE merge selector must be exact0/1\n"); return -1;
+    }
+    if (merge_moe && chunk_major_reference) {
+        std::fprintf(stderr, "window schedule: MoE merge requires layer-major mode1\n"); return -1;
+    }
+    std::vector<int> cuts;
+    for (size_t i = 0; i < graph_prefill_.nodes.size(); ++i) {
+        const auto& node = graph_prefill_.nodes[i];
+        if (node.op_type != OpType::MOE) continue;
+        if (i + 1 >= graph_prefill_.nodes.size() || node.id != i ||
+            node.params.i32.size() < 4 || node.params.i32[0] != 2560 ||
+            node.params.i32[1] != 512 || node.params.i32[2] != 10 ||
+            graph_prefill_.nodes[i + 1].op_type != OpType::GR_INJECT ||
+            graph_prefill_.nodes[i + 1].inputs.empty() ||
+            graph_prefill_.nodes[i + 1].inputs[0] != node.id) {
+            std::fprintf(stderr, "window schedule: unsupported MoE/carry graph boundary\n"); return -1;
+        }
+        cuts.push_back(int(i + 2));
+    }
+    if (cuts.size() != 48 || graph_prefill_.graph_outputs.empty()) {
+        std::fprintf(stderr, "window schedule: requires48 Qwen3.8 MoE layers and an output\n"); return -1;
+    }
+    if (cuts.back() != int(graph_prefill_.nodes.size())) cuts.push_back(int(graph_prefill_.nodes.size()));
+    std::vector<uint32_t> boundaries;
+    for (const auto& node : graph_prefill_.nodes) {
+        if (node.op_type != OpType::INPUT || node.params.str.empty()) continue;
+        const auto& name = node.params.str[0];
+        if (name == "hidden" || name == "mask" || name == "cos" || name == "sin" ||
+            name == "token_ids" || name == "position" || name == "n_tokens") boundaries.push_back(node.id);
+    }
+    struct Window {
+        Graph graph; ExecContext ctx;
+        std::vector<uint32_t> private_ids;
+        AcceleratorBackend* backend = nullptr;
+        bool plans_prepared = false;
+        int rows = 0, past = 0;
+        ~Window() {
+            if (!backend) return;
+            if (plans_prepared) backend->release_graph_plan(graph);
+            release_graph_temporaries(graph, backend);
+            for (uint32_t id : private_ids) {
+                auto& t = graph.runtime.tensors[id];
+                if (t.device.buffer) backend->free_output(t, &graph.runtime.pool);
+                clear_tensor_storage(t);
+            }
+        }
+    } a, b;
+    a.rows = 1024; b.rows = int(token_ids.size()) - a.rows;
+    a.past = past; b.past = past + a.rows;
+    auto initialize = [&](Window& w, int offset) {
+        if (!initialize_execution_frame(graph_prefill_, w.graph, boundaries)) return false;
+        w.backend = accelerator_backend_.get(); w.private_ids = boundaries;
+        w.ctx.graph = &w.graph; w.ctx.pool = &w.graph.runtime.pool; w.ctx.backend = w.backend;
+        w.ctx.thread_pool = &thread_pool_;
+        w.ctx.conservative_stateful_liveness = true; w.ctx.stateful_readonly_last_use = true;
+        w.ctx.conservative_liveness_seq_limit = 1024; w.ctx.runtime_seq_len = w.rows;
+        w.ctx.segment_fusions_enabled = segment_fusions;
+        w.plans_prepared = segment_fusions;
+        // Pointer-bearing HC plans are explicitly dropped before frame storage.
+        prepare_execution(w.ctx, segment_fusions);
+        std::vector<int> ids(token_ids.begin() + offset, token_ids.begin() + offset + w.rows);
+        Tensor hidden = embed(ids), cos, sin;
+        generate_rope_cache(w.rows, w.past, cos, sin);
+        Tensor mask = build_causal_mask(w.rows, w.past);
+        int32_t position = w.past, count = w.rows;
+        std::vector<int32_t> tokens(ids.begin(), ids.end());
+        Tensor token = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, w.rows, 1, 1, 1, tokens.data());
+        Tensor pos = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 1, 1, 1, 1, &position);
+        Tensor n = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 1, 1, 1, 1, &count);
+        bool ok = true;
+        for (uint32_t id : boundaries) {
+            const auto& name = w.graph.nodes[id].params.str[0];
+            const Tensor& input = name == "hidden" ? hidden : name == "mask" ? mask :
+                name == "cos" ? cos : name == "sin" ? sin : name == "token_ids" ? token :
+                name == "position" ? pos : n;
+            Tensor private_input = Tensor::create(input.prec, MemoryType::NONE,
+                input.shape[0], input.shape[1], input.shape[2], input.shape[3]);
+            if (!input.data || !w.backend->alloc_output(private_input, input.nbytes(), &w.graph.runtime.pool) ||
+                !w.backend->copy_from_host(input.data, private_input, input.nbytes())) ok = false;
+            w.graph.runtime.tensors[id] = private_input;
+            if (!ok) break;
+        }
+        for (Tensor* t : {&hidden, &cos, &sin, &mask}) release_pool_tensor(graph_prefill_.runtime.pool, *t);
+        if (!ok || w.backend->dispatch_failed()) return false;
+        inject_runtime_shapes(w.ctx); return true;
+    };
+    if (!initialize(a, 0) || !initialize(b, a.rows)) return -1;
+    size_t metadata_writes = 0;
+    size_t graph_ends = 0;
+    struct GraphScope {
+        AcceleratorBackend* backend;
+        size_t& ends;
+        GraphScope(AcceleratorBackend* b, size_t& e) : backend(b), ends(e) {
+            if (backend) backend->begin_graph();
+        }
+        void finish() {
+            if (backend) { auto* b = backend; backend = nullptr; b->end_graph(); ++ends; }
+        }
+        ~GraphScope() { finish(); }
+    } outer(single_graph ? a.backend : nullptr, graph_ends);
+    auto segment = [&](Window& w, int first, int end) {
+        if (selective_metadata) {
+            // Only SDPA reads a KV length in this Qwen graph. Restore the
+            // active window's two headers immediately before its attention;
+            // stateless/carry/GDN/PLE segments need no global header rewrite.
+            const uint64_t length = uint64_t(w.past);
+            for (int i = first; i < end; ++i) {
+                const auto& node = w.graph.nodes[i];
+                if (node.op_type == OpType::SDPA_MLA) return false;
+                if (node.op_type != OpType::SDPA) continue;
+                if (node.inputs.size() < 6) return false;
+                for (int input : {4, 5}) {
+                    const uint32_t id = node.inputs[input];
+                    if (w.graph.nodes[id].op_type != OpType::INPUT ||
+                        !w.backend->copy_from_host(&length, w.graph.runtime.tensors[id], sizeof(length),
+                            offsetof(CacheMetadata, current_seq_len))) return false;
+                    ++metadata_writes;
+                }
+            }
+        } else {
+            if (!set_cache_lengths(caches_, uint64_t(w.past))) return false;
+            metadata_writes += caches_.size() * 2;
+        }
+        if (!single_graph) w.backend->begin_graph();
+        execute_graph_segment(w.ctx, first, end);
+        if (!single_graph) { w.backend->end_graph(); ++graph_ends; }
+        return !w.ctx.execution_failed && !w.backend->dispatch_failed();
+    };
+    int merged_calls = 0;
+    int deferred_inject_boundaries=0;
+    if (chunk_major_reference) {
+        for (Window* w : {&a, &b}) {
+            int first = 0;
+            for (int end : cuts) { if (!segment(*w, first, end)) return -1; first = end; }
+        }
+    } else {
+        int first = 0;
+        for (int end : cuts) {
+            const int moe = end - 2;
+            if (merge_moe && graph_prefill_.nodes[moe].op_type == OpType::MOE) {
+                if (!segment(a, first, moe) || !segment(b, first, moe)) return -1;
+                if (!single_graph) a.backend->begin_graph();
+                const int merged = execute_graph_moe_pair(a.ctx, b.ctx, moe);
+                if (!single_graph) { a.backend->end_graph(); ++graph_ends; }
+                if (merged != 1 || a.backend->dispatch_failed()) {
+                    std::fprintf(stderr, "window schedule: paired native MoE failed at%d\n", moe); return -1;
+                }
+                ++merged_calls;
+                // Only move a stateless injection when the prepared fusion
+                // plan identifies its later RMS consumer in BOTH windows.
+                // Keep every stateful op and paired MoE in its original order.
+                const int inject=moe+1;
+                const bool defer=defer_moe_inject&&
+                    size_t(inject)<a.ctx.gr_inject_rms_consumers.size()&&
+                    size_t(inject)<b.ctx.gr_inject_rms_consumers.size()&&
+                    a.ctx.gr_inject_rms_consumers[inject]>=end&&
+                    a.ctx.gr_inject_rms_consumers[inject]==b.ctx.gr_inject_rms_consumers[inject];
+                if(defer) {
+                    ++deferred_inject_boundaries;
+                    first=inject;
+                    continue;
+                }
+                if (!segment(a, moe + 1, end) || !segment(b, moe + 1, end)) return -1;
+            } else if (!segment(a, first, end) || !segment(b, first, end)) return -1;
+            first = end;
+        }
+    }
+    outer.finish();
+    std::fprintf(stderr,"window schedule: deferred_moe_inject_boundaries=%d\n",deferred_inject_boundaries);
+    if (a.backend->dispatch_failed()) return -1;
+    const int next = past + int(token_ids.size());
+    if (!set_cache_lengths(caches_, uint64_t(next))) return -1;
+    past_len_ = next;
+    if (const char* path = std::getenv("MOLLM_TEST_CUDA_WINDOW_DUMP")) {
+        // Exclusive-create diagnostic evidence, never overwrite existing data.
+        FILE* file = std::fopen(path, "wbx");
+        if (!file) { std::perror("window schedule dump"); return -1; }
+        std::vector<uint8_t> bytes(256 * 1024);
+        auto record = [&](uint32_t id, const Tensor& t) {
+            if (!t.data || t.nbytes() > size_t(64) * 1024 * 1024) return false;
+            const uint64_t header[] = {id, uint64_t(t.prec), uint64_t(t.shape[0]), uint64_t(t.shape[1]),
+                uint64_t(t.shape[2]), uint64_t(t.shape[3]), uint64_t(t.nbytes())};
+            if (std::fwrite(header, 1, sizeof(header), file) != sizeof(header)) return false;
+            for (size_t offset = 0; offset < t.nbytes();) {
+                const size_t count = std::min(bytes.size(), t.nbytes() - offset);
+                if (!accelerator_backend_->copy_to_host(t, bytes.data(), count, offset) ||
+                    std::fwrite(bytes.data(), 1, count, file) != count) return false;
+                offset += count;
+            }
+            return true;
+        };
+        bool ok = record(UINT32_MAX, a.graph.runtime.tensors[a.graph.graph_outputs.back()]) &&
+            record(UINT32_MAX - 1, b.graph.runtime.tensors[b.graph.graph_outputs.back()]);
+        std::vector<uint32_t> states;
+        for (const auto& node : graph_prefill_.nodes) {
+            const int index = node.op_type == OpType::SHORTCONV || node.op_type == OpType::PLE_DILATED_CONV ? 2 :
+                node.op_type == OpType::GATED_DELTANET_PREFILL ? 7 : node.op_type == OpType::PLE_LOOKUP ? 1 : -1;
+            if (index >= 0 && size_t(index) < node.inputs.size()) states.push_back(node.inputs[index]);
+            if (node.op_type == OpType::SDPA && node.inputs.size() >= 6) {
+                states.push_back(node.inputs[4]); states.push_back(node.inputs[5]);
+            }
+        }
+        std::sort(states.begin(), states.end()); states.erase(std::unique(states.begin(), states.end()), states.end());
+        for (uint32_t id : states) {
+            if (!ok) break;
+            ok = id < graph_prefill_.runtime.tensors.size() &&
+                graph_prefill_.nodes[id].op_type == OpType::INPUT && record(id, graph_prefill_.runtime.tensors[id]);
+        }
+        const bool closed = std::fclose(file) == 0;
+        if (!ok || !closed) { std::fprintf(stderr, "window schedule: incomplete diagnostic dump\n"); return -1; }
+        std::fprintf(stderr, "window schedule: dumped both hidden windows and%zu declared state/KV inputs\n", states.size());
+    }
+    const Tensor& out = b.graph.runtime.tensors[b.graph.graph_outputs.back()];
+    const int result = run_lmhead(out, b.rows);
+    std::fprintf(stderr, "window schedule: mode=%s windows=%d+%d segments=%zu merged_moe=%d token=%d\n",
+        chunk_major_reference ? "chunk-major-reference" : "layer-major", a.rows, b.rows, cuts.size(), merged_calls, result);
+    std::fprintf(stderr, "window schedule: segment_fusions=%d selective_kv_metadata=%d segment_header_writes=%zu\n",
+        segment_fusions, selective_metadata, metadata_writes);
+    std::fprintf(stderr, "window schedule: single_device_graph=%d scheduler_graph_ends=%zu\n", single_graph, graph_ends);
+    return result;
+}
+
 int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     int n = (int)token_ids.size();
     if (n == 0)
         return -1;
+    if(cfg_.cuda_prefill_logical_batch&&
+       (!mollm_prefill::logical_length_supported(n,past,cfg_.n_ctx)||
+        n>mollm_prefill::logical_chunk_limit(cfg_)||
+        !mollm_memory::cuda_host_allocation_allowed(size_t(4)<<30,"logical prefill chunk transient admission"))) {
+        std::fprintf(stderr,"prefill_chunk: logical batch length/headroom admission rejected\n");
+        return -1;
+    }
 
     // Determine the graph's expected seq_len from its hidden input shape.
     int graph_seq_len = 1;
@@ -1239,12 +1616,13 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
         }
     }
 
-    // Check that this chunk fits in the prefill graph's static seq_len.
-    // `past` can be >= graph_seq_len (cache supports n_ctx=4096); only the
-    // chunk size n must be <= graph_seq_len.
-    if (n > graph_seq_len) {
-        fprintf(stderr, "prefill_chunk: n=%d > graph_seq_len=%d\n", n,
-                graph_seq_len);
+    // prefill() validates larger overrides against the graph's dynamic SEQ.
+    // Past length is independently bounded by the cache context capacity.
+    const int chunk_limit = cfg_.cuda_prefill_logical_batch?mollm_prefill::logical_chunk_limit(cfg_):cfg_.prefill_chunk_size > 0
+        ? cfg_.prefill_chunk_size : graph_seq_len;
+    if (n > chunk_limit) {
+        fprintf(stderr, "prefill_chunk: n=%d > chunk_limit=%d\n", n,
+                chunk_limit);
         return -1;
     }
 
@@ -1323,6 +1701,11 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     if (has_mtp() && cfg_.mtp_draft_tokens > 0) {
         Tensor verified = copy_tensor_contiguous(
             out, hidden_output_copy_, exec_ctx_prefill_.backend);
+        if (!copy_declared_mtp_state(graph_prefill_, exec_ctx_prefill_.backend,
+                                    n, target_mtp_state_copy_, target_mtp_state_))
+            verified = Tensor{};
+        else if (target_mtp_state_.data)
+            verified = target_mtp_state_;
         if (!verified.data || !sync_mtp(token_ids, verified, past)) {
             fprintf(stderr, "prefill_chunk: failed to synchronize MTP state\n");
             release_pool_tensor(graph_prefill_.runtime.pool, h);
@@ -1403,6 +1786,11 @@ int LLMEngine::decode(int token_id) {
     if (has_mtp() && cfg_.mtp_draft_tokens > 0) {
         Tensor verified = copy_tensor_contiguous(
             out, hidden_output_copy_, exec_ctx_decode_.backend);
+        if (!copy_declared_mtp_state(graph_decode_, exec_ctx_decode_.backend,
+                                    1, target_mtp_state_copy_, target_mtp_state_))
+            verified = Tensor{};
+        else if (target_mtp_state_.data)
+            verified = target_mtp_state_;
         if (!verified.data ||
             !sync_mtp(std::vector<int>{token_id}, verified, past_len_)) {
             fprintf(stderr, "decode: failed to synchronize MTP state\n");
@@ -1525,11 +1913,15 @@ bool LLMEngine::speculative_decode(int token_id,
         ++mtp_stats_.drafted_by_depth[static_cast<size_t>(i)];
         current = draft;
         draft_history.push_back(draft);
-        if (mtp_hidden.device.buffer) {
-            state_tensor = mtp_hidden;
+        const Tensor& next_state = draft_mtp_state_.data
+            ? draft_mtp_state_ : mtp_hidden;
+        if (next_state.shape[0] != hidden || next_state.shape[1] != 1)
+            return false;
+        if (next_state.device.buffer) {
+            state_tensor = next_state;
         } else {
             const float* mtp_data =
-                static_cast<const float*>(mtp_hidden.data);
+                static_cast<const float*>(next_state.data);
             if (cpu_state.empty())
                 cpu_state.resize(static_cast<size_t>(hidden));
             std::copy(mtp_data, mtp_data + hidden, cpu_state.begin());
@@ -1552,6 +1944,42 @@ bool LLMEngine::speculative_decode(int token_id,
     inputs.insert(inputs.end(), drafts.begin(), drafts.end());
     mtp_stats_.drafted += drafts.size();
     mtp_stats_.verify_tokens += inputs.size();
+
+    // KV payload can be rewound by length, but GDN/conv/RWKV/plain auxiliary
+    // buffers contain the state after the entire verification batch. Keep the
+    // pre-verification state so rejected drafts cannot leak into generation.
+    mollm::detail::RecurrentCheckpoint recurrent_checkpoint;
+    Backend* state_backend = persistent_backend();
+    struct PrefixStateScope {
+        Backend* backend=nullptr;
+        ~PrefixStateScope(){if(backend)backend->end_state_prefixes();}
+    } prefix_scope;
+    if (inputs.size() > 1) {
+        const auto checkpoint_start = MtpClock::now();
+        std::vector<Tensor*> states;
+        for (const auto& cache : caches_) {
+            for (Tensor* state : {cache.gdn_state, cache.gdn_conv,
+                                 cache.rwkv_state, cache.rwkv_att_shift,
+                                 cache.rwkv_ffn_shift})
+                if (state) states.push_back(state);
+        }
+        for (const auto& state : auxiliary_states_)
+            if (state.second) states.push_back(state.second);
+        if (!states.empty() &&
+            (!state_backend ||
+             !recurrent_checkpoint.capture(*state_backend, states))) {
+            fprintf(stderr, "speculative_decode: recurrent checkpoint failed\n");
+            return false;
+        }
+        mtp_stats_.recurrent_checkpoint_bytes += recurrent_checkpoint.bytes();
+        if (recurrent_checkpoint.device_resident())
+            mtp_stats_.recurrent_device_checkpoint_bytes += recurrent_checkpoint.bytes();
+        mtp_stats_.recurrent_checkpoint_ms +=
+            std::chrono::duration<double, std::milli>(
+                MtpClock::now() - checkpoint_start).count();
+        if(state_backend && state_backend->begin_state_prefixes(states,static_cast<int>(inputs.size())))
+            prefix_scope.backend=state_backend;
+    }
 
     Tensor verified_hidden;
     std::vector<float> logits;
@@ -1622,18 +2050,52 @@ bool LLMEngine::speculative_decode(int token_id,
         std::chrono::duration<double, std::milli>(
             MtpClock::now() - sample_start).count();
 
-    past_len_ = target_start + kept;
-    set_cache_length(caches_, past_len_);
-
-    verified_hidden.shape[1] = kept;
-    verified_hidden.compute_strides();
     std::vector<int> verified_inputs(inputs.begin(), inputs.begin() + kept);
+    if (kept < static_cast<int>(inputs.size()) &&
+        !recurrent_checkpoint.empty()) {
+        const auto rollback_start = MtpClock::now();
+        const bool restored_prefix=prefix_scope.backend && state_backend->restore_state_prefix(kept);
+        if (!restored_prefix && !recurrent_checkpoint.restore(*state_backend)) {
+            fprintf(stderr, "speculative_decode: recurrent restore failed\n");
+            return false;
+        }
+        past_len_ = restored_prefix ? target_start+kept : target_start;
+        if (!set_cache_lengths(caches_, past_len_)) return false;
+        // Replay only the accepted inputs. prefill_hidden does not mutate the
+        // sampler or synchronize MTP. Its hidden copy replaces (and may
+        // invalidate) the original verification output.
+        if(restored_prefix) {
+            verified_hidden.shape[1]=kept;verified_hidden.compute_strides();
+            if(target_mtp_state_.data) {
+                target_mtp_state_.shape[1]=kept;target_mtp_state_.compute_strides();
+            }
+        } else {
+            // Prefix capture is no longer needed and must not intercept replay.
+            if(prefix_scope.backend){prefix_scope.backend->end_state_prefixes();prefix_scope.backend=nullptr;}
+            verified_hidden = prefill_hidden(verified_inputs);
+            if (!verified_hidden.data) return false;
+        }
+        ++mtp_stats_.recurrent_rollbacks;
+        if(!restored_prefix)mtp_stats_.recurrent_replay_tokens += kept;
+        mtp_stats_.recurrent_rollback_ms +=
+            std::chrono::duration<double, std::milli>(
+                MtpClock::now() - rollback_start).count();
+    } else {
+        past_len_ = target_start + kept;
+        if (!set_cache_lengths(caches_, past_len_)) return false;
+        verified_hidden.shape[1] = kept;
+        verified_hidden.compute_strides();
+    }
     const int preserved_prefix = mtp_current_cached ? 1 : 0;
     mtp_stats_.sync_tokens += static_cast<uint64_t>(
         std::max(0, kept - preserved_prefix));
     const auto sync_start = MtpClock::now();
+    Tensor synchronized_hidden = target_mtp_state_.data
+        ? target_mtp_state_ : verified_hidden;
+    synchronized_hidden.shape[1] = kept;
+    synchronized_hidden.compute_strides();
     if (!sync_mtp(
-            verified_inputs, verified_hidden, target_start,
+            verified_inputs, synchronized_hidden, target_start,
             preserved_prefix))
         return false;
     mtp_stats_.sync_ms +=
