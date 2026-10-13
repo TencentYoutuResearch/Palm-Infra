@@ -300,7 +300,11 @@ bool read_graph(BinaryReader& reader, Graph& graph) {
     }
 
     std::string error;
-    return validate_graph(graph, error);
+    if (!validate_graph(graph, error)) {
+        std::fprintf(stderr, "graph_load: %s\n", error.c_str());
+        return false;
+    }
+    return true;
 }
 
 bool fits_u32(size_t value) {

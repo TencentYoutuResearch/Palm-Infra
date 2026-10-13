@@ -49,6 +49,17 @@ struct ExecContext {
     // Keep materialized tensors alive for dynamic graphs only when the runtime
     // shape key is exactly the same as the previous execution.
     bool          reuse_same_shape_workspace = false;
+    // Experimental planner: retain every stateful op and all its storage
+    // dependencies, but permit last-use reclamation for unrelated nodes.
+    bool          conservative_stateful_liveness = false;
+    // Diagnostic only: honor explicit backend state/output lifetime contracts.
+    // Requires conservative_stateful_liveness; engine selection test-only,
+    // prefill-only with bounded shape/memory guards and no captured segments.
+    bool          stateful_readonly_last_use = false;
+    // Opt-in: fuse only complete producer/consumer chains inside a segment.
+    bool          segment_fusions_enabled = false;
+    bool          segment_fusions_identity = false;
+    int           conservative_liveness_seq_limit = 0; // diagnostic cap, 0 = uncapped
     bool          workspace_shape_valid = false;
     int           workspace_runtime_seq_len = -1;
     int           workspace_runtime_batch = -1;
@@ -73,7 +84,32 @@ struct ExecContext {
     // Node input Tensor addresses are stable after graph_load(). Resolve them
     // once instead of allocating a temporary vector for every node/token.
     std::vector<std::vector<const Tensor*>> resolved_inputs;
+    // Runtime-only adjacent gate fusion plan. Serialized graph/IDs unchanged.
+    std::vector<int32_t> sigmoid_gr_reduce_producers;
+    std::vector<std::vector<const Tensor*>> sigmoid_gr_reduce_inputs;
+    std::vector<std::vector<uint32_t>> sigmoid_gr_reduce_release_queue;
+    std::vector<int32_t> hc_up_reduce_producers, hc_up_reduce_consumers;
+    std::vector<std::vector<const Tensor*>> hc_up_reduce_inputs;
+    std::vector<std::vector<uint32_t>> hc_up_reduce_release_queue;
+    // Only INPUT/CONSTANT nodes may intervene; the carry is not eliminated.
+    std::vector<int32_t> gr_inject_rms_producers;
+    std::vector<int32_t> gr_inject_rms_consumers;
+    std::vector<std::vector<const Tensor*>> gr_inject_rms_inputs;
+    std::vector<std::vector<uint32_t>> gr_inject_rms_release_queue;
+    std::vector<int32_t> moe_gr_inject_rms_producers,moe_gr_inject_rms_consumers;
+    std::vector<std::vector<uint32_t>> moe_gr_inject_rms_release_queue;
     std::vector<NodeProfileStat> profile_stats;
+
+    // A suspended, unfused pass. The graph/tensors and caller-owned inputs
+    // must remain unchanged until completion; separate windows need separate
+    // graph runtime storage, not merely separate ExecContext objects.
+    int segment_next = -1;
+    Graph* segment_graph = nullptr;
+    BufferPool* segment_pool = nullptr;
+    Backend* segment_backend = nullptr;
+    Backend* segment_moe_backend = nullptr;
+    int segment_seq = -1, segment_batch = -1, segment_padded_seq = -1;
+    bool segment_static_padded = false;
 };
 
 void reset_profile_stats(ExecContext& ctx);
@@ -83,7 +119,18 @@ void reset_profile_stats(ExecContext& ctx);
 /// Borrowed views are cleared, not released; RESHAPE is conservatively treated
 /// as view-like for owner propagation because it may borrow or materialize at
 /// runtime depending on input contiguity.
-void prepare_execution(ExecContext& ctx);
+void prepare_execution(ExecContext& ctx, bool prepare_backend_plan = true);
+
+/// Initialize an EMPTY runtime frame without copying mapped weight ownership.
+/// Constants and persistent INPUT tensors borrow source storage; private_inputs
+/// names INPUT IDs whose storage must instead be allocated/bound by the caller.
+/// All computed tensors start unallocated, including source's materialized
+/// outputs/views. Source mappings, shared state, and backend must outlive frame.
+/// Construct a separate ExecContext and call prepare_execution() for the frame.
+/// Caller owns output/private-input cleanup; never free borrowed shared inputs.
+/// Invalid graphs/IDs or a nonempty destination return false without mutation.
+bool initialize_execution_frame(const Graph& source, Graph& frame,
+                                const std::vector<uint32_t>& private_inputs);
 
 /// Inject runtime seq_len into the graph's INPUT tensors and patch stateful
 /// op params (GDN_PREFILL / SHORTCONV n_real_tokens). Must be called before
@@ -95,3 +142,19 @@ void inject_runtime_shapes(ExecContext& ctx);
 /// side effects, then returns without running the unused graph suffix.
 /// Allocates intermediate tensors from the BufferPool.
 void execute_graph(ExecContext& ctx, int stop_after_node_index = -1);
+
+/// Execute [first, end) in node-index order. Begin with first=0 and resume
+/// exactly at the preceding end. Only the first segment resets tensors;
+/// ordinary last-use reclamation still runs inside every segment. Fusions
+/// are disabled by default; the explicit opt-in permits only complete chains
+/// within this range, never a deferred producer across a suspension boundary.
+/// Each segment invalidates backend execution-local caches. The caller owns
+/// synchronization and must not mutate runtime/input storage while suspended.
+/// Invalid ranges or changed execution identity fail before dispatch.
+void execute_graph_segment(ExecContext& ctx, int first, int end);
+
+/// Consume the next stateless MOE node in two suspended frames on one backend.
+/// Keeps normal shape/liveness/cursor semantics; optional backend aggregation
+/// materializes two independently owned outputs, with no graph mutation.
+/// Return1 merged,0 ordinary two-dispatch fallback,-1 rejected/failed.
+int execute_graph_moe_pair(ExecContext& a, ExecContext& b, int node_index);

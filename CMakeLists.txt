@@ -19,6 +19,7 @@ option(MOLLM_BUILD_TESTS "Build tests" ON)
 option(MOLLM_BUILD_EXAMPLE "Build example CLI" ON)
 option(MOLLM_ARM_NATIVE "Build ARM64 kernels with -mcpu=native for local benchmarking" OFF)
 option(MOLLM_METAL "Build the Metal GPU backend (Apple only)" OFF)
+option(MOLLM_CUDA_DECODE_SEGMENTS "Experimental CUDA decode segment replay (per-thread default stream)" OFF)
 option(MOLLM_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(MOLLM_CUDA "Build the CUDA correctness backend" OFF)
 set(MOLLM_ARM_I8MM "AUTO" CACHE STRING
@@ -457,13 +458,19 @@ if(MOLLM_CUDA)
         backends/cuda/device_runtime.cu
         backends/cuda/dispatch.cu
         backends/cuda/lm_head.cu
+        backends/cuda/moe.cu
         kernels/cuda/attention.cu
         kernels/cuda/matmul.cu
         kernels/cuda/moe.cu
         kernels/cuda/elementwise.cu
         kernels/cuda/recurrent.cu)
     target_compile_definitions(mollm_lib PUBLIC MOLLM_CUDA=1)
-    target_link_libraries(mollm_lib PUBLIC CUDA::cudart CUDA::cublas)
+    if(MOLLM_CUDA_DECODE_SEGMENTS)
+        target_compile_options(mollm_lib PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
+        target_compile_definitions(mollm_lib PRIVATE MOLLM_CUDA_DECODE_SEGMENTS=1)
+        target_compile_definitions(mollm_lib PUBLIC CUDA_API_PER_THREAD_DEFAULT_STREAM=1)
+    endif()
+    target_link_libraries(mollm_lib PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt)
     set_target_properties(mollm_lib PROPERTIES
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
