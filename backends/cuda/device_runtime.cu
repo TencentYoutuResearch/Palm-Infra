@@ -1,6 +1,8 @@
 #include "backends/cuda/device_runtime.h"
+#include "runtime/cuda_host_memory_budget.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <map>
 #include <new>
 #include <unordered_map>
@@ -13,6 +15,14 @@ struct DeviceBufferPool {
     std::unordered_map<void*, size_t> sizes;
     std::multimap<size_t, void*> free;
 };
+size_t device_buffer_pool_reserved_bytes(const DeviceBufferPool* pool) {
+    size_t bytes=0;
+    if(pool)for(const auto& entry:pool->sizes)bytes+=entry.second;
+    return bytes;
+}
+bool device_buffer_pool_can_reuse(const DeviceBufferPool* pool, size_t bytes) {
+    return pool && bytes && pool->free.lower_bound(bytes) != pool->free.end();
+}
 
 bool report_cuda(cudaError_t error, const char* operation) {
     if (error == cudaSuccess)
@@ -31,10 +41,12 @@ bool report_cublas(cublasStatus_t status, const char* operation) {
 }
 
 bool malloc_device(void** pointer, size_t bytes, const char* operation) {
+    if (!mollm_memory::cuda_host_allocation_allowed(bytes, operation)) return false;
     return report_cuda(cudaMalloc(pointer, bytes), operation);
 }
 
 bool malloc_managed(void** pointer, size_t bytes, const char* operation) {
+    if (!mollm_memory::cuda_host_allocation_allowed(bytes, operation)) return false;
     return report_cuda(cudaMallocManaged(pointer, bytes), operation);
 }
 
@@ -82,6 +94,27 @@ void release_device_buffer(DeviceBufferPool* pool, void* pointer) {
     const auto found = pool->sizes.find(pointer);
     if (found != pool->sizes.end())
         pool->free.emplace(found->second, pointer);
+}
+
+bool trim_free_device_buffers(DeviceBufferPool* pool, cudaStream_t stream,
+                              size_t* reclaimed_bytes) {
+    if (reclaimed_bytes) *reclaimed_bytes = 0;
+    if (!pool || !reclaimed_bytes) return false;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (!report_cuda(cudaStreamIsCapturing(stream, &capture), "pool trim capture check") ||
+        capture != cudaStreamCaptureStatusNone) return false;
+    while (!pool->free.empty()) {
+        auto entry = pool->free.begin();
+        void* pointer = entry->second;
+        const size_t bytes = entry->first;
+        if (!report_cuda(cudaFree(pointer), "pool trim free")) return false;
+        *reclaimed_bytes += bytes;
+        pool->sizes.erase(pointer);
+        pool->allocations.erase(std::remove(pool->allocations.begin(),
+            pool->allocations.end(), pointer), pool->allocations.end());
+        pool->free.erase(entry);
+    }
+    return true;
 }
 
 }  // namespace mollm_cuda
