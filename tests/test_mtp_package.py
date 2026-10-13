@@ -75,7 +75,7 @@ def main() -> int:
         metadata = json.loads(
             raw[metadata_offset:metadata_offset + metadata_length])
         assert metadata["architecture"] == "test"
-        assert raw[weights_offset - mtp_length:weights_offset]
+        assert struct.unpack_from("<I", raw, weights_offset - mtp_length)[0] == 0x4D4C4C47
 
     print("MTP package tests passed")
     return 0
