@@ -605,6 +605,10 @@ if(MOLLM_BUILD_TESTS)
                               test_qwen35_graph.py)
         add_mollm_python_test(test_qwen4_exp_graph
                               test_qwen4_exp_graph.py)
+        add_mollm_python_test(test_qwen4_qsa_reference
+                              test_qwen4_qsa_reference.py)
+        add_mollm_python_test(test_qwen4_qsa_indexer_reference
+                              test_qwen4_qsa_indexer_reference.py)
         add_mollm_python_test(test_qwen35_quant_policy
                               test_qwen35_quant_policy.py)
         add_mollm_python_test(test_qwen35_moe_quant_policy
