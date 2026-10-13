@@ -459,6 +459,7 @@ if(MOLLM_CUDA)
         backends/cuda/lm_head.cu
         kernels/cuda/attention.cu
         kernels/cuda/matmul.cu
+        kernels/cuda/moe.cu
         kernels/cuda/elementwise.cu
         kernels/cuda/recurrent.cu)
     target_compile_definitions(mollm_lib PUBLIC MOLLM_CUDA=1)

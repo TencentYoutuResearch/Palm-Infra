@@ -6,11 +6,16 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <thread>
 #include <string>
 #include <vector>
+#if defined(MOLLM_CUDA)
+#include <cuda_runtime_api.h>
+#endif
 
 namespace {
 
@@ -63,6 +68,276 @@ int main() {
         std::ofstream out(path, std::ios::binary);
         out.write(reinterpret_cast<const char*>(contents), sizeof(contents));
     }
+
+    // Resident loading uses the same expert layouts but sizes itself for the
+    // complete model. Every later route must be a hit, without disk reads.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 1), "open resident expert provider");
+        check(cache.add_source(spec("resident_gate", 0)) &&
+                  cache.add_source(spec("resident_down", 12)),
+              "register resident expert sources");
+        const auto* gate = cache.find_source("resident_gate");
+        const auto* down = cache.find_source("resident_down");
+        std::vector<ExpertLease> layer_leases;
+        check(!cache.borrow_resident_layer(gate, down, layer_leases),
+              "demand providers do not opt into permanent layer pins");
+        check(!cache.load_resident({}), "reject empty resident source set");
+        check(!cache.load_resident({{gate, down}, {gate, down}}),
+              "reject duplicate resident pairs");
+        check(cache.load_resident({{gate, down}}), "preload and lock every expert");
+        check(cache.stats().resident_bytes == sizeof(contents),
+              "resident provider owns exactly one copy of every expert");
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int expert = 0; expert < 3; ++expert) {
+                Tensor gu, dw;
+                ExpertLease host_lease;
+                const bool acquired = gate->resident_device_views
+                    ? cache.borrow(gate, down, expert, host_lease)
+                    : cache.acquire(gate, down, expert, gu, dw);
+                if (host_lease) { gu = host_lease.gate_up; dw = host_lease.down; }
+                check(acquired, "resident expert remains available");
+                if (!acquired) continue;
+                const char* arena_option = std::getenv("MOLLM_RESIDENT_EXPERT_ARENA");
+                if (arena_option && std::strcmp(arena_option, "1") == 0)
+                    check(reinterpret_cast<uintptr_t>(gu.ptr<uint16_t>()) % 64 == 0 &&
+                              reinterpret_cast<uintptr_t>(dw.ptr<uint16_t>()) % 64 == 0,
+                          "resident arena components are 64-byte aligned");
+                check(gu.ptr<uint16_t>()[0] == contents[2 * expert] &&
+                          dw.ptr<uint16_t>()[0] == contents[6 + 2 * expert],
+                      "resident expert data is preserved");
+            }
+        }
+        check(cache.stats().bytes_read == 0 && cache.stats().evictions == 0 &&
+                  cache.stats().misses == 0,
+              "resident routes do no I/O or eviction after startup");
+        check(cache.borrow_resident_layer(gate, down, layer_leases) && layer_leases.size() == 3,
+              "resident provider lends all expert IDs without I/O");
+        for (size_t i = 0; i < layer_leases.size(); ++i) {
+            uint16_t first = 0;
+#if defined(MOLLM_CUDA)
+            if (gate->resident_device_views)
+                check(cudaMemcpy(&first, layer_leases[i].gate_up.data, sizeof(first),
+                    cudaMemcpyDeviceToHost) == cudaSuccess, "read device layer lease");
+            else
+#endif
+                first = layer_leases[i].gate_up.ptr<uint16_t>()[0];
+            check(first == contents[2 * i],
+                  "resident layer leases preserve expert-ID order");
+        }
+        check(!cache.clear_resident() && !cache.release(gate, down, 1),
+              "long-lived layer leases protect asynchronous GPU reads");
+        layer_leases.clear();
+        check(cache.clear_resident(), "resident layer teardown returns all pins");
+        check(!cache.borrow_resident_layer(gate, down, layer_leases),
+              "clearing the provider revokes its resident capability");
+    }
+
+#if defined(MOLLM_CUDA)
+    int cuda_devices = 0;
+    if (cudaGetDeviceCount(&cuda_devices) == cudaSuccess && cuda_devices > 0) {
+        const char* old_option = std::getenv("MOLLM_RESIDENT_EXPERT_ARENA");
+        const bool had_option = old_option != nullptr;
+        const std::string saved_option = old_option ? old_option : "";
+        setenv("MOLLM_RESIDENT_EXPERT_ARENA", "cuda-device", 1);
+        {
+            const std::string native_path = "/tmp/mollm_test_moe_native_layout.bin";
+            std::vector<uint8_t> bytes(1280);
+            for (int projection = 0; projection < 2; ++projection) {
+                for (int i = 0; i < 512; ++i) bytes[projection * 640 + i] = (i * 37 + projection * 19) & 255;
+                for (int i = 0; i < 64; ++i) bytes[projection * 640 + 512 + i] = 48 + i % 16;
+                for (int i = 0; i < 16; ++i) {
+                    const float global = (i + 1) / 64.f;
+                    std::memcpy(bytes.data() + projection * 640 + 576 + i * 4, &global, 4);
+                }
+            }
+            {
+                std::ofstream file(native_path, std::ios::binary);
+                file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            }
+            const char* previous = std::getenv("MOLLM_RESIDENT_NVFP4_MMA_LAYOUT");
+            const bool had_previous = previous != nullptr;
+            const std::string saved_native = previous ? previous : "";
+            setenv("MOLLM_RESIDENT_NVFP4_MMA_LAYOUT", "1", 1);
+            {
+                MoeSsdCache cache;
+                auto native_spec = spec("native_gate", 0);
+                native_spec.num_experts = 1; native_spec.rows = 16; native_spec.cols = 64;
+                native_spec.precision = Precision::NVFP4; native_spec.group_size = 16;
+                native_spec.groups_per_row = 4; native_spec.data_bytes = 512;
+                native_spec.scales_offset = 512; native_spec.scales_bytes = 128;
+                native_spec.expert_stride = 640;
+                native_spec.flags = MappedFile::FLAG_EXPERT_INTERLEAVED | MappedFile::FLAG_NVFP4_Q8_PAIR;
+                auto down_spec = native_spec;
+                down_spec.weight_ref = "native_down"; down_spec.data_offset = 640;
+                down_spec.scales_offset = 1152;
+                check(cache.open(native_path, 1) && cache.add_source(native_spec) && cache.add_source(down_spec),
+                    "create native-layout resident fixture");
+                const auto* gate = cache.find_source("native_gate");
+                const auto* down = cache.find_source("native_down");
+                const bool loaded = cache.load_resident({{gate, down}});
+                check(loaded, "prepare single-copy native resident layout");
+                if (loaded) {
+                    std::vector<ExpertLease> layer;
+                    check(cache.borrow_resident_layer(gate, down, layer) && layer.size() == 1 &&
+                        layer[0].gate_up.nvfp4_mma_layout && layer[0].down.nvfp4_mma_layout,
+                        "whole-layer views explicitly identify native layout");
+                    layer.clear();
+                    ExpertLease host;
+                    check(cache.borrow(gate, down, 0, host), "restore CPU views from native layout");
+                    if (host) {
+                        check(!host.gate_up.nvfp4_mma_layout && !host.down.nvfp4_mma_layout &&
+                            !std::memcmp(host.gate_up.data, bytes.data(), 512) &&
+                            !std::memcmp(host.gate_up.nvfp4_scales, bytes.data() + 512, 128) &&
+                            !std::memcmp(host.down.data, bytes.data() + 640, 512) &&
+                            !std::memcmp(host.down.nvfp4_scales, bytes.data() + 1152, 128),
+                            "CPU fallback restores every weight/scale byte");
+                    }
+                    host.reset();
+                    check(cache.stats().resident_bytes == bytes.size(), "native layout retains one payload");
+                    check(cache.clear_resident() && !gate->resident_nvfp4_mma_layout,
+                        "clear resets native layout capability");
+                }
+            }
+            if (had_previous) setenv("MOLLM_RESIDENT_NVFP4_MMA_LAYOUT", saved_native.c_str(), 1);
+            else unsetenv("MOLLM_RESIDENT_NVFP4_MMA_LAYOUT");
+            std::remove(native_path.c_str());
+        }
+        {
+            const char* names[]={"MOLLM_RESIDENT_NVFP4_GATE_CODES_KMAJOR",
+                "MOLLM_CUDA_NVFP4_MMA_PREFILL_ONLY","MOLLM_RESIDENT_NVFP4_MMA_LAYOUT",
+                "MOLLM_TEST_RESIDENT_NVFP4_GATE_SCALES_KMAJOR"};
+            std::vector<std::string> saved;
+            std::vector<bool> present;
+            for(const char* name:names){const char* value=std::getenv(name);present.push_back(value!=nullptr);saved.emplace_back(value?value:"");}
+            setenv(names[0],"1",1);setenv(names[1],"1",1);setenv(names[2],"0",1);
+            const std::string code_path="/tmp/mollm_test_moe_gate_codes.bin";
+            for(const char* scale_mode:{"0","1",static_cast<const char*>(nullptr)})for(bool pair:{false,true}) {
+                const bool scale_view=!scale_mode||!std::strcmp(scale_mode,"1");
+                if(scale_mode)setenv(names[3],scale_mode,1);else unsetenv(names[3]);
+                auto gate_spec=spec("code_gate",0);
+                gate_spec.num_experts=1;gate_spec.rows=1280;gate_spec.cols=2560;
+                gate_spec.precision=Precision::NVFP4;gate_spec.group_size=16;
+                gate_spec.groups_per_row=160;gate_spec.data_bytes=1280*2560/2;
+                gate_spec.scales_offset=gate_spec.data_bytes;
+                gate_spec.scales_bytes=1280*160+1280*sizeof(float);
+                gate_spec.expert_stride=gate_spec.data_bytes+gate_spec.scales_bytes;
+                gate_spec.flags=MappedFile::FLAG_EXPERT_INTERLEAVED|(pair?MappedFile::FLAG_NVFP4_Q8_PAIR:0);
+                gate_spec.input_scales={1.f,1.f};gate_spec.input_scales_per_expert=2;
+                auto down_spec=gate_spec;
+                down_spec.weight_ref="code_down";down_spec.rows=2560;down_spec.cols=640;
+                down_spec.groups_per_row=40;down_spec.data_bytes=2560*640/2;
+                down_spec.data_offset=gate_spec.expert_stride;
+                down_spec.scales_offset=down_spec.data_offset+down_spec.data_bytes;
+                down_spec.scales_bytes=2560*40+2560*sizeof(float);
+                down_spec.expert_stride=down_spec.data_bytes+down_spec.scales_bytes;
+                down_spec.input_scales={1.f};down_spec.input_scales_per_expert=1;
+                std::vector<uint8_t> bytes(gate_spec.expert_stride+down_spec.expert_stride);
+                for(size_t i=0;i<bytes.size();++i){uint32_t v=uint32_t(i)*0x9e3779b9u;bytes[i]=(v^(v>>16))&255;}
+                for(const auto* projection:{&gate_spec,&down_spec}) {
+                    const size_t block_bytes=size_t(projection->rows)*projection->groups_per_row;
+                    for(int row=0;row<projection->rows;++row) {
+                        const float scale=(row%7+1)/2560.f;
+                        std::memcpy(bytes.data()+projection->scales_offset+block_bytes+row*sizeof(float),&scale,sizeof(float));
+                    }
+                }
+                {std::ofstream file(code_path,std::ios::binary);file.write(reinterpret_cast<const char*>(bytes.data()),bytes.size());}
+                MoeSsdCache cache;
+                check(cache.open(code_path,1)&&cache.add_source(gate_spec)&&cache.add_source(down_spec),"create bounded gate-code cache fixture");
+                const auto* gate=cache.find_source("code_gate");const auto* down=cache.find_source("code_down");
+                setenv(names[2],"1",1);
+                check(!cache.load_resident({{gate,down}}),"reject conflicting native-MMA and K64-major layouts");
+                setenv(names[2],"0",1);
+                const bool loaded=cache.load_resident({{gate,down}});
+                check(loaded,"load gate-code view into existing arena");
+                if(loaded) {
+                    check(gate->resident_nvfp4_gate_codes_kmajor&&!down->resident_nvfp4_gate_codes_kmajor,"mark only gate source layout");
+                    std::vector<ExpertLease> layer;
+                    check(cache.borrow_resident_layer(gate,down,layer)&&layer.size()==1,"borrow gate-code device view");
+                    if(!layer.empty()) {
+                        check(layer[0].gate_up.nvfp4_gate_codes_kmajor&&!layer[0].down.nvfp4_gate_codes_kmajor,"propagate tensor layout flags");
+                        std::vector<uint8_t> actual(gate_spec.data_bytes),expected(actual.size());
+                        const size_t blocks=pair?320:1280,tile_bytes=pair?128:32;
+                        for(size_t q=0;q<40;++q)for(size_t row=0;row<blocks;++row)
+                            std::memcpy(expected.data()+(q*blocks+row)*tile_bytes,bytes.data()+(row*40+q)*tile_bytes,tile_bytes);
+                        check(cudaMemcpy(actual.data(),layer[0].gate_up.data,actual.size(),cudaMemcpyDeviceToHost)==cudaSuccess&&actual==expected,"resident gate matches independent byte transpose");
+                        check(layer[0].gate_up.nvfp4_gate_scales_kmajor==scale_view&&
+                            !layer[0].down.nvfp4_gate_scales_kmajor,"propagate gate-only scale layout flag");
+                        actual.resize(gate_spec.scales_bytes);expected.resize(gate_spec.scales_bytes);
+                        std::memcpy(expected.data(),bytes.data()+gate_spec.scales_offset,expected.size());
+                        if(scale_view)for(int row=0;row<1280;++row)for(int group=0;group<160;++group)
+                            expected[(size_t(group/4)*1280+row)*4+group%4]=
+                                bytes[gate_spec.scales_offset+size_t(row)*160+group];
+                        check(cudaMemcpy(actual.data(),layer[0].gate_up.nvfp4_scales,actual.size(),cudaMemcpyDeviceToHost)==cudaSuccess&&actual==expected,
+                            "resident gate scale bytes match transpose and preserve row-global tail");
+                    }
+                    layer.clear();
+                    ExpertLease host;
+                    check(cache.borrow(gate,down,0,host),"borrow canonical CPU fallback from code view");
+                    if(host) {
+                        check(!host.gate_up.nvfp4_gate_codes_kmajor&&!host.down.nvfp4_gate_codes_kmajor&&
+                            !host.gate_up.nvfp4_gate_scales_kmajor&&!host.down.nvfp4_gate_scales_kmajor&&
+                            !std::memcmp(host.gate_up.data,bytes.data(),gate_spec.data_bytes)&&
+                            !std::memcmp(host.gate_up.nvfp4_scales,bytes.data()+gate_spec.scales_offset,gate_spec.scales_bytes)&&
+                            !std::memcmp(host.down.data,bytes.data()+down_spec.data_offset,down_spec.data_bytes)&&
+                            !std::memcmp(host.down.nvfp4_scales,bytes.data()+down_spec.scales_offset,down_spec.scales_bytes),"canonical CPU fallback restores all gate/down bytes and flags");
+                    }
+                    host.reset();
+                    check(cache.stats().resident_bytes==bytes.size(),"gate code view retains one resident payload");
+                    check(cache.clear_resident()&&!gate->resident_nvfp4_gate_codes_kmajor&&!down->resident_nvfp4_gate_codes_kmajor&&
+                        !gate->resident_nvfp4_gate_scales_kmajor&&!down->resident_nvfp4_gate_scales_kmajor,"clear gate code/scale capability after pins released");
+                }
+            }
+            for(size_t i=0;i<saved.size();++i){if(present[i])setenv(names[i],saved[i].c_str(),1);else unsetenv(names[i]);}
+            std::remove(code_path.c_str());
+        }
+        {
+            MoeSsdCache cache;
+            check(cache.open(path, 1) && cache.add_source(spec("device_gate", 0)) &&
+                cache.add_source(spec("device_down", 12)), "create device-resident cache");
+            const auto* gate = cache.find_source("device_gate");
+            const auto* down = cache.find_source("device_down");
+            const bool loaded = cache.load_resident({{gate, down}});
+            check(loaded, "upload all experts to single device allocation");
+            if (loaded) {
+                check(gate->resident_device_views && down->resident_device_views,
+                    "resident sources identify device-only views");
+                Tensor gu, dw;
+                check(!cache.acquire(gate, down, 0, gu, dw),
+                    "legacy host acquire never exposes device-only addresses");
+                std::vector<ExpertLease> resident;
+                check(cache.borrow_resident_layer(gate, down, resident) && resident.size() == 3,
+                    "borrow immutable device layer without host copies");
+                for (int expert = 0; expert < static_cast<int>(resident.size()); ++expert) {
+                    uint16_t bytes[2]{};
+                    check(cudaMemcpy(bytes, resident[expert].gate_up.data, sizeof(bytes),
+                            cudaMemcpyDeviceToHost) == cudaSuccess &&
+                        bytes[0] == contents[expert * 2] && bytes[1] == contents[expert * 2 + 1],
+                        "device-resident gate payload preserves bytes and expert-ID order");
+                }
+                resident.clear();
+                ExpertLease host;
+                check(cache.borrow(gate, down, 1, host), "CPU fallback obtains owned host views");
+                if (host) {
+                    check(host.owned_payload && host.gate_up.ptr<uint16_t>()[0] == contents[2] &&
+                        host.down.ptr<uint16_t>()[0] == contents[8], "CPU fallback copy is exact");
+                    ExpertLease moved(std::move(host));
+                    check(!host && moved.owned_payload && moved.gate_up.ptr<uint16_t>()[1] == contents[3],
+                        "moving fallback lease preserves owned payload and pin");
+                    check(!cache.clear_resident(), "fallback lease pins the device source");
+                    moved.reset();
+                    check(!moved.owned_payload, "fallback reset releases temporary host storage");
+                }
+                check(cache.stats().bytes_read == 0 && cache.stats().resident_bytes == sizeof(contents),
+                    "device routes and CPU fallback do no post-startup file reads");
+                check(cache.clear_resident() && !gate->resident_device_views,
+                    "clearing device cache resets source capability");
+            }
+        }
+        if (had_option) setenv("MOLLM_RESIDENT_EXPERT_ARENA", saved_option.c_str(), 1);
+        else unsetenv("MOLLM_RESIDENT_EXPERT_ARENA");
+    }
+#endif
 
     // Leases protect resident payloads independently of cache-retention policy.
     {
@@ -293,12 +568,30 @@ int main() {
         MoeSsdCache cache;
         check(cache.open(nvfp4_path, 2 * (data_bytes + scale_bytes)),
               "open pair-packed NVFP4 cache");
-        check(cache.add_source(nv_spec(
-                  "nvfp4_gate", 0, 2 * data_bytes)) &&
+        auto calibrated_gate = nv_spec("nvfp4_gate", 0, 2 * data_bytes);
+        calibrated_gate.input_scales_per_expert = 2;
+        calibrated_gate.input_scales = {0.0013892765f, 0.0031854538f};
+        auto invalid_calibration = calibrated_gate;
+        invalid_calibration.weight_ref = "invalid_calibration";
+        invalid_calibration.input_scales.pop_back();
+        check(!cache.add_source(invalid_calibration), "reject incomplete activation calibration");
+        for (float invalid : {0.f, -1.f, INFINITY, NAN}) {
+            invalid_calibration = calibrated_gate;
+            invalid_calibration.weight_ref = "invalid_calibration";
+            invalid_calibration.input_scales[0] = invalid;
+            check(!cache.add_source(invalid_calibration), "reject invalid activation calibration value");
+        }
+        check(cache.add_source(calibrated_gate) &&
               cache.add_source(nv_spec(
                   "nvfp4_down", data_bytes,
                   2 * data_bytes + scale_bytes)),
               "add pair-packed NVFP4 sources");
+        const auto* calibrated_source = cache.find_source("nvfp4_gate");
+        check(calibrated_source && calibrated_source->nvfp4_input_scales_per_expert == 2 &&
+                  calibrated_source->nvfp4_input_scales == calibrated_gate.input_scales,
+              "preserve distinct gate/up checkpoint activation scales");
+        check(cache.find_source("nvfp4_down")->nvfp4_input_scales.empty(),
+              "old sources remain explicitly uncalibrated");
         Tensor gate, down;
         check(cache.acquire(cache.find_source("nvfp4_gate"),
                             cache.find_source("nvfp4_down"),
