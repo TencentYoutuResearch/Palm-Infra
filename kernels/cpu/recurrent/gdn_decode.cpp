@@ -64,8 +64,10 @@ void kernel_gdn_decode_neon(const GdnParams& params,
             for (int d = 0; d < v_head_dim; d++)
                 v_buf[d] = qkv_data[v_base + d];
 
-            gdn_l2norm_neon(q, k_head_dim, l2_eps);
-            gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
+            if (flags & 1) {
+                gdn_l2norm_neon(q, k_head_dim, l2_eps);
+                gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
+            }
 
             float a_h = a_data[vh];
             float b_h = b_data[vh];

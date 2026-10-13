@@ -5,6 +5,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+#include <array>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
 
 namespace {
 int failures = 0;
@@ -18,6 +23,42 @@ bool close(float a, float b) { return std::fabs(a - b) < 1e-6f; }
 } // namespace
 
 int main() {
+    {
+        std::vector<uint8_t> codes(4*257);
+        for(size_t i=0;i<codes.size();++i)codes[i]=static_cast<uint8_t>(i);
+        const int32_t selected[]={3,0,2,1};
+        for(float scale:{0.f,-0.f,1.f,.25f,-.33f,std::numeric_limits<float>::infinity(),
+                         std::numeric_limits<float>::quiet_NaN()}) {
+            std::vector<float> ordinary(codes.size()+2,42.f),prescaled(ordinary);
+            check(ple_gather_fp8_rows(codes.data(),4,257,selected,1,4,scale,ordinary.data()+1),"ordinary all-code gather");
+            check(ple_gather_fp8_rows(codes.data(),4,257,selected,1,4,scale,prescaled.data()+1,true),"prescaled all-code gather");
+            check(!std::memcmp(ordinary.data(),prescaled.data(),ordinary.size()*sizeof(float)),
+                  "prescaled FP8 gather bit-exact including NaN, signed zero, odd rows and guards");
+        }
+    }
+    if(std::getenv("MOLLM_PLE_GATHER_BENCH")) {
+        constexpr int row_dim=256,heads=16,total_rows=262144;
+        std::vector<uint8_t> table(size_t(total_rows)*row_dim);
+        for(size_t i=0;i<table.size();++i)table[i]=static_cast<uint8_t>((i*37+i/19)%127);
+        std::vector<float> output(heads*row_dim);
+        std::array<int32_t,heads> indices{};
+        auto timing=[&](bool prescaled) {
+            const auto start=std::chrono::steady_clock::now();
+            for(int iteration=0;iteration<10000;++iteration) {
+                for(int h=0;h<heads;++h)indices[h]=(iteration*7919+h*15427)%total_rows;
+                if(!ple_gather_fp8_rows(table.data(),total_rows,row_dim,indices.data(),1,heads,.0137f,
+                                       output.data(),prescaled))std::exit(1);
+            }
+            return std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count()/10000;
+        };
+        for(int repeat=0;repeat<3;++repeat) {
+            double ordinary,prescaled;
+            if(repeat%2){prescaled=timing(true);ordinary=timing(false);}
+            else{ordinary=timing(false);prescaled=timing(true);}
+            std::printf("ple-gather repeat=%d ordinary_us=%.3f prescaled_us=%.3f checksum=%g\n",
+                repeat,ordinary,prescaled,output[0]);
+        }
+    }
     constexpr int eos = 99;
     constexpr int seq = 5;
     constexpr int heads = 4;

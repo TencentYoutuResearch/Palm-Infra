@@ -24,7 +24,7 @@ bool ple_build_indices(const int32_t* token_ids, int seq_len,
 bool ple_gather_fp8_rows(const uint8_t* table, int64_t total_rows,
                          int row_dim, const int32_t* indices,
                          int seq_len, int num_heads, float table_scale,
-                         float* output);
+                         float* output, bool prescaled_lookup = false);
 
 bool kernel_ple_lookup(const Tensor& token_ids, Tensor& history,
                        const Tensor& table, const Tensor& table_scale,

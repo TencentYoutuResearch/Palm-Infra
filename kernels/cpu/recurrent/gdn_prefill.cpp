@@ -82,8 +82,10 @@ void kernel_gdn_prefill_neon(const GdnParams& params,
                 for (int d = 0; d < v_head_dim; d++)
                     v_buf[d] = qkv_data[(v_base + d) * seq_len + t];
 
-                gdn_l2norm_neon(q, k_head_dim, l2_eps);
-                gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
+                if (flags & 1) {
+                    gdn_l2norm_neon(q, k_head_dim, l2_eps);
+                    gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
+                }
 
                 float a_h = a_data[t * a_row_stride + vh];
                 float b_h = b_data[t * b_row_stride + vh];
@@ -117,8 +119,10 @@ void kernel_gdn_prefill_neon(const GdnParams& params,
                     k_buf[d] = qkv_data[(k_base + d) * seq_len + t];
                 }
 
-                gdn_l2norm_neon(q, k_head_dim, l2_eps);
-                gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
+                if (flags & 1) {
+                    gdn_l2norm_neon(q, k_head_dim, l2_eps);
+                    gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
+                }
 
                 int vh_begin = kh * repeat;
                 int vh_end = std::min(vh_begin + repeat, num_v_heads);

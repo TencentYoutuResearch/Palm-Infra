@@ -181,7 +181,7 @@ bool ple_build_indices(const int32_t* token_ids, int seq_len,
 bool ple_gather_fp8_rows(const uint8_t* table, int64_t total_rows,
                          int row_dim, const int32_t* indices,
                          int seq_len, int num_heads, float table_scale,
-                         float* output) {
+                         float* output, bool prescaled_lookup) {
     if (!table || !indices || !output || total_rows <= 0 || row_dim <= 0 ||
         seq_len < 0 || num_heads <= 0) {
         return false;
@@ -192,15 +192,22 @@ bool ple_gather_fp8_rows(const uint8_t* table, int64_t total_rows,
         if (row < 0 || row >= total_rows) return false;
     }
     prefetch_ple_rows(table, row_dim, indices, rows);
+    std::array<float,256> scaled;
+    if(prescaled_lookup)
+        for(size_t code=0;code<scaled.size();++code)
+            scaled[code]=kFp8E4m3fnDecodeTable[code]*table_scale;
     for (int index = 0; index < rows; ++index) {
         const int32_t row = indices[index];
         const uint8_t* source =
             table + static_cast<size_t>(row) * row_dim;
         float* destination =
             output + static_cast<size_t>(index) * row_dim;
-        for (int dim = 0; dim < row_dim; ++dim)
-            destination[dim] =
-                kFp8E4m3fnDecodeTable[source[dim]] * table_scale;
+        if(prescaled_lookup) {
+            for(int dim=0;dim<row_dim;++dim)destination[dim]=scaled[source[dim]];
+        } else {
+            for (int dim = 0; dim < row_dim; ++dim)
+                destination[dim] = kFp8E4m3fnDecodeTable[source[dim]] * table_scale;
+        }
     }
     return true;
 }
