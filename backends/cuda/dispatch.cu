@@ -1010,16 +1010,52 @@ void CudaBackend::dispatch(const GraphNode& node,
                 p.reuse_gqa=grouped&&query_length>=32&&key_dim==256&&value_dim==256&&group>=2&&group<=16;
                 if(split&&query_length==1&&p.slots>=128) {
                     p.partitions=16;
-                    const size_t bytes=size_t(num_heads)*p.partitions*(value_dim+2)*sizeof(float);
-                    if(!impl_->reserve(impl_->qsa_attention_partials,impl_->qsa_attention_partials_bytes,bytes,true)) {
+                }
+                if(p.reuse_gqa||p.partitions>1) {
+                    const size_t bytes=size_t(query_length)*num_heads*p.slots*sizeof(float);
+                    if(!impl_->reserve(impl_->qsa_selected_scores,impl_->qsa_selected_scores_bytes,bytes,true)) {
                         impl_->failed=true;return;
                     }
-                    p.split_workspace=static_cast<float*>(impl_->qsa_attention_partials);
+                    p.selected_scores=static_cast<float*>(impl_->qsa_selected_scores);
                 }
                 if(!append_cache()){impl_->failed=true;return;}
+                static const bool qsa_compare=[] {
+                    const char* value=std::getenv("MOLLM_TEST_CUDA_QSA_COMPARE");return value&&!std::strcmp(value,"1");
+                }();
+                if(qsa_compare&&(p.reuse_gqa||p.partitions>1)) {
+                    const size_t bytes=output->view_span_bytes();
+                    if(!impl_->reserve(impl_->qsa_attention_shadow,impl_->qsa_attention_shadow_bytes,bytes,true)) {
+                        impl_->failed=true;return;
+                    }
+                    auto reference=p;reference.reuse_gqa=false;reference.partitions=1;reference.selected_scores=nullptr;
+                    if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_selected_attention(query_data,key_data,value_data,fp16_cache,
+                        device_pointer_const<int32_t>(*indices),static_cast<float*>(impl_->qsa_attention_shadow),reference,
+                        cudaStreamPerThread,mask_data),"QSA shadow reference")) {impl_->failed=true;return;}
+                }
                 if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_selected_attention(query_data,key_data,value_data,fp16_cache,
                    device_pointer_const<int32_t>(*indices),output_data,p,cudaStreamPerThread,mask_data),"QSA selected attention")) {
                     impl_->failed=true;return;
+                }
+                if(qsa_compare&&(p.reuse_gqa||p.partitions>1)) {
+                    const size_t bytes=output->view_span_bytes();
+                    std::vector<float> actual((bytes+3)/4),reference((bytes+3)/4);
+                    if(!mollm_cuda::report_cuda(cudaMemcpyAsync(actual.data(),output_data,bytes,cudaMemcpyDeviceToHost,cudaStreamPerThread),"QSA compare output")||
+                       !mollm_cuda::report_cuda(cudaMemcpyAsync(reference.data(),impl_->qsa_attention_shadow,bytes,cudaMemcpyDeviceToHost,cudaStreamPerThread),"QSA compare reference")||
+                       !mollm_cuda::report_cuda(cudaStreamSynchronize(cudaStreamPerThread),"QSA compare sync")) {impl_->failed=true;return;}
+                    float maximum=0.f,magnitude=0.f;double absolute=0;size_t where=0,changed=0;
+                    bool finite=true;
+                    for(int h=0;h<num_heads;++h)for(int r=0;r<query_length;++r)for(int d=0;d<value_dim;++d) {
+                        const size_t index=size_t(h)*p.output_head_stride+size_t(r)*p.output_position_stride+d;
+                        finite=finite&&std::isfinite(actual[index])&&std::isfinite(reference[index]);
+                        changed+=std::memcmp(&actual[index],&reference[index],sizeof(float))!=0;
+                        const float delta=std::fabs(actual[index]-reference[index]);
+                        magnitude=std::max(magnitude,std::fabs(reference[index]));absolute+=delta;
+                        if(delta>maximum){maximum=delta;where=index;}
+                    }
+                    std::fprintf(stderr,"QSA compare node=%u rows=%d keys=%d grouped=%d partitions=%d max_abs=%.9g mean_abs=%.9g reference_max=%.9g at=%zu changed=%zu finite=%d\n",
+                        node.id,query_length,key_length,int(p.reuse_gqa),p.partitions,maximum,
+                        absolute/(size_t(num_heads)*query_length*value_dim),magnitude,where,changed,int(finite));
+                    if(!finite||changed!=0){impl_->failed=true;return;}
                 }
                 ++impl_->qsa_attention_enqueues;
                 if(p.reuse_gqa)++impl_->qsa_gqa_enqueues;

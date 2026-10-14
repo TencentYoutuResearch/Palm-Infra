@@ -87,15 +87,12 @@ __global__ void qsa_index_scores(const float* query,const float* pooled,float* s
         score/sqrtf(float(p.dimension)):-CUDART_INF_F;
 }
 
-template<class Cache, bool Split=false>
+template<class Cache>
 __global__ void selected_attention(const float* query, const Cache* key,
     const Cache* value, const int32_t* indices, float* output,const float* mask,
     mollm_cuda::QsaSelectedAttentionParams p) {
     const int row=blockIdx.x, head=blockIdx.y;
-    const int partition=Split?blockIdx.z:0;
-    const int partition_size=Split?(p.slots+p.partitions-1)/p.partitions:p.slots;
-    const int begin=min(p.slots,partition*partition_size);
-    const int slots=Split?max(0,min(partition_size,p.slots-begin)):p.slots;
+    const int partition_size=p.slots,begin=0,slots=p.slots;
     const int kv=head/(p.heads/p.kv_heads);
     const int lane=threadIdx.x%32, warp=threadIdx.x/32;
     const float* q=query+size_t(row)*p.query_position_stride+size_t(head)*p.query_head_stride;
@@ -133,9 +130,7 @@ __global__ void selected_attention(const float* query, const Cache* key,
     for(int slot=threadIdx.x;slot<slots;slot+=256)
         probabilities[slot]=total>0?probabilities[slot]/total:0.f;
     __syncthreads();
-    float* out=Split?p.split_workspace+((size_t(row)*p.heads+head)*p.partitions+partition)*(p.value_dim+2):
-        output+size_t(row)*p.output_position_stride+size_t(head)*p.output_head_stride;
-    if(Split&&threadIdx.x==0){out[p.value_dim]=maximum;out[p.value_dim+1]=total;}
+    float* out=output+size_t(row)*p.output_position_stride+size_t(head)*p.output_head_stride;
     for(int d=threadIdx.x;d<p.value_dim;d+=256) {
         float sum=0;
         for(int slot=0;slot<slots;++slot) {
@@ -151,93 +146,136 @@ __global__ void selected_attention(const float* query, const Cache* key,
     }
 }
 
-__global__ void merge_selected_attention(float* output,mollm_cuda::QsaSelectedAttentionParams p) {
-    const int row=blockIdx.x,head=blockIdx.y;
-    const float* parts=p.split_workspace+(size_t(row)*p.heads+head)*p.partitions*(p.value_dim+2);
-    float maximum=-CUDART_INF_F;
-    for(int i=0;i<p.partitions;++i)maximum=fmaxf(maximum,parts[size_t(i)*(p.value_dim+2)+p.value_dim]);
-    float weights[32],total=0.f;
-    for(int i=0;i<p.partitions;++i) {
-        const float* part=parts+size_t(i)*(p.value_dim+2);
-        weights[i]=part[p.value_dim+1]>0?part[p.value_dim+1]*expf(part[p.value_dim]-maximum):0.f;
-        total+=weights[i];
-    }
-    float* out=output+size_t(row)*p.output_position_stride+size_t(head)*p.output_head_stride;
-    for(int d=threadIdx.x;d<p.value_dim;d+=blockDim.x) {
-        float sum=0.f;
-        for(int i=0;i<p.partitions;++i)
-            sum=fmaf(weights[i],parts[size_t(i)*(p.value_dim+2)+d],sum);
-        out[d]=total>0?sum/total:0.f;
+template<class Cache>
+__global__ void selected_scores_partitioned(const float* query,const Cache* key,
+    const int32_t* indices,const float* mask,mollm_cuda::QsaSelectedAttentionParams p) {
+    const int row=blockIdx.x,head=blockIdx.y,partition=blockIdx.z;
+    const int width=(p.slots+p.partitions-1)/p.partitions;
+    const int begin=min(p.slots,partition*width),count=min(width,p.slots-begin);
+    const int kv=head/(p.heads/p.kv_heads),lane=threadIdx.x%32,warp=threadIdx.x/32;
+    const float* q=query+size_t(row)*p.query_position_stride+size_t(head)*p.query_head_stride;
+    const int32_t* ids=indices+size_t(row)*p.index_position_stride+begin;
+    float* scores=p.selected_scores+(size_t(row)*p.heads+head)*p.slots+begin;
+    for(int slot=warp;slot<count;slot+=8) {
+        const int id=ids[slot];
+        const bool active=id>=0&&id<p.keys&&id<=p.past+row&&
+            (!mask||mask[size_t(row)*p.mask_row_stride+size_t(id)*p.mask_column_stride]==0.f);
+        float dot=0;
+        if(active) {
+            const Cache* k=key+size_t(kv)*p.key_head_stride+size_t(id)*p.key_position_stride;
+            for(int d=lane;d<p.key_dim;d+=32)dot=fmaf(q[d],float(k[d]),dot);
+        }
+        dot=mollm_cuda::detail::warp_reduce_sum(dot);
+        if(lane==0)scores[slot]=active?dot*p.scale:-CUDART_INF_F;
     }
 }
 
 template<class Cache>
-__global__ void selected_attention_gqa(const float* query, const Cache* key,
-    const Cache* value, const int32_t* indices, float* output, const float* mask,
-    mollm_cuda::QsaSelectedAttentionParams p) {
-    constexpr int Tile=16, Dim=256;
+__global__ void selected_scores_gqa(const float* query,const Cache* key,
+    const int32_t* indices,const float* mask,mollm_cuda::QsaSelectedAttentionParams p) {
+    constexpr int Tile=16,Dim=256;
     const int row=blockIdx.x,kv=blockIdx.y,lane=threadIdx.x%32,warp=threadIdx.x/32;
-    const int group=p.heads/p.kv_heads,head=kv*group+warp;
-    __shared__ float staged_key[Tile*Dim],staged_value[Tile*Dim],scores[16*Tile];
-    __shared__ int active[Tile],any_active;
+    const int head=kv*(p.heads/p.kv_heads)+warp;
+    __shared__ float staged[Tile*Dim],scores[16*Tile];
+    __shared__ int active[Tile];
     const float* q=query+size_t(row)*p.query_position_stride+size_t(head)*p.query_head_stride;
-    float qreg[8],acc[8];
+    float qr[8];
     #pragma unroll
-    for(int j=0;j<8;++j){qreg[j]=q[lane+32*j];acc[j]=0.f;}
-    float maximum=-CUDART_INF_F,total=0.f;
+    for(int j=0;j<8;++j)qr[j]=q[lane+32*j];
     const int32_t* ids=indices+size_t(row)*p.index_position_stride;
     for(int base=0;base<p.slots;base+=Tile) {
-        if(threadIdx.x<32) {
-            const int slot=base+threadIdx.x;
-            const int id=threadIdx.x<Tile&&slot<p.slots?ids[slot]:-1;
-            const int selected=id>=0&&id<p.keys&&id<=p.past+row&&
+        if(threadIdx.x<Tile) {
+            const int slot=base+threadIdx.x,id=slot<p.slots?ids[slot]:-1;
+            active[threadIdx.x]=id>=0&&id<p.keys&&id<=p.past+row&&
                 (!mask||mask[size_t(row)*p.mask_row_stride+size_t(id)*p.mask_column_stride]==0.f)?id:-1;
-            if(threadIdx.x<Tile)active[threadIdx.x]=selected;
-            const unsigned visible=__ballot_sync(0xffffffff,selected>=0);
-            if(threadIdx.x==0)any_active=visible!=0;
         }
         __syncthreads();
-        // Arbitrarily positioned invalid/masked IDs remain supported; this
-        // skips empty tiles without assuming sorted IDs or trailing padding.
-        if(!any_active){__syncthreads();continue;}
         for(int i=threadIdx.x;i<Tile*Dim;i+=blockDim.x) {
-            const int id=active[i/Dim],d=i%Dim;
-            staged_key[i]=id>=0?float(key[size_t(kv)*p.key_head_stride+size_t(id)*p.key_position_stride+d]):0.f;
-            staged_value[i]=id>=0?float(value[size_t(kv)*p.value_head_stride+size_t(id)*p.value_position_stride+d]):0.f;
+            const int id=active[i/Dim];
+            staged[i]=id>=0?float(key[size_t(kv)*p.key_head_stride+size_t(id)*p.key_position_stride+i%Dim]):0.f;
         }
         __syncthreads();
         for(int token=0;token<Tile;++token) {
-            float dot=0.f;
+            float dot=0;
             #pragma unroll
-            for(int j=0;j<8;++j)dot=fmaf(qreg[j],staged_key[token*Dim+lane+32*j],dot);
+            for(int j=0;j<8;++j)dot=fmaf(qr[j],staged[token*Dim+lane+32*j],dot);
             dot=mollm_cuda::detail::warp_reduce_sum(dot);
             if(lane==0)scores[warp*Tile+token]=active[token]>=0?dot*p.scale:-CUDART_INF_F;
         }
         __syncwarp();
-        const float score=lane<Tile?scores[warp*Tile+lane]:-CUDART_INF_F;
-        float tile_max=score;
-        for(int shift=16;shift>0;shift/=2)tile_max=fmaxf(tile_max,__shfl_down_sync(0xffffffff,tile_max,shift));
-        tile_max=__shfl_sync(0xffffffff,tile_max,0);
-        const float next_max=fmaxf(maximum,tile_max);
-        const float factor=maximum==-CUDART_INF_F?0.f:expf(maximum-next_max);
-        const float weight=score==-CUDART_INF_F?0.f:expf(score-next_max);
-        const float tile_sum=__shfl_sync(0xffffffff,mollm_cuda::detail::warp_reduce_sum(weight),0);
-        if(lane<Tile)scores[warp*Tile+lane]=weight;
-        __syncwarp();
-        #pragma unroll
-        for(int j=0;j<8;++j)acc[j]*=factor;
-        for(int token=0;token<Tile;++token) {
-            const float probability=scores[warp*Tile+token];
-            #pragma unroll
-            for(int j=0;j<8;++j)
-                acc[j]=fmaf(probability,staged_value[token*Dim+lane+32*j],acc[j]);
+        if(lane<Tile&&base+lane<p.slots)
+            p.selected_scores[(size_t(row)*p.heads+head)*p.slots+base+lane]=scores[warp*Tile+lane];
+        __syncthreads();
+    }
+}
+
+__global__ void normalize_selected_scores(mollm_cuda::QsaSelectedAttentionParams p) {
+    float* scores=p.selected_scores+(size_t(blockIdx.x)*p.heads+blockIdx.y)*p.slots;
+    __shared__ float reduction[256];
+    float maximum=-CUDART_INF_F;
+    for(int s=threadIdx.x;s<p.slots;s+=256)maximum=fmaxf(maximum,scores[s]);
+    maximum=mollm_cuda::detail::block_reduce_max<256>(maximum,reduction);
+    float total=0;
+    for(int s=threadIdx.x;s<p.slots;s+=256) {
+        const float weight=scores[s]==-CUDART_INF_F?0.f:expf(scores[s]-maximum);
+        scores[s]=weight;total+=weight;
+    }
+    total=mollm_cuda::detail::block_reduce_sum<256>(total,reduction);
+    for(int s=threadIdx.x;s<p.slots;s+=256)scores[s]=total>0?scores[s]/total:0.f;
+}
+
+template<class Cache>
+__global__ void selected_values_gqa(const Cache* value,const int32_t* indices,float* output,
+    const float* mask,mollm_cuda::QsaSelectedAttentionParams p) {
+    constexpr int Tile=16,Dim=256;
+    const int row=blockIdx.x,kv=blockIdx.y,lane=threadIdx.x%32,warp=threadIdx.x/32;
+    const int head=kv*(p.heads/p.kv_heads)+warp;
+    __shared__ float staged[Tile*Dim],weights[16*Tile];
+    __shared__ int active[Tile];
+    const int32_t* ids=indices+size_t(row)*p.index_position_stride;
+    const float* scores=p.selected_scores+(size_t(row)*p.heads+head)*p.slots;
+    float acc[8]={};
+    for(int base=0;base<p.slots;base+=Tile) {
+        if(threadIdx.x<Tile) {
+            const int slot=base+threadIdx.x,id=slot<p.slots?ids[slot]:-1;
+            active[threadIdx.x]=id>=0&&id<p.keys&&id<=p.past+row&&
+                (!mask||mask[size_t(row)*p.mask_row_stride+size_t(id)*p.mask_column_stride]==0.f)?id:-1;
         }
-        total=total*factor+tile_sum;maximum=next_max;
+        if(lane<Tile)weights[warp*Tile+lane]=base+lane<p.slots?scores[base+lane]:0.f;
+        __syncthreads();
+        for(int i=threadIdx.x;i<Tile*Dim;i+=blockDim.x) {
+            const int id=active[i/Dim];
+            staged[i]=id>=0?float(value[size_t(kv)*p.value_head_stride+size_t(id)*p.value_position_stride+i%Dim]):0.f;
+        }
+        __syncthreads();
+        for(int token=0;token<Tile;++token)if(active[token]>=0) {
+            const float weight=weights[warp*Tile+token];
+            #pragma unroll
+            for(int j=0;j<8;++j)acc[j]=fmaf(weight,staged[token*Dim+lane+32*j],acc[j]);
+        }
         __syncthreads();
     }
     float* out=output+size_t(row)*p.output_position_stride+size_t(head)*p.output_head_stride;
     #pragma unroll
-    for(int j=0;j<8;++j)out[lane+32*j]=total>0?acc[j]/total:0.f;
+    for(int j=0;j<8;++j)out[lane+32*j]=acc[j];
+}
+
+template<class Cache>
+__global__ void selected_values_feature_tiles(const Cache* value,const int32_t* indices,float* output,
+    const float* mask,mollm_cuda::QsaSelectedAttentionParams p) {
+    const int row=blockIdx.x,head=blockIdx.y,d=blockIdx.z*64+threadIdx.x;
+    if(d>=p.value_dim)return;
+    const int kv=head/(p.heads/p.kv_heads);
+    const int32_t* ids=indices+size_t(row)*p.index_position_stride;
+    const float* scores=p.selected_scores+(size_t(row)*p.heads+head)*p.slots;
+    float sum=0;
+    for(int s=0;s<p.slots;++s) {
+        const int id=ids[s];
+        if(id>=0&&id<p.keys&&id<=p.past+row&&
+            (!mask||mask[size_t(row)*p.mask_row_stride+size_t(id)*p.mask_column_stride]==0.f))
+            sum=fmaf(scores[s],float(value[size_t(kv)*p.value_head_stride+size_t(id)*p.value_position_stride+d]),sum);
+    }
+    output[size_t(row)*p.output_position_stride+size_t(head)*p.output_head_stride+d]=sum;
 }
 
 template<int Items>
@@ -344,7 +382,7 @@ cudaError_t mollm_cuda::launch_qsa_selected_attention(const float* query,
        p.keys<1||p.past<0||p.past>p.keys||p.queries>p.keys-p.past||
        p.key_dim<1||p.value_dim<1||p.key_dim>4096||p.value_dim>4096||
        p.slots<1||p.slots>4096||p.partitions<1||p.partitions>32||
-       (p.partitions>1&&!p.split_workspace)||!std::isfinite(p.scale)||p.scale<=0||
+       ((p.partitions>1||p.reuse_gqa)&&!p.selected_scores)||!std::isfinite(p.scale)||p.scale<=0||
        p.query_position_stride<size_t(p.key_dim)||p.query_head_stride<size_t(p.key_dim)||
        p.key_position_stride<size_t(p.key_dim)||p.key_head_stride<size_t(p.key_dim)||
        p.value_position_stride<size_t(p.value_dim)||p.value_head_stride<size_t(p.value_dim)||
@@ -365,26 +403,31 @@ cudaError_t mollm_cuda::launch_qsa_selected_attention(const float* query,
        p.index_position_stride>limit/size_t(p.queries))return cudaErrorInvalidValue;
     if(mask&&(!p.mask_column_stride||!p.mask_row_stride||
         !fits(p.queries,p.keys,p.mask_row_stride,p.mask_column_stride,1)))return cudaErrorInvalidValue;
-    if(p.partitions>1) {
-        const size_t elements=size_t(p.value_dim+2)*p.partitions;
-        if(elements>limit/size_t(p.heads)/size_t(p.queries))return cudaErrorInvalidValue;
-        const size_t shared=size_t((p.slots+p.partitions-1)/p.partitions+256)*sizeof(float);
-        const dim3 grid(p.queries,p.heads,p.partitions);
-        if(half)selected_attention<__half,true><<<grid,256,shared,stream>>>(query,
-            static_cast<const __half*>(key),static_cast<const __half*>(value),ids,output,mask,p);
-        else selected_attention<float,true><<<grid,256,shared,stream>>>(query,
-            static_cast<const float*>(key),static_cast<const float*>(value),ids,output,mask,p);
-        auto error=cudaGetLastError();if(error!=cudaSuccess)return error;
-        merge_selected_attention<<<dim3(p.queries,p.heads),256,0,stream>>>(output,p);
-        return cudaGetLastError();
-    }
     const int group=p.heads/p.kv_heads;
-    if(p.reuse_gqa&&p.key_dim==256&&p.value_dim==256&&group>=2&&group<=16) {
-        const dim3 grid(p.queries,p.kv_heads);
-        if(half)selected_attention_gqa<<<grid,group*32,0,stream>>>(query,
-            static_cast<const __half*>(key),static_cast<const __half*>(value),ids,output,mask,p);
-        else selected_attention_gqa<<<grid,group*32,0,stream>>>(query,
-            static_cast<const float*>(key),static_cast<const float*>(value),ids,output,mask,p);
+    if(p.partitions>1||p.reuse_gqa) {
+        if(size_t(p.slots)>limit/size_t(p.heads)/size_t(p.queries))return cudaErrorInvalidValue;
+        const bool grouped=p.reuse_gqa&&p.key_dim==256&&p.value_dim==256&&group>=2&&group<=16;
+        if(grouped) {
+            const dim3 grid(p.queries,p.kv_heads);
+            if(half)selected_scores_gqa<<<grid,group*32,0,stream>>>(query,static_cast<const __half*>(key),ids,mask,p);
+            else selected_scores_gqa<<<grid,group*32,0,stream>>>(query,static_cast<const float*>(key),ids,mask,p);
+        } else {
+            const dim3 grid(p.queries,p.heads,p.partitions);
+            if(half)selected_scores_partitioned<<<grid,256,0,stream>>>(query,static_cast<const __half*>(key),ids,mask,p);
+            else selected_scores_partitioned<<<grid,256,0,stream>>>(query,static_cast<const float*>(key),ids,mask,p);
+        }
+        auto error=cudaGetLastError();if(error!=cudaSuccess)return error;
+        normalize_selected_scores<<<dim3(p.queries,p.heads),256,0,stream>>>(p);
+        error=cudaGetLastError();if(error!=cudaSuccess)return error;
+        if(grouped) {
+            const dim3 grid(p.queries,p.kv_heads);
+            if(half)selected_values_gqa<<<grid,group*32,0,stream>>>(static_cast<const __half*>(value),ids,output,mask,p);
+            else selected_values_gqa<<<grid,group*32,0,stream>>>(static_cast<const float*>(value),ids,output,mask,p);
+        } else {
+            const dim3 grid(p.queries,p.heads,(p.value_dim+63)/64);
+            if(half)selected_values_feature_tiles<<<grid,64,0,stream>>>(static_cast<const __half*>(value),ids,output,mask,p);
+            else selected_values_feature_tiles<<<grid,64,0,stream>>>(static_cast<const float*>(value),ids,output,mask,p);
+        }
         return cudaGetLastError();
     }
     const size_t shared=size_t(p.slots+256)*sizeof(float);

@@ -33,13 +33,13 @@ void selected_nan_underflow(bool half) {
     std::vector<__half> hk(512),hv(512);
     for(int i=0;i<512;++i){hk[i]=__float2half(k[i]);hv[i]=__float2half(v[i]);}
     int32_t ids[]={0,1};
-    Buffer dq(2048),dk(half?1024:2048),dv(half?1024:2048),di(8),out(2048),scratch(2*2*258*4);
+    Buffer dq(2048),dk(half?1024:2048),dv(half?1024:2048),di(8),out(2048),scores(16);
     check(cudaMemcpy(dq.data,q.data(),2048,cudaMemcpyHostToDevice));
     check(cudaMemcpy(dk.data,half?static_cast<void*>(hk.data()):static_cast<void*>(k.data()),half?1024:2048,cudaMemcpyHostToDevice));
     check(cudaMemcpy(dv.data,half?static_cast<void*>(hv.data()):static_cast<void*>(v.data()),half?1024:2048,cudaMemcpyHostToDevice));
     check(cudaMemcpy(di.data,ids,8,cudaMemcpyHostToDevice));
     for(int mode:{0,1,2}) {
-        p.reuse_gqa=mode==1;p.partitions=mode==2?2:1;p.split_workspace=static_cast<float*>(scratch.data);
+        p.reuse_gqa=mode==1;p.partitions=mode==2?2:1;p.selected_scores=static_cast<float*>(scores.data);
         check(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
             static_cast<int32_t*>(di.data),static_cast<float*>(out.data),p));
         check(cudaMemcpy(actual.data(),out.data,2048,cudaMemcpyDeviceToHost));
@@ -100,8 +100,9 @@ void topk(int keys) {
 void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bool interleaved,bool use_mask=false,bool reuse=false,int partitions=1,float stress_scale=1.f) {
     mollm_cuda::QsaSelectedAttentionParams p{};
     p.reuse_gqa=reuse;
-    Buffer partials(size_t(rows)*heads*partitions*(vd+2)*4);
-    p.partitions=partitions;p.split_workspace=static_cast<float*>(partials.data);
+    p.partitions=partitions;
+    Buffer scores(size_t(rows)*heads*slots*4);
+    p.selected_scores=static_cast<float*>(scores.data);
     p.heads=heads;p.kv_heads=kv;p.keys=keys;p.queries=rows;p.past=keys-rows;
     p.key_dim=kd;p.value_dim=vd;p.slots=slots;p.scale=stress_scale/std::sqrt(float(kd));
     p.query_position_stride=kd*heads+3;p.query_head_stride=kd;
@@ -195,6 +196,17 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
         check(cudaStreamSynchronize(stream));
         check(cudaMemcpy(actual.data(),out.data,actual.size()*4,cudaMemcpyDeviceToHost));
         for(int i=0;i<8;++i){require(actual[i]==12345.f);require(actual[on+8+i]==12345.f);}
+        if(p.reuse_gqa||p.partitions>1) {
+            Buffer reference_output(actual.size()*4);
+            std::vector<float> reference(actual.size(),12345.f);
+            check(cudaMemcpy(reference_output.data,reference.data(),reference.size()*4,cudaMemcpyHostToDevice));
+            auto legacy=p;legacy.reuse_gqa=false;legacy.partitions=1;legacy.selected_scores=nullptr;
+            check(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
+                static_cast<int32_t*>(di.data),static_cast<float*>(reference_output.data)+8,legacy,stream,device_mask));
+            check(cudaStreamSynchronize(stream));
+            check(cudaMemcpy(reference.data(),reference_output.data,reference.size()*4,cudaMemcpyDeviceToHost));
+            require(std::memcmp(actual.data(),reference.data(),actual.size()*4)==0);
+        }
         for(int r=0;r<rows;++r)for(int h=0;h<heads;++h) {
             std::vector<double> scores(slots,-std::numeric_limits<double>::infinity());
             double maximum=-std::numeric_limits<double>::infinity();
@@ -239,6 +251,7 @@ int main(int argc,char** argv) {
             run(half,19,3,4,2,8,5,9,interleaved,true,false,16);
             run(half,131,3,24,2,256,256,131,interleaved,true,true,1,64.f);
             run(half,131,3,24,2,256,256,131,interleaved,true,false,16,64.f);
+            run(half,32,32,24,2,256,256,131,interleaved,false,true);
         }
         std::puts("QSA optimized small-only: grouped/split, strides, masked poison and capture pass");
         return 0;
@@ -256,6 +269,7 @@ int main(int argc,char** argv) {
         run(half,19,3,4,2,8,5,9,interleaved,true,false,16);
         run(half,131,3,24,2,256,256,131,interleaved,true,true,1,64.f);
         run(half,131,3,24,2,256,256,131,interleaved,true,false,16,64.f);
+        run(half,64,64,24,2,256,256,2051,interleaved,false,true);
     }
     std::puts("QSA selected-key attention: FP16/FP32, GQA, poison, bounds, strides and capture pass");
 }

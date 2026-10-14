@@ -141,9 +141,11 @@ struct CudaBackend::Impl {
     void* qsa_mask_invalid = nullptr;
     size_t qsa_mask_invalid_bytes = 0;
     size_t qsa_indexer_enqueues = 0, qsa_attention_enqueues = 0;
-    void* qsa_attention_partials = nullptr;
-    size_t qsa_attention_partials_bytes = 0;
+    void* qsa_selected_scores = nullptr;
+    size_t qsa_selected_scores_bytes = 0;
     size_t qsa_gqa_enqueues = 0, qsa_split_enqueues = 0;
+    void* qsa_attention_shadow = nullptr;
+    size_t qsa_attention_shadow_bytes = 0;
     size_t attention_scores_bytes = 0;
     void* attention_prefix_valid = nullptr;
     size_t attention_prefix_valid_bytes = 0;
@@ -634,10 +636,11 @@ struct CudaBackend::Impl {
         if(qsa_query)cudaFree(qsa_query);
         if(qsa_scores)cudaFree(qsa_scores);
         if(qsa_mask_invalid)cudaFree(qsa_mask_invalid);
-        if(qsa_attention_partials)cudaFree(qsa_attention_partials);
+        if(qsa_selected_scores)cudaFree(qsa_selected_scores);
+        if(qsa_attention_shadow)cudaFree(qsa_attention_shadow);
         if(qsa_gqa_enqueues||qsa_split_enqueues)
-            std::fprintf(stderr,"CudaBackend: QSA grouped=%zu split=%zu partial_workspace=%zu bytes\n",
-                qsa_gqa_enqueues,qsa_split_enqueues,qsa_attention_partials_bytes);
+            std::fprintf(stderr,"CudaBackend: QSA grouped=%zu split=%zu selected_workspace=%zu bytes\n",
+                qsa_gqa_enqueues,qsa_split_enqueues,qsa_selected_scores_bytes);
         if(qsa_indexer_enqueues||qsa_attention_enqueues)
             std::fprintf(stderr,"CudaBackend: QSA indexer=%zu attention=%zu query_workspace=%zu score_workspace=%zu bytes\n",
                 qsa_indexer_enqueues,qsa_attention_enqueues,qsa_query_bytes,qsa_scores_bytes);

@@ -25,7 +25,7 @@ void bench(int rows,int keys) {
     for(int r=0;r<rows;++r)for(int s=0;s<2048;++s)
         ids[size_t(r)*p.slots+s]=int(int64_t(s)*(p.past+r+1)/2048);
     Buffer dq(query.size()*4),dk(cache.size()*2),dv(cache.size()*2),di(ids.size()*4),out(query.size()*4);
-    Buffer workspace(size_t(rows)*p.heads*16*(p.value_dim+2)*4);
+    Buffer scores(size_t(rows)*p.heads*p.slots*4);
     check(cudaMemcpy(dq.data,query.data(),query.size()*4,cudaMemcpyHostToDevice));
     check(cudaMemcpy(dk.data,cache.data(),cache.size()*2,cudaMemcpyHostToDevice));
     check(cudaMemcpy(dv.data,cache.data(),cache.size()*2,cudaMemcpyHostToDevice));
@@ -35,7 +35,7 @@ void bench(int rows,int keys) {
     cudaEvent_t begin,end;check(cudaEventCreate(&begin));check(cudaEventCreate(&end));
     for(int mode:{0,1,2,2,1,0}) {
         p.reuse_gqa=mode==1;p.partitions=mode==2?16:1;
-        p.split_workspace=static_cast<float*>(workspace.data);
+        p.selected_scores=static_cast<float*>(scores.data);
         for(int i=0;i<5;++i)launch();
         check(cudaDeviceSynchronize());
         const int repeats=rows>1?10:100;

@@ -20,22 +20,23 @@ struct QsaSelectedAttentionParams {
     size_t index_position_stride=0;
     size_t output_position_stride=0, output_head_stride=0;
     size_t mask_column_stride=0, mask_row_stride=0;
-    // Opt-in FP32 online-softmax GQA kernel: stages each selected KV tile
+    // Opt-in ordered FP32 GQA kernel: stages each selected KV tile
     // once for all query heads sharing that KV head. D256, groups2..16.
     bool reuse_gqa=false;
-    // Optional caller-owned FP32 workspace [queries,heads,partitions,value_dim+2].
-    // Split selected tokens for small batches; no internal allocation.
-    float* split_workspace=nullptr;
+    // Split independent QK scores for small batches; PV keeps original order.
     int partitions=1;
+    // Ordered optimized path: caller owns [queries,heads,slots] FP32 scores.
+    // Preserve legacy normalization/PV FMA order, important around subsequent
+    // low-precision quantization boundaries. No full-history dense scores.
+    float* selected_scores=nullptr;
 };
 
 // No allocation, host readback, full-history score buffer or expanded KV copy.
 // Invalid/padded/future indices are inactive, so they cannot cause an OOB read;
 // an entirely inactive row returns zero. Output must not alias any input;
 // read-only key/value buffers may alias each other.
-// If supplied, split_workspace must be disjoint from all inputs/output and
-// have queries*heads*partitions*(value_dim+2) FP32 elements. Partial outputs
-// are merged on-device with stable softmax weighting; no host readback.
+// If reuse_gqa or partitions>1, selected_scores is required, disjoint from
+// all inputs/output, with queries*heads*slots FP32 elements. No host readback.
 // This is a correctness-first implementation, not a throughput qualification.
 cudaError_t launch_qsa_selected_attention(const float* query, const void* key,
     const void* value, bool fp16_cache, const int32_t* indices, float* output,
