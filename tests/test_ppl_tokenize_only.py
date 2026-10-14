@@ -58,7 +58,7 @@ class TokenizeOnlyTests(unittest.TestCase):
         self.assertEqual(result.stdout, "tokens=2\ntoken_ids=2,0\n")
 
     def test_qsa_tokenization_does_not_load_companion(self):
-        result = self.run_case("--device", "cuda", "--qsa-companion", "missing-directory")
+        result = self.run_case("--device", "cuda", "--qsa-companion", "missing-directory", "--n-ctx", "262144")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "tokens=2\ntoken_ids=0,1\n")
         self.assertNotIn("Backend:", result.stderr)
@@ -67,7 +67,7 @@ class TokenizeOnlyTests(unittest.TestCase):
     def test_invalid_qsa_arguments_fail_before_model_loading(self):
         for args in (("--qsa-companion", "bundle"),
                      ("--device", "cuda", "--qsa-companion", ""),
-                     ("--device", "cuda", "--qsa-companion", "bundle", "--n-ctx", "32769")):
+                     ("--device", "cuda", "--qsa-companion", "bundle", "--n-ctx", "262145")):
             result = self.run_case(*args)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("--qsa-companion", result.stderr)

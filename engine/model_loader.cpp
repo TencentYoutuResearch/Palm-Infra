@@ -963,8 +963,8 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
     // graphs later share these buffers via the existing aux_state migration.
     std::unordered_map<uint32_t,std::pair<int,int>> qsa_state_shapes;
     for(const auto& node:g.nodes)if(node.op_type==OpType::QSA_INDEXER) {
-        const auto reject=[](){std::fprintf(stderr,"Engine: QSA requires CUDA text, ctx<=32768, no MTP/padding, valid independent auxiliary states\n");return false;};
-        if(cfg_.device!=Device::CUDA||n_ctx<1||n_ctx>32768||cfg_.mtp_draft_tokens||
+        const auto reject=[](){std::fprintf(stderr,"Engine: QSA requires CUDA text, ctx<=262144, no MTP/padding, valid independent auxiliary states\n");return false;};
+        if(cfg_.device!=Device::CUDA||n_ctx<1||n_ctx>mollm_qsa::max_context||cfg_.mtp_draft_tokens||
            !cfg_.mtp_companion_dir.empty()||cfg_.static_padded||node.inputs.size()!=8||
            node.params.i32.size()!=5||node.params.i32[0]<1||node.params.i32[0]>16||
            node.params.i32[1]<2||node.params.i32[1]>256||node.params.i32[2]<2||
@@ -1226,9 +1226,9 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 bool LLMEngine::load_impl(const EngineConfig& cfg) {
     cfg_ = cfg;
     if (!cfg_.qsa_companion_dir.empty() &&
-        (cfg_.device != Device::CUDA || cfg_.n_ctx < 1 || cfg_.n_ctx > 32768 ||
+        (cfg_.device != Device::CUDA || cfg_.n_ctx < 1 || cfg_.n_ctx > mollm_qsa::max_context ||
          cfg_.static_padded || cfg_.mtp_draft_tokens || !cfg_.mtp_companion_dir.empty())) {
-        std::fprintf(stderr, "Engine: --qsa-companion requires CUDA text, ctx1..32768, no MTP/padding\n");
+        std::fprintf(stderr, "Engine: --qsa-companion requires CUDA text, ctx1..262144, no MTP/padding\n");
         return false;
     }
     if(cfg_.cuda_prefill_logical_batch&&!mollm_prefill::logical_config_supported(cfg_)) {

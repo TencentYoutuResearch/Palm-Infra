@@ -1,4 +1,5 @@
 #pragma once
+#include "core/qsa_limits.h"
 
 #include "graph/graph.h"
 #include "graph/execute.h"

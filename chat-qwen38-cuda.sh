@@ -16,7 +16,7 @@ for preset_arg in "$@"; do
 done
 if (( ! preset_help )); then
   if (( preset_qsa )); then
-    echo 'Experimental QSA companion requested: CUDA text, contiguous causal history, context<=32768; checkpoint quality/performance validation is ongoing.' >&2
+    echo 'Experimental QSA companion requested: CUDA text, contiguous causal history, context<=262144 (memory-dependent); checkpoint quality/performance validation is ongoing.' >&2
   else
   echo 'WARNING: this bring-up package omits QSA selection; histories beyond its2048-token budget use experimental dense attention, not the original long-context model.' >&2
   fi

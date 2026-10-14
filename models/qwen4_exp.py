@@ -252,7 +252,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
         index_dim = int(tc.get("indexer_head_dim", 128))
         index_ratio = int(tc.get("indexer_compress_ratio", 4))
         if (_mtp_mode or int(tc.get("indexer_kv_heads", 1)) != 1 or
-                not 1 <= n_ctx <= 32768 or not 1 <= index_heads <= 16 or
+                not 1 <= n_ctx <= 262144 or not 1 <= index_heads <= 16 or
                 not rope_dim <= index_dim <= 256 or not 1 <= index_ratio <= 16 or
                 qsa_budget < 1 or qsa_budget % index_ratio or qsa_budget + index_ratio - 1 > 4096):
             raise ValueError("unsupported native QSA geometry/context/MTP")

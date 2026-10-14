@@ -320,9 +320,9 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         return false;
     }
     if (!opts.qsa_companion_dir.empty() &&
-        (opts.device != Device::CUDA || opts.n_ctx < 1 || opts.n_ctx > 32768 ||
+        (opts.device != Device::CUDA || opts.n_ctx < 1 || opts.n_ctx > mollm_qsa::max_context ||
          opts.static_padded || opts.mtp_draft_tokens || !opts.mtp_companion_dir.empty())) {
-        error = "--qsa-companion requires CUDA text, ctx1..32768, no MTP/padding";
+        error = "--qsa-companion requires CUDA text, ctx1..262144, no MTP/padding";
         return false;
     }
     // Context bounds retained KV history; chunk bounds transient batch work.
@@ -391,7 +391,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --mtp-draft-tokens <int>  Experimental packaged MTP speculation (0..16)\n");
     std::printf("  --mtp-companion <dir>    Local streamed MTP bundle sharing target weights\n");
-    std::printf("  --qsa-companion <dir>    Experimental CUDA QSA bundle; text, ctx<=32768, no MTP\n");
+    std::printf("  --qsa-companion <dir>    Experimental CUDA QSA bundle; text, ctx<=262144, no MTP; memory-dependent\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
     std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
     std::printf("  --no-lock-dense-weights Keep dense mmap weights pageable\n");

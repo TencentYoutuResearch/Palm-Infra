@@ -768,11 +768,17 @@ if(MOLLM_BUILD_TESTS)
         target_link_libraries(test_cuda_qsa_indexer PRIVATE mollm_lib)
         set_target_properties(test_cuda_qsa_indexer PROPERTIES CUDA_STANDARD 17)
         add_test(NAME test_cuda_qsa_indexer COMMAND test_cuda_qsa_indexer)
+        add_test(NAME test_cuda_qsa_extended_history COMMAND test_cuda_qsa_indexer --extended-history-only)
+        set_tests_properties(test_cuda_qsa_extended_history PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
         set_tests_properties(test_cuda_qsa_indexer PROPERTIES
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
         target_link_libraries(test_cuda_qsa_selected_attention PRIVATE mollm_lib)
         set_target_properties(test_cuda_qsa_selected_attention PROPERTIES CUDA_STANDARD 17)
         add_test(NAME test_cuda_qsa_selected_attention COMMAND test_cuda_qsa_selected_attention)
+        add_test(NAME test_cuda_qsa_streaming_topk COMMAND test_cuda_qsa_selected_attention --streaming-topk-only)
+        set_tests_properties(test_cuda_qsa_streaming_topk PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
         set_tests_properties(test_cuda_qsa_selected_attention PROPERTIES
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
         if(NOT TARGET bench_cuda_gr_reduce)

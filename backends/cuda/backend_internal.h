@@ -140,6 +140,11 @@ struct CudaBackend::Impl {
     size_t qsa_scores_bytes = 0;
     void* qsa_mask_invalid = nullptr;
     size_t qsa_mask_invalid_bytes = 0;
+    void* qsa_topk_scores = nullptr;
+    size_t qsa_topk_scores_bytes = 0;
+    void* qsa_topk_ids = nullptr;
+    size_t qsa_topk_ids_bytes = 0;
+    size_t qsa_streaming_topk_enqueues = 0;
     size_t qsa_indexer_enqueues = 0, qsa_attention_enqueues = 0;
     void* qsa_selected_scores = nullptr;
     size_t qsa_selected_scores_bytes = 0;
@@ -636,6 +641,11 @@ struct CudaBackend::Impl {
         if(qsa_query)cudaFree(qsa_query);
         if(qsa_scores)cudaFree(qsa_scores);
         if(qsa_mask_invalid)cudaFree(qsa_mask_invalid);
+        if(qsa_topk_scores)cudaFree(qsa_topk_scores);
+        if(qsa_topk_ids)cudaFree(qsa_topk_ids);
+        if(qsa_streaming_topk_enqueues)
+            std::fprintf(stderr,"CudaBackend: QSA streaming_topk=%zu workspace=%zu bytes\n",
+                qsa_streaming_topk_enqueues,qsa_topk_scores_bytes+qsa_topk_ids_bytes);
         if(qsa_selected_scores)cudaFree(qsa_selected_scores);
         if(qsa_attention_shadow)cudaFree(qsa_attention_shadow);
         if(qsa_gqa_enqueues||qsa_split_enqueues)

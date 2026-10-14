@@ -797,7 +797,7 @@ void CudaBackend::dispatch(const GraphNode& node,
            inputs[5]->shape[0]!=p.dimension||!inputs[6]->device.buffer||
            inputs[7]->prec!=Precision::FP32) {fail("invalid norm/frequency/cache/mask");return;}
         const auto* meta=cache_meta(static_cast<const uint8_t*>(inputs[6]->data)+inputs[6]->device.offset);
-        if(meta->max_seq_len<1||meta->max_seq_len>32768||meta->current_seq_len>meta->max_seq_len||
+        if(meta->max_seq_len<1||meta->max_seq_len>mollm_qsa::max_context||meta->current_seq_len>meta->max_seq_len||
            size_t(inputs[0]->shape[1])>meta->max_seq_len-meta->current_seq_len) {
             fail("cache length/capacity");return;
         }
@@ -831,16 +831,27 @@ void CudaBackend::dispatch(const GraphNode& node,
             fail("requires contiguous causal visibility; masked gaps are not implemented");return;
         }
         auto* query=static_cast<float*>(impl_->qsa_query);auto* scores=static_cast<float*>(impl_->qsa_scores);
+        static const bool force_streaming=[] {
+            const char* value=std::getenv("MOLLM_TEST_CUDA_QSA_FORCE_STREAMING_TOPK");return value&&!std::strcmp(value,"1");
+        }();
+        const bool streaming=keys/p.ratio>mollm_qsa::sort_tile_groups||force_streaming;
+        if(streaming) {
+            const size_t bytes=size_t(p.queries)*2*(budget/p.ratio)*4;
+            if(!impl_->reserve(impl_->qsa_topk_scores,impl_->qsa_topk_scores_bytes,bytes,true)||
+               !impl_->reserve(impl_->qsa_topk_ids,impl_->qsa_topk_ids_bytes,bytes,true)) {fail("top-k workspace allocation");return;}
+        }
         if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_indexer_update(
             device_pointer_const<float>(*inputs[0]),device_pointer_const<float>(*inputs[1]),
             device_pointer_const<float>(*inputs[2]),device_pointer_const<float>(*inputs[3]),
             device_pointer<float>(*const_cast<Tensor*>(inputs[4])),device_pointer<float>(*const_cast<Tensor*>(inputs[5])),
             query,scores,p,cudaStreamPerThread),"QSA indexer update")||
            !mollm_cuda::report_cuda(mollm_cuda::launch_qsa_causal_block_topk(scores,device_pointer<int32_t>(*output),
-            p.queries,keys,p.past,budget,p.ratio,p.score_stride,output->stride[1]/4,cudaStreamPerThread),"QSA top-k")) {
+            p.queries,keys,p.past,budget,p.ratio,p.score_stride,output->stride[1]/4,cudaStreamPerThread,
+            streaming?static_cast<float*>(impl_->qsa_topk_scores):nullptr,
+            streaming?static_cast<int32_t*>(impl_->qsa_topk_ids):nullptr,force_streaming),"QSA top-k")) {
             fail("native launch");return;
         }
-        ++impl_->qsa_indexer_enqueues;record_native();return;
+        ++impl_->qsa_indexer_enqueues;if(streaming)++impl_->qsa_streaming_topk_enqueues;record_native();return;
     }
 
     if ((node.op_type == OpType::SDPA || node.op_type == OpType::QSA_SDPA ||

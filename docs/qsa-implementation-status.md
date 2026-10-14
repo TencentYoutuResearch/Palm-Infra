@@ -320,3 +320,60 @@ execution lifecycle、三个CUDA QSA fixture、serialized engine、
 CSV比较工具、PPL CLI/tokenize、graph/export和两个算法reference。
 完整状态工具是额外真实模型证据，不替代独立数学参考，也非完整模型
 原始BF16 oracle。当前32K支持边界、带缺口mask等限制尚需继续处理。
+
+## 长历史选择扩展（2026-10-15）
+
+本机原始config的max_position_embeddings=262144、ratio4。此前32K上限
+源自top-k单CTA排序至多8192组，不是权重文件布局限制。
+新streaming top-k按8192-group tile排序，保留每tile前budget/ratio组，
+与已有候选再稳定合并，最后按token时间排序并追加所有尾组token。
+prior tile的候选排在新tile前，稳定平局保持较小原始group ID优先。
+所有排序shared memory仍<=48KiB；无CPU读回、无内部临时分配。
+caller-owned score/ID scratch各Q×2×(budget/ratio)，默认Q2048共16MiB。
+小历史默认仍用原selector，不增加额外scratch或排序开销。
+
+原生indexer、mask validator、加载器、builder和CLI共同提高算法容量
+上界到262144（`core/qsa_limits.h`）。这不等于GB10默认preset保证能以
+默认chunk/cache运行262K：KV/raw/pooled/mask/score均占内存，继续保留
+100GiB启动/24GiB停止保护和logical临时headroom检查，超预算明确失败。
+没有重写`.mollm`、没有重新导出原始权重，没有GPU reset。
+
+`--streaming-topk-only` fixture：32772/32775/65536/131071/262144长度，
+四种merge widths、ratio1/4/16、asc/desc/ties、未来NaN、early prefix、
+尾组、guard和更改score后的capture replay。CPU全量stable sort给出
+相同ID序列。`qsa-streaming-topk-correctness-2.log` 完成0；完整该scope的
+memcheck/synccheck/racecheck各完成0、0 errors/0 hazards，日志
+`qsa-streaming-topk-{memcheck,synccheck,racecheck}-1.log`。
+
+`--extended-history-only` 在64K/128K/262K历史末尾继续3个token：旧
+pooled cache不变、新跨chunk group/独立scalar scores/cutoff通过。
+日志 `qsa-extended-indexer-correctness-1.log`。这是preinitialized prefix
+continuation的证据，不是完整262K prefill/真实checkpoint认证。
+
+`MOLLM_TEST_CUDA_QSA_FORCE_STREAMING_TOPK=1` 强制现有短历史也走新
+selector，用于质量A/B。实际7046-token完整checkpoint运行
+`qsa-streaming-quality-7k-1.csv/.log` 完成0，与SIMT参考7045项CE
+逐项一致、mean_abs/max_abs0。正常模式仅历史超过8192 groups使用新路。
+
+已添加独立CTest entry `test_cuda_qsa_streaming_topk` 和
+`test_cuda_qsa_extended_history`，RUN_SERIAL；builder容量boundary与
+PPL tokenize-only的262K参数解析也有回归。
+
+真实完整checkpoint首次跨32K运行 `qsa-extended-model-56k-1.log` 完成0：
+prompt56312、ctx65536、chunk1024、warmup0/repeat2、32生成tokens，两个
+greedy输出精确一致。prefill924.17/926.21 t/s，decode23.82/23.92 t/s。
+这不是与28K/chunk2048的同步性能A/B，不据此计算新的加速倍率。
+最小35073596KiB可用内存；streaming_topk1296次、workspace8MiB，
+grouped1320/split744、indexer/attention各2064次。计数证实真实历史
+超过8192 groups时使用新selector，而非仅提高CLI限制后回到dense。
+数据文件 `qsa-64k-model-prompt.txt` 是旧28K原始测试提示重复两次，
+原提示、原模型权重均未改。全部GPU工作串行并带内存保护。
+
+完整262K模型prefill/多轮尚未执行；三token的算法测试不能代替这个门禁。
+当前还保留连续causal/无MTP/padding等范围限制，目标仍未宣告全部完成。
+
+扩展indexer的上述完整64K/128K/262K continuation scope也完成memcheck/
+synccheck/racecheck三项、退出0、0 errors/0 hazards，日志
+`qsa-extended-indexer-{memcheck,synccheck,racecheck}-1.log`。最终
+`qsa-extended-final-regression-1.log` 串行15项通过、无skip，包含两个
+新CTest entry；不是全仓库测试结果。

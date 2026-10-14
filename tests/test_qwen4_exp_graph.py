@@ -108,11 +108,16 @@ for prefill, seq in ((False, 1), (True, 17)):
         check(indexers[0].dim_expr[1].kind == DimKind.SEQ and sparse[0].dim_expr[1].kind == DimKind.SEQ,
               "indexer and attention retain dynamic query lengths")
 try:
-    build_graph(".", qsa_cfg, n_ctx=32769, enable_qsa=True)
+    build_graph(".", qsa_cfg, n_ctx=262145, enable_qsa=True)
 except ValueError:
     pass
 else:
     raise AssertionError("QSA unsupported capacity must be explicit")
+for context in (32769, 65536, 262144):
+    extended = build_graph(".", qsa_cfg, n_ctx=context, enable_qsa=True)
+    indexer = next(node for node in extended._nodes if node.op_type == OpType.QSA_INDEXER)
+    check(extended._nodes[indexer.inputs[4]].out_shape[1] == context, "extended raw capacity")
+    check(extended._nodes[indexer.inputs[5]].out_shape[1] == context // 4, "extended pooled capacity")
 
 qsa_ple_cfg = config()
 qsa_ple_cfg["text_config"].update(indexer_n_heads=2, indexer_head_dim=8,

@@ -69,7 +69,7 @@ void print_usage(const char* argv0) {
                 default_worker_threads());
     std::printf("  --device <cpu|metal|cuda>  Compute backend (default: cpu)\n");
     std::printf("  --require-native       Reject accelerator operator fallback\n");
-    std::printf("  --qsa-companion <dir>  CUDA QSA weight bundle; context<=32768\n");
+    std::printf("  --qsa-companion <dir>  CUDA QSA weight bundle; context<=262144; memory-dependent\n");
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --offload-ple         Resident experts/dense weights with pageable PLE tables\n");
     std::printf("  --cuda-prefill-reclaim  CUDA resident+PLE temporary reclamation; ctx<=4096, chunk<=1024, requires MOLLM_CUDA_HOST_HEADROOM_MB>=24576\n");
@@ -238,8 +238,8 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
         return false;
     }
     if (!opts.qsa_companion_dir.empty() &&
-        (opts.device != Device::CUDA || opts.n_ctx < 1 || opts.n_ctx > 32768)) {
-        error = "--qsa-companion requires CUDA text, ctx1..32768";
+        (opts.device != Device::CUDA || opts.n_ctx < 1 || opts.n_ctx > mollm_qsa::max_context)) {
+        error = "--qsa-companion requires CUDA text, ctx1..262144";
         return false;
     }
     if(opts.cuda_prefill_logical_batch&&

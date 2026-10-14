@@ -25,7 +25,7 @@ bool attach_qsa_companion(Graph& g, const std::string& directory,
     namespace fs = std::filesystem;
     using json = nlohmann::json;
     try {
-        check(context > 0 && context <= 32768, "QSA context must be 1..32768");
+        check(context > 0 && context <= mollm_qsa::max_context, "QSA context must be 1..262144");
         check(g.runtime.weights.empty(), "QSA rewrite requires an unloaded graph");
         const fs::path root = fs::canonical(directory);
         check(fs::file_size(root / "manifest.json") <= 1024 * 1024, "oversized QSA manifest");
