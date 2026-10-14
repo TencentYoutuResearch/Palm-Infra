@@ -13,6 +13,11 @@ t/s。具体配置及限制见末尾各节，不能跨配置计算新的加速�
 带缺口 mask 及外部 indexer graph capture 尚不支持，明确拒绝而非 dense
 替代。最新最大边界/reset 验证结果见文末；本文不是全模型完成报告。
 
+最新精度诊断还发现：只改变indexer投影后的BF16舍入，7K整模型CE就与
+当前FP32路径明显不同（mean_abs1.4152），不满足等价门禁。此诊断默认
+关闭，未改生产默认或吞吐结论；原始checkpoint整模型质量仍是未关闭
+的门禁，不能以单层group overlap/选择一致替代。
+
 **质量门禁更新：** c0ef942 的 online-softmax/partial-PV 优化未通过整模型
 token-loss等价性验证，旧性能数字仅为历史运行，不能视为合格上线证据。
 当前已删除该近似选路，改成保持原始FP32求和顺序的优化；新的质量与
@@ -505,3 +510,75 @@ checker命令：
 后才运行CUDA回归，未重置GPU或改驱动。下一步需测BF16 indexer中间舍入
 引起的选择差异对整模型token-loss的影响，不能仅凭group overlap宣告
 完整质量门禁通过。
+
+## BF16 中间舍入与整模型 loss 诊断（2026-10-15）
+
+新增默认关闭的 `MOLLM_TEST_CUDA_QSA_INDEXER_BF16=1`：只有indexer
+projection之后的激活舍入改变，raw K、query、pooling mean、centered
+RMSNorm输出、RoPE cos/sin、逐次乘法和加法模拟BF16，再存入FP32容器；
+score dot/head sum仍用FP32。模板specialization保留原FP32运算顺序。
+不改变dense projection、上游GR hidden、主attention或权重布局，所以
+不是原始BF16整模型reference。此flag不默认启用、不新增通用CLI选路。
+
+诊断快照使用QSAIDX2，沿用QSAIDX1 header/eps后追加uint32 flags=1；
+原FP32仍输出v1。checker自动识别precision，拒绝缺失/未知flags。
+小图29query的query/pool/scores和selected IDs与CPU PyTorch BF16计算
+完全一致。BF16 graph fixture保留whole/chunk/reset及独立主attention
+输出检查，snapshot lifecycle继续保证no-overwrite/continuation。
+
+真实完整checkpoint的同构建PPL A/B都完成0：原7046-token提示、ctx16384、
+chunk2048、相同calibrated package/companion/preset，只有上述flag及诊断
+dump不同，GPU严格串行、仍有100GiB启动/24GiB停止保护。日志/CSV：
+`qsa-bf16-rounding-{control,candidate}-7k-1`。min MemAvailable分别
+34753048/34633440KiB。两组各有48次indexer/attention；candidate明确
+记录 `diagnostic_bf16_post_projection=48`，不是未执行的环境开关。
+
+新control与历史ordered-no-shadow控制的7045项CE逐项完全相同，
+`qsa-bf16-default-control-revalidation-1.json` equivalent=true、误差0。
+这证明新诊断未改变当前默认FP32结果。
+
+`qsa-bf16-rounding-model-comparison-1.json` equivalent=false：7045项、
+exact2054、mean_abs1.4152091、max_abs20.2197151、p99_abs9.9219646；
+control/candidate mean CE9.0172246/9.6245748、delta+0.6073502。
+首次变化position2054，此前全部精确一致；2048..4095区间mean_abs
+1.32794，4096..7044区间2.45864。说明稀疏选择的precision差异可能被
+后续层放大，不允许据总体group overlap宣称无影响；平均CE更高/更低
+也不是谁更忠于原始模型的证据。**不能将candidate作为合格默认路径，
+也不能将当前FP32控制作为原始checkpoint质量认证。**
+
+真实candidate首个稀疏chunk的strict CPU数值oracle未通过：query中
+13/1048576元素不同、最大0.015625；pool2/131072元素不同，max0.00390625。
+原始raw K的BF16舍入精确保存。日志
+`qsa-indexer-real-bf16-oracle-1.log` 是失败证据，不计作通过。
+尝试在诊断norm使用`__frsqrt_rn`后，CPUstrict gate仍失败，且相同快照
+与PyTorch CUDA的选择一致从2048行降至2046行，故已撤回该尝试；
+`qsa-indexer-bf16-rsqrt-{replay,oracle}-1.log` 不是合格优化证据。
+
+`test_cuda_qsa_indexer --snapshot-replay input-v2 new-output` 新增限大小
+重放：使用保存的raw K重算全部pooled history，prefix Q为dummy但只
+保留实际current rows，不复用旧pooled结果。最多8192keys/2048 retained
+queries/64MiB payload；已有输出、截断或超界header拒绝。小图source
+与replay文件完全相同，并有自动拒绝/原hash保持测试。
+
+checker新增显式 `--reference-device cuda --selection-only`，仅允许BF16
+诊断：要求每行selected set与独立CUDA PyTorch方程精确相同，但分别
+报告value gate，不豁免NaN/非法padding/缺组/漏tail。CUDA oracle启动前
+检查GPU空闲；CPU为默认，不初始化GPU。不以selection-only代替strict
+value或整模型质量门禁，也不能用于FP32绕过数值检查。
+
+原candidate snapshot在该scope完成0：
+`qsa-indexer-bf16-cuda-selection-oracle-1.json` selected_set_pass=true、
+2048/2048 rows exact。query仅2个元素与GPU PyTorch不同（max0.0078125），
+pool1个（max0.000244141），scores max0.00240660；因此
+value_gate_pass=false、bf16_post_projection_oracle_pass=false、
+whole_model_bf16_certified=false。CPU/GPU及不同求和树的舍入边界不能
+混为一谈；这个scope只证明该chunk的选中集合，不证明其他layer/chunk
+或原始整模型质量。
+
+最终 `qsa-bf16-final-regression-1.log` 串行21项通过、无skip；torch环境
+oracle rejection10项、portable格式5项通过。BF16 sparse小图快照与
+continuation scope的memcheck/synccheck/racecheck都完成0，0 errors/
+0 hazards，日志 `qsa-bf16-snapshot-{memcheck,synccheck,racecheck}-1.log`。
+不是完整BF16原生kernel全形状sanitizer认证。原权重、NFS文件、驱动和
+默认精度均未改；这一轮完成诊断，原始checkpoint整模型reference门禁
+仍未关闭，目标保持进行中。

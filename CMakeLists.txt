@@ -1577,6 +1577,23 @@ if(MOLLM_BUILD_TESTS)
                     $<TARGET_FILE:test_cuda_qsa_graph>)
             set_tests_properties(test_cuda_qsa_snapshot PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
+            add_test(NAME test_cuda_qsa_snapshot_bf16_diagnostic
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_qsa_snapshot_test.py
+                    $<TARGET_FILE:test_cuda_qsa_graph>)
+            set_tests_properties(test_cuda_qsa_snapshot_bf16_diagnostic PROPERTIES
+                ENVIRONMENT "MOLLM_TEST_CUDA_QSA_INDEXER_BF16=1"
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
+            add_test(NAME test_cuda_qsa_graph_bf16_diagnostic COMMAND test_cuda_qsa_graph)
+            set_tests_properties(test_cuda_qsa_graph_bf16_diagnostic PROPERTIES
+                ENVIRONMENT "MOLLM_TEST_CUDA_QSA_INDEXER_BF16=1"
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
+            if(TARGET test_cuda_qsa_indexer)
+                add_test(NAME test_cuda_qsa_snapshot_replay
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_qsa_snapshot_replay_test.py
+                        $<TARGET_FILE:test_cuda_qsa_graph> $<TARGET_FILE:test_cuda_qsa_indexer>)
+                set_tests_properties(test_cuda_qsa_snapshot_replay PROPERTIES
+                    SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
+            endif()
         endif()
         function(add_mollm_python_test name script)
             add_test(

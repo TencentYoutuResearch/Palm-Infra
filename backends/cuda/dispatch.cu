@@ -41,8 +41,9 @@ bool qsa_indexer_snapshot(const char* path,const std::vector<const Tensor*>& inp
     }
     FILE* file=std::fopen(path,"wbx");
     if(!file){std::fprintf(stderr,"QSA snapshot cannot exclusively create %s\n",path);return false;}
-    bool ok=std::fwrite("QSAIDX1\0",1,8,file)==8&&
+    bool ok=std::fwrite(p.diagnostic_bf16?"QSAIDX2\0":"QSAIDX1\0",1,8,file)==8&&
         std::fwrite(header,sizeof(uint32_t),10,file)==10&&std::fwrite(&p.eps,4,1,file)==1;
+    if(p.diagnostic_bf16){const uint32_t flags=1;ok=ok&&std::fwrite(&flags,4,1,file)==1;}
     auto matrix=[&](const void* source,size_t rows,size_t columns,size_t pitch) {
         if(!ok)return;
         const size_t row_bytes=columns*4;
@@ -825,6 +826,10 @@ void CudaBackend::dispatch(const GraphNode& node,
         p.heads=node.params.i32[0];p.dimension=node.params.i32[1];p.rope_dim=node.params.i32[2];
         p.ratio=node.params.i32[3];const int budget=node.params.i32[4];
         p.eps=graph_params::get_f32(node.params,0,1e-6f);
+        static const bool diagnostic_bf16=[] {
+            const char* value=std::getenv("MOLLM_TEST_CUDA_QSA_INDEXER_BF16");return value&&!std::strcmp(value,"1");
+        }();
+        p.diagnostic_bf16=diagnostic_bf16;
         if(p.heads<1||p.heads>16||p.dimension<2||p.dimension>256||p.rope_dim<2||
            p.rope_dim>p.dimension||p.rope_dim%2||p.ratio<1||p.ratio>16||budget<1||
            budget>4096-p.ratio+1||budget%p.ratio||inputs[0]->shape[1]<1||inputs[0]->shape[1]>65535||
@@ -903,7 +908,8 @@ void CudaBackend::dispatch(const GraphNode& node,
             }
             impl_->qsa_indexer_dump_done=true;
         }
-        ++impl_->qsa_indexer_enqueues;if(streaming)++impl_->qsa_streaming_topk_enqueues;record_native();return;
+        ++impl_->qsa_indexer_enqueues;if(p.diagnostic_bf16)++impl_->qsa_bf16_indexer_enqueues;
+        if(streaming)++impl_->qsa_streaming_topk_enqueues;record_native();return;
     }
 
     if ((node.op_type == OpType::SDPA || node.op_type == OpType::QSA_SDPA ||

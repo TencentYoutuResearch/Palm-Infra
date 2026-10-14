@@ -79,6 +79,9 @@ struct QsaIndexerParams {
     int queries=0, past=0, capacity=0, position_offset=0;
     float eps=1e-6f;
     size_t projection_stride=0, score_stride=0;
+    // Diagnostic only: emulate BF16 rounding AFTER the dense projection.
+    // Buffers remain FP32. Does not reproduce BF16 projection/upstream states.
+    bool diagnostic_bf16=false;
 };
 // Contiguous causal text only; no masked-gap grouping. Persistent raw_cache
 // [capacity,dimension] MUST contain unnormalized/unrotated prior K. Persistent

@@ -12,7 +12,7 @@ spec.loader.exec_module(snapshot)
 torch.set_num_threads(2)
 
 
-def fixture():
+def fixture(bf16=False):
     generator = torch.Generator().manual_seed(76281)
     data = dict(q=29, past=0, heads=2, dim=8, rope=4, ratio=4, budget=8,
                 offset=37, eps=1e-6, keys=29, groups=7)
@@ -21,7 +21,10 @@ def fixture():
     data["kw"] = torch.randn(8, generator=generator)*.1
     data["frequency"] = torch.tensor([1., 0.00031622776])
     data["raw"] = data["projection"][:, 16:].clone()
-    data["query"], data["pooled"], data["scores"], visible = snapshot.oracle(data, torch, torch.float32)
+    if bf16:
+        data["diagnostic_bf16"] = True
+        data["raw"] = data["raw"].bfloat16().float()
+    data["query"], data["pooled"], data["scores"], visible = snapshot.oracle(data, torch, torch.bfloat16 if bf16 else torch.float32)
     data["ids"] = torch.full((29, 11), -1, dtype=torch.int32)
     for row in range(29):
         groups = (row+1)//4
@@ -37,6 +40,40 @@ class OracleTest(unittest.TestCase):
         self.assertTrue(report["fp32_oracle_pass"])
         self.assertEqual(report["fp32_exact_selected_rows"], 29)
         self.assertFalse(report["whole_model_bf16_certified"])
+
+    def test_bf16_post_projection(self):
+        data = fixture(True)
+        report = snapshot.check(data, torch)
+        self.assertTrue(report["bf16_post_projection_oracle_pass"])
+        self.assertEqual(report["bf16_oracle_exact_selected_rows"], 29)
+        self.assertNotIn("fp32_oracle_pass", report)
+        self.assertFalse(report["whole_model_bf16_certified"])
+
+    def test_selection_gate_is_not_value_gate(self):
+        data = fixture(True)
+        data["query"][0, 0, 0] += 1.
+        report = snapshot.check(data, torch, selection_only=True)
+        self.assertTrue(report["selected_set_pass"])
+        self.assertFalse(report["value_gate_pass"])
+        self.assertFalse(report["bf16_post_projection_oracle_pass"])
+        self.assertFalse(report["whole_model_bf16_certified"])
+        with self.assertRaises(ValueError):
+            snapshot.check(data, torch)
+
+    def test_selection_only_rejects_wrong_sets_and_nan(self):
+        for corrupt in ("ids", "scores"):
+            data = fixture(True)
+            if corrupt == "scores":
+                data["scores"][-1, 0] = float("nan")
+            else:
+                worst = torch.argsort(data["scores"][-1], stable=True)[:2]
+                data["ids"][-1] = torch.tensor(sorted([int(block)*4+i for block in worst for i in range(4)])+[28, -1, -1])
+            with self.subTest(corrupt=corrupt), self.assertRaises(ValueError):
+                snapshot.check(data, torch, selection_only=True)
+
+    def test_fp32_cannot_bypass_value_gate(self):
+        with self.assertRaisesRegex(ValueError, "BF16"):
+            snapshot.check(fixture(), torch, selection_only=True)
 
     def test_corrupt_values(self):
         for name in ("projection", "query", "pooled", "raw", "scores"):

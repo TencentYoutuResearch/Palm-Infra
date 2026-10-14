@@ -22,9 +22,18 @@ class HeaderTest(unittest.TestCase):
         self.assertLess(parsed["elements"]*4, 64*1024*1024)
 
     def test_invalid_header(self):
-        for payload in (b"", b"QSAIDX2\0"+bytes(44), self.header()[:-1]):
+        for payload in (b"", b"QSAIDX3\0"+bytes(44), self.header()[:-1]):
             with self.subTest(payload=payload[:8]), self.assertRaises(ValueError):
                 snapshot.read_header(io.BytesIO(payload))
+
+    def test_bf16_precision_flags(self):
+        header = b"QSAIDX2\0"+self.header()[8:]
+        valid = snapshot.read_header(io.BytesIO(header+struct.pack("<I", 1)))
+        self.assertTrue(valid["diagnostic_bf16"])
+        self.assertFalse(snapshot.read_header(io.BytesIO(self.header()))["diagnostic_bf16"])
+        for flags in (b"", bytes(3), struct.pack("<I", 0), struct.pack("<I", 2)):
+            with self.subTest(flags=flags), self.assertRaises(ValueError):
+                snapshot.read_header(io.BytesIO(header+flags))
 
     def test_invalid_geometry(self):
         for changes in (dict(q=0), dict(q=2049), dict(past=8192), dict(heads=17),

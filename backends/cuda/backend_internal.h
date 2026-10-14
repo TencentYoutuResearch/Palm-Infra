@@ -146,6 +146,7 @@ struct CudaBackend::Impl {
     size_t qsa_topk_ids_bytes = 0;
     size_t qsa_streaming_topk_enqueues = 0;
     size_t qsa_indexer_enqueues = 0, qsa_attention_enqueues = 0;
+    size_t qsa_bf16_indexer_enqueues = 0;
     bool qsa_indexer_dump_done = false;
     void* qsa_selected_scores = nullptr;
     size_t qsa_selected_scores_bytes = 0;
@@ -655,6 +656,8 @@ struct CudaBackend::Impl {
         if(qsa_indexer_enqueues||qsa_attention_enqueues)
             std::fprintf(stderr,"CudaBackend: QSA indexer=%zu attention=%zu query_workspace=%zu score_workspace=%zu bytes\n",
                 qsa_indexer_enqueues,qsa_attention_enqueues,qsa_query_bytes,qsa_scores_bytes);
+        if(qsa_bf16_indexer_enqueues)std::fprintf(stderr,
+            "CudaBackend: QSA diagnostic_bf16_post_projection=%zu\n",qsa_bf16_indexer_enqueues);
         if (attention_prefix_valid) cudaFree(attention_prefix_valid);
         if (attention_pv_handle) cublasDestroy(attention_pv_handle);
         if (attention_pv_values) cudaFree(attention_pv_values);

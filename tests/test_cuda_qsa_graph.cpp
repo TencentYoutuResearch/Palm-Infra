@@ -116,8 +116,14 @@ struct Frame {
             }
             selections.insert(selections.end(),ids.begin()+r*slots,ids.begin()+(r+1)*slots);
         }
-        auto raw=read(ts[4]);for(int r=0;r<rows;++r)for(int d=0;d<dim;++d)
-            require(raw[(past+r)*dim+d]==projection[r*(heads+1)*dim+heads*dim+d],"raw K graph state");
+        const char* bf16_option=std::getenv("MOLLM_TEST_CUDA_QSA_INDEXER_BF16");
+        const bool bf16=bf16_option&&!std::strcmp(bf16_option,"1");
+        auto raw=read(ts[4]);for(int r=0;r<rows;++r)for(int d=0;d<dim;++d) {
+            float expected=projection[r*(heads+1)*dim+heads*dim+d];
+            if(bf16){uint32_t bits;std::memcpy(&bits,&expected,4);bits+=0x7fffu+((bits>>16)&1u);
+                bits&=0xffff0000u;std::memcpy(&expected,&bits,4);}
+            require(raw[(past+r)*dim+d]==expected,"raw K graph state");
+        }
     }
     ~Frame(){backend.release_graph_plan(graph);for(int i:{0,1,2,3,4,5,7,8,9,10,12,13})if(graph.runtime.tensors[i].data)backend.free_output(graph.runtime.tensors[i],nullptr);}
 };

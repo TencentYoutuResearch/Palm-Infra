@@ -5,7 +5,8 @@ Equations follow Transformers Qwen4ExpTextQSAIndexer/RMSNorm/partial RoPE:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py
 The dump begins AFTER projection. This is not whole-model BF16 certification,
 nor a test of projection precision or earlier hidden-state drift. No CUDA
-context is created, no weights are loaded, and no output file is written.
+context is created by default, no weights are loaded, and no output file is
+written. Optional CUDA reference runs must be serialized with model workloads.
 """
 import argparse
 import json
@@ -14,12 +15,18 @@ import struct
 
 
 def read_header(source):
-    if source.read(8) != b"QSAIDX1\0":
+    magic = source.read(8)
+    if magic not in (b"QSAIDX1\0", b"QSAIDX2\0"):
         raise ValueError("invalid snapshot magic/version")
     header = source.read(44)
     if len(header) != 44:
         raise ValueError("truncated header")
     q, past, heads, dim, rope, ratio, budget, offset, stride, slots, eps = struct.unpack("<10If", header)
+    bf16 = magic == b"QSAIDX2\0"
+    if bf16:
+        flags = source.read(4)
+        if len(flags) != 4 or struct.unpack("<I", flags)[0] != 1:
+            raise ValueError("invalid/truncated diagnostic precision flags")
     keys, groups = past + q, (past + q) // max(1, ratio)
     if not (1 <= q <= 2048 and 0 <= past and keys <= 8192 and 1 <= heads <= 16
             and 2 <= dim <= 256 and 2 <= rope <= dim and rope % 2 == 0
@@ -32,7 +39,7 @@ def read_header(source):
         raise ValueError("snapshot exceeds64MiB bound")
     return dict(q=q, past=past, heads=heads, dim=dim, rope=rope, ratio=ratio,
                 budget=budget, offset=offset, eps=eps, keys=keys, groups=groups,
-                elements=elements, slots=slots)
+                elements=elements, slots=slots, diagnostic_bf16=bf16)
 
 
 def read_snapshot(path, torch):
@@ -64,6 +71,7 @@ def read_snapshot(path, torch):
 
 
 def oracle(data, torch, dtype):
+    device = data["projection"].device
     def norm(x, weight):
         value = x.float()
         normalized = value * torch.rsqrt(value.square().mean(-1, keepdim=True)+data["eps"])
@@ -82,32 +90,47 @@ def oracle(data, torch, dtype):
 
     q, heads, dim, groups, ratio = (data[x] for x in ("q", "heads", "dim", "groups", "ratio"))
     query = data["projection"][:, :heads*dim].to(dtype).reshape(q, heads, dim)
-    query = rope(norm(query, data["qw"]), torch.arange(data["past"], data["keys"])+data["offset"])
+    query = rope(norm(query, data["qw"]), torch.arange(data["past"], data["keys"], device=device)+data["offset"])
     raw = data["raw"].to(dtype)
     pooled = raw[:groups*ratio].reshape(groups, ratio, dim).float().mean(1).to(dtype)
-    pooled = rope(norm(pooled, data["kw"]), torch.arange(groups)*ratio+data["offset"])
+    pooled = rope(norm(pooled, data["kw"]), torch.arange(groups, device=device)*ratio+data["offset"])
     scores = torch.einsum("qhd,gd->qhg", query.float(), pooled.float()).relu().sum(1)/math.sqrt(dim)
-    visible = (torch.arange(data["past"]+1, data["keys"]+1)//ratio)[:, None] > torch.arange(groups)[None, :]
+    visible = (torch.arange(data["past"]+1, data["keys"]+1, device=device)//ratio)[:, None] > torch.arange(groups, device=device)[None, :]
     scores.masked_fill_(~visible, -math.inf)
     return query.float(), pooled.float(), scores, visible
 
 
-def check(data, torch):
-    query, pooled, scores, visible = oracle(data, torch, torch.float32)
-    report = dict(queries=data["q"], past=data["past"], keys=data["keys"], groups=data["groups"])
-    if not torch.equal(data["raw"][data["past"]:], data["projection"][:, data["heads"]*data["dim"]:]):
+def check(data, torch, *, selection_only=False, reference_device="cpu"):
+    bf16_mode = data.get("diagnostic_bf16", False)
+    dtype = torch.bfloat16 if bf16_mode else torch.float32
+    if selection_only and not bf16_mode:
+        raise ValueError("selection-only is limited to BF16 diagnostic snapshots")
+    reference = {name: value.to(reference_device) if isinstance(value, torch.Tensor) else value
+                 for name, value in data.items()}
+    query, pooled, scores, visible = (value.cpu() for value in oracle(reference, torch, dtype))
+    report = dict(queries=data["q"], past=data["past"], keys=data["keys"], groups=data["groups"],
+                  reference_device=reference_device, selection_only=selection_only)
+    current_raw = data["projection"][:, data["heads"]*data["dim"]:].to(dtype).float()
+    if not torch.equal(data["raw"][data["past"]:], current_raw):
         raise ValueError("raw cache differs from current projected keys")
+    value_gate = True
     for name, expected in (("query", query), ("pooled", pooled), ("scores", scores)):
         observed = data[name]
         if name == "scores":
             if not torch.isneginf(observed[~visible]).all():
                 raise ValueError("future group score must be -inf")
             observed, expected = observed[visible], expected[visible]
+        if not torch.isfinite(observed).all():
+            raise ValueError(f"nonfinite visible {name}")
         report[name+"_max_abs"] = float((observed-expected).abs().max())
+        report[name+"_exact_elements"] = int((observed == expected).sum())
+        report[name+"_elements"] = observed.numel()
         if not torch.allclose(observed, expected, atol=3e-4, rtol=3e-5):
-            raise ValueError(f"{name} disagrees with independent FP32 equations: {report[name+'_max_abs']}")
+            value_gate = False
+            if not selection_only:
+                raise ValueError(f"{name} disagrees with independent {dtype} equations: {report[name+'_max_abs']}")
 
-    bf_query, bf_pooled, bf_scores, _ = oracle(data, torch, torch.bfloat16)
+    bf_query, bf_pooled, bf_scores, _ = (value.cpu() for value in oracle(reference, torch, torch.bfloat16))
     report["bf16_post_projection_score_max_abs"] = float((bf_scores[visible]-scores[visible]).abs().max())
     strict_matches, bf_intersection, bf_total, bf_exact, near_cutoff = 0, 0, 0, 0, 0
     for row in range(data["q"]):
@@ -128,6 +151,8 @@ def check(data, torch):
         strict_matches += chosen == expected
         if chosen != expected:
             near_cutoff += 1
+            if selection_only:
+                raise ValueError(f"selected set differs from independent BF16 reference at row {row}")
         if keep < groups and keep:
             omitted = torch.ones(groups, dtype=torch.bool)
             omitted[chosen] = False
@@ -144,7 +169,13 @@ def check(data, torch):
     report.update(fp32_exact_selected_rows=strict_matches, fp32_near_cutoff_rows=near_cutoff,
                   bf16_post_projection_exact_selected_rows=bf_exact,
                   bf16_post_projection_group_overlap=bf_intersection/max(1, bf_total),
-                  fp32_oracle_pass=True, whole_model_bf16_certified=False)
+                  fp32_oracle_pass=value_gate, selected_set_pass=strict_matches == data["q"],
+                  value_gate_pass=value_gate, whole_model_bf16_certified=False)
+    if bf16_mode:
+        report.pop("bf16_post_projection_score_max_abs")
+        report["bf16_post_projection_oracle_pass"] = report.pop("fp32_oracle_pass")
+        report["bf16_oracle_exact_selected_rows"] = report.pop("fp32_exact_selected_rows")
+        report["bf16_oracle_near_cutoff_rows"] = report.pop("fp32_near_cutoff_rows")
     return report
 
 
@@ -152,13 +183,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot")
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--reference-device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--selection-only", action="store_true",
+                        help="BF16 diagnostics only: require exact selected sets, report value gate separately")
     args = parser.parse_args()
     if not 1 <= args.threads <= 64:
         parser.error("threads must be1..64")
     import torch
     torch.set_num_threads(args.threads)
     try:
-        report = check(read_snapshot(args.snapshot, torch), torch)
+        if args.reference_device == "cuda":
+            import subprocess
+            busy = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True)
+            if busy.strip():
+                raise ValueError("CUDA oracle requires an idle GPU; do not overlap model workloads")
+        report = check(read_snapshot(args.snapshot, torch), torch,
+                       selection_only=args.selection_only, reference_device=args.reference_device)
     except (ValueError, OSError, RuntimeError) as error:
         parser.error(str(error))
     print(json.dumps(report, indent=2, allow_nan=False))
