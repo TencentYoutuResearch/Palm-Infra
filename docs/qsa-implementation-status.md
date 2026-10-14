@@ -4,6 +4,16 @@
 
 ## 已实现
 
+- 独立图算子 `QSA_INDEXER`/`QSA_SDPA`、CUDA dispatch 与执行器生命周期
+  契约；`build_graph(..., enable_qsa=True)` 连接 index projection、原始
+  centered norm 权重、主 RoPE frequency 与 selected-key attention。
+  Legacy graph 默认保持不变；新图不会静默以 dense SDPA 替代 QSA。
+- Engine 使用既有 aux_state 分配/迁移/reset 路径共享 raw/pooled 状态；
+  这两个状态容量按 runtime --n-ctx 调整，不受包内旧容量束缚。
+  初始集成限制为 CUDA text/ctx<=32768、无 MTP/static padding。
+- 原生 dispatch 在更新状态前验证连续因果 mask；有缺口、未来可见或
+  无效未来 mask 明确报错。一次同步读取四字节标志，尚未缓存/优化；
+  QSA_INDEXER backend dispatch 暂不支持外部 CUDA capture（primitive 仍支持）。
 - Python token 选择及 indexer 投影/归一化/RoPE/raw-key-cache 小规模参考。
 - GPU FP32 indexer update/pooling/scoring primitive：消费单独 dense projection
   的结果，使用原始 centered norm 权重和主 attention 的 inv_frequency；
@@ -24,6 +34,19 @@
   不承诺相同平局顺序；质量对照应避免 cutoff ties 或接受合法 tied set。
 
 ## 本轮验证
+
+接入图执行后 `test_cuda_qsa_graph` 通过：FP16/FP32 KV、三种 liveness
+策略、whole/chunk、reset 对照、独立 sparse attention 标量输出、raw K
+保存以及不支持的 mask 在状态更新前拒绝。其 memcheck/synccheck/racecheck
+日志在 `build_cuda/qsa-graph-*-1.log`；最终包含 NaN future mask 拒绝的
+fixture 重跑三项 checker，`build_cuda/qsa-graph-*-2.log` 也各完成0、
+0 errors/0 hazards。新 `test_qsa_engine_e2e` 使用序列化
+的合成 Qwen4Exp 模型，包 ctx32、运行 ctx64；chunk3/17、越预算 prefill、
+decode、多轮和 reset versus fresh hidden 精确对照通过。QSA enqueue
+计数确认 indexer/attention 成对执行。该小模型允许其他算子 reference
+fallback，不是全模型 require-native 或 checkpoint 质量认证。
+
+接入阶段针对性11项回归通过（无跳过），并不代表全量测试已通过。
 
 `test_cuda_qsa_selected_attention` 在 GB10 完成0，覆盖：
 
@@ -78,17 +101,28 @@ BF16 rounding；完整 checkpoint 对照还需要验证所选 precision 的质�
 
 ## 尚未实现/验证
 
-1. 将 dense indexer projection 与现有 update/pooling/norm/RoPE primitive
-   连接到真实推理图，并接入跨 chunk/raw-key 的 engine 状态。
-2. 图算子/backend/engine 缓存 reset/resume 集成、带缺口 mask 的可见分组。
-   当前 top-k primitive 只适用于明确的 contiguous causal history。
-3. 小型 indexer 补充权重 artifact 与安全加载，避免重写约123GB原包。
+1. 对现有完整 checkpoint 包的 companion 安全加载与图改写（不重写大包）。
+2. 带缺口 mask 的可见分组；当前 fast path 仅接受连续因果历史。
+3. 消除或降低接入版 mask 同步校验开销，完整模型 profiling 后优化。
 4. 更长历史、真实模型 QSA 对照、完整模型多轮/reset 和吞吐测量。
 
-当前 launcher 仍使用 dense bring-up，尚未调用新 primitives。没有新增
+当前完整模型 launcher 仍使用 dense bring-up，尚未加载补充权重。没有新增
 默认开关，没有改原始模型权重，没有完整模型 TPS 更新。QSA 能减少主
 attention 的长历史计算，但 indexer 还有自身成本；prefill/decode 收益
 必须在完整接入后测量，不能按复杂度比例直接宣布整模型加速。
 
 算法参考（本轮按 hf-cli 技能只读核对，未下载模型）：
 [Transformers Qwen4ExpTextQSAIndexer](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py)。
+
+## 原始 checkpoint 小型补充权重导出
+
+`tools/export_qwen4_qsa_weights.py` 只导出主模型 indexer 的三种权重。
+Projection BF16→FP16，norm BF16→FP32 保留原始 centered 值，不加1；
+manifest 最后写入，包含 geometry、每个文件 SHA256 和源 config SHA256。
+只接受新/空目录，不覆盖已有文件。两项 fixture 测试确认转换、norm
+中心语义、源文件未改、已有目录拒绝，以及无效 geometry 不写完成标记。
+
+已从本机 NFS 原始 checkpoint 导出到工作区上层 `qwen38_qsa_bundle`：
+36文件、39,337,056 bytes（含headers），主12 attention layers3/7/…/47。
+不是独立模型；runtime companion loader 尚未实现。未复制或改写原本
+约123GB `.mollm`，没有下载原始模型。

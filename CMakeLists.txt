@@ -1571,6 +1571,7 @@ if(MOLLM_BUILD_TESTS)
                               test_qwen4_exp_graph.py)
         add_mollm_python_test(test_qwen4_qsa_reference
                               test_qwen4_qsa_reference.py)
+        add_mollm_python_test(test_qsa_weight_bundle test_qsa_weight_bundle.py)
         add_mollm_python_test(test_qwen4_qsa_indexer_reference
                               test_qwen4_qsa_indexer_reference.py)
         add_mollm_python_test(test_qwen35_quant_policy
