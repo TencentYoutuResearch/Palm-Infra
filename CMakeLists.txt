@@ -1578,6 +1578,7 @@ if(MOLLM_BUILD_TESTS)
                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/${script})
         endfunction()
         add_mollm_python_test(test_token_loss_compare test_token_loss_compare.py)
+        add_mollm_python_test(test_qwen38_cuda_preset test_qwen38_cuda_preset.py)
 
         add_mollm_python_test(test_shape_propagation
                               test_shape_propagation.py)

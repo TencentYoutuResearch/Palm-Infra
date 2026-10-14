@@ -377,3 +377,29 @@ synccheck/racecheck三项、退出0、0 errors/0 hazards，日志
 `qsa-extended-indexer-{memcheck,synccheck,racecheck}-1.log`。最终
 `qsa-extended-final-regression-1.log` 串行15项通过、无skip，包含两个
 新CTest entry；不是全仓库测试结果。
+
+## 接近checkpoint最大上下文的真实运行（2026-10-15）
+
+`qsa-extended-model-253k-1.log` 完成0：真实prompt253376 tokens、
+ctx262144、chunk512、FP16 cache上限4096MiB、gate-scale cache0、
+warmup0/repeat1、16生成tokens，仍为相同calibrated package+QSA bundle。
+提示由旧28K测试文本重复9次构成，不改原文本或模型权重。
+prefill574.08 t/s（441358.51 ms），decode21.01 t/s（714.03 ms）。
+min MemAvailable31603400KiB，高于24GiB保护阈值，未触发guard。
+
+streaming_topk5352、grouped5940/split180、indexer/attention各6120次。
+selector workspace4MiB、selected attention workspace100810752 bytes、
+index scores129499136 bytes；FP16 weight cache实际4292280320 bytes。
+这是实际253K prefill+decode，不是preinitialized-prefix替代，也不是
+完整262144-token输入或重复/reset验证；没有warmup/repeat2，不能据此
+声称完整最大边界/原始BF16模型质量等价。新配置也不同于旧28K基准，
+不计算跨配置加速倍率。全部GPU进程串行，没有GPU reset/driver修改。
+
+启动preset新增保守profile：QSA且最后一个有效`--n-ctx`>65536时，
+默认chunk512、FP16 cache4096MiB；较小上下文和dense模式保持旧默认。
+显式`--prefill-chunk-size`仍在后面覆盖，显式cache环境变量也保留。
+不解释任意shell表达式；十进制leading zero/plus正确归一，过大/非法
+值交给C++验证。不是内存预留，也不取消100GiB/24GiB保护。
+`test_qwen38_cuda_preset.py` 用fake chat/--help验证args/env，不初始化
+GPU或读取真实模型。最终 `qsa-long-preset-regression-1.log` 串行16项
+通过、无skip。当前仍需完成最大边界/更长多轮、mask范围等剩余门禁。

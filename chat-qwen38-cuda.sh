@@ -14,6 +14,28 @@ for preset_arg in "$@"; do
   [[ "$preset_arg" != --help && "$preset_arg" != -h ]] || preset_help=1
   [[ "$preset_arg" != --qsa-companion ]] || preset_qsa=1
 done
+preset_context=16384
+preset_args=("$@")
+for ((preset_i=0;preset_i+1<${#preset_args[@]};++preset_i)); do
+  if [[ ${preset_args[preset_i]} == --n-ctx && ${preset_args[preset_i+1]} =~ ^\+?[0-9]+$ ]]; then
+    preset_value=${preset_args[preset_i+1]#+}
+    preset_value=${preset_value#"${preset_value%%[!0]*}"}
+    preset_value=${preset_value:-0}
+    # Large/invalid values are left to C++ validation, without shell overflow.
+    if (( ${#preset_value}<=6 )); then
+      preset_context=$((10#$preset_value))
+    fi
+  fi
+done
+preset_chunk=2048
+preset_fp16_cache=8192
+if (( preset_qsa && preset_context>65536 )); then
+  preset_chunk=512
+  preset_fp16_cache=4096
+fi
+# Preserve explicit cache overrides; final CLI arguments likewise override the
+# chosen chunk. This is a conservative preset, not a memory reservation.
+preset_fp16_cache=${MOLLM_CUDA_PREFILL_FP16_CACHE_MB:-$preset_fp16_cache}
 if (( ! preset_help )); then
   if (( preset_qsa )); then
     echo 'Experimental QSA companion requested: CUDA text, contiguous causal history, context<=262144 (memory-dependent); checkpoint quality/performance validation is ongoing.' >&2
@@ -51,7 +73,7 @@ exec env \
   MOLLM_CUDA_NVFP4_MMA_GATE_MIN_BATCH=1 \
   MOLLM_CUDA_NVFP4_MMA_DOWN_MIN_BATCH=1 \
   MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS=4 \
-  MOLLM_CUDA_PREFILL_FP16_CACHE_MB=8192 \
+  MOLLM_CUDA_PREFILL_FP16_CACHE_MB="$preset_fp16_cache" \
   MOLLM_CUDA_NVFP4_PREFILL_TILED_GROUP=1 \
   MOLLM_CUDA_NVFP4_MMA_COMPACT_BATCHES=0 \
   MOLLM_CUDA_NVFP4_PREFILL_RADIX_GROUP=0 \
@@ -110,5 +132,5 @@ exec env \
   build_cuda/mollm_chat \
   --package ../qwen38_flash_next_nvfp4_calibrated.mollm \
   --device cuda --offload-ple --cuda-prefill-reclaim --cuda-prefill-logical-batch \
-  --n-ctx 16384 --prefill-chunk-size 2048 --threads 8 \
+  --n-ctx 16384 --prefill-chunk-size "$preset_chunk" --threads 8 \
   --max-new-tokens 512 --temperature 0.6 "$@"
