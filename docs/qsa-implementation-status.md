@@ -449,3 +449,59 @@ MTP/padding 等范围限制及原始BF16全模型质量认证仍未宣告完成�
 最终 `qsa-max-context-final-regression-1.log` 串行16项通过、无skip，包含
 更新后的 serialized engine fixture、CUDA QSA primitive/graph/indexer、
 launcher、CLI/tokenize、导出及独立算法参考；不是全仓库回归结果。
+
+## 真实 indexer 激活的独立 PyTorch 对照（2026-10-15）
+
+新增默认关闭的 `MOLLM_TEST_CUDA_QSA_DUMP=<new-file>`。每个 backend
+最多输出一次，选择首次 keys>budget+ratio 的 sparse dispatch，且限
+keys<=8192、queries<=2048、payload<=64MiB。使用 exclusive create，
+已有文件拒绝而非覆盖；失败明确报错。仅在 native kernel 之后同步读回，
+不改输入/cache/选中ID，不用CPU结果替代CUDA结果；不能用于吞吐计时。
+短提示若未达到门槛不会创建文件，不能把缺失快照视为测试通过。
+
+QSAIDX1 小端快照保存当前 projected Q/K、centered norm 权重、原始
+frequency、raw cache、normalized query/pooled keys、group scores 和
+选中ID。`tools/check_qsa_indexer_snapshot.py` 在CPU PyTorch独立计算
+centered RMSNorm、主attention partial RoPE、FP32 pooling、ReLU-head
+sum以及stable top-k，不import仓库NumPy oracle或调用CUDA；检查当前
+raw K精确保存、未来score=-inf、完整组/全部尾token、时间顺序和padding。
+FP32数值比较用atol3e-4/rtol3e-5；cutoff在此界内的变化单独报告，不
+冒充bit-exact。BF16舍入分支只作诊断，不以“数值更低/集合相似”判为等价。
+
+官方方程来源仍为上面的 Transformers indexer/RMSNorm/RoPE 源码。
+按hf-cli技能只读核对本地checkpoint和环境，未安装/升级包或下载模型；
+checker使用既有 `/home/molly/miniconda3/envs/torch/bin/python`。
+
+小图 `qsa-indexer-small-snapshot-1.log` 完成0、29query/29keys，独立
+FP32 query/pool/scores最大误差2.38e-7/1.19e-7/9.54e-7，29行选择精确
+一致。`test_cuda_qsa_snapshot` 自动验证同一backend continuation只写
+一次、payload长度、已有文件拒绝且原hash不变，保留fixture独立attention
+输出检查。`test_qsa_snapshot_format` 4项校验header/geometry/尺寸上限，
+无torch依赖。另 `test_qsa_snapshot_oracle.py` 在torch环境的6项测试
+覆盖值/未来score/ID/cutoff损坏、truncation/trailing bytes，全部通过，
+日志 `qsa-snapshot-oracle-unit-1.log`；不是原始模型oracle。
+
+真实完整checkpoint `qsa-indexer-real-model-7k-1.log` 完成0，正常7046-token
+提示、ctx16384/chunk2048、warmup0/repeat1、8生成tokens，带原内存guard。
+最小36396076KiB可用内存，未触发guard。快照取主模型首次稀疏chunk：
+queries2048/past2048/keys4096/groups1024；原权重包、NFS文件均未修改。
+checker命令：
+
+```sh
+/home/molly/miniconda3/envs/torch/bin/python \
+  tools/check_qsa_indexer_snapshot.py build_cuda/qsa-indexer-real-4k-1.bin
+```
+
+`qsa-indexer-real-oracle-1.json/.log` 完成0：query/pool/scores最大误差
+9.54e-7/7.15e-7/5.72e-6，2048行FP32选中集合全部精确一致，无near-cutoff
+变化。BF16 post-projection分支最大score差0.0321779，921/2048行集合
+完全一致，选中group总体重合率0.9987221；**不是BF16等价通过**。
+快照始于投影之后，排除不了projection精度及上游hidden drift，也不证明
+原始BF16完整模型loss/长上下文语义质量；不能把本节替代此剩余门禁。
+诊断模型日志中的TPS包含同步dump开销，不更新合格吞吐基准。
+
+最终 `qsa-snapshot-final-regression-1.log` 串行18项通过、无skip；原16项
+加快照native lifecycle和portable格式校验。主模型诊断已终止、GPU空闲
+后才运行CUDA回归，未重置GPU或改驱动。下一步需测BF16 indexer中间舍入
+引起的选择差异对整模型token-loss的影响，不能仅凭group overlap宣告
+完整质量门禁通过。

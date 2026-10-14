@@ -23,6 +23,50 @@ using mollm::cuda_backend_detail::fp32_contiguous;
 using mollm::cuda_backend_detail::same_shape;
 
 namespace {
+// Bounded, opt-in snapshot for an independent CPU indexer oracle. Never used
+// for throughput, never overwrite an existing artifact, and never substitute
+// diagnostic results for native outputs. Each backend emits at most one file.
+bool qsa_indexer_snapshot(const char* path,const std::vector<const Tensor*>& inputs,
+    const Tensor& output,const float* query,const float* scores,
+    const mollm_cuda::QsaIndexerParams& p,int budget) {
+    const int keys=p.past+p.queries,groups=keys/p.ratio,slots=budget+p.ratio-1;
+    const uint32_t header[]={uint32_t(p.queries),uint32_t(p.past),uint32_t(p.heads),
+        uint32_t(p.dimension),uint32_t(p.rope_dim),uint32_t(p.ratio),uint32_t(budget),
+        uint32_t(p.position_offset),uint32_t(p.score_stride),uint32_t(slots)};
+    const size_t width=size_t(p.heads+1)*p.dimension;
+    const size_t elements=size_t(p.queries)*(width+size_t(p.heads)*p.dimension+groups+slots)+
+        size_t(keys+groups)*p.dimension+2*p.dimension+p.rope_dim/2;
+    if(elements>size_t(64)*1024*1024/4) {
+        std::fprintf(stderr,"QSA snapshot exceeds64MiB bound\n");return false;
+    }
+    FILE* file=std::fopen(path,"wbx");
+    if(!file){std::fprintf(stderr,"QSA snapshot cannot exclusively create %s\n",path);return false;}
+    bool ok=std::fwrite("QSAIDX1\0",1,8,file)==8&&
+        std::fwrite(header,sizeof(uint32_t),10,file)==10&&std::fwrite(&p.eps,4,1,file)==1;
+    auto matrix=[&](const void* source,size_t rows,size_t columns,size_t pitch) {
+        if(!ok)return;
+        const size_t row_bytes=columns*4;
+        std::vector<uint32_t> host(rows*columns);
+        ok=mollm_cuda::report_cuda(cudaMemcpy2DAsync(host.data(),row_bytes,source,pitch,
+            row_bytes,rows,cudaMemcpyDeviceToHost,cudaStreamPerThread),"QSA snapshot copy")&&
+            mollm_cuda::report_cuda(cudaStreamSynchronize(cudaStreamPerThread),"QSA snapshot synchronize")&&
+            std::fwrite(host.data(),4,host.size(),file)==host.size();
+    };
+    matrix(device_pointer_const<float>(*inputs[0]),p.queries,width,p.projection_stride*4);
+    matrix(device_pointer_const<float>(*inputs[1]),1,p.dimension,p.dimension*4);
+    matrix(device_pointer_const<float>(*inputs[2]),1,p.dimension,p.dimension*4);
+    matrix(device_pointer_const<float>(*inputs[3]),1,p.rope_dim/2,p.rope_dim/2*4);
+    matrix(device_pointer_const<float>(*inputs[4]),keys,p.dimension,p.dimension*4);
+    matrix(query,p.queries,size_t(p.heads)*p.dimension,size_t(p.heads)*p.dimension*4);
+    matrix(device_pointer_const<float>(*inputs[5]),groups,p.dimension,p.dimension*4);
+    matrix(scores,p.queries,groups,size_t(p.score_stride)*4);
+    matrix(device_pointer_const<int32_t>(output),p.queries,slots,output.stride[1]);
+    if(std::fclose(file)!=0)ok=false;
+    if(ok)std::fprintf(stderr,"QSA snapshot written: %s queries=%d past=%d keys=%d\n",path,p.queries,p.past,keys);
+    else std::fprintf(stderr,"QSA snapshot incomplete: %s\n",path);
+    return ok;
+}
+
 // Bounded, non-captured diagnostic. Never substitute the candidate output or
 // use these synchronized runs for throughput. All scratch is private to this
 // invocation, so native attention scores/output and the KV cache stay intact.
@@ -850,6 +894,14 @@ void CudaBackend::dispatch(const GraphNode& node,
             streaming?static_cast<float*>(impl_->qsa_topk_scores):nullptr,
             streaming?static_cast<int32_t*>(impl_->qsa_topk_ids):nullptr,force_streaming),"QSA top-k")) {
             fail("native launch");return;
+        }
+        const char* snapshot_path=std::getenv("MOLLM_TEST_CUDA_QSA_DUMP");
+        if(snapshot_path&&*snapshot_path&&!impl_->qsa_indexer_dump_done&&
+           keys>budget+p.ratio&&keys<=8192&&p.queries<=2048) {
+            if(!qsa_indexer_snapshot(snapshot_path,inputs,*output,query,scores,p,budget)) {
+                fail("diagnostic snapshot failed");return;
+            }
+            impl_->qsa_indexer_dump_done=true;
         }
         ++impl_->qsa_indexer_enqueues;if(streaming)++impl_->qsa_streaming_topk_enqueues;record_native();return;
     }

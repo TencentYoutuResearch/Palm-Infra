@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include <limits>
 
@@ -135,11 +136,22 @@ void run(bool half,int liveness) {
     require(reset==reference&&ir==ix,"reset graph fresh exact");
 }
 }
-int main() {
+int main(int argc,char** argv) {
     setenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS","1",1);
     setenv("MOLLM_CUDA_QSA_GQA_REUSE","1",1);
     setenv("MOLLM_CUDA_QSA_DECODE_SPLIT","1",1);
     CudaBackend probe;if(!probe.available())return 77;
+    if(argc==3&&!std::strcmp(argv[1],"--snapshot")) {
+        setenv("MOLLM_TEST_CUDA_QSA_DUMP",argv[2],1);
+        Frame frame(true,2);
+        std::vector<float> output;std::vector<int32_t> selected;
+        frame.pass(0,29,7,0,output,selected);
+        // A second eligible invocation must not write/overwrite again.
+        frame.pass(29,1,7,0,output,selected);
+        std::puts("QSA graph snapshot: native sparse prefill and continuation pass");
+        return 0;
+    }
+    require(argc==1,"usage: test_cuda_qsa_graph [--snapshot new-file]");
     for(bool half:{false,true})for(int mode:{0,1,2})run(half,mode);
     for(int bad:{1,2,3}){Frame f(true,2);std::vector<float> out;std::vector<int32_t> ids;f.pass(0,13,7,bad,out,ids);}
     // Exercise both backend selectors: grouped whole prefill, then grouped

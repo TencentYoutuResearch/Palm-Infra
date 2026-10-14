@@ -146,6 +146,7 @@ struct CudaBackend::Impl {
     size_t qsa_topk_ids_bytes = 0;
     size_t qsa_streaming_topk_enqueues = 0;
     size_t qsa_indexer_enqueues = 0, qsa_attention_enqueues = 0;
+    bool qsa_indexer_dump_done = false;
     void* qsa_selected_scores = nullptr;
     size_t qsa_selected_scores_bytes = 0;
     size_t qsa_gqa_enqueues = 0, qsa_split_enqueues = 0;

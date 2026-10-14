@@ -1571,6 +1571,13 @@ if(MOLLM_BUILD_TESTS)
             set_tests_properties(test_qsa_engine_e2e PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda;e2e" RUN_SERIAL TRUE TIMEOUT 180)
         endif()
+        if(TARGET test_cuda_qsa_graph)
+            add_test(NAME test_cuda_qsa_snapshot
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_qsa_snapshot_test.py
+                    $<TARGET_FILE:test_cuda_qsa_graph>)
+            set_tests_properties(test_cuda_qsa_snapshot PROPERTIES
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
         function(add_mollm_python_test name script)
             add_test(
                 NAME ${name}
@@ -1579,6 +1586,7 @@ if(MOLLM_BUILD_TESTS)
         endfunction()
         add_mollm_python_test(test_token_loss_compare test_token_loss_compare.py)
         add_mollm_python_test(test_qwen38_cuda_preset test_qwen38_cuda_preset.py)
+        add_mollm_python_test(test_qsa_snapshot_format test_qsa_snapshot_format.py)
 
         add_mollm_python_test(test_shape_propagation
                               test_shape_propagation.py)
