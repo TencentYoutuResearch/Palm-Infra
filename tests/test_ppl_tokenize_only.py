@@ -57,6 +57,23 @@ class TokenizeOnlyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "tokens=2\ntoken_ids=2,0\n")
 
+    def test_qsa_tokenization_does_not_load_companion(self):
+        result = self.run_case("--device", "cuda", "--qsa-companion", "missing-directory")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "tokens=2\ntoken_ids=0,1\n")
+        self.assertNotIn("Backend:", result.stderr)
+        self.assertNotIn("Engine:", result.stderr)
+
+    def test_invalid_qsa_arguments_fail_before_model_loading(self):
+        for args in (("--qsa-companion", "bundle"),
+                     ("--device", "cuda", "--qsa-companion", ""),
+                     ("--device", "cuda", "--qsa-companion", "bundle", "--n-ctx", "32769")):
+            result = self.run_case(*args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--qsa-companion", result.stderr)
+            self.assertNotIn("Backend:", result.stderr)
+            self.assertNotIn("Engine:", result.stderr)
+
     def test_invalid_section_geometry_is_rejected(self):
         for field, value in ((0, 0), (1, 2), (4, 128), (5, 0), (4, 2**64 - 1)):
             with self.subTest(field=field, value=value):

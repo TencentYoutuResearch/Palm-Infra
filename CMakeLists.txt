@@ -755,6 +755,10 @@ if(MOLLM_BUILD_TESTS)
         set_target_properties(bench_cuda_qsa_attention PROPERTIES CUDA_STANDARD 17)
         add_executable(test_cuda_qsa_indexer tests/test_cuda_qsa_indexer.cu)
         add_executable(test_cuda_qsa_graph tests/test_cuda_qsa_graph.cpp)
+        # Explicit full-checkpoint diagnostic, never an automatic CTest load.
+        add_executable(check_qsa_model_state tests/check_qsa_model_state.cpp examples/cli_common.cpp)
+        target_include_directories(check_qsa_model_state PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples)
+        target_link_libraries(check_qsa_model_state PRIVATE mollm_lib)
         add_executable(test_qsa_engine tests/test_qsa_engine.cpp)
         target_link_libraries(test_qsa_engine PRIVATE mollm_lib)
         target_link_libraries(test_cuda_qsa_graph PRIVATE mollm_lib)
@@ -1567,6 +1571,7 @@ if(MOLLM_BUILD_TESTS)
                 COMMAND ${Python3_EXECUTABLE}
                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/${script})
         endfunction()
+        add_mollm_python_test(test_token_loss_compare test_token_loss_compare.py)
 
         add_mollm_python_test(test_shape_propagation
                               test_shape_propagation.py)

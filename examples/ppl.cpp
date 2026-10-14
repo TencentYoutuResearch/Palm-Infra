@@ -28,6 +28,7 @@ struct Options {
     int ssd_io_workers = 8;
     std::string trace_path;
     std::string token_loss_path;
+    std::string qsa_companion_dir;
     bool prepend_bos = false;
     bool tokenize_only = false;
     bool apply_chat_template = false;
@@ -68,6 +69,7 @@ void print_usage(const char* argv0) {
                 default_worker_threads());
     std::printf("  --device <cpu|metal|cuda>  Compute backend (default: cpu)\n");
     std::printf("  --require-native       Reject accelerator operator fallback\n");
+    std::printf("  --qsa-companion <dir>  CUDA QSA weight bundle; context<=32768\n");
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --offload-ple         Resident experts/dense weights with pageable PLE tables\n");
     std::printf("  --cuda-prefill-reclaim  CUDA resident+PLE temporary reclamation; ctx<=4096, chunk<=1024, requires MOLLM_CUDA_HOST_HEADROOM_MB>=24576\n");
@@ -150,6 +152,13 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
                 error = "--device cuda requires a build with -DMOLLM_CUDA=ON"; return false;
 #endif
             } else { error = std::string("unknown --device '") + dev + "' (cpu|metal|cuda)"; return false; }
+        } else if (arg == "--qsa-companion") {
+            if (!require_value("--qsa-companion", value)) return false;
+            opts.qsa_companion_dir = value;
+            if (opts.qsa_companion_dir.empty()) {
+                error = "--qsa-companion directory must not be empty";
+                return false;
+            }
         } else if (arg == "--require-native") {
             opts.require_native = true;
         } else if (arg == "--mmap") {
@@ -226,6 +235,11 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
     }
     if (opts.require_native && opts.device == Device::CPU) {
         error = "--require-native requires an accelerator device";
+        return false;
+    }
+    if (!opts.qsa_companion_dir.empty() &&
+        (opts.device != Device::CUDA || opts.n_ctx < 1 || opts.n_ctx > 32768)) {
+        error = "--qsa-companion requires CUDA text, ctx1..32768";
         return false;
     }
     if(opts.cuda_prefill_logical_batch&&
@@ -312,6 +326,7 @@ int main(int argc, char** argv) {
     cfg.sampling.temperature = 0.0f;
     cfg.weight_loading = opts.weight_loading;
     cfg.offload_ple = opts.offload_ple;
+    cfg.qsa_companion_dir = opts.qsa_companion_dir;
     cfg.cuda_prefill_reclaim = opts.cuda_prefill_reclaim;
     cfg.cuda_prefill_logical_batch = opts.cuda_prefill_logical_batch;
     if (opts.cuda_prefill_reclaim && opts.chunk_size > (opts.cuda_prefill_logical_batch?2048:1024)) {

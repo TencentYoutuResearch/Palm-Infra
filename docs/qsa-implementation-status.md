@@ -2,6 +2,11 @@
 
 2026-10-14；当前是实现中状态，不是模型功能完成报告。
 
+**质量门禁更新：** c0ef942 的 online-softmax/partial-PV 优化未通过整模型
+token-loss等价性验证，旧性能数字仅为历史运行，不能视为合格上线证据。
+当前已删除该近似选路，改成保持原始FP32求和顺序的优化；新的质量与
+状态验证通过后恢复ordered默认选路，吞吐需重新测量。细节见文末。
+
 ## 已实现
 
 - 独立图算子 `QSA_INDEXER`/`QSA_SDPA`、CUDA dispatch 与执行器生命周期
@@ -235,3 +240,83 @@ warmup1/repeat2：prefill1118.49/1114.57 t/s，decode32.52/32.47 t/s，
 的模型路径不改变算法；该非finite边界补正之后的最终检查以
 `qsa-gqa-split-*-3.log` 和 `qsa-gqa-split-final-regression-2.log` 为准。
 后者重新构建所有相关QSA fixture后10项通过、无skip；不是全量测试报告。
+
+## 整模型质量门禁与 ordered 优化
+
+`mollm_ppl` 新增 `--qsa-companion`；单独CLI原先没有传入该字段，不能
+拿原本dense的PPL运行当成QSA验证。`tools/compare_token_loss.py` 检查
+CSV的position/target对齐、finite CE及绝对差异；默认mean_abs<=1e-4、
+max_abs<=1e-3。loss更低不是等价性证明，fixture对此明确拒绝。
+
+同7046-token输入、ctx32768、chunk2048，原SIMT QSA与c0ef942近似优化：
+7045 targets，仅1项CE精确一致，mean_abs1.59153675、max_abs21.1664531，
+平均CE9.01722459→8.59651999。日志/CSV `qsa-quality-simt-7k-1` 与
+`qsa-quality-optimized-7k-1`。该结果**不通过**门禁，不得因CE更低批准。
+128-token actual-model shadow显示每个attention最大差异约1e-6..1e-5
+(`qsa-quality-shadow-128-1.log`)；独立scalar容差测试不足以认证整模型。
+
+移除online-softmax/partial-PV近似路径，新增ordered实现：
+QK按GQA共享选中K或小批量分区并行，写入仅selected-slot的FP32 scores；
+随后用与原SIMT相同的256-thread归约/normalize；PV按原slot顺序FMA，
+GQA共享V或按feature分块。workspace为Q×H×slots，不是全历史dense矩阵。
+真实Q2048/H24/slots2051为403243008 bytes；decode为196896 bytes。
+不改模型权重，不降精度。低层API和backend均只提供ordered优化。
+
+Primitive/capture fixture新增相同输入对legacy输出的逐字节比较；
+覆盖D256/H24、early causal prefix、KV strides/poison、stress logits。
+完整memcheck/synccheck完成0、0 errors，small-only racecheck完成0、
+0 hazards，日志 `qsa-ordered-{memcheck,synccheck,racecheck-small}-1.log`。
+数值日志 `qsa-ordered-correctness-2.log`。
+
+同7046输入整模型ordered对照：7045项CE逐项一致，mean_abs/max_abs0。
+带逐层shadow的 `qsa-quality-ordered-7k-1` 以及去掉shadow的
+`qsa-quality-ordered-no-shadow-7k-1` 均完成0并与SIMT CSV相同。
+说明匹配不依赖shadow同步。PPL输出本身不是与原始BF16 checkpoint
+的绝对质量oracle，此处门禁只认证优化不改变当前QSA路径的模型结果。
+
+`check_qsa_model_state` 是显式完整checkpoint诊断，不加入自动CTest。
+检查4097-token prefix、7次teacher decode、余下prefill、8次生成decode、
+follow-up prefill/8次decode，记录所有阶段最后一行hidden的完整float bits，
+并在reset后重复全序列要求exact。不是单纯比较hash，也不是主观质量评分。
+参考SIMT运行 `qsa-state-simt-full-model-1.log` 完成0：29个snapshot、
+prompt7046、final_past7085。优化版对照仍需验证。
+
+`qsa-ordered-regression-1.log` 失败：误与完整状态运行重叠启动，
+小模型CUDA context初始化报告OOM；没有GPU reset，主状态运行完成0。
+该回归不能算通过，后续只接受GPU空闲后的串行重跑。
+
+GPU空闲后串行 `qsa-ordered-regression-2.log` 完成0，9项通过、无skip。
+优化版完整状态工具 `qsa-state-ordered-full-model-1.log` 完成0，重复reset
+精确一致；与SIMT参考运行全部58行state记录的完整hidden bits逐字节一致，
+含29个阶段×2次运行、所有greedy token和past长度。grouped96/split576、
+indexer/attention各696次。故不只验证单次prefill，也覆盖prefill→decode→
+prefill、partial pooled group、第二轮追加、reset路径的真实checkpoint状态。
+
+另以prefix2048、后续连续decode、总2112个token检查teacher-forced loss：
+`qsa-quality-decode-{simt,ordered}-1.csv/.log` 均完成0，2111项CE逐项一致，
+mean_abs/max_abs0（平均CE6.47324074）。据此恢复ordered两项默认选路，
+环境变量设0仍可做参考A/B。旧近似kernel及其低层可选入口已删除，
+不是把它留在一个隐藏开关后绕过门禁。
+
+### 质量合格的ordered默认28K吞吐
+
+`qsa-ordered-default-model-28k-1.log` 完成0，prompt28160、ctx32768、
+chunk2048、warmup1/repeat2、64生成tokens；三个选择器均unset，确认
+真实默认路径。两次greedy输出一致：
+
+| 路径 | Prefill t/s | Decode t/s |
+| --- | ---: | ---: |
+| Ordered QSA repeat1 | 1092.48 | 24.60 |
+| Ordered QSA repeat2 | 1088.89 | 24.52 |
+| 同构建dense历史对照 | 450.86 | 19.29 |
+
+约2.42倍prefill、1.27倍decode；不能继续宣称旧近似版1.68倍decode。
+最小35010512KiB可用内存；grouped504/split2268，selected workspace
+403243008 bytes、index score workspace54525952 bytes，未分配全历史
+dense attention score workspace。性能与原始BF16模型质量是不同结论。
+
+最终 `qsa-ordered-final-regression-1.log` 串行13项通过，无skip，含
+execution lifecycle、三个CUDA QSA fixture、serialized engine、
+CSV比较工具、PPL CLI/tokenize、graph/export和两个算法reference。
+完整状态工具是额外真实模型证据，不替代独立数学参考，也非完整模型
+原始BF16 oracle。当前32K支持边界、带缺口mask等限制尚需继续处理。
