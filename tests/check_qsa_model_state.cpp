@@ -14,7 +14,7 @@ struct Snapshot {
     std::vector<uint32_t> hidden;
     bool operator==(const Snapshot& other)const{return past==other.past&&token==other.token&&hidden==other.hidden;}
 };
-std::vector<Snapshot> run(LLMEngine& engine,const Tokenizer& tokenizer,const std::vector<int>& ids) {
+std::vector<Snapshot> run(LLMEngine& engine,const Tokenizer& tokenizer,const std::vector<int>& ids,bool fill_context) {
     engine.reset();require(engine.past_len()==0,"reset must clear position");
     std::vector<Snapshot> result;
     int consumed=0;
@@ -51,13 +51,31 @@ std::vector<Snapshot> run(LLMEngine& engine,const Tokenizer& tokenizer,const std
     const auto followup=tokenizer.encode("\n</think>\n<|im_end|>\n<|im_start|>user\n请继续说明缓存状态如何保持一致。<|im_end|>\n<|im_start|>assistant\n<think>\n");
     token=prefill(followup,"followup-prefill");
     for(int i=0;i<8;++i)token=record(engine.decode_hidden(token),1,"followup-decode");
+    if(fill_context) {
+        const int remaining=engine.config().n_ctx-consumed;
+        require(remaining>=0,"conversation exceeded capacity before boundary fill");
+        std::vector<int> filler(remaining);
+        for(int i=0;i<remaining;++i)filler[i]=ids[size_t(i)%ids.size()];
+        if(!filler.empty())prefill(filler,"boundary-fill");
+        require(engine.past_len()==engine.config().n_ctx,"boundary not reached");
+        require(!engine.decode_hidden(token).data,"decode beyond capacity must fail");
+        require(!engine.prefill_hidden({token}).data,"hidden prefill beyond capacity must fail");
+        require(engine.prefill({token})<0,"sampled prefill beyond capacity must fail");
+        require(engine.past_len()==consumed,"rejected operations changed past");
+        std::printf("qsa_boundary_pass=1 past=%d rejected=3\n",consumed);
+    }
     return result;
 }
 }
 int main(int argc,char** argv) {
     try {
         CliCommonOptions opts;std::string error;
-        if(!parse_common_args(argc,argv,opts,error))throw std::runtime_error(error);
+        // Tool-only flag precedes common CLI options, so prompt/path values
+        // that happen to equal the flag are never reinterpreted.
+        const bool fill_context=argc>1&&std::strcmp(argv[1],"--fill-context")==0;
+        std::vector<char*> args{argv[0]};
+        for(int i=fill_context?2:1;i<argc;++i)args.push_back(argv[i]);
+        if(!parse_common_args(int(args.size()),args.data(),opts,error))throw std::runtime_error(error);
         require(opts.device==Device::CUDA&&!opts.qsa_companion_dir.empty(),"requires CUDA QSA companion");
         std::string text=opts.prompt;
         if(!opts.prompt_file.empty()){std::ifstream input(opts.prompt_file);require(bool(input),"missing prompt file");text.assign(std::istreambuf_iterator<char>(input),std::istreambuf_iterator<char>());}
@@ -69,7 +87,7 @@ int main(int argc,char** argv) {
         std::vector<Snapshot> reference;
         for(int repeat=0;repeat<std::max(2,opts.repeat);++repeat) {
             std::printf("state_repeat=%d\n",repeat);
-            auto actual=run(engine,tokenizer,ids);
+            auto actual=run(engine,tokenizer,ids,fill_context);
             if(repeat==0)reference=std::move(actual);
             else require(reference==actual,"reset versus fresh sequence differs");
         }

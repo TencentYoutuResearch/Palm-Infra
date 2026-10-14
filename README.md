@@ -82,12 +82,18 @@ Qwen3.8 prefill batching (default off): requires reclaim,
 chunk0..2048 (0 defaults to2048), output pool1..4096 MiB and disabled decode segments; rejects
 MTP/padding/SSD/vision/profile/window scheduling. It enables read-only last-use
 contracts itself; unset legacy stateful/liveness sequence caps.
-**Important:** the current Qwen3.8 bring-up graph omits the QSA indexer and
-uses dense attention beyond the2048-token budget.16K/32K are runtime capacity
-and diagnostic scopes, NOT original-model long-context correctness guarantees.
-Recorded long-input loss/reply equivalence compares optimizations of this same
-implementation, not an independent QSA reference. Sparse selection is now the
-priority implementation work.
+**Important:** without `--qsa-companion`, the current Qwen3.8 bring-up package
+omits the QSA indexer and uses experimental dense attention beyond its2048-token
+budget. Runtime context capacity alone does not restore original-model semantics.
+With the matching companion, CUDA text inference uses native QSA indexing and
+selected-key attention; the loader patches the graph in memory without rewriting
+the large package. Continuous causal history is supported up to262144 tokens,
+subject to memory admission. MTP/static padding/vision and noncanonical masks
+are not supported; unsupported QSA configurations reject rather than use dense
+attention. Independent primitive references, optimization-relative token losses,
+state checks and throughput evidence are recorded in
+[`docs/qsa-implementation-status.md`](docs/qsa-implementation-status.md);
+these are not an original-BF16 whole-model quality certification.
 Context capacity is independent of chunk size: e.g. `--n-ctx 16384` with
 `--prefill-chunk-size 512`. Long inputs append KV in configured chunks; short
 inputs are not padded. 2048 remains the supported per-batch maximum, not a
@@ -96,6 +102,11 @@ host memory guards remain enabled. Long-context throughput needs separate measur
 On GB10, build `mollm_chat`, then run `./chat-qwen38-cuda.sh` for an opt-in
 standalone interactive preset (context16384, chunk2048, max512 generated tokens).
 CLI arguments override defaults, e.g. `--prefill-chunk-size 512`. The launcher
+can enable QSA with `./chat-qwen38-cuda.sh --qsa-companion ../qwen38_qsa_bundle`.
+For QSA contexts above65536, its default chunk/cache limits are512 tokens/4096
+MiB; explicit chunk/cache overrides remain honored. Smaller contexts retain
+the existing defaults. The companion must match the selected checkpoint.
+The launcher
 uses local `../qwen38_flash_next_nvfp4_calibrated.mollm`, never sources benchmark
 scripts or downloads/builds automatically, and requires an idle GPU and100 GiB
 MemAvailable at startup. Admission checks are not memory reservations.
@@ -124,8 +135,8 @@ and dimension-paired PV: no need to set
 `MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1` or `MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1`.
 Existing validation/shape requirements remain; explicit0 disables each option,
 and defaults outside logical-prefill remain off.
-The long-KV optimizations/equivalence below apply to the dense bring-up
-diagnostic graph, NOT an implemented full QSA long-context model.
+The long-KV optimizations/equivalence below describe the dense bring-up
+diagnostic path, not the companion-enabled QSA path.
 The preset now automatically selects qualified long-KV FP32 GEMM PV while
 retaining native QK/softmax; no additional startup flag or model conversion.
 Scope: Qwen3.8 H24/KVH2/D256,32..2048 queries and compatible layouts, with

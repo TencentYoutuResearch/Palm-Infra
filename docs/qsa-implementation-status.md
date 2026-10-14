@@ -1,6 +1,17 @@
 # QSA 接入状态
 
-2026-10-14；当前是实现中状态，不是模型功能完成报告。
+2026-10-15；以下各节按实现顺序保留证据，早期容量和接入限制不代表最新状态。
+
+当前已接通真实 checkpoint 的 CUDA text QSA：小型 companion 补齐 indexer
+权重，原始大包不重写；连续 causal history 的容量上限为262144，实际受
+内存预算限制。28K ordered 路径约1091/24.6 prefill/decode t/s；与同构建
+dense 对照相比约2.42/1.27倍。253376-token 单次真实运行为574.08/21.01
+t/s。具体配置及限制见末尾各节，不能跨配置计算新的加速倍率。
+
+独立算子参考、优化前后 token-loss 等价、真实模型状态验证是不同门禁；
+目前不宣称与原始BF16完整模型的长上下文质量等价。MTP、static padding、
+带缺口 mask 及外部 indexer graph capture 尚不支持，明确拒绝而非 dense
+替代。最新最大边界/reset 验证结果见文末；本文不是全模型完成报告。
 
 **质量门禁更新：** c0ef942 的 online-softmax/partial-PV 优化未通过整模型
 token-loss等价性验证，旧性能数字仅为历史运行，不能视为合格上线证据。
@@ -403,3 +414,38 @@ index scores129499136 bytes；FP16 weight cache实际4292280320 bytes。
 `test_qwen38_cuda_preset.py` 用fake chat/--help验证args/env，不初始化
 GPU或读取真实模型。最终 `qsa-long-preset-regression-1.log` 串行16项
 通过、无skip。当前仍需完成最大边界/更长多轮、mask范围等剩余门禁。
+
+## 精确最大边界、多轮及 reset（2026-10-15）
+
+`check_qsa_model_state` 新增工具专用的前置 `--fill-context` 参数：正常
+混合序列完成后，以有效 token 补到 runtime n_ctx；在上限分别调用
+decode_hidden、prefill_hidden 和 sampled prefill，要求三者拒绝且 past
+不变。随后 reset 并完整重跑，对每个记录点的 past、完整最后位置 hidden
+FP32 bits 和 greedy token 精确比较；所有记录的 hidden/logits 要求有限。
+这个参数必须在其他 CLI 参数之前，不改变通用 CLI 或正常推理行为。
+
+真实 checkpoint 的 `qsa-state-max-context-full-model-1.log` 完成0：相同
+253376-token 提示，ctx262144、chunk512、FP16 cache4096MiB、gate-scale
+cache0，repeat2。每轮先4097-token prefill、7个 teacher-forced decode、
+剩余提示 prefill、生成8个 token，再追加真实 chat-template followup 并
+decode8次，最后补齐262144。两轮均有
+`qsa_boundary_pass=1 past=262144 rejected=3`；最终
+`qsa_state_pass=1 snapshots=538 prompt_tokens=253376 final_past=262144`。
+538个记录点全部 exact reset-versus-first-run 通过，不只是回复文本一致。
+
+min MemAvailable31123800KiB（约29.68GiB），高于24GiB保护阈值，未触发
+guard。streaming_topk11208、grouped12288/split576、indexer/attention
+各12912次；selected workspace100810752 bytes、index scores134203392
+bytes、streaming scratch4MiB。日志有大量 hidden_bits，查看状态应过滤
+`state_repeat`/`qsa_boundary_pass`/`qsa_state_pass`，避免整段输出。
+这是状态/边界门禁，不是吞吐基准，也不是原始BF16完整模型质量 oracle。
+
+合成 serialized engine fixture 同时新增 runtime ctx64 精确填满、三种
+超限拒绝、拒绝后 reset 对照；chunk3/17 都通过，包内ctx32不限制runtime
+状态容量。所有真实模型/GPU回归严格串行；原始大包、NFS原始权重及驱动
+未改。连续 causal CUDA text 的最大边界门禁已补齐，非canonical mask、
+MTP/padding 等范围限制及原始BF16全模型质量认证仍未宣告完成。
+
+最终 `qsa-max-context-final-regression-1.log` 串行16项通过、无skip，包含
+更新后的 serialized engine fixture、CUDA QSA primitive/graph/indexer、
+launcher、CLI/tokenize、导出及独立算法参考；不是全仓库回归结果。

@@ -41,6 +41,14 @@ int main(int argc,char** argv) {
         auto baseline=hidden(fresh,{2,5,7,11,13,17,19,23,29,31,3,4,6});
         require(reset==baseline,"reset exact fresh hidden");
         require(e.decode(9)>=0&&fresh.decode(9)>=0,"decode after reset/fresh");
+        const std::vector<int> remaining(64-e.past_len(),2);
+        require(e.prefill(remaining)==fresh.prefill(remaining),"fill capacity agrees with fresh path");
+        require(e.past_len()==64&&fresh.past_len()==64,"exact runtime capacity reached");
+        require(!e.decode_hidden(3).data&&!e.prefill_hidden({3}).data&&e.prefill({3})<0,
+                "all overflow entry points fail before mutation");
+        require(e.past_len()==64,"overflow rejection preserves position");
+        e.reset();fresh.reset();
+        require(hidden(e,{2,5,7,11,13})==hidden(fresh,{2,5,7,11,13}),"reset after rejected requests exact");
     }
     LLMEngine cpu;auto unsupported=config(argv[1],3);unsupported.device=Device::CPU;
     require(!cpu.load(unsupported),"unsupported CPU QSA fails instead of dense substitution");
