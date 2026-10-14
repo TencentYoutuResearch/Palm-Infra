@@ -1604,6 +1604,7 @@ if(MOLLM_BUILD_TESTS)
         add_mollm_python_test(test_token_loss_compare test_token_loss_compare.py)
         add_mollm_python_test(test_qwen38_cuda_preset test_qwen38_cuda_preset.py)
         add_mollm_python_test(test_qsa_snapshot_format test_qsa_snapshot_format.py)
+        add_mollm_python_test(test_qsa_vllm_reference test_qsa_vllm_reference.py)
 
         add_mollm_python_test(test_shape_propagation
                               test_shape_propagation.py)

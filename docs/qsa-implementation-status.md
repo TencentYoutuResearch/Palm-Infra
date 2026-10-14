@@ -18,6 +18,13 @@ t/s。具体配置及限制见末尾各节，不能跨配置计算新的加速�
 关闭，未改生产默认或吞吐结论；原始checkpoint整模型质量仍是未关闭
 的门禁，不能以单层group overlap/选择一致替代。
 
+**对照范围更正：** 后续真实独立框架参考已经取得，但检查当前包元数据
+发现它是`native-nvfp4+dense-w4g32+lm-head-w8pc`，不是原始checkpoint
+的dense/HC/lm_head BF16精度。256-token（尚未稀疏）也明显不一致。
+因此不能把不同权重精度的逐token差异直接归因QSA，或把原始BF16
+bit/CE等价当作这个既有量化包的优化等价门禁。原始精度质量仍未认证；
+同包同精度的QSA数学/状态/优化质量和性能证据应独立审计。详见文末。
+
 **质量门禁更新：** c0ef942 的 online-softmax/partial-PV 优化未通过整模型
 token-loss等价性验证，旧性能数字仅为历史运行，不能视为合格上线证据。
 当前已删除该近似选路，改成保持原始FP32求和顺序的优化；新的质量与
@@ -582,3 +589,80 @@ continuation scope的memcheck/synccheck/racecheck都完成0，0 errors/
 不是完整BF16原生kernel全形状sanitizer认证。原权重、NFS文件、驱动和
 默认精度均未改；这一轮完成诊断，原始checkpoint整模型reference门禁
 仍未关闭，目标保持进行中。
+
+## 独立 vLLM 原始 checkpoint 参考与精度范围澄清（2026-10-15）
+
+只读审计：本机torch环境为torch2.12.1+cu130/Transformers5.13，通用
+AutoConfig不认识qwen4_exp，AutoQuantizationConfig不认识modelopt。
+不在用户环境安装/升级包。checkpoint索引的张量总字节132639846394；
+experts67948314624（63.282GiB）、PLE51265925402（47.745GiB）、
+其余9829717760（9.155GiB）、vision897862112、MTP2698026496。
+仅读小JSON/header，不materialize整模型，不复制/转换大文件。
+
+发现现成镜像`qwen38-flash-dgx:latest`，固定实际identity为
+`sha256:c7f6bb4bbdac845d6e8c277f6de4cb3e301f0e2da4825056b286bd21a3d4dddd`。
+镜像内torch2.13.0+cu130、Transformers5.15.1、
+vLLM0.1.dev20073+g8e685d198。vLLM自己的Qwen4Exp兼容配置注册能够
+读取原始model_type，未更名/修改config；其PLE mmap补丁只按需gather
+原始FP8表行，保留原始global scale，不保留全47.7GiB表。该镜像是独立
+框架参考，不是未经补丁的纯Transformers实现；provenance固定image。
+
+新增`tools/run_qsa_vllm_reference.py`：host+container两阶段，模型/显式
+token IDs/runner文件只读mount，network none，rootfs只读，只有新测试
+输出目录可写。离线模式、PLE预热/预取关闭、KV cache512MiB、ctx<=8192、
+batch<=2048、单序列、eager/no-prefix-cache/no-MTP、禁用vision输入。
+100GiB启动/24GiB停止保护，每250ms读host MemAvailable；内存不足
+kill的是成功docker create返回并校验的确切container ID，不只是client，
+finally仅清理这个测试container，不动其他容器/GPU/终端。额外96GiB
+container内存上限不代替host守卫。已有输出目录拒绝，CSV用exclusive
+create；prompt-logprobs长度/target位置/有限非负CE全部验证。
+
+token IDs由既有`mollm_ppl --tokenize-only --apply-chat-template`产生，
+只读tokenizer，不加载模型。reference直接消费这些ID，不再套一次chat
+template或用另一套分词。3项portable runner单元测试验证token/target
+alignment，以及mock守卫确实只kill/rm自身container。
+
+首个`qsa-original-vllm-reference-7k-1`在模型加载前因FlashInfer试写默认
+root cache而退出2，不能计成功。修正为正确的`FLASHINFER_WORKSPACE_BASE`
+指向独立输出目录后，`qsa-original-vllm-reference-7k-2`完成0、guard0，
+原始11shards从NFS加载565.42s，模型72.91GiB，init/profile/warmup87.95s。
+PLE mmap确认启用、NFS整包预取明确跳过、NVFP4 backend选路有日志。
+min MemAvailable33335028KiB（31.79GiB），高于24GiB；正常模型shutdown，
+自己创建的临时container已移除，原模型/NFS/config/用户环境均未改。
+
+同一原始实例的两次请求：
+
+| 提示tokens | Scored | 原始vLLM mean CE | Greedy next ID |
+| --- | ---: | ---: | ---: |
+| 256 | 255 | 7.3095195 | 248046 |
+| 7046 | 7045 | 10.1536037 | 248068 |
+
+CSV/model.log/memory.log/provenance都在上述新输出目录。这是eager
+prompt-logprobs质量参考，包含首次调优，不当作新吞吐数据。
+config SHA256为`deef67a61f3311faf051b23dc4192f442c7fee4f9cd2f38cbcbe4da55c763a80`。
+
+与当前7K包对照：`qsa-original-reference-vs-fp32-7k-1.json`
+mean_abs3.2293085、max_abs26.4635639、delta CE-1.1363791，equivalent=false；
+与BF16 post-projection诊断的`...vs-bf16-diagnostic-7k-1.json`
+mean_abs3.0290348、max_abs24.4326072、delta-0.5290289，equivalent=false。
+平均CE更低不等于忠于原始模型，也不把这两个结果记作等价通过。
+
+额外匹配256-token输入的真实mollm运行
+`qsa-original-reference-mollm-prefix256-1.log/.csv`完成0，QSA各12次，
+尚未达到稀疏预算；mean CE8.4130349。
+`qsa-original-reference-vs-mollm-prefix256-1.json` mean_abs1.5756139、
+max_abs10.5153191、delta+1.1035154，equivalent=false，第一项就不同。
+故不同模型variant的整模型差异在QSA稀疏选择之前已经存在。
+
+当前大包header的quantization确认为
+`native-nvfp4+dense-w4g32+lm-head-w8pc`；原始dense/HC/LM参数是BF16。
+`models/qwen4_exp.py`已有export默认dense W4、LM W8，不是本轮QSA增加
+的量化。此前把原始全BF16激活/权重逐token认证和现有包优化等价混为
+同一个剩余QSA门禁，前提不成立，现按证据更正。不能通过改indexer
+精度或更换比较阈值消除不同权重量化的差异。恢复原始dense精度属于
+另一个内存/模型variant取舍，本轮没有擅自重转大包或替换权重。
+
+`qsa-reference-final-regression-1.log` 在reference和mollm进程都终止/GPU
+空闲后串行22项通过，无skip，含新增runner portable测试。下一步复核
+最终HEAD同包同配置的dense性能control与QSA吞吐；原始BF16质量不是
+这个不同精度包的已完成认证，仍保留明确限制和独立评估范围。
