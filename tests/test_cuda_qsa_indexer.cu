@@ -181,9 +181,9 @@ void fixture(int n,int dim,int heads,int rope,int budget) {
     check(cudaStreamDestroy(stream));
 }
 
-void long_history() {
-    constexpr int keys=32768,rows=3,past=keys-rows,dim=128,heads=4,rope=64;
-    constexpr int groups=keys/4,slots=2051;
+void long_history(int keys=32768) {
+    constexpr int rows=3,dim=128,heads=4,rope=64,slots=2051;
+    const int past=keys-rows,groups=keys/4;
     std::vector<float> raw(size_t(keys)*dim),pooled(size_t(groups)*dim,12345.f);
     std::vector<float> projection(rows*(heads+1)*dim),qw(dim),kw(dim),freq(rope/2);
     unsigned random=71937;
@@ -206,6 +206,7 @@ void long_history() {
     }
     Buffer dr(raw.size()*4),db(pooled.size()*4),dp(projection.size()*4),dq(rows*heads*dim*4);
     Buffer ds(rows*(groups+3)*4),di(rows*(slots+3)*4),dwq(dim*4),dwk(dim*4),df(freq.size()*4);
+    Buffer candidates(rows*1024*4),candidate_ids(rows*1024*4);
     check(cudaMemcpy(dr.data,raw.data(),raw.size()*4,cudaMemcpyHostToDevice));
     check(cudaMemcpy(db.data,pooled.data(),pooled.size()*4,cudaMemcpyHostToDevice));
     check(cudaMemcpy(dp.data,projection.data(),projection.size()*4,cudaMemcpyHostToDevice));
@@ -217,7 +218,7 @@ void long_history() {
     p.projection_stride=(heads+1)*dim;p.score_stride=groups+3;
     check(mollm_cuda::launch_qsa_indexer_update(dp.f(),dwq.f(),dwk.f(),df.f(),dr.f(),db.f(),dq.f(),ds.f(),p));
     check(mollm_cuda::launch_qsa_causal_block_topk(ds.f(),static_cast<int32_t*>(di.data),
-        rows,keys,past,2048,4,groups+3,slots+3));
+        rows,keys,past,2048,4,groups+3,slots+3,nullptr,candidates.f(),static_cast<int32_t*>(candidate_ids.data)));
     check(cudaDeviceSynchronize());
     std::vector<float> scores(rows*(groups+3)),actual_pooled(pooled.size());
     std::vector<int32_t> indices(rows*(slots+3));
@@ -349,6 +350,10 @@ void projected_pipeline() {
 int main(int argc,char** argv) {
     int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess||!count)return 77;
     if(argc==2&&std::strcmp(argv[1],"--long-only")==0){long_history();return 0;}
+    if(argc==2&&std::strcmp(argv[1],"--extended-history-only")==0) {
+        for(int keys:{65536,131072,262144})long_history(keys);
+        std::puts("QSA extended indexer:64K/128K/262K continuation, prefix reuse, pooling, scores and cutoff pass");return 0;
+    }
     fixture(73,8,2,4,8);
     fixture(129,128,4,64,2048);
     if(argc==1){fixture(2055,128,4,64,2048);long_history();projected_pipeline();}

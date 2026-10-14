@@ -325,16 +325,87 @@ __global__ void qsa_block_topk(const float* scores,int32_t* output,int keys,
 }
 }
 
+template<int MergeItems>
+__global__ void qsa_streaming_topk(const float* scores,int32_t* output,float* candidates,
+    int32_t* candidate_ids,int keys,int past,int budget,int ratio,size_t ss,size_t is) {
+    using TileSort=cub::BlockRadixSort<float,256,32,int>;
+    using MergeSort=cub::BlockRadixSort<float,256,MergeItems,int>;
+    using TokenSort=cub::BlockRadixSort<int,256,16>;
+    union Storage {
+        typename TileSort::TempStorage tile;
+        typename MergeSort::TempStorage merge;
+        typename TokenSort::TempStorage token;
+        int tokens[4096];
+    };
+    static_assert(sizeof(Storage)<=48*1024,"QSA streaming sort exceeds shared budget");
+    __shared__ Storage storage;
+    const int row=blockIdx.x,visible=min(keys,past+row+1),complete=visible/ratio;
+    const int keep=budget/ratio,top=min(keep,complete),count=top*ratio+visible%ratio;
+    float* values=candidates+size_t(row)*2*keep;
+    int32_t* groups=candidate_ids+size_t(row)*2*keep;
+    for(int i=threadIdx.x;i<keep;i+=256){values[i]=-CUDART_INF_F;groups[i]=-1;}
+    __syncthreads();
+    for(int base=0;base<complete;base+=8192) {
+        float tile_values[32];int tile_ids[32];
+        #pragma unroll
+        for(int i=0;i<32;++i) {
+            const int id=base+threadIdx.x*32+i;
+            tile_values[i]=id<complete?scores[size_t(row)*ss+id]:-CUDART_INF_F;
+            tile_ids[i]=id;
+        }
+        TileSort(storage.tile).SortDescending(tile_values,tile_ids);
+        __syncthreads();
+        #pragma unroll
+        for(int i=0;i<32;++i) {
+            const int rank=threadIdx.x*32+i;
+            if(rank<keep){values[keep+rank]=tile_values[i];groups[keep+rank]=tile_ids[i];}
+        }
+        __syncthreads();
+        float merged[MergeItems];int ids[MergeItems];
+        #pragma unroll
+        for(int i=0;i<MergeItems;++i) {
+            const int rank=threadIdx.x*MergeItems+i;
+            merged[i]=rank<2*keep?values[rank]:-CUDART_INF_F;
+            ids[i]=rank<2*keep?groups[rank]:-1;
+        }
+        // Prior chunks occupy the first half. Stable ties thus retain smaller
+        // original group IDs, just like the monolithic stable radix sort.
+        MergeSort(storage.merge).SortDescending(merged,ids);
+        __syncthreads();
+        #pragma unroll
+        for(int i=0;i<MergeItems;++i) {
+            const int rank=threadIdx.x*MergeItems+i;
+            if(rank<keep){values[rank]=merged[i];groups[rank]=ids[i];}
+        }
+        __syncthreads();
+    }
+    for(int i=threadIdx.x;i<4096;i+=256)storage.tokens[i]=INT_MAX;
+    __syncthreads();
+    for(int i=threadIdx.x;i<top;i+=256)
+        for(int j=0;j<ratio;++j)storage.tokens[i*ratio+j]=groups[i]*ratio+j;
+    for(int i=threadIdx.x;i<visible%ratio;i+=256)storage.tokens[top*ratio+i]=complete*ratio+i;
+    __syncthreads();
+    int tokens[16];
+    #pragma unroll
+    for(int i=0;i<16;++i)tokens[i]=storage.tokens[threadIdx.x*16+i];
+    __syncthreads();
+    TokenSort(storage.token).Sort(tokens);
+    #pragma unroll
+    for(int i=0;i<16;++i) {
+        const int rank=threadIdx.x*16+i;
+        if(rank<budget+ratio-1)output[size_t(row)*is+rank]=rank<count?tokens[i]:-1;
+    }
+}
+
 cudaError_t mollm_cuda::launch_qsa_indexer_update(const float* projection,const float* q_norm,
     const float* k_norm,const float* frequency,float* raw,float* pooled,float* query,
     float* scores,const QsaIndexerParams& p,cudaStream_t stream) {
     if(!projection||!q_norm||!k_norm||!frequency||!raw||!pooled||!query||!scores||
        p.heads<1||p.heads>16||p.dimension<1||p.dimension>256||p.rope_dim<2||
        p.rope_dim>p.dimension||p.rope_dim%2||p.ratio<1||p.ratio>16||
-       p.queries<1||p.queries>65535||p.past<0||p.capacity<1||p.past>p.capacity||
+       p.queries<1||p.queries>65535||p.past<0||p.capacity<1||p.capacity>mollm_qsa::max_context||p.past>p.capacity||
        p.queries>p.capacity-p.past||p.position_offset<0||
        p.position_offset>INT_MAX-p.capacity||!std::isfinite(p.eps)||p.eps<=0||
-       (p.past+p.queries)/p.ratio>8192||
        p.projection_stride<size_t((p.heads+1)*p.dimension)||
        p.score_stride<size_t((p.past+p.queries)/p.ratio))return cudaErrorInvalidValue;
     const size_t limit=std::numeric_limits<size_t>::max()/sizeof(float);
@@ -357,15 +428,24 @@ cudaError_t mollm_cuda::launch_qsa_indexer_update(const float* projection,const 
 
 cudaError_t mollm_cuda::launch_qsa_causal_block_topk(const float* scores,int32_t* ids,
     int queries,int keys,int past,int budget,int ratio,size_t score_stride,
-    size_t index_stride,cudaStream_t stream) {
+    size_t index_stride,cudaStream_t stream,float* candidates,int32_t* candidate_ids,bool force_streaming) {
     if(!scores||!ids||queries<1||queries>65535||keys<1||past<0||past>keys||
        queries>keys-past||ratio<1||ratio>4096||budget<1||budget>4096||budget%ratio||
-       budget>4096-ratio+1||keys/ratio>8192||score_stride<size_t(keys/ratio)||
+       budget>4096-ratio+1||keys>mollm_qsa::max_context||score_stride<size_t(keys/ratio)||
        index_stride<size_t(budget+ratio-1))return cudaErrorInvalidValue;
     const size_t limit=std::numeric_limits<size_t>::max()/sizeof(float);
     if(score_stride>limit/size_t(queries)||index_stride>limit/size_t(queries))
         return cudaErrorInvalidValue;
     const int groups=keys/ratio;
+    if(groups>mollm_qsa::sort_tile_groups||force_streaming) {
+        if(!candidates||!candidate_ids||size_t(2*(budget/ratio))>limit/size_t(queries))return cudaErrorInvalidValue;
+        const int keep=budget/ratio;
+        if(keep<=512)qsa_streaming_topk<4><<<queries,256,0,stream>>>(scores,ids,candidates,candidate_ids,keys,past,budget,ratio,score_stride,index_stride);
+        else if(keep<=1024)qsa_streaming_topk<8><<<queries,256,0,stream>>>(scores,ids,candidates,candidate_ids,keys,past,budget,ratio,score_stride,index_stride);
+        else if(keep<=2048)qsa_streaming_topk<16><<<queries,256,0,stream>>>(scores,ids,candidates,candidate_ids,keys,past,budget,ratio,score_stride,index_stride);
+        else qsa_streaming_topk<32><<<queries,256,0,stream>>>(scores,ids,candidates,candidate_ids,keys,past,budget,ratio,score_stride,index_stride);
+        return cudaGetLastError();
+    }
     // Static shared storage remains below the standard48KiB launch budget for
     // these geometries; no device attribute mutation during graph capture.
     if(groups<=2048)qsa_block_topk<8><<<queries,256,0,stream>>>(scores,ids,keys,past,budget,ratio,score_stride,index_stride);
@@ -442,7 +522,7 @@ cudaError_t mollm_cuda::launch_qsa_selected_attention(const float* query,
 cudaError_t mollm_cuda::launch_qsa_validate_causal_mask(const float* mask,uint32_t* invalid,
     int queries,int keys,int past,size_t cs,size_t rs,cudaStream_t stream) {
     const size_t limit=std::numeric_limits<size_t>::max()/sizeof(float);
-    if(!mask||!invalid||queries<1||queries>65535||keys<1||keys>32768||past<0||past>keys||
+    if(!mask||!invalid||queries<1||queries>65535||keys<1||keys>mollm_qsa::max_context||past<0||past>keys||
        queries>keys-past||!cs||!rs||cs>limit/size_t(keys)||rs>limit/size_t(queries)||
        size_t(keys-1)*cs>limit-size_t(queries-1)*rs)return cudaErrorInvalidValue;
     auto error=cudaMemsetAsync(invalid,0,sizeof(uint32_t),stream);

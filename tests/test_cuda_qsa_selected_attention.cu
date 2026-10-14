@@ -50,21 +50,29 @@ void selected_nan_underflow(bool half) {
     }
 }
 
-void topk(int keys) {
-    const int rows=std::min(keys,3),past=keys-rows,slots=2051;
-    const size_t ss=keys/4+5,is=slots+3;
+void topk(int keys,int budget=2048,int ratio=4,int start=-1,bool force=false) {
+    const int rows=std::min(keys,3),past=start<0?keys-rows:start,slots=budget+ratio-1;
+    const size_t ss=keys/ratio+5,is=slots+3;
     std::vector<float> scores(rows*ss);
     Buffer ds(scores.size()*4),di((rows*is+16)*4);
+    const size_t count=size_t(rows)*2*(budget/ratio);
+    Buffer candidates((count+16)*4),candidate_ids((count+16)*4);
+    auto* cs=static_cast<float*>(candidates.data)+8;
+    auto* ci=static_cast<int32_t*>(candidate_ids.data)+8;
+    std::vector<float> candidate_guard(count+16,12345.f);
+    std::vector<int32_t> id_guard(count+16,12345);
+    check(cudaMemcpy(candidates.data,candidate_guard.data(),candidate_guard.size()*4,cudaMemcpyHostToDevice));
+    check(cudaMemcpy(candidate_ids.data,id_guard.data(),id_guard.size()*4,cudaMemcpyHostToDevice));
     cudaStream_t stream;check(cudaStreamCreate(&stream));
     cudaGraph_t graph;cudaGraphExec_t exec;
     check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
     check(mollm_cuda::launch_qsa_causal_block_topk(static_cast<float*>(ds.data),
-        static_cast<int32_t*>(di.data)+8,rows,keys,past,2048,4,ss,is,stream));
+        static_cast<int32_t*>(di.data)+8,rows,keys,past,budget,ratio,ss,is,stream,cs,ci,force));
     check(cudaStreamEndCapture(stream,&graph));
     check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
     for(int variant=0;variant<3;++variant) {
         for(int r=0;r<rows;++r)for(size_t b=0;b<ss;++b) {
-            const bool future=int(b)>=(past+r+1)/4;
+            const bool future=int(b)>=(past+r+1)/ratio;
             scores[r*ss+b]=future?std::numeric_limits<float>::quiet_NaN():
                 variant==0?float(b):variant==1?1.f:-float(b);
         }
@@ -72,26 +80,30 @@ void topk(int keys) {
         std::vector<int32_t> actual(rows*is+16,12345);
         check(cudaMemcpy(di.data,actual.data(),actual.size()*4,cudaMemcpyHostToDevice));
         if(variant==0)check(mollm_cuda::launch_qsa_causal_block_topk(static_cast<float*>(ds.data),
-            static_cast<int32_t*>(di.data)+8,rows,keys,past,2048,4,ss,is,stream));
+            static_cast<int32_t*>(di.data)+8,rows,keys,past,budget,ratio,ss,is,stream,cs,ci,force));
         else check(cudaGraphLaunch(exec,stream));
         check(cudaStreamSynchronize(stream));
         check(cudaMemcpy(actual.data(),di.data,actual.size()*4,cudaMemcpyDeviceToHost));
         for(int i=0;i<8;++i){require(actual[i]==12345);require(actual[rows*is+8+i]==12345);}
         for(int r=0;r<rows;++r) {
-            const int visible=past+r+1,complete=visible/4;
+            const int visible=past+r+1,complete=visible/ratio;
             std::vector<int> blocks;
             for(int b=0;b<complete;++b)blocks.push_back(b);
             std::stable_sort(blocks.begin(),blocks.end(),[&](int a,int b){return scores[r*ss+a]>scores[r*ss+b];});
-            blocks.resize(std::min(512,complete));
+            blocks.resize(std::min(budget/ratio,complete));
             std::vector<int> expected;
-            for(int b:blocks)for(int d=0;d<4;++d)expected.push_back(b*4+d);
-            for(int id=complete*4;id<visible;++id)expected.push_back(id);
+            for(int b:blocks)for(int d=0;d<ratio;++d)expected.push_back(b*ratio+d);
+            for(int id=complete*ratio;id<visible;++id)expected.push_back(id);
             std::sort(expected.begin(),expected.end());
             expected.resize(slots,-1);
             for(int s=0;s<slots;++s)require(actual[8+r*is+s]==expected[s]);
             for(size_t s=slots;s<is;++s)require(actual[8+r*is+s]==12345);
         }
     }
+    check(cudaMemcpy(candidate_guard.data(),candidates.data,candidate_guard.size()*4,cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(id_guard.data(),candidate_ids.data,id_guard.size()*4,cudaMemcpyDeviceToHost));
+    for(int i=0;i<8;++i){require(candidate_guard[i]==12345.f&&candidate_guard[count+8+i]==12345.f);
+        require(id_guard[i]==12345&&id_guard[count+8+i]==12345);}
     require(mollm_cuda::launch_qsa_causal_block_topk(static_cast<float*>(ds.data),
         static_cast<int32_t*>(di.data),rows,32772,0,2048,4,ss,is,stream)==cudaErrorInvalidValue);
     check(cudaGraphExecDestroy(exec));check(cudaGraphDestroy(graph));check(cudaStreamDestroy(stream));
@@ -242,6 +254,14 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
 int main(int argc,char** argv) {
     int count=0;
     if(cudaGetDeviceCount(&count)!=cudaSuccess||count==0)return 77;
+    if(argc==2&&!std::strcmp(argv[1],"--streaming-topk-only")) {
+        for(int keys:{32772,32775,65536,131071,262144})topk(keys);
+        topk(65536,2048,4,0);
+        topk(65536,1024,1);topk(65536,2048,1);topk(65536,4096,1);
+        topk(262143,4080,16);
+        for(int keys:{1,3,2048,32768})topk(keys,2048,4,-1,true);
+        std::puts("QSA streaming top-k: boundaries, all merge widths, ties, tails, guards and capture pass");return 0;
+    }
     for(bool half:{false,true})selected_nan_underflow(half);
     if(argc==2&&!std::strcmp(argv[1],"--optimized-small-only")) {
         for(bool half:{false,true})for(bool interleaved:{false,true}) {
@@ -256,7 +276,7 @@ int main(int argc,char** argv) {
         std::puts("QSA optimized small-only: grouped/split, strides, masked poison and capture pass");
         return 0;
     }
-    for(int keys:{1,3,2048,2049,2050,2051,2052,2054,8193,16387,32768})topk(keys);
+    for(int keys:{1,3,2048,2049,2050,2051,2052,2054,8193,16387,32768,32772,65536,262144})topk(keys);
     for(bool half:{false,true})for(bool interleaved:{false,true}) {
         run(half,19,3,4,2,8,5,9,interleaved);
         run(half,19,3,4,2,8,5,9,interleaved,true);

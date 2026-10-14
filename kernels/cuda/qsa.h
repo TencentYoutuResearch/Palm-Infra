@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include "core/qsa_limits.h"
 
 namespace mollm_cuda {
 // Selected-key attention primitive used by the graph/backend selector.
@@ -56,12 +57,17 @@ cudaError_t launch_qsa_validate_causal_mask(const float* mask,uint32_t* invalid,
 // Scores for invisible/future blocks are ignored. Selects budget/ratio whole
 // groups plus ALL incomplete visible tail, sorts resulting IDs chronologically,
 // fills unused slots with -1. It does not compute projections/indexer scores.
-// Current sorting geometry supports <=8192 groups (32768 keys at ratio4).
+// Up to262144 keys. >8192 groups use bounded caller-owned streaming scratch:
+// candidate_scores and candidate_ids each have queries*2*(budget/ratio)
+// elements, disjoint from inputs/output and one another. Smaller calls do
+// not need scratch. Per-tile sorting remains <=8192 groups/48KiB shared.
 // Cutoff ties use stable ascending block IDs; official topk tie order is not
 // specified. No GPU-to-CPU readback and no per-call scratch allocation.
 cudaError_t launch_qsa_causal_block_topk(const float* scores,int32_t* indices,
     int queries,int keys,int past,int budget,int ratio,size_t score_stride,
-    size_t index_stride,cudaStream_t stream=nullptr);
+    size_t index_stride,cudaStream_t stream=nullptr,
+    float* candidate_scores=nullptr,int32_t* candidate_ids=nullptr,
+    bool force_streaming=false);
 
 // FP32-activation indexer path consistent with the existing FP32 graph.
 // It consumes a separate dense projection's [Q, (heads+1)*dimension] result;
