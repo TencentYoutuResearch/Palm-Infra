@@ -8,6 +8,9 @@
 - 本次交接分支：`qwen38-cuda-resident-prefill`，从上述基线创建。
 - 创建分支前，工作区有 61 个已跟踪文件修改、94 个未跟踪文件；新增内容包含实现、实验、测试、诊断工具及提示词 fixtures。全部尚未提交，不存在另一段 main..HEAD 的功能提交历史。
 - 本次提交是工程快照，不意味着其中所有实验均可默认启用，也不意味着全量测试已通过。未推送远端。
+- 快照提交 `573fe97` 保留在上述备份分支；后续依赖顺序拆分在
+  `qwen38-cuda-resident-prefill-split`，共 13 个提交，拆分末端 `fd22682`
+  的 Git tree 与快照完全一致。后续 review 记录是额外的文档提交。
 - 主要详细证据：`docs/performance.md`、README 中的 CUDA 段落，以及本机 `build_cuda/` 日志、runner、CSV、Nsight 文件。build 目录被忽略，不会随提交保存，换机器时需另行保留必要证据。
 
 ## 用户目标（尚未完成）
@@ -108,3 +111,27 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/qw
 4. 收敛 preset/默认策略和实验开关；补实用配置覆盖及适当全量回归。
 
 目标仍未完成。保留失败实验及原始证据，不把“能启动”“微测通过”“dense 自比较一致”重新定义为最终成功。
+
+## 2026-10-14 推送前独立 review 与回归
+
+用户要求 subagent 独立 review 最终状态后推送拆分分支（非 main）。
+独立 reviewer 只读检查了 resident provider/arena 租借和销毁顺序、backend
+析构同步、输出池 trim 与 capture graph 的失效、stateful last-use/segment
+准入、图序列化 ID、companion canonical 路径/manifest/shape 和校准表校验。
+在这些检查范围内未发现有充分证据的阻塞级新增问题。这不是对所有 kernel
+数值、并发、全部实验配置或原模型长上下文质量的完整认证。
+
+重新构建 chat/bench/PPL、执行器生命周期、MoE SSD、PLE、ShortConv、
+checkpoint/watchdog、参数策略、小模型推理/MTP 以及 CUDA logical/segment
+测试目标。24 项针对性回归通过（无跳过），包含 tiny Qwen3 CPU/CUDA
+端到端推理、PLE offload、activation calibration 包校验、MTP 恢复、
+tokenize-only、CLI、QSA oracle 和 profiling 工具测试。
+另以串行方式补跑 7 项小型 CUDA 回归，全部通过（无跳过）：device
+checkpoint、NVFP4 logical batch、分段执行及 GDN quad/validated SDPA/
+one-graph 变体。两组共 31 项通过；未运行全量 295 项测试。
+
+本轮没有加载完整 Qwen3.8 包，没有新吞吐结果，也没有验证每个中间提交。
+此前完整模型 smoke/loss/性能证据仍是历史证据，不能冒充本轮重新验证。
+已有的 QSA 未接入、长上下文 dense 近似和实验开关限制仍然有效。
+`git diff --check main..HEAD` 的唯一提示是 extended prompt fixture 末尾
+空行；为保持测试输入和原快照一致，未删除该空行。
