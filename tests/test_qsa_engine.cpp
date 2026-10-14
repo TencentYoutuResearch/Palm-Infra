@@ -22,8 +22,13 @@ std::vector<float> hidden(LLMEngine& e,const std::vector<int>& ids) {
 }
 }
 int main(int argc,char** argv) {
-    require(argc==2,"package argument");
+    require(argc==4 || argc==5,"native package, dense package and companion arguments");
     CudaBackend probe;if(!probe.available())return 77;
+    if (argc==5) {
+        auto bad=config(argv[2],3);bad.qsa_companion_dir=argv[3];
+        LLMEngine rejected;require(!rejected.load(bad),"invalid companion must fail closed");
+        return 0;
+    }
     for(int chunk:{3,17}) {
         LLMEngine e;require(e.load(config(argv[1],chunk)),"load serialized QSA model");
         std::vector<int> prompt;for(int i=0;i<29;++i)prompt.push_back(1+i%31);
@@ -39,5 +44,17 @@ int main(int argc,char** argv) {
     }
     LLMEngine cpu;auto unsupported=config(argv[1],3);unsupported.device=Device::CPU;
     require(!cpu.load(unsupported),"unsupported CPU QSA fails instead of dense substitution");
+    for (int chunk : {3,17}) {
+        LLMEngine native, companion;
+        auto rewritten = config(argv[2],chunk); rewritten.qsa_companion_dir = argv[3];
+        require(native.load(config(argv[1],chunk)),"native reference load");
+        require(companion.load(rewritten),"attach companion to legacy dense package");
+        std::vector<int> prompt; for (int i=0;i<29;++i) prompt.push_back(1+i%31);
+        require(hidden(native,prompt)==hidden(companion,prompt),"companion exact native sparse hidden");
+        require(native.decode(17)==companion.decode(17),"companion decode equivalence");
+        require(hidden(native,{3,7,11,13,17})==hidden(companion,{3,7,11,13,17}),"companion multi-turn equivalence");
+        native.reset(); companion.reset();
+        require(hidden(native,{2,5,7,11,13})==hidden(companion,{2,5,7,11,13}),"companion reset equivalence");
+    }
     std::puts("Serialized QSA engine: runtime context growth, sparse prefill, decode, multi-turn and reset pass");
 }

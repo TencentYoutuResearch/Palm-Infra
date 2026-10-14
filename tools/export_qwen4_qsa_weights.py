@@ -2,7 +2,7 @@
 """Export only missing QSA indexer weights; never rewrite the target package.
 
 The bundle contains weights/geometry, not a standalone model or a graph.
-Its runtime companion loader is a separate integration step.
+Use --qsa-companion with the CUDA text engine to attach it without a package rewrite.
 """
 import argparse
 import hashlib
@@ -99,7 +99,7 @@ def main():
     manifest = export_bundle(args.model_dir, args.output_dir)
     size = sum(entry["bytes"] for entry in manifest["weights"].values())
     print(f"QSA bundle: {len(manifest['weights'])} weights, {size} bytes, {args.output_dir}")
-    print("Not standalone; no target-package rewrite. Runtime companion loading is not yet implemented.")
+    print("Not standalone; attach with --qsa-companion. No target-package rewrite.")
 
 
 if __name__ == "__main__":

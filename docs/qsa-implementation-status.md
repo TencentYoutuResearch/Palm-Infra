@@ -101,15 +101,51 @@ BF16 rounding；完整 checkpoint 对照还需要验证所选 precision 的质�
 
 ## 尚未实现/验证
 
-1. 对现有完整 checkpoint 包的 companion 安全加载与图改写（不重写大包）。
+1. 完整 checkpoint 长上下文 companion 路径的正确性和性能验证。
 2. 带缺口 mask 的可见分组；当前 fast path 仅接受连续因果历史。
 3. 消除或降低接入版 mask 同步校验开销，完整模型 profiling 后优化。
 4. 更长历史、真实模型 QSA 对照、完整模型多轮/reset 和吞吐测量。
 
-当前完整模型 launcher 仍使用 dense bring-up，尚未加载补充权重。没有新增
-默认开关，没有改原始模型权重，没有完整模型 TPS 更新。QSA 能减少主
+当前完整模型 launcher 默认仍使用 dense bring-up，可显式增加
+`--qsa-companion ../qwen38_qsa_bundle` 使用补充权重。没有改原始模型权重。
+QSA 能减少主
 attention 的长历史计算，但 indexer 还有自身成本；prefill/decode 收益
 必须在完整接入后测量，不能按复杂度比例直接宣布整模型加速。
+
+## Companion 接入（2026-10-14）
+
+`--qsa-companion` 在加载 constants 前事务性重写 prefill/decode 图，插入
+projection、centered norm、共享频率、raw/pooled auxiliary caches 和 indexer，
+保留原始 QKV/HC/MoE 数学路径，仅将 SDPA 替换为 selected attention。
+不写回 `.mollm`，不修改 checkpoint。CUDA text、context<=32768、无 MTP/padding。
+
+加载检查 completion manifest、目录边界、完整层集合、shape/precision/header、
+逐文件 SHA-256、finite 权重、main QKV/KV geometry 和 main RoPE。一旦不兼容
+或损坏即报错，不静默回退 dense。哈希证明 bundle 自身完整，不能证明同
+geometry 的大包来自同一 checkpoint；用户必须选择匹配来源的 companion。
+
+扩展 `test_qsa_engine_e2e` 对照原生 QSA 包和 legacy dense 包+companion：
+chunk3/17 的29-token sparse prefill、decode、多轮35-token 历史、reset hidden
+逐值一致；错误 hash/path/main_heads/rope/layers 均拒绝。与 graph/export/CLI
+四项回归一起通过。日志 `build_cuda/qsa-companion-e2e-1.log` 是首个对照运行，
+随后 CTest 包含上述失败路径。
+
+真实123745 MB checkpoint 首个短提示运行完成0，38-token 总上下文，
+12层 QSA indexer/attention 各288次调用，decode32.8 t/s（24生成 token，
+未预热）。日志 `build_cuda/qsa-companion-model-short-1.log` 和 memory log。
+仅证明加载/短提示运行，不是原始 BF16 quality oracle，也不是长上下文加速证据。
+
+真实7046-token 提示、ctx32768、chunk2048、warmup1/repeat1、32生成 token
+运行完成0：prefill774.15 t/s（9101.57 ms），decode23.18 t/s。
+日志 `build_cuda/qsa-companion-model-7k-2.log` 及 memory log。QSA indexer/
+attention 各840次，未分配 dense attention score workspace。首版没有达到
+性能增加：此前同提示 dense 历史样本约1250 t/s、30 t/s；不是本轮同步
+A/B，也不是质量等价比较，不能据此宣布 QSA 本身没有价值。当前
+selected-attention 是 correctness-first SIMT 实现，需要改善 GQA KV
+复用和 PV 访存/并行度，随后再做同步 A/B。此任务尚未完成。
+
+首个7K尝试 `qsa-companion-model-7k-1.log` 因 logical 模式禁止 profile
+而在执行前失败，不能记为算子失败或成功性能样本。
 
 算法参考（本轮按 hf-cli 技能只读核对，未下载模型）：
 [Transformers Qwen4ExpTextQSAIndexer](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py)。
@@ -124,5 +160,5 @@ manifest 最后写入，包含 geometry、每个文件 SHA256 和源 config SHA2
 
 已从本机 NFS 原始 checkpoint 导出到工作区上层 `qwen38_qsa_bundle`：
 36文件、39,337,056 bytes（含headers），主12 attention layers3/7/…/47。
-不是独立模型；runtime companion loader 尚未实现。未复制或改写原本
+不是独立模型；使用上面的 runtime companion loader 接入。未复制或改写原本
 约123GB `.mollm`，没有下载原始模型。

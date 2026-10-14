@@ -48,6 +48,7 @@ struct CliCommonOptions {
     std::string trace_path;      // optional Chrome Trace / Perfetto JSON output
     int mtp_draft_tokens = 0;    // >0: use packaged single-head MTP
     std::string mtp_companion_dir;
+    std::string qsa_companion_dir;
 
     SamplingParams sampling;
 

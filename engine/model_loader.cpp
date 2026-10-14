@@ -1,5 +1,6 @@
 #include "engine/engine.h"
 #include "engine/logical_prefill.h"
+#include "engine/qsa_companion.h"
 #include "backends/factory.h"
 #include "storage/byte_ranges.h"
 #include "engine/weight_metadata.h"
@@ -502,6 +503,19 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
         return false;
     }
 
+    if (!cfg_.qsa_companion_dir.empty() && (&g == &graph_prefill_ || &g == &graph_decode_)) {
+        std::string error;
+        if (cfg_.device != Device::CUDA || cfg_.mtp_draft_tokens ||
+            !cfg_.mtp_companion_dir.empty() || cfg_.static_padded ||
+            package_metadata_["architecture"] != "qwen4-exp" ||
+            !attach_qsa_companion(g, cfg_.qsa_companion_dir, cfg_.n_ctx, error)) {
+            std::fprintf(stderr, "Engine: cannot attach CUDA text QSA companion: %s\n", error.c_str());
+            return false;
+        }
+        std::fprintf(stderr, "Engine: attached QSA companion to %s graph (context=%d)\n",
+                     &g == &graph_prefill_ ? "prefill" : "decode", cfg_.n_ctx);
+    }
+
     // Old Qwen4 packages already contain the pre-collapse HC tensor. Retain
     // that exact producer in memory, without rewriting weights or adding math.
     if (!cfg_.mtp_companion_dir.empty() && (&g == &graph_prefill_ || &g == &graph_decode_) &&
@@ -623,6 +637,23 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
                     t, is_aggregate_expert);
             }
         };
+
+        if (wref == "__qsa_frequency__") {
+            if (node.out_prec != Precision::FP32 || node.out_shape[0] <= 0 ||
+                node.out_shape[1] != 1 || node.params.f32.size() != size_t(node.out_shape[0]))
+                return false;
+            const std::string key = "#qsa_frequency_" + std::to_string(node.out_shape[0]);
+            auto& storage = packed_weights_[key];
+            const size_t bytes = node.params.f32.size() * sizeof(float);
+            if (storage.empty()) {
+                storage.resize(bytes);
+                std::memcpy(storage.data(), node.params.f32.data(), bytes);
+            } else if (storage.size() != bytes || std::memcmp(storage.data(), node.params.f32.data(), bytes)) {
+                return false;
+            }
+            setup_weight(storage.data(), Precision::FP32);
+            continue;
+        }
 
         // Package mode: resolve weight from package mmap via offset map.
         // The weight path (e.g. "./foo.weights") is looked up in
@@ -1194,6 +1225,12 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 
 bool LLMEngine::load_impl(const EngineConfig& cfg) {
     cfg_ = cfg;
+    if (!cfg_.qsa_companion_dir.empty() &&
+        (cfg_.device != Device::CUDA || cfg_.n_ctx < 1 || cfg_.n_ctx > 32768 ||
+         cfg_.static_padded || cfg_.mtp_draft_tokens || !cfg_.mtp_companion_dir.empty())) {
+        std::fprintf(stderr, "Engine: --qsa-companion requires CUDA text, ctx1..32768, no MTP/padding\n");
+        return false;
+    }
     if(cfg_.cuda_prefill_logical_batch&&!mollm_prefill::logical_config_supported(cfg_)) {
         std::fprintf(stderr,"Engine: logical prefill requires bounded CUDA resident+offload-PLE+reclaim, positive context, chunk0..2048, no MTP/padding/decode-as-prefill\n");
         return false;

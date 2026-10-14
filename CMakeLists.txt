@@ -121,6 +121,7 @@ set(SOURCES
     engine/engine.cpp
     engine/input_prep.cpp
     engine/model_loader.cpp
+    engine/qsa_companion.cpp
     engine/package.cpp
     engine/sampler.cpp
     engine/tokenizer.cpp
@@ -679,6 +680,8 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_tensor        tests/test_tensor.cpp)
     add_mollm_test(test_cpu_platform  tests/test_cpu_platform.cpp)
     add_mollm_test(test_byte_ranges   tests/test_byte_ranges.cpp)
+    add_executable(test_sha256 tests/test_sha256.cpp)
+    target_link_libraries(test_sha256 PRIVATE mollm_lib)
     add_mollm_test(test_buffer_pool   tests/test_buffer_pool.cpp)
     add_mollm_test(test_mmap_file     tests/test_mmap_file.cpp)
     add_mollm_test(test_weight_metadata tests/test_weight_metadata.cpp)
@@ -1545,6 +1548,9 @@ if(MOLLM_BUILD_TESTS)
     endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME test_sha256_streaming
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_sha256_test.py
+                $<TARGET_FILE:test_sha256>)
         if(TARGET test_qsa_engine)
             add_test(NAME test_qsa_engine_e2e
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_qsa_engine_e2e.py

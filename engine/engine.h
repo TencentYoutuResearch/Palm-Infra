@@ -110,6 +110,8 @@ struct EngineConfig {
     int mtp_draft_tokens = 0;
     // Optional local streamed MTP bundle; shares target embedding/head.
     std::string mtp_companion_dir;
+    // Missing QSA indexer weights; rewrites only the in-memory text graph.
+    std::string qsa_companion_dir;
 
     SamplingParams sampling;
 

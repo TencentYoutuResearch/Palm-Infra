@@ -191,6 +191,10 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             }
         } else if (arg == "--print-token-ids") {
             opts.print_token_ids = true;
+        } else if (arg == "--qsa-companion") {
+            if (!require_value(argc, argv, i, "--qsa-companion", value, error)) return false;
+            if (!*value) { error = "--qsa-companion directory must not be empty"; return false; }
+            opts.qsa_companion_dir = value;
         } else if (arg == "--mtp-companion") {
             if (!require_value(argc, argv, i, "--mtp-companion", value, error)) return false;
             if (!*value) { error = "--mtp-companion directory must not be empty"; return false; }
@@ -315,6 +319,12 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 "--mmap, --ssd-cache-mb and Metal";
         return false;
     }
+    if (!opts.qsa_companion_dir.empty() &&
+        (opts.device != Device::CUDA || opts.n_ctx < 1 || opts.n_ctx > 32768 ||
+         opts.static_padded || opts.mtp_draft_tokens || !opts.mtp_companion_dir.empty())) {
+        error = "--qsa-companion requires CUDA text, ctx1..32768, no MTP/padding";
+        return false;
+    }
     // Context bounds retained KV history; chunk bounds transient batch work.
     // Neither the context nor the prompt needs to equal the maximum chunk size.
     if(opts.cuda_prefill_logical_batch&&
@@ -381,6 +391,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --mtp-draft-tokens <int>  Experimental packaged MTP speculation (0..16)\n");
     std::printf("  --mtp-companion <dir>    Local streamed MTP bundle sharing target weights\n");
+    std::printf("  --qsa-companion <dir>    Experimental CUDA QSA bundle; text, ctx<=32768, no MTP\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
     std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
     std::printf("  --no-lock-dense-weights Keep dense mmap weights pageable\n");
@@ -437,6 +448,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.trace_path = opts.trace_path;
     cfg.mtp_draft_tokens = opts.mtp_draft_tokens;
     cfg.mtp_companion_dir = opts.mtp_companion_dir;
+    cfg.qsa_companion_dir = opts.qsa_companion_dir;
     cfg.lock_dense_weights = opts.lock_dense_weights;
     cfg.lock_moe_ssd_cache = opts.lock_expert_cache;
     return cfg;
