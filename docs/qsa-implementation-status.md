@@ -666,3 +666,64 @@ max_abs10.5153191、delta+1.1035154，equivalent=false，第一项就不同。
 空闲后串行22项通过，无skip，含新增runner portable测试。下一步复核
 最终HEAD同包同配置的dense性能control与QSA吞吐；原始BF16质量不是
 这个不同精度包的已完成认证，仍保留明确限制和独立评估范围。
+
+## 最终同配置性能及默认可用入口（2026-10-15）
+
+`qsa-final-head-{dense,sparse}-28k-1.log` 都完成0：当前构建、相同现有
+calibrated package/prompt28160、ctx32768/chunk2048、warmup1/repeat2、
+greedy64生成tokens。全部诊断关闭，GPU严格串行；差别仅有QSA companion。
+dense是性能control，不是超过2048后原始模型的质量reference。
+
+| 路径 | Prefill t/s（repeat1 / repeat2） | Decode t/s（repeat1 / repeat2） |
+| --- | ---: | ---: |
+| Dense control | 448.67 / 446.94 | 19.23 / 19.13 |
+| Native ordered QSA | 1084.07 / 1083.42 | 24.68 / 24.68 |
+
+均值447.805→1083.745（2.42013倍prefill），19.18→24.68（1.28676倍decode）。
+各路径自己的两次greedy回复逐字相同，不要求不同attention模型回复一致。
+QSA indexer/attention各2772次、grouped504/split2268；selected workspace
+403243008 bytes、index scores54525952 bytes。最小可用内存分别
+27710140/36011776KiB，均高于24GiB停止线；无guard/GPU reset。
+长历史56K/253K及精确262144边界证据保留前节，不跨不同配置算加速倍率。
+
+专用`chat-qwen38-cuda.sh`现在默认给它的现有Qwen3.8 package附加匹配的
+`../qwen38_qsa_bundle`，不再需要用户额外记一个启用QSA参数。缺少manifest
+在GPU检查前明确失败，不静默使用长上下文dense。`--qsa-companion`显式
+覆盖；其他package不自动附加此bundle。仅launcher的`--dense-bringup`
+保留旧诊断路径、不会传给C++，与显式companion冲突。显式chunk/cache
+仍覆盖、最后一个有效context控制大上下文默认；prompt/path值不再误认
+为flag。preset清除dump/compare/BF16/force-streaming诊断环境，帮助
+路径仍不初始化GPU或读模型。9项fake-chat preset测试通过。
+
+实际不带`--qsa-companion`的默认入口smoke：
+
+```sh
+bash chat-qwen38-cuda.sh --prompt '请用中文简短说明 QSA 的作用。' \
+  --temperature 0 --max-new-tokens 16
+```
+
+`qsa-default-launcher-model-smoke-1.log`完成0，日志确认QSA enabled，
+watchdog250ms/24GiB、indexer/attention各192次，生成16tokens；没有仅靠
+fake argv测试宣称接通。短提示冷启动65.6/31.4 t/s不是新的长提示基准。
+
+当前QSA验收针对该既有量化package的CUDA文本推理：
+
+- 接入真实indexer/selected attention、原始小型权重补充与runtime状态：
+  companion/native graph对照、真实模型native counters，加载错误明确拒绝。
+- FP32数学/选择/attention：独立标量及PyTorch参考，真实2048行选择一致；
+  optimized versus SIMT整模型7045+decode2111 CE精确一致，不使用失败的
+  online/BF16诊断作为合格路径。
+- 长历史/多轮/reset/边界：真实56K重复、253K、精确262144两轮538采样点
+  一致、三种overflow拒绝；streaming selector独立全量stable-sort对照。
+- 实际性能增加：上述当前构建同步A/B证明；默认专用入口实际启用QSA。
+- 权重/环境安全：大包/NFS/config未重写，100GiB启动/24GiB停止保护保留，
+  无GPU reset、无驱动/现有Python环境变更。独立参考的测试输出缓存已
+  归属当前用户，后续参考容器以调用者UID/GID写独立目录。
+
+最终`qsa-default-preset-final-regression-1.log`串行22项通过，无skip，含
+更新的9项preset测试及reference runner测试；并非全仓库回归。
+原始checkpoint与本package的dense/LM权重量化不同，原始BF16逐token
+质量等价不在这些已通过结论中。MTP、vision、static padding、非连续
+mask、外部indexer capture和CPU/Metal QSA仍明确不支持；不以dense替代
+这些请求。恢复原始dense精度及其质量/内存权衡、进一步逼近其他实现的
+绝对TPS是后续独立工作，不能混同为本次同包QSA性能增益证据。

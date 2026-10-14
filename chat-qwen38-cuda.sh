@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Opt-in, recorded GB10 Qwen3.8 resident+PLE preset. No benchmark-script dependency.
+# Recorded GB10 Qwen3.8 resident+PLE+QSA preset. No benchmark-script dependency.
 # Arguments are forwarded to mollm_chat; later CLI arguments override defaults.
 set -euo pipefail
 preset_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -10,23 +10,48 @@ if [[ ! -x build_cuda/mollm_chat ]]; then
 fi
 preset_help=0
 preset_qsa=0
-for preset_arg in "$@"; do
-  [[ "$preset_arg" != --help && "$preset_arg" != -h ]] || preset_help=1
-  [[ "$preset_arg" != --qsa-companion ]] || preset_qsa=1
-done
+preset_dense=0
+preset_package=../qwen38_flash_next_nvfp4_calibrated.mollm
+preset_default_package=$preset_package
+preset_companion_args=()
+preset_forward_args=()
 preset_context=16384
 preset_args=("$@")
-for ((preset_i=0;preset_i+1<${#preset_args[@]};++preset_i)); do
-  if [[ ${preset_args[preset_i]} == --n-ctx && ${preset_args[preset_i+1]} =~ ^\+?[0-9]+$ ]]; then
-    preset_value=${preset_args[preset_i+1]#+}
-    preset_value=${preset_value#"${preset_value%%[!0]*}"}
-    preset_value=${preset_value:-0}
-    # Large/invalid values are left to C++ validation, without shell overflow.
-    if (( ${#preset_value}<=6 )); then
-      preset_context=$((10#$preset_value))
-    fi
-  fi
+for ((preset_i=0;preset_i<${#preset_args[@]};++preset_i)); do
+  preset_arg=${preset_args[preset_i]}
+  if [[ $preset_arg == --dense-bringup ]]; then preset_dense=1; continue; fi
+  preset_forward_args+=("$preset_arg")
+  case "$preset_arg" in
+    --help|-h) preset_help=1 ;;
+    --package|--qsa-companion|--n-ctx|--prompt|--prompt-file|--image|--image-max-pixels|--prompt-tokens|--max-new-tokens|--rope-dim|--rope-theta|--threads|--prefill-chunk-size|--device|--ssd-cache-mb|--ssd-io-workers|--ssd-shallow-cache-layers|--mtp-draft-tokens|--mtp-companion|--warmup|--repeat|--temperature|--top-k|--top-p|--min-p|--repeat-penalty|--repeat-last-n|--presence-penalty|--frequency-penalty|--seed|--output|--trace)
+      # Consume option values, never reinterpret prompt/path text as flags.
+      if (( preset_i+1<${#preset_args[@]} )); then
+        ((preset_i+=1))
+        preset_value=${preset_args[preset_i]}
+        preset_forward_args+=("$preset_value")
+        if [[ $preset_arg == --package ]]; then preset_package=$preset_value; fi
+        if [[ $preset_arg == --qsa-companion ]]; then preset_qsa=1; fi
+        if [[ $preset_arg == --n-ctx && $preset_value =~ ^\+?[0-9]+$ ]]; then
+          preset_value=${preset_value#+}
+          preset_value=${preset_value#"${preset_value%%[!0]*}"}
+          preset_value=${preset_value:-0}
+          if (( ${#preset_value}<=6 )); then preset_context=$((10#$preset_value)); fi
+        fi
+      fi ;;
+  esac
 done
+if (( preset_dense && preset_qsa )); then
+  echo '--dense-bringup conflicts with --qsa-companion.' >&2; exit 1
+fi
+if (( !preset_dense && !preset_qsa )) &&
+   [[ $(realpath -m -- "$preset_package") == $(realpath -m -- "$preset_default_package") ]]; then
+  preset_qsa=1
+  preset_companion_args=(--qsa-companion ../qwen38_qsa_bundle)
+  if (( !preset_help )) && [[ ! -f ../qwen38_qsa_bundle/manifest.json ]]; then
+    echo 'Missing QSA bundle: ../qwen38_qsa_bundle. Supply --qsa-companion <dir>; --dense-bringup is diagnostic only.' >&2
+    exit 1
+  fi
+fi
 preset_chunk=2048
 preset_fp16_cache=8192
 if (( preset_qsa && preset_context>65536 )); then
@@ -36,11 +61,18 @@ fi
 # Preserve explicit cache overrides; final CLI arguments likewise override the
 # chosen chunk. This is a conservative preset, not a memory reservation.
 preset_fp16_cache=${MOLLM_CUDA_PREFILL_FP16_CACHE_MB:-$preset_fp16_cache}
+if (( preset_help )); then
+  echo 'Launcher: QSA is default for its Qwen3.8 package; --dense-bringup skips automatic QSA for diagnostics. Other options are forwarded.' >&2
+fi
 if (( ! preset_help )); then
   if (( preset_qsa )); then
-    echo 'Experimental QSA companion requested: CUDA text, contiguous causal history, context<=262144 (memory-dependent); checkpoint quality/performance validation is ongoing.' >&2
+    echo 'QSA enabled: CUDA text, contiguous causal history, context<=262144 (memory-dependent); package uses dense W4/LM W8, not original BF16 precision.' >&2
   else
-  echo 'WARNING: this bring-up package omits QSA selection; histories beyond its2048-token budget use experimental dense attention, not the original long-context model.' >&2
+    if [[ $(realpath -m -- "$preset_package") == $(realpath -m -- "$preset_default_package") ]]; then
+      echo 'WARNING: dense bring-up omits QSA; beyond2048 tokens this is a diagnostic model, not original long-context attention.' >&2
+    else
+      echo 'Explicit package override: no automatic QSA companion attached; verify the package attention/precision yourself.' >&2
+    fi
   fi
   if [[ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]]; then
     echo 'GPU is in use; stop the other workload before starting this resident model.' >&2
@@ -52,6 +84,10 @@ if (( ! preset_help )); then
   fi
 fi
 exec env \
+  -u MOLLM_TEST_CUDA_QSA_DUMP \
+  -u MOLLM_TEST_CUDA_QSA_COMPARE \
+  -u MOLLM_TEST_CUDA_QSA_INDEXER_BF16 \
+  -u MOLLM_TEST_CUDA_QSA_FORCE_STREAMING_TOPK \
   -u MOLLM_TEST_CUDA_WINDOW_DUMP \
   -u MOLLM_TEST_CUDA_PREFILL_LIVENESS \
   -u MOLLM_TEST_CUDA_PREFILL_LIVENESS_MAX_SEQ \
@@ -131,6 +167,7 @@ exec env \
   MOLLM_TEST_CUDA_SDPA_GEMM_SHADOW=0 \
   build_cuda/mollm_chat \
   --package ../qwen38_flash_next_nvfp4_calibrated.mollm \
+  "${preset_companion_args[@]}" \
   --device cuda --offload-ple --cuda-prefill-reclaim --cuda-prefill-logical-batch \
   --n-ctx 16384 --prefill-chunk-size "$preset_chunk" --threads 8 \
-  --max-new-tokens 512 --temperature 0.6 "$@"
+  --max-new-tokens 512 --temperature 0.6 "${preset_forward_args[@]}"

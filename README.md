@@ -99,10 +99,16 @@ Context capacity is independent of chunk size: e.g. `--n-ctx 16384` with
 inputs are not padded. 2048 remains the supported per-batch maximum, not a
 context limit. Long KV falls back from ineligible grouped attention paths;
 host memory guards remain enabled. Long-context throughput needs separate measurement.
-On GB10, build `mollm_chat`, then run `./chat-qwen38-cuda.sh` for an opt-in
-standalone interactive preset (context16384, chunk2048, max512 generated tokens).
+On GB10, build `mollm_chat`, then run `./chat-qwen38-cuda.sh` for the standalone
+interactive QSA preset (context16384, chunk2048, max512 generated tokens).
 CLI arguments override defaults, e.g. `--prefill-chunk-size 512`. The launcher
-can enable QSA with `./chat-qwen38-cuda.sh --qsa-companion ../qwen38_qsa_bundle`.
+automatically attaches the matching local `../qwen38_qsa_bundle` for its default
+package; missing companions reject rather than silently run long-context dense
+attention. `--qsa-companion <dir>` overrides the companion. Explicit other
+packages do not get an automatic companion. The launcher-only `--dense-bringup`
+skips automatic QSA for diagnostic A/B; it is not original-model long-context
+inference. It conflicts with an explicit `--qsa-companion`. Diagnostic dump/
+BF16/compare/forced-selector environment flags are cleared by this preset.
 For QSA contexts above65536, its default chunk/cache limits are512 tokens/4096
 MiB; explicit chunk/cache overrides remain honored. Smaller contexts retain
 the existing defaults. The companion must match the selected checkpoint.

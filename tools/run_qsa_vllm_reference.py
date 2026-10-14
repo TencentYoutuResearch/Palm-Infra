@@ -119,6 +119,7 @@ def host(args):
                        TRITON_CACHE_DIR="/output/triton", CUDA_CACHE_PATH="/output/cuda",
                        VLLM_CACHE_ROOT="/output/vllm", FLASHINFER_WORKSPACE_BASE="/output/flashinfer")
     command = ["docker", "create", "--network", "none", "--read-only", "--gpus", "all",
+               "--user", f"{os.getuid()}:{os.getgid()}",
                "--memory", "96g", "--memory-swap", "96g", "--pids-limit", "512", "--shm-size", "256m"]
     for source, target, readonly in ((model, "/model", True), (tokens_path, "/tokens.txt", True),
                                     (Path(__file__).resolve(), "/reference.py", True), (output, "/output", False)):
