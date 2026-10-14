@@ -1,0 +1,52 @@
+"""Small synthetic Qwen4Exp QSA model, not a checkpoint quality/performance gate."""
+import sys
+import tempfile
+from pathlib import Path
+import subprocess
+try:
+    import numpy as np
+except ImportError:
+    sys.exit(77)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "models"))
+from qwen4_exp import build_graph
+from transpile import Precision, save_package, _write_weight_file
+
+
+def main():
+    tc = dict(hidden_size=32, num_hidden_layers=1, layer_types=["full_attention"],
+              rms_norm_eps=1e-6, hc_count=4, hc_lowrank=8, indexer_budget=8,
+              indexer_n_heads=2, indexer_head_dim=8, indexer_kv_heads=1, indexer_compress_ratio=4,
+              rope_parameters=dict(rope_theta=1000000, partial_rotary_factor=.5),
+              head_dim=8, num_attention_heads=4, num_key_value_heads=2,
+              linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=4,
+              linear_value_head_dim=4, linear_conv_kernel_dim=4, moe_intermediate_size=8,
+              shared_expert_intermediate_size=8, num_experts=8, num_experts_per_tok=2,
+              vocab_size=64, ple_layer_ids=[], eos_token_id=63)
+    # Package ctx32, runtime ctx64: auxiliary states must resize with main KV.
+    pf = build_graph(".", tc, seq_len=17, n_ctx=32, is_prefill=True, enable_qsa=True)
+    dc = build_graph(".", tc, seq_len=1, n_ctx=32, enable_qsa=True)
+    with tempfile.TemporaryDirectory(prefix="mollm_qsa_engine_") as directory:
+        root = Path(directory)
+        rng = np.random.default_rng(91273)
+        written = set()
+        for graph in (pf, dc):
+            for node in graph._nodes:
+                if not node.weight_path or node.weight_path in written:
+                    continue
+                written.add(node.weight_path)
+                shape = tuple(node.out_shape[:2]) if node.out_shape[1] != 1 else (node.out_shape[0],)
+                if node.out_prec == Precision.FP32:
+                    data = np.zeros(shape, dtype=np.float32) if "indexer" in node.weight_path else np.ones(shape, dtype=np.float32)
+                else:
+                    data = rng.normal(0, .025, shape).astype(np.float16)
+                _write_weight_file(str(root / Path(node.weight_path).name), data)
+        metadata = dict(architecture="qwen4-exp", hidden_size=32, num_layers=1,
+                        num_heads=4, num_kv_heads=2, head_dim=8, vocab_size=64,
+                        n_ctx=32, prefill_seq_len=17, rope_dim=4, rope_theta=1000000)
+        package = root / "qsa.mollm"
+        save_package(str(package), pf, dc, str(root), metadata)
+        subprocess.run([sys.argv[1], str(package)], check=True)
+
+
+if __name__ == "__main__":
+    main()

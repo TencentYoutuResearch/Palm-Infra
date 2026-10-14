@@ -748,6 +748,13 @@ if(MOLLM_BUILD_TESTS)
     if(MOLLM_CUDA)
         add_executable(test_cuda_qsa_selected_attention tests/test_cuda_qsa_selected_attention.cu)
         add_executable(test_cuda_qsa_indexer tests/test_cuda_qsa_indexer.cu)
+        add_executable(test_cuda_qsa_graph tests/test_cuda_qsa_graph.cpp)
+        add_executable(test_qsa_engine tests/test_qsa_engine.cpp)
+        target_link_libraries(test_qsa_engine PRIVATE mollm_lib)
+        target_link_libraries(test_cuda_qsa_graph PRIVATE mollm_lib)
+        add_test(NAME test_cuda_qsa_graph COMMAND test_cuda_qsa_graph)
+        set_tests_properties(test_cuda_qsa_graph PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
         target_link_libraries(test_cuda_qsa_indexer PRIVATE mollm_lib)
         set_target_properties(test_cuda_qsa_indexer PROPERTIES CUDA_STANDARD 17)
         add_test(NAME test_cuda_qsa_indexer COMMAND test_cuda_qsa_indexer)
@@ -1538,6 +1545,13 @@ if(MOLLM_BUILD_TESTS)
     endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        if(TARGET test_qsa_engine)
+            add_test(NAME test_qsa_engine_e2e
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_qsa_engine_e2e.py
+                    $<TARGET_FILE:test_qsa_engine>)
+            set_tests_properties(test_qsa_engine_e2e PROPERTIES
+                SKIP_RETURN_CODE 77 LABELS "cuda;e2e" RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
         function(add_mollm_python_test name script)
             add_test(
                 NAME ${name}

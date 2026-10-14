@@ -297,6 +297,9 @@ void CudaBackend::begin_execution() {
 }
 
 uint64_t CudaBackend::independent_stateful_mutable_inputs(const GraphNode& node) const {
+    if(!impl_->segment_enabled&&node.op_type==OpType::QSA_INDEXER&&
+       node.out_prec==Precision::INT32&&node.inputs.size()==8)
+        return (uint64_t(1)<<4)|(uint64_t(1)<<5);
     if (!impl_->segment_enabled && node.out_prec == Precision::FP32 &&
         node.op_type == OpType::QK_RMS_NORM_ROPE && node.inputs.size() == 6) {
         // This fused normalization/rotation is read-only despite the generic
@@ -305,7 +308,8 @@ uint64_t CudaBackend::independent_stateful_mutable_inputs(const GraphNode& node)
         return 0;
     }
     if (!impl_->segment_enabled && node.out_prec == Precision::FP32 &&
-        node.op_type == OpType::SDPA && (node.inputs.size() == 6 || node.inputs.size() == 7)) {
+        (node.op_type == OpType::SDPA || node.op_type == OpType::QSA_SDPA) &&
+        (node.inputs.size() == 6 || node.inputs.size() == 7)) {
         // Native SDPA stores into K/V and a separately allocated destination.
         // The synchronous reference fallback stages/writes back inputs before
         // returning. Neither path retains Q/K/V/mask/output addresses beyond

@@ -66,7 +66,7 @@ void topk(int keys) {
     check(cudaGraphExecDestroy(exec));check(cudaGraphDestroy(graph));check(cudaStreamDestroy(stream));
 }
 
-void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bool interleaved) {
+void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bool interleaved,bool use_mask=false) {
     mollm_cuda::QsaSelectedAttentionParams p{};
     p.heads=heads;p.kv_heads=kv;p.keys=keys;p.queries=rows;p.past=keys-rows;
     p.key_dim=kd;p.value_dim=vd;p.slots=slots;p.scale=1/std::sqrt(float(kd));
@@ -78,6 +78,7 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
         p.output_position_stride=vd+7;p.output_head_stride=rows*p.output_position_stride+3;
     }
     p.index_position_stride=slots+3;
+    p.mask_column_stride=1;p.mask_row_stride=keys;
     p.key_position_stride=interleaved?kd*kv+5:kd+5;
     p.value_position_stride=interleaved?vd*kv+3:vd+3;
     p.key_head_stride=interleaved?kd:keys*p.key_position_stride+7;
@@ -93,6 +94,9 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
     std::vector<float> key(kn,std::numeric_limits<float>::quiet_NaN());
     std::vector<float> value(vn,std::numeric_limits<float>::quiet_NaN());
     std::vector<int32_t> ids(rows*p.index_position_stride,-1);
+    std::vector<float> mask(size_t(rows)*keys,-1e38f);
+    for(int r=0;r<rows;++r)for(int id=0;id<=p.past+r;++id)
+        mask[size_t(r)*keys+id]=use_mask&&id%6==1?-1e38f:0.f;
     // In full-size cases select the most recent 512 complete four-token
     // groups and the visible tail. This is a supplied selection, NOT indexer
     // qualification. All other KV values remain NaN to prove selective reads.
@@ -108,6 +112,7 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
         for(size_t s=0;s<selected.size();++s)ids[r*p.index_position_stride+s]=selected[s];
         if(slots!=2051&&r==0)std::fill_n(ids.begin(),slots,-1); // entirely masked row
         for(int id:selected)for(int h=0;h<kv;++h) {
+            if(use_mask&&id%6==1)continue; // masked selected KV remains NaN
             for(int d=0;d<kd;++d) {
                 float x=std::sin(float((id%193)*7+h*3+d)*.017f)*.3f;
                 key[id*p.key_position_stride+h*p.key_head_stride+d]=half?__half2float(__float2half(x)):x;
@@ -123,6 +128,9 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
         }
     }
     Buffer dq(query.size()*4),dk(kn*(half?2:4)),dv(vn*(half?2:4)),di(ids.size()*4),out((on+16)*4);
+    Buffer dm(mask.size()*4);
+    const float* device_mask=use_mask?static_cast<float*>(dm.data):nullptr;
+    if(use_mask)check(cudaMemcpy(dm.data,mask.data(),mask.size()*4,cudaMemcpyHostToDevice));
     check(cudaMemcpy(di.data,ids.data(),ids.size()*4,cudaMemcpyHostToDevice));
     if(half) {
         std::vector<__half> k(kn),v(vn);
@@ -138,7 +146,7 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
     cudaGraph_t graph;cudaGraphExec_t exec;
     check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
     check(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
-          static_cast<int32_t*>(di.data),static_cast<float*>(out.data)+8,p,stream));
+          static_cast<int32_t*>(di.data),static_cast<float*>(out.data)+8,p,stream,device_mask));
     check(cudaStreamEndCapture(stream,&graph));
     check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
     for(int variant=0;variant<3;++variant) {
@@ -148,7 +156,7 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
         check(cudaMemcpy(out.data,actual.data(),actual.size()*4,cudaMemcpyHostToDevice));
         if(variant==0)
             check(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
-                  static_cast<int32_t*>(di.data),static_cast<float*>(out.data)+8,p,stream));
+                  static_cast<int32_t*>(di.data),static_cast<float*>(out.data)+8,p,stream,device_mask));
         else check(cudaGraphLaunch(exec,stream));
         check(cudaStreamSynchronize(stream));
         check(cudaMemcpy(actual.data(),out.data,actual.size()*4,cudaMemcpyDeviceToHost));
@@ -159,7 +167,7 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
             const int kh=h/(heads/kv);
             for(int s=0;s<slots;++s) {
                 const int id=ids[r*p.index_position_stride+s];
-                if(id<0||id>=keys||id>p.past+r)continue;
+                if(id<0||id>=keys||id>p.past+r||(use_mask&&mask[size_t(r)*keys+id]!=0.f))continue;
                 double dot=0;
                 for(int d=0;d<kd;++d)dot+=double(query[r*p.query_position_stride+h*p.query_head_stride+d])*
                     key[id*p.key_position_stride+kh*p.key_head_stride+d];
@@ -191,6 +199,7 @@ int main() {
     for(int keys:{1,3,2048,2049,2050,2051,2052,2054,8193,16387,32768})topk(keys);
     for(bool half:{false,true})for(bool interleaved:{false,true}) {
         run(half,19,3,4,2,8,5,9,interleaved);
+        run(half,19,3,4,2,8,5,9,interleaved,true);
         run(half,2054,3,4,2,17,13,2051,interleaved);
         run(half,32768,1,24,2,256,256,2051,interleaved);
     }

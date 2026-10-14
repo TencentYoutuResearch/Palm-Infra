@@ -19,6 +19,7 @@ struct QsaSelectedAttentionParams {
     size_t value_position_stride=0, value_head_stride=0;
     size_t index_position_stride=0;
     size_t output_position_stride=0, output_head_stride=0;
+    size_t mask_column_stride=0, mask_row_stride=0;
 };
 
 // No allocation, host readback, full-history score buffer or expanded KV copy.
@@ -28,7 +29,16 @@ struct QsaSelectedAttentionParams {
 // This is a correctness-first implementation, not a throughput qualification.
 cudaError_t launch_qsa_selected_attention(const float* query, const void* key,
     const void* value, bool fp16_cache, const int32_t* indices, float* output,
-    const QsaSelectedAttentionParams& p, cudaStream_t stream=nullptr);
+    const QsaSelectedAttentionParams& p, cudaStream_t stream=nullptr,
+    const float* mask=nullptr);
+
+// Flag is reset by this launch. 0=canonical contiguous causal visibility,
+// 1=unsupported gaps/future visibility/nonnegative or NaN future mask.
+// Visible values must equal0; future values must be negative (-inf allowed).
+// No CPU readback inside this allocation-free primitive.
+cudaError_t launch_qsa_validate_causal_mask(const float* mask,uint32_t* invalid,
+    int queries,int keys,int past,size_t column_stride,size_t row_stride,
+    cudaStream_t stream=nullptr);
 
 // Contiguous-causal block-selection primitive. Caller provides finite FP32
 // block scores [queries, score_stride] and output [queries, index_stride].

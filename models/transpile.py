@@ -59,6 +59,8 @@ class OpType(IntEnum):
     ROTARY_EMBED   = 40
     SDPA           = 50
     SDPA_MLA       = 51
+    QSA_SDPA       = 52
+    QSA_INDEXER    = 53
     RESHAPE        = 60
     PERMUTE        = 61
     CONCAT         = 62
@@ -323,7 +325,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
         a = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, a[1], _CONST, _CONST)
 
-    if op in (OpType.SDPA, OpType.SDPA_MLA):
+    if op in (OpType.SDPA, OpType.SDPA_MLA, OpType.QSA_SDPA, OpType.QSA_INDEXER):
         q = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, q[1], _CONST, _CONST)
 
@@ -693,11 +695,15 @@ class GraphBuilder:
              kv_cache: int = 2, causal: bool = True,
              scale: float = 0.0,
              num_heads: int = 16, num_kv_heads: int = 16,
-             head_dim: int = 192, v_head_dim: int = 128
+             head_dim: int = 192, v_head_dim: int = 128,
+             selected_indices: int | None = None
              ) -> tuple[int, int, int]:
         sq = self._nodes[q].out_shape
         out_shape = (v_head_dim, sq[1], num_heads)
-        attn = self._add(OpType.SDPA, [q, k_cur, v_cur, mask, k_cache, v_cache],
+        operands = [q, k_cur, v_cur, mask, k_cache, v_cache]
+        if selected_indices is not None:
+            operands.append(selected_indices)
+        attn = self._add(OpType.QSA_SDPA if selected_indices is not None else OpType.SDPA, operands,
                          out_shape, prec=self._nodes[q].out_prec,
                          i32=[kv_cache, 1 if causal else 0,
                               num_heads, num_kv_heads, head_dim, v_head_dim],
@@ -712,6 +718,20 @@ class GraphBuilder:
                            prec=self._nodes[v_cache].out_prec,
                            i32=list(self._nodes[v_cache].out_shape))
         return attn, kc_out, vc_out
+
+    def qsa_indexer(self, projection: int, q_norm: int, k_norm: int,
+                    frequency: int, raw_cache: int, pooled_cache: int,
+                    main_k_cache: int, mask: int, *, heads: int, dimension: int,
+                    rope_dim: int, ratio: int, budget: int, eps: float = 1e-6) -> int:
+        if (heads < 1 or dimension < rope_dim or rope_dim < 2 or rope_dim % 2
+                or ratio < 1 or budget < 1 or budget % ratio or budget + ratio - 1 > 4096):
+            raise ValueError("invalid QSA indexer geometry")
+        seq = self._nodes[projection].out_shape[1]
+        return self._add(OpType.QSA_INDEXER,
+                         [projection, q_norm, k_norm, frequency, raw_cache,
+                          pooled_cache, main_k_cache, mask],
+                         (budget + ratio - 1, seq), prec=Precision.INT32,
+                         i32=[heads, dimension, rope_dim, ratio, budget], f32=[eps])
 
     def sdpa_no_cache(self, q: int, k: int, v: int,
                       causal: bool = False, scale: float = 0.0,

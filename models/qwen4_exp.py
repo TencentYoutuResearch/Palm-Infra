@@ -224,8 +224,8 @@ def _build_mtp_input_fusion(g: GraphBuilder, target_hidden: int,
 def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                 n_ctx: int = 2048, is_prefill: bool = False,
                 export_mtp_state: bool = False,
-                _mtp_mode: bool = False) -> GraphBuilder:
-    """Build a text-only Qwen4Exp graph for contexts within QSA's budget."""
+                _mtp_mode: bool = False, enable_qsa: bool = False) -> GraphBuilder:
+    """Build a text graph; opt-in QSA requires native CUDA and extra weights."""
     g = GraphBuilder()
     tc = cfg["text_config"] if "text_config" in cfg else cfg
 
@@ -236,7 +236,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     hc_count = int(tc.get("hc_count", 4))
     hc_lowrank = int(tc["hc_lowrank"])
     qsa_budget = int(tc.get("indexer_budget", 2048))
-    if n_ctx > qsa_budget and any(t == "full_attention" for t in layer_types):
+    if not enable_qsa and n_ctx > qsa_budget and any(t == "full_attention" for t in layer_types):
         raise ValueError(
             f"Qwen4Exp bring-up graph supports n_ctx <= QSA budget "
             f"({qsa_budget}); got {n_ctx}")
@@ -247,6 +247,16 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     rope_dim = int(head_dim * float(rope["partial_rotary_factor"]))
     num_heads = int(tc["num_attention_heads"])
     num_kv_heads = int(tc["num_key_value_heads"])
+    if enable_qsa:
+        index_heads = int(tc.get("indexer_n_heads", 4))
+        index_dim = int(tc.get("indexer_head_dim", 128))
+        index_ratio = int(tc.get("indexer_compress_ratio", 4))
+        if (_mtp_mode or int(tc.get("indexer_kv_heads", 1)) != 1 or
+                not 1 <= n_ctx <= 32768 or not 1 <= index_heads <= 16 or
+                not rope_dim <= index_dim <= 256 or not 1 <= index_ratio <= 16 or
+                qsa_budget < 1 or qsa_budget % index_ratio or qsa_budget + index_ratio - 1 > 4096):
+            raise ValueError("unsupported native QSA geometry/context/MTP")
+        g.metadata["qsa"] = "contiguous-causal-fp32-v1"
     linear_num_heads = int(tc["linear_num_key_heads"])
     linear_num_v_heads = int(tc["linear_num_value_heads"])
     linear_k_dim = int(tc["linear_key_head_dim"])
@@ -337,10 +347,26 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                     is_prefill=is_prefill,
                     output_gate_type=(tc.get("output_gate_type") or
                                       tc.get("hidden_act", "silu")))
+            selected = None
+            if enable_qsa:
+                import numpy as np
+                ipfx = f"model_language_model_layers_{current}_self_attn_indexer"
+                projection = g.matmul(x, _weight(g, weights_dir, f"{ipfx}_index_qk_proj_weight",
+                                                ((index_heads + 1) * index_dim, hidden_size)))
+                q_norm = _weight(g, weights_dir, f"{ipfx}_q_layernorm_weight", (index_dim,), Precision.FP32)
+                k_norm = _weight(g, weights_dir, f"{ipfx}_k_layernorm_weight", (index_dim,), Precision.FP32)
+                frequency = g.constant(1 / np.power(np.float32(rope_theta),
+                    np.arange(0, rope_dim, 2, dtype=np.float32) / rope_dim))
+                state_id = 2 * len(ple_ids) + 2 * current
+                raw = g.input(f"aux_state{state_id}", (index_dim, n_ctx), prec=Precision.FP32)
+                pooled = g.input(f"aux_state{state_id + 1}", (index_dim, max(1, n_ctx // index_ratio)), prec=Precision.FP32)
+                selected = g.qsa_indexer(projection, q_norm, k_norm, frequency, raw, pooled,
+                    c0, mask, heads=index_heads, dimension=index_dim, rope_dim=rope_dim,
+                    ratio=index_ratio, budget=qsa_budget, eps=eps)
             return _build_full_attn_layer(
                 g, x, current, weights_dir, cos, sin, mask, c0, c1,
                 eps, seq_len, rope_dim, num_heads, num_kv_heads,
-                head_dim, hidden_size, is_prefill=is_prefill)
+                head_dim, hidden_size, is_prefill=is_prefill, selected_indices=selected)
 
         residual = _gr_branch(
             g, residual, f"{pfx}_attn_hyper_connection", weights_dir,

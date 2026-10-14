@@ -202,6 +202,7 @@ void prepare_execution(ExecContext& ctx, bool prepare_backend_plan) {
     std::vector<uint32_t> protected_stateful_nodes;
     for (const auto& node : nodes) {
         if (node.op_type == OpType::SDPA || node.op_type == OpType::SDPA_MLA ||
+            node.op_type == OpType::QSA_SDPA || node.op_type == OpType::QSA_INDEXER ||
             node.op_type == OpType::GATED_DELTANET_PREFILL ||
             node.op_type == OpType::GATED_DELTANET_DECODE ||
             node.op_type == OpType::GATED_DELTANET_CONV_DECODE ||

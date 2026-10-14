@@ -134,6 +134,13 @@ struct CudaBackend::Impl {
     void* argmax_result = nullptr;
     size_t argmax_result_bytes = 0;
     void* attention_scores = nullptr;
+    void* qsa_query = nullptr;
+    size_t qsa_query_bytes = 0;
+    void* qsa_scores = nullptr;
+    size_t qsa_scores_bytes = 0;
+    void* qsa_mask_invalid = nullptr;
+    size_t qsa_mask_invalid_bytes = 0;
+    size_t qsa_indexer_enqueues = 0, qsa_attention_enqueues = 0;
     size_t attention_scores_bytes = 0;
     void* attention_prefix_valid = nullptr;
     size_t attention_prefix_valid_bytes = 0;
@@ -621,6 +628,12 @@ struct CudaBackend::Impl {
             cudaFree(argmax_result);
         if (attention_scores)
             cudaFree(attention_scores);
+        if(qsa_query)cudaFree(qsa_query);
+        if(qsa_scores)cudaFree(qsa_scores);
+        if(qsa_mask_invalid)cudaFree(qsa_mask_invalid);
+        if(qsa_indexer_enqueues||qsa_attention_enqueues)
+            std::fprintf(stderr,"CudaBackend: QSA indexer=%zu attention=%zu query_workspace=%zu score_workspace=%zu bytes\n",
+                qsa_indexer_enqueues,qsa_attention_enqueues,qsa_query_bytes,qsa_scores_bytes);
         if (attention_prefix_valid) cudaFree(attention_prefix_valid);
         if (attention_pv_handle) cublasDestroy(attention_pv_handle);
         if (attention_pv_values) cudaFree(attention_pv_values);

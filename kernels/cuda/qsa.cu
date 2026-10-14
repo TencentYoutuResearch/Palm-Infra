@@ -7,6 +7,16 @@
 #include <cub/block/block_radix_sort.cuh>
 
 namespace {
+__global__ void validate_causal_mask(const float* mask,uint32_t* invalid,
+    int queries,int keys,int past,size_t cs,size_t rs) {
+    const size_t index=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(index>=size_t(queries)*keys)return;
+    const int row=index/keys,col=index%keys;
+    const float value=mask[size_t(row)*rs+size_t(col)*cs];
+    // Future NaN/+inf would not be a valid additive attention mask even
+    // though mask==0 treats it as invisible. Reject before mutating state.
+    if(col<=past+row?value!=0.f:!(value<0.f))atomicOr(invalid,1u);
+}
 __device__ void indexer_norm_rotate(float value,const float* weight,
     const float* frequency,float* output,int dim,int rope_dim,int position,
     float eps,float* normalized,float* reduction) {
@@ -79,7 +89,7 @@ __global__ void qsa_index_scores(const float* query,const float* pooled,float* s
 
 template<class Cache>
 __global__ void selected_attention(const float* query, const Cache* key,
-    const Cache* value, const int32_t* indices, float* output,
+    const Cache* value, const int32_t* indices, float* output,const float* mask,
     mollm_cuda::QsaSelectedAttentionParams p) {
     const int row=blockIdx.x, head=blockIdx.y;
     const int kv=head/(p.heads/p.kv_heads);
@@ -91,7 +101,8 @@ __global__ void selected_attention(const float* query, const Cache* key,
     float* reduction=shared+p.slots;
     for(int slot=warp;slot<p.slots;slot+=8) {
         const int id=ids[slot];
-        const bool active=id>=0&&id<p.keys&&id<=p.past+row;
+        const bool active=id>=0&&id<p.keys&&id<=p.past+row&&
+            (!mask||mask[size_t(row)*p.mask_row_stride+size_t(id)*p.mask_column_stride]==0.f);
         float dot=0;
         if(active) {
             const Cache* k=key+size_t(kv)*p.key_head_stride+size_t(id)*p.key_position_stride;
@@ -125,7 +136,8 @@ __global__ void selected_attention(const float* query, const Cache* key,
             const int id=ids[slot];
             // Skip by validity, not just zero weight: do not read unselected
             // or future values, including poison values beyond actual keys.
-            if(id>=0&&id<p.keys&&id<=p.past+row)
+            if(id>=0&&id<p.keys&&id<=p.past+row&&
+               (!mask||mask[size_t(row)*p.mask_row_stride+size_t(id)*p.mask_column_stride]==0.f))
                 sum=fmaf(probabilities[slot],float(value[size_t(kv)*p.value_head_stride+
                               size_t(id)*p.value_position_stride+d]),sum);
         }
@@ -231,7 +243,7 @@ cudaError_t mollm_cuda::launch_qsa_causal_block_topk(const float* scores,int32_t
 
 cudaError_t mollm_cuda::launch_qsa_selected_attention(const float* query,
     const void* key,const void* value,bool half,const int32_t* ids,float* output,
-    const QsaSelectedAttentionParams& p,cudaStream_t stream) {
+    const QsaSelectedAttentionParams& p,cudaStream_t stream,const float* mask) {
     if(!query||!key||!value||!ids||!output||p.heads<1||p.kv_heads<1||
        p.heads%p.kv_heads||p.queries<1||p.queries>65535||p.heads>65535||
        p.keys<1||p.past<0||p.past>p.keys||p.queries>p.keys-p.past||
@@ -255,11 +267,26 @@ cudaError_t mollm_cuda::launch_qsa_selected_attention(const float* query,
        !fits(p.keys,p.kv_heads,p.value_position_stride,p.value_head_stride,p.value_dim)||
        !fits(p.queries,p.heads,p.output_position_stride,p.output_head_stride,p.value_dim)||
        p.index_position_stride>limit/size_t(p.queries))return cudaErrorInvalidValue;
+    if(mask&&(!p.mask_column_stride||!p.mask_row_stride||
+        !fits(p.queries,p.keys,p.mask_row_stride,p.mask_column_stride,1)))return cudaErrorInvalidValue;
     const size_t shared=size_t(p.slots+256)*sizeof(float);
     const dim3 grid(p.queries,p.heads);
     if(half)selected_attention<<<grid,256,shared,stream>>>(query,
-        static_cast<const __half*>(key),static_cast<const __half*>(value),ids,output,p);
+        static_cast<const __half*>(key),static_cast<const __half*>(value),ids,output,mask,p);
     else selected_attention<<<grid,256,shared,stream>>>(query,
-        static_cast<const float*>(key),static_cast<const float*>(value),ids,output,p);
+        static_cast<const float*>(key),static_cast<const float*>(value),ids,output,mask,p);
+    return cudaGetLastError();
+}
+
+cudaError_t mollm_cuda::launch_qsa_validate_causal_mask(const float* mask,uint32_t* invalid,
+    int queries,int keys,int past,size_t cs,size_t rs,cudaStream_t stream) {
+    const size_t limit=std::numeric_limits<size_t>::max()/sizeof(float);
+    if(!mask||!invalid||queries<1||queries>65535||keys<1||keys>32768||past<0||past>keys||
+       queries>keys-past||!cs||!rs||cs>limit/size_t(keys)||rs>limit/size_t(queries)||
+       size_t(keys-1)*cs>limit-size_t(queries-1)*rs)return cudaErrorInvalidValue;
+    auto error=cudaMemsetAsync(invalid,0,sizeof(uint32_t),stream);
+    if(error!=cudaSuccess)return error;
+    const size_t count=size_t(queries)*keys;
+    validate_causal_mask<<<(count+255)/256,256,0,stream>>>(mask,invalid,queries,keys,past,cs,rs);
     return cudaGetLastError();
 }

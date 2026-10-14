@@ -5,6 +5,7 @@
 #include "core/cache_layout.h"
 #include "graph/graph.h"
 #include "kernels/cuda/attention.h"
+#include "kernels/cuda/qsa.h"
 #include "kernels/cuda/elementwise.h"
 #include "kernels/cuda/matmul.h"
 #include "kernels/cuda/recurrent.h"
@@ -527,6 +528,7 @@ void CudaBackend::dispatch(const GraphNode& node,
         impl_->segment_candidate = ++impl_->segment_decode_steps > 1 && !impl_->resident_experts.empty();
     }
     if (node.op_type == OpType::SDPA || node.op_type == OpType::SDPA_MLA ||
+        node.op_type == OpType::QSA_INDEXER || node.op_type == OpType::QSA_SDPA ||
         node.op_type == OpType::PLE_LOOKUP) finish_decode_segment();
     if (node.op_type == OpType::INPUT ||
         node.op_type == OpType::CONSTANT) {
@@ -644,6 +646,7 @@ void CudaBackend::dispatch(const GraphNode& node,
     uint64_t hc_tag = hc_action();
     const uint64_t invalidations_before = impl_->segment_invalidations;
     if (node.op_type != OpType::SDPA && node.op_type != OpType::SDPA_MLA &&
+        node.op_type != OpType::QSA_INDEXER && node.op_type != OpType::QSA_SDPA &&
         node.op_type != OpType::PLE_LOOKUP &&
         try_decode_segment(node, inputs, output, thread_pool, hc_tag,
             hc_tag ? hc_second_weight->data : nullptr, hc_tag ? hc_pair->cache : nullptr)) {
@@ -768,7 +771,79 @@ void CudaBackend::dispatch(const GraphNode& node,
         }
     }
 
-    if ((node.op_type == OpType::SDPA ||
+    if(node.op_type==OpType::QSA_INDEXER) {
+        const auto fail=[&](const char* reason){std::fprintf(stderr,"CudaBackend: QSA indexer rejected: %s\n",reason);impl_->failed=true;};
+        if(inputs.size()!=8||!output||output->prec!=Precision::INT32||node.params.i32.size()!=5||
+           std::any_of(inputs.begin(),inputs.end(),[](const Tensor* t){return !t||!t->data;})) {
+            fail("invalid operands/parameters");return;
+        }
+        mollm_cuda::QsaIndexerParams p{};
+        p.heads=node.params.i32[0];p.dimension=node.params.i32[1];p.rope_dim=node.params.i32[2];
+        p.ratio=node.params.i32[3];const int budget=node.params.i32[4];
+        p.eps=graph_params::get_f32(node.params,0,1e-6f);
+        if(p.heads<1||p.heads>16||p.dimension<2||p.dimension>256||p.rope_dim<2||
+           p.rope_dim>p.dimension||p.rope_dim%2||p.ratio<1||p.ratio>16||budget<1||
+           budget>4096-p.ratio+1||budget%p.ratio||inputs[0]->shape[1]<1||inputs[0]->shape[1]>65535||
+           inputs[0]->prec!=Precision::FP32||inputs[0]->stride[0]!=sizeof(float)||inputs[0]->stride[1]%4||
+           inputs[0]->shape[0]!=(p.heads+1)*p.dimension||inputs[0]->shape[2]!=1||inputs[0]->shape[3]!=1||
+           output->shape[0]!=budget+p.ratio-1||output->shape[1]!=inputs[0]->shape[1]||
+           output->shape[2]!=1||output->shape[3]!=1||output->stride[0]!=sizeof(int32_t)||output->stride[1]%4||
+           output->stride[1]<size_t(output->shape[0])*sizeof(int32_t)||!std::isfinite(p.eps)||p.eps<=0) {
+            fail("unsupported geometry/precision");return;
+        }
+        for(int i:{1,2,3,4,5})if(!fp32_contiguous(*inputs[i])){fail("noncontiguous norm/frequency/state");return;}
+        if(inputs[1]->nelements()!=p.dimension||inputs[2]->nelements()!=p.dimension||
+           inputs[3]->nelements()!=p.rope_dim/2||inputs[4]->shape[0]!=p.dimension||
+           inputs[5]->shape[0]!=p.dimension||!inputs[6]->device.buffer||
+           inputs[7]->prec!=Precision::FP32) {fail("invalid norm/frequency/cache/mask");return;}
+        const auto* meta=cache_meta(static_cast<const uint8_t*>(inputs[6]->data)+inputs[6]->device.offset);
+        if(meta->max_seq_len<1||meta->max_seq_len>32768||meta->current_seq_len>meta->max_seq_len||
+           size_t(inputs[0]->shape[1])>meta->max_seq_len-meta->current_seq_len) {
+            fail("cache length/capacity");return;
+        }
+        p.queries=inputs[0]->shape[1];p.past=meta->current_seq_len;p.capacity=meta->max_seq_len;
+        p.projection_stride=inputs[0]->stride[1]/sizeof(float);
+        const int keys=p.past+p.queries;
+        p.score_stride=std::max(1,keys/p.ratio);
+        if(inputs[4]->shape[1]<p.capacity||inputs[5]->shape[1]<p.capacity/p.ratio||
+           inputs[7]->shape[0]<keys||inputs[7]->shape[1]<p.queries||
+           inputs[7]->shape[2]!=1||inputs[7]->shape[3]!=1||
+           inputs[7]->stride[0]%sizeof(float)||inputs[7]->stride[1]%sizeof(float)) {
+            fail("insufficient state or mask span");return;
+        }
+        cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+        if(!mollm_cuda::report_cuda(cudaStreamIsCapturing(cudaStreamPerThread,&capture),"QSA capture check")||
+           capture!=cudaStreamCaptureStatusNone) {fail("mask validation requires noncaptured dispatch");return;}
+        if(!impl_->reserve(impl_->qsa_query,impl_->qsa_query_bytes,size_t(p.queries)*p.heads*p.dimension*4,true)||
+           !impl_->reserve(impl_->qsa_scores,impl_->qsa_scores_bytes,size_t(p.queries)*p.score_stride*4,true)||
+           !impl_->reserve(impl_->qsa_mask_invalid,impl_->qsa_mask_invalid_bytes,sizeof(uint32_t),true)) {
+            fail("workspace allocation");return;
+        }
+        const float* mask=device_pointer_const<float>(*inputs[7]);
+        auto* invalid=static_cast<uint32_t*>(impl_->qsa_mask_invalid);
+        uint32_t host_invalid=1;
+        // Correctness-first gate. Never silently apply contiguous grouping to
+        // a masked gap. This tiny flag readback is not a kernel-only timing.
+        if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_validate_causal_mask(mask,invalid,
+             p.queries,keys,p.past,inputs[7]->stride[0]/4,inputs[7]->stride[1]/4,cudaStreamPerThread),"QSA mask validation")||
+           !mollm_cuda::report_cuda(cudaMemcpyAsync(&host_invalid,invalid,4,cudaMemcpyDeviceToHost,cudaStreamPerThread),"QSA mask flag")||
+           !mollm_cuda::report_cuda(cudaStreamSynchronize(cudaStreamPerThread),"QSA mask synchronize")||host_invalid) {
+            fail("requires contiguous causal visibility; masked gaps are not implemented");return;
+        }
+        auto* query=static_cast<float*>(impl_->qsa_query);auto* scores=static_cast<float*>(impl_->qsa_scores);
+        if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_indexer_update(
+            device_pointer_const<float>(*inputs[0]),device_pointer_const<float>(*inputs[1]),
+            device_pointer_const<float>(*inputs[2]),device_pointer_const<float>(*inputs[3]),
+            device_pointer<float>(*const_cast<Tensor*>(inputs[4])),device_pointer<float>(*const_cast<Tensor*>(inputs[5])),
+            query,scores,p,cudaStreamPerThread),"QSA indexer update")||
+           !mollm_cuda::report_cuda(mollm_cuda::launch_qsa_causal_block_topk(scores,device_pointer<int32_t>(*output),
+            p.queries,keys,p.past,budget,p.ratio,p.score_stride,output->stride[1]/4,cudaStreamPerThread),"QSA top-k")) {
+            fail("native launch");return;
+        }
+        ++impl_->qsa_indexer_enqueues;record_native();return;
+    }
+
+    if ((node.op_type == OpType::SDPA || node.op_type == OpType::QSA_SDPA ||
          node.op_type == OpType::SDPA_MLA) &&
         inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] &&
         output && inputs[0]->prec == Precision::FP32 &&
@@ -897,10 +972,40 @@ void CudaBackend::dispatch(const GraphNode& node,
                 // Decode may fold the one-token append into its score stage.
                 // Prefill and generic decode layouts keep the standalone
                 // append path below.
-                if (query_length != 1 && !append_cache()) {
+                if (query_length != 1 && node.op_type != OpType::QSA_SDPA && !append_cache()) {
                     impl_->failed = true;
                     return;
                 }
+            }
+            if(node.op_type==OpType::QSA_SDPA) {
+                const Tensor* indices=inputs.size()==7?inputs[6]:nullptr;
+                if(!indices||indices->prec!=Precision::INT32||indices->shape[0]<1||indices->shape[0]>4096||
+                   indices->shape[1]!=query_length||indices->shape[2]!=1||indices->shape[3]!=1||
+                   indices->stride[0]!=4||indices->stride[1]%4||!cached||!causal||current_length!=query_length||
+                   query.shape[2]!=num_heads||query.shape[3]!=1||current_key.shape[2]!=num_kv_heads||current_key.shape[3]!=1||
+                   current_value.shape[1]!=query_length||current_value.shape[2]!=num_kv_heads||current_value.shape[3]!=1||
+                   output->shape[2]!=num_heads||output->shape[3]!=1||query.stride[1]%4||query.stride[2]%4||
+                   output->stride[1]%4||output->stride[2]%4||current_key.stride[1]%4||current_key.stride[2]%4||
+                   current_value.stride[1]%4||current_value.stride[2]%4||
+                   query.stride[0]!=4||current_key.stride[0]!=4||current_value.stride[0]!=4||output->stride[0]!=4||
+                   !mask||mask->prec!=Precision::FP32||mask->shape[0]<key_length||mask->shape[1]<query_length||
+                   mask->stride[0]%4||mask->stride[1]%4) {
+                    std::fprintf(stderr,"CudaBackend: QSA attention invalid operands/layout\n");impl_->failed=true;return;
+                }
+                if(!append_cache()){impl_->failed=true;return;}
+                mollm_cuda::QsaSelectedAttentionParams p{};
+                p.heads=num_heads;p.kv_heads=num_kv_heads;p.queries=query_length;p.keys=key_length;p.past=past_length;
+                p.key_dim=key_dim;p.value_dim=value_dim;p.slots=indices->shape[0];p.scale=scale;
+                p.query_position_stride=query.stride[1]/4;p.query_head_stride=query.stride[2]/4;
+                p.output_position_stride=output->stride[1]/4;p.output_head_stride=output->stride[2]/4;
+                p.key_position_stride=key_dim;p.key_head_stride=size_t(key_capacity)*key_dim;
+                p.value_position_stride=value_dim;p.value_head_stride=size_t(key_capacity)*value_dim;
+                p.index_position_stride=indices->stride[1]/4;p.mask_column_stride=mask->stride[0]/4;p.mask_row_stride=mask->stride[1]/4;
+                if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_selected_attention(query_data,key_data,value_data,fp16_cache,
+                   device_pointer_const<int32_t>(*indices),output_data,p,cudaStreamPerThread,mask_data),"QSA selected attention")) {
+                    impl_->failed=true;return;
+                }
+                ++impl_->qsa_attention_enqueues;record_native();return;
             }
             const size_t score_count = static_cast<size_t>(num_heads) *
                 query_length * key_length;

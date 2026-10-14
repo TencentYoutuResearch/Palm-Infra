@@ -90,6 +90,38 @@ except ValueError as exc:
 else:
     raise AssertionError("long context must not silently run dense attention")
 
+qsa_cfg = config()
+qsa_cfg["text_config"].update(indexer_n_heads=2, indexer_head_dim=8, indexer_compress_ratio=4)
+for prefill, seq in ((False, 1), (True, 17)):
+    qsa_graph = build_graph(".", qsa_cfg, seq_len=seq, n_ctx=256, is_prefill=prefill, enable_qsa=True)
+    propagate_dim_exprs(qsa_graph._nodes)
+    indexers = [n for n in qsa_graph._nodes if n.op_type == OpType.QSA_INDEXER]
+    sparse = [n for n in qsa_graph._nodes if n.op_type == OpType.QSA_SDPA]
+    check(len(indexers) == len(sparse) == 1, "QSA indexer connects to selected-key attention")
+    check(not any(n.op_type == OpType.SDPA for n in qsa_graph._nodes), "QSA graph never silently substitutes dense SDPA")
+    check(indexers[0].out_prec == Precision.INT32 and indexers[0].out_shape[:2] == (67, seq), "index slots include all incomplete tail tokens")
+    check(sparse[0].inputs[6] == indexers[0].id, "selected IDs flow into main attention")
+    check(indexers[0].params_i32 == [2, 8, 4, 4, 64], "indexer uses main RoPE width, not indexer fractional width")
+    check(qsa_graph._nodes[indexers[0].inputs[4]].out_shape[:2] == (8, 256), "raw indexer state capacity")
+    check(qsa_graph._nodes[indexers[0].inputs[5]].out_shape[:2] == (8, 64), "pooled complete-group capacity")
+    if prefill:
+        check(indexers[0].dim_expr[1].kind == DimKind.SEQ and sparse[0].dim_expr[1].kind == DimKind.SEQ,
+              "indexer and attention retain dynamic query lengths")
+try:
+    build_graph(".", qsa_cfg, n_ctx=32769, enable_qsa=True)
+except ValueError:
+    pass
+else:
+    raise AssertionError("QSA unsupported capacity must be explicit")
+
+qsa_ple_cfg = config()
+qsa_ple_cfg["text_config"].update(indexer_n_heads=2, indexer_head_dim=8,
+                              indexer_compress_ratio=4, ple_layer_ids=[2])
+qsa_ple_graph = build_graph(".", qsa_ple_cfg, seq_len=17, n_ctx=256, is_prefill=True, enable_qsa=True)
+qsa_aux = [n.params_str[0] for n in qsa_ple_graph._nodes if n.op_type == OpType.INPUT
+           and n.params_str and n.params_str[0].startswith("aux_state")]
+check(len(qsa_aux) == len(set(qsa_aux)) == 4, "QSA state namespace does not collide with PLE history/convolution")
+
 ple_cfg = config()
 ple_cfg["text_config"]["ple_layer_ids"] = [2]
 ple_graph = build_graph("/tmp/qwen4-test", ple_cfg, seq_len=1, n_ctx=64)

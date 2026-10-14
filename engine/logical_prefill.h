@@ -29,7 +29,7 @@ inline bool logical_graph_supported(const Graph& g) {
                 n.params.i32[2]!=10||n.params.i32[3]!=640)return false;
             ++moe;
         }
-        if(n.op_type==OpType::SDPA) {
+        if(n.op_type==OpType::SDPA||n.op_type==OpType::QSA_SDPA) {
             if(n.params.i32.size()<6||n.params.i32[4]!=256||n.params.i32[5]!=256)return false;
             ++attention;
         }

@@ -927,6 +927,31 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
 
 bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
                                 std::vector<CachePair>& caches, int n_ctx) {
+    // QSA auxiliary capacities follow runtime context, just like main KV.
+    // Package graph capacity is not a second hidden --n-ctx limit. The two
+    // graphs later share these buffers via the existing aux_state migration.
+    std::unordered_map<uint32_t,std::pair<int,int>> qsa_state_shapes;
+    for(const auto& node:g.nodes)if(node.op_type==OpType::QSA_INDEXER) {
+        const auto reject=[](){std::fprintf(stderr,"Engine: QSA requires CUDA text, ctx<=32768, no MTP/padding, valid independent auxiliary states\n");return false;};
+        if(cfg_.device!=Device::CUDA||n_ctx<1||n_ctx>32768||cfg_.mtp_draft_tokens||
+           !cfg_.mtp_companion_dir.empty()||cfg_.static_padded||node.inputs.size()!=8||
+           node.params.i32.size()!=5||node.params.i32[0]<1||node.params.i32[0]>16||
+           node.params.i32[1]<2||node.params.i32[1]>256||node.params.i32[2]<2||
+           node.params.i32[2]>node.params.i32[1]||node.params.i32[2]%2||
+           node.params.i32[3]<1||node.params.i32[3]>16||node.params.i32[4]<1||
+           node.params.i32[4]>4096-node.params.i32[3]+1||node.params.i32[4]%node.params.i32[3]||
+           node.out_prec!=Precision::INT32||node.out_shape[0]!=node.params.i32[4]+node.params.i32[3]-1)return reject();
+        const int dimension=node.params.i32[1],ratio=node.params.i32[3];
+        for(int operand:{4,5}) {
+            const uint32_t id=node.inputs[operand];
+            if(id>=g.nodes.size())return reject();
+            const auto& state=g.nodes[id];
+            if(state.op_type!=OpType::INPUT||state.params.str.empty()||state.out_prec!=Precision::FP32||
+               parse_persistent_input(state.params.str[0]).kind!=PersistentInputKind::AUX_STATE||
+               state.out_shape[0]!=dimension||state.out_shape[2]!=1||state.out_shape[3]!=1||
+               !qsa_state_shapes.emplace(id,std::make_pair(dimension,operand==4?n_ctx:std::max(1,n_ctx/ratio))).second)return reject();
+        }
+    }
     // Find persistent INPUT nodes and initialise their tensor shapes.
     // All recurrent state follows this path: KV cache, GDN state, and RWKV
     // state.
@@ -941,6 +966,11 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
         Tensor& tensor = g.runtime.tensors[node.id];
         initialize_input_tensor(tensor, node);
         if (input.kind == PersistentInputKind::AUX_STATE) {
+            const auto qsa=qsa_state_shapes.find(node.id);
+            if(qsa!=qsa_state_shapes.end()) {
+                tensor.shape[0]=qsa->second.first;tensor.shape[1]=qsa->second.second;
+                tensor.compute_strides();
+            }
             auxiliary_states_[input.layer] = &tensor;
             continue;
         }
