@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -18,6 +19,36 @@ struct Buffer {
     ~Buffer(){if(data)cudaFree(data);}
     Buffer(const Buffer&)=delete;
 };
+
+void selected_nan_underflow(bool half) {
+    mollm_cuda::QsaSelectedAttentionParams p;
+    p.heads=2;p.kv_heads=1;p.queries=1;p.keys=2;p.past=1;
+    p.key_dim=p.value_dim=256;p.slots=2;p.scale=1.f/16;
+    p.query_position_stride=p.output_position_stride=512;
+    p.query_head_stride=p.output_head_stride=256;
+    p.key_position_stride=p.value_position_stride=256;
+    p.key_head_stride=p.value_head_stride=512;p.index_position_stride=2;
+    std::vector<float> q(512,1.f),k(512,100.f),v(512,1.f),actual(512);
+    std::fill_n(k.begin(),256,-100.f);v[0]=std::numeric_limits<float>::quiet_NaN();
+    std::vector<__half> hk(512),hv(512);
+    for(int i=0;i<512;++i){hk[i]=__float2half(k[i]);hv[i]=__float2half(v[i]);}
+    int32_t ids[]={0,1};
+    Buffer dq(2048),dk(half?1024:2048),dv(half?1024:2048),di(8),out(2048),scratch(2*2*258*4);
+    check(cudaMemcpy(dq.data,q.data(),2048,cudaMemcpyHostToDevice));
+    check(cudaMemcpy(dk.data,half?static_cast<void*>(hk.data()):static_cast<void*>(k.data()),half?1024:2048,cudaMemcpyHostToDevice));
+    check(cudaMemcpy(dv.data,half?static_cast<void*>(hv.data()):static_cast<void*>(v.data()),half?1024:2048,cudaMemcpyHostToDevice));
+    check(cudaMemcpy(di.data,ids,8,cudaMemcpyHostToDevice));
+    for(int mode:{0,1,2}) {
+        p.reuse_gqa=mode==1;p.partitions=mode==2?2:1;p.split_workspace=static_cast<float*>(scratch.data);
+        check(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
+            static_cast<int32_t*>(di.data),static_cast<float*>(out.data),p));
+        check(cudaMemcpy(actual.data(),out.data,2048,cudaMemcpyDeviceToHost));
+        for(int h=0;h<2;++h) {
+            require(std::isnan(actual[h*256]));
+            for(int d=1;d<256;++d)require(std::fabs(actual[h*256+d]-1.f)<3e-6);
+        }
+    }
+}
 
 void topk(int keys) {
     const int rows=std::min(keys,3),past=keys-rows,slots=2051;
@@ -66,10 +97,13 @@ void topk(int keys) {
     check(cudaGraphExecDestroy(exec));check(cudaGraphDestroy(graph));check(cudaStreamDestroy(stream));
 }
 
-void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bool interleaved,bool use_mask=false) {
+void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bool interleaved,bool use_mask=false,bool reuse=false,int partitions=1,float stress_scale=1.f) {
     mollm_cuda::QsaSelectedAttentionParams p{};
+    p.reuse_gqa=reuse;
+    Buffer partials(size_t(rows)*heads*partitions*(vd+2)*4);
+    p.partitions=partitions;p.split_workspace=static_cast<float*>(partials.data);
     p.heads=heads;p.kv_heads=kv;p.keys=keys;p.queries=rows;p.past=keys-rows;
-    p.key_dim=kd;p.value_dim=vd;p.slots=slots;p.scale=1/std::sqrt(float(kd));
+    p.key_dim=kd;p.value_dim=vd;p.slots=slots;p.scale=stress_scale/std::sqrt(float(kd));
     p.query_position_stride=kd*heads+3;p.query_head_stride=kd;
     p.output_position_stride=vd*heads+7;p.output_head_stride=vd;
     if(interleaved) {
@@ -193,15 +227,35 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
     check(cudaGraphExecDestroy(exec));check(cudaGraphDestroy(graph));check(cudaStreamDestroy(stream));
 }
 }
-int main() {
+int main(int argc,char** argv) {
     int count=0;
     if(cudaGetDeviceCount(&count)!=cudaSuccess||count==0)return 77;
+    for(bool half:{false,true})selected_nan_underflow(half);
+    if(argc==2&&!std::strcmp(argv[1],"--optimized-small-only")) {
+        for(bool half:{false,true})for(bool interleaved:{false,true}) {
+            run(half,131,3,24,2,256,256,131,interleaved,true,true);
+            run(half,131,3,24,2,256,256,131,interleaved,true,false,16);
+            run(half,19,3,6,2,256,256,9,interleaved,true,true);
+            run(half,19,3,4,2,8,5,9,interleaved,true,false,16);
+            run(half,131,3,24,2,256,256,131,interleaved,true,true,1,64.f);
+            run(half,131,3,24,2,256,256,131,interleaved,true,false,16,64.f);
+        }
+        std::puts("QSA optimized small-only: grouped/split, strides, masked poison and capture pass");
+        return 0;
+    }
     for(int keys:{1,3,2048,2049,2050,2051,2052,2054,8193,16387,32768})topk(keys);
     for(bool half:{false,true})for(bool interleaved:{false,true}) {
         run(half,19,3,4,2,8,5,9,interleaved);
         run(half,19,3,4,2,8,5,9,interleaved,true);
         run(half,2054,3,4,2,17,13,2051,interleaved);
         run(half,32768,1,24,2,256,256,2051,interleaved);
+        run(half,32768,1,24,2,256,256,2051,interleaved,false,true);
+        run(half,2054,3,24,2,256,256,2051,interleaved,true,true);
+        run(half,19,3,6,2,256,256,9,interleaved,true,true);
+        run(half,32768,1,24,2,256,256,2051,interleaved,false,false,16);
+        run(half,19,3,4,2,8,5,9,interleaved,true,false,16);
+        run(half,131,3,24,2,256,256,131,interleaved,true,true,1,64.f);
+        run(half,131,3,24,2,256,256,131,interleaved,true,false,16,64.f);
     }
     std::puts("QSA selected-key attention: FP16/FP32, GQA, poison, bounds, strides and capture pass");
 }

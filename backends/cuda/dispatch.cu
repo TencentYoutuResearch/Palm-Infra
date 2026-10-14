@@ -992,7 +992,6 @@ void CudaBackend::dispatch(const GraphNode& node,
                    mask->stride[0]%4||mask->stride[1]%4) {
                     std::fprintf(stderr,"CudaBackend: QSA attention invalid operands/layout\n");impl_->failed=true;return;
                 }
-                if(!append_cache()){impl_->failed=true;return;}
                 mollm_cuda::QsaSelectedAttentionParams p{};
                 p.heads=num_heads;p.kv_heads=num_kv_heads;p.queries=query_length;p.keys=key_length;p.past=past_length;
                 p.key_dim=key_dim;p.value_dim=value_dim;p.slots=indices->shape[0];p.scale=scale;
@@ -1001,11 +1000,31 @@ void CudaBackend::dispatch(const GraphNode& node,
                 p.key_position_stride=key_dim;p.key_head_stride=size_t(key_capacity)*key_dim;
                 p.value_position_stride=value_dim;p.value_head_stride=size_t(key_capacity)*value_dim;
                 p.index_position_stride=indices->stride[1]/4;p.mask_column_stride=mask->stride[0]/4;p.mask_row_stride=mask->stride[1]/4;
+                static const bool grouped=[] {
+                    const char* value=std::getenv("MOLLM_CUDA_QSA_GQA_REUSE");return !value||!std::strcmp(value,"1");
+                }();
+                static const bool split=[] {
+                    const char* value=std::getenv("MOLLM_CUDA_QSA_DECODE_SPLIT");return !value||!std::strcmp(value,"1");
+                }();
+                const int group=num_heads/num_kv_heads;
+                p.reuse_gqa=grouped&&query_length>=32&&key_dim==256&&value_dim==256&&group>=2&&group<=16;
+                if(split&&query_length==1&&p.slots>=128) {
+                    p.partitions=16;
+                    const size_t bytes=size_t(num_heads)*p.partitions*(value_dim+2)*sizeof(float);
+                    if(!impl_->reserve(impl_->qsa_attention_partials,impl_->qsa_attention_partials_bytes,bytes,true)) {
+                        impl_->failed=true;return;
+                    }
+                    p.split_workspace=static_cast<float*>(impl_->qsa_attention_partials);
+                }
+                if(!append_cache()){impl_->failed=true;return;}
                 if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_selected_attention(query_data,key_data,value_data,fp16_cache,
                    device_pointer_const<int32_t>(*indices),output_data,p,cudaStreamPerThread,mask_data),"QSA selected attention")) {
                     impl_->failed=true;return;
                 }
-                ++impl_->qsa_attention_enqueues;record_native();return;
+                ++impl_->qsa_attention_enqueues;
+                if(p.reuse_gqa)++impl_->qsa_gqa_enqueues;
+                if(p.partitions>1)++impl_->qsa_split_enqueues;
+                record_native();return;
             }
             const size_t score_count = static_cast<size_t>(num_heads) *
                 query_length * key_length;

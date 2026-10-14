@@ -162,3 +162,76 @@ manifest 最后写入，包含 geometry、每个文件 SHA256 和源 config SHA2
 36文件、39,337,056 bytes（含headers），主12 attention layers3/7/…/47。
 不是独立模型；使用上面的 runtime companion loader 接入。未复制或改写原本
 约123GB `.mollm`，没有下载原始模型。
+
+## FP32 selected-attention 吞吐候选
+
+新增两条 QSA 默认选路，不改选择集、不降低精度（环境变量可设0做A/B）：
+
+- `MOLLM_CUDA_QSA_GQA_REUSE=1`：D256、GQA group2..16、queries>=32，
+  每个 CTA 处理一个 query row/KV head，把16个选中 K/V 暂存一次给共享
+  该 KV head 的 query heads 复用。FP32 online softmax，无 dense scratch。
+- `MOLLM_CUDA_QSA_DECODE_SPLIT=1`：queries1、slots>=128，16个 partition
+  分别做 selected attention，再在设备上按 max/sum 合并；复用 bounded
+  workspace，真实H24/D256需要396288 bytes。prefill 不使用该拆分路径。
+
+`bench_cuda_qsa_attention` 用 supplied selections 做0/1/2/2/1/0模式对照
+（legacy/grouped/split），不是 indexer 或整模型 benchmark。
+`build_cuda/qsa-gqa-split-bench-2.log`：Q2048/K32768 legacy约100ms、
+grouped约58ms；Q1/K32768 legacy约0.29ms、split约0.064ms。
+Q32的grouped仍略快，Q128/512收益更明确；grouped单token明显退化，
+split大prefill无收益，因此 selector 按不同批量选路。
+
+完整 primitive 数值、capture、strides、masked poison 对照通过。完整
+shape memcheck/synccheck各完成0，0 errors，日志
+`build_cuda/qsa-gqa-split-{memcheck,synccheck}-1.log`。完整 racecheck
+`qsa-gqa-split-racecheck-1.log` 被主动终止（退出15），**没有通过**。
+随后 `--optimized-small-only` 用131-slot/9-slot检查 grouped/split 的同步、
+FP16/FP32、strides、poison和capture，racecheck完成0、0 hazards，日志
+`build_cuda/qsa-gqa-split-racecheck-small-1.log`；不能扩张为完整racecheck证明。
+
+`test_cuda_qsa_graph` 扩充 D256/H12、whole64 versus32/31/1 chunks，明确
+执行 grouped prefill和split decode。输出对独立标量参考abs<3e-6，whole/
+chunk选中ID精确一致；因online softmax不同FP32归约顺序，输出按相同
+容差比较，不要求bit exact。日志 `build_cuda/qsa-gqa-split-graph-1.log`。
+
+最新空tile跳过与64倍score-scale压力fixture重跑完整数值/memcheck/
+synccheck均完成0、0 errors；`--optimized-small-only` racecheck完成0、
+0 hazards。日志 `qsa-gqa-split-correctness-2.log`、
+`qsa-gqa-split-{memcheck,synccheck}-2.log`、
+`qsa-gqa-split-racecheck-small-2.log`。空tile跳过不依赖ID排序假设，仍
+支持分散的invalid/masked IDs，并在共享状态复用前保持block barrier。
+
+### 同构建整模型28K性能对照
+
+原始模型包/提示不改，prompt28160 tokens、ctx32768、chunk2048、
+warmup1/repeat1、greedy64生成 tokens、相同 accepted env、gate scale
+cache0；串行、启动100GiB/停止24GiB内存保护。两个运行均完成0：
+
+| 路径 | Prefill t/s | Decode t/s | Prefill ms | Decode ms |
+| --- | ---: | ---: | ---: | ---: |
+| QSA grouped+split | 1104.59 | 32.36 | 25493.57 | 1946.89 |
+| Dense bring-up | 450.86 | 19.29 | 62458.75 | 3266.67 |
+
+日志 `build_cuda/qsa-gqa-split-model-28k-1.log`、
+`build_cuda/qsa-gqa-split-dense-control-28k-1.log` 及各 memory log。
+约2.45倍prefill、1.68倍decode。最小可用内存分别35904004/27928968KiB。
+QSA grouped336/split1512次，partial workspace396288 bytes、index score
+workspace54525952 bytes、dense attention score workspace0。
+仅QSA模式启用新默认选路，legacy dense行为不变。
+
+这是吞吐证据，不是dense/QSA质量等价证明（越预算dense本身不是原始
+模型算法）。本轮两边均单次timed样本；重复/反向验证与完整checkpoint
+质量/多轮验证仍需继续，不据此宣布整个QSA任务完成。
+
+默认选路（两个选择器均unset）、空tile跳过版继续完整模型
+warmup1/repeat2：prefill1118.49/1114.57 t/s，decode32.52/32.47 t/s，
+完成0；bench 内部验证两次greedy输出精确一致，也与显式开关候选的
+64-token输出一致。日志 `build_cuda/qsa-gqa-split-default-model-28k-2.log`
+和 memory log，最小35360240KiB。确认默认参数兑现性能提升及重复reset。
+
+随后补正 split merge 的零权重行为：仍对有效partition的输出做IEEE FMA，
+不因最终权重下溢为0就掩盖selected V的NaN（masked/unselected NaN仍不读）。
+新增FP16/FP32、legacy/grouped/split、极端logit的对应fixture。对有限输入
+的模型路径不改变算法；该非finite边界补正之后的最终检查以
+`qsa-gqa-split-*-3.log` 和 `qsa-gqa-split-final-regression-2.log` 为准。
+后者重新构建所有相关QSA fixture后10项通过、无skip；不是全量测试报告。

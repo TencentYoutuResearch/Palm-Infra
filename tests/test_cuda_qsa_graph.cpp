@@ -11,7 +11,7 @@
 
 namespace {
 void require(bool x,const char* s){if(!x){std::fprintf(stderr,"QSA graph: %s\n",s);std::exit(1);}}
-constexpr int dim=8,vdim=5,heads=2,capacity=64,slots=11;
+int dim=8,vdim=5,heads=2,capacity=64,slots=11;
 struct Frame {
     CudaBackend backend;
     Graph graph;
@@ -30,7 +30,7 @@ struct Frame {
             if(i<12)graph.graph_inputs.push_back(i);
         }
         graph.nodes[12].op_type=OpType::QSA_INDEXER;graph.nodes[12].out_prec=Precision::INT32;
-        graph.nodes[12].inputs={0,1,2,3,4,5,6,7};graph.nodes[12].params.i32={heads,dim,4,4,8};
+        graph.nodes[12].inputs={0,1,2,3,4,5,6,7};graph.nodes[12].params.i32={heads,dim,4,4,slots-3};
         graph.nodes[12].params.f32={1e-6f};graph.nodes[12].out_shape[0]=slots;
         graph.nodes[13].op_type=OpType::QSA_SDPA;graph.nodes[13].inputs={8,9,10,7,6,11,12};
         graph.nodes[13].params.i32={2,1,heads,1,dim,vdim};graph.nodes[13].params.f32={1/std::sqrt(float(dim))};
@@ -137,8 +137,22 @@ void run(bool half,int liveness) {
 }
 int main() {
     setenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS","1",1);
+    setenv("MOLLM_CUDA_QSA_GQA_REUSE","1",1);
+    setenv("MOLLM_CUDA_QSA_DECODE_SPLIT","1",1);
     CudaBackend probe;if(!probe.available())return 77;
     for(bool half:{false,true})for(int mode:{0,1,2})run(half,mode);
     for(int bad:{1,2,3}){Frame f(true,2);std::vector<float> out;std::vector<int32_t> ids;f.pass(0,13,7,bad,out,ids);}
+    // Exercise both backend selectors: grouped whole prefill, then grouped
+    // chunk, legacy small tail and split decode. Online softmax changes FP32
+    // reduction order, so compare independently verified outputs by tolerance.
+    dim=vdim=256;heads=12;capacity=128;slots=131;
+    for(bool half:{false,true}) {
+        Frame whole(half,2),chunk(half,2);
+        std::vector<float> a,b;std::vector<int32_t> ia,ib;
+        whole.pass(0,64,17,0,a,ia);
+        chunk.pass(0,32,17,0,b,ib);chunk.pass(32,31,17,0,b,ib);chunk.pass(63,1,17,0,b,ib);
+        require(ia==ib&&a.size()==b.size(),"optimized backend selection/cache equivalence");
+        for(size_t i=0;i<a.size();++i)require(std::fabs(a[i]-b[i])<3e-6,"optimized chunk/whole output tolerance");
+    }
     std::puts("QSA graph: native FP16/FP32 KV, liveness, chunk/reset and mask rejection pass");
 }
