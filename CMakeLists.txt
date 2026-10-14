@@ -460,6 +460,7 @@ if(MOLLM_CUDA)
         backends/cuda/lm_head.cu
         backends/cuda/moe.cu
         kernels/cuda/attention.cu
+        kernels/cuda/qsa.cu
         kernels/cuda/matmul.cu
         kernels/cuda/moe.cu
         kernels/cuda/elementwise.cu
@@ -745,6 +746,12 @@ if(MOLLM_BUILD_TESTS)
     target_link_libraries(test_ppl_decode_schedule PRIVATE mollm_lib)
     add_test(NAME test_ppl_decode_schedule COMMAND test_ppl_decode_schedule)
     if(MOLLM_CUDA)
+        add_executable(test_cuda_qsa_selected_attention tests/test_cuda_qsa_selected_attention.cu)
+        target_link_libraries(test_cuda_qsa_selected_attention PRIVATE mollm_lib)
+        set_target_properties(test_cuda_qsa_selected_attention PROPERTIES CUDA_STANDARD 17)
+        add_test(NAME test_cuda_qsa_selected_attention COMMAND test_cuda_qsa_selected_attention)
+        set_tests_properties(test_cuda_qsa_selected_attention PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
         if(NOT TARGET bench_cuda_gr_reduce)
             add_executable(bench_cuda_gr_reduce tests/bench_cuda_gr_reduce.cu)
             target_link_libraries(bench_cuda_gr_reduce PRIVATE mollm_lib)
