@@ -7,6 +7,76 @@
 #include <cub/block/block_radix_sort.cuh>
 
 namespace {
+__device__ void indexer_norm_rotate(float value,const float* weight,
+    const float* frequency,float* output,int dim,int rope_dim,int position,
+    float eps,float* normalized,float* reduction) {
+    const int d=threadIdx.x;
+    const float square=d<dim?__fmul_rn(value,value):0.f;
+    const float variance=mollm_cuda::detail::block_reduce_sum<256>(square,reduction)/dim;
+    const float inverse=rsqrtf(variance+eps);
+    if(d<dim)normalized[d]=__fmul_rn(__fmul_rn(value,inverse),__fadd_rn(1.f,weight[d]));
+    __syncthreads();
+    if(d<dim) {
+        float x=normalized[d];
+        if(d<rope_dim) {
+            const int half=rope_dim/2,offset=d%half;
+            float sine,cosine;
+            sincosf(float(position)*frequency[offset],&sine,&cosine);
+            const float rotated=d<half?-normalized[d+half]:normalized[d-half];
+            x=__fadd_rn(__fmul_rn(x,cosine),__fmul_rn(rotated,sine));
+        }
+        output[d]=x;
+    }
+}
+
+__global__ void qsa_append_query_raw(const float* projection,const float* weight,
+    const float* frequency,float* raw,float* query,mollm_cuda::QsaIndexerParams p) {
+    const int row=blockIdx.x,head=blockIdx.y,d=threadIdx.x;
+    const float* source=projection+size_t(row)*p.projection_stride+head*p.dimension;
+    if(head==p.heads) {
+        if(d<p.dimension)raw[size_t(p.past+row)*p.dimension+d]=source[d];
+        return;
+    }
+    __shared__ float normalized[256],reduction[256];
+    indexer_norm_rotate(d<p.dimension?source[d]:0.f,weight,frequency,
+        query+(size_t(row)*p.heads+head)*p.dimension,p.dimension,p.rope_dim,
+        p.position_offset+p.past+row,p.eps,normalized,reduction);
+}
+
+__global__ void qsa_pool_complete(const float* raw,const float* weight,
+    const float* frequency,float* pooled,mollm_cuda::QsaIndexerParams p) {
+    const int group=p.past/p.ratio+blockIdx.x,d=threadIdx.x;
+    float value=0;
+    if(d<p.dimension) {
+        for(int i=0;i<p.ratio;++i)value=__fadd_rn(value,raw[size_t(group*p.ratio+i)*p.dimension+d]);
+        value/=p.ratio;
+    }
+    __shared__ float normalized[256],reduction[256];
+    indexer_norm_rotate(value,weight,frequency,pooled+size_t(group)*p.dimension,
+        p.dimension,p.rope_dim,p.position_offset+group*p.ratio,p.eps,normalized,reduction);
+}
+
+__global__ void qsa_index_scores(const float* query,const float* pooled,float* scores,
+    mollm_cuda::QsaIndexerParams p) {
+    const int row=blockIdx.x,group=blockIdx.y*8+threadIdx.x/32,lane=threadIdx.x%32;
+    const int total_groups=(p.past+p.queries)/p.ratio;
+    if(group>=total_groups)return; // uniform within each warp
+    const bool visible=group<(p.past+row+1)/p.ratio;
+    float score=0;
+    if(visible) {
+        const float* key=pooled+size_t(group)*p.dimension;
+        for(int h=0;h<p.heads;++h) {
+            const float* q=query+(size_t(row)*p.heads+h)*p.dimension;
+            float dot=0;
+            for(int d=lane;d<p.dimension;d+=32)dot=fmaf(q[d],key[d],dot);
+            dot=mollm_cuda::detail::warp_reduce_sum(dot);
+            if(lane==0)score+=fmaxf(0.f,dot);
+        }
+    }
+    if(lane==0)scores[size_t(row)*p.score_stride+group]=visible?
+        score/sqrtf(float(p.dimension)):-CUDART_INF_F;
+}
+
 template<class Cache>
 __global__ void selected_attention(const float* query, const Cache* key,
     const Cache* value, const int32_t* indices, float* output,
@@ -108,6 +178,36 @@ __global__ void qsa_block_topk(const float* scores,int32_t* output,int keys,
             output[size_t(row)*index_stride+slot]=slot<count?tokens[i]:-1;
     }
 }
+}
+
+cudaError_t mollm_cuda::launch_qsa_indexer_update(const float* projection,const float* q_norm,
+    const float* k_norm,const float* frequency,float* raw,float* pooled,float* query,
+    float* scores,const QsaIndexerParams& p,cudaStream_t stream) {
+    if(!projection||!q_norm||!k_norm||!frequency||!raw||!pooled||!query||!scores||
+       p.heads<1||p.heads>16||p.dimension<1||p.dimension>256||p.rope_dim<2||
+       p.rope_dim>p.dimension||p.rope_dim%2||p.ratio<1||p.ratio>16||
+       p.queries<1||p.queries>65535||p.past<0||p.capacity<1||p.past>p.capacity||
+       p.queries>p.capacity-p.past||p.position_offset<0||
+       p.position_offset>INT_MAX-p.capacity||!std::isfinite(p.eps)||p.eps<=0||
+       (p.past+p.queries)/p.ratio>8192||
+       p.projection_stride<size_t((p.heads+1)*p.dimension)||
+       p.score_stride<size_t((p.past+p.queries)/p.ratio))return cudaErrorInvalidValue;
+    const size_t limit=std::numeric_limits<size_t>::max()/sizeof(float);
+    if(p.projection_stride>limit/size_t(p.queries)||p.score_stride>limit/size_t(p.queries)||
+       size_t(p.capacity)>limit/size_t(p.dimension)||
+       size_t(p.queries)>limit/size_t(p.heads*p.dimension))return cudaErrorInvalidValue;
+    qsa_append_query_raw<<<dim3(p.queries,p.heads+1),256,0,stream>>>(projection,q_norm,frequency,raw,query,p);
+    auto error=cudaGetLastError();if(error!=cudaSuccess)return error;
+    const int complete=(p.past+p.queries)/p.ratio,new_groups=complete-p.past/p.ratio;
+    if(new_groups) {
+        qsa_pool_complete<<<new_groups,256,0,stream>>>(raw,k_norm,frequency,pooled,p);
+        error=cudaGetLastError();if(error!=cudaSuccess)return error;
+    }
+    if(complete) {
+        qsa_index_scores<<<dim3(p.queries,(complete+7)/8),256,0,stream>>>(query,pooled,scores,p);
+        error=cudaGetLastError();
+    }
+    return error;
 }
 
 cudaError_t mollm_cuda::launch_qsa_causal_block_topk(const float* scores,int32_t* ids,

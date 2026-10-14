@@ -5,6 +5,11 @@
 ## 已实现
 
 - Python token 选择及 indexer 投影/归一化/RoPE/raw-key-cache 小规模参考。
+- GPU FP32 indexer update/pooling/scoring primitive：消费单独 dense projection
+  的结果，使用原始 centered norm 权重和主 attention 的 inv_frequency；
+  raw K 按 token 存储，只有新完成的组才进行 pooling/norm/组首 RoPE。
+  已完成组缓存复用，未满组不写 pooled cache；query 分数仅读取其可见完整组。
+  该 primitive 本身不进行 dense projection，也还没有接入 engine 状态。
 - `kernels/cuda/qsa.cu` 原生 selected-key attention：只 gather 选中的 K/V，
   不分配全历史 H×Q×K scores，不展开整个 KV，也不靠 dense mask 假装稀疏。
   支持 FP16/FP32 KV、FP32 Q/output、GQA、显式 stride、causal/actual-length
@@ -38,9 +43,43 @@ synccheck、racecheck 同样完成0，各为0 errors；racecheck 为0 hazards。
 既有 QSA 两个 CPU reference、Qwen4Exp graph 与 CLI diagnostics 四项
 针对性回归也全部通过。不是全量回归结果。
 
+`test_cuda_qsa_indexer` 新增后完成0：73-token 小维度与129/2055-token
+真实 indexer heads4/D128/RoPE64 形状，独立 FP64 scalar norm/RoPE/score
+参考及合法 cutoff 检查。Whole versus irregular chunks/decode 的 normalized
+Q、raw K、pooled K、visible scores、selected IDs 都按同一 GPU 算法精确
+一致；第二组更换 projection 后从 past0 重建，并覆盖 capture、offset
+positions、原始 K 精确保存、未完成/未来 pooled groups 不写和输出 guards。
+两项 CUDA fixture（indexer + selected attention）同时回归通过。
+
+另外验证真实32768历史的三 token continuation：独立准备的8191完整组
+缓存保持逐字节不变，最后跨 chunk 组才更新；8192候选组的可见分数、
+512选中组的独立 cutoff、尾 token 与 padding 都通过。此场景用
+`--long-only` 单独运行，memcheck/synccheck/racecheck 各完成0，均0 errors，
+racecheck 为0 hazards，日志 `build_cuda/qsa-indexer-long-{memcheck,synccheck,racecheck}-1.log`。
+这是长历史 continuation 算子检查，不是整段32K模型 prefill 检查。
+
+还添加 native dense projection → indexer update → top-k → selected attention
+的组合 fixture，使用2560→640真实 projection 形状，FP16 weights/input、
+FP32 accumulation/output。稀疏 dyadic 测试权重的 projection 与独立标量
+结果精确一致；9 tokens/缩小预算4的选择与 attention 对照也通过。
+该 fixture 故意使用合成、关联的主 attention Q/K/V，不是实际 checkpoint
+或全模型图的验证，也没有吞吐测量。
+Selected attention fixture 还补充了主图实际需要的 head-major Q/output
+布局，与原有 token-major、KV interleaved/padded 布局一起回归通过。
+扩充后的 selected fixture 重跑 memcheck/synccheck/racecheck 也各完成0、
+0 errors/0 hazards，日志 `build_cuda/qsa-selected-attention-*-2.log`。
+
+Indexer memcheck 目前只检查 `--small-only`（73/129 tokens）范围，完成0、
+0 errors，日志 `build_cuda/qsa-indexer-memcheck-1.log`；不能据此声明完整
+2055-token checker 范围已通过。当前 FP32 activation 数值参考不模拟原始
+BF16 rounding；完整 checkpoint 对照还需要验证所选 precision 的质量影响。
+最终 small-only fixture 又完成 memcheck/synccheck/racecheck 三项检查，均
+完成0，0 errors/0 hazards，日志 `build_cuda/qsa-indexer-*-2.log`。
+
 ## 尚未实现/验证
 
-1. 原生 indexer projection、pooling/norm/RoPE 与跨 chunk/raw-key 状态接入。
+1. 将 dense indexer projection 与现有 update/pooling/norm/RoPE primitive
+   连接到真实推理图，并接入跨 chunk/raw-key 的 engine 状态。
 2. 图算子/backend/engine 缓存 reset/resume 集成、带缺口 mask 的可见分组。
    当前 top-k primitive 只适用于明确的 contiguous causal history。
 3. 小型 indexer 补充权重 artifact 与安全加载，避免重写约123GB原包。

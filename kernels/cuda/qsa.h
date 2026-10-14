@@ -23,7 +23,8 @@ struct QsaSelectedAttentionParams {
 
 // No allocation, host readback, full-history score buffer or expanded KV copy.
 // Invalid/padded/future indices are inactive, so they cannot cause an OOB read;
-// an entirely inactive row returns zero. Caller owns all distinct buffers.
+// an entirely inactive row returns zero. Output must not alias any input;
+// read-only key/value buffers may alias each other.
 // This is a correctness-first implementation, not a throughput qualification.
 cudaError_t launch_qsa_selected_attention(const float* query, const void* key,
     const void* value, bool fp16_cache, const int32_t* indices, float* output,
@@ -40,4 +41,27 @@ cudaError_t launch_qsa_selected_attention(const float* query, const void* key,
 cudaError_t launch_qsa_causal_block_topk(const float* scores,int32_t* indices,
     int queries,int keys,int past,int budget,int ratio,size_t score_stride,
     size_t index_stride,cudaStream_t stream=nullptr);
+
+// FP32-activation indexer path consistent with the existing FP32 graph.
+// It consumes a separate dense projection's [Q, (heads+1)*dimension] result;
+// norm weights are ORIGINAL zero-centered weights (the kernel applies 1+w).
+// inv_frequency is derived from the MAIN attention rope width, has rope_dim/2
+// FP32 entries, and is shared by query and pooled-key rotation.
+struct QsaIndexerParams {
+    int heads=4, dimension=128, rope_dim=64, ratio=4;
+    int queries=0, past=0, capacity=0, position_offset=0;
+    float eps=1e-6f;
+    size_t projection_stride=0, score_stride=0;
+};
+// Contiguous causal text only; no masked-gap grouping. Persistent raw_cache
+// [capacity,dimension] MUST contain unnormalized/unrotated prior K. Persistent
+// pooled_cache [capacity/ratio,dimension] contains only COMPLETE normalized,
+// rotated groups. Only newly completed groups (including a cross-chunk group)
+// are recomputed. Caller resets logical past to0; stale future cache is never
+// read. Caller owns query [Q,heads,dimension] and scores [Q,score_stride].
+// All buffers distinct FP32; no allocation/readback or metadata mutation.
+cudaError_t launch_qsa_indexer_update(const float* projection,const float* q_norm,
+    const float* k_norm,const float* inv_frequency,float* raw_cache,
+    float* pooled_cache,float* query,float* scores,const QsaIndexerParams& p,
+    cudaStream_t stream=nullptr);
 }

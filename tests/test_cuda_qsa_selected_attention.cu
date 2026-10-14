@@ -72,6 +72,11 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
     p.key_dim=kd;p.value_dim=vd;p.slots=slots;p.scale=1/std::sqrt(float(kd));
     p.query_position_stride=kd*heads+3;p.query_head_stride=kd;
     p.output_position_stride=vd*heads+7;p.output_head_stride=vd;
+    if(interleaved) {
+        // Main graph's Q/output are head-major, unlike token-major index Q.
+        p.query_position_stride=kd+3;p.query_head_stride=rows*p.query_position_stride+5;
+        p.output_position_stride=vd+7;p.output_head_stride=rows*p.output_position_stride+3;
+    }
     p.index_position_stride=slots+3;
     p.key_position_stride=interleaved?kd*kv+5:kd+5;
     p.value_position_stride=interleaved?vd*kv+3:vd+3;
@@ -79,8 +84,12 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
     p.value_head_stride=interleaved?vd:keys*p.value_position_stride+7;
     const size_t kn=size_t(keys-1)*p.key_position_stride+(kv-1)*p.key_head_stride+kd;
     const size_t vn=size_t(keys-1)*p.value_position_stride+(kv-1)*p.value_head_stride+vd;
-    const size_t on=rows*p.output_position_stride;
-    std::vector<float> query(rows*p.query_position_stride,.125f);
+    const size_t on=size_t(rows-1)*p.output_position_stride+(heads-1)*p.output_head_stride+vd+3;
+    const size_t qn=size_t(rows-1)*p.query_position_stride+(heads-1)*p.query_head_stride+kd+3;
+    std::vector<float> query(qn,.125f);
+    std::vector<bool> written(on,false);
+    for(int r=0;r<rows;++r)for(int h=0;h<heads;++h)for(int d=0;d<vd;++d)
+        written[r*p.output_position_stride+h*p.output_head_stride+d]=true;
     std::vector<float> key(kn,std::numeric_limits<float>::quiet_NaN());
     std::vector<float> value(vn,std::numeric_limits<float>::quiet_NaN());
     std::vector<int32_t> ids(rows*p.index_position_stride,-1);
@@ -168,8 +177,7 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
                 require(std::isfinite(got)&&std::fabs(got-expected)<3e-6);
             }
         }
-        for(int r=0;r<rows;++r)for(size_t d=heads*vd;d<p.output_position_stride;++d)
-            require(actual[8+r*p.output_position_stride+d]==12345.f);
+        for(size_t i=0;i<on;++i)if(!written[i])require(actual[8+i]==12345.f);
     }
     auto bad=p;bad.slots=4097;
     require(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
