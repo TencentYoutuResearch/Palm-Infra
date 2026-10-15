@@ -18,7 +18,7 @@ OPTIONS = {
 
 
 class SelectorTests(unittest.TestCase):
-    def run_case(self, changes=None, args=None):
+    def run_case(self, changes=None, args=None, require_headroom=True):
         environment = os.environ.copy()
         for name in ("MOLLM_TEST_CUDA_PREFILL_LIVENESS",
                      "MOLLM_TEST_CUDA_PREFILL_LIVENESS_MAX_SEQ",
@@ -33,7 +33,21 @@ class SelectorTests(unittest.TestCase):
         result = subprocess.run(args or BASE, env=environment, capture_output=True,
                                 text=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)  # Missing package even if guard accepts.
+        # The CLI watchdog runs before engine guards. Small CI hosts cannot
+        # reserve the 24 GiB required by these experimental selectors.
+        if require_headroom and "CUDA host watchdog: cannot start" in result.stderr:
+            self.assertNotIn("MoE: loading", result.stderr)
+            self.skipTest("host cannot reserve the selector's required CUDA memory headroom")
         return result.stderr
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux CLI memory watchdog")
+    def test_host_watchdog_rejects_impossible_headroom(self):
+        # This still runs on small hosts where the engine guard cases skip.
+        error = self.run_case({"MOLLM_CUDA_HOST_HEADROOM_MB": "1073741824"},
+                              require_headroom=False)
+        self.assertIn("CUDA host watchdog: cannot start", error)
+        self.assertNotIn("CudaBackend:", error)
+        self.assertNotIn("MoE: loading", error)
 
     def test_invalid_environment_rejected_before_backend(self):
         cases = {
