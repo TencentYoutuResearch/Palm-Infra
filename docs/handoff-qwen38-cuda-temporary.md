@@ -1,5 +1,9 @@
 # 临时 handoff：Qwen3.8 Flash Next CUDA resident + offload-PLE
 
+> 已归档的工程快照。下文的“尚未完成”和“QSA 尚未接入”等描述仅反映记录时状态。
+> 当前 QSA 实现、支持范围和验证结果见 [QSA 状态文档](qsa-implementation-status.md)，
+> 启动方式见 [README](../README_zh.md)。
+
 记录日期：2026-10-13。此文用于交接当前工程快照，不是优化完成报告。
 
 ## 分支与范围

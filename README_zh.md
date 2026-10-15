@@ -54,10 +54,13 @@ chunk256/512 基线、历史 chunk1024 参考一致，具体范围见 `docs/perf
 （默认关闭）：要求 reclaim、chunk0..2048（0 默认2048）、输出池1..4096 MiB
 及关闭 decode segments；拒绝 MTP/padding/SSD/vision/profile/两窗口调度。
 该参数自动启用 read-only last-use；需取消旧 stateful/liveness 序列上限。
-重要：当前 Qwen3.8 bring-up 图没有实现 QSA indexer；2048 budget 之外
-仍做 dense attention。16K/32K 是运行时容量及诊断范围，不是原模型长上下文
-正确性保证。此前长输入 loss/回复一致仅指本实现优化前后，不能替代原模型
-QSA 对照。正在优先补齐稀疏选择路径。
+重要：未加载 `--qsa-companion` 时，当前 Qwen3.8 bring-up 图没有 QSA indexer，
+2048 budget 之外仍做实验性的 dense attention。加载匹配的 companion 后，
+CUDA 文本推理使用原生 QSA 索引和 selected-key attention，在内存允许时支持
+最多262144 tokens 的连续因果上下文；加载器在内存中改图，无需重写模型包。
+该路径不支持 MTP、static padding、vision 或非标准 mask，不支持的配置会拒绝。
+当前包使用 dense W4/LM W8；优化前后的一致性不等于原始 BF16 整模型质量认证。
+验证范围和性能见 [QSA 状态文档](docs/qsa-implementation-status.md)。
 上下文容量 `--n-ctx` 与批量大小独立，例如可用 `--n-ctx 16384`
 配合 `--prefill-chunk-size 512`。长输入按配置批量追加 KV，短输入不补齐；
 2048 是当前支持的单批上限，不是上下文上限。长 KV 不满足 grouped attention
@@ -67,7 +70,12 @@ GB10 上可用独立的可选启动脚本简化上述实验配置：
 运行 `./chat-qwen38-cuda.sh` 进入多轮对话。脚本默认上下文16384、
 chunk2048、最多生成512 tokens；例如
 `./chat-qwen38-cuda.sh --n-ctx 16384 --prefill-chunk-size 512` 可覆盖批量。
-它使用本地 `../qwen38_flash_next_nvfp4_calibrated.mollm`，不读取历史测试脚本，
+它使用本地 `../qwen38_flash_next_nvfp4_calibrated.mollm`，并自动加载匹配的
+`../qwen38_qsa_bundle`；缺少 bundle 时拒绝启动。可通过 `--qsa-companion <dir>`
+指定匹配的 bundle；显式选择其他模型包时不会自动附加 companion。
+启动脚本参数 `--dense-bringup` 可用于 dense 诊断对照，与显式 companion 互斥。
+QSA context 大于65536时，默认 chunk/cache 为512 tokens/4096 MiB，仍可显式覆盖。
+脚本不读取历史测试脚本，
 不会自动编译/下载；启动前要求 GPU 空闲且 MemAvailable 至少100 GiB。
 Linux chat/bench 还复用 `MOLLM_CUDA_HOST_HEADROOM_MB` 每250ms检查可用内存；
 该 preset 的阈值为24 GiB。低于阈值或无法读取时，只终止模型进程并返回137，
@@ -89,8 +97,8 @@ logical-prefill 也自动请求已验证的 prefix、跳过零 PV 和 PV 维度�
 无需再设置 `MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1`、
 `MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1`、`MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1`。
 原有验证及形状限制不变，每个选项仍可显式设为 `0` 关闭；作用域之外默认关闭。
-注意：下述长 KV 优化与数值一致性仅针对当前 dense bring-up 诊断图，
-不表示完整 QSA 长上下文模型已实现。
+注意：下述长 KV 优化与数值一致性针对 dense bring-up 诊断图；
+companion 启用的 QSA 路径及验证范围见上述 QSA 状态文档。
 该 preset 现在自动选择已验证的长 KV attention PV 路径：保留原 QK/softmax，
 仅用 FP32 GEMM 替换 PV，无需额外启动开关或重新转换权重。选择范围为
 Qwen3.8 的 H24/KVH2/D256、32..2048 行和兼容布局，KV 容量可到32768。

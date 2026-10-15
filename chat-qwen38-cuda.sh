@@ -43,8 +43,21 @@ done
 if (( preset_dense && preset_qsa )); then
   echo '--dense-bringup conflicts with --qsa-companion.' >&2; exit 1
 fi
-if (( !preset_dense && !preset_qsa )) &&
-   [[ $(realpath -m -- "$preset_package") == $(realpath -m -- "$preset_default_package") ]]; then
+# Existing files can be compared by identity (including symlinks). For help
+# before downloading weights, compare the basename and physical parent path.
+# Failed directory resolution must never identify a custom package as default.
+preset_is_default_package() {
+  [[ $preset_package == "$preset_default_package" ||
+     $preset_package -ef $preset_default_package ]] && return 0
+  [[ ${preset_package##*/} == "${preset_default_package##*/}" ]] || return 1
+  local package_parent default_parent
+  package_parent=$(cd -P -- "$(dirname -- "$preset_package")" 2>/dev/null && pwd -P) || return 1
+  default_parent=$(cd -P -- "$(dirname -- "$preset_default_package")" 2>/dev/null && pwd -P) || return 1
+  [[ -n $package_parent && $package_parent == "$default_parent" ]]
+}
+preset_default=0
+if preset_is_default_package; then preset_default=1; fi
+if (( !preset_dense && !preset_qsa && preset_default )); then
   preset_qsa=1
   preset_companion_args=(--qsa-companion ../qwen38_qsa_bundle)
   if (( !preset_help )) && [[ ! -f ../qwen38_qsa_bundle/manifest.json ]]; then
@@ -68,7 +81,7 @@ if (( ! preset_help )); then
   if (( preset_qsa )); then
     echo 'QSA enabled: CUDA text, contiguous causal history, context<=262144 (memory-dependent); package uses dense W4/LM W8, not original BF16 precision.' >&2
   else
-    if [[ $(realpath -m -- "$preset_package") == $(realpath -m -- "$preset_default_package") ]]; then
+    if (( preset_default )); then
       echo 'WARNING: dense bring-up omits QSA; beyond2048 tokens this is a diagnostic model, not original long-context attention.' >&2
     else
       echo 'Explicit package override: no automatic QSA companion attached; verify the package attention/precision yourself.' >&2

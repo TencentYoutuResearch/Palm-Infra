@@ -80,6 +80,28 @@ class PresetTests(unittest.TestCase):
         result = self.run_case("--package", "another.mollm", "--package", "../qwen38_flash_next_nvfp4_calibrated.mollm")
         self.assertIn("--qsa-companion", result["args"])
 
+    def test_package_identity_without_gnu_realpath(self):
+        from unittest.mock import patch
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        realpath = bin_dir / "realpath"
+        realpath.write_text("#!/bin/sh\nexit 1\n")
+        realpath.chmod(0o755)
+        default = self.root.parent / "qwen38_flash_next_nvfp4_calibrated.mollm"
+        with patch.dict(os.environ, {"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}):
+            # Help must work even before the default package has been created.
+            for path in (str(default), "./../" + default.name):
+                self.assertIn("--qsa-companion", self.run_case("--package", path)["args"])
+            for path in ("another.mollm", "missing/" + default.name):
+                self.assertNotIn("--qsa-companion", self.run_case("--package", path)["args"])
+            default.touch()
+            alias = self.root / "model-alias.mollm"
+            alias.symlink_to(default)
+            self.assertIn("--qsa-companion", self.run_case("--package", str(alias))["args"])
+            other = self.root / default.name
+            other.touch()
+            self.assertNotIn("--qsa-companion", self.run_case("--package", str(other))["args"])
+
     def test_prompt_text_is_not_a_flag(self):
         result = self.run_case("--dense-bringup", "--prompt", "--qsa-companion")
         self.assertEqual(result["args"][-2:], ["--prompt", "--qsa-companion"])

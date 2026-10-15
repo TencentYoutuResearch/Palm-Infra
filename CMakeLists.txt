@@ -138,6 +138,7 @@ set(PUBLIC_ENGINE_HEADERS
 
 set(PUBLIC_CORE_HEADERS
     core/tensor.h
+    core/qsa_limits.h
     core/fp16.h
     core/rwkv_params.h
     core/gdn_params.h
