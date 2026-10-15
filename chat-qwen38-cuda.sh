@@ -96,6 +96,8 @@ if (( ! preset_help )); then
     exit 1
   fi
 fi
+# The guarded array expansions below also support Bash 3.2 + nounset, where
+# expanding an empty array directly raises an unbound-variable error.
 exec env \
   -u MOLLM_TEST_CUDA_QSA_DUMP \
   -u MOLLM_TEST_CUDA_QSA_COMPARE \
@@ -180,7 +182,7 @@ exec env \
   MOLLM_TEST_CUDA_SDPA_GEMM_SHADOW=0 \
   build_cuda/mollm_chat \
   --package ../qwen38_flash_next_nvfp4_calibrated.mollm \
-  "${preset_companion_args[@]}" \
+  ${preset_companion_args[@]+"${preset_companion_args[@]}"} \
   --device cuda --offload-ple --cuda-prefill-reclaim --cuda-prefill-logical-batch \
   --n-ctx 16384 --prefill-chunk-size "$preset_chunk" --threads 8 \
-  --max-new-tokens 512 --temperature 0.6 "${preset_forward_args[@]}"
+  --max-new-tokens 512 --temperature 0.6 ${preset_forward_args[@]+"${preset_forward_args[@]}"}

@@ -670,8 +670,9 @@ void run(int seq,int real,int heads,int values,bool timing) {
         }
         call(1);check(cudaDeviceSynchronize());
         if(prepare_comparison) {
-            for(auto item:{std::pair<const Buffer*,const std::vector<float>*>{&work,&original_work},
-                {&out1,&original_out},{&candidate,&original_state}}) {
+            const std::pair<const Buffer*,const std::vector<float>*> comparisons[]={
+                {&work,&original_work},{&out1,&original_out},{&candidate,&original_state}};
+            for(auto item:comparisons) {
                 compare_block_control(*item.first,*item.second,item.first==&work);
             }
         }
@@ -711,9 +712,12 @@ void run(int seq,int real,int heads,int values,bool timing) {
         }
         for(int mode=0;mode<2;++mode)check(cudaGraphLaunch(graphs[mode],cudaStreamPerThread));
         check(cudaStreamSynchronize(cudaStreamPerThread));require(error(out0,out1)<=1e-5&&error(ref,candidate)<=1e-5);guard(work);guard(grams);
-        if(prepare_comparison)for(auto item:{std::pair<const Buffer*,const std::vector<float>*>{&work,&original_work},
-            {&out1,&original_out},{&candidate,&original_state}}) {
-            compare_block_control(*item.first,*item.second,item.first==&work);
+        if(prepare_comparison) {
+            const std::pair<const Buffer*,const std::vector<float>*> comparisons[]={
+                {&work,&original_work},{&out1,&original_out},{&candidate,&original_state}};
+            for(auto item:comparisons) {
+                compare_block_control(*item.first,*item.second,item.first==&work);
+            }
         }
         check(cudaGraphLaunch(graphs[2],cudaStreamPerThread));
         check(cudaGraphLaunch(graphs[3],cudaStreamPerThread));

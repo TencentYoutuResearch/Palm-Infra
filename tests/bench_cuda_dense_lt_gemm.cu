@@ -310,7 +310,12 @@ int main(int argc,char** argv){
     else if(tile_finalists)run(classic,lt,1743,16480,2560,true,7,true,true);
     else if(tile_sweep)run(classic,lt,1743,16480,2560,true,3,true);
     else if(logical_sweep)for(int n:{16480,13312})run(classic,lt,1743,n,2560,true,7);
-    else if(remaining)for(int m:{1024,719})for(auto shape:{std::pair<int,int>{320,10240},{2560,6144},{6144,2560}})run(classic,lt,m,shape.first,shape.second,true,7);
-    else for(int m:{1024,719})for(auto shape:{std::pair<int,int>{320,2560},{640,2560},{2560,6144},{6144,2560},{10240,320},{13312,2560},{16480,2560}})run(classic,lt,m,shape.first,shape.second,!only);
+    else if(remaining) {
+        const std::pair<int,int> shapes[]={{320,10240},{2560,6144},{6144,2560}};
+        for(int m:{1024,719})for(auto shape:shapes)run(classic,lt,m,shape.first,shape.second,true,7);
+    } else {
+        const std::pair<int,int> shapes[]={{320,2560},{640,2560},{2560,6144},{6144,2560},{10240,320},{13312,2560},{16480,2560}};
+        for(int m:{1024,719})for(auto shape:shapes)run(classic,lt,m,shape.first,shape.second,!only);
+    }
     blas(cublasDestroy(classic));blas(cublasLtDestroy(lt));
 }

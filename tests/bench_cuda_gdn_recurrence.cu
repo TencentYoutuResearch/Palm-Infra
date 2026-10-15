@@ -101,8 +101,9 @@ static bool run(int sequence, int real, int heads, int values, bool timing, int 
         fill(decay, gate_count, replay, .0001f, .99f); fill(beta, gate_count, replay, .001f, .1f);
         fill(old_state, state_count, replay, .002f, 0.f);
         if(quad_values && replay>=3) {
-            for(auto item:{std::pair<Buffer*,size_t>{&qkv,qkv_count},{&q,qk_count},{&k,qk_count},
-                           {&dot,dot_count},{&old_state,state_count}}) {
+            const std::pair<Buffer*,size_t> buffers[]={{&qkv,qkv_count},{&q,qk_count},{&k,qk_count},
+                                                    {&dot,dot_count},{&old_state,state_count}};
+            for(auto item:buffers) {
                 for(size_t i=0;i<item.second;++i)host[i]=replay==3?((i&1)?-0.f:0.f):
                     replay==4?((i&1)?-1e-38f:1e-38f):replay==5?((i&1)?-1e20f:1e20f):
                     i%3==0?NAN:i%3==1?INFINITY:-INFINITY;

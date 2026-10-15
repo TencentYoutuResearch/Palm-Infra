@@ -140,17 +140,9 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
             std::string dev = argv[++i];
             if (dev == "cpu") opts.device = Device::CPU;
             else if (dev == "metal") {
-#ifdef MOLLM_METAL
                 opts.device = Device::METAL;
-#else
-                error = "--device metal requires a build with -DMOLLM_METAL=ON"; return false;
-#endif
             } else if (dev == "cuda") {
-#ifdef MOLLM_CUDA
                 opts.device = Device::CUDA;
-#else
-                error = "--device cuda requires a build with -DMOLLM_CUDA=ON"; return false;
-#endif
             } else { error = std::string("unknown --device '") + dev + "' (cpu|metal|cuda)"; return false; }
         } else if (arg == "--qsa-companion") {
             if (!require_value("--qsa-companion", value)) return false;
@@ -248,6 +240,20 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
          opts.n_ctx<1||opts.chunk_size>2048||opts.decode_after_prefill>2048)) {
         error="--cuda-prefill-logical-batch requires bounded CUDA resident+offload-PLE+reclaim, positive context, chunk/prefix<=2048";
         return false;
+    }
+    // Tokenization uses only package tokenizer sections. Defer build capability
+    // checks until all options are parsed so --tokenize-only is order independent.
+    if (!opts.tokenize_only) {
+#ifndef MOLLM_METAL
+        if (opts.device == Device::METAL) {
+            error = "--device metal requires a build with -DMOLLM_METAL=ON"; return false;
+        }
+#endif
+#ifndef MOLLM_CUDA
+        if (opts.device == Device::CUDA) {
+            error = "--device cuda requires a build with -DMOLLM_CUDA=ON"; return false;
+        }
+#endif
     }
     return true;
 }

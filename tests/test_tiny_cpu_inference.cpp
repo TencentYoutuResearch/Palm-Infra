@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 #include <sys/resource.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace {
 
@@ -271,7 +273,23 @@ int main(int argc, char** argv) {
         rlimit no_lock = old_limit;
         no_lock.rlim_cur = 0;
         CHECK(setrlimit(RLIMIT_MEMLOCK, &no_lock) == 0, "lower memlock soft limit");
-        CHECK(!engine.load(config), "failed locking does not silently use mmap");
+        // ASan intercepts mlock as a successful no-op; privileged processes can
+        // also bypass RLIMIT_MEMLOCK. Probe whether this failure injection works
+        // before expecting the engine to reject it. Inference/parity and reload
+        // checks still run in those environments.
+        const size_t probe_bytes = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        void* probe = mmap(nullptr, probe_bytes, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(probe != MAP_FAILED, "allocate memlock capability probe");
+        if (probe != MAP_FAILED) {
+            if (mlock(probe, probe_bytes) != 0) {
+                CHECK(!engine.load(config), "failed locking does not silently use mmap");
+            } else {
+                munlock(probe, probe_bytes);
+                std::printf("  SKIP: memlock failure injection unavailable (mlock succeeds at limit zero)\n");
+            }
+            munmap(probe, probe_bytes);
+        }
         CHECK(setrlimit(RLIMIT_MEMLOCK, &old_limit) == 0, "restore memlock limit");
         CHECK(engine.load(config), "engine recovers after failed resident load");
         CHECK(engine.prefill({1, 2}) >= 0, "reloaded engine can infer");

@@ -39,12 +39,16 @@ class TokenizeOnlyTests(unittest.TestCase):
             resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
         environment = os.environ.copy()
         environment.update(CUDA_VISIBLE_DEVICES="", MOLLM_CUDA_HOST_HEADROOM_MB="bad")
+        # Darwin rejects this RLIMIT_AS setting before exec. Keep all functional
+        # checks there; Linux additionally proves the 8 GiB payload is not mapped
+        # or copied under a 2 GiB address-space ceiling.
+        limit_address_space = bounded_address_space if sys.platform.startswith("linux") else None
         return subprocess.run([BINARY, "--package", str(self.package), "--text", "ab",
                                "--tokenize-only", *args], env=environment, text=True,
-                              capture_output=True, timeout=15, preexec_fn=bounded_address_space)
+                              capture_output=True, timeout=15, preexec_fn=limit_address_space)
 
     def test_sparse_weights_and_invalid_graphs_are_not_loaded(self):
-        for device in ("cpu", "cuda"):
+        for device in ("cpu", "cuda", "metal"):
             with self.subTest(device=device):
                 result = self.run_case("--device", device)
                 self.assertEqual(result.returncode, 0, result.stderr)

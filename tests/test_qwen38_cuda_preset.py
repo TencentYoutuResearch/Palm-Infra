@@ -32,7 +32,8 @@ class PresetTests(unittest.TestCase):
             env["MOLLM_CUDA_PREFILL_FP16_CACHE_MB"] = cache
         # --help deliberately bypasses all GPU/process/memory checks.
         result = subprocess.run(["bash", str(self.root / SCRIPT.name), "--help", *args],
-                                env=env, text=True, capture_output=True, check=True)
+                                env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
     def chunk(self, result):
