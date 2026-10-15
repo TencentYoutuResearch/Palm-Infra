@@ -30,6 +30,7 @@ bool half_products=false;
 int apply_threads=128;
 int timing_replays=16;
 constexpr int HalfSharedBytes=(D*32+2*C*32)*sizeof(float)+4*C*D*sizeof(__half);
+constexpr int PaddedStateSharedBytes=D*(32+8)*sizeof(float);
 __device__ void gemm_tf32_residual(const float*,int,const float*,int,float*,int,int,int,int,int=0,int=0);
 // Q/K heads are shared by several value heads. These two unweighted Gram
 // matrices are independent of value-head decay/beta and may be computed once.
@@ -314,7 +315,12 @@ __global__ void apply_tensor_core(const float* query,const float* key,const floa
     constexpr int Pitch=Columns+Padding,QPitch=D+Padding,KPitch=C+Padding;
     constexpr int OperandSize=D*KPitch>C*QPitch?D*KPitch:C*QPitch;
     static_assert(!StagedCoefficients||(Columns==32&&Padding==0&&SharedUpdate&&!DualProjection));
-    __shared__ __align__(32) float st[D*Pitch],h[C*Pitch],temp[C*Pitch],operand[OperandSize];
+    // The padded variant totals 50 KiB, above the 48 KiB static limit on
+    // SM80. Keep its state in opt-in dynamic shared memory instead.
+    __shared__ __align__(32) float static_state[Padding?1:D*Pitch];
+    extern __shared__ __align__(32) float dynamic_state[];
+    float* st=Padding?dynamic_state:static_state;
+    __shared__ __align__(32) float h[C*Pitch],temp[C*Pitch],operand[OperandSize];
     float* base=state+size_t(vh)*D*D;
     for(int i=tid;i<D*Columns;i+=blockDim.x)st[(i/Columns)*Pitch+i%Columns]=base[(i/Columns)*D+column+i%Columns];
     __syncthreads();
@@ -494,7 +500,7 @@ void launch_apply(const float* q,const float* k,const float* work,float* state,f
     else if(dual_projection)apply_tensor_core<32,0,true,true><<<dim3(4,values),256>>>(q,k,work,state,out,heads,values,seq,real,chunks,scale);
     else if(half_products)apply_half_products<<<dim3(4,values),apply_threads,HalfSharedBytes>>>(q,k,work,state,out,heads,values,seq,real,chunks,scale);
     else if(tensor_core&&shared_update)apply_tensor_core<32,0,true><<<dim3(4,values),apply_threads>>>(q,k,work,state,out,heads,values,seq,real,chunks,scale);
-    else if(tensor_core&&tensor_padding)apply_tensor_core<32,8><<<dim3(4,values),apply_threads>>>(q,k,work,state,out,heads,values,seq,real,chunks,scale);
+    else if(tensor_core&&tensor_padding)apply_tensor_core<32,8><<<dim3(4,values),apply_threads,PaddedStateSharedBytes>>>(q,k,work,state,out,heads,values,seq,real,chunks,scale);
     else if(tensor_core&&tensor_columns==32)apply_tensor_core<32><<<dim3(4,values),apply_threads>>>(q,k,work,state,out,heads,values,seq,real,chunks,scale);
     else if(tensor_core)apply_tensor_core<16><<<dim3(8,values),apply_threads>>>(q,k,work,state,out,heads,values,seq,real,chunks,scale);
     else apply<<<dim3(16,values),64>>>(q,k,work,state,out,heads,values,seq,real,chunks,scale);
@@ -779,6 +785,12 @@ int main(int argc,char** argv) {
         if(prop.sharedMemPerBlockOptin<HalfSharedBytes)return 77;
         check(cudaFuncSetAttribute(apply_half_products,cudaFuncAttributeMaxDynamicSharedMemorySize,HalfSharedBytes));
     }
+    if(tensor_padding) {
+        cudaFuncAttributes attributes;
+        check(cudaFuncGetAttributes(&attributes,apply_tensor_core<32,8>));
+        if(prop.sharedMemPerBlockOptin<attributes.sharedSizeBytes+PaddedStateSharedBytes)return 77;
+        check(cudaFuncSetAttribute(apply_tensor_core<32,8>,cudaFuncAttributeMaxDynamicSharedMemorySize,PaddedStateSharedBytes));
+    }
     std::printf("apply_mode=%s value_tile=%d padding=%d tensor_prepare=%d tensor_coeff=%d shared_update=%d apply_threads=%d\n",half_products?"half_three_products":tensor_core?"tf32_three_products":"scalar_fp32",tensor_columns,tensor_padding?8:0,tensor_prepare,tensor_coeff,shared_update,apply_threads);
     std::printf("device=%s sms=%d shared_per_sm=%zu\n",prop.name,prop.multiProcessorCount,prop.sharedMemPerMultiprocessor);
     std::printf("internal_chunk_rows=%d prefill_input_shape_unchanged=true\n",C);
@@ -788,7 +800,7 @@ int main(int argc,char** argv) {
     else if(dual_projection){occupancy("dual_projection",apply_tensor_core<32,0,true,true>,256,0,prop);occupancy("original_apply",apply_tensor_core<32,0,true>,256,0,prop);}
     else if(half_products)occupancy("half_products",apply_half_products,apply_threads,HalfSharedBytes,prop);
     else if(shared_update)occupancy("tf32_shared_update",apply_tensor_core<32,0,true>,apply_threads,0,prop);
-    else if(tensor_padding)occupancy("tf32_padded",apply_tensor_core<32,8>,apply_threads,0,prop);
+    else if(tensor_padding)occupancy("tf32_padded",apply_tensor_core<32,8>,apply_threads,PaddedStateSharedBytes,prop);
     else if(tensor_core&&tensor_columns==32)occupancy("tf32_tile32",apply_tensor_core<32>,apply_threads,0,prop);
     else if(tensor_core)occupancy("tf32_tile16",apply_tensor_core<16>,apply_threads,0,prop);
     else occupancy("scalar_block",apply,64,0,prop);
