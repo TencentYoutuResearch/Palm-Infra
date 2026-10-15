@@ -611,7 +611,7 @@ if(MOLLM_CUDA)
             target_link_libraries(bench_cuda_nvfp4_bf16_tile PRIVATE mollm_lib)
             target_compile_options(bench_cuda_nvfp4_bf16_tile PRIVATE
                 $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
-            set_target_properties(bench_cuda_nvfp4_bf16_tile PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 121a)
+            set_target_properties(bench_cuda_nvfp4_bf16_tile PROPERTIES CUDA_STANDARD 17)
         endif()
     endif()
 endif()
