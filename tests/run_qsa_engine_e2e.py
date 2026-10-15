@@ -71,7 +71,10 @@ def main():
                                                       precision=graph_node.out_prec.name,
                                                       sha256=hashlib.sha256(payload).hexdigest())
         (bundle / "manifest.json").write_text(json.dumps(manifest))
-        subprocess.run([sys.argv[1], str(package), str(dense_package), str(bundle)], check=True)
+        result = subprocess.run([sys.argv[1], str(package), str(dense_package), str(bundle)])
+        if result.returncode == 77:
+            return 77
+        result.check_returncode()
         # Failure paths must not silently revert to dense attention.
         reference = next(iter(manifest["weights"]))
         for mutate in (lambda m: m["weights"][reference].update(sha256="0" * 64),
@@ -86,4 +89,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

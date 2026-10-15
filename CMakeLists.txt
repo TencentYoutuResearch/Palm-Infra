@@ -1374,7 +1374,7 @@ if(MOLLM_BUILD_TESTS)
             SKIP_RETURN_CODE 77 LABELS "cuda")
         set_tests_properties(test_cuda_backend_narrow_pipeline PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_Q4_NARROW_PIPELINE=1"
-            LABELS "cuda")
+            LABELS "cuda" SKIP_RETURN_CODE 77)
         add_test(NAME test_cuda_backend_shared_overlap COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_moe_prefill_half_reuse COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_moe_prefill_half_reuse PROPERTIES

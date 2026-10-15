@@ -1,4 +1,7 @@
 #include "engine/engine.h"
+#ifdef MOLLM_CUDA
+#include "backends/cuda/backend.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -103,7 +106,12 @@ int main(int argc, char** argv) {
     const char* companion = argc == 3 ? argv[2] : nullptr;
     if (!run(argv[1], Device::CPU, companion)) return 1;
 #ifdef MOLLM_CUDA
-    if (!run(argv[1], Device::CUDA, companion)) return 1;
+    CudaBackend probe;
+    if (probe.available()) {
+        if (!run(argv[1], Device::CUDA, companion)) return 1;
+    } else {
+        std::printf("SKIP: CUDA MTP checks require an available CUDA device; CPU checks passed\n");
+    }
 #endif
     return 0;
 }
