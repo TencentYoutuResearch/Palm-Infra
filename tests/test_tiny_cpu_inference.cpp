@@ -278,17 +278,17 @@ int main(int argc, char** argv) {
         // before expecting the engine to reject it. Inference/parity and reload
         // checks still run in those environments.
         const size_t probe_bytes = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-        void* probe = mmap(nullptr, probe_bytes, PROT_READ | PROT_WRITE,
+        void* memlock_probe = mmap(nullptr, probe_bytes, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        CHECK(probe != MAP_FAILED, "allocate memlock capability probe");
-        if (probe != MAP_FAILED) {
-            if (mlock(probe, probe_bytes) != 0) {
+        CHECK(memlock_probe != MAP_FAILED, "allocate memlock capability probe");
+        if (memlock_probe != MAP_FAILED) {
+            if (mlock(memlock_probe, probe_bytes) != 0) {
                 CHECK(!engine.load(config), "failed locking does not silently use mmap");
             } else {
-                munlock(probe, probe_bytes);
+                munlock(memlock_probe, probe_bytes);
                 std::printf("  SKIP: memlock failure injection unavailable (mlock succeeds at limit zero)\n");
             }
-            munmap(probe, probe_bytes);
+            munmap(memlock_probe, probe_bytes);
         }
         CHECK(setrlimit(RLIMIT_MEMLOCK, &old_limit) == 0, "restore memlock limit");
         CHECK(engine.load(config), "engine recovers after failed resident load");
