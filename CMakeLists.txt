@@ -159,6 +159,7 @@ set(PUBLIC_RUNTIME_HEADERS
     runtime/trace.h
     runtime/host_buffer_pool.h
     runtime/host_compute.h
+    runtime/host_matmul_backend.h
 )
 
 set(PUBLIC_CPU_BACKEND_HEADERS
@@ -586,7 +587,8 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_stq1_0        tests/test_stq1_0.cpp)
     add_executable(gguf_k_decode_dump tests/gguf_k_decode_dump.cpp)
     target_link_libraries(gguf_k_decode_dump PRIVATE mollm_lib)
-    add_mollm_test(stq1_0_crosscheck  tests/stq1_0_crosscheck.cpp)
+    add_executable(stq1_0_crosscheck tests/stq1_0_crosscheck.cpp)
+    target_link_libraries(stq1_0_crosscheck PRIVATE mollm_lib)
     # Not a test but a decoder dump the Python GGUF reader is diffed against
     # (see models/verify_gguf_reader.py). It takes a block file as an argument,
     # so it is added as a plain executable rather than through add_mollm_test,
@@ -630,6 +632,8 @@ if(MOLLM_BUILD_TESTS)
                               test_qwen4_exp_graph.py)
         add_mollm_python_test(test_hy4_graph
                               test_hy4_graph.py)
+        add_mollm_python_test(test_hy4_mla_weights
+                              test_hy4_mla_weights.py)
         add_mollm_python_test(test_qwen35_quant_policy
                               test_qwen35_quant_policy.py)
         add_mollm_python_test(test_qwen35_moe_quant_policy
