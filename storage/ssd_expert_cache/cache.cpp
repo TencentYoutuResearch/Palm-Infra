@@ -712,7 +712,7 @@ bool MoeSsdCache::load_resident(const std::vector<std::pair<
             std::lock_guard<std::mutex> lock(mutex_);
             const Entry* entry = find_entry_locked(gate, down, expert);
             const auto locked = [](const ByteBuffer& buffer) {
-                return buffer.empty() || buffer.locked;
+                return buffer.empty() || buffer.is_locked();
             };
             if (!entry || !locked(entry->gate_up_data) ||
                 !locked(entry->gate_up_scales) || !locked(entry->down_data) ||

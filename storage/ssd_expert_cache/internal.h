@@ -275,6 +275,7 @@ struct MoeSsdCache::ByteBuffer {
         if (locked_bytes) munlock(storage, locked_bytes);
         locked_bytes = 0;
     }
+    bool is_locked() const { return arena ? arena->locked : locked_bytes == active_bytes; }
     bool empty() const { return length == 0; }
     size_t size() const { return length; }
     size_t capacity_bytes() const { return !arena && read_alignment ? active_bytes : length; }
@@ -324,6 +325,7 @@ struct MoeSsdCache::ByteBuffer {
     bool empty() const { return length == 0; }
     size_t size() const { return length; }
     size_t capacity_bytes() const { return length; }
+    bool is_locked() const { return locked; }
     uint8_t* data() { return arena ? slice : storage.get(); }
     const uint8_t* data() const { return arena ? slice : storage.get(); }
 };
