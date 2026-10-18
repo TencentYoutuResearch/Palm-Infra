@@ -133,6 +133,29 @@ static bool gguf_native_matmul_matches_block_decoder() {
                 magnitude[m * N + n] = abs64;
             }
         }
+        if (format == Precision::GGUF_Q4_K) {
+            // Independently force each FP32 rounding; an explicit FMA is a
+            // negative control for compiler contraction of the strict oracle.
+            volatile float ordered = 0.0f;
+            float fused = 0.0f;
+            for (int block = 0; block < 2; ++block) {
+                if (!gguf_k_dequantize_block(format, encoded.data() + block * bytes_per_block,
+                                             decoded.data()))
+                    return false;
+                for (int k = 0; k < values_per_block; ++k) {
+                    const float x = input[block * values_per_block + k];
+                    volatile float product = x * decoded[k];
+                    ordered = ordered + product;
+                    fused = std::fma(x, decoded[k], fused);
+                }
+            }
+            if (output[0] != ordered || reference[0] != ordered || fused == ordered) {
+                std::fprintf(stderr,
+                             "  Q4_K rounding: kernel %.9g reference %.9g ordered %.9g fused %.9g\n",
+                             output[0], reference[0], float(ordered), fused);
+                return false;
+            }
+        }
         for (int i = 0; i < M * N; ++i) {
             if (!std::isfinite(output[i]) || output[i] != reference[i]) {
                 std::fprintf(stderr,

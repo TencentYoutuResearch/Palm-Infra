@@ -1,5 +1,6 @@
 #include "kernels/cpu/models/mla_absorbed_attention.h"
 #include "core/cache_layout.h"
+#include "core/fp16.h"
 #include "graph/graph.h"
 
 #include <algorithm>
