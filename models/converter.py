@@ -119,6 +119,10 @@ def main():
     if text_only and model_type != "qwen3_5":
         print("Error: --text-only currently applies only to qwen3_5 checkpoints")
         sys.exit(1)
+    if model_type == "hy_v4" and quant != "fp16":
+        print("Error: Hy4 checkpoints support only fp16 through this converter; "
+              "use hy4.py for native GGUF conversion")
+        sys.exit(1)
 
     mod_name, func_name = SUPPORTED_MODELS[model_type]
 
@@ -134,10 +138,9 @@ def main():
     # Import and dispatch
     module = __import__(mod_name)
     convert_fn = getattr(module, func_name)
-    kwargs = {
-        "prefill_seq_len": prefill_seq_len,
-        "quant": quant,
-    }
+    kwargs = {"prefill_seq_len": prefill_seq_len}
+    if model_type != "hy_v4":
+        kwargs["quant"] = quant
     if model_type == "qwen3_5":
         kwargs["include_vision"] = not text_only
     convert_fn(model_dir, output_path, **kwargs)

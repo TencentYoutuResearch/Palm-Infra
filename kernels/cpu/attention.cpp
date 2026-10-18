@@ -149,7 +149,7 @@ static void flash_attn_fp32_decode(
 static void flash_attn_fp32_prefill_selected(
     const float* Q, const float* K, const float* V, float* O,
     const int32_t* selected, int n, int d_k, int d_v, float scale,
-    int visible_limit, const float* sink = nullptr)
+    int visible_limit, const float* mask_row, const float* sink = nullptr)
 {
     float m = sink ? *sink : -FLT_MAX;
     float l = sink ? 1.f : 0.f;
@@ -157,7 +157,9 @@ static void flash_attn_fp32_prefill_selected(
     for (int j = 0; j < n; j++) {
         const int pos = selected[j];
         if (pos < 0 || pos > visible_limit) continue;
-        const float s = dot_fp32_neon(Q, K + (size_t)pos * d_k, d_k) * scale;
+        const float s = dot_fp32_neon(Q, K + (size_t)pos * d_k, d_k) * scale +
+                        (mask_row ? mask_row[pos] : 0.f);
+        if (!std::isfinite(s)) continue;
         const float m_new = fmaxf(m, s);
         const float alpha = fast_exp_f32(m - m_new);
         const float p = fast_exp_f32(s - m_new);
@@ -191,7 +193,7 @@ static void flash_attn_fp32_prefill_selected(
 static void flash_attn_fp32_decode_selected(
     const float* Q, const float* K, const float* V, float* O,
     const int32_t* selected, int n, int d_k, int d_v, float scale,
-    int visible_limit, const float* sink = nullptr)
+    int visible_limit, const float* mask_row, const float* sink = nullptr)
 {
     const int Bc = 32;
     const bool sparse = selected != nullptr;
@@ -210,7 +212,8 @@ static void flash_attn_fp32_decode_selected(
                 scores[j] = -INFINITY;
                 continue;
             }
-            scores[j] = dot_fp32_neon(Q, K + (size_t)pos * d_k, d_k) * scale;
+            scores[j] = dot_fp32_neon(Q, K + (size_t)pos * d_k, d_k) * scale +
+                        (mask_row ? mask_row[pos] : 0.f);
         }
         float m_block = scores[0];
         for (int j = 1; j < bc; j++) m_block = fmaxf(m_block, scores[j]);
@@ -230,7 +233,7 @@ static void flash_attn_fp32_decode_selected(
         l *= alpha;
         for (int j = 0; j < bc; j++) {
             const int pos = sparse ? selected[jb + j] : (jb + j);
-            if (pos < 0 || pos > visible_limit) continue;
+            if (pos < 0 || pos > visible_limit || !std::isfinite(scores[j])) continue;
             const float p = fast_exp_f32(scores[j] - m_new);
             l += p;
             const float* vj = V + (size_t)pos * d_v;
@@ -635,7 +638,7 @@ static void flash_attn_fp16_decode(
                 scores[j] = (pos < 0)
                     ? -INFINITY
                     : dot_fp16_neon(Q, K + (size_t)pos * d_k, d_k) * scale;
-                if (pos >= 0 && mask) scores[j] += mask[jb + j];
+                if (pos >= 0 && mask) scores[j] += mask[pos];
             }
         } else {
             int j = 0;
@@ -686,14 +689,19 @@ static void flash_attn_fp16_decode(
             float32x4_t vl = vdupq_n_f32(0.f);
             int j = 0;
             for (; j + 3 < bc; j += 4) {
-                float32x4_t s4 = vsubq_f32(vld1q_f32(scores + j), vm_new);
+                const float32x4_t score4 = vld1q_f32(scores + j);
+                float32x4_t s4 = vsubq_f32(score4, vm_new);
                 float32x4_t p4 = fast_exp_f32x4(s4);
+                if (sparse)
+                    p4 = vbslq_f32(vcleq_f32(vabsq_f32(score4), vdupq_n_f32(FLT_MAX)),
+                                   p4, vdupq_n_f32(0.f));
                 vst1q_f32(scores + j, p4);
                 vl = vaddq_f32(vl, p4);
             }
             l += vaddvq_f32(vl);
             for (; j < bc; j++) {
-                scores[j] = fast_exp_f32(scores[j] - m_new);
+                scores[j] = sparse && !std::isfinite(scores[j])
+                    ? 0.f : fast_exp_f32(scores[j] - m_new);
                 l += scores[j];
             }
         }
@@ -806,8 +814,11 @@ static void flash_attn_fp16_decode(
             // Scalar tail
             for (; d_start < d_v; d_start++) {
                 float o0 = O_fp32[d_start];
-                for (int j = 0; j < bc; j++)
-                    o0 += scores[j] * (float)V[(jb + j) * d_v + d_start];
+                for (int j = 0; j < bc; j++) {
+                    const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    o0 += scores[j] * (float)V[(size_t)vpos * d_v + d_start];
+                }
                 O_fp32[d_start] = o0;
             }
         }
@@ -895,8 +906,8 @@ static void flash_attn_fp16_prefill(
                         S[i][j] = (pos < 0)
                             ? -INFINITY
                             : dot_fp16_neon(qi, K + (size_t)pos * d_k, d_k) * scale;
-                        if (pos >= 0 && mask)
-                            S[i][j] += mask[(ib + i) * N + jb + j];
+                        // The sparse entry invokes this kernel for one query at a time.
+                        if (pos >= 0 && mask) S[i][j] += mask[pos];
                     }
                 }
             } else {
@@ -972,14 +983,19 @@ static void flash_attn_fp16_prefill(
                     float32x4_t vl = vdupq_n_f32(0.f);
                     int j = 0;
                     for (; j + 3 < bc; j += 4) {
-                        float32x4_t s4 = vsubq_f32(vld1q_f32(&S[i][j]), vm_new);
+                        const float32x4_t score4 = vld1q_f32(&S[i][j]);
+                        float32x4_t s4 = vsubq_f32(score4, vm_new);
                         float32x4_t p4 = fast_exp_f32x4(s4);
+                        if (sparse)
+                            p4 = vbslq_f32(vcleq_f32(vabsq_f32(score4), vdupq_n_f32(FLT_MAX)),
+                                           p4, vdupq_n_f32(0.f));
                         vst1q_f32(P + j, p4);
                         vl = vaddq_f32(vl, p4);
                     }
                     l_block = vaddvq_f32(vl);
                     for (; j < bc; j++) {
-                        P[j] = fast_exp_f32(S[i][j] - m_new);
+                        P[j] = sparse && !std::isfinite(S[i][j])
+                            ? 0.f : fast_exp_f32(S[i][j] - m_new);
                         l_block += P[j];
                     }
                 }
@@ -1082,8 +1098,8 @@ static void flash_attn_fp16_prefill(
                     if (vpos < 0) continue;
                     const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                         float16x4_t vp = vdup_n_f16((__fp16)p);
-                        // Load 4 FP16 values into low half of a FP16x8 for FMLAL.
-                        float16x8_t v0 = vld1q_f16(vj);
+                        const float16x4_t v0_low = vld1_f16(vj);
+                        float16x8_t v0 = vcombine_f16(v0_low, v0_low);
                         o0 = vfmlalq_lane_low_f16(o0, v0, vp, 0);
                     }
                     vst1q_f32(oi + d_start, o0);
@@ -1092,7 +1108,9 @@ static void flash_attn_fp16_prefill(
                 for (; d_start < d_v; d_start++) {
                     float acc = oi[d_start];
                     for (int j = 0; j < bc; j++) {
-                        acc += P[j] * (float)V[(jb + j) * d_v + d_start];
+                        const int vpos = key_pos(jb + j);
+                        if (vpos < 0) continue;
+                        acc += P[j] * (float)V[(size_t)vpos * d_v + d_start];
                     }
                     oi[d_start] = acc;
                 }
@@ -1124,10 +1142,14 @@ static void flash_attn_fp16_prefill(
 
 #if !HAS_NEON
 
-static inline void softmax_row(float* row, int len) {
-    float max_val = -INFINITY;
+static inline void softmax_row(float* row, int len, const float* sink) {
+    float max_val = sink ? *sink : -INFINITY;
     for (int i = 0; i < len; i++) max_val = fmaxf(max_val, row[i]);
-    float sum = 0.f;
+    if (!std::isfinite(max_val)) {
+        std::fill(row, row + len, 0.f);
+        return;
+    }
+    float sum = sink ? expf(*sink - max_val) : 0.f;
     for (int i = 0; i < len; i++) { row[i] = expf(row[i] - max_val); sum += row[i]; }
     float inv_sum = 1.f / sum;
     for (int i = 0; i < len; i++) row[i] *= inv_sum;
@@ -1135,7 +1157,8 @@ static inline void softmax_row(float* row, int len) {
 
 static void naive_sdpa_head(
     const float* Q, const float* K, const float* V, float* O,
-    int M, int N, int d_k, int d_v, float scale, const float* mask)
+    int M, int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink)
 {
     float* qk_row = new float[N];
     for (int s = 0; s < M; s++) {
@@ -1147,7 +1170,7 @@ static void naive_sdpa_head(
             qk_row[j] = dot * scale;
             if (mask) qk_row[j] += mask[s * N + j];
         }
-        softmax_row(qk_row, N);
+        softmax_row(qk_row, N, sink);
         float* o = O + s * d_v;
         memset(o, 0, d_v * sizeof(float));
         for (int j = 0; j < N; j++) {
@@ -1163,7 +1186,8 @@ static void naive_sdpa_head(
 static void naive_sdpa_head_fp16_cache(
     const float* Q, const mollm::cpu::fp16_t* K,
     const mollm::cpu::fp16_t* V, float* O,
-    int M, int N, int d_k, int d_v, float scale, const float* mask) {
+    int M, int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink) {
     float* qk_row = new float[N];
     for (int s = 0; s < M; ++s) {
         const float* q = Q + static_cast<size_t>(s) * d_k;
@@ -1177,7 +1201,7 @@ static void naive_sdpa_head_fp16_cache(
                 qk_row[position] += mask[static_cast<size_t>(s) * N +
                                          position];
         }
-        softmax_row(qk_row, N);
+        softmax_row(qk_row, N, sink);
         float* output = O + static_cast<size_t>(s) * d_v;
         std::memset(output, 0, static_cast<size_t>(d_v) * sizeof(float));
         for (int position = 0; position < N; ++position) {
@@ -1191,68 +1215,41 @@ static void naive_sdpa_head_fp16_cache(
     delete[] qk_row;
 }
 
+template <typename CacheValue>
+static void naive_sdpa_selected(
+        const float* q, const CacheValue* k, const CacheValue* v, float* out,
+        const int32_t* selected, int width, int head_dim, int v_head_dim,
+        float scale, int visible_limit, const float* mask_row, const float* sink) {
+    std::fill(out, out + v_head_dim, 0.f);
+    float maximum = sink ? *sink : -INFINITY;
+    float denominator = sink ? 1.f : 0.f;
+    for (int slot = 0; slot < width; ++slot) {
+        const int position = selected[slot];
+        if (position < 0 || position > visible_limit) continue;
+        const CacheValue* key = k + size_t(position) * head_dim;
+        float dot = 0.f;
+        for (int dim = 0; dim < head_dim; ++dim)
+            dot += q[dim] * static_cast<float>(key[dim]);
+        const float score = dot * scale + (mask_row ? mask_row[position] : 0.f);
+        if (!std::isfinite(score)) continue;
+        const float next_maximum = std::max(maximum, score);
+        const float old_factor = denominator > 0.f ? std::exp(maximum - next_maximum) : 0.f;
+        const float probability = std::exp(score - next_maximum);
+        const CacheValue* value = v + size_t(position) * v_head_dim;
+        for (int dim = 0; dim < v_head_dim; ++dim)
+            out[dim] = out[dim] * old_factor + probability * static_cast<float>(value[dim]);
+        denominator = denominator * old_factor + probability;
+        maximum = next_maximum;
+    }
+    if (denominator > 0.f)
+        for (int dim = 0; dim < v_head_dim; ++dim) out[dim] /= denominator;
+}
+
 #endif // !HAS_NEON
 
 // ---------------------------------------------------------------------------
 // kernel_sdpa
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Sparse SDPA (Hy4 Gated DeepSeek Sparse Attention)
-//
-// A selection is INT32 [width, seq]: one ranked list of cache positions per
-// query position, descending by score, with -1 padding the unused tail.
-//
-// The selection is per query position, which rules out a flat membership
-// table, and the lists are long (Hy4: 2048), so testing each of the N cache
-// positions for membership would cost more than dense attention. The only
-// workable shape is index-driven: visit the selected positions directly.
-//
-// flash_attn_* walks a contiguous 0..N-1 key range, so the selected keys are
-// gathered into compact per-head buffers first and the existing kernels then
-// run unmodified over width entries instead of N. That keeps the numerical
-// path identical to the dense one and lets the two be validated separately.
-//
-// Cost note: the gather copies width keys per query position. For decode
-// (seq 1) that is negligible; for prefill it is width * head_dim * seq bytes,
-// which is why prefill sparse is the expensive direction.
-// ---------------------------------------------------------------------------
-
-// Gather the selected keys/values for one query position and head into
-// contiguous scratch, in rank order. Returns the number of entries written.
-// `mask_out`, when given, receives the additive causal mask for the gathered
-// entries: 0 for a visible position and -inf for one that is not. Causality is
-// re-applied here rather than assumed, because the selection may name future
-// positions (the kernel must not silently attend to them).
-inline int gather_selected_kv(
-    const int32_t* token_selection, int width, int capacity,
-    int visible_limit,
-    const void* k_head, const void* v_head, size_t element_bytes,
-    int head_dim, int v_head_dim,
-    std::vector<uint8_t>& k_out, std::vector<uint8_t>& v_out,
-    std::vector<float>* mask_out) {
-    const uint8_t* k_src = static_cast<const uint8_t*>(k_head);
-    const uint8_t* v_src = static_cast<const uint8_t*>(v_head);
-    const size_t k_row = static_cast<size_t>(head_dim) * element_bytes;
-    const size_t v_row = static_cast<size_t>(v_head_dim) * element_bytes;
-    int count = 0;
-    for (int rank = 0; rank < width; ++rank) {
-        const int position = token_selection[rank];
-        if (position < 0)
-            break;                       // -1 marks the start of the tail
-        if (position >= capacity)
-            continue;                    // beyond the valid cache range
-        std::memcpy(k_out.data() + static_cast<size_t>(count) * k_row,
-                    k_src + static_cast<size_t>(position) * k_row, k_row);
-        std::memcpy(v_out.data() + static_cast<size_t>(count) * v_row,
-                    v_src + static_cast<size_t>(position) * v_row, v_row);
-        if (mask_out)
-            (*mask_out)[static_cast<size_t>(count)] =
-                (position <= visible_limit) ? 0.0f : -INFINITY;
-        ++count;
-    }
-    return count;
-}
 
 void kernel_sdpa(const SdpaParams& params,
                  const std::vector<const Tensor*>& inputs,
@@ -1499,7 +1496,8 @@ void kernel_sdpa(const SdpaParams& params,
                 float* O_head = (float*)out.channel<unsigned char>(h);
                 naive_sdpa_head_fp16_cache(
                     Q_head, K_head, V_head, O_head, src_seqlen,
-                    dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);
+                    dst_seqlen, head_dim, v_head_dim, scale, mask_ptr,
+                    params.sink ? params.sink + h : nullptr);
                 continue;
             }
             const float* K_head =
@@ -1508,7 +1506,7 @@ void kernel_sdpa(const SdpaParams& params,
                 static_cast<const float*>(get_v_ptr(kv_h));
             float* O_head = (float*)out.channel<unsigned char>(h);
 #if defined(MOLLM_CPU_X86_SIMD)
-            if (mollm::cpu::capabilities().x86_avx512) {
+            if (!params.sink && mollm::cpu::capabilities().x86_avx512) {
                 sdpa_x86_avx512_head(
                     Q_head, K_head, V_head, O_head, src_seqlen, dst_seqlen,
                     head_dim, v_head_dim, scale, mask_ptr);
@@ -1517,7 +1515,7 @@ void kernel_sdpa(const SdpaParams& params,
 #endif
             naive_sdpa_head(Q_head, K_head, V_head, O_head,
                             src_seqlen, dst_seqlen, head_dim, v_head_dim,
-                            scale, mask_ptr);
+                            scale, mask_ptr, params.sink ? params.sink + h : nullptr);
         }
     };
     if (thread_pool && num_heads >= 2) {
@@ -1603,10 +1601,10 @@ void kernel_sdpa_sparse(const SdpaParams& params,
 
     const Tensor& K_cur = *inputs[1];
     const Tensor& V_cur = *inputs[2];
-    // Causality is re-applied per entry inside the kernels below
-    // (`visible_limit`); it is NOT inherited from the indexer, whose ranking
-    // is a heuristic the attention math must not depend on. inputs[3] is
-    // deliberately unused -- the mask is folded into the visibility limit.
+    // Selection ranks are not mask positions: each query uses the original
+    // additive-mask row, indexed by the selected key's cache position.
+    const Tensor* mask =
+        (inputs.size() > 3 && inputs[3] && inputs[3]->data) ? inputs[3] : nullptr;
     const Tensor* K_cache =
         (inputs.size() > 4 && inputs[4] && inputs[4]->data) ? inputs[4] : nullptr;
     const Tensor* V_cache =
@@ -1690,19 +1688,8 @@ void kernel_sdpa_sparse(const SdpaParams& params,
     };
 
     const int32_t* selection_data = selection->ptr<int32_t>();
-    const size_t element_bytes =
-        cache_is_fp16 ? sizeof(__fp16) : sizeof(float);
-
-    // One scratch set per thread: gathered K/V plus a single contiguous query
-    // row. The prefill kernels index Q as Q + row*d_k, so a strided query row
-    // has to be staged the same way the keys are.
+    // Visit selected cache rows directly; no key/value gather is needed.
     auto run_head = [&](int, int h_begin, int h_end) {
-        std::vector<uint8_t> k_gather(
-            static_cast<size_t>(width) * head_dim * element_bytes);
-        std::vector<uint8_t> v_gather(
-            static_cast<size_t>(width) * v_head_dim * element_bytes);
-        std::vector<float> q_stage(static_cast<size_t>(head_dim));
-        std::vector<float> causal_mask(static_cast<size_t>(width));
         for (int h = h_begin; h < h_end; h++) {
             const int kv_h = h / heads_per_group;
             const void* k_head = get_k_ptr(kv_h);
@@ -1714,9 +1701,11 @@ void kernel_sdpa_sparse(const SdpaParams& params,
             for (int s = 0; s < src_seqlen; s++) {
                 const int32_t* token_selection =
                     selection_data + static_cast<size_t>(s) * width;
-                // Each kernel re-applies causality against the positions the
-                // selection names, so pass the query's visibility limit.
-                const int visible_limit = past_seqlen + s;
+                const int visible_limit = params.causal
+                    ? std::min(past_seqlen + s, dst_seqlen - 1) : dst_seqlen - 1;
+                const float* head_sink = params.sink ? params.sink + h : nullptr;
+                const float* mask_row = mask ? reinterpret_cast<const float*>(
+                    static_cast<const char*>(mask->data) + size_t(s) * mask->stride[1]) : nullptr;
                 const float* q_row = Q.ptr<float>() +
                     static_cast<size_t>(s) * Q.stride[1] / sizeof(float) +
                     static_cast<size_t>(h) * Q.stride[2] / sizeof(float);
@@ -1724,6 +1713,7 @@ void kernel_sdpa_sparse(const SdpaParams& params,
                     out.stride[1] / sizeof(float);
                 const int width_for_query = width;
 
+#if HAS_NEON
                 if (cache_is_fp16) {
                     std::vector<__fp16> q16(static_cast<size_t>(head_dim));
                     for (int d = 0; d < head_dim; d++)
@@ -1734,7 +1724,7 @@ void kernel_sdpa_sparse(const SdpaParams& params,
                             static_cast<const __fp16*>(k_head),
                             static_cast<const __fp16*>(v_head), o_row,
                             width_for_query, head_dim, v_head_dim, scale,
-                            nullptr, nullptr,
+                            mask_row, head_sink,
                             token_selection, visible_limit);
                     } else {
                         // One query row per call; the prefill kernel walks M=1.
@@ -1743,7 +1733,7 @@ void kernel_sdpa_sparse(const SdpaParams& params,
                             static_cast<const __fp16*>(k_head),
                             static_cast<const __fp16*>(v_head), o_row,
                             1, width_for_query, head_dim, v_head_dim, scale,
-                            nullptr, nullptr,
+                            mask_row, head_sink,
                             token_selection, visible_limit);
                     }
                 } else {
@@ -1752,15 +1742,29 @@ void kernel_sdpa_sparse(const SdpaParams& params,
                             q_row, static_cast<const float*>(k_head),
                             static_cast<const float*>(v_head), o_row,
                             token_selection, width_for_query, head_dim,
-                            v_head_dim, scale, visible_limit, nullptr);
+                            v_head_dim, scale, visible_limit, mask_row, head_sink);
                     } else {
                         flash_attn_fp32_prefill_selected(
                             q_row, static_cast<const float*>(k_head),
                             static_cast<const float*>(v_head), o_row,
                             token_selection, width_for_query, head_dim,
-                            v_head_dim, scale, visible_limit, nullptr);
+                            v_head_dim, scale, visible_limit, mask_row, head_sink);
                     }
                 }
+#else
+                if (cache_is_fp16) {
+                    naive_sdpa_selected(q_row,
+                        static_cast<const mollm::cpu::fp16_t*>(k_head),
+                        static_cast<const mollm::cpu::fp16_t*>(v_head), o_row,
+                        token_selection, width_for_query, head_dim, v_head_dim,
+                        scale, visible_limit, mask_row, head_sink);
+                } else {
+                    naive_sdpa_selected(q_row,
+                        static_cast<const float*>(k_head), static_cast<const float*>(v_head), o_row,
+                        token_selection, width_for_query, head_dim, v_head_dim,
+                        scale, visible_limit, mask_row, head_sink);
+                }
+#endif
             }
         }
     };

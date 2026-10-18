@@ -424,6 +424,45 @@ def test_convert_rejects_non_hy4():
     print("  PASS: convert() rejects a non-Hy4 checkpoint")
 
 
+def test_converter_dispatches_hy4():
+    import contextlib
+    import io
+    import json
+    import tempfile
+    from unittest.mock import create_autospec, patch
+    import converter
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "config.json"), "w") as f:
+            json.dump({"model_type": "hy_v4"}, f)
+        output = os.path.join(tmp, "out.mollm")
+        for quant_args in ([], ["fp16"]):
+            convert = create_autospec(hy4.convert)
+            argv = ["converter.py", tmp, output, *quant_args]
+            with patch.object(sys, "argv", argv), \
+                    patch.object(hy4, "convert", convert), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                converter.main()
+            convert.assert_called_once_with(
+                tmp, output, prefill_seq_len=converter.DEFAULT_PREFILL_SEQ_LEN)
+        for quant_args in (["w4g128"], ["native"], ["unknown"],
+                           ["2", "32", "w8pc"]):
+            convert = create_autospec(hy4.convert)
+            messages = io.StringIO()
+            argv = ["converter.py", tmp, output, *quant_args]
+            with patch.object(sys, "argv", argv), \
+                    patch.object(hy4, "convert", convert), \
+                    contextlib.redirect_stdout(messages):
+                try:
+                    converter.main()
+                    raise AssertionError("unsupported Hy4 quant should be rejected")
+                except SystemExit as error:
+                    check(error.code == 1, "unsupported quant must fail")
+            convert.assert_not_called()
+            check("fp16" in messages.getvalue(), "error must explain supported quant")
+    print("  PASS: generic converter dispatches Hy4 and rejects unsupported quant")
+
+
 def main():
     test_layer_counts()
     test_indexer_only_on_full_layers()
@@ -435,6 +474,7 @@ def main():
     test_absorbed_dense_cache()
     test_bad_config_rejected()
     test_convert_rejects_non_hy4()
+    test_converter_dispatches_hy4()
     print("\nAll Hy4 graph tests passed!")
     return 0
 

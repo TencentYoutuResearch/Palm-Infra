@@ -579,6 +579,199 @@ static void test_backend_dispatch_consumes_selection() {
     free(kb_a); free(vb_a); free(kb_b); free(vb_b);
 }
 
+enum class SparseScenario {
+    Plain, Sink, BiasMask, Mixed, AllMasked, Invalid, OddTail, MaskedBlock
+};
+
+// Independent scalar math: no dense kernel or production softmax helper.
+static bool sparse_reference_case(bool fp16, int src, int vd, bool causal,
+                                  SparseScenario scenario, int requested_width = 0) {
+    const int H = 4, KV = 2, hd = 9;
+    const int width = requested_width ? requested_width :
+        (scenario == SparseScenario::Sink || scenario == SparseScenario::OddTail ? 1 : 5);
+    const int past = requested_width ? requested_width + 1 : 6;
+    const int dst = past + src, cap = dst;
+    const int q_stride = hd + 3, o_stride = vd + 2, mask_stride = dst + 3;
+    const float guard = 12345.f, scale = 0.37f;
+    std::vector<float> q(H * src * q_stride, guard), k(KV * src * hd);
+    std::vector<float> v(KV * src * vd), keys(KV * cap * hd), values(KV * cap * vd);
+    std::vector<float> output(H * src * o_stride, guard);
+    std::vector<float> mask(src * mask_stride, guard), sink(H);
+    std::vector<int32_t> selected(src * width);
+    const bool zero_q = scenario == SparseScenario::Sink ||
+                        scenario == SparseScenario::OddTail;
+    const bool use_mask = scenario == SparseScenario::BiasMask ||
+                          scenario == SparseScenario::Mixed ||
+                          scenario == SparseScenario::AllMasked ||
+                          scenario == SparseScenario::MaskedBlock;
+    const bool use_sink = scenario == SparseScenario::Sink ||
+                          scenario == SparseScenario::BiasMask ||
+                          scenario == SparseScenario::Mixed;
+    auto rounded = [&](float x) {
+        return fp16 ? static_cast<float>(mollm::cpu::fp16_t(x)) : x;
+    };
+    for (int h = 0; h < H; ++h) {
+        sink[h] = logf(3.f + h);
+        for (int s = 0; s < src; ++s)
+            for (int d = 0; d < hd; ++d)
+                q[(h * src + s) * q_stride + d] = zero_q ? 0.f :
+                    sinf(float(h * 17 + s * 7 + d) * 0.13f) * 0.4f;
+    }
+    for (int g = 0; g < KV; ++g)
+        for (int pos = 0; pos < dst; ++pos) {
+            for (int d = 0; d < hd; ++d) {
+                const float x = cosf(float(g * 23 + pos * 11 + d) * 0.07f) * 0.3f;
+                keys[(g * cap + pos) * hd + d] = rounded(x);
+                if (pos >= past) k[(g * src + pos - past) * hd + d] = x;
+            }
+            for (int d = 0; d < vd; ++d) {
+                const float x = scenario == SparseScenario::Sink ? 4.f :
+                    scenario == SparseScenario::OddTail ? float((pos + 1) * 10) :
+                    float(g * 32 + pos * 3 + d % 11 - 20) / 16.f;
+                values[(g * cap + pos) * vd + d] = rounded(x);
+                if (pos >= past) v[(g * src + pos - past) * vd + d] = x;
+            }
+        }
+    for (int s = 0; s < src; ++s) {
+        for (int pos = 0; pos < dst; ++pos)
+            mask[s * mask_stride + pos] = scenario == SparseScenario::MaskedBlock ?
+                (pos == 1 ? 0.f : -INFINITY) :
+                scenario == SparseScenario::AllMasked ? -INFINITY :
+                (pos == (s % 2 ? past : 1) ? -INFINITY :
+                 float((pos * 3 + s * 5) % 7 - 3) * 0.4f);
+        const int32_t positions[5] = {dst - 1, 2, past, 0, 4};
+        const int32_t mixed[5] = {dst - 1, -1, dst + 10, 1, past};
+        const int32_t invalid[5] = {-1, dst, -7, dst + 10, -2};
+        for (int r = 0; r < width; ++r)
+            selected[s * width + r] = zero_q ? 1 :
+                scenario == SparseScenario::Invalid ? invalid[r % 5] :
+                scenario == SparseScenario::Mixed && r < 5 ? mixed[r] :
+                requested_width ? (r == 0 ? dst - 1 : width - r) : positions[r];
+    }
+    const size_t es = fp16 ? sizeof(mollm::cpu::fp16_t) : sizeof(float);
+    auto cache = [&](const std::vector<float>& data, int dim, bool is_value) {
+        void* buf = calloc(1, CacheMetadata::SIZE + data.size() * es);
+        auto* meta = cache_meta(buf);
+        meta->current_seq_len = past; meta->max_seq_len = cap;
+        meta->num_kv_heads = KV;
+        if (is_value) meta->v_head_dim = dim;
+        else meta->head_dim = dim;
+        if (fp16) {
+            auto* dst16 = static_cast<mollm::cpu::fp16_t*>(cache_data(buf));
+            for (size_t i = 0; i < data.size(); ++i)
+                dst16[i] = mollm::cpu::fp16_t(data[i]);
+        } else memcpy(cache_data(buf), data.data(), data.size() * es);
+        return buf;
+    };
+    void* kb = cache(keys, hd, false), *vb = cache(values, vd, true);
+    auto Q = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, src, H, 1, q.data());
+    Q.stride[1] = q_stride * sizeof(float); Q.stride[2] = src * Q.stride[1];
+    auto K = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hd, src, KV, 1, k.data());
+    auto V = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vd, src, KV, 1, v.data());
+    auto KC = Tensor::create(fp16 ? Precision::FP16 : Precision::FP32,
+                            MemoryType::EXTERNAL, hd, cap, KV, 1, kb);
+    auto VC = Tensor::create(KC.prec, MemoryType::EXTERNAL, vd, cap, KV, 1, vb);
+    auto O = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vd, src, H, 1, output.data());
+    O.stride[1] = o_stride * sizeof(float); O.stride[2] = src * O.stride[1];
+    auto Mask = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, dst, src, 1, 1, mask.data());
+    Mask.stride[1] = mask_stride * sizeof(float);
+    auto Selection = Tensor::create(Precision::INT32, MemoryType::EXTERNAL,
+                                    width, src, 1, 1, selected.data());
+    SdpaParams p{2, causal ? 1 : 0, H, KV, hd, vd, scale};
+    p.selection_input = 6; p.sink = use_sink ? sink.data() : nullptr;
+    std::vector<const Tensor*> ins = {&Q, &K, &V, use_mask ? &Mask : nullptr,
+                                      &KC, &VC, &Selection};
+    std::vector<Tensor*> outs = {&O, &KC, &VC};
+    bool ok = width < dst;
+    if (scenario == SparseScenario::Mixed) {
+        auto Sink = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                   H, 1, 1, 1, sink.data());
+        ins.push_back(&Sink);
+        GraphNode node;
+        node.op_type = OpType::SDPA;
+        node.params.i32 = {2, causal ? 1 : 0, H, KV, hd, vd, 7, 6};
+        node.params.f32 = {scale};
+        CPUBackend backend;
+        backend.dispatch(node, ins, &O, nullptr);
+        ok = ok && !backend.dispatch_failed();
+    } else {
+        kernel_sdpa_sparse(p, ins, outs);
+    }
+
+    for (int h = 0; h < H; ++h)
+        for (int s = 0; s < src; ++s) {
+            const int g = h / (H / KV);
+            std::vector<double> scores(width, -INFINITY);
+            double mx = use_sink ? sink[h] : -INFINITY;
+            for (int r = 0; r < width; ++r) {
+                const int pos = selected[s * width + r];
+                if (pos < 0 || pos >= dst || (causal && pos > past + s)) continue;
+                double dot = 0.;
+                for (int d = 0; d < hd; ++d) {
+                    const float query = q[(h * src + s) * q_stride + d];
+                    dot += double(fp16 && HAS_NEON ? rounded(query) : query) *
+                           keys[(g * cap + pos) * hd + d];
+                }
+                scores[r] = dot * scale + (use_mask ? mask[s * mask_stride + pos] : 0.);
+                mx = std::fmax(mx, scores[r]);
+            }
+            double sum = use_sink ? std::exp(double(sink[h]) - mx) : 0.;
+            for (double& score : scores) {
+                score = std::isfinite(score) ? std::exp(score - mx) : 0.;
+                sum += score;
+            }
+            for (int d = 0; d < o_stride; ++d) {
+                double ref = 0.;
+                if (d < vd && sum > 0.)
+                    for (int r = 0; r < width; ++r)
+                        if (scores[r] > 0.)
+                            ref += scores[r] / sum *
+                                values[(g * cap + selected[s * width + r]) * vd + d];
+                if (d >= vd) ref = guard;
+                const float got = output[(h * src + s) * o_stride + d];
+                if (!std::isfinite(got) || std::fabs(got - ref) > 2e-3 * (1. + std::fabs(ref))) {
+                    if (ok) fprintf(stderr, "  sparse ref fp16=%d src=%d vd=%d causal=%d case=%d h=%d s=%d d=%d: got=%g ref=%g\n",
+                                    fp16, src, vd, causal, int(scenario), h, s, d, got, ref);
+                    ok = false;
+                }
+            }
+        }
+    free(kb); free(vb);
+    return ok;
+}
+
+static void test_sparse_scalar_reference() {
+    const SparseScenario cases[] = {SparseScenario::Plain, SparseScenario::Sink,
+        SparseScenario::BiasMask, SparseScenario::Mixed, SparseScenario::AllMasked,
+        SparseScenario::Invalid, SparseScenario::OddTail};
+    for (bool fp16 : {false, true})
+        for (int src : {1, 3})
+            for (int vd : {1, 5, 9, 65})
+                for (bool causal : {false, true}) {
+                    bool ok = true;
+                    for (auto scenario : cases)
+                        ok = sparse_reference_case(fp16, src, vd, causal, scenario) && ok;
+                    char label[100];
+                    snprintf(label, sizeof(label), "sparse scalar reference: FP%d src=%d vd=%d causal=%d",
+                             fp16 ? 16 : 32, src, vd, causal);
+                    CHECK(ok, label);
+                }
+    // Cross both 32- and 64-key blocks, including an entirely masked first block.
+    for (bool fp16 : {false, true})
+        for (int src : {1, 3})
+            for (int width : {33, 65})
+                for (bool causal : {false, true}) {
+                    bool ok = true;
+                    for (auto scenario : {SparseScenario::Plain, SparseScenario::BiasMask,
+                                          SparseScenario::AllMasked, SparseScenario::MaskedBlock})
+                        ok = sparse_reference_case(fp16, src, 5, causal, scenario, width) && ok;
+                    char label[100];
+                    snprintf(label, sizeof(label), "sparse multi-block reference: FP%d src=%d width=%d causal=%d",
+                             fp16 ? 16 : 32, src, width, causal);
+                    CHECK(ok, label);
+                }
+}
+
 int main() {
     srand(42);
     CHECK(test_case(8, 4, 32, 24, 4, 4, 3, 16, true, true, TestPath::Backend),
@@ -668,6 +861,7 @@ int main() {
     test_sparse_select_all_matches_dense();
     test_sparse_falls_back_when_selection_is_not_sparser();
     test_sparse_narrow_selection();
+    test_sparse_scalar_reference();
     test_backend_dispatch_consumes_selection();
 
     printf(failures ? "\n%d FAILED\n" : "\nAll attention tests passed!\n", failures);
