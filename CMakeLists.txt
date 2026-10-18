@@ -178,6 +178,14 @@ set(PUBLIC_GRAPH_HEADERS
 )
 
 add_library(mollm_lib STATIC ${SOURCES})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Native GGUF ordered reductions round the product before the addition.
+    # Keep the scalar kernel and its strict reference on the same contract;
+    # explicitly requested FMA intrinsics remain fused.
+    set_property(SOURCE
+        kernels/cpu/matmul/gguf_k.cpp tests/test_matmul.cpp
+        APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         set_source_files_properties(
