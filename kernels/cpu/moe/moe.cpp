@@ -3,8 +3,10 @@
 #include "core/bf16.h"
 #include "backends/cpu/platform.h"
 #include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 #include "kernels/cpu/moe/moe_routing.h"
 #include "runtime/expert_provider.h"
+#include "runtime/host_moe_ffn.h"
 #include "runtime/trace.h"
 #include "runtime/threading.h"
 
@@ -30,6 +32,7 @@ enum class MoeProfileStage : int {
     RoutedScatter,
     SharedGateUp,
     SharedDown,
+    SharedScale,
     Count,
 };
 
@@ -47,6 +50,7 @@ static const char* moe_profile_stage_name(int stage) {
     case MoeProfileStage::RoutedScatter: return "routed_scatter";
     case MoeProfileStage::SharedGateUp: return "shared_gate_up";
     case MoeProfileStage::SharedDown: return "shared_down";
+    case MoeProfileStage::SharedScale: return "shared_scale";
     case MoeProfileStage::Count: break;
     }
     return "unknown";
@@ -248,6 +252,15 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
             view.data = static_cast<char*>(src.data) +
                         (size_t)row0 * (size_t)K * elem;
         }
+        return true;
+    }
+
+    const size_t gguf_bytes = gguf_k_block_bytes(src.prec);
+    const size_t gguf_values = gguf_k_block_values(src.prec);
+    if (gguf_bytes) {
+        if (K % gguf_values) return false;
+        const size_t row_bytes = (size_t)K / gguf_values * gguf_bytes;
+        view.data = static_cast<char*>(src.data) + (size_t)row0 * row_bytes;
         return true;
     }
 
@@ -541,6 +554,9 @@ bool kernel_moe_shared_expert(const Tensor& hidden,
     Tensor up_output = make_fp32_tensor(
         up_values.data(), intermediate_size, seq_len);
 
+    const bool profile = moe_profile_enabled();
+    std::chrono::steady_clock::time_point stage_start;
+    if (profile) stage_start = moe_profile_now();
     bool batched_gate_up = false;
     if (seq_len == 1) {
         std::vector<Tensor> shared_inputs = {hidden, hidden};
@@ -568,7 +584,9 @@ bool kernel_moe_shared_expert(const Tensor& hidden,
         intermediate_size, swiglu_limit);
     if (emulate_bf16)
         mollm_round_to_bf16(activated.data(), activated.size());
+    if (profile) moe_profile_add(MoeProfileStage::SharedGateUp, stage_start);
 
+    if (profile) stage_start = moe_profile_now();
     Tensor activated_tensor = make_fp32_tensor(
         activated.data(), intermediate_size, seq_len);
     Tensor down_weight = make_weight_view_2d(
@@ -579,8 +597,10 @@ bool kernel_moe_shared_expert(const Tensor& hidden,
         mollm_round_to_bf16(
             output.ptr<float>(), static_cast<size_t>(output.nelements()));
     }
+    if (profile) moe_profile_add(MoeProfileStage::SharedDown, stage_start);
 
     if (scale_weight) {
+        if (profile) stage_start = moe_profile_now();
         std::vector<float> scales(static_cast<size_t>(seq_len));
         Tensor scale_output = make_fp32_tensor(scales.data(), 1, seq_len);
         Tensor scale_matrix = make_weight_view_2d(
@@ -598,6 +618,7 @@ bool kernel_moe_shared_expert(const Tensor& hidden,
             for (int dim = 0; dim < hidden_size; ++dim)
                 row[dim] *= multiplier;
         }
+        if (profile) moe_profile_add(MoeProfileStage::SharedScale, stage_start);
     }
     return true;
 }
@@ -620,7 +641,9 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       int router_bias_input,
                       int token_ids_input,
                       int hash_table_input,
-                      float swiglu_limit) {
+                      float swiglu_limit,
+                      float shared_swiglu_limit,
+                      HostMoeFfn* host_moe_ffn) {
     if (!validate_inputs(inputs, output, hidden_size, num_experts, top_k,
                          intermediate_size, shared_intermediate_size,
                          has_shared_expert, shared_expert_has_gate)) {
@@ -681,7 +704,27 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     if (profile) stage_start = moe_profile_now();
     {
         mollm_trace::ScopedEvent trace_router("compute", "moe.router", trace_layer_args);
-        kernel_matmul_fp32(hidden, router_b, router_out, thread_pool);
+        // Hy4's FP16 router can change expert order when a multi-token
+        // GEMM and a single-token GEMV use different FP16 reduction trees.
+        // Accumulate each token in FP32 so routing is independent of chunk
+        // size and stays close to the checkpoint's original FP32 router.
+        const bool accurate_hy4_router =
+            router_b.prec == Precision::FP16 &&
+            gguf_k_block_bytes(experts_gate_up.prec) != 0;
+        if (accurate_hy4_router) {
+            for (int token = 0; token < seq_len; ++token) {
+                Tensor row_input = make_fp32_tensor(
+                    const_cast<float*>(x_data + (int64_t)token * ldx),
+                    hidden_size, 1);
+                Tensor row_output = make_fp32_tensor(
+                    router_logits.data() + (size_t)token * num_experts,
+                    num_experts, 1);
+                kernel_matmul_fp32(row_input, router_b, row_output,
+                                   thread_pool, Activation::NONE, 0, -1, true);
+            }
+        } else {
+            kernel_matmul_fp32(hidden, router_b, router_out, thread_pool);
+        }
     }
     if (profile) moe_profile_add(MoeProfileStage::Router, stage_start);
 
@@ -773,15 +816,15 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             (size_t)seq_len * (size_t)hidden_size);
         Tensor shared_output = make_fp32_tensor(
             shared_contribution.data(), hidden_size, seq_len);
-        if (profile) stage_start = moe_profile_now();
         if (!kernel_moe_shared_expert(
                 hidden, *shared_gate, *shared_up, *shared_down,
                 shared_expert_has_gate ? shared_expert_gate : nullptr,
                 shared_output, thread_pool, shared_intermediate_size,
-                use_bf16_activations, swiglu_limit)) {
+                use_bf16_activations,
+                shared_swiglu_limit < 0.0f ? swiglu_limit
+                                           : shared_swiglu_limit)) {
             return false;
         }
-        if (profile) moe_profile_add(MoeProfileStage::SharedDown, stage_start);
     }
 
     std::vector<int> counts(num_experts, 0);
@@ -843,12 +886,19 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                 static_cast<int>(output_base + i);
         }
 
+        batch_down_out.resize(
+            (output_base + batch) * static_cast<size_t>(hidden_size));
+        if (host_moe_ffn && host_moe_ffn->run_ready_batch(
+                *gate_up_source->provider, leases, x_data,
+                hidden_size, intermediate_size, swiglu_limit,
+                batch_down_out.data() + output_base * static_cast<size_t>(hidden_size),
+                thread_pool)) {
+            return true;
+        }
         std::vector<float> batch_gate_up_out(
             batch * static_cast<size_t>(2 * intermediate_size));
         std::vector<float> batch_inter(
             batch * static_cast<size_t>(intermediate_size));
-        batch_down_out.resize(
-            (output_base + batch) * static_cast<size_t>(hidden_size));
         Tensor hidden_one = make_fp32_tensor(
             const_cast<float*>(x_data), hidden_size, 1);
         std::vector<Tensor> gate_inputs(batch, hidden_one);
@@ -876,6 +926,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                 !kernel_matmul_mxfp4_gemv_batch(
                     gate_inputs, gate_up_weights, gate_outputs, thread_pool) &&
                 !kernel_matmul_nvfp4_gemv_batch(
+                    gate_inputs, gate_up_weights, gate_outputs, thread_pool) &&
+                !kernel_matmul_gguf_k_gemv_batch(
                     gate_inputs, gate_up_weights, gate_outputs, thread_pool)) {
                 for (size_t i = 0; i < batch; ++i) {
                     kernel_matmul_fp32(
@@ -938,6 +990,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                 !kernel_matmul_mxfp4_gemv_batch(
                     down_inputs, down_weights, down_outputs, thread_pool) &&
                 !kernel_matmul_nvfp4_gemv_batch(
+                    down_inputs, down_weights, down_outputs, thread_pool) &&
+                !kernel_matmul_gguf_k_gemv_batch(
                     down_inputs, down_weights, down_outputs, thread_pool)) {
                 for (size_t i = 0; i < batch; ++i) {
                     kernel_matmul_fp32(
@@ -959,9 +1013,10 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
 
     if (can_batch_ready_decode) {
         // The first batch overlaps its compute with reads that were not ready
-        // after the shared expert. Re-scan after each non-trivial wave so those
-        // newly completed experts also share two thread-pool dispatches instead
-        // of falling back to two dispatches per expert.
+        // after the shared expert. Re-scan after each wave so newly completed
+        // experts can share dispatches too. Consume even a singleton: otherwise
+        // the ordered fallback can wait on an earlier expert while this ready
+        // expert could have overlapped its compute with that read.
         for (;;) {
             std::vector<int> ready;
             for (int expert : selected_experts) {
@@ -971,7 +1026,7 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                     ready.push_back(expert);
                 }
             }
-            if (ready.size() < 2)
+            if (ready.empty())
                 break;
             if (!process_ready_batch(ready))
                 break;
@@ -1045,8 +1100,23 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         bool has_gate_up_view = false;
         bool has_down_view = false;
         if (use_provider) {
-            if (!gate_up_source->provider->borrow(gate_up_source, down_source, e,
-                                                 lease)) {
+            bool borrowed = false;
+            if (seq_len == 1 && thread_pool && thread_pool->num_threads() > 1) {
+                borrowed = gate_up_source->provider->borrow(
+                    gate_up_source, down_source, e, lease, false);
+                if (!borrowed) {
+                    // Previous matmuls have joined. Let idle compute workers
+                    // sleep while the provider waits for missing weights.
+                    thread_pool->park();
+                    borrowed = gate_up_source->provider->borrow(
+                        gate_up_source, down_source, e, lease);
+                    thread_pool->resume();
+                }
+            } else {
+                borrowed = gate_up_source->provider->borrow(
+                    gate_up_source, down_source, e, lease);
+            }
+            if (!borrowed) {
                 std::fprintf(stderr, "MOE: failed to borrow expert %d\n", e);
                 return false;
             }

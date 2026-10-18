@@ -89,6 +89,7 @@ enum class OpType : uint32_t {
     SDPA_MLA = 51,
     QSA_SDPA = 52,    // cached SDPA with selected-token IDs input6
     QSA_INDEXER = 53, // projection/norm/frequency/raw+pooled/K metadata/mask -> IDs
+    SDPA_MLA_ABSORB = 54, // Hy4 latent-cache MLA; legacy Hy4 graphs used52
 
     // shape (zero-copy views)
     RESHAPE  = 60,
@@ -130,6 +131,13 @@ enum class OpType : uint32_t {
     PLE_LOOKUP           = 135,
     PLE_GATE             = 136,
     PLE_DILATED_CONV     = 137,
+    // Hy4 identity Hyper-Connections. Same tensor layouts as HC_PRE/POST/HEAD
+    // but no Sinkhorn mixing matrix; see kernels/cpu/hyper_connection.h.
+    HC_PRE_ID            = 138,
+    HC_POST_ID           = 139,
+    HC_HEAD_ID           = 141,
+    // Hy4 Gated-DSA indexer; selects the top-k keys a later SDPA attends to.
+    HY4_INDEXER          = 142,
     DSV4_COMPRESSOR      = 160,
     DSV4_INDEXER         = 161,
     DSV4_SPARSE_ATTN     = 162,
@@ -160,6 +168,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::ROTARY_EMBED: return "ROTARY_EMBED";
     case OpType::SDPA: return "SDPA";
     case OpType::SDPA_MLA: return "SDPA_MLA";
+    case OpType::SDPA_MLA_ABSORB: return "SDPA_MLA_ABSORB";
     case OpType::QSA_SDPA: return "QSA_SDPA";
     case OpType::QSA_INDEXER: return "QSA_INDEXER";
     case OpType::RESHAPE: return "RESHAPE";
@@ -192,6 +201,10 @@ inline const char* op_type_name(OpType op) {
     case OpType::PLE_LOOKUP: return "PLE_LOOKUP";
     case OpType::PLE_GATE: return "PLE_GATE";
     case OpType::PLE_DILATED_CONV: return "PLE_DILATED_CONV";
+    case OpType::HC_PRE_ID: return "HC_PRE_ID";
+    case OpType::HC_POST_ID: return "HC_POST_ID";
+    case OpType::HC_HEAD_ID: return "HC_HEAD_ID";
+    case OpType::HY4_INDEXER: return "HY4_INDEXER";
     case OpType::DSV4_COMPRESSOR: return "DSV4_COMPRESSOR";
     case OpType::DSV4_INDEXER: return "DSV4_INDEXER";
     case OpType::DSV4_SPARSE_ATTN: return "DSV4_SPARSE_ATTN";

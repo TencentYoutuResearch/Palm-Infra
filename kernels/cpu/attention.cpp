@@ -84,11 +84,14 @@ static inline float dot_fp32_neon(const float* a, const float* b, int d) {
 // Decode kernel: M=1, Bc=32, online softmax
 static void flash_attn_fp32_decode(
     const float* Q, const float* K, const float* V, float* O,
-    int N, int d_k, int d_v, float scale, const float* mask)
+    int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink = nullptr)
 {
     const int Bc = 32;
-    float m = -FLT_MAX;
-    float l = 0.f;
+    // A per-head sink is one extra logit appended to the score vector. It has
+    // no value row, so it seeds the running max but never the numerator.
+    float m = sink ? *sink : -FLT_MAX;
+    float l = sink ? fast_exp_f32(*sink - m) : 0.f;
     memset(O, 0, d_v * sizeof(float));
 
     for (int jb = 0; jb < N; jb += Bc) {
@@ -141,16 +144,143 @@ static void flash_attn_fp32_decode(
 }
 
 // Prefill kernel: Br=4, Bc=32, 2D tiled with online softmax
+// Indirect variant of flash_attn_fp32_prefill: same online softmax, keys
+// addressed through `selected`. M is always 1 from the sparse entry.
+static void flash_attn_fp32_prefill_selected(
+    const float* Q, const float* K, const float* V, float* O,
+    const int32_t* selected, int n, int d_k, int d_v, float scale,
+    int visible_limit, const float* mask_row, const float* sink = nullptr)
+{
+    float m = sink ? *sink : -FLT_MAX;
+    float l = sink ? 1.f : 0.f;
+    memset(O, 0, d_v * sizeof(float));
+    for (int j = 0; j < n; j++) {
+        const int pos = selected[j];
+        if (pos < 0 || pos > visible_limit) continue;
+        const float s = dot_fp32_neon(Q, K + (size_t)pos * d_k, d_k) * scale +
+                        (mask_row ? mask_row[pos] : 0.f);
+        if (!std::isfinite(s)) continue;
+        const float m_new = fmaxf(m, s);
+        const float alpha = fast_exp_f32(m - m_new);
+        const float p = fast_exp_f32(s - m_new);
+        float32x4_t va = vdupq_n_f32(alpha);
+        float32x4_t vp = vdupq_n_f32(p);
+        const float* vj = V + (size_t)pos * d_v;
+        int d = 0;
+        for (; d + 7 < d_v; d += 8) {
+            vst1q_f32(O + d, vfmaq_f32(vmulq_f32(vld1q_f32(O + d), va), vp, vld1q_f32(vj + d)));
+            vst1q_f32(O + d + 4, vfmaq_f32(vmulq_f32(vld1q_f32(O + d + 4), va), vp, vld1q_f32(vj + d + 4)));
+        }
+        for (; d + 3 < d_v; d += 4)
+            vst1q_f32(O + d, vfmaq_f32(vmulq_f32(vld1q_f32(O + d), va), vp, vld1q_f32(vj + d)));
+        for (; d < d_v; d++) O[d] = O[d] * alpha + p * vj[d];
+        l = l * alpha + p;
+        m = m_new;
+    }
+    if (l > 0.f) {
+        const float inv = 1.f / l;
+        float32x4_t vi = vdupq_n_f32(inv);
+        int d = 0;
+        for (; d + 3 < d_v; d += 4)
+            vst1q_f32(O + d, vmulq_f32(vld1q_f32(O + d), vi));
+        for (; d < d_v; d++) O[d] *= inv;
+    }
+}
+
+// Indirect variant of flash_attn_fp32_decode: identical control flow and
+// online softmax, except each key is addressed through `selected` rather than
+// by contiguity. `n` is the number of selected entries, not the cache length.
+static void flash_attn_fp32_decode_selected(
+    const float* Q, const float* K, const float* V, float* O,
+    const int32_t* selected, int n, int d_k, int d_v, float scale,
+    int visible_limit, const float* mask_row, const float* sink = nullptr)
+{
+    const int Bc = 32;
+    const bool sparse = selected != nullptr;
+    float m = sink ? *sink : -FLT_MAX;
+    float l = sink ? 1.f : 0.f;
+    memset(O, 0, d_v * sizeof(float));
+
+    for (int jb = 0; jb < n; jb += Bc) {
+        const int bc = (jb + Bc <= n) ? Bc : (n - jb);
+        float scores[32];
+        for (int j = 0; j < bc; j++) {
+            const int pos = sparse ? selected[jb + j] : (jb + j);
+            // Causality is re-applied here: the selection may name positions
+            // the query cannot see yet.
+            if (pos < 0 || pos > visible_limit) {
+                scores[j] = -INFINITY;
+                continue;
+            }
+            scores[j] = dot_fp32_neon(Q, K + (size_t)pos * d_k, d_k) * scale +
+                        (mask_row ? mask_row[pos] : 0.f);
+        }
+        float m_block = scores[0];
+        for (int j = 1; j < bc; j++) m_block = fmaxf(m_block, scores[j]);
+        float m_new = fmaxf(m, m_block);
+        float alpha = (m_new == m) ? 1.f : fast_exp_f32(m - m_new);
+        if (l != 0.f && alpha != 1.f) {
+            float32x4_t valpha = vdupq_n_f32(alpha);
+            int d = 0;
+            for (; d + 7 < d_v; d += 8) {
+                vst1q_f32(O + d, vmulq_f32(vld1q_f32(O + d), valpha));
+                vst1q_f32(O + d + 4, vmulq_f32(vld1q_f32(O + d + 4), valpha));
+            }
+            for (; d + 3 < d_v; d += 4)
+                vst1q_f32(O + d, vmulq_f32(vld1q_f32(O + d), valpha));
+            for (; d < d_v; d++) O[d] *= alpha;
+        }
+        l *= alpha;
+        for (int j = 0; j < bc; j++) {
+            const int pos = sparse ? selected[jb + j] : (jb + j);
+            if (pos < 0 || pos > visible_limit || !std::isfinite(scores[j])) continue;
+            const float p = fast_exp_f32(scores[j] - m_new);
+            l += p;
+            const float* vj = V + (size_t)pos * d_v;
+            float32x4_t vp = vdupq_n_f32(p);
+            int d = 0;
+            for (; d + 7 < d_v; d += 8) {
+                vst1q_f32(O + d, vfmaq_f32(vld1q_f32(O + d), vp, vld1q_f32(vj + d)));
+                vst1q_f32(O + d + 4, vfmaq_f32(vld1q_f32(O + d + 4), vp, vld1q_f32(vj + d + 4)));
+            }
+            for (; d + 3 < d_v; d += 4)
+                vst1q_f32(O + d, vfmaq_f32(vld1q_f32(O + d), vp, vld1q_f32(vj + d)));
+            for (; d < d_v; d++) O[d] += p * vj[d];
+        }
+        m = m_new;
+    }
+    if (l > 0.f) {
+        const float inv_l = 1.f / l;
+        float32x4_t vinv = vdupq_n_f32(inv_l);
+        int d = 0;
+        for (; d + 3 < d_v; d += 4)
+            vst1q_f32(O + d, vmulq_f32(vld1q_f32(O + d), vinv));
+        for (; d < d_v; d++) O[d] *= inv_l;
+    }
+}
+
 static void flash_attn_fp32_prefill(
     const float* Q, const float* K, const float* V, float* O,
-    int M, int N, int d_k, int d_v, float scale, const float* mask)
+    int M, int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink = nullptr)
 {
+    // FP32 prefill keeps contiguous addressing; the sparse entry uses the
+    // dedicated indirect variant below.
+    const int32_t* selected = nullptr;
+    const int visible_limit = INT32_MAX;
+    (void)selected; (void)visible_limit;
     const int Br = 4;
     const int Bc = 32;
     float* row_m = (float*)malloc(M * sizeof(float));
     float* row_l = (float*)malloc(M * sizeof(float));
     memset(O, 0, M * d_v * sizeof(float));
-    for (int i = 0; i < M; i++) { row_m[i] = -FLT_MAX; row_l[i] = 0.f; }
+    // Seed the running max and denominator with the per-head sink logit, which
+    // behaves as a virtual extra key with no value row. With the sink as the
+    // initial max, its own contribution to the denominator is exp(0) = 1.
+    for (int i = 0; i < M; i++) {
+        row_m[i] = sink ? *sink : -FLT_MAX;
+        row_l[i] = sink ? 1.f : 0.f;
+    }
 
     for (int jb = 0; jb < N; jb += Bc) {
         const int bc = (jb + Bc <= N) ? Bc : (N - jb);
@@ -462,14 +592,29 @@ static inline void dot_fp16_8x(const __fp16* Q,
 
 // FP16 decode kernel: M=1, Bc=64, online softmax, FP16FML PV accumulation.
 // Q/K/V are FP16 (caller converts from FP32). O is FP32 output.
+// `selected`, when given, names the cache position for each visited key, so
+// `N` becomes the number of selected entries rather than the cache length.
+// `visible_limit` re-applies causality against those positions.
 static void flash_attn_fp16_decode(
     const __fp16* Q, const __fp16* K, const __fp16* V, float* O,
-    int N, int d_k, int d_v, float scale, const float* mask)
+    int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink = nullptr,
+    const int32_t* selected = nullptr, int visible_limit = INT32_MAX)
 {
     const int Bc = 64;
+    const bool sparse = selected != nullptr;
+    // Cache position for a block-local slot.
+    auto key_pos = [&](int slot) -> int {
+        if (!sparse) return slot;
+        const int pos = selected[slot];
+        if (pos < 0 || pos > visible_limit) return -1;
+        return pos;
+    };
 
-    float m = -FLT_MAX;
-    float l = 0.f;
+    // A per-head sink is a virtual extra key logit: it seeds the running max
+    // and denominator but has no value row, so it never enters the numerator.
+    float m = sink ? *sink : -FLT_MAX;
+    float l = sink ? 1.f : 0.f;
 
     // O accumulator in FP32 (stays in registers for inner PV loop)
     float O_buf[256];
@@ -480,8 +625,22 @@ static void flash_attn_fp16_decode(
         const int bc = (jb + Bc <= N) ? Bc : (N - jb);
 
         // 1. QK scores: 4-way batched FP16FML dot product
+        //
+        // Selecting permutes the keys, so the 4-wide batch can only be used
+        // when addressing stays contiguous. In sparse mode the batched dot is
+        // skipped in favour of single-key dots: measurements on real indexer
+        // output show selected positions are essentially never adjacent
+        // (mean run length 1.00), so there is nothing to batch anyway.
         float scores[64];
-        {
+        if (sparse) {
+            for (int j = 0; j < bc; j++) {
+                const int pos = key_pos(jb + j);
+                scores[j] = (pos < 0)
+                    ? -INFINITY
+                    : dot_fp16_neon(Q, K + (size_t)pos * d_k, d_k) * scale;
+                if (pos >= 0 && mask) scores[j] += mask[pos];
+            }
+        } else {
             int j = 0;
             for (; j + 3 < bc; j += 4) {
                 dot_fp16_4x(Q,
@@ -530,14 +689,19 @@ static void flash_attn_fp16_decode(
             float32x4_t vl = vdupq_n_f32(0.f);
             int j = 0;
             for (; j + 3 < bc; j += 4) {
-                float32x4_t s4 = vsubq_f32(vld1q_f32(scores + j), vm_new);
+                const float32x4_t score4 = vld1q_f32(scores + j);
+                float32x4_t s4 = vsubq_f32(score4, vm_new);
                 float32x4_t p4 = fast_exp_f32x4(s4);
+                if (sparse)
+                    p4 = vbslq_f32(vcleq_f32(vabsq_f32(score4), vdupq_n_f32(FLT_MAX)),
+                                   p4, vdupq_n_f32(0.f));
                 vst1q_f32(scores + j, p4);
                 vl = vaddq_f32(vl, p4);
             }
             l += vaddvq_f32(vl);
             for (; j < bc; j++) {
-                scores[j] = fast_exp_f32(scores[j] - m_new);
+                scores[j] = sparse && !std::isfinite(scores[j])
+                    ? 0.f : fast_exp_f32(scores[j] - m_new);
                 l += scores[j];
             }
         }
@@ -567,7 +731,9 @@ static void flash_attn_fp16_decode(
 
                 for (int j = 0; j < bc; j++) {
                     float16x4_t vp = vdup_n_f16((__fp16)scores[j]);
-                    const __fp16* vj = V + (jb + j) * d_v + d_start;
+                    const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
 
                     float16x8_t v01 = vld1q_f16(vj + 0);
                     float16x8_t v23 = vld1q_f16(vj + 8);
@@ -620,7 +786,9 @@ static void flash_attn_fp16_decode(
                 float32x4_t o1 = vld1q_f32(O_fp32 + d_start + 4);
                 for (int j = 0; j < bc; j++) {
                     float16x4_t vp = vdup_n_f16((__fp16)scores[j]);
-                    const __fp16* vj = V + (jb + j) * d_v + d_start;
+                    const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                     float16x8_t v = vld1q_f16(vj);
                     o0 = vfmlalq_lane_low_f16(o0, v, vp, 0);
                     o1 = vfmlalq_lane_high_f16(o1, v, vp, 0);
@@ -634,7 +802,9 @@ static void flash_attn_fp16_decode(
                 float32x4_t o0 = vld1q_f32(O_fp32 + d_start);
                 for (int j = 0; j < bc; j++) {
                     float16x4_t vp = vdup_n_f16((__fp16)scores[j]);
-                    const __fp16* vj = V + (jb + j) * d_v + d_start;
+                    const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                     float16x4_t v = vld1_f16(vj);
                     o0 = vfmlalq_lane_low_f16(o0, vcombine_f16(v, v), vp, 0);
                 }
@@ -644,8 +814,11 @@ static void flash_attn_fp16_decode(
             // Scalar tail
             for (; d_start < d_v; d_start++) {
                 float o0 = O_fp32[d_start];
-                for (int j = 0; j < bc; j++)
-                    o0 += scores[j] * (float)V[(jb + j) * d_v + d_start];
+                for (int j = 0; j < bc; j++) {
+                    const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    o0 += scores[j] * (float)V[(size_t)vpos * d_v + d_start];
+                }
                 O_fp32[d_start] = o0;
             }
         }
@@ -678,8 +851,17 @@ static void flash_attn_fp16_decode(
 // but uses FP16FML for dot product and PV accumulation.
 static void flash_attn_fp16_prefill(
     const __fp16* Q, const __fp16* K, const __fp16* V, float* O,
-    int M, int N, int d_k, int d_v, float scale, const float* mask)
+    int M, int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink = nullptr,
+    const int32_t* selected = nullptr, int visible_limit = INT32_MAX)
 {
+    const bool sparse = selected != nullptr;
+    auto key_pos = [&](int slot) -> int {
+        if (!sparse) return slot;
+        const int pos = selected[slot];
+        if (pos < 0 || pos > visible_limit) return -1;
+        return pos;
+    };
     // Rewritten kernel (尝试 27): Br=8, Bc=64, register-tiled PV.
     //
     // Why: previous Br=4 Bc=32 with non-tiled PV was issue-bound at ~34 GF/s/head
@@ -699,7 +881,12 @@ static void flash_attn_fp16_prefill(
     float* row_m = (float*)malloc(M * sizeof(float));
     float* row_l = (float*)malloc(M * sizeof(float));
     memset(O, 0, M * d_v * sizeof(float));
-    for (int i = 0; i < M; i++) { row_m[i] = -FLT_MAX; row_l[i] = 0.f; }
+    // Seed the running max/denominator with the per-head sink logit; as the
+    // initial max its own denominator contribution is exp(0) = 1.
+    for (int i = 0; i < M; i++) {
+        row_m[i] = sink ? *sink : -FLT_MAX;
+        row_l[i] = sink ? 1.f : 0.f;
+    }
 
     for (int jb = 0; jb < N; jb += Bc) {
         const int bc = (jb + Bc <= N) ? Bc : (N - jb);
@@ -709,6 +896,21 @@ static void flash_attn_fp16_prefill(
             float S[8][64];
 
             // ---- QK: 8 K rows × 1 Q row per dot_fp16_8x call ----
+            // Sparse selection permutes the keys, so the batched dots only
+            // apply when addressing stays contiguous (see the decode note).
+            if (sparse) {
+                for (int i = 0; i < br; i++) {
+                    const __fp16* qi = Q + (ib + i) * d_k;
+                    for (int j = 0; j < bc; j++) {
+                        const int pos = key_pos(jb + j);
+                        S[i][j] = (pos < 0)
+                            ? -INFINITY
+                            : dot_fp16_neon(qi, K + (size_t)pos * d_k, d_k) * scale;
+                        // The sparse entry invokes this kernel for one query at a time.
+                        if (pos >= 0 && mask) S[i][j] += mask[pos];
+                    }
+                }
+            } else {
             for (int i = 0; i < br; i++) {
                 const __fp16* qi = Q + (ib + i) * d_k;
                 int j = 0;
@@ -741,6 +943,7 @@ static void flash_attn_fp16_prefill(
                     S[i][j] = dot_fp16_neon(qi, K + (jb + j) * d_k, d_k) * scale;
                     if (mask) S[i][j] += mask[(ib + i) * N + jb + j];
                 }
+            }
             }
 
             // ---- Online softmax + register-tiled PV (per Q row) ----
@@ -780,14 +983,19 @@ static void flash_attn_fp16_prefill(
                     float32x4_t vl = vdupq_n_f32(0.f);
                     int j = 0;
                     for (; j + 3 < bc; j += 4) {
-                        float32x4_t s4 = vsubq_f32(vld1q_f32(&S[i][j]), vm_new);
+                        const float32x4_t score4 = vld1q_f32(&S[i][j]);
+                        float32x4_t s4 = vsubq_f32(score4, vm_new);
                         float32x4_t p4 = fast_exp_f32x4(s4);
+                        if (sparse)
+                            p4 = vbslq_f32(vcleq_f32(vabsq_f32(score4), vdupq_n_f32(FLT_MAX)),
+                                           p4, vdupq_n_f32(0.f));
                         vst1q_f32(P + j, p4);
                         vl = vaddq_f32(vl, p4);
                     }
                     l_block = vaddvq_f32(vl);
                     for (; j < bc; j++) {
-                        P[j] = fast_exp_f32(S[i][j] - m_new);
+                        P[j] = sparse && !std::isfinite(S[i][j])
+                            ? 0.f : fast_exp_f32(S[i][j] - m_new);
                         l_block += P[j];
                     }
                 }
@@ -816,7 +1024,9 @@ static void flash_attn_fp16_prefill(
 
                     for (int j = 0; j < bc; j++) {
                         float p = P[j];
-                        const __fp16* vj = V + (jb + j) * d_v + d_start;
+                        const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                         float16x4_t vp = vdup_n_f16((__fp16)p);
                         float16x8_t v01 = vld1q_f16(vj + 0);
                         float16x8_t v23 = vld1q_f16(vj + 8);
@@ -868,7 +1078,9 @@ static void flash_attn_fp16_prefill(
                     float32x4_t o1 = vld1q_f32(oi + d_start + 4);
                     for (int j = 0; j < bc; j++) {
                         float p = P[j];
-                        const __fp16* vj = V + (jb + j) * d_v + d_start;
+                        const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                         float16x4_t vp = vdup_n_f16((__fp16)p);
                         float16x8_t v0 = vld1q_f16(vj);
                         o0 = vfmlalq_lane_low_f16 (o0, v0, vp, 0);
@@ -882,10 +1094,12 @@ static void flash_attn_fp16_prefill(
                     float32x4_t o0 = vld1q_f32(oi + d_start);
                     for (int j = 0; j < bc; j++) {
                         float p = P[j];
-                        const __fp16* vj = V + (jb + j) * d_v + d_start;
+                        const int vpos = key_pos(jb + j);
+                    if (vpos < 0) continue;
+                    const __fp16* vj = V + (size_t)vpos * d_v + d_start;
                         float16x4_t vp = vdup_n_f16((__fp16)p);
-                        // Load 4 FP16 values into low half of a FP16x8 for FMLAL.
-                        float16x8_t v0 = vld1q_f16(vj);
+                        const float16x4_t v0_low = vld1_f16(vj);
+                        float16x8_t v0 = vcombine_f16(v0_low, v0_low);
                         o0 = vfmlalq_lane_low_f16(o0, v0, vp, 0);
                     }
                     vst1q_f32(oi + d_start, o0);
@@ -894,7 +1108,9 @@ static void flash_attn_fp16_prefill(
                 for (; d_start < d_v; d_start++) {
                     float acc = oi[d_start];
                     for (int j = 0; j < bc; j++) {
-                        acc += P[j] * (float)V[(jb + j) * d_v + d_start];
+                        const int vpos = key_pos(jb + j);
+                        if (vpos < 0) continue;
+                        acc += P[j] * (float)V[(size_t)vpos * d_v + d_start];
                     }
                     oi[d_start] = acc;
                 }
@@ -926,10 +1142,14 @@ static void flash_attn_fp16_prefill(
 
 #if !HAS_NEON
 
-static inline void softmax_row(float* row, int len) {
-    float max_val = -INFINITY;
+static inline void softmax_row(float* row, int len, const float* sink) {
+    float max_val = sink ? *sink : -INFINITY;
     for (int i = 0; i < len; i++) max_val = fmaxf(max_val, row[i]);
-    float sum = 0.f;
+    if (!std::isfinite(max_val)) {
+        std::fill(row, row + len, 0.f);
+        return;
+    }
+    float sum = sink ? expf(*sink - max_val) : 0.f;
     for (int i = 0; i < len; i++) { row[i] = expf(row[i] - max_val); sum += row[i]; }
     float inv_sum = 1.f / sum;
     for (int i = 0; i < len; i++) row[i] *= inv_sum;
@@ -937,7 +1157,8 @@ static inline void softmax_row(float* row, int len) {
 
 static void naive_sdpa_head(
     const float* Q, const float* K, const float* V, float* O,
-    int M, int N, int d_k, int d_v, float scale, const float* mask)
+    int M, int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink)
 {
     float* qk_row = new float[N];
     for (int s = 0; s < M; s++) {
@@ -949,7 +1170,7 @@ static void naive_sdpa_head(
             qk_row[j] = dot * scale;
             if (mask) qk_row[j] += mask[s * N + j];
         }
-        softmax_row(qk_row, N);
+        softmax_row(qk_row, N, sink);
         float* o = O + s * d_v;
         memset(o, 0, d_v * sizeof(float));
         for (int j = 0; j < N; j++) {
@@ -965,7 +1186,8 @@ static void naive_sdpa_head(
 static void naive_sdpa_head_fp16_cache(
     const float* Q, const mollm::cpu::fp16_t* K,
     const mollm::cpu::fp16_t* V, float* O,
-    int M, int N, int d_k, int d_v, float scale, const float* mask) {
+    int M, int N, int d_k, int d_v, float scale, const float* mask,
+    const float* sink) {
     float* qk_row = new float[N];
     for (int s = 0; s < M; ++s) {
         const float* q = Q + static_cast<size_t>(s) * d_k;
@@ -979,7 +1201,7 @@ static void naive_sdpa_head_fp16_cache(
                 qk_row[position] += mask[static_cast<size_t>(s) * N +
                                          position];
         }
-        softmax_row(qk_row, N);
+        softmax_row(qk_row, N, sink);
         float* output = O + static_cast<size_t>(s) * d_v;
         std::memset(output, 0, static_cast<size_t>(d_v) * sizeof(float));
         for (int position = 0; position < N; ++position) {
@@ -991,6 +1213,36 @@ static void naive_sdpa_head_fp16_cache(
         }
     }
     delete[] qk_row;
+}
+
+template <typename CacheValue>
+static void naive_sdpa_selected(
+        const float* q, const CacheValue* k, const CacheValue* v, float* out,
+        const int32_t* selected, int width, int head_dim, int v_head_dim,
+        float scale, int visible_limit, const float* mask_row, const float* sink) {
+    std::fill(out, out + v_head_dim, 0.f);
+    float maximum = sink ? *sink : -INFINITY;
+    float denominator = sink ? 1.f : 0.f;
+    for (int slot = 0; slot < width; ++slot) {
+        const int position = selected[slot];
+        if (position < 0 || position > visible_limit) continue;
+        const CacheValue* key = k + size_t(position) * head_dim;
+        float dot = 0.f;
+        for (int dim = 0; dim < head_dim; ++dim)
+            dot += q[dim] * static_cast<float>(key[dim]);
+        const float score = dot * scale + (mask_row ? mask_row[position] : 0.f);
+        if (!std::isfinite(score)) continue;
+        const float next_maximum = std::max(maximum, score);
+        const float old_factor = denominator > 0.f ? std::exp(maximum - next_maximum) : 0.f;
+        const float probability = std::exp(score - next_maximum);
+        const CacheValue* value = v + size_t(position) * v_head_dim;
+        for (int dim = 0; dim < v_head_dim; ++dim)
+            out[dim] = out[dim] * old_factor + probability * static_cast<float>(value[dim]);
+        denominator = denominator * old_factor + probability;
+        maximum = next_maximum;
+    }
+    if (denominator > 0.f)
+        for (int dim = 0; dim < v_head_dim; ++dim) out[dim] /= denominator;
 }
 
 #endif // !HAS_NEON
@@ -1017,6 +1269,11 @@ void kernel_sdpa(const SdpaParams& params,
     const Tensor& Q      = *inputs[0];
     const Tensor& K_cur  = *inputs[1];
     const Tensor& V_cur  = *inputs[2];
+    // A per-head sink is indexed by query head, so the caller must supply
+    // num_heads entries. Reject an impossible count rather than read past it.
+    if (params.sink && params.num_heads <= 0) {
+        return;
+    }
     const Tensor* mask   = (inputs.size() > 3 && inputs[3] && inputs[3]->data) ? inputs[3] : nullptr;
     const Tensor* K_cache= (inputs.size() > 4 && inputs[4] && inputs[4]->data) ? inputs[4] : nullptr;
     const Tensor* V_cache= (inputs.size() > 5 && inputs[5] && inputs[5]->data) ? inputs[5] : nullptr;
@@ -1183,13 +1440,17 @@ void kernel_sdpa(const SdpaParams& params,
                     for (; i < q_size; i++) Q_h16[i] = (__fp16)Q_head[i];
                 }
 
+                // Sinks are per query head, not per KV head.
+                const float* head_sink = params.sink ? &params.sink[h] : nullptr;
+
                 if (src_seqlen == 1) {
                     flash_attn_fp16_decode(Q_h16, K_head, V_head, O_head,
-                                           dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);
+                                           dst_seqlen, head_dim, v_head_dim, scale, mask_ptr,
+                                           head_sink);
                 } else {
                     flash_attn_fp16_prefill(Q_h16, K_head, V_head, O_head,
                                             src_seqlen, dst_seqlen, head_dim, v_head_dim,
-                                            scale, mask_ptr);
+                                            scale, mask_ptr, head_sink);
                 }
             } else {
                 // FP32 cache fallback
@@ -1197,13 +1458,17 @@ void kernel_sdpa(const SdpaParams& params,
                 const float* K_head = (const float*)get_k_ptr(kv_h);
                 const float* V_head = (const float*)get_v_ptr(kv_h);
 
+                // Sinks are per query head, not per KV head.
+                const float* head_sink = params.sink ? &params.sink[h] : nullptr;
+
                 if (src_seqlen == 1) {
                     flash_attn_fp32_decode(Q_head, K_head, V_head, O_head,
-                                           dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);
+                                           dst_seqlen, head_dim, v_head_dim, scale, mask_ptr,
+                                           head_sink);
                 } else {
                     flash_attn_fp32_prefill(Q_head, K_head, V_head, O_head,
                                             src_seqlen, dst_seqlen, head_dim, v_head_dim,
-                                            scale, mask_ptr);
+                                            scale, mask_ptr, head_sink);
                 }
             }
         }
@@ -1231,7 +1496,8 @@ void kernel_sdpa(const SdpaParams& params,
                 float* O_head = (float*)out.channel<unsigned char>(h);
                 naive_sdpa_head_fp16_cache(
                     Q_head, K_head, V_head, O_head, src_seqlen,
-                    dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);
+                    dst_seqlen, head_dim, v_head_dim, scale, mask_ptr,
+                    params.sink ? params.sink + h : nullptr);
                 continue;
             }
             const float* K_head =
@@ -1240,7 +1506,7 @@ void kernel_sdpa(const SdpaParams& params,
                 static_cast<const float*>(get_v_ptr(kv_h));
             float* O_head = (float*)out.channel<unsigned char>(h);
 #if defined(MOLLM_CPU_X86_SIMD)
-            if (mollm::cpu::capabilities().x86_avx512) {
+            if (!params.sink && mollm::cpu::capabilities().x86_avx512) {
                 sdpa_x86_avx512_head(
                     Q_head, K_head, V_head, O_head, src_seqlen, dst_seqlen,
                     head_dim, v_head_dim, scale, mask_ptr);
@@ -1249,7 +1515,7 @@ void kernel_sdpa(const SdpaParams& params,
 #endif
             naive_sdpa_head(Q_head, K_head, V_head, O_head,
                             src_seqlen, dst_seqlen, head_dim, v_head_dim,
-                            scale, mask_ptr);
+                            scale, mask_ptr, params.sink ? params.sink + h : nullptr);
         }
     };
     if (thread_pool && num_heads >= 2) {
@@ -1273,5 +1539,248 @@ void kernel_sdpa(const SdpaParams& params,
         V_cache_out->shape[1] = dst_seqlen;
         V_cache_out->stride[2] = V_cache_out->stride[1] * dst_seqlen;
         V_cache_out->stride[3] = V_cache_out->stride[2];
+    }
+}
+
+void kernel_sdpa_sparse(const SdpaParams& params,
+                        const std::vector<const Tensor*>& inputs,
+                        std::vector<Tensor*>& outputs,
+                        ThreadPool* thread_pool) {
+    const int kv_cache     = params.kv_cache;
+    const int num_heads    = params.num_heads;
+    const int num_kv_heads = params.num_kv_heads;
+    const int head_dim     = params.head_dim;
+    const int v_head_dim   = params.v_head_dim;
+    float scale = params.scale;
+    if (scale == 0.f) scale = 1.f / std::sqrt(static_cast<float>(head_dim));
+    if (num_kv_heads <= 0 || num_heads % num_kv_heads != 0) {
+        std::fprintf(stderr, "SDPA_SPARSE: invalid head counts\n");
+        return;
+    }
+    const int heads_per_group = num_heads / num_kv_heads;
+
+    // The selection's position is recorded in params (an absent optional
+    // input shortens the list rather than leaving a placeholder), so read the
+    // recorded index instead of assuming a fixed slot -- `sink` may occupy an
+    // earlier one. Without a selection this entry has no reason to exist, so
+    // fall back to the dense kernel rather than guess.
+    const int selection_index = params.selection_input;
+    const Tensor* selection = nullptr;
+    if (selection_index >= 0 &&
+        static_cast<size_t>(selection_index) < inputs.size() &&
+        inputs[selection_index] && inputs[selection_index]->data) {
+        selection = inputs[selection_index];
+    }
+    if (!selection) {
+        kernel_sdpa(params, inputs, outputs, thread_pool);
+        return;
+    }
+    if (selection->prec != Precision::INT32) {
+        std::fprintf(stderr, "SDPA_SPARSE: selection must be INT32\n");
+        return;
+    }
+    const int width = static_cast<int>(selection->shape[0]);
+
+    const Tensor& Q     = *inputs[0];
+    const Tensor& K_cur_probe = *inputs[1];
+    // Exact dense fallback: if the selection names at least as many keys as
+    // there are visible ones, sparse can only add lookup overhead. This
+    // covers short contexts automatically (a fresh cache has few positions)
+    // without a tuned threshold, and never costs correctness because the
+    // dense path is the reference the sparse one must match.
+    if (K_cur_probe.data) {
+        const Tensor* kc =
+            (inputs.size() > 4 && inputs[4] && inputs[4]->data) ? inputs[4] : nullptr;
+        const int past = kc ? static_cast<int>(cache_meta(kc->data)->current_seq_len) : 0;
+        const int visible = past + static_cast<int>(K_cur_probe.shape[1]);
+        if (width >= visible) {
+            kernel_sdpa(params, inputs, outputs, thread_pool);
+            return;
+        }
+    }
+
+    const Tensor& K_cur = *inputs[1];
+    const Tensor& V_cur = *inputs[2];
+    // Selection ranks are not mask positions: each query uses the original
+    // additive-mask row, indexed by the selected key's cache position.
+    const Tensor* mask =
+        (inputs.size() > 3 && inputs[3] && inputs[3]->data) ? inputs[3] : nullptr;
+    const Tensor* K_cache =
+        (inputs.size() > 4 && inputs[4] && inputs[4]->data) ? inputs[4] : nullptr;
+    const Tensor* V_cache =
+        (inputs.size() > 5 && inputs[5] && inputs[5]->data) ? inputs[5] : nullptr;
+    if (kv_cache == 2 && K_cache && V_cache &&
+        K_cache->prec != V_cache->prec) {
+        std::fprintf(stderr, "SDPA_SPARSE: K/V cache precision must match\n");
+        return;
+    }
+
+    Tensor& out = *outputs[0];
+    Tensor* K_cache_out = outputs.size() > 1 ? outputs[1] : nullptr;
+    Tensor* V_cache_out = outputs.size() > 2 ? outputs[2] : nullptr;
+
+    const int src_seqlen = static_cast<int>(Q.shape[1]);
+    const int cur_seqlen = static_cast<int>(K_cur.shape[1]);
+    int past_seqlen = 0;
+
+    const bool cache_is_fp16 =
+        (kv_cache == 2 && K_cache && K_cache->data &&
+         K_cache->prec == Precision::FP16);
+    // ---- KV cache append, identical to the dense path ----
+    if (kv_cache == 2 && K_cache && K_cache->data) {
+        const CacheMetadata* meta = cache_meta(K_cache->data);
+        past_seqlen = static_cast<int>(meta->current_seq_len);
+        const size_t cache_es = K_cache->element_size();
+        void* k_cache_data = cache_data(K_cache->data);
+        void* v_cache_data = V_cache ? cache_data(V_cache->data) : nullptr;
+        for (int g = 0; g < num_kv_heads; g++) {
+            unsigned char* kd = static_cast<unsigned char*>(k_cache_data) +
+                g * (static_cast<size_t>(head_dim) * meta->max_seq_len * cache_es);
+            unsigned char* vd = static_cast<unsigned char*>(v_cache_data) +
+                g * (static_cast<size_t>(v_head_dim) * meta->max_seq_len * cache_es);
+            for (int s = 0; s < cur_seqlen; s++) {
+                const float* ks = K_cur.ptr<float>() +
+                    static_cast<size_t>(s) * K_cur.stride[1] / sizeof(float) +
+                    static_cast<size_t>(g) * K_cur.stride[2] / sizeof(float);
+                const float* vs = V_cur.ptr<float>() +
+                    static_cast<size_t>(s) * V_cur.stride[1] / sizeof(float) +
+                    static_cast<size_t>(g) * V_cur.stride[2] / sizeof(float);
+                unsigned char* dk = kd + static_cast<size_t>(past_seqlen + s) *
+                    head_dim * cache_es;
+                unsigned char* dv = vd + static_cast<size_t>(past_seqlen + s) *
+                    v_head_dim * cache_es;
+                if (cache_is_fp16) {
+                    __fp16* dk16 = reinterpret_cast<__fp16*>(dk);
+                    __fp16* dv16 = reinterpret_cast<__fp16*>(dv);
+                    for (int d = 0; d < head_dim; d++)
+                        dk16[d] = (__fp16)ks[d];
+                    for (int d = 0; d < v_head_dim; d++)
+                        dv16[d] = (__fp16)vs[d];
+                } else {
+                    std::memcpy(dk, ks, head_dim * sizeof(float));
+                    std::memcpy(dv, vs, v_head_dim * sizeof(float));
+                }
+            }
+        }
+    }
+    const int dst_seqlen = past_seqlen + cur_seqlen;
+    // K_cache/V_cache are const here, but the cache payload is addressed
+    // through the same helpers the dense path uses.
+    auto get_k_ptr = [&](int kv_h) -> const void* {
+        if (kv_cache == 2 && K_cache && K_cache->data) {
+            const char* base = static_cast<const char*>(
+                cache_data(const_cast<void*>(K_cache->data)));
+            return base + kv_h *
+                (head_dim * cache_meta(K_cache->data)->max_seq_len) *
+                K_cache->element_size();
+        }
+        return static_cast<const void*>(K_cur.channel<unsigned char>(kv_h));
+    };
+    auto get_v_ptr = [&](int kv_h) -> const void* {
+        if (kv_cache == 2 && V_cache && V_cache->data) {
+            const char* base = static_cast<const char*>(
+                cache_data(const_cast<void*>(V_cache->data)));
+            return base + kv_h *
+                (v_head_dim * cache_meta(V_cache->data)->max_seq_len) *
+                V_cache->element_size();
+        }
+        return static_cast<const void*>(V_cur.channel<unsigned char>(kv_h));
+    };
+
+    const int32_t* selection_data = selection->ptr<int32_t>();
+    // Visit selected cache rows directly; no key/value gather is needed.
+    auto run_head = [&](int, int h_begin, int h_end) {
+        for (int h = h_begin; h < h_end; h++) {
+            const int kv_h = h / heads_per_group;
+            const void* k_head = get_k_ptr(kv_h);
+            const void* v_head = get_v_ptr(kv_h);
+            float* o_head = out.ptr<float>() +
+                static_cast<size_t>(h) * out.stride[2] / sizeof(float);
+
+            // Decode has one query position; prefill has src_seqlen of them.
+            for (int s = 0; s < src_seqlen; s++) {
+                const int32_t* token_selection =
+                    selection_data + static_cast<size_t>(s) * width;
+                const int visible_limit = params.causal
+                    ? std::min(past_seqlen + s, dst_seqlen - 1) : dst_seqlen - 1;
+                const float* head_sink = params.sink ? params.sink + h : nullptr;
+                const float* mask_row = mask ? reinterpret_cast<const float*>(
+                    static_cast<const char*>(mask->data) + size_t(s) * mask->stride[1]) : nullptr;
+                const float* q_row = Q.ptr<float>() +
+                    static_cast<size_t>(s) * Q.stride[1] / sizeof(float) +
+                    static_cast<size_t>(h) * Q.stride[2] / sizeof(float);
+                float* o_row = o_head + static_cast<size_t>(s) *
+                    out.stride[1] / sizeof(float);
+                const int width_for_query = width;
+
+#if HAS_NEON
+                if (cache_is_fp16) {
+                    std::vector<__fp16> q16(static_cast<size_t>(head_dim));
+                    for (int d = 0; d < head_dim; d++)
+                        q16[d] = (__fp16)q_row[d];
+                    if (src_seqlen == 1) {
+                        flash_attn_fp16_decode(
+                            q16.data(),
+                            static_cast<const __fp16*>(k_head),
+                            static_cast<const __fp16*>(v_head), o_row,
+                            width_for_query, head_dim, v_head_dim, scale,
+                            mask_row, head_sink,
+                            token_selection, visible_limit);
+                    } else {
+                        // One query row per call; the prefill kernel walks M=1.
+                        flash_attn_fp16_prefill(
+                            q16.data(),
+                            static_cast<const __fp16*>(k_head),
+                            static_cast<const __fp16*>(v_head), o_row,
+                            1, width_for_query, head_dim, v_head_dim, scale,
+                            mask_row, head_sink,
+                            token_selection, visible_limit);
+                    }
+                } else {
+                    if (src_seqlen == 1) {
+                        flash_attn_fp32_decode_selected(
+                            q_row, static_cast<const float*>(k_head),
+                            static_cast<const float*>(v_head), o_row,
+                            token_selection, width_for_query, head_dim,
+                            v_head_dim, scale, visible_limit, mask_row, head_sink);
+                    } else {
+                        flash_attn_fp32_prefill_selected(
+                            q_row, static_cast<const float*>(k_head),
+                            static_cast<const float*>(v_head), o_row,
+                            token_selection, width_for_query, head_dim,
+                            v_head_dim, scale, visible_limit, mask_row, head_sink);
+                    }
+                }
+#else
+                if (cache_is_fp16) {
+                    naive_sdpa_selected(q_row,
+                        static_cast<const mollm::cpu::fp16_t*>(k_head),
+                        static_cast<const mollm::cpu::fp16_t*>(v_head), o_row,
+                        token_selection, width_for_query, head_dim, v_head_dim,
+                        scale, visible_limit, mask_row, head_sink);
+                } else {
+                    naive_sdpa_selected(q_row,
+                        static_cast<const float*>(k_head), static_cast<const float*>(v_head), o_row,
+                        token_selection, width_for_query, head_dim, v_head_dim,
+                        scale, visible_limit, mask_row, head_sink);
+                }
+#endif
+            }
+        }
+    };
+
+    if (thread_pool && num_heads >= 2) {
+        thread_pool->parallel_for(0, num_heads, 1, run_head);
+    } else {
+        run_head(0, 0, num_heads);
+    }
+
+    // Cache length is advanced by the kernel exactly as the dense path does,
+    // so the next call sees the positions this one appended.
+    if (kv_cache == 2 && K_cache_out && V_cache_out) {
+        CacheMetadata* k_meta = cache_meta(K_cache_out->data);
+        CacheMetadata* v_meta = cache_meta(V_cache_out->data);
+        k_meta->current_seq_len = static_cast<uint64_t>(dst_seqlen);
+        v_meta->current_seq_len = static_cast<uint64_t>(dst_seqlen);
     }
 }

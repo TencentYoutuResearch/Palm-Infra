@@ -1,9 +1,12 @@
 #include "engine/engine.h"
+#include "kernels/cpu/matmul/gguf_k.h"
+#include "storage/mapped_file.h"
 #include "engine/tokenizer.h"
 #include "storage/ssd_expert_cache/cache.h"
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -211,6 +214,87 @@ bool checked_add(uint64_t a, uint64_t b, uint64_t& result) {
     if (b > std::numeric_limits<uint64_t>::max() - a)
         return false;
     result = a + b;
+    return true;
+}
+
+bool derive_native_gguf_expert_storage(int fd, const PackageHeaderInfo& package,
+                                       json& metadata) {
+    // Older Hy4 packages predate moe_expert_storage. Their native GGUF expert
+    // tensors are contiguous expert-major rows, so their XMAP headers are
+    // enough to reconstruct the same byte ranges without repacking the model.
+    if (!metadata.contains("weights") || !metadata["weights"].is_object())
+        return false;
+    const int num_experts = metadata.value("num_experts", 0);
+    const int num_layers = metadata.value("num_layers", 0);
+    const int first_moe_layer = metadata.value("first_k_dense_replace", 1);
+    if (num_experts <= 0 || num_layers <= first_moe_layer ||
+        first_moe_layer < 0)
+        return false;
+
+    json layers = json::array();
+    const auto& weights = metadata["weights"];
+    for (int layer = first_moe_layer; layer < num_layers; ++layer) {
+        json layer_storage = {
+            {"layer", layer}, {"num_experts", num_experts},
+        };
+        for (const char* part : {"gate_up", "down"}) {
+            const std::string reference = "layer_" + std::to_string(layer) +
+                                          "_ffn_experts_" + part;
+            const auto weight = weights.find(reference);
+            if (weight == weights.end() || !weight->is_array() ||
+                weight->size() < 2)
+                return false;
+            const uint64_t weight_offset = (*weight)[0].get<uint64_t>();
+            const uint64_t weight_size = (*weight)[1].get<uint64_t>();
+            if (weight_offset > package.w_len ||
+                weight_size > package.w_len - weight_offset)
+                return false;
+            uint8_t raw_header[sizeof(MappedFile::Header)];
+            if (!read_exact_at(fd, package.w_off + weight_offset,
+                               raw_header, sizeof(raw_header), reference.c_str()))
+                return false;
+            MappedFile::Header header;
+            if (!MappedFile::parse_header(raw_header,
+                                          static_cast<size_t>(weight_size), header))
+                return false;
+            const Precision precision = static_cast<Precision>(header.precision);
+            const size_t values_per_block = gguf_k_block_values(precision);
+            const size_t bytes_per_block = gguf_k_block_bytes(precision);
+            if (!values_per_block || !bytes_per_block || header.flags != 0 ||
+                header.scales_size != 0 || header.ndim < 2 ||
+                header.ndim > 4 ||
+                header.shape[0] % static_cast<uint64_t>(num_experts) != 0 ||
+                header.shape[0] > static_cast<uint64_t>(INT_MAX) * num_experts ||
+                header.shape[1] > INT_MAX ||
+                header.shape[1] % values_per_block != 0 ||
+                header.shape[2] != 1 || header.shape[3] != 1)
+                return false;
+            const uint64_t rows = header.shape[0] / num_experts;
+            const uint64_t cols = header.shape[1];
+            uint64_t expected_bytes = 0;
+            if (!checked_multiply(header.shape[0],
+                                  cols / values_per_block, expected_bytes) ||
+                !checked_multiply(expected_bytes, bytes_per_block,
+                                  expected_bytes) ||
+                expected_bytes != header.data_size)
+                return false;
+            layer_storage[part] = {
+                {"weight", reference},
+                {"weight_offset", weight_offset},
+                {"precision", header.precision},
+                {"flags", header.flags},
+                {"rows_per_expert", rows},
+                {"cols", cols},
+                {"data_offset", header.data_offset},
+                {"expert_data_bytes", header.data_size / num_experts},
+                {"expert_scales_bytes", 0},
+            };
+        }
+        layers.push_back(std::move(layer_storage));
+    }
+    metadata["moe_expert_storage"] = {
+        {"num_experts", num_experts}, {"layers", std::move(layers)},
+    };
     return true;
 }
 
@@ -427,6 +511,13 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                     package_weight_map_[name] = {off, sz};
                 }
             }
+            if (cfg_.moe_ssd_cache_bytes != 0 && !meta.contains("moe_expert_storage") &&
+                meta.value("architecture", std::string()) == "hy-v4" &&
+                meta.value("quantization", std::string()) == "gguf-native-blocks" &&
+                !derive_native_gguf_expert_storage(package_file.get(), ph, meta)) {
+                fprintf(stderr, "Engine: failed to derive native GGUF expert storage\n");
+                return false;
+            }
             if (cfg_.offload_ple && !std::any_of(
                     package_weight_map_.begin(), package_weight_map_.end(),
                     [](const auto& weight) {
@@ -556,7 +647,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                         if (layer_index < 0 || num_experts <= 0 ||
                             spec.rows <= 0 || spec.cols <= 0 ||
                             static_cast<uint32_t>(spec.precision) >
-                                static_cast<uint32_t>(Precision::NVFP4) ||
+                                static_cast<uint32_t>(Precision::GGUF_IQ4_XS) ||
                             !valid_spans ||
                             weight_offset > ph.w_len ||
                             data_offset > ph.w_len - weight_offset ||
@@ -656,6 +747,27 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 } else {
                     if (!cache->set_global_capacity_pool(cfg_.moe_ssd_global_cache))
                         return false;
+#if defined(__APPLE__)
+                    // Validated for the native Hy4 CPU offload path at 4 and 8 GiB.
+                    // Keep the fixed reuse reservation away from small caches;
+                    // unsupported component alignment retains the existing policy.
+                    if (cfg_.device == Device::CPU && cfg_.moe_ssd_global_cache &&
+                        host_cache_bytes >= size_t{4} * 1024 * 1024 * 1024 &&
+                        meta.value("architecture", std::string()) == "hy-v4" &&
+                        meta.value("quantization", std::string()) == "gguf-native-blocks" &&
+                        cache->set_read_alignment(4096) &&
+                        cache->set_buffer_reuse_capacity(size_t{64} * 1024 * 1024)) {
+                        // Keep spare CPU time for the predictor and SSD workers
+                        // at high compute concurrency; lower thread counts retain
+                        // the existing spin policy. load() resets this on reuse.
+                        if (cfg_.num_threads >= 16)
+                            thread_pool_.resize(cfg_.num_threads, 1024);
+                        std::fprintf(stderr,
+                                     "Engine: aligned expert reads; buffer reuse reserves %.1f MB "
+                                     "within the cache budget\n",
+                                     cache->stats().buffer_reserve_bytes / 1e6);
+                    }
+#endif
                     if (!cache->configure_shallow_favoring(
                             cfg_.moe_ssd_shallow_cache_layers)) {
                         return false;
@@ -687,6 +799,8 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 } else if (it->is_number_unsigned()) {
                     package_metadata_[key] =
                         std::to_string(it->get<uint64_t>());
+                } else if (it->is_number_float()) {
+                    package_metadata_[key] = it->dump();
                 } else if (it->is_boolean()) {
                     package_metadata_[key] = it->get<bool>() ? "true" : "false";
                 }

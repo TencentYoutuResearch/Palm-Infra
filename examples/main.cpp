@@ -341,7 +341,7 @@ private:
 
 bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
                        const std::string& prompt, int max_new_tokens,
-                       const std::string& image_path) {
+                       const std::string& image_path, bool enable_thinking) {
     VisionEmbedding vision;
     int image_token_id = -1;
     std::string user_content = prompt;
@@ -366,10 +366,19 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
         user_content += "<|vision_end|>";
         user_content += prompt;
     }
-    std::vector<int> prompt_ids = tokenizer.apply_chat(user_content);
+    std::vector<int> prompt_ids = tokenizer.apply_chat(
+        std::vector<ChatMessage>{{"user", user_content}}, enable_thinking);
     if (prompt_ids.empty()) {
         std::fprintf(stderr, "[error] prompt is empty after tokenization\n");
         return false;
+    }
+    // Optional: echo the exact token ids so a reference implementation can be
+    // fed the identical sequence. Numerical alignment is meaningless if the
+    // two sides tokenize differently.
+    if (std::getenv("MOLLM_DUMP_IDS")) {
+        std::fprintf(stderr, "PROMPT_IDS");
+        for (int id : prompt_ids) std::fprintf(stderr, " %d", id);
+        std::fprintf(stderr, "\n");
     }
     // No length check here — engine.prefill() handles chunked prefill for
     // prompts longer than graph_seq_len.
@@ -405,9 +414,10 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
 bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
                     std::vector<ChatMessage>& history,
                     std::vector<int>& cached_token_ids,
-                    const std::string& user_input, int max_new_tokens) {
+                    const std::string& user_input, int max_new_tokens,
+                    bool enable_thinking) {
     history.push_back({"user", user_input});
-    std::vector<int> full_prompt_ids = tokenizer.apply_chat(history);
+    std::vector<int> full_prompt_ids = tokenizer.apply_chat(history, enable_thinking);
     if (full_prompt_ids.empty()) {
         std::fprintf(stderr, "[error] prompt is empty after tokenization\n");
         history.pop_back();
@@ -526,7 +536,8 @@ int main(int argc, char** argv) {
     }
     if (!prompt_text.empty()) {
         return run_prompt_single(engine, tokenizer, prompt_text,
-                                  opts.max_new_tokens, opts.image_path)
+                                  opts.max_new_tokens, opts.image_path,
+                                  opts.enable_thinking)
                    ? 0
                    : 1;
     }
@@ -560,7 +571,7 @@ int main(int argc, char** argv) {
         }
         std::printf("\n");
         run_turn_multi(engine, tokenizer, history, cached_token_ids,
-                       line, opts.max_new_tokens);
+                       line, opts.max_new_tokens, opts.enable_thinking);
     }
 
     return 0;

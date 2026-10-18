@@ -29,6 +29,14 @@ enum class Precision : uint8_t {
     // NVIDIA NVFP4: packed E2M1 values, E4M3 block-16 scales and one FP32
     // global scale per matrix. Routed experts currently use it from SSD.
     NVFP4 = 8,
+    GGUF_Q4_K = 9,
+    GGUF_Q5_K = 10,
+    GGUF_Q6_K = 11,
+    GGUF_Q8_0 = 12,
+    GGUF_IQ2_XXS = 13,
+    GGUF_IQ3_XXS = 14,
+    GGUF_STQ1_0 = 15,
+    GGUF_IQ4_XS = 16,
 };
 
 enum class MemoryType : uint8_t {
@@ -172,6 +180,14 @@ struct Tensor {
         case Precision::INT32: return 4;
         case Precision::RAW_U8: return 1;
         case Precision::NVFP4: return 1; // packed storage byte
+        case Precision::GGUF_Q4_K:
+        case Precision::GGUF_Q5_K:
+        case Precision::GGUF_Q6_K: return 1; // 256-value packed blocks
+        case Precision::GGUF_Q8_0: return 1; // 32-value packed blocks
+        case Precision::GGUF_IQ2_XXS:
+        case Precision::GGUF_IQ3_XXS: return 1; // 256-value packed blocks
+        case Precision::GGUF_STQ1_0: return 1; // 256-value packed blocks
+        case Precision::GGUF_IQ4_XS: return 1; // 256-value packed blocks
         }
         return 0;
     }
@@ -381,6 +397,14 @@ inline size_t precision_size(Precision p) {
     case Precision::INT32: return 4;
     case Precision::RAW_U8: return 1;
     case Precision::NVFP4: return 1; // packed storage byte
+    case Precision::GGUF_Q4_K:
+    case Precision::GGUF_Q5_K:
+    case Precision::GGUF_Q6_K: return 1; // 256-value packed blocks
+    case Precision::GGUF_Q8_0: return 1; // 32-value packed blocks
+    case Precision::GGUF_IQ2_XXS:
+    case Precision::GGUF_IQ3_XXS: return 1; // 256-value packed blocks
+    case Precision::GGUF_STQ1_0: return 1; // 256-value packed blocks
+    case Precision::GGUF_IQ4_XS: return 1; // 256-value packed blocks
     }
     return 0;
 }

@@ -295,7 +295,39 @@ static void test_long_fn_overlap() {
     CHECK(mismatches.load() == 0, "no fn-override across 100 long-fn iters");
 }
 
+// Reconfiguration at the same thread count must not leave old workers using
+// the previous idle policy. Exercise both scheduling modes after every change.
+static void test_idle_yield_reconfigure() {
+    ThreadPool pool(4);
+    CHECK(pool.idle_yield_period() == 0, "idle yield defaults off");
+    for (unsigned period : {1u, 1024u, 0u, 1024u}) {
+        pool.park();
+        pool.resize(4, period);
+        CHECK(pool.idle_yield_period() == period, "same-count idle policy update");
+        for (int iteration = 0; iteration < 20; ++iteration) {
+            std::vector<int> values(257, 0);
+            pool.parallel_for(0, 257, 7, [&](int, int begin, int end) {
+                for (int i = begin; i < end; ++i) values[i] = i + 1;
+            });
+            pool.parallel_for_2d(1, 1, 257, 13,
+                                [&](int, int, int, int begin, int end) {
+                for (int i = begin; i < end; ++i) values[i] *= 2;
+            });
+            bool correct = true;
+            for (int i = 0; i < 257; ++i) correct &= values[i] == 2 * (i + 1);
+            CHECK(correct, "dispatch completes after idle policy update");
+        }
+    }
+    pool.park();
+    pool.resize(4);  // Same-count model reload resets the optional policy.
+    CHECK(pool.idle_yield_period() == 0, "same-count default resize resets policy");
+    pool.resize(2, 1024);
+    pool.parallel_for(0, 2, 1, [](int, int, int) {});
+    pool.park();  // Destructor must still join yielding/parked workers.
+}
+
 int main() {
+    test_idle_yield_reconfigure();
     test_parallel_for_correctness();
     test_parallel_for_2d_correctness();
     test_park_resume_race();

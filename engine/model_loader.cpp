@@ -4,6 +4,7 @@
 #include "backends/factory.h"
 #include "storage/byte_ranges.h"
 #include "engine/weight_metadata.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 
 #include "runtime/host_compute.h"
 #include "storage/ssd_expert_cache/cache.h"
@@ -32,6 +33,7 @@ enum class PersistentInputKind {
     NONE,
     KV_KEY,
     KV_VALUE,
+    LATENT_CACHE,
     GDN_STATE,
     GDN_CONV,
     STATE,
@@ -68,6 +70,8 @@ PersistentInput parse_persistent_input(const std::string& name) {
         input.kind = PersistentInputKind::KV_KEY;
     } else if (parse_indexed_input_name(name, "cache_v", input.layer)) {
         input.kind = PersistentInputKind::KV_VALUE;
+    } else if (parse_indexed_input_name(name, "latent_cache", input.layer)) {
+        input.kind = PersistentInputKind::LATENT_CACHE;
     } else if (parse_indexed_input_name(name, "gdn_state", input.layer)) {
         input.kind = PersistentInputKind::GDN_STATE;
     } else if (parse_indexed_input_name(name, "gdn_conv", input.layer)) {
@@ -79,6 +83,11 @@ PersistentInput parse_persistent_input(const std::string& name) {
     } else if (parse_indexed_input_name(name, "rwkv_ffn_shift", input.layer)) {
         input.kind = PersistentInputKind::FFN_SHIFT;
     } else if (parse_indexed_input_name(name, "aux_state", input.layer)) {
+        input.kind = PersistentInputKind::AUX_STATE;
+    } else if (parse_indexed_input_name(name, "index_state", input.layer)) {
+        // The DSA indexer's key cache (Hy4). Shares the auxiliary-state
+        // storage path but keeps its own name so it cannot collide with
+        // DeepSeek-V4's aux_state numbering.
         input.kind = PersistentInputKind::AUX_STATE;
     }
     return input;
@@ -114,6 +123,8 @@ void LLMEngine::clear_model_state() {
     exec_ctx_decode_ = ExecContext{};
     exec_ctx_vision_ = ExecContext{};
     exec_ctx_mtp_ = ExecContext{};
+    host_matmul_backend_.reset();
+    metal_host_moe_backend_.reset();
     accelerator_backend_.reset();
     // Backends may hold long-lived resident expert leases. Drain device work
     // and release those leases before stopping/destroying their provider.
@@ -169,6 +180,7 @@ void LLMEngine::clear_model_state() {
     temp_files_.clear();
 
     package_metadata_.clear();
+    lm_head_fp32_acc_ = false;
     past_len_ = 0;
     mtp_past_len_ = 0;
     rope_position_delta_ = 0;
@@ -198,16 +210,21 @@ size_t LLMEngine::warmup_package_weights() {
             mmap_weight_exclusion_ranges_, len);
 
 #if defined(MADV_WILLNEED)
-    // Preserve the eager readahead behaviour for ordinary mmap packages. In
-    // SSD mode it would pull aggregate expert tensors into the kernel cache,
-    // so dense-only warmup below intentionally relies on page touches alone.
-    if (expert_ranges.empty()) {
-        uintptr_t start = reinterpret_cast<uintptr_t>(package_weights_base_);
-        uintptr_t aligned_start = (start / page_size) * page_size;
-        size_t prefix = static_cast<size_t>(start - aligned_start);
+    // Read ahead only the dense spans. Advising the entire package in SSD
+    // mode would also pull the much larger expert aggregates into RAM.
+    auto advise_dense = [&](size_t begin, size_t end) {
+        if (begin >= end) return;
+        const uintptr_t start = reinterpret_cast<uintptr_t>(p) + begin;
+        const uintptr_t aligned_start = (start / page_size) * page_size;
         madvise(reinterpret_cast<void*>(aligned_start),
-                prefix + package_weights_size_, MADV_WILLNEED);
+                end - begin + (start - aligned_start), MADV_WILLNEED);
+    };
+    size_t cursor = 0;
+    for (const auto& range : expert_ranges) {
+        advise_dense(cursor, range.begin);
+        cursor = range.end;
     }
+    advise_dense(cursor, len);
 #endif
 
     uint8_t sink = 0;
@@ -228,7 +245,8 @@ size_t LLMEngine::warmup_package_weights() {
 }
 
 size_t LLMEngine::lock_dense_package_weights() {
-    if (!package_weights_mmap_backed() || (!moe_ssd_cache_ && !cfg_.offload_ple) ||
+    if (!package_weights_mmap_backed() ||
+        (!moe_ssd_cache_ && !cfg_.pin_gguf_dense_weights && !cfg_.offload_ple) ||
         !locked_dense_ranges_.empty()) {
         return 0;
     }
@@ -503,6 +521,59 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
         return false;
     }
 
+    // Repair legacy Hy4 graph conventions in memory, without rewriting the
+    // weight package: GGUF rotary pairing and the shared-expert clamp.
+    const auto architecture = package_metadata_.find("architecture");
+    if (architecture != package_metadata_.end() && architecture->second == "hy-v4") {
+        // Older Hy4 exports recorded RoPE settings only in the package JSON.
+        // Input preparation reads graph metadata; retain explicit graph values
+        // and recover missing settings before configuring the runtime.
+        for (const char* key : {"rope_dim", "rope_theta"}) {
+            const auto value = package_metadata_.find(key);
+            if (value != package_metadata_.end())
+                g.metadata.emplace(key, value->second);
+        }
+        const auto quantization = package_metadata_.find("quantization");
+        // Earlier GGUF exports used the Transformers rotate_half convention,
+        // but their weights follow the GGUF reference's consecutive pairs.
+        // New exports record the convention explicitly and need no repair.
+        const bool hy4_gguf = quantization != package_metadata_.end() &&
+            (quantization->second == "gguf-native-blocks" ||
+             quantization->second == "gguf-dequant-fp16");
+        const bool legacy_gguf_rope = hy4_gguf &&
+            package_metadata_.find("rope_interleave") == package_metadata_.end();
+        if (hy4_gguf) g.metadata.emplace("lm_head_fp32_acc", "1");
+        for (auto& node : g.nodes) {
+            // GGUF reference MLA retains its latent K/V in FP32. Rounding
+            // this shared state to FP16 perturbs subsequent expert routing.
+            if (hy4_gguf && node.op_type == OpType::INPUT &&
+                !node.params.str.empty() &&
+                parse_persistent_input(node.params.str[0]).kind ==
+                    PersistentInputKind::LATENT_CACHE) {
+                node.out_prec = Precision::FP32;
+            }
+            if (hy4_gguf && node.op_type == OpType::HY4_INDEXER &&
+                node.params.i32.size() == 8) {
+                node.params.i32.push_back(0); // FP32 projections, cache, scores
+            }
+            // GGUF residual streams stay FP32; only older graphs omitted the
+            // explicit HF BF16-emulation flag. Preserve explicit new settings.
+            if (hy4_gguf && node.params.i32.size() == 2 &&
+                (node.op_type == OpType::HC_PRE_ID ||
+                 node.op_type == OpType::HC_POST_ID ||
+                 node.op_type == OpType::HC_HEAD_ID)) {
+                node.params.i32.push_back(0);
+            }
+            if (legacy_gguf_rope && node.op_type == OpType::ROTARY_EMBED &&
+                node.params.i32.size() >= 2) {
+                node.params.i32[1] = 1;
+            }
+            if (node.op_type == OpType::MOE && node.params.f32.size() < 3) {
+                node.params.f32 = {graph_params::get_f32(node.params, 0, 1.0f),
+                                   graph_params::get_f32(node.params, 1, 0.0f), 0.0f};
+            }
+        }
+    }
     if (!cfg_.qsa_companion_dir.empty() && (&g == &graph_prefill_ || &g == &graph_decode_)) {
         std::string error;
         if (cfg_.device != Device::CUDA || cfg_.mtp_draft_tokens ||
@@ -706,6 +777,13 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
                     ? blob + weight_header.scales_offset : nullptr;
                 const Precision precision =
                     static_cast<Precision>(weight_header.precision);
+                if (gguf_k_block_bytes(precision) && accelerator_backend_ &&
+                    exec_ctx.backend == accelerator_backend_.get()) {
+                    fprintf(stderr,
+                            "Engine: GGUF quantized weight %s currently requires CPU execution\n",
+                            wref.c_str());
+                    return false;
+                }
                 const bool cpu_weight = build_cpu_weight_sidecars;
                 auto align_package_region =
                     [&](const void* source, uint64_t size, size_t alignment,
@@ -849,12 +927,9 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
                         host_prepare_fp8_bf16_fp16_weight(
                             t, wref, data, packed_weights_);
                 }
-                // Once a CPU sidecar owns every value needed by the selected
-                // kernel, the original package pages are no longer used at
-                // inference time. Exclude the whole weight blob from dense
-                // warmup/mlock. Gate this on the prepared pointers rather
-                // than the architecture or weight name so unsupported
-                // platforms retain their raw fallback.
+                // Sidecar-backed weights no longer need their original pages.
+                // Native GGUF expert blocks stay pageable. The optional dense
+                // pinning mode keeps only the always-used GGUF blocks resident.
                 const bool complete_cpu_sidecar =
                     (t.prec == Precision::FP8_E4M3 &&
                      (t.q8_repack_data || t.fp8_bf16_fp16_data)) ||
@@ -863,7 +938,19 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
                     (t.prec == Precision::FP32 && t.fp32_bf16_data) ||
                     (t.prec == Precision::FP16 && t.is_interleaved &&
                      t.data != data);
-                if (complete_cpu_sidecar) {
+                const bool gguf_source_to_skip =
+                    gguf_k_block_bytes(t.prec) &&
+                    (!(cfg_.pin_gguf_dense_weights || moe_ssd_cache_) ||
+                     mollm::detail::is_routed_expert_aggregate_ref(wref));
+                // Offloaded decode only looks up a few embedding rows. Keep
+                // the table mapped, but avoid warming and wiring every row at
+                // the expense of memory available for expert reads. Explicit
+                // dense pinning still requests the original resident policy.
+                const bool pageable_lookup =
+                    moe_ssd_cache_ && lookup_table &&
+                    !cfg_.pin_gguf_dense_weights;
+                if (complete_cpu_sidecar || gguf_source_to_skip ||
+                    pageable_lookup) {
                     mmap_weight_exclusion_ranges_.push_back(
                         {pit->second.first, pit->second.second});
                 }
@@ -900,6 +987,15 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
         }
 
         const MappedFile& mapped = shared_weights_[weight_index];
+        if (gguf_k_block_bytes(
+                static_cast<Precision>(mapped.header().precision)) &&
+            accelerator_backend_ &&
+            exec_ctx.backend == accelerator_backend_.get()) {
+            fprintf(stderr,
+                    "Engine: GGUF quantized weight %s currently requires CPU execution\n",
+                    wref.c_str());
+            return false;
+        }
         setup_weight(
             const_cast<void*>(mapped.data()),
             static_cast<Precision>(mapped.header().precision));
@@ -1029,6 +1125,12 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
             cache.v_head_dim = (int)node.out_shape[0];
             cache.v_num_heads = (int)node.out_shape[2];
             break;
+        case PersistentInputKind::LATENT_CACHE:
+            cache.latent = &tensor;
+            cache.latent_width = (int)node.out_shape[0];
+            if (node.out_shape[2] != 1 || node.out_shape[3] != 1)
+                return false;
+            break;
         case PersistentInputKind::GDN_STATE:
             cache.gdn_state = &tensor;
             cache.gdn_v_dim = (int)node.out_shape[0];
@@ -1088,6 +1190,27 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
     };
 
     for (auto& cp : caches) {
+        if (cp.latent) {
+            const size_t es = cp.latent->element_size();
+            const size_t data_bytes = (size_t)cp.latent_width * n_ctx * es;
+            const size_t total = CacheMetadata::SIZE + data_bytes;
+            cp.latent->mem_type = MemoryType::POOLED;
+            cp.latent->shape[0] = (int64_t)total / (int64_t)es;
+            cp.latent->shape[1] = cp.latent->shape[2] = cp.latent->shape[3] = 1;
+            cp.latent->compute_strides();
+            if (!alloc_cache_buf(
+                    cp.latent, total,
+                    PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX,
+                    CacheMetadata::SIZE))
+                return false;
+            CacheMetadata metadata;
+            metadata.max_seq_len = (uint64_t)n_ctx;
+            metadata.num_kv_heads = 1;
+            metadata.head_dim = (uint64_t)cp.latent_width;
+            if (!storage_backend->copy_from_host(
+                    &metadata, *cp.latent, sizeof(metadata)))
+                return false;
+        }
         // Standard KV cache
         if (cp.k) {
             int hd = cp.k_head_dim;
@@ -1335,6 +1458,33 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 "--ssd-cache-mb\n");
         return false;
     }
+    if (cfg_.metal_dense) {
+        if (cfg_.device != Device::CPU) {
+            std::fprintf(stderr, "Engine: --metal-dense requires --device cpu\n");
+            return false;
+        }
+        std::string reason;
+        host_matmul_backend_ = create_metal_host_matmul_backend(reason);
+        if (!host_matmul_backend_) {
+            std::fprintf(stderr, "Engine: --metal-dense unavailable: %s\n", reason.c_str());
+            return false;
+        }
+        cfg_.weight_loading = WeightLoadingMode::MMAP;
+    }
+    if (cfg_.metal_moe_ffn) {
+        if (cfg_.device != Device::CPU || cfg_.moe_ssd_cache_bytes == 0) {
+            std::fprintf(stderr,
+                         "Engine: --metal-moe-ffn requires --device cpu and --ssd-cache-mb\n");
+            return false;
+        }
+        std::string reason;
+        metal_host_moe_backend_ = create_metal_host_moe_ffn_backend(reason);
+        if (!metal_host_moe_backend_) {
+            std::fprintf(stderr, "Engine: --metal-moe-ffn unavailable: %s\n",
+                         reason.c_str());
+            return false;
+        }
+    }
     mollm_trace::start(cfg_.trace_path);
     mollm_trace::set_thread_name("main");
     if (cfg_.moe_ssd_cache_bytes != 0) {
@@ -1367,6 +1517,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_mtp_.backend = cpu_backend_.get();
     exec_ctx_prefill_.moe_backend = nullptr;
     exec_ctx_decode_.moe_backend = nullptr;
+    if (metal_host_moe_backend_)
+        exec_ctx_decode_.moe_backend = metal_host_moe_backend_.get();
     exec_ctx_vision_.moe_backend = nullptr;
     exec_ctx_mtp_.moe_backend = nullptr;
     accelerator_backend_.reset();
@@ -1527,17 +1679,33 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 "Engine: --mtp-draft-tokens requires a package with an MTP graph\n");
         return false;
     }
+    const auto quantization_it = package_metadata_.find("quantization");
+    if (cfg_.pin_gguf_dense_weights &&
+        (cfg_.weight_loading != WeightLoadingMode::MMAP ||
+         !cfg_.lock_dense_weights ||
+         quantization_it == package_metadata_.end() ||
+         quantization_it->second != "gguf-native-blocks")) {
+        std::fprintf(stderr,
+                     "Engine: --pin-gguf-dense requires a native GGUF mmap package\n");
+        return false;
+    }
 
     const auto architecture_it = package_metadata_.find("architecture");
     const std::string architecture =
         architecture_it != package_metadata_.end()
             ? architecture_it->second
             : std::string();
-    if (architecture == "deepseek-v4") {
+    if (cfg_.metal_dense && (architecture != "hy-v4" || !package_mmap_)) {
+        std::fprintf(stderr, "Engine: --metal-dense requires a Hy4 mmap package\n");
+        return false;
+    }
+    if (architecture == "deepseek-v4" || architecture == "hy-v4") {
+        const bool hy4 = architecture == "hy-v4";
         const auto context_it = package_metadata_.find("n_ctx");
         if (context_it == package_metadata_.end()) {
             fprintf(stderr,
-                    "Engine: DeepSeek-V4 package is missing n_ctx metadata\n");
+                    "Engine: %s package is missing n_ctx metadata\n",
+                    hy4 ? "Hy4" : "DeepSeek-V4");
             return false;
         }
         char* context_end = nullptr;
@@ -1545,19 +1713,22 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             std::strtol(context_it->second.c_str(), &context_end, 10);
         if (!context_end || *context_end != '\0' || package_context <= 0) {
             fprintf(stderr,
-                    "Engine: DeepSeek-V4 package has invalid n_ctx metadata\n");
+                    "Engine: %s package has invalid n_ctx metadata\n",
+                    hy4 ? "Hy4" : "DeepSeek-V4");
             return false;
         }
         if (cfg_.n_ctx > package_context) {
             fprintf(
                 stderr,
-                "Engine: requested n_ctx=%d exceeds this DeepSeek-V4 "
+                "Engine: requested n_ctx=%d exceeds this %s "
                 "package's auxiliary-cache capacity (%ld); reconvert with "
                 "a larger --n-ctx or lower --n-ctx\n",
-                cfg_.n_ctx, package_context);
+                cfg_.n_ctx, hy4 ? "Hy4" : "DeepSeek-V4", package_context);
             return false;
         }
+    }
 
+    if (architecture == "deepseek-v4") {
         // Metal uses a CPU graph, but may delegate routed MXFP4 experts
         // through its dedicated SSD cache.
         const bool unsupported_accelerator = cfg_.device == Device::METAL;
@@ -1644,13 +1815,17 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         !load_graph(graph_vision_, exec_ctx_vision_, vi_path.c_str())) {
         return false;
     }
-    // RWKV state and token-shift buffers are persistent INPUT tensors, so the
-    // regular release queue can safely manage all materialized intermediates.
+    // RWKV state and verified CPU absorbed-MLA caches are persistent INPUTs,
+    // so the release queue can manage materialized prefill intermediates.
     // Keeping every same-shape node output resident defeats that liveness and
     // costs multiple gigabytes for a 256-token prefill graph.
     for (const auto& node : graph_prefill_.nodes) {
         if (node.op_type == OpType::RWKV7 ||
-            node.op_type == OpType::RWKV_TOKEN_SHIFT) {
+            node.op_type == OpType::RWKV_TOKEN_SHIFT ||
+            (node.op_type == OpType::SDPA_MLA_ABSORB &&
+             std::any_of(exec_ctx_prefill_.release_queue.begin(),
+                         exec_ctx_prefill_.release_queue.end(),
+                         [](const auto& batch) { return !batch.empty(); }))) {
             exec_ctx_prefill_.reuse_same_shape_workspace = false;
             break;
         }
@@ -1671,6 +1846,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     };
     cfg_.rope_dim = get_meta_int("rope_dim", cfg_.rope_dim);
     cfg_.rope_theta = get_meta_float("rope_theta", cfg_.rope_theta);
+    lm_head_fp32_acc_ = get_meta_int("lm_head_fp32_acc", 0) != 0;
 
     if (!allocate_caches(
             graph_prefill_, exec_ctx_prefill_, caches_, cfg.n_ctx)) {
@@ -1693,6 +1869,40 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             return false;
         }
     }
+    if (host_matmul_backend_) {
+        size_t registered = 0;
+        for (const auto& node : graph_decode_.nodes) {
+            if (node.op_type != OpType::CONSTANT || node.params.str.empty()) continue;
+            std::string key = node.params.str[0];
+            const auto slash = key.find_last_of("/\\");
+            if (slash != std::string::npos) key.erase(0, slash + 1);
+            if (key.size() > 4 && key.compare(key.size()-4, 4, ".xmm") == 0)
+                key.resize(key.size()-4);
+            if (key.compare(0, 6, "layer_") != 0) continue;
+            const auto suffix = key.find('_', 6);
+            if (suffix == std::string::npos || suffix == 6 ||
+                key.find_first_not_of("0123456789", 6) != suffix) continue;
+            const std::string family = key.substr(suffix);
+            if (family != "_attn_o_proj_weight" &&
+                family != "_attn_linear_gate_weight") continue;
+            const auto& weight = graph_decode_.runtime.tensors[node.id];
+            if (weight.prec != Precision::GGUF_Q5_K) continue;
+            if (!host_matmul_backend_->register_weight(
+                    weight, package_mmap_, package_mmap_size_)) {
+                std::fprintf(stderr, "Engine: cannot register Metal dense weight %s\n", key.c_str());
+                return false;
+            }
+            ++registered;
+        }
+        if (!registered) {
+            std::fprintf(stderr, "Engine: --metal-dense found no eligible Hy4 Q5 projections\n");
+            return false;
+        }
+        exec_ctx_decode_.matmul_backend = host_matmul_backend_.get();
+        std::fprintf(stderr,
+            "Engine: Metal dense decode enabled for %zu Q5 projections; KV and MoE remain CPU\n",
+            registered);
+    }
     // Graph loading builds the CPU sidecars used by FP8 dense weights and
     // records their source blobs as exclusions. Lock only after both graphs
     // have been prepared so those now-unused raw package pages are not pulled
@@ -1705,8 +1915,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                                  "locked-memory allowance for all non-PLE weights\n");
             return false;
         }
-    } else if (cfg_.lock_dense_weights && moe_ssd_cache_) {
-        lock_dense_package_weights();
+    } else if (cfg_.lock_dense_weights &&
+               (moe_ssd_cache_ || cfg_.pin_gguf_dense_weights)) {
+        const size_t locked = lock_dense_package_weights();
+        if (cfg_.pin_gguf_dense_weights && locked == 0)
+            return false;
     }
 
     if (!embed_weight_ || !embed_weight_->data) {
@@ -1750,6 +1963,9 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             break;
         case PersistentInputKind::KV_VALUE:
             source = cache.v;
+            break;
+        case PersistentInputKind::LATENT_CACHE:
+            source = cache.latent;
             break;
         case PersistentInputKind::GDN_STATE:
             source = cache.gdn_state;

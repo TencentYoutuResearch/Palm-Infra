@@ -1,5 +1,6 @@
 #include "storage/mapped_file.h"
 #include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 #include "storage/ssd_expert_cache/cache.h"
 
 #include <chrono>
@@ -13,6 +14,10 @@
 #include <thread>
 #include <string>
 #include <vector>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/mman.h>
+#endif
 #if defined(MOLLM_CUDA)
 #include <cuda_runtime_api.h>
 #endif
@@ -54,9 +59,147 @@ MoeSsdTensorSpec spec(const char* name, uint64_t offset) {
     return out;
 }
 
+// Reuse, completed prefetch and readiness describe different events.
+void test_readiness_counters() {
+    const std::string path = "/tmp/mollm_test_moe_ssd_readiness.bin";
+    { std::ofstream out(path, std::ios::binary);
+      const uint16_t data[12] = {}; out.write(reinterpret_cast<const char*>(data), sizeof(data)); }
+    MoeSsdCache cache;
+    check(cache.open(path, 24, 1, false, false), "open readiness counter cache");
+    check(cache.add_source(spec("g", 0)) && cache.add_source(spec("d", 12)),
+          "add readiness counter sources");
+    auto* g = cache.find_source("g");
+    auto* d = cache.find_source("d");
+    check(cache.prefetch_many(g, d, {0}) && wait_until([&] { return cache.is_ready(g, d, 0); }),
+          "prefetch completes before first acquire");
+    cache.reset_stats();
+    ExpertLease lease;
+    check(cache.borrow(g, d, 0, lease, false), "borrow completed prefetch without waiting");
+    auto st = cache.stats();
+    check(st.hits == 0 && st.misses == 0 && st.layers.size() == 1 &&
+          st.layers[0].demand_acquires == 1 && st.layers[0].demand_misses == 1 &&
+          st.layers[0].acquires_ready_at_lookup == 1 && st.layers[0].acquires_waited == 0,
+          "first completed prefetch is ready but is neither global hit nor demand load");
+    lease.reset();
+    check(cache.borrow(g, d, 0, lease, false), "borrow reusable ready expert");
+    lease.reset();
+    check(!cache.borrow(g, d, 1, lease, false), "nonblocking missing probe fails");
+    st = cache.stats();
+    check(st.hits == 1 && st.layers[0].demand_acquires == 2 &&
+          st.layers[0].demand_hits == 1 && st.layers[0].acquires_ready_at_lookup == 2 &&
+          st.layers[0].acquires_waited == 0, "failed probe does not count as successful acquire");
+    check(cache.borrow(g, d, 1, lease), "cold demand acquire succeeds");
+    lease.reset();
+    st = cache.stats();
+    check(st.misses == 1 && st.layers[0].demand_acquires == 3 &&
+          st.layers[0].acquires_ready_at_lookup == 2 && st.layers[0].acquires_waited <= 1,
+          "cold acquire is not initially ready regardless of I/O completion race");
+    cache.reset_stats();
+    check(cache.stats().layers.empty(), "reset clears readiness counters");
+    check(cache.borrow(g, d, 0, lease, false), "reset preserves resident expert");
+    st = cache.stats();
+    check(st.hits == 1 && st.layers[0].demand_acquires == 1 &&
+          st.layers[0].acquires_ready_at_lookup == 1 && st.layers[0].acquires_waited == 0,
+          "post-reset ready reuse has fresh counters");
+    lease.reset();
+    std::remove(path.c_str());
+}
+
+#if defined(__APPLE__)
+void test_aligned_reads() {
+    const size_t page = static_cast<size_t>(getpagesize());
+    const std::string path = "/tmp/mollm_test_moe_ssd_aligned.bin";
+    std::vector<uint8_t> bytes(16 * page + 74);
+    for (size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = static_cast<uint8_t>(i * 23 + i / page + i / 4096);
+    { std::ofstream out(path, std::ios::binary);
+      out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()); }
+    const std::vector<size_t> offsets = {0, 128, 4094, 4096, page - 2, bytes.size() - 6 * page};
+    const std::vector<size_t> sizes = {page, 2 * page, 6 * page, 2 * page, page, 6 * page};
+    auto part = [&](size_t i, const char* name) {
+        auto x = spec(name, offsets[i]);
+        x.layer = static_cast<int>(i); x.num_experts = 1;
+        x.cols = static_cast<int>(sizes[i] / sizeof(uint16_t));
+        x.data_bytes = sizes[i];
+        return x;
+    };
+    for (bool locked : {false, true}) for (bool reuse : {false, true}) {
+        MoeSsdCache cache;
+        const size_t capacity = (reuse ? 48 : 16) * page;
+        check(cache.open(path, capacity, 4, false, locked) &&
+              cache.set_global_capacity_pool(true), "open aligned read cache");
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            check(cache.add_source(part(i, ("ag" + std::to_string(i)).c_str())) &&
+                  cache.add_source(part(i, ("ad" + std::to_string(i)).c_str())),
+                  "register aligned read sources");
+        }
+        check(!cache.set_read_alignment(3) && !cache.set_read_alignment(2 * page),
+              "reject unsupported alignment");
+        check(cache.set_read_alignment(4096) && cache.set_read_alignment(0) &&
+              cache.set_read_alignment(4096), "configure and reset alignment before I/O");
+        check(!cache.set_global_capacity_pool(false) &&
+              !cache.add_source(part(0, "late")), "freeze aligned capacity layout");
+        if (reuse) {
+            check(cache.set_buffer_reuse_capacity(16 * page), "enable aligned buffer reuse");
+            check(cache.stats().buffer_reserve_bytes == 30 * page &&
+                  !cache.set_read_alignment(0), "replacement margin includes padded pair");
+        }
+        uint64_t logical = 0;
+        for (int round = 0; round < 3; ++round) for (size_t i = 0; i < sizes.size(); ++i) {
+            auto* g = cache.find_source("ag" + std::to_string(i));
+            auto* d = cache.find_source("ad" + std::to_string(i));
+            if (!cache.is_ready(g, d, 0)) logical += 2 * sizes[i];
+            ExpertLease lease;
+            const bool ok = cache.borrow(g, d, 0, lease);
+            check(ok, "borrow aligned payload");
+            if (!ok) continue;
+            check(std::memcmp(lease.gate_up.data, bytes.data() + offsets[i], sizes[i]) == 0 &&
+                  std::memcmp(lease.down.data, bytes.data() + offsets[i], sizes[i]) == 0,
+                  "aligned window preserves payload through resize, reuse and EOF");
+            size_t resident = 0;
+            for (size_t j = 0; j < sizes.size(); ++j)
+                if (cache.is_ready(cache.find_source("ag" + std::to_string(j)),
+                                   cache.find_source("ad" + std::to_string(j)), 0))
+                    resident += 2 * (sizes[j] + page);
+            const auto stats = cache.stats();
+            check(stats.resident_bytes == resident && stats.bytes_read == logical &&
+                  resident + stats.buffer_reserve_bytes <= capacity &&
+                  resident + stats.reusable_buffer_bytes <= capacity,
+                  "padded residency and logical reads use separate exact charges");
+            check(!cache.evict(g, d, 0) && !cache.clear_resident() &&
+                  !cache.set_read_alignment(0) && !cache.open(path, capacity),
+                  "aligned payload remains pinned across configuration attempts");
+        }
+        check(cache.clear_resident() && cache.stats().resident_bytes == 0 &&
+              cache.stats().reusable_buffer_bytes == 0, "clear aligned pages and idle pool");
+        check(cache.open(path, 2 * page, 1) && cache.set_global_capacity_pool(true) &&
+              cache.add_source(part(0, "g")) && cache.add_source(part(0, "d")),
+              "reopen clears alignment policy");
+        Tensor g, d;
+        check(cache.acquire(cache.find_source("g"), cache.find_source("d"), 0, g, d) &&
+              cache.stats().resident_bytes == 2 * page, "reopened cache has unpadded charges");
+        check(cache.clear_resident() && cache.set_read_alignment(4096), "reconfigure empty cache");
+        check(!cache.can_prefetch_pairs(cache.find_source("g"), cache.find_source("d"), 1) &&
+              !cache.acquire(cache.find_source("g"), cache.find_source("d"), 0, g, d),
+              "capacity checks include read padding before allocation");
+    }
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 8 * page) && cache.set_global_capacity_pool(true) &&
+              cache.add_source(spec("small", 0)) && !cache.set_read_alignment(4096),
+              "reject component lengths with unsupported page rounding");
+    }
+    std::remove(path.c_str());
+}
+#endif
+
 } // namespace
 
 int main() {
+    test_readiness_counters();
+#if defined(__APPLE__)
+    test_aligned_reads();
+#endif
     const std::string path = "/tmp/mollm_test_moe_ssd.bin";
     // Three gate expert slices, then three down slices. The values are raw
     // fp16 bit patterns; the cache must preserve their byte ordering exactly.
@@ -381,6 +524,220 @@ int main() {
         check(cache.clear_resident(), "all lease pins are returned on reset and failure");
     }
 
+    // Recycling differently sized experts must release unused tail pages,
+    // retain exact payload bytes, and leave cache capacity available.
+    {
+        const size_t page = static_cast<size_t>(getpagesize());
+        const std::string resized_path = "/tmp/mollm_test_moe_ssd_resized.bin";
+        std::vector<uint8_t> bytes(24 * page);
+        for (size_t i = 0; i < bytes.size(); ++i)
+            bytes[i] = static_cast<uint8_t>(i * 17 + i / page);
+        {
+            std::ofstream out(resized_path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        for (bool locked : {false, true}) {
+            MoeSsdCache cache;
+            check(cache.open(resized_path, 16 * page, 2, false, locked),
+                  "open mixed-size expert cache");
+            check(cache.set_global_capacity_pool(true), "share mixed-size cache");
+            auto part = [&](const char* name, int layer, size_t offset, size_t length) {
+                auto item = spec(name, offset);
+                item.layer = layer;
+                item.num_experts = 1;
+                item.cols = static_cast<int>(length / sizeof(uint16_t));
+                item.data_bytes = length;
+                return item;
+            };
+            check(cache.add_source(part("large_gate", 0, 0, 8 * page)) &&
+                  cache.add_source(part("large_down", 0, 8 * page, 4 * page)) &&
+                  cache.add_source(part("small_gate", 1, 12 * page, 5 * page)) &&
+                  cache.add_source(part("small_down", 1, 17 * page, 5 * page)),
+                  "register differently sized expert pairs");
+            const auto* lg = cache.find_source("large_gate");
+            const auto* ld = cache.find_source("large_down");
+            const auto* sg = cache.find_source("small_gate");
+            const auto* sd = cache.find_source("small_down");
+            Tensor gate, down;
+            check(cache.acquire(lg, ld, 0, gate, down), "load large expert");
+#if defined(__APPLE__)
+            void* original_gate = gate.data;
+            void* original_down = down.data;
+#endif
+            for (int round = 0; round < 3; ++round) {
+                check(cache.acquire(sg, sd, 0, gate, down), "recycle large expert for small");
+                check(std::memcmp(gate.data, bytes.data() + 12 * page, 5 * page) == 0 &&
+                      std::memcmp(down.data, bytes.data() + 17 * page, 5 * page) == 0,
+                      "shrinking and growing buffers preserve incoming expert bytes");
+                check(cache.stats().resident_bytes == 10 * page,
+                      "small expert frees capacity for the full size difference");
+#if defined(__APPLE__)
+                check(gate.data == original_gate && down.data == original_down,
+                      "recycled buffers keep their reserved address ranges");
+                char residency[3] = {};
+                check(mincore(static_cast<uint8_t*>(gate.data) + 5 * page,
+                              3 * page, residency) == 0 &&
+                      !(residency[0] & 1) && !(residency[1] & 1) && !(residency[2] & 1),
+                      "shrunk buffer tail no longer holds resident pages");
+#endif
+                check(cache.acquire(lg, ld, 0, gate, down), "grow recycled expert again");
+                check(std::memcmp(gate.data, bytes.data(), 8 * page) == 0 &&
+                      std::memcmp(down.data, bytes.data() + 8 * page, 4 * page) == 0,
+                      "repeated growth loads the complete expert payload");
+                check(cache.stats().resident_bytes == 12 * page,
+                      "growth stays within the expert cache budget");
+            }
+            check(cache.stats().bytes_read == 78 * page &&
+                  cache.stats().expert_bytes_acquired == 78 * page,
+                  "resize leaves logical I/O and consumption counts exact");
+            check(cache.clear_resident() && cache.stats().resident_bytes == 0,
+                  "mixed-size cache releases all resident buffers");
+
+            check(cache.open(resized_path, 12 * page, 2, false, locked) &&
+                  cache.set_global_capacity_pool(true),
+                  "reopen cache for growth beyond the reserved address range");
+            check(cache.add_source(part("tiny_gate", 0, 0, page)) &&
+                  cache.add_source(part("tiny_down", 0, page, page)) &&
+                  cache.add_source(part("grown_gate", 1, 0, 9 * page)) &&
+                  cache.add_source(part("grown_down", 1, 9 * page, 3 * page)),
+                  "register experts spanning a reservation growth");
+            check(cache.acquire(cache.find_source("tiny_gate"),
+                                cache.find_source("tiny_down"), 0, gate, down) &&
+                  cache.acquire(cache.find_source("grown_gate"),
+                                cache.find_source("grown_down"), 0, gate, down),
+                  "replace a small reservation with larger buffers");
+            check(std::memcmp(gate.data, bytes.data(), 9 * page) == 0 &&
+                  std::memcmp(down.data, bytes.data() + 9 * page, 3 * page) == 0 &&
+                  cache.stats().resident_bytes == 12 * page &&
+                  cache.stats().bytes_read == 14 * page,
+                  "reservation replacement preserves payload and byte accounting");
+        }
+        std::remove(resized_path.c_str());
+    }
+
+#if defined(__APPLE__)
+    // Reuse is instance-local and its idle mappings consume an explicit slice
+    // of the total budget. Exercise payloads, lease pins, clear and reopen.
+    {
+        const size_t page = static_cast<size_t>(getpagesize());
+        const std::string path = "/tmp/mollm_test_moe_ssd_pool.bin";
+        std::vector<uint8_t> bytes(24 * page);
+        for (size_t i = 0; i < bytes.size(); ++i)
+            bytes[i] = static_cast<uint8_t>(i * 31 + i / page);
+        { std::ofstream out(path, std::ios::binary);
+          out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()); }
+        for (bool locked : {false, true}) {
+            MoeSsdCache cache, other;
+            auto configure = [&](MoeSsdCache& c) {
+                check(c.open(path, 40 * page, 2, false, locked) &&
+                      c.set_global_capacity_pool(true), "open per-instance buffer pool");
+                auto part = [&](const char* name, int layer, size_t offset, size_t size) {
+                    auto x = spec(name, offset); x.layer = layer; x.num_experts = 1;
+                    x.cols = static_cast<int>(size / sizeof(uint16_t)); x.data_bytes = size;
+                    return x;
+                };
+                check(c.add_source(part("pg", 0, 0, 8 * page)) &&
+                      c.add_source(part("pd", 0, 8 * page, 4 * page)) &&
+                      c.add_source(part("sg", 1, 12 * page, 5 * page)) &&
+                      c.add_source(part("sd", 1, 17 * page, 5 * page)), "register pool sources");
+                check(!c.set_buffer_reuse_capacity(page + 1) &&
+                      !c.set_buffer_reuse_capacity(20 * page), "reject invalid pool budgets");
+                check(c.set_buffer_reuse_capacity(16 * page), "reserve idle and replacement bytes");
+                check(c.stats().buffer_reserve_bytes == 28 * page &&
+                      !c.set_global_capacity_pool(false), "pool budget requires global policy");
+            };
+            configure(cache); configure(other);
+            auto* g = cache.find_source("pg"); auto* d = cache.find_source("pd");
+            auto* sg = cache.find_source("sg"); auto* sd = cache.find_source("sd");
+            ExpertLease lease;
+            check(!cache.borrow(g, g, 0, lease), "pool pair margin excludes duplicate source aliases");
+            check(cache.borrow(g, d, 0, lease), "borrow pool-backed expert");
+            struct TestRegistration final : MoeSsdBufferRegistration {};
+            int registrations = 0;
+            const auto register_buffer = [&](void* address, size_t bytes)
+                    -> std::unique_ptr<MoeSsdBufferRegistration> {
+                check(address != nullptr && bytes >= page,
+                      "registration receives readable allocation prefix");
+                ++registrations;
+                return std::make_unique<TestRegistration>();
+            };
+            MoeSsdRegisteredPair registered;
+            check(!cache.get_or_register_borrowed_buffers(
+                      ExpertLease{}, register_buffer, registered) &&
+                  !registered.gate_up.registration && registrations == 0,
+                  "unborrowed registration access is rejected");
+            check(cache.get_or_register_borrowed_buffers(
+                      lease, register_buffer, registered) &&
+                  registered.gate_up.registration &&
+                  registered.down.registration &&
+                  registered.gate_up.payload_offset < registered.gate_up.active_bytes &&
+                  registered.down.payload_offset < registered.down.active_bytes &&
+                  registrations == 2,
+                  "live lease creates two allocation registrations");
+            auto* gate_registration = registered.gate_up.registration;
+            auto* down_registration = registered.down.registration;
+            check(cache.get_or_register_borrowed_buffers(
+                      lease, register_buffer, registered) &&
+                  registered.gate_up.registration == gate_registration &&
+                  registered.down.registration == down_registration &&
+                  registrations == 2,
+                  "repeated access keeps the same registrations");
+            check(!cache.evict(g, d, 0) && !cache.clear_resident() &&
+                  !cache.set_buffer_reuse_capacity(0) &&
+                  !cache.open(path, 40 * page), "pool cannot recycle pinned storage");
+            lease = ExpertLease();
+            check(cache.evict(g, d, 0) && cache.stats().reusable_buffer_bytes == 12 * page,
+                  "evicted mappings remain inside the idle budget");
+            Tensor gate, down;
+            check(other.acquire(other.find_source("pg"), other.find_source("pd"), 0, gate, down) &&
+                  other.stats().buffer_reuses == 0, "another cache cannot consume idle mappings");
+            ExpertLease foreign_lease;
+            check(other.borrow(other.find_source("pg"), other.find_source("pd"),
+                               0, foreign_lease, false) &&
+                  !cache.get_or_register_borrowed_buffers(
+                      foreign_lease, register_buffer, registered) &&
+                  !registered.gate_up.registration && registrations == 2,
+                  "another cache cannot register through a foreign lease");
+            foreign_lease.reset();
+            check(cache.acquire(g, d, 0, gate, down) && cache.stats().buffer_reuses == 2,
+                  "both expert components reuse exact page counts");
+            check(cache.borrow(g, d, 0, lease, false) &&
+                  cache.get_or_register_borrowed_buffers(
+                      lease, register_buffer, registered) &&
+                  registered.gate_up.registration == gate_registration &&
+                  registered.down.registration == down_registration &&
+                  registrations == 2,
+                  "pooled allocations retain their registration owners");
+            lease.reset();
+            registered = {};
+            check(std::memcmp(gate.data, bytes.data(), 8 * page) == 0 &&
+                  std::memcmp(down.data, bytes.data() + 8 * page, 4 * page) == 0,
+                  "reused locked and unlocked mappings contain exact payloads");
+            for (int i = 0; i < 4; ++i) {
+                check(cache.acquire(sg, sd, 0, gate, down), "replace with smaller expert");
+                check(std::memcmp(gate.data, bytes.data() + 12 * page, 5 * page) == 0 &&
+                      std::memcmp(down.data, bytes.data() + 17 * page, 5 * page) == 0,
+                      "mixed-size pooled payload is correct");
+                auto stats = cache.stats();
+                check(stats.resident_bytes <= 12 * page &&
+                      stats.reusable_buffer_bytes <= 16 * page &&
+                      stats.resident_bytes + stats.reusable_buffer_bytes <= 40 * page,
+                      "active and idle bytes respect the reserved budget");
+                check(cache.evict(sg, sd, 0), "return smaller expert to pool");
+                check(cache.acquire(g, d, 0, gate, down), "reload larger expert");
+            }
+            cache.reset_stats();
+            check(cache.stats().buffer_reuses == 0, "reuse counters reset without losing mappings");
+            check(cache.clear_resident() && cache.stats().resident_bytes == 0 &&
+                  cache.stats().reusable_buffer_bytes == 0, "clear releases active and idle mappings");
+            check(cache.open(path, 40 * page) && cache.stats().buffer_reserve_bytes == 0 &&
+                  cache.stats().reusable_buffer_bytes == 0, "reopen resets pool policy and storage");
+            check(other.clear_resident(), "second pool remains independent");
+        }
+        std::remove(path.c_str());
+    }
+#endif
+
     // Reject corrupt package metadata during registration, before an I/O
     // worker can turn it into a short read or an overflowing allocation.
     {
@@ -401,6 +758,57 @@ int main() {
         short_stride.expert_stride = short_stride.data_bytes - 1;
         check(!cache.add_source(short_stride),
               "reject expert stride shorter than its data");
+    }
+
+    // Native GGUF blocks have no scale sidecar. Expert-major Q8_0 rows must
+    // retain their exact bytes when read into the asynchronous cache.
+    {
+        const std::string gguf_path = "/tmp/mollm_test_moe_ssd_gguf.bin";
+        std::vector<uint8_t> bytes(4 * 34, 0);
+        for (int block = 0; block < 4; ++block) {
+            bytes[block * 34 + 1] = 0x3c; // fp16 scale = 1
+            for (int col = 0; col < 32; ++col)
+                bytes[block * 34 + 2 + col] =
+                    static_cast<uint8_t>(block * 8 + col);
+        }
+        {
+            std::ofstream out(gguf_path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        }
+        auto gguf_spec = [](const char* name, uint64_t offset) {
+            MoeSsdTensorSpec out;
+            out.weight_ref = name;
+            out.layer = 0;
+            out.num_experts = 2;
+            out.rows = 1;
+            out.cols = 32;
+            out.precision = Precision::GGUF_Q8_0;
+            out.data_offset = offset;
+            out.data_bytes = 34;
+            return out;
+        };
+        MoeSsdCache cache;
+        check(cache.open(gguf_path, bytes.size()), "open native GGUF cache");
+        check(cache.add_source(gguf_spec("gguf_gate", 0)) &&
+                  cache.add_source(gguf_spec("gguf_down", 68)),
+              "register native GGUF expert sources");
+        Tensor gate, down;
+        check(cache.acquire(cache.find_source("gguf_gate"),
+                            cache.find_source("gguf_down"), 1, gate, down),
+              "load native GGUF expert one");
+        float decoded[32];
+        check(gate.prec == Precision::GGUF_Q8_0 &&
+                  down.prec == Precision::GGUF_Q8_0 &&
+                  std::memcmp(gate.data, bytes.data() + 34, 34) == 0 &&
+                  std::memcmp(down.data, bytes.data() + 102, 34) == 0 &&
+                  gguf_k_dequantize_block(
+                      gate.prec, static_cast<const uint8_t*>(gate.data), decoded) &&
+                  decoded[0] == 8.0f,
+              "native GGUF cache preserves exact expert blocks");
+        auto invalid = gguf_spec("gguf_wrong_size", 0);
+        invalid.data_bytes = 33;
+        check(!cache.add_source(invalid), "reject malformed GGUF block span");
     }
 
     // Direct BG128 blocks carry their own scales. The SSD cache should accept

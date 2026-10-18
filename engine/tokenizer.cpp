@@ -118,6 +118,10 @@ bool Tokenizer::configure_chat_template(const std::string& path,
     } else if (source.find("<｜User｜>") != std::string::npos &&
                source.find("<｜Assistant｜>") != std::string::npos) {
         chat_template_style_ = ChatTemplateStyle::DEEPSEEK_V4;
+    } else if (source.find("hy_start_token") != std::string::npos &&
+               source.find("hy_middle_token") != std::string::npos &&
+               source.find("hy_end_token") != std::string::npos) {
+        chat_template_style_ = ChatTemplateStyle::HY_V4;
     } else if (source.find("hy_User") != std::string::npos &&
                source.find("hy_Assistant") != std::string::npos) {
         chat_template_style_ = ChatTemplateStyle::HY_V3;
@@ -269,6 +273,10 @@ bool Tokenizer::load_impl(const std::string& path) {
         eos_id_ = added_tokens_["<eos:6124c78e>"];
     else if (added_tokens_.count("<｜hy_eos:opensource｜>"))
         eos_id_ = added_tokens_["<｜hy_eos:opensource｜>"];
+    for (const auto& [piece, id] : added_tokens_) {
+        if (piece.rfind("<｜hy_start:", 0) == 0) bos_id_ = id;
+        if (piece.rfind("<｜hy_end:", 0) == 0) eos_id_ = id;
+    }
 
     return true;
 }
@@ -993,6 +1001,47 @@ std::vector<int> Tokenizer::apply_chat(
         prompt += "<｜Assistant｜>assistant<｜im▁middle｜>";
         prompt += enable_thinking ? "<think>\n"
                                   : "<think>\n\n</think>\n\n";
+    } else if (style == ChatTemplateStyle::HY_V4) {
+        // Plain text, no-tools branch of the packaged Hy4 template. The
+        // checkpoint's token suffix is read from its added-token vocabulary.
+        auto find_token = [&](const std::string& prefix) {
+            for (const auto& [piece, id] : added_tokens_) {
+                (void)id;
+                if (piece.rfind(prefix, 0) == 0) return piece;
+            }
+            return std::string();
+        };
+        const std::string start = find_token("<｜hy_start:");
+        const std::string middle = find_token("<｜hy_middle:");
+        const std::string end = find_token("<｜hy_end:");
+        const std::string think_begin = find_token("<think:");
+        const std::string think_end = find_token("</think:");
+        const std::string reasoning = find_token("<｜reasoning_mode:");
+        if (start.empty() || middle.empty() || end.empty() ||
+            think_begin.empty() || think_end.empty() || reasoning.empty())
+            return {};
+        const std::string effort = enable_thinking ? "high" : "no_think";
+        const bool leading_system = !messages.empty() &&
+                                    messages.front().role == "system";
+        if (!leading_system)
+            prompt = start + "system" + middle + reasoning +
+                     "reasoning_effort:" + effort + end;
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const auto& msg = messages[i];
+            prompt += start + msg.role + middle;
+            if (msg.role == "assistant") {
+                prompt += think_begin + think_end + msg.content;
+            } else {
+                prompt += msg.content;
+                if (msg.role == "system" && i == 0)
+                    prompt += reasoning + "reasoning_effort:" + effort;
+            }
+            prompt += end;
+        }
+        if (messages.empty() || messages.back().role != "assistant") {
+            prompt += start + "assistant" + middle + think_begin;
+            if (!enable_thinking) prompt += think_end;
+        }
     } else if (style == ChatTemplateStyle::HY_V3) {
         // Plain no-tools branch of the official HY-V3 template. Hy-MT2 uses
         // no_think by default, including its documented translation example.

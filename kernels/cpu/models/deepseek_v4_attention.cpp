@@ -3,6 +3,7 @@
 #include "core/bf16.h"
 #include "backends/cpu/platform.h"
 #include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/norm.h"
 #include "runtime/threading.h"
 
 #include <algorithm>
@@ -1077,6 +1078,174 @@ bool kernel_dsv4_grouped_linear(
             kernel_matmul_fp32(
                 group_input, group_weight, group_output, thread_pool);
         }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Hy4 indexer (Gated DSA)
+// ---------------------------------------------------------------------------
+
+bool kernel_hy4_indexer(
+    const Tensor& hidden,
+    const Tensor& q_lora,
+    const Tensor& wq_b,
+    const Tensor& wk,
+    const Tensor& weights_projection,
+    const Tensor& k_norm_weight,
+    const Tensor& k_norm_bias,
+    Tensor& key_cache,
+    Tensor& indices,
+    int start_pos,
+    const Hy4IndexerConfig& config,
+    ThreadPool* thread_pool) {
+    const int sequence = static_cast<int>(hidden.shape[1]);
+    const int query_width = config.num_heads * config.head_dim;
+    if (hidden.prec != Precision::FP32 || q_lora.prec != Precision::FP32 ||
+        hidden.shape[0] != config.hidden_size ||
+        q_lora.shape[0] != config.q_lora_rank ||
+        q_lora.shape[1] != sequence ||
+        wq_b.shape[0] != query_width ||
+        wq_b.shape[1] != config.q_lora_rank ||
+        wk.shape[0] != config.head_dim ||
+        wk.shape[1] != config.hidden_size ||
+        weights_projection.shape[0] != config.num_heads ||
+        weights_projection.shape[1] != config.hidden_size ||
+        k_norm_weight.shape[0] != config.head_dim ||
+        k_norm_bias.shape[0] != config.head_dim ||
+        k_norm_weight.prec != Precision::FP32 ||
+        k_norm_bias.prec != Precision::FP32 ||
+        !std::isfinite(config.norm_eps) || config.norm_eps <= 0.0f ||
+        key_cache.prec != Precision::FP32 ||
+        key_cache.shape[0] != config.head_dim ||
+        key_cache.shape[1] != config.capacity ||
+        indices.prec != Precision::INT32 ||
+        indices.shape[0] != config.top_k ||
+        indices.shape[1] != sequence ||
+        config.num_heads <= 0 || config.head_dim <= 0 ||
+        // rope_dim == 0 disables rotation; otherwise it must be an even
+        // trailing width within head_dim.
+        config.rope_dim < 0 || config.rope_dim > config.head_dim ||
+        (config.rope_dim & 1) || sequence <= 0) {
+        std::fprintf(stderr, "HY4_INDEXER: invalid tensor shape or precision\n");
+        return false;
+    }
+    const int head_dim = config.head_dim;
+    const int capacity = config.capacity;
+
+    // Indexer query: wq_b @ q_lora, where q_lora is already normed by
+    // q_a_layernorm upstream. Same low-rank source as the main MLA query.
+    std::vector<float> query(static_cast<size_t>(query_width) * sequence);
+    Tensor query_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        query_width, sequence, 1, 1, query.data());
+    kernel_matmul_fp32(q_lora, wq_b, query_tensor, thread_pool);
+
+    // Indexer keys: wk @ hidden, then a norm with both weight and bias.
+    std::vector<float> keys(static_cast<size_t>(head_dim) * sequence);
+    Tensor keys_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        head_dim, sequence, 1, 1, keys.data());
+    kernel_matmul_fp32(hidden, wk, keys_tensor, thread_pool);
+    // HY4's indexer uses LayerNorm (including mean subtraction), not RMSNorm
+    // or just an affine transform. Normalize before applying positional RoPE.
+    kernel_layer_norm(keys_tensor, k_norm_weight, k_norm_bias,
+                      config.norm_eps, keys_tensor, thread_pool);
+
+    // Per-head selection weights, computed from the hidden state.
+    std::vector<float> head_weights(
+        static_cast<size_t>(config.num_heads) * sequence);
+    Tensor weights_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        config.num_heads, sequence, 1, 1, head_weights.data());
+    kernel_matmul_fp32(hidden, weights_projection, weights_tensor, thread_pool);
+
+    // GGUF keeps projections, scoring, and our FP32 key cache in FP32.
+    // Retain the earlier HF BF16 emulation only when explicitly requested.
+    const float weight_scale = 1.0f / std::sqrt(
+        static_cast<float>(head_dim) * static_cast<float>(config.num_heads));
+    if (config.round_bf16)
+        mollm_round_to_bf16(head_weights.data(), head_weights.size());
+    for (float& value : head_weights)
+        value *= weight_scale;
+
+    // Rotate q and k per position and write this chunk's keys into the cache,
+    // so a later decode step can score without recomputing them.
+    for (int token = 0; token < sequence; ++token) {
+        const int position = start_pos + token;
+
+        float* token_query =
+            query.data() + static_cast<size_t>(token) * query_width;
+        for (int head = 0; head < config.num_heads; ++head) {
+            float* head_query = token_query + static_cast<size_t>(head) * head_dim;
+            // RoPE covers the trailing rope_dim values (nope first, rope last),
+            // matching the reference split.
+            dsv4_apply_rope(head_query, head_dim, position, config.rope);
+            if (config.round_bf16)
+                mollm_round_to_bf16(head_query, static_cast<size_t>(head_dim));
+        }
+
+        float* token_key =
+            keys.data() + static_cast<size_t>(token) * head_dim;
+        dsv4_apply_rope(token_key, head_dim, position, config.rope);
+        if (config.round_bf16)
+            mollm_round_to_bf16(token_key, static_cast<size_t>(head_dim));
+
+        if (capacity > 0 && position < capacity) {
+            float* slot = key_cache.ptr<float>() +
+                          static_cast<size_t>(position) * head_dim;
+            std::memcpy(slot, token_key, head_dim * sizeof(float));
+        }
+    }
+
+    // Score every query position against all cached keys up to and including
+    // itself, then keep the top_k highest.
+    int32_t* output = indices.ptr<int32_t>();
+    std::fill(output, output + indices.nelements(), static_cast<int32_t>(-1));
+
+    std::vector<float> scores;
+    std::vector<int> order;
+    for (int token = 0; token < sequence; ++token) {
+        const int position = start_pos + token;
+        const int available = std::min(position + 1, capacity);
+        if (available <= 0)
+            continue;
+        const float* token_query =
+            query.data() + static_cast<size_t>(token) * query_width;
+        const float* token_weights =
+            head_weights.data() + static_cast<size_t>(token) * config.num_heads;
+        const float* cache_data = key_cache.ptr<float>();
+
+        scores.assign(static_cast<size_t>(available), 0.0f);
+        for (int cache_index = 0; cache_index < available; ++cache_index) {
+            const float* key =
+                cache_data + static_cast<size_t>(cache_index) * head_dim;
+            float score = 0.0f;
+            for (int head = 0; head < config.num_heads; ++head) {
+                float dot = dot_product(
+                    token_query + static_cast<size_t>(head) * head_dim,
+                    key, head_dim);
+                if (config.round_bf16) dot = mollm_round_to_bf16(dot);
+                float weighted = std::max(dot, 0.0f) * token_weights[head];
+                if (config.round_bf16) weighted = mollm_round_to_bf16(weighted);
+                score += weighted;
+            }
+            scores[cache_index] = config.round_bf16 ? mollm_round_to_bf16(score) : score;
+        }
+
+        const int selected = std::min(config.top_k, available);
+        order.resize(static_cast<size_t>(available));
+        for (int i = 0; i < available; ++i) order[i] = i;
+        std::partial_sort(
+            order.begin(), order.begin() + selected, order.end(),
+            [&](int left, int right) {
+                if (scores[left] == scores[right]) return left < right;
+                return scores[left] > scores[right];
+            });
+        int32_t* token_output =
+            output + static_cast<size_t>(token) * config.top_k;
+        for (int rank = 0; rank < selected; ++rank)
+            token_output[rank] = static_cast<int32_t>(order[rank]);
     }
     return true;
 }

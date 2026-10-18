@@ -188,7 +188,54 @@ int main() {
     CHECK(!graph_save(invalid, "/tmp/test_graph_invalid.gllm"),
           "reject non-topological graph on save");
 
+    // Opcode52 existed independently in the two feature branches. Preserve
+    // QSA packages while migrating explicitly identified legacy Hy4 graphs.
+    Graph legacy;
+    legacy.metadata["model_type"] = "hy-v4";
+    for (uint32_t id = 0; id < 8; ++id) {
+        GraphNode input;
+        input.id = id;
+        input.op_type = OpType::INPUT;
+        legacy.nodes.push_back(input);
+        legacy.graph_inputs.push_back(id);
+    }
+    GraphNode attention;
+    attention.id = 8;
+    attention.op_type = OpType::QSA_SDPA; // raw legacy opcode52
+    attention.inputs = {0, 1, 2, 3, 4, 5, 6, 7};
+    attention.params.i32 = {2, 1, 2, 1, 8, 8, -1, -1, 4, 2};
+    legacy.nodes.push_back(attention);
+    legacy.graph_outputs = {8};
+    CHECK(graph_save(legacy, "/tmp/test_graph_legacy_hy4.gllm"), "write legacy Hy4 opcode52");
+    Graph migrated;
+    CHECK(graph_load(migrated, "/tmp/test_graph_legacy_hy4.gllm") &&
+          migrated.nodes.back().op_type == OpType::SDPA_MLA_ABSORB,
+          "explicit Hy4 identity migrates MLA opcode52 to54");
+    CHECK(graph_save(migrated, "/tmp/test_graph_hy4_current.gllm") &&
+          graph_load(migrated, "/tmp/test_graph_hy4_current.gllm") &&
+          migrated.nodes.back().op_type == OpType::SDPA_MLA_ABSORB,
+          "new Hy4 opcode54 survives roundtrip");
+    legacy.metadata["model_type"] = "qwen4-exp";
+    legacy.nodes.back().inputs.pop_back();
+    legacy.nodes.back().params.i32.resize(6);
+    CHECK(graph_save(legacy, "/tmp/test_graph_qsa.gllm") &&
+          graph_load(migrated, "/tmp/test_graph_qsa.gllm") &&
+          migrated.nodes.back().op_type == OpType::QSA_SDPA,
+          "Qwen QSA opcode52 remains unchanged");
+    legacy.metadata.clear();
+    CHECK(graph_save(legacy, "/tmp/test_graph_qsa.gllm") &&
+          graph_load(migrated, "/tmp/test_graph_qsa.gllm") &&
+          migrated.nodes.back().op_type == OpType::QSA_SDPA,
+          "missing model identity never triggers guessed migration");
+    legacy.metadata["model_type"] = "hy-v4";
+    CHECK(graph_save(legacy, "/tmp/test_graph_legacy_hy4.gllm") &&
+          !graph_load(migrated, "/tmp/test_graph_legacy_hy4.gllm"),
+          "malformed legacy Hy4 MLA is rejected");
+
     // cleanup
+    remove("/tmp/test_graph_legacy_hy4.gllm");
+    remove("/tmp/test_graph_hy4_current.gllm");
+    remove("/tmp/test_graph_qsa.gllm");
     remove("/tmp/test_graph.gllm");
     remove("/tmp/test_graph_empty.gllm");
     remove("/tmp/test_graph_strs.gllm");

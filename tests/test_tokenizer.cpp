@@ -74,6 +74,50 @@ int main() {
         ran_any = true;
     }
 
+    {
+        const char* path = "/tmp/mollm_hyv4_tokenizer_test.json";
+        const char* chat = "/tmp/mollm_hyv4_template_test.jinja";
+        {
+            std::ofstream f(path);
+            f << R"({"model":{"vocab":{"a":0},"merges":[]},"added_tokens":[)"
+              << R"({"id":20,"content":"<｜hy_start:hash｜>"},)"
+              << R"({"id":21,"content":"<｜hy_middle:hash｜>"},)"
+              << R"({"id":22,"content":"<｜hy_end:hash｜>"},)"
+              << R"({"id":23,"content":"<think:hash>"},)"
+              << R"({"id":24,"content":"</think:hash>"},)"
+              << R"({"id":25,"content":"<｜reasoning_mode:hash｜>"}]})";
+        }
+        {
+            std::ofstream f(chat);
+            f << "{% set hy_start_token = '<｜hy_start:hash｜>' %}"
+                 "{% set hy_middle_token = '<｜hy_middle:hash｜>' %}"
+                 "{% set hy_end_token = '<｜hy_end:hash｜>' %}";
+        }
+        Tokenizer tok;
+        CHECK(tok.load(path, chat, "hy-v4"), "Hy4 tokenizer loads");
+        CHECK(tok.bos_id() == 20 && tok.eos_id() == 22,
+              "Hy4 GGUF start/end IDs detected");
+        const std::string system =
+            "<｜hy_start:hash｜>system<｜hy_middle:hash｜>"
+            "<｜reasoning_mode:hash｜>reasoning_effort:high<｜hy_end:hash｜>";
+        const std::string user =
+            "<｜hy_start:hash｜>user<｜hy_middle:hash｜>a<｜hy_end:hash｜>";
+        const std::string assistant =
+            "<｜hy_start:hash｜>assistant<｜hy_middle:hash｜><think:hash>";
+        check_ids(tok.apply_chat("a"), tok.encode(system + user + assistant),
+                  "Hy4 plain high-effort prompt matches template");
+        const std::string no_think_system =
+            "<｜hy_start:hash｜>system<｜hy_middle:hash｜>"
+            "<｜reasoning_mode:hash｜>reasoning_effort:no_think<｜hy_end:hash｜>";
+        check_ids(tok.apply_chat({{"user", "a"}}, false),
+                  tok.encode(no_think_system + user + assistant +
+                             "</think:hash>"),
+                  "Hy4 no-think prompt closes empty thinking block");
+        std::remove(path);
+        std::remove(chat);
+        ran_any = true;
+    }
+
     // Some HF BPE tokenizers isolate Unicode numbers in chunks of at most
     // three before their main split regex. BPE merges must not cross those
     // chunk boundaries: "28448" is "284" + "48", not five digits.

@@ -38,7 +38,11 @@ public:
     ThreadPool(ThreadPool&&) = delete;
     ThreadPool& operator=(ThreadPool&&) = delete;
 
-    void resize(int num_threads);
+    // Call between jobs. Changing either value joins existing workers before
+    // restarting lazily. Zero retains pure spin; otherwise idle workers yield
+    // to the OS after this many spin iterations. A one-argument call resets it.
+    void resize(int num_threads, unsigned idle_yield_period = 0);
+    unsigned idle_yield_period() const { return idle_yield_period_; }
     int num_threads() const { return num_threads_; }
 
     // Park all workers: they exit their spin loop and block on a CV until
@@ -92,6 +96,7 @@ private:
     std::vector<std::thread> workers_;
     Job job_;
     int num_threads_ = 1;
+    unsigned idle_yield_period_ = 0;
     bool workers_started_ = false;
     std::atomic<bool> parked_{false};  // workers blocked on park_cv_
 

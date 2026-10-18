@@ -146,6 +146,12 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
             for (uint8_t component_index = 0;
                  component_index < component_count; ++component_index) {
                 const uint8_t component = first_component + component_index;
+                // Block formats such as native GGUF embed scales in the data.
+                // An absent sidecar needs neither an I/O job nor a completion
+                // dependency; keep data jobs so every entry still completes.
+                if ((component == 1 || component == 3) &&
+                    component_buffer(*entry, component).empty())
+                    continue;
                 IoJob job;
                 job.component = component;
                 job.trace_id = next_trace_id_++;
@@ -300,6 +306,22 @@ bool MoeSsdCache::read_job(const IoJob& job) {
     const uint64_t offset = component_offset(*job.entries.front(), job.component);
     if (job.entries.size() == 1) {
         ByteBuffer& dst = component_buffer(*job.entries.front(), job.component);
+#if defined(__APPLE__)
+        if (read_alignment_) {
+            const size_t head = offset % read_alignment_;
+            const uint64_t start = offset - head;
+            if (start > file_size_ || dst.size() > dst.active_bytes - head)
+                return false;
+            const size_t needed = head + dst.size();
+            const size_t rounded = (needed + read_alignment_ - 1) /
+                                   read_alignment_ * read_alignment_;
+            const size_t count = static_cast<size_t>(
+                std::min<uint64_t>(rounded, file_size_ - start));
+            if (count < needed || count > dst.active_bytes) return false;
+            dst.payload_offset = head;
+            if (!read_exact(start, dst.storage, count)) return false;
+        } else
+#endif
         if (!read_exact(offset, dst.data(), dst.size())) return false;
         lock_buffer(dst);
         return true;

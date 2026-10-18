@@ -30,35 +30,31 @@
 // ---------------------------------------------------------------------------
 // sigmoid (FP32, NEON). Also used by SILU.
 //
-// Polynomial exp approximation good to ~7 bits in [-88, 88]. Same impl as the
-// one previously defined static-inline in graph/execute.cpp — moved here to
-// share between the eltwise SILU executor and the fused-activation matmul path.
+// Evaluate exp(-abs(x)) with range reduction and a degree-six polynomial.
+// Keeping the exponent nonpositive avoids overflow at either sigmoid tail.
+// The final division retains FP32 accuracy instead of a raw reciprocal estimate.
 // ---------------------------------------------------------------------------
 #if HAS_NEON
 static inline float32x4_t sigmoid_f32_neon(float32x4_t x) {
-    // sigmoid(x) = 1 / (1 + exp(-x))
-    float32x4_t neg_x = vnegq_f32(x);
-    neg_x = vmaxq_f32(neg_x, vdupq_n_f32(-88.f));
-    neg_x = vminq_f32(neg_x, vdupq_n_f32(88.f));
-    const float32x4_t log2e = vdupq_n_f32(1.4426950408889634f);
-    float32x4_t t = vmulq_f32(neg_x, log2e);
-    float32x4_t n = vrndmq_f32(t);
-    float32x4_t f = vsubq_f32(t, n);
-    int32x4_t ni = vcvtq_s32_f32(n);
-    float32x4_t pow2n = vreinterpretq_f32_s32(
-        vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23));
-    const float32x4_t c0 = vdupq_n_f32(1.0f);
-    const float32x4_t c1 = vdupq_n_f32(0.6931472f);
-    const float32x4_t c2 = vdupq_n_f32(0.2402265f);
-    const float32x4_t c3 = vdupq_n_f32(0.0555049f);
-    const float32x4_t c4 = vdupq_n_f32(0.0096813f);
-    float32x4_t pow2f = vfmaq_f32(c3, c4, f);
-    pow2f = vfmaq_f32(c2, pow2f, f);
-    pow2f = vfmaq_f32(c1, pow2f, f);
-    pow2f = vfmaq_f32(c0, pow2f, f);
-    float32x4_t ex = vmulq_f32(pow2n, pow2f);
-    float32x4_t one = vdupq_n_f32(1.0f);
-    return vrecpeq_f32(vaddq_f32(one, ex));
+    const float32x4_t one = vdupq_n_f32(1.f);
+    const float32x4_t magnitude = vabsq_f32(x);
+    const float32x4_t z = vnegq_f32(vminq_f32(magnitude, vdupq_n_f32(87.f)));
+    const float32x4_t n = vrndnq_f32(vmulq_n_f32(z, 1.4426950408889634f));
+    // Split ln(2) keeps the reduced argument accurate near the negative tail.
+    float32x4_t r = vfmsq_n_f32(z, n, 0.693145751953125f);
+    r = vfmsq_n_f32(r, n, 1.428606765330187e-6f);
+    float32x4_t p = vdupq_n_f32(1.f / 720.f);
+    p = vfmaq_f32(vdupq_n_f32(1.f / 120.f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.f / 24.f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.f / 6.f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
+    p = vfmaq_f32(one, p, r);
+    p = vfmaq_f32(one, p, r);
+    const int32x4_t exponent = vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127));
+    float32x4_t e = vmulq_f32(p, vreinterpretq_f32_s32(vshlq_n_s32(exponent, 23)));
+    e = vbslq_f32(vcgtq_f32(magnitude, vdupq_n_f32(87.f)), vdupq_n_f32(0.f), e);
+    const float32x4_t numerator = vbslq_f32(vcltq_f32(x, vdupq_n_f32(0.f)), e, one);
+    return vdivq_f32(numerator, vaddq_f32(one, e));
 }
 #endif  // HAS_NEON
 

@@ -32,6 +32,11 @@ token-loss等价性验证，旧性能数字仅为历史运行，不能视为合�
 
 ## 已实现
 
+图格式兼容：`QSA_SDPA=52`、`QSA_INDEXER=53` 保持不变；Hy4 的
+`SDPA_MLA_ABSORB` 使用54。整合前的 Hy4 图曾使用52，加载器仅在图中
+`model_type=hy-v4` 且具备 MLA 输入/参数结构时迁移到54，不改写模型包。
+缺少模型身份时不会猜测算子含义；新导出的 Hy4 图直接写54。
+
 - 独立图算子 `QSA_INDEXER`/`QSA_SDPA`、CUDA dispatch 与执行器生命周期
   契约；`build_graph(..., enable_qsa=True)` 连接 index projection、原始
   centered norm 权重、主 RoPE frequency 与 selected-key attention。

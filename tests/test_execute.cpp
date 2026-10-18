@@ -1,5 +1,7 @@
 #include "graph/execute.h"
+#include "runtime/host_matmul_backend.h"
 #include "backends/cpu/backend.h"
+#include "core/cache_layout.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -12,8 +14,212 @@ static int failures = 0;
     else { printf("  PASS: %s\n", msg); } \
 } while(0)
 
+class TestHostMatmul final : public HostMatmulBackend {
+public:
+    HostMatmulResult result;
+    int calls = 0;
+    explicit TestHostMatmul(HostMatmulResult r) : result(r) {}
+    bool register_weight(const Tensor&, const void*, size_t) override { return true; }
+    HostMatmulResult dispatch(const GraphNode&, const std::vector<const Tensor*>&,
+                             Tensor* output, ThreadPool*) override {
+        ++calls;
+        if (result == HostMatmulResult::Completed) {
+            output->ptr<float>()[0] = 42.f;
+            output->ptr<float>()[1] = 43.f;
+        }
+        return result;
+    }
+};
+
 int main() {
     CPUBackend cpu_backend;  // shared across all ExecContexts below
+    for (auto result : {HostMatmulResult::Unsupported,
+                        HostMatmulResult::Completed, HostMatmulResult::Failed}) {
+        Graph graph;
+        graph.nodes.resize(3);
+        graph.runtime.tensors.resize(3);
+        for (int id=0; id<3; ++id) {
+            graph.nodes[id].id=id;
+            graph.nodes[id].op_type=id<2?OpType::INPUT:OpType::MATMUL;
+            graph.nodes[id].out_shape[0]=2;
+            graph.nodes[id].out_shape[1]=id==1?2:1;
+            graph.nodes[id].out_prec=Precision::FP32;
+        }
+        graph.nodes[2].inputs={0,1};
+        graph.graph_inputs={0,1}; graph.graph_outputs={2};
+        float x[]={1,2},w[]={1,2,3,4};
+        graph.runtime.tensors[0]=Tensor::create(Precision::FP32,MemoryType::EXTERNAL,2,1,1,1,x);
+        graph.runtime.tensors[1]=Tensor::create(Precision::FP32,MemoryType::EXTERNAL,2,2,1,1,w);
+        BufferPool pool; TestHostMatmul delegate(result); ExecContext ctx;
+        ctx.graph=&graph;ctx.pool=&pool;ctx.backend=&cpu_backend;ctx.matmul_backend=&delegate;
+        prepare_execution(ctx);execute_graph(ctx);
+        CHECK(delegate.calls==1, "host matmul dispatched once");
+        CHECK(ctx.execution_failed==(result==HostMatmulResult::Failed),
+              "host matmul failure stops execution");
+        if (!ctx.execution_failed) {
+            const float* out=graph.runtime.tensors[2].ptr<float>();
+            CHECK(out && out[0]==(result==HostMatmulResult::Completed?42.f:5.f) &&
+                         out[1]==(result==HostMatmulResult::Completed?43.f:11.f),
+                  "host matmul unsupported falls back; completed skips CPU");
+        }
+    }
+
+
+    // Absorbed MLA may release temporary producers/views after their last
+    // use, while its persistent cache must survive subsequent executions.
+    {
+        Graph graph;
+        graph.nodes.resize(13);
+        graph.runtime.tensors.resize(13);
+        for (uint32_t id = 0; id < 13; ++id) {
+            graph.nodes[id].id = id;
+            graph.nodes[id].out_shape[0] = 1;
+        }
+        for (uint32_t id = 0; id < 9; ++id)
+            graph.graph_inputs.push_back(id);
+        auto& product = graph.nodes[9];
+        product.op_type = OpType::MUL;
+        product.inputs = {0, 8};
+        auto& view = graph.nodes[10];
+        view.op_type = OpType::RESHAPE;
+        view.inputs = {9};
+        view.params.i32 = {1, 1, 1, 1};
+        auto& attention = graph.nodes[11];
+        attention.op_type = OpType::SDPA_MLA_ABSORB;
+        attention.inputs = {10, 1, 2, 3, 4, 5, 6, 7};
+        attention.params.i32 = {2, 1, 1, 1, 2, 1, -1, -1, 1, 1};
+        attention.params.f32 = {1.0f};
+        graph.nodes[12].op_type = OpType::MUL;
+        graph.nodes[12].inputs = {11, 8};
+        graph.graph_outputs = {12};
+
+        float query = 2.0f, zero = 0.0f, latent = 1.0f, multiplier = 0.5f;
+        float mask[2] = {};
+        __fp16 key_weight = 1.0f, value_weight = 2.0f;
+        std::vector<uint64_t> cache((CacheMetadata::SIZE + 8) / sizeof(uint64_t));
+        auto* metadata = cache_meta(cache.data());
+        metadata->max_seq_len = 2;
+        metadata->num_kv_heads = 1;
+        metadata->head_dim = 2;
+        auto bind = [&](int id, Precision precision, void* data, int width = 1) {
+            graph.runtime.tensors[id] = Tensor::create(
+                precision, MemoryType::EXTERNAL, width, 1, 1, 1, data);
+        };
+        bind(0, Precision::FP32, &query);
+        bind(1, Precision::FP32, &zero);
+        bind(2, Precision::FP32, &latent);
+        bind(3, Precision::FP32, &zero);
+        bind(4, Precision::FP16, &key_weight);
+        bind(5, Precision::FP16, &value_weight);
+        bind(6, Precision::FP32, mask);
+        bind(7, Precision::FP16, cache.data());
+        bind(8, Precision::FP32, &multiplier);
+        ExecContext ctx;
+        ctx.graph = &graph;
+        ctx.pool = &graph.runtime.pool;
+        ctx.backend = &cpu_backend;
+        ctx.runtime_seq_len = 1;
+        prepare_execution(ctx);
+        for (int pass = 0; pass < 2; ++pass) {
+            latent = pass == 0 ? 1.0f : 3.0f;
+            graph.runtime.tensors[6].shape[0] = pass + 1;
+            graph.runtime.tensors[6].compute_strides();
+            execute_graph(ctx);
+            const auto& output = graph.runtime.tensors[12];
+            const float e = std::exp(-2.0f);
+            const float expected = pass == 0 ? 1.0f : (e + 3.0f) / (e + 1.0f);
+            CHECK(!ctx.execution_failed && output.data &&
+                      std::fabs(output.ptr<float>()[0] - expected) < 1e-5f,
+                  "MLA liveness preserves attention through a temporary view");
+            CHECK(metadata->current_seq_len == static_cast<uint64_t>(pass + 1) &&
+                      graph.runtime.tensors[7].data == cache.data(),
+                  "MLA persistent cache survives intermediate release");
+            CHECK(graph.runtime.pool.active_bytes() == BufferPool::MIN_BUCKET &&
+                      !graph.runtime.tensors[9].data &&
+                      !graph.runtime.tensors[10].data &&
+                      !graph.runtime.tensors[11].data,
+                  "MLA liveness retains only the graph output");
+        }
+        auto no_releases = [&] {
+            for (const auto& batch : ctx.release_queue)
+                if (!batch.empty()) return false;
+            return true;
+        };
+        attention.inputs[7] = 9;
+        prepare_execution(ctx);
+        CHECK(no_releases(), "temporary MLA state keeps conservative cleanup");
+        attention.op_type = OpType::HY4_INDEXER;
+        prepare_execution(ctx);
+        CHECK(no_releases(), "temporary indexer state keeps conservative cleanup");
+        attention.op_type = OpType::SDPA_MLA_ABSORB;
+        attention.inputs[7] = 7;
+        class DeviceCPU : public CPUBackend {
+            bool is_device_resident() const override { return true; }
+        } device;
+        ctx.backend = &device;
+        prepare_execution(ctx);
+        CHECK(no_releases(), "device MLA keeps conservative cleanup");
+    }
+
+    // A RESHAPE chain may borrow or materialize after a PERMUTE. Keep every
+    // possible storage owner and the view metadata alive through the consumer.
+    for (bool transpose : {false, true}) {
+        Graph graph;
+        graph.nodes.resize(7);
+        graph.runtime.tensors.resize(7);
+        for (uint32_t id = 0; id < 7; ++id) {
+            auto& node = graph.nodes[id];
+            node.id = id;
+            node.out_prec = Precision::FP32;
+            node.out_shape[0] = node.out_shape[1] = 2;
+        }
+        graph.nodes[0].op_type = OpType::INPUT;
+        graph.nodes[1].op_type = OpType::ADD;
+        graph.nodes[1].inputs = {0, 0};
+        graph.nodes[2].op_type = OpType::PERMUTE;
+        graph.nodes[2].inputs = {1};
+        graph.nodes[2].params.i32 = transpose ? std::vector<int32_t>{1, 0, 2, 3}
+                                             : std::vector<int32_t>{0, 1, 2, 3};
+        for (int id : {3, 4}) {
+            graph.nodes[id].op_type = OpType::RESHAPE;
+            graph.nodes[id].inputs = {uint32_t(id - 1)};
+            graph.nodes[id].params.i32 = {2, 2, 1, 1};
+        }
+        // This allocation would overwrite an owner released at the view's
+        // creation instead of its last consumer.
+        graph.nodes[5].op_type = OpType::ADD;
+        graph.nodes[5].inputs = {0, 0};
+        graph.nodes[6].op_type = OpType::ADD;
+        graph.nodes[6].inputs = {4, 5};
+        graph.graph_inputs = {0};
+        graph.graph_outputs = {6};
+        float data[] = {1, 2, 3, 4};
+        graph.runtime.tensors[0] = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 2, 2, 1, 1, data);
+        ExecContext ctx;
+        ctx.graph = &graph;
+        ctx.pool = &graph.runtime.pool;
+        ctx.backend = &cpu_backend;
+        prepare_execution(ctx);
+        for (int pass = 0; pass < 2; ++pass) {
+            execute_graph(ctx);
+            const float* output = graph.runtime.tensors[6].ptr<float>();
+            CHECK(!ctx.execution_failed && output && output[0] == 4 &&
+                      output[1] == (transpose ? 10 : 8) &&
+                      output[2] == (transpose ? 10 : 12) && output[3] == 16,
+                  "nested reshape liveness preserves borrowed/materialized data");
+            CHECK(graph.runtime.pool.active_bytes() == BufferPool::MIN_BUCKET,
+                  "nested reshape liveness retains only graph output");
+        }
+        // A returned view must also retain intermediate materialized owners.
+        graph.graph_outputs = {4};
+        prepare_execution(ctx);
+        execute_graph(ctx);
+        const float* output = graph.runtime.tensors[4].ptr<float>();
+        CHECK(output && output[0] == 2 && output[1] == (transpose ? 6 : 4) &&
+                  output[2] == (transpose ? 4 : 6) && output[3] == 8,
+              "returned reshape view keeps its complete storage chain alive");
+    }
 
     // Static padding must never advance recurrent PLE state past real tokens.
     {

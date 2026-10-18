@@ -126,3 +126,52 @@ void dsv4_fp4_simulate_inplace(float* values, int width,
                                int group_size = 32);
 void dsv4_fp8_simulate_inplace(float* values, int width,
                                int group_size = 64);
+
+// ---------------------------------------------------------------------------
+// Hy4 indexer (Gated DSA)
+//
+// Structurally simpler than the DeepSeek-V4 indexer above: Hy4 selects keys
+// directly from the hidden state with a single `wk` projection, so there is no
+// learned compressor, no compressor state and no ratio. The keys are scored
+// once per position and cached, rather than reconstructed from compressed
+// history.
+//
+// Layouts (dim0-fast):
+//   hidden:        [hidden_size, sequence]
+//   q_lora:        [q_lora_rank, sequence]        already normed by q_a_layernorm
+//   wq_b:          [num_heads * head_dim, q_lora_rank]
+//   wk:            [head_dim, hidden_size]
+//   weights_proj:  [num_heads, hidden_size]
+//   k_norm_weight: [head_dim]
+//   k_norm_bias:   [head_dim]
+//   key_cache:     [head_dim, capacity]           keys, RoPE already applied
+//   indices:       INT32 [top_k, sequence]; unused slots are set to -1
+//
+// All written slots are in [0, position]. Positions beyond `capacity` are
+// skipped and left as -1, matching the sparse attention consumer.
+struct Hy4IndexerConfig {
+    int hidden_size = 6144;
+    int q_lora_rank = 2048;
+    int num_heads = 32;
+    int head_dim = 128;
+    int rope_dim = 64;      // leading-none split: nope then rope
+    int top_k = 2048;
+    int capacity = 0;       // capacity of key_cache
+    float norm_eps = 1e-5f; // key LayerNorm uses the model's rms_norm_eps
+    bool round_bf16 = true; // legacy HF emulation; GGUF uses FP32 compute/cache
+    Dsv4RopeConfig rope;
+};
+
+bool kernel_hy4_indexer(
+    const Tensor& hidden,
+    const Tensor& q_lora,
+    const Tensor& wq_b,
+    const Tensor& wk,
+    const Tensor& weights_projection,
+    const Tensor& k_norm_weight,
+    const Tensor& k_norm_bias,
+    Tensor& key_cache,
+    Tensor& indices,
+    int start_pos,
+    const Hy4IndexerConfig& config,
+    ThreadPool* thread_pool = nullptr);

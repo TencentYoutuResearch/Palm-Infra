@@ -10,6 +10,7 @@
 #include "kernels/cpu/elementwise.h"
 #include "kernels/cpu/gated_residual.h"
 #include "kernels/cpu/hyper_connection.h"
+#include "kernels/cpu/models/mla_absorbed_attention.h"
 #include "kernels/cpu/matmul/matmul.h"
 #include "kernels/cpu/ple.h"
 #include "kernels/cpu/rope.h"
@@ -75,6 +76,10 @@ void CPUBackend::dispatch(const GraphNode& node,
         if (!dispatch_cpu_attention(node, inputs, output, thread_pool))
             reject();
         break;
+    case OpType::SDPA_MLA_ABSORB:
+        if (!kernel_mla_absorbed_attention(node, inputs, output, thread_pool))
+            reject();
+        break;
     case OpType::GATED_DELTANET_PREFILL:
     case OpType::GATED_DELTANET_DECODE:
     case OpType::GATED_DELTANET_CONV_DECODE:
@@ -117,6 +122,47 @@ void CPUBackend::dispatch(const GraphNode& node,
                 graph_params::get_i32(params, 1, 4),
                 graph_params::get_f32(params, 0, 1e-6f),
                 graph_params::get_f32(params, 1, 1e-6f), thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::HC_HEAD_ID:
+        if (has_inputs(4) && output) {
+            if (!kernel_hc_head_id(
+                *inputs[0], *inputs[1], *inputs[2], *inputs[3], *output,
+                graph_params::get_i32(params, 0, 0),
+                graph_params::get_i32(params, 1, 4),
+                graph_params::get_f32(params, 0, 1e-6f),
+                graph_params::get_f32(params, 1, 1e-6f), thread_pool,
+                graph_params::get_i32(params, 2, 1) != 0))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::HC_PRE_ID:
+        if (has_inputs(4) && output) {
+            if (!kernel_hc_pre_id(
+                *inputs[0], *inputs[1], *inputs[2], *inputs[3], *output,
+                graph_params::get_i32(params, 0, 0),
+                graph_params::get_i32(params, 1, 4),
+                graph_params::get_f32(params, 0, 2.0f),
+                graph_params::get_f32(params, 1, 1e-6f),
+                graph_params::get_f32(params, 2, 1e-6f), thread_pool,
+                graph_params::get_i32(params, 2, 1) != 0))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::HC_POST_ID:
+        if (has_inputs(3) && output) {
+            if (!kernel_hc_post_id(
+                *inputs[0], *inputs[1], *inputs[2], *output,
+                graph_params::get_i32(params, 0, 0),
+                graph_params::get_i32(params, 1, 4), thread_pool,
+                graph_params::get_i32(params, 2, 1) != 0))
                 reject();
         } else {
             reject();
@@ -197,6 +243,8 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::DSV4_INDEXER:
     case OpType::DSV4_SPARSE_ATTN:
     case OpType::DSV4_GROUPED_LINEAR:
+    // The Hy4 indexer shares this dispatcher and the DSV4 config types.
+    case OpType::HY4_INDEXER:
         if (!dispatch_cpu_deepseek_v4(
                 node, inputs, output, thread_pool))
             reject();

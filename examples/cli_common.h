@@ -15,6 +15,7 @@ struct CliCommonOptions {
     int image_max_pixels = EngineConfig::kDefaultImageMaxPixels;
     int prompt_tokens = 0;   // >0: use N dummy tokens instead of --prompt text
     int max_new_tokens = 2048;
+    bool enable_thinking = true;
     int n_ctx = 16384;
     int rope_dim = 64;
     float rope_theta = 10000000.f;
@@ -24,7 +25,7 @@ struct CliCommonOptions {
     int warmup = 1;
     int repeat = 1;             // benchmark timed runs after one model load
     bool static_padded = false;  // pad short prompts to graph_seq_len (A/B vs DYNAMIC)
-    int prefill_chunk_size = 0; // zero keeps the package's chunk length
+    int prefill_chunk_size = 0;  // 0: package default; larger sizes require dynamic shapes
     Device device = Device::CPU;  // compute backend (--device cpu|metal|cuda)
     bool require_native = false;  // reject accelerator operator fallback
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
@@ -36,14 +37,17 @@ struct CliCommonOptions {
     // but an explicit --load-warmup can still warm only dense mmap weights.
     bool load_warmup_explicit = false;
     // SSD expert offload benefits from keeping the always-used dense weights
-    // resident. Users on constrained systems can opt out explicitly.
+    // resident. Native GGUF can opt in separately when memory permits.
     bool lock_dense_weights = true;
+    bool pin_gguf_dense_weights = false;
     bool lock_expert_cache = kDefaultLockMoeSsdCache;
     int ssd_cache_mb = 0;        // >0: page routed MoE experts from package
     int ssd_io_workers = 8;      // dedicated pread workers for MoE SSD cache
     bool ssd_cross_layer_prefetch = true;   // next-layer predictor (with global pool)
     int ssd_shallow_cache_layers = 0;  // early MoE layers with priority cache quota
     bool ssd_global_cache = true;   // dynamically shared cache capacity across layers
+    bool metal_dense = false;       // selected Hy4 Q5 projections, CPU graph
+    bool metal_moe_ffn = false;     // resident IQ2/IQ3 decode batches
     bool metal_ssd_full = false;    // full-Metal decode with direct Metal I/O
     std::string trace_path;      // optional Chrome Trace / Perfetto JSON output
     int mtp_draft_tokens = 0;    // >0: use packaged single-head MTP

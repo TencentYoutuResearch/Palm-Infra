@@ -96,6 +96,8 @@ set(SOURCES
     kernels/cpu/matmul/matmul_sparse.cpp
     kernels/cpu/matmul/matmul_w4.cpp
     kernels/cpu/matmul/matmul_w8.cpp
+    kernels/cpu/matmul/stq1_0.cpp
+    kernels/cpu/matmul/gguf_k.cpp
     kernels/cpu/matmul/matmul_mxfp4.cpp
     kernels/cpu/matmul/matmul_nvfp4.cpp
     ${MOLLM_CPU_PLATFORM_SOURCE}
@@ -111,6 +113,7 @@ set(SOURCES
     kernels/cpu/gated_residual.cpp
     kernels/cpu/ple.cpp
     kernels/cpu/models/deepseek_v4_attention.cpp
+    kernels/cpu/models/mla_absorbed_attention.cpp
     kernels/cpu/hyper_connection.cpp
     kernels/cpu/moe/moe.cpp
     kernels/cpu/moe/moe_routing.cpp
@@ -159,6 +162,7 @@ set(PUBLIC_RUNTIME_HEADERS
     runtime/trace.h
     runtime/host_buffer_pool.h
     runtime/host_compute.h
+    runtime/host_matmul_backend.h
 )
 
 set(PUBLIC_CPU_BACKEND_HEADERS
@@ -177,6 +181,14 @@ set(PUBLIC_GRAPH_HEADERS
 )
 
 add_library(mollm_lib STATIC ${SOURCES})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Native GGUF ordered reductions round the product before the addition.
+    # Keep the scalar kernel and its strict reference on the same contract;
+    # explicitly requested FMA intrinsics remain fused.
+    set_property(SOURCE
+        kernels/cpu/matmul/gguf_k.cpp tests/test_matmul.cpp
+        APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         set_source_files_properties(
@@ -335,6 +347,8 @@ if(MOLLM_METAL)
     # Compile each shader domain independently, then link one metallib.
     set(MOLLM_METAL_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/matmul.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/gguf_matmul.metal
+        ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/iq_moe_ffn.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/moe.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/attention.metal
         ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal/elementwise.metal
@@ -372,9 +386,15 @@ if(MOLLM_METAL)
                                ${MOLLM_METAL_SOURCE} NAME_WE)
         set(MOLLM_METAL_DOMAIN_AIR
             ${CMAKE_CURRENT_BINARY_DIR}/${MOLLM_METAL_DOMAIN}.air)
+        # Q5 host delegation preserves the CPU FMA/reduction order.
+        set(MOLLM_METAL_DOMAIN_FLAGS ${MOLLM_METAL_FLAGS})
+        if(MOLLM_METAL_DOMAIN STREQUAL "gguf_matmul" OR
+           MOLLM_METAL_DOMAIN STREQUAL "iq_moe_ffn")
+            list(APPEND MOLLM_METAL_DOMAIN_FLAGS -fno-fast-math)
+        endif()
         add_custom_command(
             OUTPUT ${MOLLM_METAL_DOMAIN_AIR}
-            COMMAND xcrun -sdk macosx metal ${MOLLM_METAL_FLAGS}
+            COMMAND xcrun -sdk macosx metal ${MOLLM_METAL_DOMAIN_FLAGS}
                     -c ${MOLLM_METAL_SOURCE}
                     -I ${CMAKE_CURRENT_SOURCE_DIR}/kernels/metal
                     -o ${MOLLM_METAL_DOMAIN_AIR}
@@ -400,6 +420,8 @@ if(MOLLM_METAL)
         backends/metal/buffer_pool.mm
         backends/metal/command_context.mm
         backends/metal/elementwise_ops.mm
+        backends/metal/host_matmul.mm
+        backends/metal/host_moe_ffn.mm
         backends/metal/layout_ops.mm
         backends/metal/lm_head.mm
         backends/metal/matmul_ops.mm
@@ -419,6 +441,8 @@ if(MOLLM_METAL)
         backends/metal/backend.mm backends/metal/buffer_pool.mm
         backends/metal/command_context.mm
         backends/metal/elementwise_ops.mm
+        backends/metal/host_matmul.mm
+        backends/metal/host_moe_ffn.mm
         backends/metal/layout_ops.mm
         backends/metal/lm_head.mm
         backends/metal/matmul_ops.mm
@@ -705,6 +729,10 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_gated_residual tests/test_gated_residual.cpp)
     add_mollm_test(test_ple            tests/test_ple.cpp)
     add_mollm_test(test_deepseek_v4_attention tests/test_deepseek_v4_attention.cpp)
+    add_mollm_test(test_mla_absorbed_attention tests/test_mla_absorbed_attention.cpp)
+    add_mollm_test(test_host_matmul_backend tests/test_host_matmul_backend.cpp)
+    add_executable(dump_hy4_logits tests/dump_hy4_logits.cpp)
+    target_link_libraries(dump_hy4_logits PRIVATE mollm_lib)
     add_mollm_test(test_trace         tests/test_trace.cpp)
     add_mollm_test(bench_matmul       tests/bench_matmul.cpp)
     add_mollm_test(bench_sdpa         tests/bench_sdpa.cpp)
@@ -712,6 +740,19 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_norm          tests/test_norm.cpp)
     add_mollm_test(test_rope          tests/test_rope.cpp)
     add_mollm_test(test_attention     tests/test_attention.cpp)
+    add_mollm_test(test_stq1_0        tests/test_stq1_0.cpp)
+    add_executable(gguf_k_decode_dump tests/gguf_k_decode_dump.cpp)
+    target_link_libraries(gguf_k_decode_dump PRIVATE mollm_lib)
+    add_executable(stq1_0_crosscheck tests/stq1_0_crosscheck.cpp)
+    target_link_libraries(stq1_0_crosscheck PRIVATE mollm_lib)
+    # Not a test but a decoder dump the Python GGUF reader is diffed against
+    # (see models/verify_gguf_reader.py). It takes a block file as an argument,
+    # so it is added as a plain executable rather than through add_mollm_test,
+    # which would register it with ctest and fail on a missing argument. Living
+    # in the build keeps the cross-check reproducible instead of depending on a
+    # hand-typed command that silently rots.
+    add_executable(stq_decode_dump tests/stq_decode_dump.cpp)
+    target_link_libraries(stq_decode_dump PRIVATE mollm_lib)
     add_mollm_test(test_shortconv     tests/test_shortconv.cpp)
     add_mollm_test(test_gdn           tests/test_gdn.cpp)
     add_mollm_test(test_rwkv_e2e      tests/test_rwkv_e2e.cpp)
@@ -1617,6 +1658,10 @@ if(MOLLM_BUILD_TESTS)
                               test_qwen35_graph.py)
         add_mollm_python_test(test_qwen4_exp_graph
                               test_qwen4_exp_graph.py)
+        add_mollm_python_test(test_hy4_graph
+                              test_hy4_graph.py)
+        add_mollm_python_test(test_hy4_mla_weights
+                              test_hy4_mla_weights.py)
         add_mollm_python_test(test_qwen4_qsa_reference
                               test_qwen4_qsa_reference.py)
         add_mollm_python_test(test_qsa_weight_bundle test_qsa_weight_bundle.py)

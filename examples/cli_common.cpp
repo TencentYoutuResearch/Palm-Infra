@@ -60,6 +60,8 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         } else if (arg == "--prompt-file") {
             if (!require_value(argc, argv, i, "--prompt-file", value, error)) return false;
             opts.prompt_file = value;
+        } else if (arg == "--no-think") {
+            opts.enable_thinking = false;
         } else if (arg == "--image") {
             if (!require_value(argc, argv, i, "--image", value, error)) return false;
             opts.image_path = value;
@@ -180,6 +182,10 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.ssd_global_cache = true;
         } else if (arg == "--no-ssd-global-cache") {
             opts.ssd_global_cache = false;
+        } else if (arg == "--metal-dense") {
+            opts.metal_dense = true;
+        } else if (arg == "--metal-moe-ffn") {
+            opts.metal_moe_ffn = true;
         } else if (arg == "--metal-ssd-full") {
             opts.metal_ssd_full = true;
         } else if (arg == "--trace") {
@@ -216,6 +222,9 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.lock_dense_weights = true;
         } else if (arg == "--no-lock-dense-weights") {
             opts.lock_dense_weights = false;
+        } else if (arg == "--pin-gguf-dense") {
+            opts.pin_gguf_dense_weights = true;
+            opts.weight_loading = WeightLoadingMode::MMAP;
         } else if (arg == "--lock-expert-cache") {
             opts.lock_expert_cache = true;
         } else if (arg == "--no-lock-expert-cache") {
@@ -309,6 +318,10 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         error = "--require-native requires an accelerator device";
         return false;
     }
+    if (opts.pin_gguf_dense_weights && !opts.lock_dense_weights) {
+        error = "--pin-gguf-dense conflicts with --no-lock-dense-weights";
+        return false;
+    }
     if (!validate_sampling_params(opts.sampling, &error))
         return false;
     if (opts.offload_ple &&
@@ -362,6 +375,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --package <file.mollm>    Single-file model package (required)\n");
     std::printf("  --prompt <text>           Run one prompt and exit\n");
     std::printf("  --prompt-file <path>      Read prompt text from file, run and exit\n");
+    std::printf("  --no-think                Request a direct answer in chat mode\n");
     std::printf("  --image <path>            Attach one image (Qwen3.5-VL, single-shot)\n");
     std::printf("  --image-max-pixels <int>  Resize budget; default 262144, max 1048576\n");
     std::printf("  --prompt-tokens <int>     Use N dummy tokens (skip chat template)\n");
@@ -387,6 +401,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --ssd-shallow-cache-layers <int>  Favor the first N MoE layers in the RAM cache\n");
     std::printf("  --ssd-global-cache      Shared capacity pool across MoE layers (default)\n");
     std::printf("  --no-ssd-global-cache   Use legacy equal per-layer cache (also disables prefetch)\n");
+    std::printf("  --metal-dense           Accelerate large Hy4 Q5 decode projections; --device cpu\n");
+    std::printf("  --metal-moe-ffn         Accelerate ready 8-expert Hy4 IQ2/IQ3 batches; --device cpu\n");
     std::printf("  --metal-ssd-full        Experimental full-Metal decode with direct Metal I/O\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --mtp-draft-tokens <int>  Experimental packaged MTP speculation (0..16)\n");
@@ -395,6 +411,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
     std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
     std::printf("  --no-lock-dense-weights Keep dense mmap weights pageable\n");
+    std::printf("  --pin-gguf-dense       Pin GGUF dense mmap weights without SSD offload\n");
     std::printf("  --lock-expert-cache     Pin the expert RAM cache (default on macOS)\n");
     std::printf("  --no-lock-expert-cache  Allow the OS to compress/page expert cache entries\n");
     std::printf("  --no-load-warmup        Skip mmap page-in warmup\n");
@@ -445,11 +462,14 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.moe_ssd_shallow_cache_layers = opts.ssd_shallow_cache_layers;
     cfg.moe_ssd_global_cache = opts.ssd_global_cache;
     cfg.metal_ssd_full = opts.metal_ssd_full;
+    cfg.metal_dense = opts.metal_dense;
+    cfg.metal_moe_ffn = opts.metal_moe_ffn;
     cfg.trace_path = opts.trace_path;
     cfg.mtp_draft_tokens = opts.mtp_draft_tokens;
     cfg.mtp_companion_dir = opts.mtp_companion_dir;
     cfg.qsa_companion_dir = opts.qsa_companion_dir;
     cfg.lock_dense_weights = opts.lock_dense_weights;
+    cfg.pin_gguf_dense_weights = opts.pin_gguf_dense_weights;
     cfg.lock_moe_ssd_cache = opts.lock_expert_cache;
     return cfg;
 }

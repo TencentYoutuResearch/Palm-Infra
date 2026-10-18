@@ -7,6 +7,7 @@
 #include "core/fp16.h"
 #include "runtime/host_compute.h"
 #include "runtime/trace.h"
+#include "kernels/cpu/matmul/gguf_k.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -261,7 +262,7 @@ bool LLMEngine::set_cache_lengths(
     if (!backend)
         return false;
     for (auto& cache : caches) {
-        for (Tensor* tensor : {cache.k, cache.v}) {
+        for (Tensor* tensor : {cache.k, cache.v, cache.latent}) {
             if (tensor && !backend->copy_from_host(
                     &length, *tensor, sizeof(length),
                     offsetof(CacheMetadata, current_seq_len)))
@@ -355,7 +356,25 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids, int pad_to) {
         // Zero-init so padding positions (if any) are well-defined zeros.
         std::memset(t.data, 0, nbytes);
 
-        if (embed_weight_->prec == Precision::FP16) {
+        if (embed_weight_->prec == Precision::GGUF_Q4_K ||
+            embed_weight_->prec == Precision::GGUF_Q5_K ||
+            embed_weight_->prec == Precision::GGUF_Q6_K ||
+            embed_weight_->prec == Precision::GGUF_Q8_0) {
+            const size_t block_bytes = gguf_k_block_bytes(embed_weight_->prec);
+            const size_t block_values = gguf_k_block_values(embed_weight_->prec);
+            const size_t row_bytes = size_t(hidden_dim / block_values) * block_bytes;
+            const auto* encoded = static_cast<const uint8_t*>(embed_weight_->data);
+            for (int s = 0; s < n; ++s) {
+                int tid = token_ids[s];
+                if (tid < 0 || tid >= vocab_size) tid = 0;
+                float* dst = t.ptr<float>() + s * hidden_dim;
+                const uint8_t* row = encoded + size_t(tid) * row_bytes;
+                for (size_t b = 0; b < size_t(hidden_dim) / block_values; ++b)
+                    gguf_k_dequantize_block(embed_weight_->prec,
+                                            row + b * block_bytes,
+                                            dst + b * block_values);
+            }
+        } else if (embed_weight_->prec == Precision::FP16) {
             // Row-major FP16 — simple direct access
             const __fp16* embed_data =
                 reinterpret_cast<const __fp16*>(embed_weight_->data);
@@ -495,7 +514,7 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
             hidden_dim);
     } else {
         host_matmul_fp32(A, *lm_head_weight_, C,
-                           exec_ctx_decode_.thread_pool);
+                           exec_ctx_decode_.thread_pool, lm_head_fp32_acc_);
     }
 
     if (accelerator_backend_ && accelerator_backend_->dispatch_failed()) {
@@ -579,7 +598,7 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
                 hidden_dim);
         } else {
             host_matmul_fp32(A, *lm_head_weight_, C,
-                               exec_ctx_decode_.thread_pool);
+                               exec_ctx_decode_.thread_pool, lm_head_fp32_acc_);
         }
     }
 
@@ -1028,6 +1047,29 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
             n, past_len_, cfg_.n_ctx);
         return -1;
     }
+    int graph_seq_len = 1;
+    bool dynamic_sequence = false;
+    for (const auto& node : graph_prefill_.nodes) {
+        if (node.op_type == OpType::INPUT && !node.params.str.empty() &&
+            node.params.str[0] == "hidden") {
+            graph_seq_len = static_cast<int>(node.out_shape[1]);
+            dynamic_sequence = node.dim_expr[1].kind == DIM_SEQ;
+            break;
+        }
+    }
+    const int chunk_limit = cfg_.cuda_prefill_logical_batch
+        ? mollm_prefill::logical_chunk_limit(cfg_) : cfg_.prefill_chunk_size > 0
+        ? cfg_.prefill_chunk_size : graph_seq_len;
+    if (cfg_.prefill_chunk_size < 0 || chunk_limit <= 0 ||
+        (chunk_limit > graph_seq_len &&
+         (cfg_.static_padded || !dynamic_sequence))) {
+        std::fprintf(stderr,
+                     "prefill: invalid chunk size %d (package=%d); larger "
+                     "batches require a symbolic sequence dimension and "
+                     "dynamic execution\n",
+                     cfg_.prefill_chunk_size, graph_seq_len);
+        return -1;
+    }
     sampler_.accept(token_ids);
 
     Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
@@ -1069,34 +1111,6 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         }
         exec_ctx_prefill_.backend = saved_prefill_backend;
     };
-
-    // Determine the graph's expected seq_len from its hidden input shape.
-    int graph_seq_len = 1;
-    for (auto& node : graph_prefill_.nodes) {
-        if (node.op_type == OpType::INPUT && !node.params.str.empty() &&
-            node.params.str[0] == "hidden") {
-            graph_seq_len = (int)node.out_shape[1];
-            break;
-        }
-    }
-
-    int chunk_limit = cfg_.cuda_prefill_logical_batch?mollm_prefill::logical_chunk_limit(cfg_):cfg_.prefill_chunk_size > 0
-        ? cfg_.prefill_chunk_size : graph_seq_len;
-    if (chunk_limit > graph_seq_len) {
-        bool dynamic_hidden = false;
-        for (const auto& node : graph_prefill_.nodes) {
-            if (node.op_type == OpType::INPUT && !node.params.str.empty() &&
-                node.params.str[0] == "hidden") {
-                dynamic_hidden = node.dim_expr[1].kind == DIM_SEQ;
-                break;
-            }
-        }
-        if (cfg_.static_padded || !dynamic_hidden) {
-            fprintf(stderr, "prefill: larger chunk size requires dynamic hidden SEQ and no static padding\n");
-            finish_prefill_phase();
-            return -1;
-        }
-    }
 
     const char* window_selector = std::getenv("MOLLM_TEST_CUDA_PREFILL_WINDOW_SCHEDULE");
     if (window_selector && std::strcmp(window_selector, "0")) {

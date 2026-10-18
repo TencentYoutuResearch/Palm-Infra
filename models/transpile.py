@@ -61,6 +61,7 @@ class OpType(IntEnum):
     SDPA_MLA       = 51
     QSA_SDPA       = 52
     QSA_INDEXER    = 53
+    SDPA_MLA_ABSORB = 54
     RESHAPE        = 60
     PERMUTE        = 61
     CONCAT         = 62
@@ -91,6 +92,11 @@ class OpType(IntEnum):
     PLE_LOOKUP     = 135
     PLE_GATE       = 136
     PLE_DILATED_CONV = 137
+    # Hy4 identity Hyper-Connections; values must match graph/graph.h.
+    HC_PRE_ID      = 138
+    HC_POST_ID     = 139
+    HC_HEAD_ID     = 141
+    HY4_INDEXER    = 142
     DSV4_COMPRESSOR = 160
     DSV4_INDEXER = 161
     DSV4_SPARSE_ATTN = 162
@@ -114,6 +120,14 @@ class Precision(IntEnum):
     # NVIDIA NVFP4: packed E2M1, one E4M3 block scale per 16 values, and a
     # per-matrix FP32 global scale. Currently used by SSD-backed MoE experts.
     NVFP4 = 8
+    GGUF_Q4_K = 9
+    GGUF_Q5_K = 10
+    GGUF_Q6_K = 11
+    GGUF_Q8_0 = 12
+    GGUF_IQ2_XXS = 13
+    GGUF_IQ3_XXS = 14
+    GGUF_STQ1_0 = 15
+    GGUF_IQ4_XS = 16
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +319,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.RWKV_L2_NORM, OpType.RWKV_POST,
               OpType.MOE,
               OpType.HC_PRE, OpType.HC_POST, OpType.HC_HEAD,
+              OpType.HC_PRE_ID, OpType.HC_POST_ID, OpType.HC_HEAD_ID,
               OpType.GR_REDUCE, OpType.GR_INJECT,
               OpType.PLE_GATE, OpType.PLE_DILATED_CONV):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
@@ -321,11 +336,12 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
 
     if op in (OpType.MATMUL, OpType.MATMUL_BATCH, OpType.GEMV_SPARSE_A,
               OpType.DSV4_INDEXER, OpType.DSV4_SPARSE_ATTN,
-              OpType.DSV4_GROUPED_LINEAR):
+              OpType.DSV4_GROUPED_LINEAR, OpType.HY4_INDEXER):
         a = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, a[1], _CONST, _CONST)
 
-    if op in (OpType.SDPA, OpType.SDPA_MLA, OpType.QSA_SDPA, OpType.QSA_INDEXER):
+    if op in (OpType.SDPA, OpType.SDPA_MLA, OpType.SDPA_MLA_ABSORB,
+              OpType.QSA_SDPA, OpType.QSA_INDEXER):
         q = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, q[1], _CONST, _CONST)
 
@@ -696,17 +712,41 @@ class GraphBuilder:
              scale: float = 0.0,
              num_heads: int = 16, num_kv_heads: int = 16,
              head_dim: int = 192, v_head_dim: int = 128,
+             sink: int | None = None,
+             selection: int | None = None,
              selected_indices: int | None = None
              ) -> tuple[int, int, int]:
         sq = self._nodes[q].out_shape
         out_shape = (v_head_dim, sq[1], num_heads)
-        operands = [q, k_cur, v_cur, mask, k_cache, v_cache]
+        # `sink` is an optional [num_heads] FP32 input holding one logit per
+        # query head, appended to the softmax denominator.
+        # Optional inputs are appended in a fixed order and their indices are
+        # recorded in params, matching the MOE convention (an absent optional
+        # input is simply a shorter list, not a placeholder).
+        sdpa_inputs = [q, k_cur, v_cur, mask, k_cache, v_cache]
+        # `sink` is an optional [num_heads] FP32 tensor: one learned logit per
+        # query head, added to the softmax denominator.
+        sink_input = -1
+        if sink is not None:
+            sink_input = len(sdpa_inputs)
+            sdpa_inputs.append(sink)
+        # `selection` is an optional INT32 [top_k, seq] key selection from the
+        # Hy4 Gated-DSA indexer; attention then visits only those keys.
+        selection_input = -1
+        if selection is not None:
+            selection_input = len(sdpa_inputs)
+            sdpa_inputs.append(selection)
         if selected_indices is not None:
-            operands.append(selected_indices)
-        attn = self._add(OpType.QSA_SDPA if selected_indices is not None else OpType.SDPA, operands,
+            if sink is not None or selection is not None:
+                raise ValueError("QSA selected_indices cannot be combined with Hy4 sink/selection")
+            sdpa_inputs.append(selected_indices)
+        sdpa_params = [kv_cache, 1 if causal else 0,
+                       num_heads, num_kv_heads, head_dim, v_head_dim]
+        if selected_indices is None:
+            sdpa_params += [sink_input, selection_input]
+        attn = self._add(OpType.QSA_SDPA if selected_indices is not None else OpType.SDPA, sdpa_inputs,
                          out_shape, prec=self._nodes[q].out_prec,
-                         i32=[kv_cache, 1 if causal else 0,
-                              num_heads, num_kv_heads, head_dim, v_head_dim],
+                         i32=sdpa_params,
                          f32=[scale])
         # cache outputs are views of the same cache buffers
         kc_out = self._add(OpType.RESHAPE, [k_cache],
@@ -718,6 +758,36 @@ class GraphBuilder:
                            prec=self._nodes[v_cache].out_prec,
                            i32=list(self._nodes[v_cache].out_shape))
         return attn, kc_out, vc_out
+
+    def sdpa_mla_absorb(
+            self, q_nope: int, q_rope: int, kv_cur: int, rope_cur: int,
+            k_b: int, v_b: int, mask: int, latent_cache: int, *,
+            num_heads: int, qk_head_dim: int, v_head_dim: int,
+            kv_rank: int, rope_dim: int, sink: int | None = None,
+            selection: int | None = None) -> int:
+        """Hy4 MLA with one shared latent cache and per-head K/V projections.
+
+        Selection entries are absolute cache positions per query; the CPU
+        kernel uses dense attention when every visible key can be selected.
+        """
+        inputs = [q_nope, q_rope, kv_cur, rope_cur, k_b, v_b, mask,
+                  latent_cache]
+        sink_idx = -1
+        if sink is not None:
+            sink_idx = len(inputs)
+            inputs.append(sink)
+        selection_idx = -1
+        if selection is not None:
+            selection_idx = len(inputs)
+            inputs.append(selection)
+        sq = self._nodes[q_nope].out_shape
+        return self._add(
+            OpType.SDPA_MLA_ABSORB, inputs,
+            (v_head_dim, sq[1], num_heads),
+            prec=self._nodes[q_nope].out_prec,
+            i32=[2, 1, num_heads, 1, qk_head_dim, v_head_dim,
+                 sink_idx, selection_idx, kv_rank, rope_dim],
+            f32=[1.0 / (qk_head_dim ** 0.5)])
 
     def qsa_indexer(self, projection: int, q_norm: int, k_norm: int,
                     frequency: int, raw_cache: int, pooled_cache: int,
@@ -1064,12 +1134,15 @@ class GraphBuilder:
             routed_scaling_factor: float = 1.0,
             swiglu_limit: float = 0.0,
             hash_token_ids: int | None = None,
-            hash_table: int | None = None) -> int:
+            hash_table: int | None = None,
+            shared_swiglu_limit: float | None = None) -> int:
         """Fused Qwen-style sparse MLP.
 
         The expert tensors keep HF row-major layout:
           experts_gate_up [num_experts, 2*intermediate, hidden]
           experts_down    [num_experts, hidden, intermediate]
+        shared_swiglu_limit=None inherits the routed clamp for older models;
+        an explicit zero leaves the shared branch unclipped.
         """
         sx = self._nodes[hidden].out_shape
         inputs = [hidden, router, experts_gate_up, experts_down]
@@ -1094,6 +1167,9 @@ class GraphBuilder:
             inputs.append(hash_token_ids)
             hash_table_input = len(inputs)
             inputs.append(hash_table)
+        moe_f32 = [float(routed_scaling_factor), float(swiglu_limit)]
+        if shared_swiglu_limit is not None:
+            moe_f32.append(float(shared_swiglu_limit))
         return self._add(OpType.MOE,
                          inputs,
                          sx,
@@ -1107,8 +1183,7 @@ class GraphBuilder:
                               1 if shared_expert_has_gate else 0,
                               router_bias_input, token_ids_input,
                               hash_table_input],
-                         f32=[float(routed_scaling_factor),
-                              float(swiglu_limit)])
+                         f32=moe_f32)
 
     def hc_pre(self, x: int, fn: int, scale: int, base: int,
                hidden_size: int, hc_mult: int = 4,
@@ -1137,6 +1212,70 @@ class GraphBuilder:
             OpType.HC_HEAD, [x, fn, scale, base],
             (hidden_size, sx[1]), prec=Precision.FP32,
             i32=[hidden_size, hc_mult], f32=[norm_eps, hc_eps])
+
+    def hc_pre_id(self, x: int, fn: int, scale: int, base: int,
+                  hidden_size: int, hc_mult: int = 4,
+                  hc_magnitude: float = 2.0, norm_eps: float = 1e-6,
+                  hc_eps: float = 1e-6, round_bf16: bool = True) -> int:
+        """Hy4 identity Hyper-Connections: reduce hc streams to one.
+
+        Unlike hc_pre there is no Sinkhorn mixing matrix, so `fn` is
+        [2*hc_mult, hc_mult*hidden_size] and the packed output carries only
+        the reduced state plus the per-stream post gate.
+        """
+        sx = self._nodes[x].out_shape
+        packed_size = hidden_size + hc_mult
+        return self._add(
+            OpType.HC_PRE_ID, [x, fn, scale, base],
+            (packed_size, sx[1]), prec=Precision.FP32,
+            i32=[hidden_size, hc_mult, int(round_bf16)],
+            f32=[hc_magnitude, norm_eps, hc_eps])
+
+    def hc_post_id(self, branch: int, residual: int, packed: int,
+                   hidden_size: int, hc_mult: int = 4,
+                   round_bf16: bool = True) -> int:
+        """Hy4 iHC: apply each stream's gate to its own residual."""
+        sr = self._nodes[residual].out_shape
+        return self._add(
+            OpType.HC_POST_ID, [branch, residual, packed], sr,
+            prec=Precision.FP32, i32=[hidden_size, hc_mult, int(round_bf16)])
+
+    def hc_head_id(self, x: int, fn: int, scale: int, base: int,
+                   hidden_size: int, hc_mult: int = 4,
+                   norm_eps: float = 1e-6, hc_eps: float = 1e-6,
+                   round_bf16: bool = True) -> int:
+        """Hy4 iHC: collapse the hc streams once before the output head."""
+        sx = self._nodes[x].out_shape
+        return self._add(
+            OpType.HC_HEAD_ID, [x, fn, scale, base],
+            (hidden_size, sx[1]), prec=Precision.FP32,
+            i32=[hidden_size, hc_mult, int(round_bf16)], f32=[norm_eps, hc_eps])
+
+    def hy4_indexer(self, hidden: int, q_lora: int, wq_b: int, wk: int,
+                    weights_proj: int, k_norm_w: int, k_norm_b: int,
+                    key_cache: int, position: int, n_tokens: int,
+                    hidden_size: int, q_lora_rank: int, num_heads: int,
+                    head_dim: int, rope_dim: int, top_k: int,
+                    capacity: int, theta: float = 1e7,
+                    factor: float = 1.0, original_context: int = 0,
+                    beta_fast: float = 32.0,
+                    beta_slow: float = 1.0,
+                    norm_eps: float = 1e-5, round_bf16: bool = True) -> int:
+        """Hy4 Gated-DSA indexer: emits INT32 [top_k, seq] key indices.
+
+        Unlike the DeepSeek-V4 indexer there is no compressor; keys come
+        straight from `wk @ hidden`. `q_lora` must already be normed.
+        `n_tokens` bounds the valid positions, as in the DSV4 indexer.
+        """
+        sx = self._nodes[hidden].out_shape
+        return self._add(
+            OpType.HY4_INDEXER,
+            [hidden, q_lora, wq_b, wk, weights_proj, k_norm_w,
+             k_norm_b, key_cache, position, n_tokens],
+            (top_k, sx[1]), prec=Precision.INT32,
+            i32=[hidden_size, q_lora_rank, num_heads, head_dim,
+                 rope_dim, top_k, capacity, original_context, int(round_bf16)],
+            f32=[theta, factor, beta_fast, beta_slow, norm_eps])
 
     def gr_reduce(self, normalized: int, gates: int,
                   hidden_size: int, hc_count: int = 4) -> int:

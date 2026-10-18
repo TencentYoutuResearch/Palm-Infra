@@ -18,9 +18,10 @@
 #include <vector>
 
 // CPU-side, demand-paged storage for the two matrices belonging to a routed
-// MoE expert.  The package converter emits byte-accurate slices for these
-// matrices in `moe_expert_storage`; this class reads only selected slices with
-// pread(2) and retains recently used expert pairs in an LRU cache.
+// MoE expert. The package converter emits byte-accurate slices in
+// `moe_expert_storage`; the loader can derive them for older native-GGUF Hy4
+// packages. This class reads selected slices with pread(2) and retains
+// recently used expert pairs in an LRU cache.
 // load_resident() also supports eagerly loading and locking the complete
 // expert set, with the same tensor layouts and no capacity-driven evictions.
 struct MoeSsdTensorSpec {
@@ -67,6 +68,25 @@ struct MoeSsdTensorSource : ExpertSource {
     MoeSsdCache* cache = nullptr;
 };
 
+#if defined(__APPLE__)
+// Device registrations contain backend-specific resources but are owned by
+// the cache allocation. The cache destroys them before changing its mapping.
+struct MoeSsdBufferRegistration {
+    virtual ~MoeSsdBufferRegistration() = default;
+};
+
+struct MoeSsdRegisteredBuffer {
+    MoeSsdBufferRegistration* registration = nullptr;
+    size_t payload_offset = 0;
+    size_t active_bytes = 0;
+};
+
+struct MoeSsdRegisteredPair {
+    MoeSsdRegisteredBuffer gate_up;
+    MoeSsdRegisteredBuffer down;
+};
+#endif
+
 // Router metadata used by the advisory next-layer SSD prefetch predictor.
 struct MoeSsdPredictConfig {
     int hidden_size = 0;
@@ -102,6 +122,16 @@ class MoeSsdCache : public ExpertProvider {
 public:
     bool borrow(const ExpertSource*, const ExpertSource*, int, ExpertLease&,
                 bool wait = true) override;
+#if defined(__APPLE__)
+    // Only a live lease may expose a mapped pair to a device. The factory
+    // receives the readable active prefix, excluding the reserved PROT_NONE
+    // tail. Returned registration pointers stay valid through this lease;
+    // the caller must finish GPU work before releasing it.
+    bool get_or_register_borrowed_buffers(
+        const ExpertLease& lease,
+        const std::function<std::unique_ptr<MoeSsdBufferRegistration>(void*, size_t)>& factory,
+        MoeSsdRegisteredPair& out);
+#endif
     bool borrow_resident_layer(const ExpertSource*, const ExpertSource*,
                                std::vector<ExpertLease>&) override;
     bool request_many(const ExpertSource*, const ExpertSource*,
@@ -125,10 +155,19 @@ public:
         uint64_t prefetch_admitted = 0;
         uint64_t unused_prefetch_evictions = 0;
         uint64_t short_term_reloads = 0;
+        // Successful acquires whose first lookup under mutex_ was ready.
+        uint64_t acquires_ready_at_lookup = 0;
+        // Successful acquires that entered the slot/load wait path. This
+        // excludes mutex contention and can overlap I/O completion races.
+        uint64_t acquires_waited = 0;
     };
 
     struct Stats {
+        // Reuse acquires after the first consumption of a loaded entry.
         uint64_t hits = 0;
+        // Demand-triggered load admissions; excludes speculative loads.
+        // hits + misses is not a complete acquire denominator. Use layer
+        // demand_acquires and acquires_ready_at_lookup for readiness ratios.
         uint64_t misses = 0;
         uint64_t evictions = 0;
         // Logical cache-entry bytes whose asynchronous load completed during
@@ -153,6 +192,9 @@ public:
         uint64_t cross_layer_used = 0;
         uint64_t cross_layer_rejected = 0;
         size_t resident_bytes = 0;
+        size_t reusable_buffer_bytes = 0;
+        size_t buffer_reserve_bytes = 0;
+        uint64_t buffer_reuses = 0;
         std::vector<uint64_t> cross_layer_rank_attempts;
         std::vector<uint64_t> cross_layer_rank_hits;
         std::vector<double> cross_layer_rank_confidence_sum;
@@ -176,6 +218,16 @@ public:
     // Switch from isolated per-layer quotas to one shared capacity pool.
     // Call before any expert I/O.
     bool set_global_capacity_pool(bool enabled);
+    // macOS: aligned read windows for page-multiple component lengths.
+    // Configure after registration and before I/O or buffer reuse. Padding is
+    // charged to resident capacity; logical byte counters still exclude it.
+    // Zero disables alignment. open() resets this optional policy.
+    bool set_read_alignment(size_t alignment);
+    // macOS: reserve capacity for recycling page-aligned component mappings.
+    // Configure after source registration, before I/O, with global pooling.
+    // The reservation includes an additional largest-pair replacement margin.
+    // Zero disables reuse. open() resets this optional policy.
+    bool set_buffer_reuse_capacity(size_t bytes);
     // Favor the first N MoE layers, while retaining one streaming slot for
     // every layer. Call after registering all expert sources and before I/O.
     bool configure_shallow_favoring(int shallow_layers);
@@ -270,6 +322,7 @@ private:
     bool acquire_impl(const MoeSsdTensorSource*, const MoeSsdTensorSource*, int,
                       Tensor&, Tensor&, Entry** pinned_entry, bool wait);
     struct ByteBuffer;
+    struct BufferPool;
     struct ResidentArena;
     std::shared_ptr<ResidentArena> resident_arena_;
     struct LayerLayout {
@@ -292,6 +345,11 @@ private:
         uint64_t prefetch_admitted = 0;
         uint64_t unused_prefetch_evictions = 0;
         uint64_t short_term_reloads = 0;
+        // Successful acquires whose first lookup under mutex_ was ready.
+        uint64_t acquires_ready_at_lookup = 0;
+        // Successful acquires that entered the slot/load wait path. This
+        // excludes mutex contention and can overlap I/O completion races.
+        uint64_t acquires_waited = 0;
     };
     // A job reads one component (gate/down data or scales) for a small window
     // of experts. Interleaved packages keep data and scales adjacent on disk,
@@ -326,8 +384,15 @@ private:
                                                bool count_eviction);
     size_t layer_capacity_bytes_locked(int layer) const;
     bool prefer_left_layer_eviction_locked() const;
-    bool global_victim_before_locked(const Entry* candidate,
-                                     const Entry* current) const;
+    // Valid only during a victim scan while mutex_ is held.
+    struct VictimKey {
+        int rank;
+        int layer;
+        bool future;
+    };
+    VictimKey victim_key_locked(const Entry* entry, bool prefer_left) const;
+    bool global_victim_before_locked(const Entry* candidate, VictimKey candidate_key,
+                                     const Entry* current, VictimKey current_key) const;
     static ByteBuffer& component_buffer(Entry& entry, uint8_t component);
     static const ByteBuffer& component_buffer(const Entry& entry, uint8_t component);
     static uint64_t component_offset(const Entry& entry, uint8_t component);
@@ -346,6 +411,11 @@ private:
     uint64_t file_size_ = 0;
     int io_workers_count_ = 0;
     uint64_t next_trace_id_ = 1;
+    // Declared before entries so their buffers return before pool destruction.
+    std::unique_ptr<BufferPool> buffer_pool_;
+    size_t buffer_reserve_bytes_ = 0;
+    size_t read_alignment_ = 0;
+    size_t expert_capacity_bytes() const { return capacity_bytes_ - buffer_reserve_bytes_; }
     size_t capacity_bytes_ = 0;
     size_t resident_bytes_ = 0;
     uint64_t clock_ = 0;
@@ -394,6 +464,9 @@ private:
     int active_layer_ = -1;
     using EntryList = std::list<std::unique_ptr<Entry>>;
     EntryList entries_;
+    // Non-owning pointers in entries_ order, for contiguous victim scans.
+    // Insert, erase and clear alongside entries_ while holding mutex_.
+    std::vector<Entry*> eviction_entries_;
     std::unordered_map<Entry*, EntryList::iterator> entry_locations_;
     // Expert residency is partitioned by model layer. Keep that partition in
     // the cache too: a 16+ GiB cache can have thousands of global entries,

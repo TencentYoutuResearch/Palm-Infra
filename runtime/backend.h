@@ -78,6 +78,8 @@ public:
         return false;
     }
 
+    virtual uint64_t completed_host_moe_batches() const { return 0; }
+
     /// Reset/query a recoverable dispatch failure. Most kernels are legacy
     /// void functions, so this side channel lets checked operators stop graph
     /// execution without changing every backend dispatch signature at once.

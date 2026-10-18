@@ -443,6 +443,48 @@ def quantize_w8pc_streamed_weight(weight: StreamedWeight) -> StreamedWeight:
         num_groups=rows)
 
 
+def aggregate_dense_experts(index: SafeTensorIndex, name: str, *,
+                            rows_per_expert: int) -> StreamedWeight:
+    """Flatten a fused 3-D expert tensor into expert-major rows.
+
+    Hy4 stores its routed experts as one tensor of shape
+    ``[experts, rows, K]`` (for gate_up, ``rows = 2 * moe_intermediate``).
+    The MoE kernel addresses expert ``e`` at row ``e * rows_per_expert`` with
+    row stride ``K``, which is exactly the row order of this tensor already,
+    so the payload can be streamed verbatim and only the declared shape
+    changes: ``[experts * rows, K]``.
+
+    The element count is unchanged by the reshape, which is what makes this a
+    metadata-only operation. Declaring the 3-D shape instead would leave
+    ``shape[1] == rows`` where the loader and kernel expect ``K``.
+    """
+    tensor = index.tensor(name)
+    if tensor.dtype not in ("BF16", "F16", "F32"):
+        raise ValueError(f"fused experts must be unquantized: {name}")
+    if len(tensor.shape) != 3:
+        raise ValueError(
+            f"fused experts must be 3-D [experts, rows, K]: "
+            f"{name} has shape {tensor.shape}")
+    experts, rows, columns = tensor.shape
+    if rows != rows_per_expert:
+        raise ValueError(
+            f"{name} has {rows} rows per expert, expected {rows_per_expert}")
+    precision = {
+        "BF16": Precision.FP16,
+        "F16": Precision.FP16,
+        "F32": Precision.FP32,
+    }[tensor.dtype]
+    transform = _bf16_to_fp16 if tensor.dtype == "BF16" else None
+    data_range = WeightByteRange(
+        tensor.source.path, tensor.source.offset, tensor.source.size,
+        transform)
+    return StreamedWeight(
+        precision=precision,
+        logical_shape=(experts * rows, columns),
+        data_ranges=[data_range],
+        expert_interleave_count=experts)
+
+
 def fp32_streamed_weight(
         index: SafeTensorIndex, name: str,
         logical_shape: tuple[int, ...] | None = None) -> StreamedWeight:
@@ -508,6 +550,86 @@ def fp32_plus_one_streamed_weight(
         data_ranges=[WeightByteRange(
             tensor.source.path, tensor.source.offset, tensor.source.size,
             transform, output_size)])
+
+
+def split_mla_kv_b(index: SafeTensorIndex, name: str, *,
+                   num_heads: int, nope_dim: int, v_head_dim: int,
+                   kv_lora_rank: int) -> tuple[StreamedWeight, StreamedWeight]:
+    """Split a fused ``kv_b_proj`` into the absorbed ``k_b`` and ``v_b`` pair.
+
+    The checkpoint stores one matrix ``[heads * (nope + v), kv_lora]`` that
+    expands the compressed KV latent into per-head keys and values. Absorption
+    needs the two halves in *opposite* orientations:
+
+        k_b  [heads, kv_lora, nope]   -- so a query can be folded into the latent
+        v_b  [heads, v_head,  kv_lora] -- values still expand out of the latent
+
+    Only ``k_b`` is transposed; ``v_b`` keeps the checkpoint's [v, kv_lora] row
+    order. Both are pure reindexing of the same bytes, so nothing here changes a
+    value -- it only decides which axis the matmul consumes. The inverse
+    (``k_b.transpose`` + concat) reproduces the original bit for bit, which is
+    what makes it safe to do at conversion time rather than in the graph.
+    """
+    tensor = index.tensor(name)
+    if tensor.dtype not in ("BF16", "F16"):
+        raise ValueError(f"kv_b_proj must be BF16/F16 to split: {name}")
+    if len(tensor.shape) != 2:
+        raise ValueError(f"kv_b_proj must be a matrix: {name}")
+    fused_rows, fused_cols = tensor.shape
+    expected_rows = num_heads * (nope_dim + v_head_dim)
+    if fused_rows != expected_rows:
+        raise ValueError(
+            f"{name} has {fused_rows} rows, expected "
+            f"heads({num_heads}) * (nope({nope_dim}) + v({v_head_dim})) = "
+            f"{expected_rows}")
+    if fused_cols != kv_lora_rank:
+        raise ValueError(
+            f"{name} has {fused_cols} columns, expected kv_lora_rank "
+            f"{kv_lora_rank}")
+
+    stride = nope_dim + v_head_dim
+    transform = _bf16_to_fp16 if tensor.dtype == "BF16" else None
+    item = 2  # FP16 bytes per element after the transform
+
+    def transpose_k_head(chunk: bytes) -> bytes:
+        """Convert one [nope, kv_lora] head into [kv_lora, nope]."""
+        expected = nope_dim * kv_lora_rank * item
+        if len(chunk) != expected:
+            raise ValueError(f"incomplete MLA K head: {len(chunk)} != {expected}")
+        if tensor.dtype == "BF16":
+            bits = np.frombuffer(chunk, dtype="<u2").astype(np.uint32) << 16
+            values = bits.view(np.float32).astype("<f2")
+        else:
+            values = np.frombuffer(chunk, dtype="<f2")
+        return values.reshape(nope_dim, kv_lora_rank).T.copy().tobytes()
+
+    # Every head's k block starts at head * stride, and the k rows are the
+    # first `nope_dim` of that block; v follows immediately. Element offsets
+    # are per-row, so one range per head per output.
+    k_ranges = []
+    v_ranges = []
+    for head in range(num_heads):
+        k_row_begin = head * stride
+        v_row_begin = k_row_begin + nope_dim
+        k_ranges.append(WeightByteRange(
+            tensor.source.path,
+            tensor.source.offset + k_row_begin * fused_cols * item,
+            nope_dim * fused_cols * item, transpose_k_head,
+            transform_alignment=nope_dim * fused_cols * item))
+        v_ranges.append(WeightByteRange(
+            tensor.source.path,
+            tensor.source.offset + v_row_begin * fused_cols * item,
+            v_head_dim * fused_cols * item, transform))
+
+    k_b = StreamedWeight(
+        precision=Precision.FP16,
+        logical_shape=(num_heads, kv_lora_rank, nope_dim),
+        data_ranges=k_ranges)
+    v_b = StreamedWeight(
+        precision=Precision.FP16,
+        logical_shape=(num_heads, v_head_dim, kv_lora_rank),
+        data_ranges=v_ranges)
+    return k_b, v_b
 
 
 def concatenate_fp16_streamed_weights(

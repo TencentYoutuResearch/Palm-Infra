@@ -155,7 +155,7 @@ private:
 };
 
 bool valid_precision(uint32_t value) {
-    return value <= static_cast<uint32_t>(Precision::NVFP4);
+    return value <= static_cast<uint32_t>(Precision::GGUF_IQ4_XS);
 }
 
 bool valid_dim_expr(int8_t kind) {
@@ -296,6 +296,21 @@ bool read_graph(BinaryReader& reader, Graph& graph) {
         for (std::string& value : node.params.str) {
             if (!reader.read_string(value))
                 return false;
+        }
+    }
+
+    // Pre-integration Hy4 exports assigned opcode52 to absorbed MLA. QSA
+    // already uses52 in main. Only the explicit Hy4 graph identity permits
+    // migration; never reinterpret a Qwen graph or infer from tensor shapes.
+    const auto model_type = graph.metadata.find("model_type");
+    if (model_type != graph.metadata.end() && model_type->second == "hy-v4") {
+        for (auto& node : graph.nodes) {
+            if (node.op_type != OpType::QSA_SDPA) continue;
+            if (node.inputs.size() < 8 || node.params.i32.size() < 10) {
+                std::fprintf(stderr, "graph_load: malformed legacy Hy4 MLA opcode52\n");
+                return false;
+            }
+            node.op_type = OpType::SDPA_MLA_ABSORB;
         }
     }
 

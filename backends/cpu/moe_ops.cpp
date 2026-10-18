@@ -6,7 +6,8 @@
 
 bool dispatch_cpu_moe(
         const GraphNode& node, const std::vector<const Tensor*>& inputs,
-        Tensor* output, ThreadPool* thread_pool) {
+        Tensor* output, ThreadPool* thread_pool,
+        HostMoeFfn* host_moe_ffn) {
     const OpParams& params = node.params;
     bool success = true;
     auto reject = [&] { success = false; };
@@ -29,6 +30,7 @@ bool dispatch_cpu_moe(
     int hash_table_input = graph_params::get_i32(params, 13, -1);
     float routed_scaling_factor = graph_params::get_f32(params, 0, 1.0f);
     float swiglu_limit = graph_params::get_f32(params, 1, 0.0f);
+    float shared_swiglu_limit = graph_params::get_f32(params, 2, swiglu_limit);
     if (output) {
         if (!kernel_qwen3_moe(
                 inputs, *output, thread_pool,
@@ -39,7 +41,7 @@ bool dispatch_cpu_moe(
                 routed_scaling_factor,
                 shared_expert_has_gate, router_bias_input,
                 token_ids_input, hash_table_input,
-                swiglu_limit)) {
+                swiglu_limit, shared_swiglu_limit, host_moe_ffn)) {
             reject();
         }
     } else {
