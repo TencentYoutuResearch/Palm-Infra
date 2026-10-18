@@ -71,6 +71,7 @@ void run_case(int groups, int seq_len, int kernel_size, int n_real,
         state[i] =
             static_cast<float>(static_cast<int>((i * 3) % 11) - 5) * 0.01f;
 
+    const std::vector<float> initial_state = state;
     std::vector<float> expected_state = state;
     std::vector<float> expected_output(groups * seq_len, 0.f);
     reference_shortconv(input, weights, expected_state, expected_output, groups,
@@ -108,6 +109,35 @@ void run_case(int groups, int seq_len, int kernel_size, int n_real,
     for (size_t i = 0; i < state.size(); ++i)
         matches &= std::fabs(state[i] - expected_state[i]) < 1e-6f;
     CHECK(matches, label);
+
+    // Independent schedule check: concatenate real one-token outputs in
+    // logical token order, explicitly accounting for ShortConv's special
+    // group-major physical output rather than assuming Tensor strides.
+    std::vector<float> serial_state = initial_state;
+    std::vector<float> serial_output(groups * seq_len, 0.f);
+    Tensor serial_state_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, kernel_size - 1,
+        groups, 1, 1, serial_state.data());
+    const int process_len = n_real > 0 && n_real < seq_len ? n_real : seq_len;
+    for (int token = 0; token < process_len; ++token) {
+        Tensor serial_input = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, groups, 1, 1, 1,
+            input.data() + token * groups);
+        Tensor serial_result = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, groups, 1, 1, 1,
+            serial_output.data() + token * groups);
+        kernel_shortconv(ShortConvParams{kernel_size, 1},
+            {&serial_input, &weight_tensor, &serial_state_tensor},
+            serial_result, thread_pool);
+    }
+    bool schedule_matches = true;
+    for (int token = 0; token < seq_len; ++token)
+        for (int group = 0; group < groups; ++group)
+            schedule_matches &= std::fabs(output[group * seq_len + token] -
+                serial_output[token * groups + group]) < 1e-5f;
+    for (size_t i = 0; i < state.size(); ++i)
+        schedule_matches &= std::fabs(state[i] - serial_state[i]) < 1e-6f;
+    CHECK(schedule_matches, "batch/serial token layout and final state");
 }
 
 } // namespace

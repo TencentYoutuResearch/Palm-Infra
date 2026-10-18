@@ -647,7 +647,7 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
                             cos, sin, mask, ck_in, cv_in,
                             eps, seq_len, rope_dim,
                             num_heads, num_kv_heads, head_dim, hidden_size,
-                            is_prefill=False):
+                            is_prefill=False, selected_indices=None):
     """Build a full attention (GQA + QK norm + output gate) layer."""
     # In prefill graphs, use SEQ symbol for seq dims (runtime substitutes
     # actual seq_len). In decode graphs, use seq_len literal (=1, static).
@@ -732,7 +732,7 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
         query, k, v, mask, ck_in, cv_in,
         kv_cache=2, causal=True, scale=scale,
         num_heads=num_heads, num_kv_heads=num_kv_heads,
-        head_dim=head_dim, v_head_dim=head_dim)
+        head_dim=head_dim, v_head_dim=head_dim, selected_indices=selected_indices)
 
     # ---- Output layout + sigmoid gate ----
     # Permuting attention to [HD,NH,seq] is a view. SIGMOID_MUL accepts strided

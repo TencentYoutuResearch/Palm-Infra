@@ -13,6 +13,7 @@ import os
 import math
 import json
 import tempfile
+import copy
 from pathlib import Path
 
 from transpile import GraphBuilder, Precision, save_package
@@ -21,6 +22,8 @@ from model_metadata import infer_hf_model_name
 from safetensors_stream import (
     SafeTensorIndex,
     aggregate_nvfp4_experts,
+    aggregate_nvfp4_input_scales,
+    aggregate_fp16_experts,
     concatenate_fp16_row_slices,
     concatenate_fp16_streamed_weights,
     dense_streamed_weight,
@@ -187,9 +190,42 @@ def _gr_branch(g: GraphBuilder, state: int, prefix: str, weights_dir: str,
     return g.gr_inject(branch, state, injection, hidden_size, hc_count)
 
 
+def _build_mtp_input_fusion(g: GraphBuilder, target_hidden: int,
+                          token_hidden: int, weights_dir: str,
+                          hidden_size: int, hc_count: int,
+                          eps: float) -> int:
+    """Global HC normalization, shared per-stream projection, token broadcast.
+
+    Norm files contain the effective Gemma gamma (checkpoint gamma + 1),
+    like the existing Qwen4Exp norm exports. Projection files are separate
+    H-by-H matrices; no expanded HC-by-HC weight is materialized.
+    """
+    from transpile import SEQ
+    seq = SEQ.bind(g._nodes[token_hidden].out_shape[1])
+    if hc_count <= 1:
+        raise ValueError("Qwen4Exp MTP shared-residual fusion requires hc_count > 1")
+    wide = hidden_size * hc_count
+    embedding_norm = _weight(g, weights_dir, "mtp_pre_fc_norm_embedding_weight",
+                             (hidden_size,), Precision.FP32)
+    hidden_norm = _weight(g, weights_dir, "mtp_pre_fc_norm_hidden_weight",
+                          (wide,), Precision.FP32)
+    embedding_fc = _weight(g, weights_dir, "mtp_fc_embedding_weight",
+                           (hidden_size, hidden_size))
+    hidden_fc = _weight(g, weights_dir, "mtp_fc_hidden_weight",
+                        (hidden_size, hidden_size))
+    embedding = g.matmul(g.rms_norm(token_hidden, embedding_norm, eps), embedding_fc)
+    normalized = g.rms_norm(target_hidden, hidden_norm, eps)
+    per_stream = g.reshape(normalized, (hidden_size, hc_count * seq))
+    projected = g.matmul(per_stream, hidden_fc)
+    projected = g.reshape(projected, (wide, seq))
+    return g.add(projected, g.tile(embedding, (hc_count, 1)))
+
+
 def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
-                n_ctx: int = 2048, is_prefill: bool = False) -> GraphBuilder:
-    """Build a text-only Qwen4Exp graph for contexts within QSA's budget."""
+                n_ctx: int = 2048, is_prefill: bool = False,
+                export_mtp_state: bool = False,
+                _mtp_mode: bool = False, enable_qsa: bool = False) -> GraphBuilder:
+    """Build a text graph; opt-in QSA requires native CUDA and extra weights."""
     g = GraphBuilder()
     tc = cfg["text_config"] if "text_config" in cfg else cfg
 
@@ -200,7 +236,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     hc_count = int(tc.get("hc_count", 4))
     hc_lowrank = int(tc["hc_lowrank"])
     qsa_budget = int(tc.get("indexer_budget", 2048))
-    if n_ctx > qsa_budget and any(t == "full_attention" for t in layer_types):
+    if not enable_qsa and n_ctx > qsa_budget and any(t == "full_attention" for t in layer_types):
         raise ValueError(
             f"Qwen4Exp bring-up graph supports n_ctx <= QSA budget "
             f"({qsa_budget}); got {n_ctx}")
@@ -211,6 +247,16 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     rope_dim = int(head_dim * float(rope["partial_rotary_factor"]))
     num_heads = int(tc["num_attention_heads"])
     num_kv_heads = int(tc["num_key_value_heads"])
+    if enable_qsa:
+        index_heads = int(tc.get("indexer_n_heads", 4))
+        index_dim = int(tc.get("indexer_head_dim", 128))
+        index_ratio = int(tc.get("indexer_compress_ratio", 4))
+        if (_mtp_mode or int(tc.get("indexer_kv_heads", 1)) != 1 or
+                not 1 <= n_ctx <= 262144 or not 1 <= index_heads <= 16 or
+                not rope_dim <= index_dim <= 256 or not 1 <= index_ratio <= 16 or
+                qsa_budget < 1 or qsa_budget % index_ratio or qsa_budget + index_ratio - 1 > 4096):
+            raise ValueError("unsupported native QSA geometry/context/MTP")
+        g.metadata["qsa"] = "contiguous-causal-fp32-v1"
     linear_num_heads = int(tc["linear_num_key_heads"])
     linear_num_v_heads = int(tc["linear_num_value_heads"])
     linear_k_dim = int(tc["linear_key_head_dim"])
@@ -273,7 +319,13 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                            (qkv, conv_kernel - 1), prec=Precision.FP16)
             caches.append(("gdn", state, conv))
 
-    residual = g.tile(hidden, (hc_count, 1))
+    if _mtp_mode:
+        target_hidden = g.input("target_hidden", (hidden_size * hc_count, seq_len),
+                                dynamic=hidden_dynamic)
+        residual = _build_mtp_input_fusion(
+            g, target_hidden, hidden, weights_dir, hidden_size, hc_count, eps)
+    else:
+        residual = g.tile(hidden, (hc_count, 1))
     for layer, layer_type in enumerate(layer_types):
         if layer + 1 in ple_ids:
             assert token_ids is not None
@@ -295,10 +347,26 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                     is_prefill=is_prefill,
                     output_gate_type=(tc.get("output_gate_type") or
                                       tc.get("hidden_act", "silu")))
+            selected = None
+            if enable_qsa:
+                import numpy as np
+                ipfx = f"model_language_model_layers_{current}_self_attn_indexer"
+                projection = g.matmul(x, _weight(g, weights_dir, f"{ipfx}_index_qk_proj_weight",
+                                                ((index_heads + 1) * index_dim, hidden_size)))
+                q_norm = _weight(g, weights_dir, f"{ipfx}_q_layernorm_weight", (index_dim,), Precision.FP32)
+                k_norm = _weight(g, weights_dir, f"{ipfx}_k_layernorm_weight", (index_dim,), Precision.FP32)
+                frequency = g.constant(1 / np.power(np.float32(rope_theta),
+                    np.arange(0, rope_dim, 2, dtype=np.float32) / rope_dim))
+                state_id = 2 * len(ple_ids) + 2 * current
+                raw = g.input(f"aux_state{state_id}", (index_dim, n_ctx), prec=Precision.FP32)
+                pooled = g.input(f"aux_state{state_id + 1}", (index_dim, max(1, n_ctx // index_ratio)), prec=Precision.FP32)
+                selected = g.qsa_indexer(projection, q_norm, k_norm, frequency, raw, pooled,
+                    c0, mask, heads=index_heads, dimension=index_dim, rope_dim=rope_dim,
+                    ratio=index_ratio, budget=qsa_budget, eps=eps)
             return _build_full_attn_layer(
                 g, x, current, weights_dir, cos, sin, mask, c0, c1,
                 eps, seq_len, rope_dim, num_heads, num_kv_heads,
-                head_dim, hidden_size, is_prefill=is_prefill)
+                head_dim, hidden_size, is_prefill=is_prefill, selected_indices=selected)
 
         residual = _gr_branch(
             g, residual, f"{pfx}_attn_hyper_connection", weights_dir,
@@ -314,6 +382,14 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
             down = _weight(
                 g, weights_dir, f"{mlp}_experts_down_proj",
                 (num_experts * hidden_size, moe_intermediate))
+            if tc.get("export_nvfp4_activation_calibration", False):
+                # Package collection walks constant nodes, not every supplied
+                # streamed weight. These metadata constants intentionally do
+                # not alter the MoE operator's inputs or arithmetic.
+                _weight(g, weights_dir, f"{mlp}_experts_gate_up_input_scales",
+                        (num_experts, 2), Precision.FP32)
+                _weight(g, weights_dir, f"{mlp}_experts_down_input_scales",
+                        (num_experts, 1), Precision.FP32)
             shared_gate = _weight(
                 g, weights_dir, f"{mlp}_shared_expert_gate_proj_weight",
                 (shared_intermediate, hidden_size))
@@ -338,6 +414,11 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
             g, residual, f"{pfx}_mlp_hyper_connection", weights_dir,
             hidden_size, hc_count, hc_lowrank, eps, moe_branch)
 
+    if export_mtp_state:
+        # An explicit graph output retains the pre-collapse HC stream through
+        # execution/liveness. Keep it before the normal logits-hidden output.
+        state_output = g.scalar_mul(residual, 1.0)
+        g.metadata["mtp_state_output_node"] = str(state_output)
     collapsed, _ = _gr_read(
         g, residual, "model_language_model_hyper_connection_mixer",
         weights_dir, hidden_size, hc_count, hc_lowrank, eps,
@@ -345,11 +426,62 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     return g
 
 
+def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 8,
+                    n_ctx: int = 2048) -> GraphBuilder:
+    """Build the single-layer Qwen4Exp draft; weight export is separate.
+
+    Uses shared token embeddings/head, no PLE, and independent MTP attention,
+    MoE and hyper-connection weights. Never mutates the main model config.
+    Contexts above QSA budget and non-final target-layer taps remain unsupported.
+    """
+    draft_cfg = copy.deepcopy(cfg)
+    tc = draft_cfg["text_config"] if "text_config" in draft_cfg else draft_cfg
+    mtp = tc.get("mtp", {})
+    if seq_len < 1 or n_ctx < 1:
+        raise ValueError("Qwen4Exp MTP needs positive sequence and context lengths")
+    if int(mtp.get("num_hidden_layers", tc.get("mtp_num_hidden_layers", 1))) != 1:
+        raise ValueError("Qwen4Exp MTP currently supports exactly one draft layer")
+    if mtp.get("mtp_use_hidden_state_from_layer") is not None:
+        raise ValueError("Qwen4Exp MTP currently uses the final target HC state")
+    if tc.get("mtp_use_dedicated_embeddings", False):
+        raise ValueError("Qwen4Exp MTP currently requires shared target embeddings")
+    if mtp.get("layer_types", ["full_attention"]) != ["full_attention"]:
+        raise ValueError("Qwen4Exp MTP currently requires a full-attention draft layer")
+    if float(mtp.get("rope_theta", tc["rope_parameters"]["rope_theta"])) != float(tc["rope_parameters"]["rope_theta"]):
+        raise ValueError("Qwen4Exp MTP currently shares target RoPE theta in the engine")
+    tc["num_hidden_layers"] = 1
+    tc["layer_types"] = ["full_attention"]
+    tc["ple_layer_ids"] = []
+    tc["export_nvfp4_activation_calibration"] = False
+    if "rope_theta" in mtp:
+        tc["rope_parameters"]["rope_theta"] = mtp["rope_theta"]
+    graph = build_graph(weights_dir, draft_cfg, seq_len, n_ctx,
+                        is_prefill=True, export_mtp_state=True, _mtp_mode=True)
+    for node in graph._nodes:
+        if node.weight_path:
+            for old, new in (
+                ("model_language_model_layers_0_", "mtp_layers_0_"),
+                ("model_language_model_hyper_connection_mixer_", "mtp_hyper_connection_mixer_"),
+            ):
+                node.weight_path = node.weight_path.replace(old, new)
+                node.params_str = [s.replace(old, new) for s in node.params_str]
+            # The draft exporter deliberately materializes FP16 projections.
+            # Reused attention builders may declare target FP8/W4 constants;
+            # do not carry those storage declarations into this FP16 bundle.
+            if node.out_prec != Precision.FP32:
+                node.out_prec = Precision.FP16
+    return graph
+
+
 def build_streamed_weights(model_dir: str | Path, cfg: dict,
-                           num_layers: int | None = None):
+                           num_layers: int | None = None, *,
+                           _index=None, _expert_precision="nvfp4",
+                           _dense_precision="w4", _include_shared_weights=True):
     """Map a Qwen4-Exp checkpoint into graph-native streamed weights."""
     model_dir = Path(model_dir)
-    index = SafeTensorIndex(model_dir)
+    index = _index if _index is not None else SafeTensorIndex(model_dir)
+    if _expert_precision not in ("nvfp4", "fp16") or _dense_precision not in ("w4", "fp16"):
+        raise ValueError("unsupported streamed export precision")
     tc = cfg["text_config"] if "text_config" in cfg else cfg
     layers = int(tc["num_hidden_layers"]) if num_layers is None else num_layers
     hidden = int(tc["hidden_size"])
@@ -370,15 +502,16 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
     def put(name: str, weight):
         streamed[_ref(name)] = weight
 
-    put("embed_tokens", dense_streamed_weight(
-        index, "model.language_model.embed_tokens.weight"))
-    put("lm_head", quantize_w8pc_streamed_weight(
-        dense_streamed_weight(index, "lm_head.weight")))
+    if _include_shared_weights:
+        put("embed_tokens", dense_streamed_weight(
+            index, "model.language_model.embed_tokens.weight"))
+        put("lm_head", quantize_w8pc_streamed_weight(
+            dense_streamed_weight(index, "lm_head.weight")))
 
     def dense(checkpoint_name: str, output_name: str | None = None):
+        weight = dense_streamed_weight(index, checkpoint_name)
         put(output_name or checkpoint_name.replace(".", "_"),
-            quantize_w4g32_streamed_weight(
-                dense_streamed_weight(index, checkpoint_name)))
+            quantize_w4g32_streamed_weight(weight) if _dense_precision == "w4" else weight)
 
     def fp32(checkpoint_name: str, output_name: str | None = None,
              shape: tuple[int, ...] | None = None):
@@ -417,10 +550,9 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
                           linear_v_heads * linear_v +
                           2 * linear_v_heads +
                           linear_v_heads * linear_v)
+            fused = concatenate_fp16_streamed_weights(index, names, (fused_rows, hidden))
             put(f"{output}_in_proj_weight",
-                quantize_w4g32_streamed_weight(
-                    concatenate_fp16_streamed_weights(
-                        index, names, (fused_rows, hidden))))
+                quantize_w4g32_streamed_weight(fused) if _dense_precision == "w4" else fused)
             fp32(f"{prefix}.conv1d.weight", f"{output}_conv1d_weight",
                  (2 * linear_heads * linear_k +
                   linear_v_heads * linear_v, int(tc["linear_conv_kernel_dim"])))
@@ -443,10 +575,9 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
                 (f"{prefix}.v_proj.weight", 0, kv_heads * head_dim),
             ])
             qkv_rows = 2 * heads * head_dim + 2 * kv_heads * head_dim
+            fused = concatenate_fp16_row_slices(index, slices, (qkv_rows, hidden))
             put(f"{output}_qkv_proj_weight",
-                quantize_w4g32_streamed_weight(
-                    concatenate_fp16_row_slices(
-                        index, slices, (qkv_rows, hidden))))
+                quantize_w4g32_streamed_weight(fused) if _dense_precision == "w4" else fused)
             norm(f"{prefix}.q_norm.weight", f"{output}_q_norm_weight")
             norm(f"{prefix}.k_norm.weight", f"{output}_k_norm_weight")
             dense(f"{prefix}.o_proj.weight", f"{output}_o_proj_weight")
@@ -461,15 +592,31 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
               f"{mlp_out}_shared_expert_gate_weight")
         expert_prefixes = [
             f"{mlp}.experts.{expert}" for expert in range(experts)]
+        aggregate_experts = aggregate_nvfp4_experts if _expert_precision == "nvfp4" else aggregate_fp16_experts
         put(f"{mlp_out}_experts_gate_up_proj",
-            aggregate_nvfp4_experts(index, [
+            aggregate_experts(index, [
                 [f"{prefix}.gate_proj.weight",
                  f"{prefix}.up_proj.weight"]
                 for prefix in expert_prefixes]))
         put(f"{mlp_out}_experts_down_proj",
-            aggregate_nvfp4_experts(index, [
+            aggregate_experts(index, [
                 [f"{prefix}.down_proj.weight"]
                 for prefix in expert_prefixes]))
+        # Preserve the original activation calibration for an optional native
+        # W4A4 backend. Current W4/FP32-activation inference remains unchanged.
+        input_scale_names = [f"{prefix}.{projection}.input_scale"
+            for prefix in expert_prefixes
+            for projection in ("gate_proj", "up_proj", "down_proj")]
+        present = [index.contains(name) for name in input_scale_names]
+        if any(present):
+            if not all(present):
+                raise ValueError("incomplete NVFP4 expert activation calibration")
+            for output, projections in (("gate_up", ("gate_proj", "up_proj")),
+                                        ("down", ("down_proj",))):
+                put(f"{mlp_out}_experts_{output}_input_scales",
+                    aggregate_nvfp4_input_scales(index, [
+                        [f"{prefix}.{projection}.weight" for projection in projections]
+                        for prefix in expert_prefixes]))
 
         if layer + 1 in tc.get("ple_layer_ids", []):
             ple = f"{base}.ple"
@@ -507,6 +654,41 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
     return streamed
 
 
+def build_mtp_streamed_weights(model_dir: str | Path, cfg: dict):
+    """MTP-only FP16 baseline descriptors, excluding shared embedding/head.
+
+    Source experts use E4M3FN with BF16/F32 128x128 scales. Decoding is bounded
+    to 128 rows at a time, not a full FP32 expert arena. These weights still
+    require package integration and an appropriate native expert backend.
+    """
+    build_mtp_graph(".", cfg, seq_len=1, n_ctx=1)  # validate supported contract
+    source = SafeTensorIndex(model_dir)
+    def checkpoint_name(name):
+        return name.replace("model.language_model.layers.0.", "mtp.layers.0.").replace(
+            "model.language_model.hyper_connection_mixer.", "mtp.hyper_connection_mixer.")
+    class MtpIndex:
+        def tensor(self, name):
+            return source.tensor(checkpoint_name(name))
+        def contains(self, name):
+            return source.contains(checkpoint_name(name))
+    draft_cfg = copy.deepcopy(cfg)
+    tc = draft_cfg["text_config"] if "text_config" in draft_cfg else draft_cfg
+    tc["num_hidden_layers"] = 1
+    tc["layer_types"] = ["full_attention"]
+    tc["ple_layer_ids"] = []
+    weights = build_streamed_weights(model_dir, draft_cfg, _index=MtpIndex(),
+        _expert_precision="fp16", _dense_precision="fp16", _include_shared_weights=False)
+    weights = {key.replace("model_language_model_layers_0_", "mtp_layers_0_").replace(
+        "model_language_model_hyper_connection_mixer_", "mtp_hyper_connection_mixer_"): value
+        for key, value in weights.items()}
+    for name in ("pre_fc_norm_embedding", "pre_fc_norm_hidden"):
+        weights[_ref(f"mtp_{name}_weight")] = fp32_plus_one_streamed_weight(
+            source, f"mtp.{name}.weight")
+    for name in ("fc_embedding", "fc_hidden"):
+        weights[_ref(f"mtp_{name}_weight")] = dense_streamed_weight(source, f"mtp.{name}.weight")
+    return weights
+
+
 def convert_qwen4_exp(model_dir: str, output_path: str,
                       num_layers: int | None = None,
                       prefill_seq_len: int = 256, n_ctx: int = 2048,
@@ -534,6 +716,8 @@ def convert_qwen4_exp(model_dir: str, output_path: str,
     cfg["text_config"] = tc
 
     streamed = build_streamed_weights(model_path, cfg, num_layers)
+    tc["export_nvfp4_activation_calibration"] = any(
+        name.endswith("_input_scales.weights") for name in streamed)
     prefill = build_graph(".", cfg, prefill_seq_len, n_ctx, True)
     decode = build_graph(".", cfg, 1, n_ctx, False)
     moe_layers = []
@@ -553,6 +737,10 @@ def convert_qwen4_exp(model_dir: str, output_path: str,
                 "cols": int(tc["moe_intermediate_size"]),
             },
         })
+        if tc["export_nvfp4_activation_calibration"]:
+            for projection in ("gate_up", "down"):
+                moe_layers[-1][projection]["input_scales_weight"] = _ref(
+                    f"{prefix}_experts_{projection}_input_scales")
     metadata = {
         "model_name": infer_hf_model_name(
             model_path, cfg, "Qwen3.8-Flash-Next-NVFP4"),

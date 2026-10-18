@@ -21,5 +21,13 @@ DeviceBufferPool* create_device_buffer_pool();
 void destroy_device_buffer_pool(DeviceBufferPool* pool);
 void* acquire_device_buffer(DeviceBufferPool* pool, size_t bytes);
 void release_device_buffer(DeviceBufferPool* pool, void* pointer);
+size_t device_buffer_pool_reserved_bytes(const DeviceBufferPool* pool);
+bool device_buffer_pool_can_reuse(const DeviceBufferPool* pool, size_t bytes);
+// Diagnostic primitive, not used by inference. Caller must first invalidate
+// cached graphs referencing freed blocks and ensure no other stream captures
+// refer to this pool. Active allocations are never released. Reports partial
+// progress on CUDA failure; capture on the supplied stream fails without frees.
+bool trim_free_device_buffers(DeviceBufferPool* pool, cudaStream_t stream,
+                              size_t* reclaimed_bytes);
 
 }  // namespace mollm_cuda

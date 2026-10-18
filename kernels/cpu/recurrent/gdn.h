@@ -25,13 +25,12 @@
 // ---------------------------------------------------------------------------
 // Input layout contract (CRITICAL):
 //
-// All four matmul-derived inputs are consumed in their NATIVE [seq, dim] row-major
-// data layout — i.e. ptr[t * dim + d]. The declared Tensor shape ([dim, seq]) is
-// NOT consulted by the kernel; seq_len and dims come from params. The builder
-// emits a `reshape` materialize on qkv_conv (shortconv output) to bring it to
-// [seq, qkv_total] so all four inputs share this convention.
+// QKV uses ShortConv's dim-major output: ptr[d * seq_len + t]. The other
+// three projection inputs use token-major ptr[t * dim + d]. The declared
+// Tensor strides are NOT consulted; seq_len and dims come from params.
+// The builder passes ShortConv output directly without a reshape.
 //
-//   inputs[0] qkv_conv     FP32  data [seq, qkv_total=3*num_heads*k_dim]  (post-shortconv, post-reshape)
+//   inputs[0] qkv_conv     FP32  data [qkv_total, seq] (post-shortconv)
 //   inputs[1] a_out        FP32  data [seq, num_heads]
 //   inputs[2] b_out        FP32  data [seq, num_heads]
 //   inputs[3] z_out        FP32  data [seq, num_v_heads*v_dim]  (z_proj output)

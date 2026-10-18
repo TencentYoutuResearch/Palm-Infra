@@ -82,6 +82,78 @@ logical application-level quantities rather than physical NAND traffic.
 Cache capacity must leave room for dense weights, KV cache, runtime buffers, and
 other applications.
 
+### Resident experts with PLE paging
+
+On CPU or CUDA, `--offload-ple` extends the default resident mode: eagerly load and
+lock every routed expert, lock the dense working set and its prepared CPU
+layouts, and leave the PLE embedding table file-backed and demand-paged.
+Qwen3.8-Flash-Next has about 67.55 GiB of non-PLE weights and a 47.68 GiB PLE
+table. Allow additional RAM for runtime buffers and KV state.
+
+For experimental large-page-backed resident experts on Linux, set
+`MOLLM_RESIDENT_EXPERT_ARENA=1`. The allocator reads experts directly into one
+locked anonymous arena with 64-byte-aligned slices and transparent huge-page
+advice; it does not retain a second expert copy. Actual huge-page allocation is
+up to the kernel. The option is off by default (`0` also disables it), does not
+change demand-cache allocation or global memory policy, and fails resident
+loading if allocation or locking fails. See [performance.md](performance.md)
+for the measured CUDA configuration and current validation scope.
+
+`MOLLM_RESIDENT_EXPERT_ARENA=cuda-device` is a separate experimental CUDA
+storage mode: a single device allocation holds the prepared expert payload,
+with no retained full host copy. I/O workers use small reusable host staging
+buffers and finish their asynchronous transfers before publishing ready views.
+Resident CUDA layer leases expose device pointers; ordinary CPU expert leases
+instead own temporary host copies for the duration of the lease. The legacy
+CPU-pointer-only `acquire` API rejects this mode. CPU-only builds reject device
+arena allocation, and allocation failure aborts loading. The default remains
+unchanged. On GB10 this still consumes unified physical RAM: a lower process
+RSS reflects driver accounting, not removal of the expert weights. A first
+full-model run measured 35.54 decode tok/s, which does not establish a speedup
+over the large-page host arena. Five cache/provider/CUDA/PLE/tiny-model
+regression tests pass with this option enabled.
+
+```bash
+./build_i8mm/mollm_chat --package qwen38_flash_next_nvfp4.mollm \
+  --offload-ple --threads 8 --n-ctx 2048
+```
+
+This mode reuses the per-expert provider (including NVFP4 scales), sizes its
+pool for all registered experts, and completes all expert reads before
+generation. It does not copy the full package into a second resident buffer.
+Startup takes longer; subsequent expert requests hit RAM. PLE page faults can
+still read the package, so keep it on local storage for inference.
+
+For CUDA, add `--device cuda` using a CUDA-enabled build. On coherent-memory
+devices such as GB10, CUDA reads the resident NVFP4 expert buffers directly:
+expert and shared-expert projections run on GPU. Fully resident providers
+lend the complete layer through long-lived leases; ungrouped route selection
+stays on GPU, prefill groups jobs by expert, and eligible Q4 decode replays a
+cached MoE CUDA graph. Descriptor tables are tiny metadata, not another copy
+of the expert matrices. Leases are released after outstanding device work
+finishes, before provider teardown. Demand caches retain per-call leases and
+CPU route selection and are never pinned in full by this optimization.
+This requires both pageable-memory access and host-page-table support,
+checked at runtime. Other devices/layouts use the reference bridge. PLE lookup
+stays on CPU and demand-paged; its gate and dilated convolution run on CUDA.
+CUDA also allocates device copies of supported dense
+weights, so allow additional memory beyond the CPU resident estimate.
+`MOLLM_CUDA_DISABLE_NVFP4_MOE=1` restores the reference MoE bridge for numerical
+or performance comparisons without changing the loading policy.
+`MOLLM_CUDA_DISABLE_RESIDENT_ROUTES=1`,
+`MOLLM_CUDA_DISABLE_NVFP4_GROUPING=1`, and
+`MOLLM_CUDA_DISABLE_MOE_GRAPHS=1` disable individual optimizations for diagnostics.
+On GB10 with CUDA 13, build with `-DCMAKE_CUDA_ARCHITECTURES=121a` to enable
+the architecture-specific FP4 conversion instructions. A plain `121` build
+uses the compatible conversion fallback.
+
+The option requires a package with PLE weights, resident mode, enough RAM,
+and a sufficient OS locked-memory allowance (`ulimit -l`). It rejects
+`--mmap`, `--ssd-cache-mb`, and Metal devices. Locking failure aborts the
+load rather than silently falling back to paging. `--no-load-warmup` and
+`--no-lock-dense-weights` do not disable its residency guarantee. Without this
+option, existing loading behavior is unchanged.
+
 Qwen3.8-Flash-Next NVFP4 reaches a best observed 16.2 prefill and 21.8 decode
 tokens/s in real-prompt interactive generation with eight CPU threads and a
 20 GiB expert cache. This is not a strict five-process median. A controlled

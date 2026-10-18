@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -26,12 +28,17 @@ struct Options {
     int ssd_io_workers = 8;
     std::string trace_path;
     std::string token_loss_path;
+    std::string qsa_companion_dir;
     bool prepend_bos = false;
     bool tokenize_only = false;
     bool apply_chat_template = false;
     bool decode_token_by_token = false;
+    int decode_after_prefill = 0;
     bool metal_ssd_full = false;
     bool require_native = false;
+    bool offload_ple = false;
+    bool cuda_prefill_reclaim = false;
+    bool cuda_prefill_logical_batch = false;
     Device device = Device::CPU;
 };
 
@@ -62,7 +69,11 @@ void print_usage(const char* argv0) {
                 default_worker_threads());
     std::printf("  --device <cpu|metal|cuda>  Compute backend (default: cpu)\n");
     std::printf("  --require-native       Reject accelerator operator fallback\n");
+    std::printf("  --qsa-companion <dir>  CUDA QSA weight bundle; context<=262144; memory-dependent\n");
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
+    std::printf("  --offload-ple         Resident experts/dense weights with pageable PLE tables\n");
+    std::printf("  --cuda-prefill-reclaim  CUDA resident+PLE temporary reclamation; ctx<=4096, chunk<=1024, requires MOLLM_CUDA_HOST_HEADROOM_MB>=24576\n");
+    std::printf("  --cuda-prefill-logical-batch  Experimental Qwen3.8 batching; requires reclaim, context independent of chunk<=2048\n");
     std::printf("  --ssd-cache-mb <int>  CPU MoE SSD cache capacity\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --metal-ssd-full      Experimental full-Metal SSD decode\n");
@@ -70,7 +81,8 @@ void print_usage(const char* argv0) {
     std::printf("  --dump-token-loss <path.csv>  Write position,target,CE rows\n");
     std::printf("  --prepend-bos         Prepend tokenizer BOS before scoring\n");
     std::printf("  --decode-token-by-token  Score through decode_hidden after the first token\n");
-    std::printf("  --tokenize-only       Print token ids and exit before running the model\n");
+    std::printf("  --decode-after-prefill <int>  Prefill this many tokens, then score through decode_hidden\n");
+    std::printf("  --tokenize-only       Read tokenizer/template only; no model weights or backend; print token ids and exit\n");
     std::printf("  --apply-chat-template Wrap text as one user turn before tokenization\n");
 }
 
@@ -128,22 +140,27 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
             std::string dev = argv[++i];
             if (dev == "cpu") opts.device = Device::CPU;
             else if (dev == "metal") {
-#ifdef MOLLM_METAL
                 opts.device = Device::METAL;
-#else
-                error = "--device metal requires a build with -DMOLLM_METAL=ON"; return false;
-#endif
             } else if (dev == "cuda") {
-#ifdef MOLLM_CUDA
                 opts.device = Device::CUDA;
-#else
-                error = "--device cuda requires a build with -DMOLLM_CUDA=ON"; return false;
-#endif
             } else { error = std::string("unknown --device '") + dev + "' (cpu|metal|cuda)"; return false; }
+        } else if (arg == "--qsa-companion") {
+            if (!require_value("--qsa-companion", value)) return false;
+            opts.qsa_companion_dir = value;
+            if (opts.qsa_companion_dir.empty()) {
+                error = "--qsa-companion directory must not be empty";
+                return false;
+            }
         } else if (arg == "--require-native") {
             opts.require_native = true;
         } else if (arg == "--mmap") {
             opts.weight_loading = WeightLoadingMode::MMAP;
+        } else if (arg == "--offload-ple") {
+            opts.offload_ple = true;
+        } else if (arg == "--cuda-prefill-reclaim") {
+            opts.cuda_prefill_reclaim = true;
+        } else if (arg == "--cuda-prefill-logical-batch") {
+            opts.cuda_prefill_logical_batch = true;
         } else if (arg == "--ssd-cache-mb") {
             if (!require_value("--ssd-cache-mb", value)) return false;
             if (!parse_int(value, opts.ssd_cache_mb) || opts.ssd_cache_mb < 1) {
@@ -176,6 +193,12 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
             opts.prepend_bos = true;
         } else if (arg == "--decode-token-by-token") {
             opts.decode_token_by_token = true;
+        } else if (arg == "--decode-after-prefill") {
+            if (!require_value("--decode-after-prefill", value)) return false;
+            if (!parse_int(value, opts.decode_after_prefill) || opts.decode_after_prefill < 1) {
+                error = "invalid value for --decode-after-prefill";
+                return false;
+            }
         } else if (arg == "--tokenize-only") {
             opts.tokenize_only = true;
         } else if (arg == "--apply-chat-template") {
@@ -198,11 +221,53 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
         error = "use only one of --text or --text-file";
         return false;
     }
+    if (opts.decode_token_by_token && opts.decode_after_prefill) {
+        error = "use only one of --decode-token-by-token or --decode-after-prefill";
+        return false;
+    }
     if (opts.require_native && opts.device == Device::CPU) {
         error = "--require-native requires an accelerator device";
         return false;
     }
+    if (!opts.qsa_companion_dir.empty() &&
+        (opts.device != Device::CUDA || opts.n_ctx < 1 || opts.n_ctx > mollm_qsa::max_context)) {
+        error = "--qsa-companion requires CUDA text, ctx1..262144";
+        return false;
+    }
+    if(opts.cuda_prefill_logical_batch&&
+        (opts.device!=Device::CUDA||!opts.offload_ple||!opts.cuda_prefill_reclaim||
+         opts.weight_loading!=WeightLoadingMode::RESIDENT||opts.ssd_cache_mb||
+         opts.n_ctx<1||opts.chunk_size>2048||opts.decode_after_prefill>2048)) {
+        error="--cuda-prefill-logical-batch requires bounded CUDA resident+offload-PLE+reclaim, positive context, chunk/prefix<=2048";
+        return false;
+    }
+    // Tokenization uses only package tokenizer sections. Defer build capability
+    // checks until all options are parsed so --tokenize-only is order independent.
+    if (!opts.tokenize_only) {
+#ifndef MOLLM_METAL
+        if (opts.device == Device::METAL) {
+            error = "--device metal requires a build with -DMOLLM_METAL=ON"; return false;
+        }
+#endif
+#ifndef MOLLM_CUDA
+        if (opts.device == Device::CUDA) {
+            error = "--device cuda requires a build with -DMOLLM_CUDA=ON"; return false;
+        }
+#endif
+    }
     return true;
+}
+
+struct ScoringStep {
+    int count;
+    bool decode;
+};
+
+ScoringStep scoring_step(const Options& opts, int offset, int remaining) {
+    const bool decode = offset > 0 && (opts.decode_token_by_token || opts.decode_after_prefill);
+    const int requested = decode || opts.decode_token_by_token ? 1 :
+        opts.decode_after_prefill ? opts.decode_after_prefill : opts.chunk_size;
+    return {std::min(requested, remaining), decode};
 }
 
 float cross_entropy_for_target(const float* logits, int vocab, int target, bool& finite) {
@@ -224,6 +289,13 @@ float cross_entropy_for_target(const float* logits, int vocab, int target, bool&
     return (float)((double)max_logit + std::log(sum_exp) - (double)logits[target]);
 }
 
+std::vector<int> tokenize_text(const Options& opts,const Tokenizer& tokenizer,const std::string& text) {
+    auto ids=opts.apply_chat_template?tokenizer.apply_chat(text):tokenizer.encode(text);
+    if(opts.prepend_bos&&tokenizer.bos_id()>=0)ids.insert(ids.begin(),tokenizer.bos_id());
+    if(opts.max_tokens>0&&ids.size()>size_t(opts.max_tokens))ids.resize(opts.max_tokens);
+    return ids;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -241,6 +313,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if(opts.tokenize_only) {
+        Tokenizer tokenizer;
+        if(!tokenizer.load_package(opts.package_path)) {
+            std::fprintf(stderr,"ppl: failed to load package tokenizer\n");return 1;
+        }
+        const auto ids=tokenize_text(opts,tokenizer,text);
+        std::printf("tokens=%zu\ntoken_ids=",ids.size());
+        for(size_t i=0;i<ids.size();++i)std::printf("%s%d",i?",":"",ids[i]);
+        std::printf("\n");return 0;
+    }
+
     LLMEngine engine;
     EngineConfig cfg;
     cfg.package_path = opts.package_path;
@@ -248,6 +331,14 @@ int main(int argc, char** argv) {
     cfg.num_threads = opts.threads;
     cfg.sampling.temperature = 0.0f;
     cfg.weight_loading = opts.weight_loading;
+    cfg.offload_ple = opts.offload_ple;
+    cfg.qsa_companion_dir = opts.qsa_companion_dir;
+    cfg.cuda_prefill_reclaim = opts.cuda_prefill_reclaim;
+    cfg.cuda_prefill_logical_batch = opts.cuda_prefill_logical_batch;
+    if (opts.cuda_prefill_reclaim && opts.chunk_size > (opts.cuda_prefill_logical_batch?2048:1024)) {
+        std::fprintf(stderr, "ppl: --cuda-prefill-reclaim requires chunk<=1024\n");
+        return 1;
+    }
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;
     cfg.metal_ssd_full = opts.metal_ssd_full;
@@ -287,26 +378,7 @@ int main(int argc, char** argv) {
         tokenizer.set_rwkv_legacy_chat_template(true);
     }
 
-    std::vector<int> token_ids =
-        opts.apply_chat_template
-            ? tokenizer.apply_chat(text)
-            : tokenizer.encode(text);
-    if (opts.prepend_bos && tokenizer.bos_id() >= 0) {
-        token_ids.insert(token_ids.begin(), tokenizer.bos_id());
-    }
-    if (opts.max_tokens > 0 && (int)token_ids.size() > opts.max_tokens) {
-        token_ids.resize(opts.max_tokens);
-    }
-    if (opts.tokenize_only) {
-        std::printf("tokens=%zu\n", token_ids.size());
-        std::printf("token_ids=");
-        for (size_t i = 0; i < token_ids.size(); i++) {
-            if (i) std::printf(",");
-            std::printf("%d", token_ids[i]);
-        }
-        std::printf("\n");
-        return 0;
-    }
+    std::vector<int> token_ids=tokenize_text(opts,tokenizer,text);
     if ((int)token_ids.size() < 2) {
         std::fprintf(stderr, "ppl: need at least 2 tokens after tokenization\n");
         return 1;
@@ -323,6 +395,7 @@ int main(int argc, char** argv) {
     bool finite = true;
     double total_ce = 0.0;
     const int scoring_chunk_size =
+        opts.decode_after_prefill ? opts.decode_after_prefill :
         opts.decode_token_by_token ? 1 : opts.chunk_size;
     std::ofstream token_loss;
     if (!opts.token_loss_path.empty()) {
@@ -332,17 +405,19 @@ int main(int argc, char** argv) {
                          opts.token_loss_path.c_str());
             return 1;
         }
+        token_loss << std::setprecision(std::numeric_limits<double>::max_digits10);
         token_loss << "position,target,ce\n";
     }
 
     auto start = std::chrono::steady_clock::now();
-    for (int offset = 0; offset < n_tokens - 1; offset += scoring_chunk_size) {
-        int chunk = std::min(scoring_chunk_size, n_tokens - offset);
+    for (int offset = 0; offset < n_tokens - 1;) {
+        const auto step = scoring_step(opts, offset, n_tokens - offset);
+        int chunk = step.count;
         std::vector<int> chunk_ids(token_ids.begin() + offset,
                                    token_ids.begin() + offset + chunk);
 
         Tensor hidden;
-        if (opts.decode_token_by_token && offset > 0)
+        if (step.decode)
             hidden = engine.decode_hidden(chunk_ids[0]);
         else
             hidden = engine.prefill_hidden(chunk_ids);
@@ -378,6 +453,7 @@ int main(int argc, char** argv) {
             n_targets++;
         }
         chunks++;
+        offset += chunk;
     }
     auto end = std::chrono::steady_clock::now();
 
@@ -398,6 +474,7 @@ int main(int argc, char** argv) {
     std::printf("chunk_size=%d\n", scoring_chunk_size);
     std::printf("decode_token_by_token=%s\n",
                 opts.decode_token_by_token ? "true" : "false");
+    std::printf("decode_after_prefill=%d\n", opts.decode_after_prefill);
     std::printf("ce=%.6f\n", ce);
     std::printf("ppl=%.6f\n", ppl);
     std::printf("finite=%s\n", finite ? "true" : "false");

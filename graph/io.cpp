@@ -299,8 +299,27 @@ bool read_graph(BinaryReader& reader, Graph& graph) {
         }
     }
 
+    // Pre-integration Hy4 exports assigned opcode52 to absorbed MLA. QSA
+    // already uses52 in main. Only the explicit Hy4 graph identity permits
+    // migration; never reinterpret a Qwen graph or infer from tensor shapes.
+    const auto model_type = graph.metadata.find("model_type");
+    if (model_type != graph.metadata.end() && model_type->second == "hy-v4") {
+        for (auto& node : graph.nodes) {
+            if (node.op_type != OpType::QSA_SDPA) continue;
+            if (node.inputs.size() < 8 || node.params.i32.size() < 10) {
+                std::fprintf(stderr, "graph_load: malformed legacy Hy4 MLA opcode52\n");
+                return false;
+            }
+            node.op_type = OpType::SDPA_MLA_ABSORB;
+        }
+    }
+
     std::string error;
-    return validate_graph(graph, error);
+    if (!validate_graph(graph, error)) {
+        std::fprintf(stderr, "graph_load: %s\n", error.c_str());
+        return false;
+    }
+    return true;
 }
 
 bool fits_u32(size_t value) {

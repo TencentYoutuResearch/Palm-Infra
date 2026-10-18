@@ -177,6 +177,67 @@ def assert_has_bg32_weight(package: Path) -> None:
     raise AssertionError("tiny W4G32 package contains no native BG32 weight")
 
 
+def build_dequantized_reference(package: Path, model_dir: Path, output: Path) -> None:
+    """Use the actual quantized weights with floating activations as an oracle.
+
+    ARM CPU W4 uses dynamic INT8 activations; CUDA uses floating activations.
+    Comparing those two directly with FP16 tolerances conflates activation
+    quantization with backend errors. Decode the package independently here.
+    """
+    import numpy as np
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "models"))
+    from qwen3 import build_graph
+    from transpile import _read_weight_header, _write_weight_file, save_package
+
+    data = package.read_bytes()
+    meta_offset, meta_length = struct.unpack_from("<QQ", data, 8)
+    weights_offset, _ = struct.unpack_from("<QQ", data, PACKAGE_WEIGHTS_OFFSET)
+    metadata = json.loads(data[meta_offset:meta_offset + meta_length])
+    root = output.parent / "dequantized_weights"
+    root.mkdir()
+    for ref, (offset, size) in metadata["weights"].items():
+        path = root / Path(ref).name
+        blob = data[weights_offset + offset:weights_offset + offset + size]
+        path.write_bytes(blob)
+        header = _read_weight_header(str(path))
+        precision = header["precision"]
+        if precision not in (2, 3):  # INT8 / INT4
+            continue
+        assert header["ndim"] == 2
+        rows, cols = header["shape"][:2]
+        begin = header["data_offset"]
+        if precision == 3:
+            assert header["flags"] & WEIGHT_INT4_BG32_FLAG
+            assert header["group_size"] == 32 and cols % 32 == 0
+            dense = np.empty((rows, cols), dtype=np.float32)
+            for row in range(rows):
+                for group in range(cols // 32):
+                    block = begin + ((row // 8) * (cols // 32) + group) * 160
+                    scale = struct.unpack_from("<f", blob, block + (row % 8) * 4)[0]
+                    packed = np.frombuffer(blob, dtype=np.uint8, count=16,
+                                           offset=block + 32 + (row % 8) * 16)
+                    nibbles = np.empty(32, dtype=np.int16)
+                    nibbles[0::2] = packed & 15
+                    nibbles[1::2] = packed >> 4
+                    signed = np.where(nibbles >= 8, nibbles - 16, nibbles)
+                    dense[row, group * 32:(group + 1) * 32] = signed * scale
+        else:
+            quant = np.frombuffer(blob, dtype=np.int8, count=rows * cols,
+                                  offset=begin).reshape(rows, cols)
+            scales = np.frombuffer(blob, dtype="<f4", count=header["num_groups"],
+                                   offset=header["scales_offset"]).reshape(rows, -1)
+            dense = quant * np.repeat(scales, header["group_size"], axis=1)[:, :cols]
+        _write_weight_file(str(path), dense.astype(np.float16))
+    cfg = json.loads((model_dir / "config.json").read_text())
+    pf = build_graph(".", cfg, seq_len=metadata["prefill_seq_len"],
+                     n_ctx=metadata["n_ctx"], is_prefill=True)
+    dc = build_graph(".", cfg, seq_len=1, n_ctx=metadata["n_ctx"])
+    metadata.pop("weights", None)
+    metadata["quantization"] = "dequantized-fp16-reference"
+    save_package(str(output), pf, dc, str(root), metadata)
+
+
 def main() -> int:
     if len(sys.argv) != 4:
         print("usage: run_tiny_qwen3_cpu_e2e.py <converter.py> <quantizer> <runner>",
@@ -214,7 +275,9 @@ def main() -> int:
                 [sys.executable, str(converter), str(model_dir), str(package), quant],
                 check=True, env=environment, cwd=str(converter.parent.parent))
         assert_has_bg32_weight(w4)
-        subprocess.run([str(runner), str(fp16), str(w4), str(qwen35)], check=True)
+        reference = temp_dir / "tiny_w4_dequantized.mollm"
+        build_dequantized_reference(w4, qwen3_dir, reference)
+        subprocess.run([str(runner), str(fp16), str(w4), str(qwen35), str(reference)], check=True)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
     return 0

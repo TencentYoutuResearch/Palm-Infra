@@ -1,6 +1,7 @@
 #include "engine/engine.h"
 #include "kernels/cpu/matmul/gguf_k.h"
 #include "storage/mapped_file.h"
+#include "engine/tokenizer.h"
 #include "storage/ssd_expert_cache/cache.h"
 
 #include <algorithm>
@@ -402,6 +403,49 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
 
 } // namespace
 
+bool Tokenizer::load_package(const std::string& path) {
+    ScopedFd source(open(path.c_str(), O_RDONLY));
+    struct stat st{};
+    if(source.get()<0||fstat(source.get(),&st)!=0||st.st_size<128||
+       static_cast<uint64_t>(st.st_size)>SIZE_MAX)return false;
+    uint8_t header[128];PackageHeaderInfo ph;
+    if(!read_exact_at(source.get(),0,header,sizeof(header),"package header")||
+       !parse_package_header(header,size_t(st.st_size),ph)||!ph.tok_len)return false;
+    struct TemporarySections {
+        std::vector<std::string> paths;
+        ~TemporarySections(){for(const auto& p:paths)std::remove(p.c_str());}
+    } temporary;
+    try {
+        std::string metadata(ph.meta_len,'\0');
+        if(!read_exact_at(source.get(),ph.meta_off,metadata.data(),metadata.size(),"package metadata"))return false;
+        const auto meta=json::parse(metadata);
+        if(!meta.is_object())return false;
+        // Match the engine's scalar metadata conversion, including old
+        // packages that omitted or used non-string architecture metadata.
+        const auto scalar=[&](const char* name)->std::string {
+            const auto it=meta.find(name);
+            if(it==meta.end())return {};
+            if(it->is_string())return it->get<std::string>();
+            if(it->is_number_unsigned())return std::to_string(it->get<uint64_t>());
+            if(it->is_number_integer())return std::to_string(it->get<int64_t>());
+            if(it->is_boolean())return it->get<bool>()?"true":"false";
+            return {};
+        };
+        std::string tok_path,template_path;
+        if(!extract_temp_section(source.get(),nullptr,ph.tok_off,ph.tok_len,"tokenizer",tok_path,temporary.paths)||
+           !extract_temp_section(source.get(),nullptr,ph.jin_off,ph.jin_len,"chat template",template_path,temporary.paths))return false;
+        Tokenizer candidate;
+        if(!candidate.load(tok_path,template_path,scalar("architecture")))return false;
+        if(scalar("rwkv_chat_template")=="rwkv_legacy")
+            candidate.set_rwkv_legacy_chat_template(true);
+        *this=std::move(candidate);
+        return true;
+    } catch(const std::exception& e) {
+        std::fprintf(stderr,"Tokenizer: failed to load package sections: %s\n",e.what());
+        return false;
+    }
+}
+
 bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                              std::string& dc_path, std::string& vi_path,
                              std::string& mtp_path,
@@ -467,17 +511,24 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                     package_weight_map_[name] = {off, sz};
                 }
             }
-            if (cfg_.moe_ssd_cache_bytes != 0) {
-                if (!meta.contains("moe_expert_storage") &&
-                    meta.value("architecture", std::string()) == "hy-v4" &&
-                    meta.value("quantization", std::string()) ==
-                        "gguf-native-blocks" &&
-                    !derive_native_gguf_expert_storage(
-                        package_file.get(), ph, meta)) {
-                    fprintf(stderr,
-                            "Engine: failed to derive native GGUF expert storage\n");
-                    return false;
-                }
+            if (cfg_.moe_ssd_cache_bytes != 0 && !meta.contains("moe_expert_storage") &&
+                meta.value("architecture", std::string()) == "hy-v4" &&
+                meta.value("quantization", std::string()) == "gguf-native-blocks" &&
+                !derive_native_gguf_expert_storage(package_file.get(), ph, meta)) {
+                fprintf(stderr, "Engine: failed to derive native GGUF expert storage\n");
+                return false;
+            }
+            if (cfg_.offload_ple && !std::any_of(
+                    package_weight_map_.begin(), package_weight_map_.end(),
+                    [](const auto& weight) {
+                        return weight.first.find("ple_embedding_ngram_embedding_weight") !=
+                               std::string::npos;
+                    })) {
+                std::fprintf(stderr, "Engine: --offload-ple requires a package with PLE weights\n");
+                return false;
+            }
+            if (cfg_.moe_ssd_cache_bytes != 0 ||
+                (cfg_.offload_ple && meta.contains("moe_expert_storage"))) {
                 auto storage_it = meta.find("moe_expert_storage");
                 if (storage_it == meta.end() || !storage_it->is_object() ||
                     !storage_it->contains("layers") ||
@@ -495,14 +546,17 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                 // bounded while preserving the user budget for Metal.
                 constexpr size_t kMetalCpuPrefillCacheBytes =
                     size_t{1024} * 1024 * 1024;
-                const size_t host_cache_bytes =
-                    cfg_.metal_ssd_full
-                        ? std::min(cfg_.moe_ssd_cache_bytes,
-                                   kMetalCpuPrefillCacheBytes)
-                        : cfg_.moe_ssd_cache_bytes;
+                // Resident loading computes its exact capacity after source
+                // registration, before admitting any I/O into this empty pool.
+                size_t host_cache_bytes = cfg_.moe_ssd_cache_bytes;
+                if (cfg_.offload_ple)
+                    host_cache_bytes = 1;
+                else if (cfg_.metal_ssd_full)
+                    host_cache_bytes = std::min(host_cache_bytes,
+                                                kMetalCpuPrefillCacheBytes);
                 if (!cache->open(path, host_cache_bytes,
                                  cfg_.moe_ssd_io_workers,
-                                 cfg_.moe_ssd_global_cache &&
+                                 !cfg_.offload_ple && cfg_.moe_ssd_global_cache &&
                                      cfg_.moe_ssd_cross_layer_prefetch,
                                  cfg_.lock_moe_ssd_cache))
                     return false;
@@ -636,6 +690,39 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                                 : 0;
                         spec.scales_bytes = scales_bytes;
                         spec.expert_stride = expert_stride;
+                        if (item.contains("input_scales")) {
+                            const auto& calibration = item["input_scales"];
+                            if (!calibration.is_object() || spec.precision != Precision::NVFP4 || num_experts <= 0)
+                                return false;
+                            const std::string ref = calibration.value("weight", std::string());
+                            const auto entry = package_weight_map_.find(ref);
+                            const uint32_t per_expert = std::strcmp(name, "gate_up") == 0 ? 2 : 1;
+                            const uint64_t expected_bytes = static_cast<uint64_t>(num_experts) * per_expert * sizeof(float);
+                            if (entry == package_weight_map_.end() ||
+                                calibration.value("scales_per_expert", 0u) != per_expert ||
+                                calibration.value("weight_offset", uint64_t{0}) != entry->second.first ||
+                                calibration.value("data_bytes", uint64_t{0}) != expected_bytes ||
+                                entry->second.first > ph.w_len || entry->second.second > ph.w_len - entry->second.first ||
+                                entry->second.second < sizeof(MappedFile::Header)) return false;
+                            MappedFile::Header input_header{};
+                            const uint64_t offset = ph.w_off + entry->second.first;
+                            if (!read_exact_at(package_file.get(), offset, &input_header,
+                                    sizeof(input_header), "NVFP4 activation header") ||
+                                input_header.magic != MappedFile::MAGIC || input_header.flags != 0 ||
+                                input_header.ndim != 2 || input_header.precision != static_cast<uint32_t>(Precision::FP32) ||
+                                input_header.shape[0] != static_cast<uint64_t>(num_experts) || input_header.shape[1] != per_expert ||
+                                input_header.data_size != expected_bytes || input_header.scales_size != 0 ||
+                                input_header.data_offset < sizeof(input_header) ||
+                                input_header.data_offset > entry->second.second ||
+                                expected_bytes > entry->second.second - input_header.data_offset ||
+                                calibration.value("data_offset", uint64_t{0}) != input_header.data_offset)
+                                return false;
+                            spec.input_scales_per_expert = per_expert;
+                            spec.input_scales.resize(static_cast<size_t>(num_experts) * per_expert);
+                            if (!read_exact_at(package_file.get(), offset + input_header.data_offset,
+                                    spec.input_scales.data(), static_cast<size_t>(expected_bytes),
+                                    "NVFP4 activation calibration")) return false;
+                        }
                         if (!cache->add_source(spec))
                             return false;
                         ++source_count;
@@ -647,42 +734,54 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                         "Engine: package has no MoE expert storage entries\n");
                     return false;
                 }
-                if (!cache->set_global_capacity_pool(cfg_.moe_ssd_global_cache))
-                    return false;
+                if (cfg_.offload_ple) {
+                    std::vector<std::pair<const MoeSsdTensorSource*,
+                                          const MoeSsdTensorSource*>> pairs;
+                    for (const auto& layer : (*storage_it)["layers"]) {
+                        pairs.emplace_back(
+                            cache->find_source(layer["gate_up"]["weight"].get<std::string>()),
+                            cache->find_source(layer["down"]["weight"].get<std::string>()));
+                    }
+                    if (!cache->load_resident(pairs))
+                        return false;
+                } else {
+                    if (!cache->set_global_capacity_pool(cfg_.moe_ssd_global_cache))
+                        return false;
 #if defined(__APPLE__)
-                // Validated for the native Hy4 CPU offload path at 4 and 8 GiB.
-                // Keep the fixed reuse reservation away from small caches;
-                // unsupported component alignment retains the existing policy.
-                if (cfg_.device == Device::CPU && cfg_.moe_ssd_global_cache &&
-                    host_cache_bytes >= size_t{4} * 1024 * 1024 * 1024 &&
-                    meta.value("architecture", std::string()) == "hy-v4" &&
-                    meta.value("quantization", std::string()) == "gguf-native-blocks" &&
-                    cache->set_read_alignment(4096) &&
-                    cache->set_buffer_reuse_capacity(size_t{64} * 1024 * 1024)) {
-                    // Keep spare CPU time for the predictor and SSD workers
-                    // at high compute concurrency; lower thread counts retain
-                    // the existing spin policy. load() resets this on reuse.
-                    if (cfg_.num_threads >= 16)
-                        thread_pool_.resize(cfg_.num_threads, 1024);
-                    std::fprintf(stderr,
-                                 "Engine: aligned expert reads; buffer reuse reserves %.1f MB "
-                                 "within the cache budget\n",
-                                 cache->stats().buffer_reserve_bytes / 1e6);
-                }
+                    // Validated for the native Hy4 CPU offload path at 4 and 8 GiB.
+                    // Keep the fixed reuse reservation away from small caches;
+                    // unsupported component alignment retains the existing policy.
+                    if (cfg_.device == Device::CPU && cfg_.moe_ssd_global_cache &&
+                        host_cache_bytes >= size_t{4} * 1024 * 1024 * 1024 &&
+                        meta.value("architecture", std::string()) == "hy-v4" &&
+                        meta.value("quantization", std::string()) == "gguf-native-blocks" &&
+                        cache->set_read_alignment(4096) &&
+                        cache->set_buffer_reuse_capacity(size_t{64} * 1024 * 1024)) {
+                        // Keep spare CPU time for the predictor and SSD workers
+                        // at high compute concurrency; lower thread counts retain
+                        // the existing spin policy. load() resets this on reuse.
+                        if (cfg_.num_threads >= 16)
+                            thread_pool_.resize(cfg_.num_threads, 1024);
+                        std::fprintf(stderr,
+                                     "Engine: aligned expert reads; buffer reuse reserves %.1f MB "
+                                     "within the cache budget\n",
+                                     cache->stats().buffer_reserve_bytes / 1e6);
+                    }
 #endif
-                if (!cache->configure_shallow_favoring(
-                        cfg_.moe_ssd_shallow_cache_layers)) {
-                    return false;
-                }
-                if (cfg_.moe_ssd_global_cache) {
-                    std::fprintf(stderr, "Engine: SSD cache uses a shared "
-                                         "global capacity pool\n");
-                }
-                if (cfg_.moe_ssd_shallow_cache_layers > 0) {
-                    std::fprintf(
-                        stderr,
-                        "Engine: SSD cache favors the first %d MoE layers\n",
-                        cfg_.moe_ssd_shallow_cache_layers);
+                    if (!cache->configure_shallow_favoring(
+                            cfg_.moe_ssd_shallow_cache_layers)) {
+                        return false;
+                    }
+                    if (cfg_.moe_ssd_global_cache) {
+                        std::fprintf(stderr, "Engine: SSD cache uses a shared "
+                                             "global capacity pool\n");
+                    }
+                    if (cfg_.moe_ssd_shallow_cache_layers > 0) {
+                        std::fprintf(
+                            stderr,
+                            "Engine: SSD cache favors the first %d MoE layers\n",
+                            cfg_.moe_ssd_shallow_cache_layers);
+                    }
                 }
                 moe_ssd_cache_ = std::move(cache);
             }
@@ -752,7 +851,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
         }
     }
 
-    if (cfg_.weight_loading == WeightLoadingMode::RESIDENT) {
+    if (cfg_.weight_loading == WeightLoadingMode::RESIDENT && !cfg_.offload_ple) {
 
         try {
             package_weights_storage_.resize(static_cast<size_t>(ph.w_len));
@@ -838,8 +937,8 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
 
     fprintf(stderr,
             "Engine: loaded package %s (%.1f MB, %zu weights, prefill_seq=%d, "
-            "weights=mmap)\n",
+            "weights=%s)\n",
             path.c_str(), file_size / 1e6, package_weight_map_.size(),
-            prefill_seq_len);
+            prefill_seq_len, cfg_.offload_ple ? "resident+PLE-offload" : "mmap");
     return true;
 }

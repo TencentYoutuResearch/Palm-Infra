@@ -98,6 +98,10 @@ struct Tensor {
     // offline-packed packages this aliases data; experimental online packing
     // may also attach a separate sidecar.
     const uint8_t* nvfp4_q8_pair_data = nullptr;
+    // Runtime-only resident layout; never serialized as package flags.
+    bool nvfp4_mma_layout = false;
+    bool nvfp4_gate_codes_kmajor = false;
+    bool nvfp4_gate_scales_kmajor = false;
     // Optional load-time Q8-dot sidecar for native FP8 weights. It keeps the
     // package bytes in FP8 while avoiding per-token FP8 decode on CPUs without
     // native FP8 arithmetic.

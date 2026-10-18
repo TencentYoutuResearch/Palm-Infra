@@ -12,6 +12,7 @@
 //   inputs[0] x          FP32, logical shape [groups, seq], row-major [seq,
 //   groups] inputs[1] weight     FP32, [kernel_size, groups] inputs[2] state
 //   FP32, [kernel_size - 1, groups], updated in place
+// Output: physical group-major [groups, seq], consumed by GDN as dim-major.
 //
 void kernel_shortconv(const ShortConvParams& params,
                       const std::vector<const Tensor*>& inputs, Tensor& output,

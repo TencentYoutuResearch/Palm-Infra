@@ -59,7 +59,9 @@ class OpType(IntEnum):
     ROTARY_EMBED   = 40
     SDPA           = 50
     SDPA_MLA       = 51
-    SDPA_MLA_ABSORB = 52
+    QSA_SDPA       = 52
+    QSA_INDEXER    = 53
+    SDPA_MLA_ABSORB = 54
     RESHAPE        = 60
     PERMUTE        = 61
     CONCAT         = 62
@@ -338,7 +340,8 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
         a = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, a[1], _CONST, _CONST)
 
-    if op in (OpType.SDPA, OpType.SDPA_MLA, OpType.SDPA_MLA_ABSORB):
+    if op in (OpType.SDPA, OpType.SDPA_MLA, OpType.SDPA_MLA_ABSORB,
+              OpType.QSA_SDPA, OpType.QSA_INDEXER):
         q = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, q[1], _CONST, _CONST)
 
@@ -710,7 +713,8 @@ class GraphBuilder:
              num_heads: int = 16, num_kv_heads: int = 16,
              head_dim: int = 192, v_head_dim: int = 128,
              sink: int | None = None,
-             selection: int | None = None
+             selection: int | None = None,
+             selected_indices: int | None = None
              ) -> tuple[int, int, int]:
         sq = self._nodes[q].out_shape
         out_shape = (v_head_dim, sq[1], num_heads)
@@ -732,11 +736,17 @@ class GraphBuilder:
         if selection is not None:
             selection_input = len(sdpa_inputs)
             sdpa_inputs.append(selection)
-        attn = self._add(OpType.SDPA, sdpa_inputs,
+        if selected_indices is not None:
+            if sink is not None or selection is not None:
+                raise ValueError("QSA selected_indices cannot be combined with Hy4 sink/selection")
+            sdpa_inputs.append(selected_indices)
+        sdpa_params = [kv_cache, 1 if causal else 0,
+                       num_heads, num_kv_heads, head_dim, v_head_dim]
+        if selected_indices is None:
+            sdpa_params += [sink_input, selection_input]
+        attn = self._add(OpType.QSA_SDPA if selected_indices is not None else OpType.SDPA, sdpa_inputs,
                          out_shape, prec=self._nodes[q].out_prec,
-                         i32=[kv_cache, 1 if causal else 0,
-                              num_heads, num_kv_heads, head_dim, v_head_dim,
-                              sink_input, selection_input],
+                         i32=sdpa_params,
                          f32=[scale])
         # cache outputs are views of the same cache buffers
         kc_out = self._add(OpType.RESHAPE, [k_cache],
@@ -778,6 +788,20 @@ class GraphBuilder:
             i32=[2, 1, num_heads, 1, qk_head_dim, v_head_dim,
                  sink_idx, selection_idx, kv_rank, rope_dim],
             f32=[1.0 / (qk_head_dim ** 0.5)])
+
+    def qsa_indexer(self, projection: int, q_norm: int, k_norm: int,
+                    frequency: int, raw_cache: int, pooled_cache: int,
+                    main_k_cache: int, mask: int, *, heads: int, dimension: int,
+                    rope_dim: int, ratio: int, budget: int, eps: float = 1e-6) -> int:
+        if (heads < 1 or dimension < rope_dim or rope_dim < 2 or rope_dim % 2
+                or ratio < 1 or budget < 1 or budget % ratio or budget + ratio - 1 > 4096):
+            raise ValueError("invalid QSA indexer geometry")
+        seq = self._nodes[projection].out_shape[1]
+        return self._add(OpType.QSA_INDEXER,
+                         [projection, q_norm, k_norm, frequency, raw_cache,
+                          pooled_cache, main_k_cache, mask],
+                         (budget + ratio - 1, seq), prec=Precision.INT32,
+                         i32=[heads, dimension, rope_dim, ratio, budget], f32=[eps])
 
     def sdpa_no_cache(self, q: int, k: int, v: int,
                       causal: bool = False, scale: float = 0.0,
@@ -1028,15 +1052,13 @@ class GraphBuilder:
 
         Replaces: split qkv, g/beta compute, GDN recurrence, RMSNormGated.
 
-        All four matmul-derived inputs (qkv_conv/a_out/b_out/z_out) MUST be in
-        their native [seq, dim] row-major data layout (the layout matmul writes
-        C in). The builder emits a `reshape` materialize on qkv_conv (shortconv
-        output, which is [groups, seq]) to bring it to [seq, qkv_total] so all
-        four inputs share the same convention. The kernel indexes ptr[t*dim+d]
-        directly and does NOT consult Tensor shape/stride.
+        QKV uses ShortConv's dim-major physical output ptr[d*seq+t].
+        The other three inputs (a_out/b_out/z_out) use the native token-major
+        projection layout ptr[t*dim+d]. No reshape or transpose is required.
+        The kernels index these physical layouts directly, not Tensor strides.
 
         Args:
-            qkv_conv:    shortconv output reshaped to [seq, qkv_total] data
+            qkv_conv:    shortconv output with [qkv_total, seq] physical data
                          (qkv_total = 3*num_heads*k_dim)
             a_out:       matmul x@w_a, data [seq, num_heads]
             b_out:       matmul x@w_b, data [seq, num_heads]
@@ -2143,6 +2165,25 @@ def _augment_moe_expert_storage(meta: dict,
                 else _read_weight_header(weight_paths[ref])
             )
             weight_offset, weight_size = weight_files[ref]
+            input_ref = spec.get("input_scales_weight")
+            if input_ref:
+                if input_ref not in weight_files or weight_headers is None or input_ref not in weight_headers:
+                    raise ValueError(f"missing NVFP4 activation calibration weight: {input_ref}")
+                input_header = weight_headers[input_ref]
+                expected_projections = 2 if key == "gate_up" else 1
+                input_bytes = layer_num_experts * expected_projections * 4
+                if (int(input_header["precision"]) != int(Precision.FP32) or
+                    list(input_header["shape"][:2]) != [layer_num_experts, expected_projections] or
+                    int(input_header["data_size"]) != input_bytes or
+                    int(input_header["scales_size"]) != 0 or int(input_header["flags"]) != 0):
+                    raise ValueError(f"invalid NVFP4 activation calibration weight: {input_ref}")
+                spec["input_scales"] = {
+                    "weight": input_ref,
+                    "weight_offset": int(weight_files[input_ref][0]),
+                    "data_offset": int(input_header["data_offset"]),
+                    "data_bytes": input_bytes,
+                    "scales_per_expert": expected_projections,
+                }
             rows_per_expert = int(spec["rows_per_expert"])
             expected_rows = layer_num_experts * rows_per_expert
             if int(header["shape"][0]) != expected_rows:
@@ -2384,8 +2425,10 @@ def save_package(output_path: str,
             f.write(pf_bytes)
             f.write(dc_bytes)
             f.write(vi_bytes)
-            f.write(mtp_bytes)
+            # MTP has no explicit offset: the loader locates it at
+            # w_off - mtp_len. Alignment padding must precede that graph.
             f.write(b'\0' * (w_off - weights_unaligned))
+            f.write(mtp_bytes)
             buf = bytearray(8 * 1024 * 1024)
             view = memoryview(buf)
             weights_written = 0

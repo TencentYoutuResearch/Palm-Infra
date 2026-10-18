@@ -167,6 +167,87 @@ def _int64_to_int32(chunk: bytes) -> bytes:
     return values.astype("<i4").tobytes()
 
 
+def fp8_block128_to_fp16_streamed_weight(index: SafeTensorIndex,
+                                         name: str) -> StreamedWeight:
+    """Decode E4M3FN with BF16/F32 weight_scale_inv, bounded to 128 rows.
+
+    This format occurs in Qwen3.8's MTP experts and differs from the E8M0
+    native dense format. Each range has fixed scale-row context, so repeated
+    writes and arbitrary aligned writer chunks are deterministic.
+    """
+    tensor = index.tensor(name)
+    if tensor.dtype != "F8_E4M3" or len(tensor.shape) != 2:
+        raise ValueError(f"expected a block-scaled FP8 matrix: {name}")
+    rows, columns = tensor.shape
+    if rows <= 0 or columns <= 0:
+        raise ValueError(f"empty FP8 matrix: {name}")
+    scale = index.tensor(name.rsplit(".", 1)[0] + ".weight_scale_inv")
+    expected = ((rows + 127) // 128, (columns + 127) // 128)
+    if scale.shape != expected or scale.dtype not in ("BF16", "F32"):
+        raise ValueError(f"invalid FP8 block scale for {name}: {scale.dtype} {scale.shape}")
+    with open(scale.source.path, "rb") as source:
+        source.seek(scale.source.offset)
+        raw = source.read(scale.source.size)
+    if len(raw) != scale.source.size:
+        raise ValueError(f"truncated FP8 block scale: {name}")
+    if scale.dtype == "BF16":
+        scales = (np.frombuffer(raw, dtype="<u2").astype(np.uint32) << 16).view(np.float32)
+    else:
+        scales = np.frombuffer(raw, dtype="<f4")
+    scales = scales.reshape(expected)
+    if not np.all(np.isfinite(scales)) or np.any(scales < 0):
+        raise ValueError(f"invalid FP8 block scale values: {name}")
+    codes = np.arange(256, dtype=np.uint16)
+    exponent, mantissa = (codes >> 3) & 15, codes & 7
+    table = np.where(exponent == 0, mantissa * 2.0 ** -9,
+                     (1 + mantissa / 8.0) * np.exp2(exponent.astype(np.int32) - 7))
+    table = (table * np.where(codes & 128, -1, 1)).astype(np.float32)
+    table[(codes & 127) == 127] = np.nan
+    ranges = []
+    for row in range(0, rows, 128):
+        row_count = min(128, rows - row)
+        factors = np.repeat(scales[row // 128], 128)[:columns].copy()
+        def transform(data, factors=factors):
+            values = table[np.frombuffer(data, dtype=np.uint8)].reshape(-1, columns)
+            values = values * factors[None, :]
+            if not np.all(np.isfinite(values)) or np.any(np.abs(values) > 65504):
+                raise ValueError(f"non-finite or FP16-overflow FP8 payload: {name}")
+            return values.astype("<f2").tobytes()
+        size = row_count * columns
+        ranges.append(WeightByteRange(tensor.source.path,
+            tensor.source.offset + row * columns, size, transform,
+            size * 2, columns))
+    return StreamedWeight(precision=Precision.FP16,
+                          logical_shape=tensor.shape, data_ranges=ranges)
+
+
+def aggregate_fp16_experts(index: SafeTensorIndex,
+                           expert_projection_names: Iterable[Iterable[str]]) -> StreamedWeight:
+    """Expert-major, row-concatenated FP16 baseline including FP8 sources."""
+    experts = [list(names) for names in expert_projection_names]
+    if not experts or not experts[0] or any(not names for names in experts):
+        raise ValueError("empty FP16 expert projections")
+    ranges, geometry = [], None
+    for names in experts:
+        rows, columns = 0, None
+        for name in names:
+            tensor = index.tensor(name)
+            weight = (fp8_block128_to_fp16_streamed_weight(index, name)
+                      if tensor.dtype == "F8_E4M3" else dense_streamed_weight(index, name))
+            if weight.precision != Precision.FP16 or len(weight.logical_shape) != 2:
+                raise ValueError(f"cannot aggregate source as FP16 expert: {name}")
+            n, k = weight.logical_shape
+            if columns is not None and columns != k:
+                raise ValueError("FP16 expert projection column mismatch")
+            columns, rows = k, rows + n
+            ranges.extend(weight.data_ranges)
+        if geometry is not None and geometry != (rows, columns):
+            raise ValueError("FP16 expert geometry mismatch")
+        geometry = (rows, columns)
+    return StreamedWeight(precision=Precision.FP16,
+        logical_shape=(len(experts) * geometry[0], geometry[1]), data_ranges=ranges)
+
+
 def dense_streamed_weight(index: SafeTensorIndex,
                           name: str) -> StreamedWeight:
     """Create a streamed dense weight, preserving native quantization."""
@@ -710,6 +791,42 @@ def _pair_pack_nvfp4(packed_k: int):
         ).tobytes()
 
     return transform
+
+
+def aggregate_nvfp4_input_scales(
+        index: SafeTensorIndex,
+        expert_projection_names: Iterable[Iterable[str]]) -> StreamedWeight:
+    """Preserve calibrated activation globals, expert-major/projection-minor.
+
+    Values are copied in checkpoint units without reciprocation or fusion.
+    Gate and up may have different globals despite sharing an activation.
+    This is separate metadata, not part of the expert weight-scale sidecar.
+    """
+    experts = [list(names) for names in expert_projection_names]
+    if not experts or not experts[0]:
+        raise ValueError("cannot aggregate empty NVFP4 input scales")
+    projections = len(experts[0])
+    ranges = []
+    for names in experts:
+        if len(names) != projections:
+            raise ValueError("inconsistent NVFP4 input-scale projection count")
+        for name in names:
+            if not name.endswith(".weight"):
+                raise ValueError(f"invalid NVFP4 projection name: {name}")
+            scale = index.tensor(name[:-len(".weight")] + ".input_scale")
+            if scale.dtype != "F32" or scale.shape not in ((), (1,)):
+                raise ValueError(f"invalid NVFP4 input scale: {scale.name}")
+            with open(scale.source.path, "rb") as source:
+                source.seek(scale.source.offset)
+                raw = source.read(4)
+            if len(raw) != 4:
+                raise ValueError(f"truncated NVFP4 input scale: {scale.name}")
+            value = struct.unpack("<f", raw)[0]
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"nonpositive/nonfinite NVFP4 input scale: {scale.name}")
+            ranges.append(scale.source)
+    return StreamedWeight(precision=Precision.FP32,
+        logical_shape=(len(experts), projections), data_ranges=ranges)
 
 
 def aggregate_nvfp4_experts(

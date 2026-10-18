@@ -1,8 +1,16 @@
 #include "backends/cuda/backend.h"
+#include "backends/cuda/prefill_batch_policy.h"
+#include "backends/cuda/device_runtime.h"
 #include "engine/engine.h"
 #include "graph/execute.h"
 #include "backends/cpu/backend.h"
 #include "core/quant_layouts.h"
+#include "core/bf16.h"
+#include "runtime/expert_provider.h"
+#include "kernels/cuda/moe.h"
+#include "kernels/cuda/matmul.h"
+#include "kernels/cpu/moe/moe_routing.h"
+#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <cmath>
@@ -13,12 +21,14 @@
 namespace {
 
 bool close_enough(const std::vector<float>& actual,
-                  const std::vector<float>& expected, float tolerance) {
+                  const std::vector<float>& expected, float tolerance,
+                  int line = __builtin_LINE()) {
     for (size_t i = 0; i < actual.size(); ++i) {
-        if (std::fabs(actual[i] - expected[i]) > tolerance) {
+        if (!std::isfinite(actual[i]) || !std::isfinite(expected[i]) ||
+            std::fabs(actual[i] - expected[i]) > tolerance) {
             std::fprintf(stderr,
-                         "CUDA mismatch at %zu: actual=%g expected=%g\n",
-                         i, actual[i], expected[i]);
+                         "CUDA mismatch at %zu (test line %d): actual=%g expected=%g\n",
+                         i, line, actual[i], expected[i]);
             return false;
         }
     }
@@ -27,17 +37,18 @@ bool close_enough(const std::vector<float>& actual,
 
 bool close_enough_relative(
     const std::vector<float>& actual, const std::vector<float>& expected,
-    float absolute_tolerance, float relative_tolerance) {
+    float absolute_tolerance, float relative_tolerance,
+    int line = __builtin_LINE()) {
     for (size_t index = 0; index < actual.size(); ++index) {
         const float difference = std::fabs(actual[index] - expected[index]);
         const float tolerance = absolute_tolerance +
             relative_tolerance * std::fabs(expected[index]);
-        if (difference > tolerance) {
+        if (!std::isfinite(actual[index]) || !std::isfinite(expected[index]) || difference > tolerance) {
             std::fprintf(
                 stderr,
-                "CUDA mismatch at %zu: actual=%g expected=%g "
+                "CUDA mismatch at %zu (test line %d): actual=%g expected=%g "
                 "tolerance=%g\n",
-                index, actual[index], expected[index], tolerance);
+                index, line, actual[index], expected[index], tolerance);
             return false;
         }
     }
@@ -187,6 +198,29 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
         return false;
 
     Tensor view_source = device_tensor(backend, 6, 2);
+    // Both scalar operand positions must remain native, including constants
+    // used for Qwen3.8 residual gates. Use exact values to isolate broadcasting.
+    Tensor scalar = device_tensor(backend, 1);
+    if (!upload(backend, scalar, {0.25f}) ||
+        !backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE))
+        return false;
+    for (OpType operation : {OpType::MUL, OpType::ADD}) {
+        for (bool scalar_left : {false, true}) {
+            GraphNode binary;
+            binary.op_type = operation;
+            backend.dispatch(binary, scalar_left
+                ? std::vector<const Tensor*>{&scalar, &lhs}
+                : std::vector<const Tensor*>{&lhs, &scalar}, &sum, nullptr);
+            std::vector<float> broadcast_expected(lhs_data.size());
+            for (size_t i = 0; i < lhs_data.size(); ++i)
+                broadcast_expected[i] = operation == OpType::MUL
+                    ? lhs_data[i] * 0.25f : lhs_data[i] + 0.25f;
+            if (backend.dispatch_failed() || !download(backend, sum, actual) ||
+                !close_enough(actual, broadcast_expected, 0.0f))
+                return false;
+        }
+    }
+    backend.set_operator_fallback_policy(OperatorFallbackPolicy::ALLOW_REFERENCE);
     std::vector<float> view_source_data(12);
     for (int i = 0; i < 12; ++i)
         view_source_data[i] = (i - 4) / 5.0f;
@@ -275,6 +309,40 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
         return false;
     if (backend.dispatch_failed() || !close_enough(actual, expected, 0.0f))
         return false;
+
+    // TILE must replicate a sliced, row-strided input on every axis without
+    // staging the view through CPU memory.
+    Tensor tiled = device_tensor(backend, 16, 6, 2, 2);
+    GraphNode tile_node;
+    tile_node.op_type = OpType::TILE;
+    tile_node.params.i32 = {2, 3, 2, 2};
+    backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+    backend.dispatch(tile_node, {&rope_input}, &tiled, nullptr);
+    backend.end_graph();
+    backend.set_operator_fallback_policy(OperatorFallbackPolicy::ALLOW_REFERENCE);
+    if (!download(backend, tiled, actual) || backend.dispatch_failed()) return false;
+    expected.resize(16 * 6 * 2 * 2);
+    for (size_t index = 0; index < expected.size(); ++index)
+        expected[index] = rope_storage_data[((index / 16) % 6 % 2) * 10 + (index % 16 % 8) + 1];
+    if (!close_enough(actual, expected, 0.0f)) return false;
+
+    // Growing boundary inputs must refresh contents without reallocating
+    // within the same geometric capacity bucket.
+    void* previous_boundary = nullptr;
+    const int boundary_sizes[] = {1, 1025, 1100, 2049, 2050, 16};
+    for (int step = 0; step < 6; ++step) {
+        const int count = boundary_sizes[step];
+        std::vector<float> values(count);
+        for (int i = 0; i < count; ++i) values[i] = static_cast<float>(i + step * 7);
+        Tensor boundary = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+            count, 1, 1, 1, values.data());
+        backend.upload_input(boundary, "growth-regression", values.data(), values.size() * sizeof(float));
+        if (backend.dispatch_failed() || !download(backend, boundary, actual) ||
+            !close_enough(actual, values, 0.0f)) return false;
+        if (!std::getenv("MOLLM_CUDA_DISABLE_GEOMETRIC_GROWTH") &&
+            (step == 2 || step >= 4) && boundary.device.buffer != previous_boundary) return false;
+        previous_boundary = boundary.device.buffer;
+    }
 
     constexpr int norm_width = 8;
     constexpr int norm_rows = 2;
@@ -918,15 +986,18 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
                            Precision cache_precision, int past_length,
                            int current_length = 1,
                            bool explicit_mask = false,
-                           int kv_heads = 1, int head_dim = 128) {
+                           int kv_heads = 1, int head_dim = 128,
+                           bool canonical_mask = false, int heads_per_kv = 2,
+                           int capacity_override = 0) {
     backend.clear_dispatch_error();
-    const int heads = 2 * kv_heads;
+    const int heads = heads_per_kv * kv_heads;
     // Exercise common Qwen head widths so decode and prefill specializations
     // can test their parallel reductions against the same reference.
     const int key_dim = head_dim;
     const int value_dim = head_dim;
     const int key_length = past_length + current_length;
-    const int capacity = key_length + 1;
+    const int capacity = capacity_override ? capacity_override : key_length + 1;
+    if(capacity<key_length)return false;
 
     Tensor query = device_tensor(backend, key_dim, current_length, heads);
     Tensor key = device_tensor(backend, key_dim, current_length, kv_heads);
@@ -962,6 +1033,7 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
             for (int position = 0; position < key_length; ++position) {
                 mask_data[static_cast<size_t>(query_position) * key_length +
                           position] =
+                    canonical_mask ? (position>past_length+query_position?-1e38f:0.f) :
                     position > past_length + query_position
                         ? -INFINITY
                         : ((query_position * 3 + position) % 5 - 2) / 100.0f;
@@ -1336,7 +1408,799 @@ bool test_shortconv(CudaBackend& backend) {
         close_enough(actual_state, expected_state, 1e-6f);
 }
 
-bool test_gdn(CudaBackend& backend) {
+bool test_nvfp4_moe_provider() {
+    int pageable = 0, host_tables = 0;
+    cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0);
+    cudaDeviceGetAttribute(&host_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, 0);
+    if (!pageable || !host_tables) return true;
+    struct Provider final : ExpertProvider {
+        ExpertSource gate_source, down_source;
+        std::vector<uint8_t> gate_bytes[2], down_bytes[2], gs, ds;
+        std::vector<float> row_scales;
+        int pins = 0, borrows = 0;
+        bool miss_nonblocking = false;
+        bool resident_capability = false;
+        Provider() : gs(64, 56), ds(32, 56), row_scales(32, 1.f / 32) {
+            gate_source.provider = down_source.provider = this;
+            for (int e = 0; e < 2; ++e) {
+                gate_bytes[e].assign(512, (e + 1) * 0x11);
+                down_bytes[e].assign(256, (e + 1) * 0x11);
+            }
+        }
+        bool borrow(const ExpertSource*, const ExpertSource*, int expert,
+                    ExpertLease& lease, bool wait) override {
+            lease.reset();
+            if (expert < 0 || expert >= 2) return false;
+            if (!wait && miss_nonblocking && expert == 1) return false;
+            Tensor gate = Tensor::create(Precision::NVFP4, MemoryType::EXTERNAL,
+                32, 32, 1, 1, gate_bytes[expert].data());
+            Tensor down = Tensor::create(Precision::NVFP4, MemoryType::EXTERNAL,
+                32, 16, 1, 1, down_bytes[expert].data());
+            gate.nvfp4_scales = gs.data(); down.nvfp4_scales = ds.data();
+            gate.nvfp4_row_scales = down.nvfp4_row_scales = row_scales.data();
+            gate.group_size = down.group_size = 16;
+            gate.groups_per_row = 2; down.groups_per_row = 1;
+            ++pins; ++borrows;
+            lease = ExpertLease(*this, this, gate, down);
+            return true;
+        }
+        bool request_many(const ExpertSource*, const ExpertSource*, const std::vector<int>&) override { return true; }
+        bool borrow_resident_layer(const ExpertSource* gate, const ExpertSource* down,
+                                   std::vector<ExpertLease>& leases) override {
+            leases.clear();
+            if (!resident_capability) return false;
+            leases.resize(2);
+            return borrow(gate, down, 0, leases[0], false) && borrow(gate, down, 1, leases[1], false);
+        }
+        bool retain_for_next_forward(const ExpertSource*, const ExpertSource*, const std::vector<int>&, bool) override { return true; }
+        size_t resident_count(const ExpertSource*, const ExpertSource*, const std::vector<int>&) const override { return 2; }
+        bool contains(const ExpertSource*, const ExpertSource*, int) const override { return true; }
+        bool is_ready(const ExpertSource*, const ExpertSource*, int) const override { return true; }
+        bool evict(const ExpertSource*, const ExpertSource*, int) override { return false; }
+        void release_lease(void*) noexcept override { --pins; }
+    } provider;
+    CudaBackend backend;
+    backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+    std::vector<float> router_data(64, 0), shared_g(512, 1.f/32), shared_u(512, 1.f/16);
+    std::vector<float> shared_d(512, 1.f/32), shared_scale(32, 0);
+    auto weight = [&](std::vector<float>& data, int n, int k) {
+        Tensor t = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, n, k, 1, 1, data.data());
+        backend.wrap_weight(t);
+        return t;
+    };
+    Tensor router = weight(router_data, 2, 32), sg = weight(shared_g, 16, 32);
+    Tensor su = weight(shared_u, 16, 32), sd = weight(shared_d, 32, 16);
+    Tensor scale = weight(shared_scale, 1, 32);
+    Tensor gate = Tensor::create(Precision::NVFP4, MemoryType::EXTERNAL, 32, 32, 2);
+    Tensor down = Tensor::create(Precision::NVFP4, MemoryType::EXTERNAL, 32, 16, 2);
+    gate.moe_ssd_source = &provider.gate_source;
+    down.moe_ssd_source = &provider.down_source;
+    for (int rows : {1, 3}) {
+        std::vector<float> input(rows * 32), expected(rows * 32), actual;
+        for (int row = 0; row < rows; ++row)
+            std::fill(input.begin() + row * 32, input.begin() + (row + 1) * 32, (row + 1) * .25f);
+        Tensor host_x = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, rows, 1, 1, input.data());
+        Tensor host_y = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, rows, 1, 1, expected.data());
+        GraphNode node;
+        node.op_type = OpType::MOE;
+        node.params.i32 = {32, 2, 2, 16, 16, 0, 1, 1, 1, 1, 1};
+        CPUBackend cpu;
+        cpu.dispatch(node, {&host_x, &router, &gate, &down, &sg, &su, &sd, &scale}, &host_y, nullptr);
+        Tensor x = device_tensor(backend, 32, rows), y = device_tensor(backend, 32, rows);
+        if (!upload(backend, x, input)) return false;
+        const int before = provider.borrows;
+        backend.dispatch(node, {&x, &router, &gate, &down, &sg, &su, &sd, &scale}, &y, nullptr);
+        if (cpu.dispatch_failed() || backend.dispatch_failed() || provider.pins != 0 ||
+            provider.borrows - before != rows * 2 || !download(backend, y, actual) ||
+            !close_enough(actual, expected, 1e-6f)) return false;
+        // A partial nonblocking acquisition must release its pins before
+        // entering the CPU bridge; reference execution may then wait for I/O.
+        provider.miss_nonblocking = true;
+        backend.set_operator_fallback_policy(OperatorFallbackPolicy::ALLOW_REFERENCE);
+        backend.dispatch(node, {&x, &router, &gate, &down, &sg, &su, &sd, &scale}, &y, nullptr);
+        if (backend.dispatch_failed() || provider.pins != 0 ||
+            !download(backend, y, actual) ||
+            !close_enough(actual, expected, 1e-6f)) return false;
+        provider.miss_nonblocking = false;
+        backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+    }
+    provider.resident_capability = true;
+    {
+        CudaBackend resident_backend;
+        resident_backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+        for (Tensor* t : {&router, &sg, &su, &sd, &scale}) resident_backend.wrap_weight(*t);
+        constexpr int resident_rows[] = {1, 2, 3, 4, 5, 7, 8};
+        for (int pass = 0; pass < 21; ++pass) {
+            const int rows = resident_rows[pass % 7];
+            std::vector<float> input(rows * 32, .25f + pass / 32.f), expected(rows * 32), actual;
+            Tensor host_x = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, rows, 1, 1, input.data());
+            Tensor host_y = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, rows, 1, 1, expected.data());
+            GraphNode node;
+            node.op_type = OpType::MOE;
+            node.params.i32 = {32, 2, 2, 16, 16, pass / 7, 1, 1, 1, 1, 1};
+            CPUBackend cpu;
+            cpu.dispatch(node, {&host_x, &router, &gate, &down, &sg, &su, &sd, &scale}, &host_y, nullptr);
+            Tensor x = device_tensor(resident_backend, 32, rows), y = device_tensor(resident_backend, 32, rows);
+            if (!upload(resident_backend, x, input)) return false;
+            const int before = provider.borrows;
+            resident_backend.dispatch(node, {&x, &router, &gate, &down, &sg, &su, &sd, &scale}, &y, nullptr);
+            if (cpu.dispatch_failed() || resident_backend.dispatch_failed() || provider.pins != 2 ||
+                provider.borrows - before != (pass == 0 ? 2 : 0) ||
+                !download(resident_backend, y, actual) || !close_enough(actual, expected, 1e-6f)) return false;
+        }
+    }
+    if (provider.pins != 0) return false;
+    {
+        // Q4 router/shared weights make decode eligible for graph replay.
+        // Reuse pointers, grow scratch with prefill, then change routing
+        // parameters: every cached graph must bind the current invocation.
+        const char* previous_limit = std::getenv("MOLLM_CUDA_OUTPUT_POOL_MB");
+        struct RestoreGraphPoolLimit {
+            bool had; std::string value;
+            ~RestoreGraphPoolLimit() {
+                if (had) setenv("MOLLM_CUDA_OUTPUT_POOL_MB", value.c_str(), 1);
+                else unsetenv("MOLLM_CUDA_OUTPUT_POOL_MB");
+            }
+        } restore_limit{previous_limit != nullptr, previous_limit ? previous_limit : ""};
+        setenv("MOLLM_CUDA_OUTPUT_POOL_MB", "1", 1);
+        CudaBackend graph_backend;
+        graph_backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+        std::vector<Q4B8G32Block> rb(1), gb(4), ub(4), db(4), sb(1);
+        const auto q4_weight = [&](std::vector<Q4B8G32Block>& blocks, int n, float s) {
+            for (auto& b : blocks) for (int row = 0; row < 8; ++row) {
+                b.scales[row] = s;
+                std::fill(std::begin(b.q[row]), std::end(b.q[row]), uint8_t{0x11});
+            }
+            Tensor t = Tensor::create(Precision::INT4, MemoryType::EXTERNAL, n, 32, 1, 1, blocks.data());
+            t.is_q4_g32_packed = true; t.q4_g32_data = blocks.data();
+            t.group_size = 32; t.groups_per_row = 1;
+            graph_backend.wrap_weight_int4(t);
+            return t;
+        };
+        Tensor qr = q4_weight(rb, 2, 0), qg = q4_weight(gb, 32, 1.f/32);
+        Tensor qu = q4_weight(ub, 32, 1.f/16), qd = q4_weight(db, 32, 1.f/32), qs = q4_weight(sb, 1, 0);
+        std::vector<float> hg(1024, 1.f/32), hu(1024, 1.f/16), hd(1024, 1.f/32);
+        Tensor fg = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, 32, 1, 1, hg.data());
+        Tensor fu = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, 32, 1, 1, hu.data());
+        Tensor fd = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, 32, 1, 1, hd.data());
+        Tensor x1 = device_tensor(graph_backend, 32), y1 = device_tensor(graph_backend, 32);
+        Tensor x3 = device_tensor(graph_backend, 32, 3), y3 = device_tensor(graph_backend, 32, 3);
+        for (int pass = 0; pass < 6; ++pass) {
+            const int rows = pass == 2 ? 3 : 1;
+            std::vector<float> input(rows * 32, .25f + pass / 32.f), expected(rows * 32), actual;
+            Tensor hx = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, rows, 1, 1, input.data());
+            Tensor hy = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, rows, 1, 1, expected.data());
+            GraphNode node; node.op_type = OpType::MOE;
+            node.params.i32 = {32, 2, 2, 16, 32, pass >= 4 ? 1 : 0, 1, 1, 1, 1, 1};
+            CPUBackend cpu;
+            cpu.dispatch(node, {&hx, &router, &gate, &down, &fg, &fu, &fd, &scale}, &hy, nullptr);
+            Tensor& x = rows == 1 ? x1 : x3;
+            Tensor& y = rows == 1 ? y1 : y3;
+            if (!upload(graph_backend, x, input)) return false;
+            graph_backend.dispatch(node, {&x, &qr, &gate, &down, &qg, &qu, &qd, &qs}, &y, nullptr);
+            if (cpu.dispatch_failed() || graph_backend.dispatch_failed() || provider.pins != 2 ||
+                !download(graph_backend, y, actual) || !close_enough(actual, expected, 1e-6f)) return false;
+        }
+        // Exercise segment capture/replay, external BF16 rounding, a late
+        // parameter mismatch after a skipped prefix, and scratch growth from
+        // interleaved prefill. A zero-real-token PLE lookup is a valid CPU
+        // boundary without allocating a model-sized embedding table.
+        if(std::getenv("MOLLM_CUDA_MOE_PREFILL_INPUT_HALF_REUSE")) {
+            setenv("MOLLM_CUDA_OUTPUT_POOL_MB","8",1);
+            CudaBackend scoped_backend;
+            setenv("MOLLM_CUDA_OUTPUT_POOL_MB","1",1);
+            scoped_backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+            Tensor sr=qr,sgate=qg,sup=qu,sdown=qd,sscale=qs;
+            for(Tensor* t:{&sr,&sgate,&sup,&sdown,&sscale})scoped_backend.wrap_weight_int4(*t);
+            // One scoped shadow must follow changed shapes/values, and must
+            // not survive into the small-row/decode fallback. This is only a
+            // tiny two-expert native fixture, not a model-sized graph window.
+            for(int rows:{15,16,17,65,1024,2048,2049,17,1}) {
+                Tensor tx=device_tensor(scoped_backend,32,rows),ty=device_tensor(scoped_backend,32,rows);
+                for(int variant=0;variant<3;++variant) {
+                    std::vector<float> input(rows*32,.25f+variant/32.f),expected(rows*32),actual;
+                    Tensor hx=Tensor::create(Precision::FP32,MemoryType::EXTERNAL,32,rows,1,1,input.data());
+                    Tensor hy=Tensor::create(Precision::FP32,MemoryType::EXTERNAL,32,rows,1,1,expected.data());
+                    GraphNode node;node.op_type=OpType::MOE;
+                    node.params.i32={32,2,2,16,32,variant%2,1,1,1,1,1};
+                    CPUBackend cpu;
+                    cpu.dispatch(node,{&hx,&router,&gate,&down,&fg,&fu,&fd,&scale},&hy,nullptr);
+                    if(!upload(scoped_backend,tx,input))return false;
+                    scoped_backend.dispatch(node,{&tx,&sr,&gate,&down,&sgate,&sup,&sdown,&sscale},&ty,nullptr);
+                    if(cpu.dispatch_failed()||scoped_backend.dispatch_failed()||
+                       !download(scoped_backend,ty,actual)||!close_enough(actual,expected,1e-6f))return false;
+                }
+                scoped_backend.free_output(tx,nullptr);scoped_backend.free_output(ty,nullptr);
+            }
+        }
+        Tensor tiled = device_tensor(graph_backend, 32), activated = device_tensor(graph_backend, 32);
+        Tensor ple_output = device_tensor(graph_backend, 32);
+        int32_t token = 0, history_data[2] = {}, vocabulary = 2, offset = 0;
+        uint8_t table_data[32] = {};
+        float table_scale = 1;
+        Tensor ids = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 1, 1, 1, 1, &token);
+        Tensor history = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 2, 1, 1, 1, history_data);
+        Tensor table = Tensor::create(Precision::RAW_U8, MemoryType::EXTERNAL, 32, 1, 1, 1, table_data);
+        Tensor table_scales = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1, &table_scale);
+        Tensor vocabularies = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 1, 1, 1, 1, &vocabulary);
+        Tensor offsets = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 1, 1, 1, 1, &offset);
+        GraphNode tile, lookup, sigmoid, segment_moe;
+        tile.op_type = OpType::TILE; tile.params.i32 = {1, 1, 1, 1};
+        lookup.op_type = OpType::PLE_LOOKUP; lookup.params.i32 = {2, 1, 0, 2, 0, 1234, 0, 0};
+        sigmoid.op_type = OpType::SIGMOID;
+        segment_moe.op_type = OpType::MOE;
+        for (int pass = 0; pass < 12; ++pass) {
+            if (pass == 9) {
+                // Force automatic limit-triggered reclamation while resident
+                // and segment caches from the preceding passes exist.
+                Tensor cached = device_tensor(graph_backend, 768 * 1024 / sizeof(float));
+                if (!cached.data) return false;
+                graph_backend.free_output(cached, nullptr);
+                Tensor larger = device_tensor(graph_backend, 896 * 1024 / sizeof(float));
+                if (!larger.data || graph_backend.dispatch_failed()) return false;
+                graph_backend.free_output(larger, nullptr);
+                Tensor large_x = device_tensor(graph_backend, 32, 33), large_y = device_tensor(graph_backend, 32, 33);
+                std::vector<float> values(32 * 33, .25f);
+                if (!upload(graph_backend, large_x, values)) return false;
+                GraphNode prefill; prefill.op_type = OpType::MOE;
+                prefill.params.i32 = {32, 2, 2, 16, 32, 1, 1, 1, 1, 1, 1};
+                graph_backend.begin_graph();
+                graph_backend.dispatch(prefill, {&large_x, &qr, &gate, &down, &qg, &qu, &qd, &qs}, &large_y, nullptr);
+                graph_backend.end_graph();
+                if (graph_backend.dispatch_failed()) return false;
+            }
+            std::vector<float> input(32, .25f + pass / 32.f), transformed(32), expected(32), actual;
+            for (int i = 0; i < 32; ++i) transformed[i] = 1.f / (1.f + std::exp(-input[i]));
+            Tensor hx = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, 1, 1, 1, transformed.data());
+            Tensor hy = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 32, 1, 1, 1, expected.data());
+            segment_moe.params.i32 = {32, 2, 2, 16, 32, pass >= 3 ? 1 : 0, 1, 1, 1, 1, 1};
+            segment_moe.params.f32 = {pass >= 5 ? .75f : 1.f};
+            CPUBackend cpu;
+            cpu.dispatch(segment_moe, {&hx, &router, &gate, &down, &fg, &fu, &fd, &scale}, &hy, nullptr);
+            for (float& value : expected) value = mollm_round_to_bf16(value);
+            if (!upload(graph_backend, x1, input)) return false;
+            graph_backend.begin_graph();
+            graph_backend.dispatch(tile, {&x1}, &tiled, nullptr);
+            graph_backend.set_operator_fallback_policy(OperatorFallbackPolicy::ALLOW_REFERENCE);
+            graph_backend.dispatch(lookup, {&ids, &history, &table, &table_scales, &vocabularies, &offsets}, &ple_output, nullptr);
+            graph_backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+            graph_backend.dispatch(sigmoid, {&tiled}, &activated, nullptr);
+            graph_backend.dispatch(segment_moe, {&activated, &qr, &gate, &down, &qg, &qu, &qd, &qs}, &y1, nullptr);
+            if (!graph_backend.round_to_bf16(y1)) return false;
+            graph_backend.end_graph();
+            if (cpu.dispatch_failed() || graph_backend.dispatch_failed() ||
+                !download(graph_backend, y1, actual) || !close_enough(actual, expected, 0.f)) return false;
+            if (pass == 7) {
+                // Both resident MoE and (when enabled) segment graph caches
+                // already exist. Preserve all live operands and invalidate
+                // cached executables before releasing this returned block.
+                Tensor cached = device_tensor(graph_backend, 2048);
+                if (!cached.data) return false;
+                graph_backend.free_output(cached, nullptr);
+                size_t reclaimed = 0, invalidated = 0;
+                if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return false;
+                const bool rejected = !graph_backend.trim_cached_outputs(&reclaimed, &invalidated) &&
+                    reclaimed == 0 && invalidated == 0;
+                cudaGraph_t capture = nullptr;
+                const cudaError_t ended = cudaStreamEndCapture(cudaStreamPerThread, &capture);
+                if (capture) cudaGraphDestroy(capture);
+                if (!rejected || ended != cudaSuccess) return false;
+                if (!graph_backend.trim_cached_outputs(&reclaimed, &invalidated) || reclaimed < 8192) return false;
+                std::vector<float> survived;
+                if (!download(graph_backend, y1, survived) || survived.size() != actual.size() ||
+                    std::memcmp(survived.data(), actual.data(), actual.size() * sizeof(float))) return false;
+                std::printf("cuda_backend_output_trim reclaimed=%zu invalidated_graphs=%zu live_output_exact=1 capture_rejected=1\n",
+                    reclaimed, invalidated);
+                // Later changed-input passes must rebuild caches and still
+                // match the complete CPU output, including BF16 rounding.
+            }
+        }
+    }
+    if (provider.pins != 0) return false;
+    return true;
+}
+
+bool test_ple_device_ops(CudaBackend& backend) {
+    backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+    for (int hidden : {7, 2560}) for (int rows : {1, 5}) {
+        constexpr int streams = 4;
+        const int wide = hidden * streams;
+        std::vector<float> q(wide * rows), k(wide * rows), v(hidden * rows), expected(wide * rows), actual;
+        for (size_t i = 0; i < q.size(); ++i) {
+            q[i] = (static_cast<int>(i % 43) - 21) / 16.f;
+            k[i] = (static_cast<int>((i * 17) % 59) - 29) / 32.f;
+        }
+        for (size_t i = 0; i < v.size(); ++i) v[i] = (static_cast<int>(i % 23) - 11) / 32.f;
+        Tensor hq = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, wide, rows, 1, 1, q.data());
+        Tensor hk = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, wide, rows, 1, 1, k.data());
+        Tensor hv = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, hidden, rows, 1, 1, v.data());
+        Tensor hy = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, wide, rows, 1, 1, expected.data());
+        GraphNode node; node.op_type = OpType::PLE_GATE; node.params.i32 = {hidden, streams};
+        CPUBackend cpu; cpu.dispatch(node, {&hq, &hk, &hv}, &hy, nullptr);
+        Tensor dq = device_tensor(backend, wide, rows), dk = device_tensor(backend, wide, rows);
+        Tensor dv = device_tensor(backend, hidden, rows), dy = device_tensor(backend, wide, rows);
+        if (!upload(backend, dq, q) || !upload(backend, dk, k) || !upload(backend, dv, v)) return false;
+        backend.dispatch(node, {&dq, &dk, &dv}, &dy, nullptr);
+        if (cpu.dispatch_failed() || backend.dispatch_failed() || !download(backend, dy, actual) ||
+            !close_enough(actual, expected, 3e-6f)) return false;
+    }
+    for (int channels : {7, 10240}) for (int kernel : {2, 4}) for (int dilation : {1, 3}) {
+        const int history_len = (kernel - 1) * dilation;
+        std::vector<float> w(channels * kernel), history(channels * history_len), actual, actual_history;
+        for (size_t i = 0; i < w.size(); ++i) w[i] = (static_cast<int>(i % 17) - 8) / 32.f;
+        for (size_t i = 0; i < history.size(); ++i) history[i] = (static_cast<int>(i % 13) - 6) / 16.f;
+        Tensor hw = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, channels, kernel, 1, 1, w.data());
+        Tensor hs = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, channels, history_len, 1, 1, history.data());
+        Tensor dw = device_tensor(backend, channels, kernel), ds = device_tensor(backend, channels, history_len);
+        if (!upload(backend, dw, w) || !upload(backend, ds, history)) return false;
+        // Keep state across padded prefill, decode, and zero-token forwards.
+        for (int rows : {17, 1, 3}) for (int real : {0, 1, rows - 1, -1, rows + 3}) {
+            std::vector<float> x(channels * rows), expected(channels * rows);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = (static_cast<int>((i * 7 + rows) % 31) - 15) / 32.f;
+            Tensor hx = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, channels, rows, 1, 1, x.data());
+            Tensor hy = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, channels, rows, 1, 1, expected.data());
+            GraphNode node; node.op_type = OpType::PLE_DILATED_CONV; node.params.i32 = {kernel, dilation, real};
+            const char* prefix_flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
+            const bool prefix_test=prefix_flag && !std::strcmp(prefix_flag,"1") && rows==3 && real==-1;
+            const auto initial_history=history;
+            if(prefix_test && !backend.begin_state_prefixes({&ds},rows))return false;
+            CPUBackend cpu; cpu.dispatch(node, {&hx, &hw, &hs}, &hy, nullptr);
+            Tensor dx = device_tensor(backend, channels, rows), dy = device_tensor(backend, channels, rows);
+            if (!upload(backend, dx, x)) return false;
+            backend.dispatch(node, {&dx, &dw, &ds}, &dy, nullptr);
+            if (cpu.dispatch_failed() || backend.dispatch_failed() || !download(backend, dy, actual) ||
+                !download(backend, ds, actual_history) || !close_enough(actual, expected, 1e-6f) ||
+                !close_enough(actual_history, history, 0.f)) return false;
+            if(prefix_test) {
+                for(int kept=1;kept<=rows;++kept) {
+                    if(!backend.restore_state_prefix(kept)||!download(backend,ds,actual_history))return false;
+                    for(int channel=0;channel<channels;++channel)for(int j=0;j<history_len;++j) {
+                        const int source=j+kept;
+                        const float value=source<history_len?initial_history[size_t(channel)*history_len+source]
+                            :x[size_t(source-history_len)*channels+channel];
+                        if(actual_history[size_t(channel)*history_len+j]!=value)return false;
+                    }
+                }
+                backend.end_state_prefixes();
+            }
+        }
+    }
+    return true;
+}
+
+bool test_resident_routes(CudaBackend& backend) {
+    using mollm_cuda::Nvfp4Projection;
+    const bool local16_probe=std::getenv("MOLLM_ROUTE_LOCAL16_PROBE")!=nullptr;
+    for (int experts : {1, 7, 31, 32, 33, 511, 512, 513, 1023, 1024}) {
+        for (int top_k : {1, std::min(10, experts), std::min(32, experts)}) {
+          for(int rows : local16_probe?std::vector<int>{1,3}:std::vector<int>{3}) {
+            constexpr int hidden = 32, inter = 16;
+            const int routes = rows * top_k;
+            std::vector<uint8_t> identities(2 * experts);
+            std::vector<Nvfp4Projection> tables(2 * experts), jobs(2 * routes);
+            for (int i = 0; i < 2 * experts; ++i)
+                tables[i] = {&identities[i], &identities[i], nullptr, nullptr, nullptr, i % 2 != 0};
+            Tensor dt = device_tensor(backend, 2 * experts * sizeof(Nvfp4Projection) / sizeof(float));
+            Tensor dj = device_tensor(backend, 2 * routes * sizeof(Nvfp4Projection) / sizeof(float));
+            Tensor logits = device_tensor(backend, experts, rows);
+            Tensor weights = device_tensor(backend, top_k, rows);
+            Tensor input = device_tensor(backend, hidden, rows);
+            Tensor gate = device_tensor(backend, 2 * inter, routes);
+            Tensor activated = device_tensor(backend, inter, routes);
+            Tensor down = device_tensor(backend, hidden, routes);
+            std::vector<float> data(rows * experts), actual;
+            for (int row = 0; row < rows; ++row)
+                for (int i = 0; i < experts; ++i)
+                    data[row * experts + i] = row == 0 && rows!=1 ? 0.f :
+                        (static_cast<int>((i * 37 + row * 11) % 97) - 48) / 8.f;
+            if (!upload(backend, logits, data) ||
+                cudaMemcpy(dt.device.buffer, tables.data(), dt.nbytes(), cudaMemcpyHostToDevice) != cudaSuccess)
+                return false;
+            for (int score_func : {0, 1, 2}) for (bool normalize : {false, true})
+            for (int cache_mode : local16_probe?std::vector<int>{-1,0,1,2}:std::vector<int>{0,1}) {
+                mollm::detail::MoeRoutingParams params;
+                params.num_experts = experts; params.top_k = top_k;
+                params.score_func = score_func; params.normalize_topk = normalize;
+                params.scaling_factor = 1.25f;
+                std::vector<int> ids;
+                std::vector<float> expected;
+                if (!mollm::detail::select_moe_routes(data.data(), rows, nullptr, params, ids, expected)) return false;
+                for (int row = 0; row < rows; ++row)
+                    for (int k = 1; k < top_k; ++k)
+                        for (int j = k; j > 0 && ids[row * top_k + j] < ids[row * top_k + j - 1]; --j) {
+                            std::swap(ids[row * top_k + j], ids[row * top_k + j - 1]);
+                            std::swap(expected[row * top_k + j], expected[row * top_k + j - 1]);
+                        }
+                auto* gate_jobs = static_cast<Nvfp4Projection*>(dj.device.buffer);
+                mollm_cuda::launch_moe_resident_routes(static_cast<const float*>(logits.device.buffer),
+                    rows, experts, top_k, score_func, normalize, params.scaling_factor,
+                    static_cast<const Nvfp4Projection*>(dt.device.buffer),
+                    static_cast<const float*>(input.device.buffer), static_cast<float*>(gate.device.buffer),
+                    static_cast<float*>(activated.device.buffer), static_cast<float*>(down.device.buffer),
+                    hidden, inter, gate_jobs, gate_jobs + routes, static_cast<float*>(weights.device.buffer),nullptr,cache_mode);
+                if (!download(backend, weights, actual) || !close_enough_relative(actual, expected, 1e-6f, 1e-6f) ||
+                    cudaMemcpy(jobs.data(), dj.device.buffer, dj.nbytes(), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+                for (int i = 0; i < routes; ++i) {
+                    if (jobs[i].weight != tables[ids[i]].weight || jobs[i].pair_layout != tables[ids[i]].pair_layout ||
+                        jobs[i + routes].weight != tables[experts + ids[i]].weight ||
+                        jobs[i].input != static_cast<float*>(input.device.buffer) + (i / top_k) * hidden ||
+                        jobs[i].output != static_cast<float*>(gate.device.buffer) + i * 2 * inter ||
+                        jobs[i + routes].input != static_cast<float*>(activated.device.buffer) + i * inter ||
+                        jobs[i + routes].output != static_cast<float*>(down.device.buffer) + i * hidden) return false;
+                }
+                if(local16_probe && (cache_mode==2 || cache_mode==-1)) {
+                    cudaStream_t replay_stream;
+                    if(cudaStreamCreateWithFlags(&replay_stream,cudaStreamNonBlocking)!=cudaSuccess)return false;
+                    auto launch=[&](int mode) {
+                        mollm_cuda::launch_moe_resident_routes(static_cast<const float*>(logits.device.buffer),
+                            rows,experts,top_k,score_func,normalize,params.scaling_factor,
+                            static_cast<const Nvfp4Projection*>(dt.device.buffer),static_cast<const float*>(input.device.buffer),
+                            static_cast<float*>(gate.device.buffer),static_cast<float*>(activated.device.buffer),
+                            static_cast<float*>(down.device.buffer),hidden,inter,gate_jobs,gate_jobs+routes,
+                            static_cast<float*>(weights.device.buffer),replay_stream,mode);
+                    };
+                    cudaGraph_t graph;cudaGraphExec_t executable;
+                    if(cudaStreamBeginCapture(replay_stream,cudaStreamCaptureModeThreadLocal)!=cudaSuccess)return false;
+                    launch(cache_mode);
+                    if(cudaStreamEndCapture(replay_stream,&graph)!=cudaSuccess ||
+                        cudaGraphInstantiateWithFlags(&executable,graph,0)!=cudaSuccess)return false;
+                    std::vector<Nvfp4Projection> reference_jobs(2*routes),replayed_jobs(2*routes);
+                    std::vector<float> changed(data.size()),reference_weights(routes),replayed_weights(routes);
+                    for(int replay=0;replay<6;++replay) {
+                        for(size_t i=0;i<changed.size();++i) {
+                            if(replay==0)changed[i]=(int((i*19+7)%61)-30)*.125f;
+                            else if(replay==1)changed[i]=.25f;
+                            else if(replay==2)changed[i]=i%2?-0.f:0.f;
+                            else if(replay==3)changed[i]=i%2?-1e20f:1e20f;
+                            else if(replay==4)changed[i]=i%3==0?NAN:i%3==1?INFINITY:-INFINITY;
+                            else changed[i]=NAN;
+                        }
+                        if(cudaMemcpyAsync(logits.device.buffer,changed.data(),logits.nbytes(),cudaMemcpyHostToDevice,replay_stream)!=cudaSuccess ||
+                            cudaMemsetAsync(dj.device.buffer,0xa5,dj.nbytes(),replay_stream)!=cudaSuccess)return false;
+                        launch(0);
+                        if(cudaMemcpyAsync(reference_jobs.data(),dj.device.buffer,dj.nbytes(),cudaMemcpyDeviceToHost,replay_stream)!=cudaSuccess ||
+                            cudaMemcpyAsync(reference_weights.data(),weights.device.buffer,weights.nbytes(),cudaMemcpyDeviceToHost,replay_stream)!=cudaSuccess ||
+                            cudaStreamSynchronize(replay_stream)!=cudaSuccess ||
+                            cudaMemsetAsync(dj.device.buffer,0xa5,dj.nbytes(),replay_stream)!=cudaSuccess ||
+                            cudaGraphLaunch(executable,replay_stream)!=cudaSuccess ||
+                            cudaMemcpyAsync(replayed_jobs.data(),dj.device.buffer,dj.nbytes(),cudaMemcpyDeviceToHost,replay_stream)!=cudaSuccess ||
+                            cudaMemcpyAsync(replayed_weights.data(),weights.device.buffer,weights.nbytes(),cudaMemcpyDeviceToHost,replay_stream)!=cudaSuccess ||
+                            cudaStreamSynchronize(replay_stream)!=cudaSuccess)return false;
+                        if(std::memcmp(reference_jobs.data(),replayed_jobs.data(),dj.nbytes()) ||
+                            std::memcmp(reference_weights.data(),replayed_weights.data(),weights.nbytes())) {
+                            std::fprintf(stderr,"local16 route replay mismatch rows=%d experts=%d top_k=%d score=%d normalize=%d replay=%d\n",
+                                rows,experts,top_k,score_func,int(normalize),replay);return false;
+                        }
+                    }
+                    if(cudaGraphExecDestroy(executable)!=cudaSuccess || cudaGraphDestroy(graph)!=cudaSuccess ||
+                        cudaStreamDestroy(replay_stream)!=cudaSuccess || !upload(backend,logits,data))return false;
+                }
+                if (std::getenv("MOLLM_ROUTE_BENCH") && cache_mode==0 && experts==512 && top_k==10 && score_func==1 && normalize) {
+                    auto require_cuda = [](cudaError_t status) {
+                        if (status != cudaSuccess) {
+                            std::fprintf(stderr,"route benchmark CUDA failure: %s\n",cudaGetErrorString(status));
+                            std::abort();
+                        }
+                    };
+                    cudaStream_t stream; if(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking)!=cudaSuccess)return false;
+                    auto time = [&](int mode) {
+                        cudaGraph_t graph; cudaGraphExec_t executable;
+                        require_cuda(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
+                        for(int iteration=0;iteration<128;++iteration)
+                            mollm_cuda::launch_moe_resident_routes(static_cast<const float*>(logits.device.buffer),
+                                rows,experts,top_k,score_func,normalize,params.scaling_factor,
+                                static_cast<const Nvfp4Projection*>(dt.device.buffer),static_cast<const float*>(input.device.buffer),
+                                static_cast<float*>(gate.device.buffer),static_cast<float*>(activated.device.buffer),
+                                static_cast<float*>(down.device.buffer),hidden,inter,gate_jobs,gate_jobs+routes,
+                                static_cast<float*>(weights.device.buffer),stream,mode);
+                        require_cuda(cudaStreamEndCapture(stream,&graph));require_cuda(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
+                        for(int warm=0;warm<2;++warm)require_cuda(cudaGraphLaunch(executable,stream));
+                        cudaEvent_t start,stop;require_cuda(cudaEventCreate(&start));require_cuda(cudaEventCreate(&stop));
+                        require_cuda(cudaEventRecord(start,stream));for(int replay=0;replay<4;++replay)require_cuda(cudaGraphLaunch(executable,stream));
+                        require_cuda(cudaEventRecord(stop,stream));require_cuda(cudaEventSynchronize(stop));float ms=0;require_cuda(cudaEventElapsedTime(&ms,start,stop));
+                        std::vector<float> measured;
+                        if (!download(backend,weights,measured) || measured.size()!=actual.size() ||
+                            std::memcmp(measured.data(),actual.data(),actual.size()*sizeof(float))) ms=-1;
+                        require_cuda(cudaEventDestroy(start));require_cuda(cudaEventDestroy(stop));require_cuda(cudaGraphExecDestroy(executable));require_cuda(cudaGraphDestroy(graph));
+                        return ms*1000./512;
+                    };
+                    for(int repeat=0;repeat<3;++repeat) {
+                        double original,cached;
+                        const int candidate_mode=local16_probe?2:1;
+                        if(repeat%2){cached=time(candidate_mode);original=time(0);}else{original=time(0);cached=time(candidate_mode);}
+                        if(original<0||cached<0)return false;
+                        std::printf("route_cached_best rows=%d repeat=%d original_us=%.3f cached_us=%.3f bit_exact=yes candidate_mode=%d\n",rows,repeat,original,cached,candidate_mode);
+                    }
+                    cudaStreamDestroy(stream);
+                }
+            }
+          }
+        }
+    }
+    return true;
+}
+
+bool test_nvfp4_system_memory(CudaBackend& backend) {
+    int pageable = 0, host_tables = 0;
+    if (cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0) != cudaSuccess ||
+        cudaDeviceGetAttribute(&host_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, 0) != cudaSuccess)
+        return false;
+    if (!pageable || !host_tables) {
+        std::printf("SKIP: direct system-memory NVFP4 requires coherent host memory\n");
+        return true;
+    }
+    {
+        constexpr int rows = 3, width = 17, top_k = 2;
+        std::vector<float> gate_up(rows * top_k * width * 2);
+        std::vector<float> weights(rows * top_k);
+        std::vector<float> expected(rows * top_k * width), actual;
+        for (size_t i = 0; i < gate_up.size(); ++i)
+            gate_up[i] = (static_cast<int>(i % 29) - 14) / 8.f;
+        for (size_t i = 0; i < weights.size(); ++i)
+            weights[i] = (i + 1) / 16.f;
+        for (int row = 0; row < rows * top_k; ++row) {
+            for (int col = 0; col < width; ++col) {
+                const float gate = mollm_round_to_bf16(gate_up[row * 2 * width + col]);
+                const float up = mollm_round_to_bf16(gate_up[row * 2 * width + width + col]);
+                expected[row * width + col] = mollm_round_to_bf16(
+                    (gate * (1.f / (1.f + std::exp(-gate)))) * up * weights[row]);
+            }
+        }
+        Tensor activated = device_tensor(backend, width, rows * top_k);
+        mollm_cuda::launch_moe_activation(gate_up.data(), gate_up.data() + width,
+            weights.data(), static_cast<float*>(activated.device.buffer),
+            rows * top_k, width, 2 * width);
+        if (!download(backend, activated, actual) ||
+            !close_enough(actual, expected, 0.0f)) return false;
+        std::vector<float> shared(rows * width), shared_gate(rows);
+        for (size_t i = 0; i < shared.size(); ++i) shared[i] = (i % 7) / 31.f;
+        for (int i = 0; i < rows; ++i) shared_gate[i] = (i - 1) / 3.f;
+        std::vector<float> combined(rows * width);
+        for (int row = 0; row < rows; ++row) {
+            for (int col = 0; col < width; ++col) {
+                float sum = 0;
+                for (int route = 0; route < top_k; ++route)
+                    sum += mollm_round_to_bf16(expected[(row * top_k + route) * width + col]);
+                const float contribution = mollm_round_to_bf16(shared[row * width + col]) *
+                    (1.f / (1.f + std::exp(-mollm_round_to_bf16(shared_gate[row]))));
+                combined[row * width + col] = sum + contribution;
+            }
+        }
+        Tensor output = device_tensor(backend, width, rows);
+        mollm_cuda::launch_moe_combine(expected.data(), shared.data(), shared_gate.data(),
+            static_cast<float*>(output.device.buffer), rows, width, top_k);
+        if (!download(backend, output, actual) ||
+            !close_enough(actual, combined, 1e-6f)) return false;
+    }
+    constexpr float values[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6,
+                                  0, -.5f, -1, -1.5f, -2, -3, -4, -6};
+    constexpr uint8_t scale_codes[] = {0, 1, 7, 8, 48, 56, 64, 126};
+    constexpr float scale_values[] = {0, 1.f/512, 7.f/512, 1.f/64, .5f, 1, 2, 448};
+    for (int rows : {7, 12}) {
+        for (int inner : {16, 32, 80, 640, 2560}) {
+            const int groups = inner / 16;
+            std::vector<float> activation(inner), row_scales(rows), expected(rows);
+            std::vector<uint8_t> row_major(rows * inner / 2), pair_layout(
+                ((rows + 3) / 4) * 4 * inner / 2), scales(rows * groups);
+            for (int k = 0; k < inner; ++k)
+                activation[k] = (k % 19 - 9) / 16.f;
+            for (int row = 0; row < rows; ++row) {
+                row_scales[row] = (row + 1) / 1024.f;
+                double sum = 0;
+                for (int group = 0; group < groups; ++group) {
+                    const int scale_index = (row + group) % 8;
+                    scales[row * groups + group] = scale_codes[scale_index];
+                    for (int p = 0; p < 8; ++p) {
+                        const uint8_t packed = static_cast<uint8_t>(row * 29 + group * 7 + p * 13);
+                        row_major[row * (inner / 2) + group * 8 + p] = packed;
+                        pair_layout[((row / 4) * groups + group) * 32 + (row % 4) * 8 + p] = packed;
+                        sum += activation[group * 16 + p * 2] *
+                            values[packed & 15] * scale_values[scale_index];
+                        sum += activation[group * 16 + p * 2 + 1] *
+                            values[packed >> 4] * scale_values[scale_index];
+                    }
+                }
+                expected[row] = static_cast<float>(sum * row_scales[row]);
+            }
+            Tensor input = device_tensor(backend, inner);
+            Tensor output0 = device_tensor(backend, rows);
+            Tensor output1 = device_tensor(backend, rows);
+            if (!upload(backend, input, activation)) return false;
+            const mollm_cuda::Nvfp4Projection jobs[] = {
+                {row_major.data(), scales.data(), row_scales.data(),
+                 static_cast<const float*>(input.device.buffer),
+                 static_cast<float*>(output0.device.buffer), false},
+                {pair_layout.data(), scales.data(), row_scales.data(),
+                 static_cast<const float*>(input.device.buffer),
+                 static_cast<float*>(output1.device.buffer), true}};
+            // Descriptors and all weights deliberately stay in ordinary CPU
+            // allocations. The caller must keep them alive until completion.
+            mollm_cuda::launch_nvfp4_projections(jobs, 2, rows, inner);
+            if (cudaGetLastError() != cudaSuccess) return false;
+            std::vector<float> actual;
+            for (const Tensor* output : {&output0, &output1}) {
+                if (!download(backend, *output, actual) ||
+                    !close_enough_relative(actual, expected, 1e-5f, 2e-6f)) return false;
+            }
+            std::vector<float> gold0, gold1;
+            if (!download(backend, output0, gold0) || !download(backend, output1, gold1)) return false;
+            // Unequal layouts/weights exercise the independent-pair fallback.
+            if (mollm_cuda::launch_nvfp4_paired_projections(jobs, 2, rows, inner) != cudaSuccess ||
+                !download(backend, output0, actual) || actual != gold0 ||
+                !download(backend, output1, actual) || actual != gold1) return false;
+            // Equal immutable weights, distinct destinations; odd last job.
+            Tensor output2 = device_tensor(backend, rows);
+            const mollm_cuda::Nvfp4Projection same[] = {jobs[0],
+                {jobs[0].weight, jobs[0].block_scales, jobs[0].row_scales,
+                 jobs[0].input, jobs[1].output, false},
+                {jobs[1].weight, jobs[1].block_scales, jobs[1].row_scales,
+                 jobs[1].input, static_cast<float*>(output2.device.buffer), true}};
+            if (mollm_cuda::launch_nvfp4_paired_projections(same, 2, rows, inner) != cudaSuccess ||
+                !download(backend, output1, actual) || actual != gold0 ||
+                mollm_cuda::launch_nvfp4_paired_projections(same, 1, rows, inner) != cudaSuccess ||
+                !download(backend, output0, actual) || actual != gold0) return false;
+            mollm_cuda::Nvfp4MmaBatch* pair_plan = nullptr;
+            if (cudaMalloc(reinterpret_cast<void**>(&pair_plan), 4 * sizeof(*pair_plan)) != cudaSuccess) return false;
+            mollm_cuda::Nvfp4Projection* ranked_jobs = nullptr;
+            if(cudaMalloc(reinterpret_cast<void**>(&ranked_jobs),6*sizeof(*ranked_jobs))!=cudaSuccess)return false;
+            for (int mode : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}) {
+            if((mode==14 || mode==18) && inner%128)continue;
+            cudaStream_t stream = nullptr;
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t executable = nullptr;
+            auto ranked_launch = [&] {
+                mollm_cuda::launch_group_nvfp4_jobs(same,same,ranked_jobs,ranked_jobs+3,3,stream,pair_plan);
+                const auto status=cudaGetLastError();
+                return status!=cudaSuccess?status:mollm_cuda::launch_nvfp4_ranked_pairs(ranked_jobs,3,pair_plan,rows,inner,stream);
+            };
+            if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess ||
+                (mode >= 21 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,mode-16)
+                 : mode == 20 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,4)
+                 : mode == 19 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,3)
+                 : mode == 18 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,0,false,false,false,false,false,false,false,true)
+                 : mode >= 16 ? mollm_cuda::launch_nvfp4_exact_subwarp(same,3,rows,inner,mode==16?16:8,stream)
+                 : mode == 15 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,0,false,false,false,false,false,true)
+                 : mode == 14 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,0,false,false,true)
+                 : mode >= 12 ? mollm_cuda::launch_nvfp4_row_reuse(same,3,rows,inner,mode==12?2:4,stream)
+                 : mode == 11 ? ranked_launch()
+                 : mode == 10 ? mollm_cuda::launch_nvfp4_inline_pairs(same,3,rows,inner,stream)
+                 : mode >= 6 ? mollm_cuda::launch_nvfp4_pipelined_projections(same, 3, rows, inner, true, stream, mode == 6, mode >= 7 && mode <= 8 ? mode - 6 : 0, mode == 9)
+                 : mode >= 4 ? mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 3, rows, inner, mode == 4 ? 2 : 4, stream)
+                 : mode >= 2 ? mollm_cuda::launch_nvfp4_pipelined_projections(same, 3, rows, inner, mode == 3, stream)
+                 : mode == 1 ? mollm_cuda::launch_nvfp4_grouped_pairs(same, 3, pair_plan, rows, inner, stream)
+                             : mollm_cuda::launch_nvfp4_paired_projections(same, 3, rows, inner, stream)) != cudaSuccess ||
+                cudaStreamEndCapture(stream, &graph) != cudaSuccess ||
+                cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != cudaSuccess) return false;
+            bool exact = true;
+            for (int replay = 0; replay < 2; ++replay) {
+                if (replay) {
+                    for (float& value : activation) value = value * -.75f + .125f;
+                    if (!upload(backend, input, activation)) { exact = false; break; }
+                    mollm_cuda::launch_nvfp4_projections(jobs, 2, rows, inner);
+                    if (!download(backend, output0, gold0) || !download(backend, output1, gold1)) {
+                        exact = false; break;
+                    }
+                }
+                if (cudaGraphLaunch(executable, stream) != cudaSuccess ||
+                    cudaStreamSynchronize(stream) != cudaSuccess ||
+                    !download(backend, output0, actual) || actual != gold0 ||
+                    !download(backend, output1, actual) || actual != gold0 ||
+                    !download(backend, output2, actual) || actual != gold1) { exact = false; break; }
+            }
+            cudaGraphExecDestroy(executable);
+            cudaGraphDestroy(graph);
+            cudaStreamDestroy(stream);
+            if (!exact) return false;
+            }
+            cudaFree(pair_plan);
+            cudaFree(ranked_jobs);
+            if(mollm_cuda::launch_nvfp4_ranked_pairs(nullptr,0,nullptr,rows,inner)!=cudaSuccess ||
+                mollm_cuda::launch_nvfp4_ranked_pairs(same,1,nullptr,rows,inner)!=cudaErrorInvalidValue)return false;
+            if (mollm_cuda::launch_nvfp4_deep_pipelined_projections(nullptr, 0, rows, inner, 2) != cudaSuccess ||
+                mollm_cuda::launch_nvfp4_deep_pipelined_projections(nullptr, 1, rows, inner, 2) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 1, rows, inner, 3) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, -1, rows, inner, 4) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 65536, rows, inner, 4) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 1, 0, inner, 2) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 1, rows, inner - 1, 4) != cudaErrorInvalidValue)
+                return false;
+            if (mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner, true, nullptr, false, 12) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner, false, nullptr, false, 2) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner, true, nullptr, true, 2) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_pipelined_projections(nullptr, 0, rows, inner) != cudaSuccess ||
+                mollm_cuda::launch_nvfp4_pipelined_projections(nullptr, 1, rows, inner) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_pipelined_projections(same, -1, rows, inner) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_pipelined_projections(same, 65536, rows, inner) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, 0, inner) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner - 1) != cudaErrorInvalidValue)
+                return false;
+            if (mollm_cuda::launch_nvfp4_grouped_pairs(nullptr, 0, nullptr, rows, inner) != cudaSuccess ||
+                mollm_cuda::launch_nvfp4_grouped_pairs(nullptr, 1, nullptr, rows, inner) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_grouped_pairs(same, 4097, nullptr, rows, inner) != cudaErrorInvalidValue ||
+                mollm_cuda::launch_nvfp4_grouped_pairs(same, 1, nullptr, rows, inner) != cudaErrorInvalidValue)
+                return false;
+        }
+    }
+    return true;
+}
+
+bool test_gated_residual(CudaBackend& backend) {
+    backend.clear_dispatch_error();
+    backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+    for (int hidden : {7, 2560}) {
+        for (int rows : {1, 5}) {
+            for (int streams : {3, 4}) {
+                const int wide = hidden * streams;
+                std::vector<float> x_data(wide * rows), gates_data(wide * rows);
+                std::vector<float> gamma_data(wide), branch_data(hidden * rows);
+                std::vector<float> inject_gates_data(streams * rows);
+                for (size_t i = 0; i < x_data.size(); ++i) {
+                    x_data[i] = (static_cast<int>(i % 29) - 14) / 8.0f;
+                    gates_data[i] = static_cast<float>(i % 17) / 16.0f;
+                }
+                for (int i = 0; i < wide; ++i)
+                    gamma_data[i] = 0.5f + (i % 23) / 32.0f;
+                for (size_t i = 0; i < branch_data.size(); ++i)
+                    branch_data[i] = (static_cast<int>(i % 31) - 15) / 16.0f;
+                for (size_t i = 0; i < inject_gates_data.size(); ++i)
+                    inject_gates_data[i] = static_cast<float>(i % 13) / 16.0f;
+                Tensor x = device_tensor(backend, wide, rows);
+                Tensor gates = device_tensor(backend, wide, rows);
+                Tensor gamma = device_tensor(backend, wide);
+                Tensor branch = device_tensor(backend, hidden, rows);
+                Tensor inject_gates = device_tensor(backend, streams, rows);
+                Tensor wide_output = device_tensor(backend, wide, rows);
+                Tensor narrow_output = device_tensor(backend, hidden, rows);
+                if (!upload(backend, x, x_data) || !upload(backend, gates, gates_data) ||
+                    !upload(backend, gamma, gamma_data) ||
+                    !upload(backend, branch, branch_data) ||
+                    !upload(backend, inject_gates, inject_gates_data)) return false;
+                Tensor hx = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                    wide, rows, 1, 1, x_data.data());
+                Tensor hg = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                    wide, rows, 1, 1, gates_data.data());
+                Tensor hw = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                    wide, 1, 1, 1, gamma_data.data());
+                Tensor hb = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                    hidden, rows, 1, 1, branch_data.data());
+                Tensor hi = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                    streams, rows, 1, 1, inject_gates_data.data());
+                for (OpType op : {OpType::GROUP_RMS_NORM,
+                                  OpType::GR_REDUCE, OpType::GR_INJECT}) {
+                    const bool reduce = op == OpType::GR_REDUCE;
+                    Tensor& out = reduce ? narrow_output : wide_output;
+                    std::vector<float> expected(out.nelements()), actual;
+                    Tensor host_out = Tensor::create(Precision::FP32,
+                        MemoryType::EXTERNAL, out.shape[0], rows, 1, 1, expected.data());
+                    GraphNode node;
+                    node.op_type = op;
+                    node.params.i32 = {hidden, streams};
+                    node.params.f32 = {1e-6f};
+                    const std::vector<const Tensor*> host_inputs =
+                        op == OpType::GROUP_RMS_NORM ? std::vector<const Tensor*>{&hx, &hw} :
+                        reduce ? std::vector<const Tensor*>{&hx, &hg} :
+                                 std::vector<const Tensor*>{&hb, &hx, &hi};
+                    const std::vector<const Tensor*> device_inputs =
+                        op == OpType::GROUP_RMS_NORM ? std::vector<const Tensor*>{&x, &gamma} :
+                        reduce ? std::vector<const Tensor*>{&x, &gates} :
+                                 std::vector<const Tensor*>{&branch, &x, &inject_gates};
+                    CPUBackend cpu;
+                    cpu.dispatch(node, host_inputs, &host_out, nullptr);
+                    backend.dispatch(node, device_inputs, &out, nullptr);
+                    if (cpu.dispatch_failed() || backend.dispatch_failed() ||
+                        !download(backend, out, actual) ||
+                        !close_enough(actual, expected,
+                            op == OpType::GROUP_RMS_NORM ? 1e-5f : 0.0f)) return false;
+                }
+            }
+        }
+    }
+    backend.set_operator_fallback_policy(OperatorFallbackPolicy::ALLOW_REFERENCE);
+    return true;
+}
+
+bool test_gdn(CudaBackend& backend, bool sigmoid_output_gate = false) {
     backend.clear_dispatch_error();
     constexpr int key_heads = 3;
     constexpr int value_heads = 6;
@@ -1381,7 +2245,7 @@ bool test_gdn(CudaBackend& backend) {
 
     OpParams params;
     params.i32 = {key_heads, dimension, dimension, sequence_length,
-                  1, 4, real_tokens, value_heads};
+                  sigmoid_output_gate ? 3 : 1, 4, real_tokens, value_heads};
     params.f32 = {1e-6f, 1e-6f, 1.0f / std::sqrt(128.0f)};
     std::vector<float> expected_state = initial_state;
     std::vector<float> expected_output(
@@ -1465,6 +2329,84 @@ bool test_gdn(CudaBackend& backend) {
     // a one-shot numerical tolerance check.
     const std::vector<float> deterministic_output = actual_output;
     const std::vector<float> deterministic_state = actual_state;
+    {
+        // Bounded graph-level liveness test around the real GDN state update.
+        // Padded tail stays present, but only real_tokens may advance state.
+        for (bool owned_state : {false,true}) {
+        std::vector<std::vector<float>> graph_outputs, graph_states;
+        for (int mode : {0,1,2}) {
+            const bool planned=mode!=0,contract=mode==2;
+            Graph graph; graph.nodes.resize(owned_state ? 16 : 14);
+            graph.runtime.tensors.resize(graph.nodes.size());
+            const std::vector<Tensor> sources = {qkv, a, b, z, device_a_log,
+                                                device_dt_bias, norm, state};
+            for (int id = 0; id < 14; ++id) {
+                auto& node = graph.nodes[id]; node.id = id;
+                node.out_shape[0] = id == 8 || id == 9 ? qkv_width : output_width;
+                node.out_shape[1] = sequence_length;
+            }
+            for (int id = 0; id < 8; ++id) {
+                graph.nodes[id].op_type = OpType::INPUT;
+                graph.runtime.tensors[id] = sources[id];
+            }
+            graph.nodes[8].op_type = OpType::ADD; graph.nodes[8].inputs = {0, 0};
+            graph.nodes[9].op_type = OpType::RESHAPE; graph.nodes[9].inputs = {8};
+            graph.nodes[10] = gdn; graph.nodes[10].id = 10;
+            graph.nodes[10].out_shape[0] = output_width;
+            graph.nodes[10].out_shape[1] = sequence_length;
+            graph.nodes[10].inputs = {9, 1, 2, 3, 4, 5, 6, 7};
+            const bool reclaim=contract && backend.independent_stateful_mutable_input(graph.nodes[10])==7;
+            graph.nodes[11].op_type = OpType::ADD; graph.nodes[11].inputs = {3, 3};
+            graph.nodes[12].op_type = OpType::ADD; graph.nodes[12].inputs = {11, 11};
+            graph.nodes[13].op_type = OpType::ADD; graph.nodes[13].inputs = {10, 10};
+            if (owned_state) {
+                auto& owner=graph.nodes[14]; owner.id=14;
+                owner.op_type=OpType::ADD; owner.inputs={7,7};
+                for (int dim=0;dim<4;++dim) owner.out_shape[dim]=state.shape[dim];
+                graph.nodes[15]=owner; graph.nodes[15].id=15;
+                graph.nodes[15].op_type=OpType::RESHAPE; graph.nodes[15].inputs={14};
+                graph.nodes[10].inputs[7]=15;
+                std::rotate(graph.nodes.begin()+8,graph.nodes.begin()+14,graph.nodes.end());
+            }
+            graph.graph_outputs = {13};
+            BufferPool pool; ExecContext ctx;
+            ctx.graph = &graph; ctx.backend = &backend; ctx.pool = &pool;
+            ctx.conservative_stateful_liveness = planned;
+            ctx.stateful_readonly_last_use = contract;
+            ctx.runtime_seq_len = real_tokens; ctx.static_padded = true;
+            ctx.padded_seq_len = sequence_length;
+            prepare_execution(ctx);
+            if (!upload(backend, state, initial_state)) return false;
+            for (int pass = 0; pass < 3; ++pass) {
+                auto changed = qkv_data;
+                for (size_t i = 0; i < changed.size(); ++i) changed[i] += .01f * pass;
+                if (!upload(backend, qkv, changed)) return false;
+                inject_runtime_shapes(ctx);
+                backend.begin_graph(); execute_graph(ctx); backend.end_graph();
+                std::vector<float> result, final_state;
+                if (ctx.execution_failed || backend.dispatch_failed() ||
+                    !download(backend, graph.runtime.tensors[13], result) ||
+                    !download(backend,owned_state ? graph.runtime.tensors[15] : state,final_state)) return false;
+                if (owned_state && (!graph.runtime.tensors[14].data ||
+                    graph.runtime.tensors[15].data!=graph.runtime.tensors[14].data)) return false;
+                if (!planned) { graph_outputs.push_back(result); graph_states.push_back(final_state); }
+                else if (result.size() != graph_outputs[pass].size() || final_state.size() != graph_states[pass].size() ||
+                    std::memcmp(result.data(), graph_outputs[pass].data(), result.size() * sizeof(float)) ||
+                    std::memcmp(final_state.data(), graph_states[pass].data(), final_state.size() * sizeof(float)) ||
+                    (reclaim ? (graph.runtime.tensors[8].data || graph.runtime.tensors[9].data || graph.runtime.tensors[10].data)
+                              : (!graph.runtime.tensors[8].data || !graph.runtime.tensors[10].data)) ||
+                    graph.runtime.tensors[11].data || graph.runtime.tensors[12].data) return false;
+            }
+            for (int id : {8, 10, 11, 12, 13})
+                if (graph.runtime.tensors[id].data) backend.free_output(graph.runtime.tensors[id], nullptr);
+            if (owned_state && graph.runtime.tensors[14].data)
+                backend.free_output(graph.runtime.tensors[14],nullptr);
+        }
+        std::printf("conservative_gdn_state_owner sigmoid_gate=%d owned_state=%d exact_output_state=1 passes=3 policies=3\n",sigmoid_output_gate,owned_state);
+        }
+        if (!upload(backend, qkv, qkv_data)) return false;
+        std::printf("conservative_gdn_graph sigmoid_gate=%d exact_output_state=1 padded=65 real=61 replays=3 released_branch=1\n", sigmoid_output_gate);
+    }
     for (int iteration = 0; iteration < 3; ++iteration) {
         if (!upload(backend, state, initial_state))
             return false;
@@ -1488,7 +2430,7 @@ bool test_gdn(CudaBackend& backend) {
         static_cast<size_t>(output_width) * sequence_length);
     h_state.data = expected_raw_state.data();
     h_output.data = expected_raw_output.data();
-    params.i32[4] = 0;
+    params.i32[4] = sigmoid_output_gate ? 2 : 0;
     {
         GraphNode reference;
         reference.op_type = OpType::GATED_DELTANET_PREFILL;
@@ -1512,7 +2454,7 @@ bool test_gdn(CudaBackend& backend) {
             actual_state, expected_raw_state, 5e-4f, 2e-6f))
         return false;
 
-    params.i32[4] = 1;
+    params.i32[4] = sigmoid_output_gate ? 3 : 1;
     if (!upload(backend, state, expected_state))
         return false;
 
@@ -1738,6 +2680,134 @@ bool test_lm_head_argmax(CudaBackend& backend) {
     return !backend.dispatch_failed() && expected == 1 && actual == expected;
 }
 
+bool test_ple_history_prefix(CudaBackend&) {
+    const char* flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
+    if(!flag||std::strcmp(flag,"1"))return true;
+    CudaBackend backend;
+    int32_t ids_data[4]={4,0,5,6},sizes_data[2]={7,11},offset_data[2]={0,7};
+    uint8_t table_data[36]={};float scale_data=1.f;
+    Tensor ids=Tensor::create(Precision::INT32,MemoryType::EXTERNAL,4,1,1,1,ids_data);
+    Tensor table=Tensor::create(Precision::RAW_U8,MemoryType::EXTERNAL,2,18,1,1,table_data);
+    Tensor scale=Tensor::create(Precision::FP32,MemoryType::EXTERNAL,1,1,1,1,&scale_data);
+    Tensor sizes=Tensor::create(Precision::INT32,MemoryType::EXTERNAL,2,1,1,1,sizes_data);
+    Tensor offsets=Tensor::create(Precision::INT32,MemoryType::EXTERNAL,2,1,1,1,offset_data);
+    Tensor history=Tensor::create(Precision::INT32,MemoryType::EXTERNAL,3);
+    backend.alloc_persistent(history,12,PersistentHostAccess::NONE);
+    Tensor output=device_tensor(backend,4,4);
+    GraphNode node;node.op_type=OpType::PLE_LOOKUP;node.params.i32={3,1,0,100,0,1234,0,4};
+    for(int initialized:{0,1}) {
+        int32_t initial[3]={1,2,initialized};
+        if(!backend.copy_from_host(initial,history,12)||!backend.begin_state_prefixes({&history},4))return false;
+        backend.dispatch(node,{&ids,&history,&table,&scale,&sizes,&offsets},&output,nullptr);
+        backend.end_graph();if(backend.dispatch_failed())return false;
+        for(int kept=1;kept<=4;++kept) {
+            int32_t expected[3];std::memcpy(expected,initial,12);
+            Tensor host_history=Tensor::create(Precision::INT32,MemoryType::EXTERNAL,3,1,1,1,expected);
+            Tensor prefix_ids=ids;prefix_ids.shape[0]=kept;prefix_ids.compute_strides();
+            std::vector<float> values(4*kept);
+            Tensor host_output=Tensor::create(Precision::FP32,MemoryType::EXTERNAL,4,kept,1,1,values.data());
+            GraphNode prefix=node;prefix.params.i32[7]=kept;
+            CPUBackend cpu;cpu.dispatch(prefix,{&prefix_ids,&host_history,&table,&scale,&sizes,&offsets},&host_output,nullptr);
+            int32_t actual[3];
+            if(cpu.dispatch_failed()||!backend.restore_state_prefix(kept)||
+                !backend.copy_to_host(history,actual,12)||std::memcmp(expected,actual,12))return false;
+        }
+        backend.end_state_prefixes();
+    }
+    return true;
+}
+
+bool test_state_prefix_coverage(CudaBackend&) {
+    CudaBackend backend;
+    Tensor input=device_tensor(backend,7,3),weight=device_tensor(backend,4,7);
+    Tensor state=device_tensor(backend,3,7),output=device_tensor(backend,7,3),unused=device_tensor(backend,4);
+    std::vector<float> x(21),w(28,.25f),initial(21,.5f),dummy(4,9.f);
+    for(int i=0;i<21;++i)x[i]=float(i-10)/17.f;
+    if(!upload(backend,input,x)||!upload(backend,weight,w)||!upload(backend,state,initial)||!upload(backend,unused,dummy))return false;
+    const char* flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
+    if(!flag||std::strcmp(flag,"1"))return !backend.begin_state_prefixes({&state},3);
+    GraphNode node;node.op_type=OpType::SHORTCONV;node.params.i32={4,3};
+    for(bool incomplete:{true,false}) {
+        if(!upload(backend,state,initial))return false;
+        std::vector<Tensor*> states={&state,&state};if(incomplete)states.push_back(&unused);
+        if(!backend.begin_state_prefixes(states,3)||backend.restore_state_prefix(1))return false;
+        backend.dispatch(node,{&input,&weight,&state},&output,nullptr);backend.end_graph();
+        std::vector<float> before,after;
+        if(backend.dispatch_failed()||!download(backend,state,before))return false;
+        if(incomplete) {
+            if(backend.restore_state_prefix(1)||!download(backend,state,after)||after!=before)return false;
+            std::vector<float> untouched;if(!download(backend,unused,untouched)||untouched!=dummy)return false;
+        } else {
+            for(int kept:{1,2,3}) {
+                if(!backend.restore_state_prefix(kept)||!download(backend,state,after))return false;
+                for(int group=0;group<7;++group)for(int tap=0;tap<3;++tap) {
+                    const int token=kept-3+tap;
+                    const float expected=token<0?.5f:x[token*7+group];
+                    if(after[group*3+tap]!=expected)return false;
+                }
+            }
+            if(backend.restore_state_prefix(0)||backend.restore_state_prefix(4))return false;
+        }
+        backend.end_state_prefixes();if(backend.restore_state_prefix(1))return false;
+    }
+    return true;
+}
+
+bool test_q8_batch_head(CudaBackend&) {
+    CudaBackend backend;
+    constexpr int n=39,k=256;
+    std::vector<int8_t> weights(n*k);
+    std::vector<float> scales(n,.125f);
+    for(int r=0;r<n;++r)for(int c=0;c<k;++c)
+        weights[r*k+c]=static_cast<int8_t>((r*13+c*7)%127-63);
+    // Duplicate rows exercise the same lowest-index argmax tie handling.
+    std::copy_n(weights.data(),k,weights.data()+k);
+    Tensor weight=Tensor::create(Precision::INT8,MemoryType::EXTERNAL,n,k,1,1,weights.data());
+    weight.rowmajor_data=weights.data();weight.scales=scales.data();
+    weight.group_size=k;weight.groups_per_row=1;backend.wrap_weight(weight);
+    const char* flag=std::getenv("MOLLM_CUDA_MTP_VERIFY_Q8_BATCH");
+    if(!flag||std::strcmp(flag,"1"))return !backend.supports_lm_head_small_batch(weight);
+    if(!backend.supports_lm_head_small_batch(weight)) {std::fprintf(stderr,"q8 batch unsupported\n");return false;}
+    {
+        Tensor activation=device_tensor(backend,k,2);
+        int output[2]={-1,-1};
+        for(int bad_m:{0,1,9}) {
+            if(backend.lm_head_small_batch_argmax_device_and_end_graph(
+                activation,weight,output,bad_m,n,k) || !backend.dispatch_failed() ||
+                output[0]!=-1 || output[1]!=-1)return false;
+            backend.clear_dispatch_error();
+        }
+        if(backend.lm_head_small_batch_argmax_device_and_end_graph(
+            activation,weight,output,2,INT32_MAX,k) || !backend.dispatch_failed())return false;
+        backend.clear_dispatch_error();
+        if(backend.lm_head_small_batch_argmax_device_and_end_graph(
+            activation,weight,output,2,n,k,1) || !backend.dispatch_failed())return false;
+        backend.clear_dispatch_error();
+    }
+    for(int m:{2,3,4,5,7,8}) {
+        Tensor activation=device_tensor(backend,k,m);
+        std::vector<float> inputs(m*k),logits(n);
+        std::vector<int> expected(m),actual(m,-1);
+        for(int replay=0;replay<2;++replay) {
+            for(int t=0;t<m;++t)for(int c=0;c<k;++c)
+                inputs[t*k+c]=replay?((c*11+t*17)%97-48)/101.f:0.f;
+            if(!upload(backend,activation,inputs))return false;
+            for(int t=0;t<m;++t) {
+                backend.lm_head_gemv_device_and_end_graph(activation,size_t(t)*k,weight,logits.data(),n,k);
+                if(backend.dispatch_failed())return false;
+                expected[t]=std::max_element(logits.begin(),logits.end())-logits.begin();
+            }
+            if(!backend.lm_head_small_batch_argmax_device_and_end_graph(
+                activation,weight,actual.data(),m,n,k)||actual!=expected) {
+                std::fprintf(stderr,"q8 batch head failed m=%d replay=%d failed=%d\n",m,replay,backend.dispatch_failed());
+                for(int t=0;t<m;++t)std::fprintf(stderr,"t=%d got=%d expected=%d\n",t,actual[t],expected[t]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool test_memory_and_fallback_bridge(CudaBackend& backend) {
     backend.clear_dispatch_error();
     Tensor storage = device_tensor(backend, 6, 2);
@@ -1916,14 +2986,1264 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
     return rejected_before_staging;
 }
 
+bool test_grouped_narrow_stream() {
+    for (int rows : {1, 4, 7, 19, 21, 257, 319, 320, 321, 512, 640}) {
+        const int inner = rows == 19 ? 2080 : rows == 21 ? 2144 : rows == 257 ? 6144 :
+            (rows == 1 || rows == 512 || rows == 640) ? 2560 : 10240;
+        const size_t projection_blocks = static_cast<size_t>((rows + 7) / 8) * (inner / 32);
+        std::vector<Q4B8G32Block> host(2 * projection_blocks);
+        for (size_t i = 0; i < host.size(); ++i)
+            for (int row = 0; row < 8; ++row) {
+                host[i].scales[row] = (1 + (i + row) % 17) / 37.f;
+                for (int byte = 0; byte < 16; ++byte)
+                    host[i].q[row][byte] = (i * 19 + row * 7 + byte * 13) & 255;
+            }
+        std::vector<float> activation(inner), reference(rows), second_reference(rows), actual(2 * (rows + 8), 42.f);
+        for (int i = 0; i < inner; ++i) activation[i] = (i % 31 - 15) / 19.f;
+        Q4B8G32Block* weight = nullptr;
+        float* input = nullptr; float* output = nullptr;
+        cudaStream_t stream = nullptr;
+        const auto cleanup = [&]() {
+            if (stream) cudaStreamDestroy(stream);
+            cudaFree(weight); cudaFree(input); cudaFree(output);
+        };
+        if (cudaMalloc(reinterpret_cast<void**>(&weight), host.size() * sizeof(host[0])) != cudaSuccess ||
+            cudaMalloc(reinterpret_cast<void**>(&input), inner * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(reinterpret_cast<void**>(&output), actual.size() * sizeof(float)) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaMemcpy(weight, host.data(), host.size() * sizeof(host[0]), cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(input, activation.data(), inner * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+            cleanup(); return false;
+        }
+        mollm_cuda::launch_q4_g32_dense_gemv(input, weight, output, rows, inner);
+        if (cudaMemcpy(reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cleanup(); return false;
+        }
+        mollm_cuda::launch_q4_g32_dense_gemv(input, weight + projection_blocks, output, rows, inner);
+        if (cudaMemcpy(second_reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cleanup(); return false;
+        }
+        if (mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(nullptr, weight, output, rows, inner, 1, true, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(input + 1, weight, output, rows, inner, 2, true, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(input, weight, output, rows, inner, 3, false, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(input, weight, output, rows, inner - 1, 4, true, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_spatial_narrow_gemv(nullptr, weight, output, rows, inner, 2, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_spatial_narrow_gemv(input + 1, weight, output, rows, inner, 4, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_spatial_narrow_gemv(input, weight, output, rows, inner, 3, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_spatial_narrow_gemv(input, weight, output, rows, inner - 1, 8, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_dual_lane_gemv(nullptr, weight, output, rows, inner, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_dual_lane_gemv(input + 1, weight, output, rows, inner, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_dual_lane_gemv(input, weight, output, rows, inner - 1, stream) != cudaErrorInvalidValue) {
+            cleanup(); return false;
+        }
+        if (mollm_cuda::launch_q4_g32_paired_projections(input + 1, weight, weight + projection_blocks,
+                output, output + rows + 8, rows, inner, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_paired_projections(input, weight, nullptr,
+                output, output + rows + 8, rows, inner, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_paired_projections(input, weight, weight + projection_blocks,
+                output, output + rows + 8, rows, 2016, stream) != cudaErrorInvalidValue) {
+            cleanup(); return false;
+        }
+        if (mollm_cuda::launch_q4_g32_shared_activation(input + 1, weight, weight + projection_blocks,
+                output, rows, inner, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_shared_activation(input, weight, nullptr,
+                output, rows, inner, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_shared_activation(input, weight, weight + projection_blocks,
+                output, rows, 2016, stream) != cudaErrorInvalidValue) {
+            cleanup(); return false;
+        }
+        if (mollm_cuda::launch_q4_g32_unequal_projections(input + 1, weight, weight + projection_blocks,
+                output, output + rows + 8, rows, 1, inner, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_unequal_projections(input, weight, nullptr,
+                output, output + rows + 8, rows, 1, inner, stream) != cudaErrorInvalidValue ||
+            mollm_cuda::launch_q4_g32_unequal_projections(input, weight, weight + projection_blocks,
+                output, output + rows + 8, rows, 0, inner, stream) != cudaErrorInvalidValue) {
+            cleanup(); return false;
+        }
+        for (int group : {-16, -15, -14, -13, -12, -11, -10, -9, -8, -4, -3, -2, -1, 0, 2, 4, 8}) {
+            std::fill(actual.begin(), actual.end(), 42.f);
+            if (cudaMemcpyAsync(output, actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+                cudaStreamSynchronize(stream) != cudaSuccess ||
+                cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+                cleanup(); return false;
+            }
+            // -2 fuses shared activation; -1 pairs projections; zero uses dual lanes.
+            // Both retain byte-exact references and explicit graph streams.
+            if (group == -16) {
+                mollm_cuda::launch_q4_g32_unequal_projections(input, weight, weight + projection_blocks,
+                    output, output + rows + 8, rows, std::min(rows, 4), inner, stream);
+            } else if (group <= -10) {
+                const int ordinal = (-group - 10) % 3;
+                mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(input, weight, output, rows, inner,
+                    1 << ordinal, group >= -12, stream);
+            } else if (group == -9)
+                mollm_cuda::launch_q4_g32_single_barrier_gemv(input, weight, output, rows, inner, stream);
+            else if (group < -2)
+                mollm_cuda::launch_q4_g32_spatial_narrow_gemv(input, weight, output, rows, inner,
+                    group == -3 ? 2 : -group, stream);
+            else if (group == -2)
+                mollm_cuda::launch_q4_g32_shared_activation(input, weight, weight + projection_blocks,
+                    output, rows, inner, stream);
+            else if (group == -1)
+                mollm_cuda::launch_q4_g32_paired_projections(input, weight, weight + projection_blocks,
+                    output, output + rows + 8, rows, inner, stream);
+            else if (group == 0)
+                mollm_cuda::launch_q4_g32_dual_lane_gemv(input, weight, output, rows, inner, stream);
+            else
+                mollm_cuda::launch_q4_g32_grouped_narrow_gemv(input, weight, output, rows, inner, group, stream);
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t executable = nullptr;
+            bool ok = cudaStreamEndCapture(stream, &graph) == cudaSuccess && graph;
+            if (ok) ok = cudaGraphInstantiateWithFlags(&executable, graph, 0) == cudaSuccess;
+            for (int replay = 0; ok && replay < 2; ++replay) {
+                for (int j = 0; j < inner; ++j)
+                    activation[j] = (j % 31 - 15) / (replay ? 23.f : 19.f);
+                ok = cudaMemcpy(input, activation.data(), inner * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+                if (ok) {
+                    mollm_cuda::launch_q4_g32_dense_gemv(input, weight, output, rows, inner);
+                    ok = cudaMemcpy(reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+                    mollm_cuda::launch_q4_g32_dense_gemv(input, weight + projection_blocks, output + rows + 8, rows, inner);
+                    ok = ok && cudaMemcpy(second_reference.data(), output + rows + 8, rows * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+                    if (group == -2 && ok) {
+                        mollm_cuda::launch_moe_activation(output, output + rows + 8, nullptr,
+                            output, 1, rows, rows);
+                        ok = cudaMemcpy(reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+                    }
+                }
+                std::fill(actual.begin(), actual.end(), 42.f);
+                // Reset on the replay stream, after reference copies complete.
+                ok = ok && cudaMemcpyAsync(output, actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                    cudaGraphLaunch(executable, stream) == cudaSuccess &&
+                    cudaMemcpyAsync(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                    cudaStreamSynchronize(stream) == cudaSuccess;
+                ok = ok && std::memcmp(reference.data(), actual.data(), rows * sizeof(float)) == 0 &&
+                    std::all_of(actual.begin() + rows, actual.begin() + rows + 8, [](float x) { return x == 42.f; });
+                if (group == -1 || group == -16) {
+                    const int second_rows = group == -16 ? std::min(rows, 4) : rows;
+                    ok = ok && std::memcmp(second_reference.data(), actual.data() + rows + 8, second_rows * sizeof(float)) == 0 &&
+                        std::all_of(actual.begin() + rows + 8 + second_rows, actual.end(), [](float x) { return x == 42.f; });
+                } else
+                    ok = ok && std::all_of(actual.begin() + rows + 8, actual.end(), [](float x) { return x == 42.f; });
+            }
+            if (executable) cudaGraphExecDestroy(executable);
+            if (graph) cudaGraphDestroy(graph);
+            if (!ok) {
+                std::fprintf(stderr, "grouped narrow graph mismatch rows=%d group=%d\n", rows, group);
+                cleanup(); return false;
+            }
+        }
+        cleanup();
+    }
+    return true;
+}
+
+bool test_q4_wide_pipeline_stream(int pair_mode = 0) {
+    std::vector<std::pair<int, int>> shapes = {{1, 32}, {19, 96}, {31, 160}, {33, 2560}, {16480, 2560}};
+    if (pair_mode == 1 || pair_mode == 2) { shapes.emplace_back(10240, 320); shapes.emplace_back(2560, 640); }
+    const auto launch = [&](const float* input, const Q4B8G32Block* weight, float* output,
+                            int rows, int inner, cudaStream_t stream) {
+        return pair_mode >= 3 ? mollm_cuda::launch_q4_g32_l1_prefetch_wide_gemv(input, weight, output, rows, inner, 1 << (pair_mode - 3), stream)
+                         : pair_mode ? mollm_cuda::launch_q4_g32_pipelined_pair_gemv(input, weight, output, rows, inner, pair_mode == 2, stream)
+                         : mollm_cuda::launch_q4_g32_pipelined_wide_gemv(input, weight, output, rows, inner, stream);
+    };
+    for (const auto shape : shapes) {
+        const int rows = shape.first, inner = shape.second;
+        std::vector<Q4B8G32Block> host(((rows + 7) / 8) * (inner / 32));
+        for (size_t i = 0; i < host.size(); ++i)
+            for (int row = 0; row < 8; ++row) {
+                host[i].scales[row] = (1 + (i + row) % 17) / 37.f;
+                for (int byte = 0; byte < 16; ++byte) host[i].q[row][byte] = (i * 19 + row * 7 + byte * 13) & 255;
+            }
+        Q4B8G32Block* weight = nullptr;
+        float* input = nullptr; float* output = nullptr;
+        cudaStream_t stream = nullptr; cudaGraph_t graph = nullptr; cudaGraphExec_t executable = nullptr;
+        const auto cleanup = [&]() {
+            if (executable) cudaGraphExecDestroy(executable);
+            if (graph) cudaGraphDestroy(graph);
+            if (stream) cudaStreamDestroy(stream);
+            cudaFree(weight); cudaFree(input); cudaFree(output);
+        };
+        if (cudaMalloc(&weight, host.size() * sizeof(host[0])) != cudaSuccess ||
+            cudaMalloc(&input, inner * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&output, (rows + 8) * sizeof(float)) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaMemcpy(weight, host.data(), host.size() * sizeof(host[0]), cudaMemcpyHostToDevice) != cudaSuccess) {
+            cleanup(); return false;
+        }
+        if (pair_mode >= 3 && mollm_cuda::launch_q4_g32_l1_prefetch_wide_gemv(
+                input, weight, output, rows, inner, 3, stream) != cudaErrorInvalidValue) {
+            cleanup(); return false;
+        }
+        if (launch(nullptr, weight, output, rows, inner, stream) != cudaErrorInvalidValue ||
+            launch(input + 1, weight, output, rows, inner, stream) != cudaErrorInvalidValue ||
+            launch(input, weight, output, rows, inner - 1, stream) != cudaErrorInvalidValue ||
+            launch(input, weight, output, rows, 2592, stream) != cudaErrorInvalidValue) {
+            cleanup(); return false;
+        }
+        if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess ||
+            launch(input, weight, output, rows, inner, stream) != cudaSuccess ||
+            cudaStreamEndCapture(stream, &graph) != cudaSuccess ||
+            cudaGraphInstantiateWithFlags(&executable, graph, 0) != cudaSuccess) {
+            cleanup(); return false;
+        }
+        std::vector<float> activation(inner), reference(rows), actual(rows + 8);
+        for (int replay = 0; replay < 2; ++replay) {
+            for (int i = 0; i < inner; ++i) activation[i] = (i % 41 - 20 + replay) / (37.f + replay);
+            bool ok = cudaMemcpyAsync(input, activation.data(), inner * sizeof(float), cudaMemcpyHostToDevice, stream) == cudaSuccess;
+            if (pair_mode == 1 || pair_mode == 2) mollm_cuda::launch_q4_g32_pair_narrow_gemv(input, weight, output, rows, inner, false, stream);
+            else mollm_cuda::launch_q4_g32_prefetch_wide_gemv(input, weight, output, rows, inner, 4, stream);
+            ok = ok && cudaMemcpyAsync(reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                cudaStreamSynchronize(stream) == cudaSuccess;
+            std::fill(actual.begin(), actual.end(), 42.f);
+            ok = ok && cudaMemcpyAsync(output, actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                cudaGraphLaunch(executable, stream) == cudaSuccess &&
+                cudaMemcpyAsync(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                cudaStreamSynchronize(stream) == cudaSuccess &&
+                std::memcmp(actual.data(), reference.data(), rows * sizeof(float)) == 0 &&
+                std::all_of(actual.begin() + rows, actual.end(), [](float x) { return x == 42.f; });
+            if (!ok) {
+                std::fprintf(stderr,"Q4 wide pipeline graph check failed pair_mode=%d rows=%d inner=%d replay=%d\n",
+                    pair_mode,rows,inner,replay);
+                cleanup(); return false;
+            }
+        }
+        cleanup();
+    }
+    return true;
+}
+
+bool test_q4_async_stream() {
+    for (int rows : {1, 19, 31, 33}) for (int inner : {32, 96, 128, 160, 2560})
+    for (int variant : {0, 4, 8}) {
+        std::vector<Q4B8G32Block> host(((rows + 7) / 8) * (inner / 32));
+        for (size_t i = 0; i < host.size(); ++i) for (int r = 0; r < 8; ++r) {
+            host[i].scales[r] = (1 + (i + r) % 17) / 37.f;
+            for (int k = 0; k < 16; ++k) host[i].q[r][k] = (i * 19 + r * 7 + k * 13) & 255;
+        }
+        std::vector<float> x(inner), reference(rows), actual(rows + 8), initial(rows + 8, 42.f);
+        for (int k = 0; k < inner; ++k) x[k] = (k % 41 - 20) / 37.f;
+        Q4B8G32Block* weight = nullptr;
+        float *input = nullptr, *output = nullptr;
+        cudaStream_t stream = nullptr;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        bool ok = cudaMalloc(reinterpret_cast<void**>(&weight), host.size() * sizeof(host[0])) == cudaSuccess &&
+            cudaMalloc(reinterpret_cast<void**>(&input), inner * sizeof(float)) == cudaSuccess &&
+            cudaMalloc(reinterpret_cast<void**>(&output), initial.size() * sizeof(float)) == cudaSuccess &&
+            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
+        if (ok) ok = cudaMemcpy(weight, host.data(), host.size() * sizeof(host[0]), cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(input, x.data(), inner * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) {
+            mollm_cuda::launch_q4_g32_prefetch_wide_gemv(input, weight, output, rows, inner, 4);
+            ok = cudaMemcpy(reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess &&
+                cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+            if (ok) {
+                const auto launch = variant == 0
+                    ? mollm_cuda::launch_q4_g32_async_wide_gemv(input, weight, output, rows, inner, stream)
+                    : mollm_cuda::launch_q4_g32_prefetch_scale_gemv(input, weight, output, rows, inner, variant, stream);
+                const auto end = cudaStreamEndCapture(stream, &graph);
+                ok = launch == cudaSuccess && end == cudaSuccess;
+            }
+            if (ok) ok = cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) == cudaSuccess;
+            for (int replay = 0; ok && replay < 2; ++replay) {
+                ok = cudaMemcpyAsync(output, initial.data(), initial.size() * sizeof(float), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                    cudaGraphLaunch(executable, stream) == cudaSuccess &&
+                    cudaMemcpyAsync(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                    cudaStreamSynchronize(stream) == cudaSuccess;
+                ok = ok && std::memcmp(actual.data(), reference.data(), rows * sizeof(float)) == 0 &&
+                    std::all_of(actual.begin() + rows, actual.end(), [](float y) { return y == 42.f; });
+            }
+        }
+        if (executable) cudaGraphExecDestroy(executable);
+        if (graph) cudaGraphDestroy(graph);
+        if (stream) cudaStreamDestroy(stream);
+        if (output) cudaFree(output);
+        if (input) cudaFree(input);
+        if (weight) cudaFree(weight);
+        if (!ok) {
+            std::fprintf(stderr, "Q4 async/scale-prefetch graph mismatch rows=%d inner=%d variant=%d\n", rows, inner, variant);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool test_fp16_to_fp32_reference() {
+    for (size_t count : {size_t(1), size_t(255), size_t(256), size_t(257)}) {
+        std::vector<__half> source(count);
+        std::vector<float> expected(count), actual(count);
+        const uint16_t codes[] = {0x0000, 0x8000, 0x0001, 0x03ff, 0x0400,
+                                  0x3c01, 0xbc00, 0x7bff, 0x7c00, 0xfc00};
+        for (size_t i = 0; i < count; ++i) {
+            std::memcpy(&source[i], &codes[i % 10], sizeof(__half));
+            expected[i] = __half2float(source[i]);
+        }
+        __half* input = nullptr;
+        float* output = nullptr;
+        bool ok = cudaMalloc(reinterpret_cast<void**>(&input), count * sizeof(__half)) == cudaSuccess &&
+            cudaMalloc(reinterpret_cast<void**>(&output), count * sizeof(float)) == cudaSuccess;
+        if (ok) ok = cudaMemcpy(input, source.data(), count * sizeof(__half), cudaMemcpyHostToDevice) == cudaSuccess;
+        if (ok) {
+            mollm_cuda::launch_fp16_to_fp32(input, output, count);
+            ok = cudaGetLastError() == cudaSuccess &&
+                cudaMemcpy(actual.data(), output, count * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess &&
+                std::memcmp(actual.data(), expected.data(), count * sizeof(float)) == 0;
+        }
+        if (input) cudaFree(input);
+        if (output) cudaFree(output);
+        if (!ok) return false;
+    }
+    mollm_cuda::launch_fp16_to_fp32(nullptr, nullptr, 0);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool test_nvfp4_sort_stream() {
+    using Job = mollm_cuda::Nvfp4Projection;
+    const auto same_job = [](const Job& a, const Job& b) {
+        return a.weight == b.weight && a.block_scales == b.block_scales &&
+            a.row_scales == b.row_scales && a.input == b.input && a.output == b.output &&
+            a.pair_layout == b.pair_layout && a.mma_layout == b.mma_layout &&
+            std::memcmp(&a.input_global, &b.input_global, sizeof(float)) == 0 &&
+            std::memcmp(&a.input_global_second, &b.input_global_second, sizeof(float)) == 0 &&
+            std::memcmp(&a.output_scale, &b.output_scale, sizeof(float)) == 0;
+    };
+    size_t zero_bytes = 1;
+    if (mollm_cuda::nvfp4_radix_group_scratch_size(0, &zero_bytes) != cudaSuccess || zero_bytes ||
+        mollm_cuda::nvfp4_radix_group_scratch_size(-1, &zero_bytes) != cudaErrorInvalidValue ||
+        mollm_cuda::nvfp4_radix_group_scratch_size(65536, &zero_bytes) != cudaErrorInvalidValue ||
+        mollm_cuda::nvfp4_radix_group_scratch_size(1, nullptr) != cudaErrorInvalidValue ||
+        mollm_cuda::launch_group_nvfp4_jobs_radix(nullptr, nullptr, nullptr, nullptr,
+            0, nullptr, 0) != cudaSuccess) return false;
+    for (int method : {0, 1, 2})
+    for (bool paired : {false, true})
+    for (int count : {1, 127, 128, 129, 2048, 2560, 4096, 5120, 10240, 65535}) {
+        const bool tiled = method == 1, radix = method == 2;
+        if (radix && paired) continue;
+        if (!radix && count > 10240) continue;
+        if (!tiled && !radix && count > 4096) continue;
+        std::vector<Job> gate(count), down(count), actual(2 * count);
+        std::vector<int> order(count);
+        for (int i = 0; i < count; ++i) {
+            gate[i] = {};
+            down[i] = {};
+            // Opaque keys are sorted but never dereferenced by this kernel.
+            gate[i].weight = reinterpret_cast<const uint8_t*>(uintptr_t(1 + (i * 37) % 113));
+            gate[i].input_global = float(i + 1);
+            down[i].output_scale = float(-i - 1);
+            if (!paired) {
+                gate[i].block_scales = reinterpret_cast<const uint8_t*>(uintptr_t(16 + i * 8));
+                gate[i].input = reinterpret_cast<const float*>(uintptr_t(64 + i * 4));
+                gate[i].output = reinterpret_cast<float*>(uintptr_t(128 + i * 4));
+                gate[i].pair_layout = i % 2;
+                gate[i].mma_layout = i % 3 == 0;
+                gate[i].input_global_second = float(-i - 1);
+                gate[i].output_scale = i % 2 ? -0.0f : 0.0f;
+                down[i].weight = reinterpret_cast<const uint8_t*>(uintptr_t(1 + i % 41));
+                down[i].block_scales = reinterpret_cast<const uint8_t*>(uintptr_t(32 + i * 8));
+                down[i].row_scales = reinterpret_cast<const float*>(uintptr_t(256 + i * 4));
+                down[i].input = reinterpret_cast<const float*>(uintptr_t(512 + i * 4));
+                down[i].output = reinterpret_cast<float*>(uintptr_t(1024 + i * 4));
+                down[i].pair_layout = i % 3 == 0;
+                down[i].mma_layout = i % 2;
+                down[i].input_global = float(i % 7 + 1);
+                down[i].input_global_second = float(-i % 11 - 1);
+            }
+            order[i] = i;
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            return reinterpret_cast<uintptr_t>(gate[a].weight) <
+                   reinterpret_cast<uintptr_t>(gate[b].weight);
+        });
+        Job* device = nullptr;
+        cudaStream_t stream = nullptr;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        mollm_cuda::Nvfp4MmaBatch* plan = nullptr;
+        void* radix_scratch = nullptr;
+        size_t radix_bytes = 0;
+        std::vector<mollm_cuda::Nvfp4MmaBatch> actual_plan(count);
+        bool ok = cudaMalloc(reinterpret_cast<void**>(&device), 4 * count * sizeof(Job)) == cudaSuccess &&
+            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
+        if (ok && paired) ok = cudaMalloc(reinterpret_cast<void**>(&plan), count * sizeof(*plan)) == cudaSuccess;
+        if (ok && radix) ok = mollm_cuda::nvfp4_radix_group_scratch_size(count, &radix_bytes) == cudaSuccess &&
+            cudaMalloc(&radix_scratch, radix_bytes) == cudaSuccess;
+        if (ok) ok = cudaMemcpyAsync(device, gate.data(), count * sizeof(Job), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+            cudaMemcpyAsync(device + count, down.data(), count * sizeof(Job), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+            cudaStreamSynchronize(stream) == cudaSuccess;
+        if (ok) {
+            if (radix) {
+                ok = mollm_cuda::launch_group_nvfp4_jobs_radix(device, device + count,
+                    device + 2 * count, device + 3 * count, count, radix_scratch,
+                    radix_bytes - 1, stream) == cudaErrorInvalidValue &&
+                    mollm_cuda::launch_group_nvfp4_jobs_radix(device, device + count,
+                        device + 2 * count, device + 3 * count, count,
+                        static_cast<uint8_t*>(radix_scratch) + 1, radix_bytes, stream) == cudaErrorInvalidValue &&
+                    mollm_cuda::launch_group_nvfp4_jobs_radix(device, device + count,
+                        device + 2 * count, device + 2 * count, count,
+                        radix_scratch, radix_bytes, stream) == cudaErrorInvalidValue &&
+                    mollm_cuda::launch_group_nvfp4_jobs_radix(device, device + count,
+                        device, device + 3 * count, count,
+                        radix_scratch, radix_bytes, stream) == cudaErrorInvalidValue &&
+                    mollm_cuda::launch_group_nvfp4_jobs_radix(device, device + count,
+                        device + 2 * count, device + 3 * count, count,
+                        device, radix_bytes, stream) == cudaErrorInvalidValue;
+            }
+        }
+        if (ok) {
+            ok = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+            if (ok) {
+                if (radix) ok = mollm_cuda::launch_group_nvfp4_jobs_radix(device, device + count,
+                    device + 2 * count, device + 3 * count, count, radix_scratch, radix_bytes, stream) == cudaSuccess;
+                else mollm_cuda::launch_group_nvfp4_jobs(device, device + count,
+                    device + 2 * count, device + 3 * count, count, stream, plan, tiled);
+                const auto ended = cudaStreamEndCapture(stream, &graph);
+                ok = ok && ended == cudaSuccess;
+            }
+            if (ok) ok = cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) == cudaSuccess;
+            for (int replay = 0; ok && replay < 3; ++replay) {
+                // Replay with changed keys and layout metadata, not just outputs.
+                for (int i = 0; i < count; ++i) {
+                    uintptr_t key = 1 + ((replay ? count - 1 - i : i) * 37) % 113;
+                    if (replay == 1) {
+                        if (i % 3 == 0) key |= uintptr_t(1) << (sizeof(uintptr_t) * 8 - 1);
+                        if (i % 5 == 0) key |= uintptr_t(1) << (sizeof(uintptr_t) * 4);
+                    } else if (replay == 2) key = 0;  // all-equal keys must stay stable
+                    gate[i].weight = reinterpret_cast<const uint8_t*>(key);
+                    gate[i].row_scales = replay && i % 257 == 0
+                        ? reinterpret_cast<const float*>(uintptr_t(4)) : nullptr;
+                    order[i] = i;
+                }
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                    return reinterpret_cast<uintptr_t>(gate[a].weight) < reinterpret_cast<uintptr_t>(gate[b].weight);
+                });
+                ok = cudaMemcpyAsync(device, gate.data(), count * sizeof(Job), cudaMemcpyHostToDevice, stream) == cudaSuccess;
+                if (!ok) break;
+                ok = cudaMemsetAsync(device + 2 * count, 0xff, 2 * count * sizeof(Job), stream) == cudaSuccess &&
+                    cudaGraphLaunch(executable, stream) == cudaSuccess &&
+                    cudaMemcpyAsync(actual.data(), device + 2 * count, 2 * count * sizeof(Job), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                    cudaStreamSynchronize(stream) == cudaSuccess;
+                for (int i = 0; ok && i < count; ++i)
+                    ok = same_job(actual[i], gate[order[i]]) &&
+                        same_job(actual[count + i], down[order[i]]);
+                if (ok && paired) {
+                    ok = cudaMemcpyAsync(actual_plan.data(), plan, count * sizeof(*plan), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                        cudaStreamSynchronize(stream) == cudaSuccess;
+                    for (int start = 0; ok && start < count;) {
+                        int end = start + 1;
+                        bool compatible = true;
+                        while (end < count && gate[order[end]].weight == gate[order[start]].weight) {
+                            compatible &= gate[order[end]].row_scales == gate[order[start]].row_scales;
+                            ++end;
+                        }
+                        for (int i = start; ok && i < end; ++i) {
+                            const int first = !compatible ? i : (i - start) % 2 ? -1 : i;
+                            const int size = !compatible ? 1 : (i - start) % 2 ? 0 : i + 1 < end ? 2 : 1;
+                            ok = actual_plan[i].first == first && actual_plan[i].size == size;
+                        }
+                        start = end;
+                    }
+                }
+            }
+        }
+        if (executable) cudaGraphExecDestroy(executable);
+        if (graph) cudaGraphDestroy(graph);
+        if (stream) cudaStreamDestroy(stream);
+        if (device) cudaFree(device);
+        if (plan) cudaFree(plan);
+        if (radix_scratch) cudaFree(radix_scratch);
+        if (!ok) {
+            std::fprintf(stderr, "NVFP4 stable sort stream/graph mismatch method=%d paired=%d count=%d\n", method, paired, count);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool test_conservative_shortconv_graph(CudaBackend& backend, bool ple_conv = false,
+                                      bool returned_view = false, bool owned_state = false) {
+    std::vector<std::vector<float>> outputs, states, view_outputs, prefix_states;
+    const char* prefix_flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
+    const bool prefixes=!ple_conv && !owned_state && prefix_flag && !std::strcmp(prefix_flag,"1");
+    for (int mode : {0,1,2}) {
+        const bool planned=mode!=0,contract=mode==2;
+        backend.clear_dispatch_error();
+        Graph graph; graph.nodes.resize(9 + (owned_state ? 2 : 0) + (returned_view ? 1 : 0));
+        graph.runtime.tensors.resize(graph.nodes.size());
+        for (size_t i = 0; i < graph.nodes.size(); ++i) {
+            auto& node = graph.nodes[i]; node.id = i;
+            node.out_shape[0] = 4; node.out_shape[1] = 3;
+            node.dim_expr[1].kind = DIM_SEQ;
+        }
+        for (int i = 0; i < 3; ++i) graph.nodes[i].op_type = OpType::INPUT;
+        graph.nodes[1].dim_expr[1].kind = DIM_CONST;
+        graph.nodes[2].dim_expr[1].kind = DIM_CONST;
+        graph.nodes[3].op_type = OpType::ADD; graph.nodes[3].inputs = {0, 0};
+        graph.nodes[4].op_type = OpType::RESHAPE; graph.nodes[4].inputs = {3};
+        graph.nodes[5].op_type = ple_conv ? OpType::PLE_DILATED_CONV : OpType::SHORTCONV;
+        graph.nodes[5].inputs = {4, 1, 2};
+        graph.nodes[5].params.i32 = ple_conv ? std::vector<int32_t>{3, 2, 3} : std::vector<int32_t>{4, 3};
+        const bool reclaim=contract && backend.independent_stateful_mutable_input(graph.nodes[5])==2;
+        graph.nodes[6].op_type = OpType::ADD; graph.nodes[6].inputs = {0, 0};
+        graph.nodes[7].op_type = OpType::ADD; graph.nodes[7].inputs = {6, 6};
+        graph.nodes[8].op_type = OpType::ADD; graph.nodes[8].inputs = {5, 5};
+        graph.graph_inputs = {0, 1, 2}; graph.graph_outputs = {8};
+        if (owned_state) {
+            // Unlike the read-only activation view, this alias and its freshly
+            // materialized owner must survive the state-mutating dispatch.
+            auto& owner = graph.nodes[9];
+            owner.op_type = OpType::ADD; owner.inputs = {2, 2};
+            owner.out_shape[0] = ple_conv ? 4 : 3; owner.out_shape[1] = 4;
+            owner.dim_expr[1].kind = DIM_CONST;
+            graph.nodes[10] = owner; graph.nodes[10].id = 10;
+            graph.nodes[10].op_type = OpType::RESHAPE; graph.nodes[10].inputs = {9};
+            graph.nodes[5].inputs[2] = 10;
+            // Node IDs index tensors, whereas node order is topological.
+            std::rotate(graph.nodes.begin()+3, graph.nodes.begin()+9, graph.nodes.begin()+11);
+        }
+        if(returned_view) {
+            auto& view=graph.nodes.back();
+            view.op_type=OpType::RESHAPE;view.inputs={5};
+            graph.graph_outputs.push_back(view.id);
+        }
+        auto& tensors = graph.runtime.tensors;
+        tensors[1] = device_tensor(backend, 4, ple_conv ? 3 : 4);
+        tensors[2] = device_tensor(backend, ple_conv ? 4 : 3, 4);
+        std::vector<float> weights(ple_conv ? 12 : 16), state(ple_conv ? 16 : 12);
+        for (size_t i = 0; i < weights.size(); ++i) weights[i] = .03f * (i + 1);
+        for (size_t i = 0; i < state.size(); ++i) state[i] = .01f * i;
+        if (!upload(backend, tensors[1], weights) || !upload(backend, tensors[2], state)) return false;
+        BufferPool pool; ExecContext ctx;
+        ctx.graph = &graph; ctx.backend = &backend; ctx.pool = &pool;
+        ctx.conservative_stateful_liveness = planned;
+        ctx.stateful_readonly_last_use = contract;
+        prepare_execution(ctx);
+        for (int pass = 0; pass < 3; ++pass) {
+            const int rows = pass == 1 ? 5 : 3;
+            if (tensors[0].data) backend.free_output(tensors[0], nullptr);
+            tensors[0] = device_tensor(backend, 4, rows);
+            std::vector<float> input(4 * rows);
+            for (size_t i = 0; i < input.size(); ++i) input[i] = std::sin(i * .2f + pass);
+            if (!upload(backend, tensors[0], input)) return false;
+            ctx.runtime_seq_len = rows; inject_runtime_shapes(ctx);
+            if (owned_state) {
+                // Stop after the materialized state + alias, before the
+                // convolution. A partial call must also preserve both. The
+                // subsequent full call rematerializes, so do not bind prefix
+                // snapshots across those two execution lifetimes.
+                backend.begin_graph(); execute_graph(ctx,4); backend.end_graph();
+                if (ctx.execution_failed || !tensors[9].data ||
+                    tensors[10].data!=tensors[9].data) return false;
+            }
+            if (prefixes) {
+                if (!backend.begin_state_prefixes({&tensors[owned_state ? 10 : 2]},rows)) return false;
+            }
+            backend.begin_graph(); execute_graph(ctx); backend.end_graph();
+            std::vector<float> result, final_state, view_result;
+            if (ctx.execution_failed || backend.dispatch_failed() ||
+                !download(backend, tensors[8], result) ||
+                !download(backend, tensors[owned_state ? 10 : 2], final_state)) return false;
+            if (owned_state && (!tensors[9].data || tensors[10].data!=tensors[9].data)) return false;
+            if(returned_view && !download(backend,tensors[graph.graph_outputs.back()],view_result))return false;
+            if (!planned) { outputs.push_back(result); states.push_back(final_state);view_outputs.push_back(view_result); }
+            else if (result.size() != outputs[pass].size() || final_state.size() != states[pass].size() ||
+                     std::memcmp(result.data(), outputs[pass].data(), result.size() * sizeof(float)) ||
+                     std::memcmp(final_state.data(), states[pass].data(), final_state.size() * sizeof(float)) ||
+                     (returned_view && (view_result.size()!=view_outputs[pass].size() ||
+                         std::memcmp(view_result.data(),view_outputs[pass].data(),view_result.size()*sizeof(float)))) ||
+                     (reclaim ? (tensors[3].data || tensors[4].data ||
+                         (returned_view ? !tensors[5].data : tensors[5].data!=nullptr))
+                                             : (!tensors[3].data || !tensors[5].data)) ||
+                     tensors[6].data || tensors[7].data) return false;
+            if (prefixes) {
+                // Return each accepted prefix after read-only operands have
+                // been released, then restore the full prefix for the next pass.
+                for (int kept=1;kept<=rows;++kept) {
+                    std::vector<float> restored;
+                    if (!backend.restore_state_prefix(kept) ||
+                        !download(backend,tensors[owned_state ? 10 : 2],restored)) return false;
+                    if (mode==0) prefix_states.push_back(restored);
+                    else {
+                        const size_t index=(pass==0 ? 0 : pass==1 ? 3 : 8)+kept-1;
+                        if (restored.size()!=prefix_states[index].size() ||
+                            std::memcmp(restored.data(),prefix_states[index].data(),restored.size()*sizeof(float))) return false;
+                    }
+                }
+                backend.end_state_prefixes();
+                std::vector<float> restored_full;
+                if (!download(backend,tensors[owned_state ? 10 : 2],restored_full) || restored_full!=final_state) return false;
+            }
+        }
+        // Node4 is a borrowed view; release only owners that remain live.
+        for (int id : {0, 1, 2, 3, 5, 6, 7, 8})
+            if (tensors[id].data) backend.free_output(tensors[id], nullptr);
+        if (owned_state && tensors[9].data) backend.free_output(tensors[9], nullptr);
+    }
+    std::printf("conservative_convolution_graph ple_conv=%d returned_view=%d owned_state=%d prefixes=%d contract_modes=3 exact_output_state=1 changed_shapes=3 released_branch=1\n", ple_conv,returned_view,owned_state,prefixes);
+    return true;
+}
+
+bool test_conservative_sdpa_graph(CudaBackend& backend, bool fp16_cache = false, int dim = 4, bool contiguous_view = false) {
+    std::vector<std::vector<float>> outputs;
+    std::vector<std::vector<uint8_t>> caches;
+    constexpr int capacity = 16;
+    for (bool planned : {false, true}) {
+        backend.clear_dispatch_error();
+        Graph graph; graph.nodes.resize(12); graph.runtime.tensors.resize(12);
+        for (int i = 0; i < 12; ++i) {
+            auto& node = graph.nodes[i]; node.id = i;
+            node.out_shape[0] = dim; node.out_shape[1] = 3;
+            node.dim_expr[1].kind = DIM_SEQ;
+        }
+        for (int i = 0; i < 6; ++i) graph.nodes[i].op_type = OpType::INPUT;
+        for (int i : {3, 4, 5}) graph.nodes[i].dim_expr[1].kind = DIM_CONST;
+        graph.nodes[6].op_type = OpType::ADD; graph.nodes[6].inputs = {0, 0};
+        graph.nodes[7].op_type = contiguous_view ? OpType::CONTIGUOUS : OpType::RESHAPE;
+        graph.nodes[7].inputs = {6};
+        graph.nodes[8].op_type = OpType::SDPA;
+        graph.nodes[8].inputs = {7, 1, 2, 3, 4, 5};
+        graph.nodes[8].params.i32 = {2, 1, 1, 1, dim, dim};
+        graph.nodes[8].params.f32 = {.5f};
+        graph.nodes[9].op_type = OpType::ADD; graph.nodes[9].inputs = {0, 0};
+        graph.nodes[10].op_type = OpType::ADD; graph.nodes[10].inputs = {9, 9};
+        graph.nodes[11].op_type = OpType::ADD; graph.nodes[11].inputs = {8, 8};
+        graph.graph_inputs = {0, 1, 2, 3, 4, 5}; graph.graph_outputs = {11};
+        auto& tensors = graph.runtime.tensors;
+        const size_t element_bytes = fp16_cache ? sizeof(uint16_t) : sizeof(float);
+        const size_t payload_bytes = dim * capacity * element_bytes;
+        const size_t bytes = CacheMetadata::SIZE + payload_bytes;
+        for (int id : {4, 5}) {
+            tensors[id] = Tensor::create(fp16_cache ? Precision::FP16 : Precision::FP32,
+                MemoryType::EXTERNAL, bytes / element_bytes);
+            backend.alloc_persistent(tensors[id], bytes,
+                PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX, CacheMetadata::SIZE);
+            std::vector<uint8_t> zero(payload_bytes, 0);
+            if (!backend.copy_from_host(zero.data(), tensors[id], zero.size(), CacheMetadata::SIZE)) return false;
+        }
+        BufferPool pool; ExecContext ctx;
+        ctx.graph = &graph; ctx.backend = &backend; ctx.pool = &pool;
+        ctx.conservative_stateful_liveness = planned; prepare_execution(ctx);
+        int past = 0;
+        for (int pass = 0; pass < 3; ++pass) {
+            const int rows = pass == 1 ? 5 : 3;
+            for (int id : {0, 1, 2}) {
+                if (tensors[id].data) backend.free_output(tensors[id], nullptr);
+                tensors[id] = device_tensor(backend, dim, rows);
+                std::vector<float> values(dim * rows);
+                for (size_t i = 0; i < values.size(); ++i) values[i] = std::sin(i * .2f + pass + id);
+                if (!upload(backend, tensors[id], values)) return false;
+            }
+            CacheMetadata metadata{};
+            metadata.current_seq_len = past; metadata.max_seq_len = capacity;
+            metadata.num_kv_heads = 1; metadata.head_dim = dim; metadata.v_head_dim = dim;
+            for (int id : {4, 5}) if (!backend.copy_from_host(&metadata, tensors[id], sizeof(metadata))) return false;
+            ctx.runtime_seq_len = rows; inject_runtime_shapes(ctx);
+            backend.begin_graph(); execute_graph(ctx); backend.end_graph();
+            std::vector<float> result;
+            std::vector<uint8_t> payload(2 * payload_bytes);
+            if (ctx.execution_failed || backend.dispatch_failed() || !download(backend, tensors[11], result)) return false;
+            for (int id : {4, 5}) if (!backend.copy_to_host(tensors[id],
+                payload.data() + (id - 4) * payload_bytes, payload_bytes, CacheMetadata::SIZE)) return false;
+            if (!planned) { outputs.push_back(result); caches.push_back(payload); }
+            else if (result.size() != outputs[pass].size() ||
+                std::memcmp(result.data(), outputs[pass].data(), result.size() * sizeof(float)) ||
+                std::memcmp(payload.data(), caches[pass].data(), payload.size()) ||
+                !tensors[6].data || !tensors[8].data || tensors[9].data || tensors[10].data) return false;
+            past += rows;
+        }
+        for (int id : {0, 1, 2, 6, 8, 9, 10, 11})
+            if (tensors[id].data) backend.free_output(tensors[id], nullptr);
+    }
+    std::printf("conservative_sdpa_graph dim=%d fp16_cache=%d contiguous_view=%d exact_output_kv=1 changed_shapes=3 released_branch=1\n", dim, fp16_cache, contiguous_view);
+    return true;
+}
+
+bool test_conservative_materialized_view_chain(CudaBackend& backend, bool dynamic = false) {
+    std::vector<std::vector<float>> reference;
+    for (bool planned : {false, true}) {
+        Graph graph; graph.nodes.resize(8); graph.runtime.tensors.resize(8);
+        const int64_t shapes[8][4] = {{8,3,1,1}, {8,3,1,1}, {4,3,1,1},
+            {2,2,3,1}, {2,3,2,1}, {4,3,1,1}, {2,6,1,1}, {2,6,1,1}};
+        for (int i = 0; i < 8; ++i) {
+            graph.nodes[i].id = i;
+            std::copy(shapes[i], shapes[i] + 4, graph.nodes[i].out_shape);
+            if (dynamic) {
+                const int axis = i == 3 ? 2 : 1;
+                graph.nodes[i].dim_expr[axis].kind = i >= 6 ? DIM_MUL : DIM_SEQ;
+                graph.nodes[i].dim_expr[axis].coeff = i >= 6 ? 2 : 0;
+            }
+        }
+        graph.nodes[0].op_type = OpType::INPUT;
+        graph.nodes[1].op_type = OpType::ADD; graph.nodes[1].inputs = {0,0};
+        graph.nodes[2].op_type = OpType::SLICE; graph.nodes[2].inputs = {1};
+        graph.nodes[2].params.i32 = {0,2,4};
+        graph.nodes[3].op_type = OpType::RESHAPE; graph.nodes[3].inputs = {2};
+        graph.nodes[4].op_type = OpType::PERMUTE; graph.nodes[4].inputs = {3};
+        graph.nodes[4].params.i32 = {0,2,1,3};
+        // Same-sized allocation between the borrowed view and its consumer:
+        // an early release of materialized reshape 3 corrupts view 4.
+        graph.nodes[5].op_type = OpType::SIGMOID_MUL; graph.nodes[5].inputs = {2,2};
+        graph.nodes[6].op_type = OpType::RESHAPE; graph.nodes[6].inputs = {4};
+        graph.nodes[7].op_type = OpType::ADD; graph.nodes[7].inputs = {6,6};
+        graph.graph_inputs = {0}; graph.graph_outputs = {7};
+        auto& tensors = graph.runtime.tensors;
+        tensors[0] = device_tensor(backend,8,3);
+        BufferPool pool; ExecContext ctx;
+        ctx.graph = &graph; ctx.backend = &backend; ctx.pool = &pool;
+        ctx.conservative_stateful_liveness = planned;
+        ctx.reuse_static_workspace = !planned;
+        prepare_execution(ctx);
+        if (planned) {
+            for (size_t i = 0; i < 6; ++i)
+                if (std::find(ctx.release_queue[i].begin(), ctx.release_queue[i].end(), 3) !=
+                    ctx.release_queue[i].end()) {
+                    std::fprintf(stderr,"materialized_view_chain premature_release node=3 at=%zu\n",i);
+                    return false;
+                }
+        }
+        for (int pass = 0; pass < 3; ++pass) {
+            const int rows = dynamic && pass == 1 ? 5 : 3;
+            if (dynamic) {
+                backend.free_output(tensors[0], nullptr);
+                tensors[0] = device_tensor(backend, 8, rows);
+                ctx.runtime_seq_len = rows;
+                inject_runtime_shapes(ctx);
+            }
+            std::vector<float> values(8 * rows), actual;
+            for (size_t i = 0; i < values.size(); ++i) values[i] = float(i + pass * 31) / 8.f;
+            if (!upload(backend,tensors[0],values)) return false;
+            backend.begin_graph(); execute_graph(ctx); backend.end_graph();
+            if (ctx.execution_failed || backend.dispatch_failed() ||
+                !download(backend,tensors[7],actual)) return false;
+            if (actual.size() != size_t(4 * rows)) return false;
+            for (int h = 0; h < 2; ++h)
+                for (int s = 0; s < rows; ++s)
+                    for (int d = 0; d < 2; ++d)
+                        if (actual[d + 2 * (s + rows * h)] !=
+                            4.f * values[2 + d + 2 * h + 8 * s]) {
+                            std::fprintf(stderr, "reshape analytic mismatch dynamic=%d planned=%d pass=%d d=%d s=%d h=%d actual=%g expected=%g\n",
+                                dynamic, planned, pass, d, s, h, actual[d + 2 * (s + rows * h)],
+                                4.f * values[2 + d + 2 * h + 8 * s]);
+                            return false;
+                        }
+            if (!planned && !dynamic) {
+                size_t strides[4];
+                const bool view = backend.reshape_view_strides(tensors[2], tensors[3], strides);
+                if (tensors[3].shares_storage_with(tensors[2]) != view ||
+                    tensors[6].shares_storage_with(tensors[4])) {
+                    std::fprintf(stderr, "reshape alias mismatch dynamic=%d planned=%d pass=%d view=%d\n", dynamic, planned, pass, view);
+                    return false;
+                }
+            }
+            if (!planned) reference.push_back(actual);
+            else if (actual.size() != reference[pass].size() ||
+                std::memcmp(actual.data(),reference[pass].data(),actual.size()*sizeof(float))) {
+                std::fprintf(stderr,"materialized_view_chain mismatch pass=%d\n",pass);
+                return false;
+            }
+        }
+        const bool borrowed3 = tensors[3].data && tensors[3].shares_storage_with(tensors[2]);
+        for (int id : {0,1,3,5,6,7})
+            if (!(id == 3 && borrowed3))
+            if (tensors[id].data) backend.free_output(tensors[id],nullptr);
+        backend.release_graph_plan(graph);
+    }
+    std::printf("conservative_materialized_view_chain exact_output=1 changed_inputs=3 dynamic=%d\n", dynamic);
+    return true;
+}
+
+bool test_conservative_ple_graph(CudaBackend&) {
+    CudaBackend backend;
+    backend.set_operator_fallback_policy(OperatorFallbackPolicy::ALLOW_REFERENCE);
+    std::vector<std::vector<float>> outputs;
+    std::vector<std::vector<int32_t>> histories;
+    for (bool planned : {false, true}) {
+        Graph graph; graph.nodes.resize(11); graph.runtime.tensors.resize(11);
+        for (int i = 0; i < 11; ++i) {
+            auto& node = graph.nodes[i]; node.id = i;
+            node.out_shape[0] = 4; node.out_shape[1] = 4;
+        }
+        for (int i = 0; i < 7; ++i) graph.nodes[i].op_type = OpType::INPUT;
+        graph.nodes[7].op_type = OpType::PLE_LOOKUP;
+        graph.nodes[7].inputs = {0, 1, 2, 3, 4, 5};
+        graph.nodes[7].params.i32 = {3, 1, 0, 100, 0, 1234, 0, 4};
+        graph.nodes[8].op_type = OpType::ADD; graph.nodes[8].inputs = {6, 6};
+        graph.nodes[9].op_type = OpType::ADD; graph.nodes[9].inputs = {8, 8};
+        graph.nodes[10].op_type = OpType::ADD; graph.nodes[10].inputs = {7, 7};
+        graph.graph_outputs = {10};
+        int32_t ids[4] = {4, 0, 5, 6}, history[3] = {1, 2, 1};
+        int32_t sizes[2] = {7, 11}, offsets[2] = {0, 7};
+        uint8_t table[36]; float scale = .5f;
+        for (int i = 0; i < 36; ++i) table[i] = uint8_t(0x30 + i % 8);
+        auto& tensors = graph.runtime.tensors;
+        tensors[0] = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 4, 1, 1, 1, ids);
+        tensors[1] = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 3, 1, 1, 1, history);
+        tensors[2] = Tensor::create(Precision::RAW_U8, MemoryType::EXTERNAL, 2, 18, 1, 1, table);
+        tensors[3] = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1, &scale);
+        tensors[4] = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 2, 1, 1, 1, sizes);
+        tensors[5] = Tensor::create(Precision::INT32, MemoryType::EXTERNAL, 2, 1, 1, 1, offsets);
+        tensors[6] = device_tensor(backend, 4, 4);
+        if (!upload(backend, tensors[6], std::vector<float>(16, .25f))) return false;
+        BufferPool pool; ExecContext ctx;
+        ctx.graph = &graph; ctx.backend = &backend; ctx.pool = &pool;
+        ctx.conservative_stateful_liveness = planned;
+        ctx.static_padded = true; ctx.padded_seq_len = 4;
+        prepare_execution(ctx);
+        for (int pass = 0; pass < 3; ++pass) {
+            ids[0] = 4 + pass; ids[2] = 5 - pass;
+            ctx.runtime_seq_len = pass == 1 ? 4 : 3;
+            inject_runtime_shapes(ctx);
+            backend.begin_graph(); execute_graph(ctx); backend.end_graph();
+            std::vector<float> result;
+            if (ctx.execution_failed || backend.dispatch_failed() || !download(backend, tensors[10], result)) return false;
+            std::vector<int32_t> current(history, history + 3);
+            if (!planned) { outputs.push_back(result); histories.push_back(current); }
+            else if (result.size() != outputs[pass].size() ||
+                std::memcmp(result.data(), outputs[pass].data(), result.size() * sizeof(float)) ||
+                current != histories[pass] || !tensors[7].data || tensors[8].data || tensors[9].data) return false;
+        }
+        for (int id : {6, 7, 8, 9, 10})
+            if (tensors[id].data) backend.free_output(tensors[id], nullptr);
+    }
+    std::puts("conservative_ple_graph host_table=1 exact_output_history=1 changed_real_tokens=3 released_branch=1");
+    return true;
+}
+
+bool test_sigmoid_gr_reduce_graph(CudaBackend& backend) {
+    constexpr int hidden = 19, streams = 4, wide = hidden * streams;
+    Graph graph; graph.nodes.resize(5); graph.runtime.tensors.resize(5);
+    for (int i = 0; i < 5; ++i) {
+        auto& node = graph.nodes[i]; node.id = i;
+        node.out_shape[0] = i == 4 ? hidden : wide;
+        node.out_shape[1] = 3; node.dim_expr[1].kind = DIM_SEQ;
+        graph.runtime.tensors[i] = Tensor::create(Precision::FP32,
+            MemoryType::NONE, node.out_shape[0], 3, 1, 1, nullptr);
+    }
+    graph.nodes[0].op_type = graph.nodes[1].op_type = OpType::INPUT;
+    graph.nodes[2].op_type = OpType::ADD; graph.nodes[2].inputs = {1, 1};
+    graph.nodes[3].op_type = OpType::SIGMOID; graph.nodes[3].inputs = {2};
+    graph.nodes[4].op_type = OpType::GR_REDUCE;
+    graph.nodes[4].inputs = {0, 3}; graph.nodes[4].params.i32 = {hidden, streams};
+    graph.graph_inputs = {0, 1}; graph.graph_outputs = {4};
+    BufferPool pool; ExecContext ctx;
+    ctx.graph = &graph; ctx.pool = &pool; ctx.backend = &backend;
+    prepare_execution(ctx);
+    for (int rows : {3, 5, 1, 5}) {
+        std::vector<float> x(wide * rows), logits(wide * rows), doubled(wide * rows);
+        for (size_t i = 0; i < x.size(); ++i) {
+            x[i] = std::sin(float(i) * .17f + rows);
+            logits[i] = std::cos(float(i) * .11f + rows);
+            doubled[i] = logits[i] + logits[i];
+        }
+        for (int id : {0, 1}) {
+            if (graph.runtime.tensors[id].data) backend.free_output(graph.runtime.tensors[id], nullptr);
+            graph.runtime.tensors[id] = device_tensor(backend, wide, rows);
+        }
+        if (!upload(backend, graph.runtime.tensors[0], x) ||
+            !upload(backend, graph.runtime.tensors[1], logits)) return false;
+        ctx.runtime_seq_len = rows; inject_runtime_shapes(ctx);
+        backend.begin_graph(); execute_graph(ctx); backend.end_graph();
+        std::vector<float> actual;
+        if (ctx.execution_failed || backend.dispatch_failed() ||
+            !download(backend, graph.runtime.tensors[4], actual)) return false;
+        Tensor raw = device_tensor(backend, wide, rows);
+        Tensor gate = device_tensor(backend, wide, rows);
+        Tensor output = device_tensor(backend, hidden, rows);
+        if (!upload(backend, raw, doubled)) return false;
+        backend.begin_graph();
+        backend.dispatch(graph.nodes[3], {&raw}, &gate, nullptr);
+        backend.dispatch(graph.nodes[4], {&graph.runtime.tensors[0], &gate}, &output, nullptr);
+        backend.end_graph();
+        std::vector<float> expected;
+        if (backend.dispatch_failed() || !download(backend, output, expected) ||
+            actual.size() != expected.size() ||
+            std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float))) {
+            std::fprintf(stderr, "sigmoid GR graph bit-exact mismatch rows=%d\n", rows);
+            return false;
+        }
+        if (rows > 1 && backend.supports_sigmoid_gr_reduce_fusion() &&
+            graph.runtime.tensors[3].data) return false;
+        for (Tensor* tensor : {&raw, &gate, &output}) backend.free_output(*tensor, nullptr);
+    }
+    for (auto& tensor : graph.runtime.tensors)
+        if (tensor.data) backend.free_output(tensor, nullptr);
+    return true;
+}
+
 }  // namespace
 
-int main() {
+bool test_shared_fp16_cache(CudaBackend& backend) {
+    const char* trace_flag = std::getenv("MOLLM_TEST_CUDA_SHARED_CACHE_TRACE");
+    const bool trace = trace_flag && !std::strcmp(trace_flag,"1");
+    const auto stage = [&](const char* label,int n=0,int k=0,int rows=0,int pass=0) {
+        if (trace) std::fprintf(stderr,"shared_cache_stage=%s n=%d k=%d rows=%d pass=%d\n",label,n,k,rows,pass);
+    };
+    stage("begin");
+    if (!backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE)) return false;
+    const char* flag = std::getenv("MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED");
+    const char* budget = std::getenv("MOLLM_CUDA_PREFILL_FP16_CACHE_MB");
+    const bool enabled = flag && !std::strcmp(flag, "1");
+    const size_t limit = budget ? size_t(std::strtoull(budget, nullptr, 10)) * 1024 * 1024 : 0;
+    const bool small = std::getenv("MOLLM_TEST_CUDA_SHARED_CACHE_SMALL") != nullptr;
+    const std::vector<int> row_cases = small ? std::vector<int>{17} : std::vector<int>{17,719,1743};
+    std::vector<std::vector<Q4B8G32Block>> sources;
+    std::vector<std::vector<mollm::cpu::fp16_t>> dense_sources;
+    size_t expected_bytes = backend.prefill_shared_cache_bytes(), expected_hits = backend.prefill_shared_cache_hits();
+    for (auto shape : {std::pair<int,int>{640,2560}, {2560,640}, {512,2560}}) {
+        const int n = shape.first, k = shape.second, groups = k / 32;
+        sources.emplace_back(size_t(n / 8) * groups);
+        dense_sources.emplace_back(size_t(n) * k);
+        auto& blocks = sources.back(); auto& dense = dense_sources.back();
+        for (int row = 0; row < n; ++row) for (int group = 0; group < groups; ++group) {
+            auto& b = blocks[size_t(row / 8) * groups + group];
+            const float scale = (1 + (row + group) % 13) / 7.f;
+            b.scales[row % 8] = scale;
+            for (int pair = 0; pair < 16; ++pair) {
+                const unsigned low = (row + group * 7 + pair * 3) % 16;
+                const unsigned high = (row * 3 + group + pair * 11) % 16;
+                b.q[row % 8][pair] = uint8_t((low ^ 8u) | ((high ^ 8u) << 4));
+                dense[size_t(row) * k + group * 32 + 2 * pair] = mollm::cpu::fp16_t((int(low)-8)*scale);
+                dense[size_t(row) * k + group * 32 + 2 * pair + 1] = mollm::cpu::fp16_t((int(high)-8)*scale);
+            }
+        }
+        Tensor q = Tensor::create(Precision::INT4, MemoryType::EXTERNAL, n, k, 1, 1, blocks.data());
+        q.rowmajor_data = blocks.data(); q.q4_g32_data = blocks.data(); q.is_q4_g32_packed = true;
+        stage("wrap_q4",n,k);
+        q.group_size = 32; q.groups_per_row = groups; backend.wrap_weight_int4(q);
+        Tensor h = Tensor::create(Precision::FP16, MemoryType::EXTERNAL, n, k, 1, 1, dense.data());
+        stage("wrap_fp16",n,k);
+        backend.wrap_weight(h);
+        stage("weights_ready",n,k);
+        const size_t bytes = size_t(n) * k * 2;
+        const bool cached = enabled && n != 512 && expected_bytes <= limit && bytes <= limit - expected_bytes;
+        if (cached) expected_bytes += size_t(n) * k * 2;
+        if (backend.prefill_shared_cache_bytes() != expected_bytes) {
+            std::fprintf(stderr,"shared cache bytes mismatch actual=%zu expected=%zu\n",backend.prefill_shared_cache_bytes(),expected_bytes);
+            return false;
+        }
+        for (int rows : row_cases) for (int pass = 0; pass < 3; ++pass) {
+            stage("gemm_begin",n,k,rows,pass);
+            std::vector<float> x(size_t(rows)*k), actual(size_t(rows)*n), reference(size_t(rows)*n);
+            for (size_t i=0;i<x.size();++i) x[i] = float(int((i*7+pass*19)%97)-48)/83.f;
+            Tensor dx = device_tensor(backend,k,rows), dy = device_tensor(backend,n,rows), dr = device_tensor(backend,n,rows);
+            GraphNode gemm; gemm.op_type=OpType::MATMUL;
+            if (!upload(backend,dx,x)) { stage("upload_failed",n,k,rows,pass); return false; }
+            backend.clear_dispatch_error(); backend.dispatch(gemm,{&dx,&q},&dy,nullptr);
+            if (backend.dispatch_failed()) { stage("q4_dispatch_failed",n,k,rows,pass); return false; }
+            stage("q4_dispatched",n,k,rows,pass);
+            backend.dispatch(gemm,{&dx,&h},&dr,nullptr);
+            stage("fp16_dispatched",n,k,rows,pass);
+            const bool okay = !backend.dispatch_failed() && download(backend,dy,actual) && download(backend,dr,reference);
+            for (Tensor* t : {&dx,&dy,&dr}) backend.free_output(*t,nullptr);
+            if (!okay ||
+                actual.size()!=reference.size() || std::memcmp(actual.data(),reference.data(),actual.size()*4)) {
+                std::fprintf(stderr,"shared cache/reference mismatch n=%d k=%d rows=%d pass=%d\n",n,k,rows,pass);
+                return false;
+            }
+            if (cached) ++expected_hits;
+            if (backend.prefill_shared_cache_hits()!=expected_hits ||
+                backend.prefill_shared_cache_bytes()!=expected_bytes) {
+                std::fprintf(stderr,"shared cache counters mismatch hits=%zu/%zu bytes=%zu/%zu\n",backend.prefill_shared_cache_hits(),expected_hits,backend.prefill_shared_cache_bytes(),expected_bytes);
+                return false;
+            }
+            stage("gemm_exact",n,k,rows,pass);
+        }
+        stage("decode_begin",n,k);
+        std::vector<float> x(k,.125f), decode(n);
+        Tensor dx = device_tensor(backend,k), dy = device_tensor(backend,n);
+        GraphNode gemm; gemm.op_type=OpType::MATMUL;
+        if (!upload(backend,dx,x)) return false;
+        backend.clear_dispatch_error(); backend.dispatch(gemm,{&dx,&q},&dy,nullptr);
+        const bool okay = !backend.dispatch_failed() && download(backend,dy,decode);
+        backend.free_output(dx,nullptr); backend.free_output(dy,nullptr);
+        if (!okay || backend.prefill_shared_cache_hits()!=expected_hits) return false;
+        stage("decode_done",n,k);
+    }
+    std::printf("shared_fp16_cache enabled=%d bytes=%zu hits=%zu shapes=3 rows=%s changed_inputs=3 exact_fp16_reference=1 decode_not_using_cache=1\n",
+                enabled,expected_bytes,expected_hits,small?"17":"17,719,1743");
+    return true;
+}
+
+int main(int argc, char** argv) {
+    const bool shared_cache_only=argc==2 && !std::strcmp(argv[1],"--shared-cache-only");
+    const bool reshape_only=argc==2 && !std::strcmp(argv[1],"--strided-reshape-only");
+    const bool contracts_only=argc==2 && !std::strcmp(argv[1],"--stateful-contract-only");
+    const bool shadow_only=argc==2 && !std::strcmp(argv[1],"--sdpa-shadow-only");
+    const bool head_group_only=argc==2 && !std::strcmp(argv[1],"--sdpa-head-group-only");
+    const bool native_pv_only=argc==2 && !std::strcmp(argv[1],"--sdpa-native-pv-only");
+    const bool full_batch_only=argc==2 && !std::strcmp(argv[1],"--sdpa-full-batch-only");
+    if (argc!=1 && !contracts_only && !shadow_only && !head_group_only && !native_pv_only && !full_batch_only && !reshape_only && !shared_cache_only) {
+        std::fprintf(stderr,"usage: %s [--stateful-contract-only|--sdpa-shadow-only|--sdpa-head-group-only|--sdpa-native-pv-only|--sdpa-full-batch-only|--strided-reshape-only|--shared-cache-only]\n",argv[0]);
+        return 2;
+    }
+    {
+        const char* prior = std::getenv("MOLLM_CUDA_HOST_HEADROOM_MB");
+        const bool had_prior = prior != nullptr;
+        const std::string saved = prior ? prior : "";
+        void* pointer = nullptr;
+        setenv("MOLLM_CUDA_HOST_HEADROOM_MB", "bad", 1);
+        const bool rejected_device = !mollm_cuda::malloc_device(&pointer, 4096, "test guard device") && !pointer;
+        const bool rejected_managed = !mollm_cuda::malloc_managed(&pointer, 4096, "test guard managed") && !pointer;
+        setenv("MOLLM_CUDA_HOST_HEADROOM_MB", "1048576", 1);
+        const bool rejected_budget = !mollm_cuda::malloc_device(&pointer, SIZE_MAX, "test guard impossible") && !pointer;
+        if (had_prior) setenv("MOLLM_CUDA_HOST_HEADROOM_MB", saved.c_str(), 1);
+        else unsetenv("MOLLM_CUDA_HOST_HEADROOM_MB");
+        if (!rejected_device || !rejected_managed || !rejected_budget) return 1;
+        std::puts("cuda_host_headroom_guard rejected_device_managed=1 allocation_pointer_null=1");
+    }
     CudaBackend backend;
     if (!backend.available()) {
         std::fprintf(stderr, "CUDA device unavailable; skipping\n");
         return 77;
     }
+    if (shared_cache_only) return test_shared_fp16_cache(backend) ? 0 : 1;
+    if (reshape_only) {
+        if (!backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE)) return 1;
+        Tensor source = Tensor::create(Precision::FP32, MemoryType::NONE, 4, 3);
+        source.stride[1] = 32;
+        Graph geometry;
+        geometry.nodes.resize(5); geometry.runtime.tensors.resize(5);
+        for (int i = 0; i < 5; ++i) geometry.nodes[i].id = i;
+        geometry.nodes[0].op_type = OpType::INPUT;
+        geometry.nodes[1].op_type = OpType::SLICE; geometry.nodes[1].inputs = {0};
+        geometry.nodes[1].params.i32 = {0, 0, 4};
+        geometry.nodes[2].op_type = OpType::RESHAPE; geometry.nodes[2].inputs = {1};
+        geometry.nodes[3].op_type = OpType::PERMUTE; geometry.nodes[3].inputs = {2};
+        geometry.nodes[3].params.i32 = {0, 2, 1, 3};
+        geometry.nodes[4].op_type = OpType::RESHAPE; geometry.nodes[4].inputs = {3};
+        geometry.graph_outputs = {4};
+        Tensor& target = geometry.runtime.tensors[2];
+        target = Tensor::create(Precision::FP32, MemoryType::NONE, 2, 2, 3);
+        backend.prepare_graph(geometry);
+        size_t strides[4] = {11, 22, 33, 44};
+        const bool enabled = backend.reshape_view_strides(source, target, strides);
+        GraphNode conv; conv.op_type = OpType::SHORTCONV; conv.inputs = {0, 1, 2};
+        const char* flag = std::getenv("MOLLM_CUDA_STRIDED_RESHAPE_VIEWS");
+        if (enabled != bool(flag && !std::strcmp(flag, "1") &&
+                            backend.independent_stateful_mutable_input(conv) == 2)) return 1;
+        if (enabled && (strides[0] != 4 || strides[1] != 8 || strides[2] != 32 || strides[3] != 96)) return 1;
+        const Tensor original_target = target;
+        for (int invalid = 0; invalid < 8; ++invalid) {
+            Tensor s = source;
+            target = original_target;
+            if (invalid == 0) s.stride[0] = 8;
+            if (invalid == 1) s.stride[1] = 8;
+            if (invalid == 2) s.stride[1] = 31;
+            if (invalid == 3) s.shape[2] = 2;
+            if (invalid == 4) target.shape[0] = 3;
+            if (invalid == 5) target.shape[2] = 4;
+            if (invalid == 6) target.prec = Precision::FP16;
+            if (invalid == 7) s.stride[1] = SIZE_MAX - 3;
+            size_t untouched[4] = {11, 22, 33, 44};
+            if (backend.reshape_view_strides(s, target, untouched) || untouched[0] != 11 ||
+                untouched[1] != 22 || untouched[2] != 33 || untouched[3] != 44) return 1;
+        }
+        target = original_target;
+        for (int rejected = 0; rejected < 4; ++rejected) {
+            geometry.nodes[3].op_type = rejected == 0 ? OpType::ADD : OpType::PERMUTE;
+            geometry.nodes[3].inputs = rejected == 0 ? std::vector<uint32_t>({2, 2}) : std::vector<uint32_t>({2});
+            geometry.nodes[2].inputs = rejected == 3 ? std::vector<uint32_t>({0}) : std::vector<uint32_t>({1});
+            geometry.graph_outputs = rejected == 1 ? std::vector<uint32_t>({2, 4}) :
+                                     rejected == 2 ? std::vector<uint32_t>({3, 4}) : std::vector<uint32_t>({4});
+            backend.prepare_graph(geometry);
+            if (backend.reshape_view_strides(source, target, strides)) return 1;
+        }
+        backend.release_graph_plan(geometry);
+        const auto before = backend.strided_reshape_view_calls();
+        if (!test_conservative_materialized_view_chain(backend) ||
+            !test_conservative_materialized_view_chain(backend, true) ||
+            backend.strided_reshape_view_calls() - before != size_t(enabled ? 12 : 0)) return 1;
+        std::printf("strided_reshape_views enabled=%d exact_analytic_output=1 static_dynamic_reuse=1 calls=%zu invalid=8\n",
+                    enabled, backend.strided_reshape_view_calls() - before);
+        return 0;
+    }
+    if(full_batch_only) {
+        for(int rows:{1025,1743,2048,2049}) {
+            const auto before=backend.attention_query_group_calls();
+            if(!test_wide_cached_sdpa(backend,Precision::FP16,0,rows,true,1,256,true,2)||
+                backend.attention_query_group_calls()-before!=size_t(rows<=2048))return 1;
+            std::printf("CUDA SDPA logical batch rows=%d reference/cache checks PASS grouped=%d\n",rows,int(rows<=2048));
+            std::fflush(stdout);
+        }
+        return 0;
+    }
+    if(native_pv_only) {
+        if(!backend.set_logical_prefill_batch(true))return 1;
+        const char* mode=std::getenv("MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM");
+        const bool enabled=(!mode||!std::strcmp(mode,"1"))&&
+            mollm_cuda::logical_prefill_option(std::getenv("MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX"),true)&&
+            mollm_cuda::logical_prefill_option(std::getenv("MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV"),true)&&
+            mollm_cuda::logical_prefill_option(std::getenv("MOLLM_CUDA_SDPA_PREFILL_PV_PAIR"),true);
+        cudaDeviceProp properties{};int current_device=0;
+        if(cudaGetDevice(&current_device)!=cudaSuccess||cudaGetDeviceProperties(&properties,current_device)!=cudaSuccess)return 1;
+        const bool long_pv_qualified=properties.major==12&&properties.minor==1&&
+            properties.maxThreadsPerBlock>=512&&properties.regsPerBlock>=32768;
+        const bool actual_long_selected=long_pv_qualified||(mode&&!std::strcmp(mode,"1"));
+        const char* head_option=std::getenv("MOLLM_TEST_CUDA_SDPA_PV_HEAD_LANES");
+        const int head_max_keys=head_option&&!std::strcmp(head_option,"2")?32768:16384;
+        const bool head_pair=properties.major==12&&properties.minor==1&&
+            properties.maxThreadsPerBlock>=512&&properties.regsPerBlock>=32768&&
+            (!head_option||!std::strcmp(head_option,"2"));
+        const char* mid_option=std::getenv("MOLLM_TEST_CUDA_SDPA_MID_PV_GEMM");
+        const bool mid_pair=(!mid_option||!std::strcmp(mid_option,"1"))&&
+            properties.major==12&&properties.minor==1&&
+            properties.maxThreadsPerBlock>=512&&properties.regsPerBlock>=32768;
+        size_t expected_score_peak=0;
+        auto run=[&](int keys,int rows,int ratio,bool selected,int capacity=0) {
+            expected_score_peak=std::max(expected_score_peak,size_t(2*ratio)*rows*keys*sizeof(float));
+            const auto before=backend.attention_native_pv_calls();
+            const auto head_before=backend.attention_head_lane_calls();
+            return test_wide_cached_sdpa(backend,Precision::FP16,keys-rows,rows,true,2,256,true,ratio,capacity)&&
+                backend.attention_score_workspace_bytes()==expected_score_peak&&
+                backend.attention_native_pv_calls()-before==size_t(enabled&&selected)&&
+                backend.attention_head_lane_calls()-head_before==size_t(enabled&&selected&&head_pair&&keys>4096&&keys<=head_max_keys);
+        };
+        const bool passed=run(4097,32,12,true)&&run(4097,33,12,true)&&
+            run(8192,32,12,true)&&run(8193,32,12,true)&&
+            run(16384,32,12,true,16384)&&run(16384,32,12,true)&&run(16385,32,12,actual_long_selected)&&
+            run(32768,32,12,actual_long_selected,32768)&&
+            run(4097,32,12,true,32768)&&run(16384,32,12,true,32768)&&run(4097,32,12,false,32769)&&
+            run(4097,31,12,false)&&run(4096,32,12,mid_pair)&&run(4097,32,4,false)&&
+            run(2080,32,12,mid_pair)&&run(3072,1024,12,mid_pair)&&
+            run(3072,1025,12,false)&&run(2080,31,12,false)&&run(2048,32,12,false);
+        if(!backend.set_logical_prefill_batch(false))return 1;
+        const auto before=backend.attention_native_pv_calls();
+        const auto ordinary_head_before=backend.attention_head_lane_calls();
+        const bool ordinary=test_wide_cached_sdpa(backend,Precision::FP16,4065,32,true,2,256,true,12)&&
+            backend.attention_native_pv_calls()==before&&backend.attention_head_lane_calls()==ordinary_head_before;
+        if(!backend.set_logical_prefill_batch(true))return 1;
+        const bool restored=run(4097,32,12,true);
+        std::puts(passed&&ordinary&&restored?"CUDA native-probability PV selector/reference fixtures passed":"CUDA native-probability PV fixtures FAILED");
+        return passed&&ordinary&&restored?0:1;
+    }
+    if(head_group_only) {
+        const char* mode=std::getenv("MOLLM_CUDA_SDPA_PREFILL_HEAD_GROUP");
+        const bool enabled=mode&&!std::strcmp(mode,"4");
+        auto run=[&](int past,int current,int dim,int ratio,bool selected) {
+            const auto before=backend.attention_head_group_calls();
+            return test_wide_cached_sdpa(backend,Precision::FP16,past,current,true,2,dim,true,ratio)&&
+                backend.attention_head_group_calls()-before==size_t(enabled&&selected);
+        };
+        const bool narrow_passed=run(0,17,256,4,false)&&run(1007,17,256,4,false)&&
+            run(1008,17,256,4,true)&&run(1280,17,256,2,false)&&
+            run(1280,1,256,4,false)&&run(1280,17,128,4,false)&&
+            run(4080,17,256,4,false)&&run(16381,3,256,4,false);
+        const auto before_full=backend.attention_head_group_calls();
+        const bool passed=narrow_passed&&
+            test_wide_cached_sdpa(backend,Precision::FP16,0,1743,true,1,256,true,4)&&
+            backend.attention_head_group_calls()-before_full==size_t(enabled);
+        std::puts(passed?"CUDA long head-group selector/reference fixtures passed":"CUDA long head-group selector/reference fixtures FAILED");
+        return passed?0:1;
+    }
+    if(shadow_only) {
+        if(!std::getenv("MOLLM_TEST_CUDA_SDPA_GEMM_SHADOW"))return 2;
+        const bool passed=test_wide_cached_sdpa(backend,Precision::FP16,0,17,true,2,256,true)&&
+            test_wide_cached_sdpa(backend,Precision::FP16,511,17,true,2,256,true)&&
+            test_wide_cached_sdpa(backend,Precision::FP16,1280,17,true,2,256,true)&&
+            test_wide_cached_sdpa(backend,Precision::FP16,0,17,true,2,256,false)&&
+            test_wide_cached_sdpa(backend,Precision::FP16,0,1743,true,1,256,true);
+        std::puts(passed?"CUDA SDPA diagnostic shadow fixtures passed":"CUDA SDPA diagnostic shadow fixtures FAILED");
+        return passed?0:1;
+    }
+    {
+        GraphNode conv;conv.op_type=OpType::SHORTCONV;conv.inputs={0,1,2};
+        GraphNode gdn;gdn.op_type=OpType::GATED_DELTANET_PREFILL;gdn.inputs.resize(8);
+        bool uncaptured=true;
+#ifdef MOLLM_CUDA_DECODE_SEGMENTS
+        uncaptured=std::getenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS")!=nullptr;
+#endif
+        if (backend.independent_stateful_mutable_input(conv)!=(uncaptured ? 2 : -1) ||
+            backend.independent_stateful_mutable_input(gdn)!=(uncaptured ? 7 : -1)) return 1;
+        std::printf("stateful_contract_capture_guard uncaptured=%d contracts_available=%d\n",uncaptured,uncaptured);
+    }
+    if (contracts_only) {
+        const bool passed=test_conservative_shortconv_graph(backend) &&
+            test_conservative_shortconv_graph(backend,true) &&
+            test_conservative_shortconv_graph(backend,false,true) &&
+            test_conservative_shortconv_graph(backend,false,false,true) &&
+            test_conservative_shortconv_graph(backend,false,true,true) &&
+            test_gdn(backend) && test_gdn(backend,true);
+        std::puts(passed ? "CUDA stateful contract fixtures passed" : "CUDA stateful contract fixtures FAILED");
+        return passed ? 0 : 1;
+    }
+
+    {
+        const char* prior = std::getenv("MOLLM_CUDA_OUTPUT_POOL_MB");
+        struct RestoreOption {
+            bool had;
+            std::string value;
+            ~RestoreOption() {
+                if (had) setenv("MOLLM_CUDA_OUTPUT_POOL_MB", value.c_str(), 1);
+                else unsetenv("MOLLM_CUDA_OUTPUT_POOL_MB");
+            }
+        } restore{prior != nullptr, prior ? prior : ""};
+        for (const char* bad : {"", "bad", "-1", "+1", " 1", "1 ", "18446744073709551615"}) {
+            setenv("MOLLM_CUDA_OUTPUT_POOL_MB", bad, 1);
+            CudaBackend invalid;
+            if (invalid.available()) return 1;
+        }
+        setenv("MOLLM_CUDA_OUTPUT_POOL_MB", "1", 1);
+        CudaBackend limited;
+        if (!limited.available()) return 1;
+        Tensor active, cached, larger, rejected;
+        void* live = limited.alloc_output(active, 128 * 1024, nullptr);
+        if (!live || !limited.alloc_output(cached, 512 * 1024, nullptr) ||
+            cudaMemset(live, 0x5a, 128 * 1024) != cudaSuccess) return 1;
+        limited.free_output(cached, nullptr);
+        // 640KiB reserved +768KiB new exceeds1MiB; reclaim512KiB first.
+        if (!limited.alloc_output(larger, 768 * 1024, nullptr) || limited.dispatch_failed()) return 1;
+        std::vector<unsigned char> bytes(128 * 1024);
+        if (cudaMemcpy(bytes.data(), live, bytes.size(), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            !std::all_of(bytes.begin(), bytes.end(), [](unsigned char x) { return x == 0x5a; })) return 1;
+        // 896KiB active +256KiB cannot fit, even after all idle blocks free.
+        if (limited.alloc_output(rejected, 256 * 1024, nullptr) || !limited.dispatch_failed() || rejected.data) return 1;
+        std::puts("cuda_output_pool_limit reclaim=1 live_output_exact=1 active_over_limit_rejected=1 invalid_options_rejected=1");
+    }
+
+    {
+        auto* pool = mollm_cuda::create_device_buffer_pool();
+        if (!pool) return 1;
+        struct PoolOwner {
+            mollm_cuda::DeviceBufferPool* pool;
+            ~PoolOwner() { mollm_cuda::destroy_device_buffer_pool(pool); }
+        } owner{pool};
+        void* active = mollm_cuda::acquire_device_buffer(pool, 4096);
+        void* cached = mollm_cuda::acquire_device_buffer(pool, 8192);
+        if (!active || !cached || cudaMemset(active, 0x5a, 4096) != cudaSuccess) return 1;
+        mollm_cuda::release_device_buffer(pool, cached);
+        cudaStream_t stream = nullptr;
+        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return 1;
+        if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return 1;
+        size_t reclaimed = 123;
+        const bool capture_rejected = !mollm_cuda::trim_free_device_buffers(pool, stream, &reclaimed) &&
+            reclaimed == 0 && mollm_cuda::device_buffer_pool_reserved_bytes(pool) == 12288;
+        cudaGraph_t graph = nullptr;
+        const cudaError_t ended = cudaStreamEndCapture(stream, &graph);
+        if (graph) cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
+        if (!capture_rejected || ended != cudaSuccess ||
+            !mollm_cuda::trim_free_device_buffers(pool, cudaStreamPerThread, &reclaimed) ||
+            reclaimed != 8192 || mollm_cuda::device_buffer_pool_reserved_bytes(pool) != 4096) return 1;
+        std::vector<unsigned char> bytes(4096);
+        if (cudaMemcpy(bytes.data(), active, bytes.size(), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            !std::all_of(bytes.begin(), bytes.end(), [](unsigned char value) { return value == 0x5a; })) return 1;
+        if (!mollm_cuda::trim_free_device_buffers(pool, cudaStreamPerThread, &reclaimed) || reclaimed != 0) return 1;
+        mollm_cuda::release_device_buffer(pool, active);
+        if (!mollm_cuda::trim_free_device_buffers(pool, cudaStreamPerThread, &reclaimed) || reclaimed != 4096 ||
+            mollm_cuda::device_buffer_pool_reserved_bytes(pool) != 0) return 1;
+        void* fresh = mollm_cuda::acquire_device_buffer(pool, 2048);
+        if (!fresh) return 1;
+        std::puts("cuda_output_pool_trim active_bytes_preserved=1 capture_rejected=1 reacquire=1");
+    }
+
+    // Preserve the test's early-return behavior, but identify the failing
+    // phase even when a reference/helper check has no detailed diagnostic.
+    struct FailurePhase {
+        const char* name = "FP16 and device-resident operations";
+        bool passed = false;
+        ~FailurePhase() {
+            if (!passed) std::fprintf(stderr, "CUDA backend test failed in phase: %s\n", name);
+        }
+    } phase;
 
     constexpr int m = 3;
     constexpr int n = 8;
@@ -2031,6 +4351,10 @@ int main() {
         !test_wide_cached_sdpa(backend, Precision::FP16, 512) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 1023) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 1280) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 2047, 1, false, 2, 256) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 4095, 1, false, 2, 256) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 4096, 1, false, 2, 256) ||
+        !test_wide_cached_sdpa(backend, Precision::FP32, 2047) ||
         !test_wide_cached_sdpa(
             backend, Precision::FP16, 255, 1, false, 4) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 0, 4) ||
@@ -2042,14 +4366,39 @@ int main() {
             backend, Precision::FP16, 0, 17, false, 2, 256) ||
         !test_wide_cached_sdpa(
             backend, Precision::FP16, 1023, 2, true, 1, 256) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 0, 17, true, 2, 256, true) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 1023, 2, true, 1, 256, true) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 4094, 2, true, 1, 256, true) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 4095, 2, true, 1, 256, true) ||
         !test_shortconv(backend) ||
+        !test_conservative_shortconv_graph(backend) ||
+        !test_conservative_shortconv_graph(backend, true) ||
+        !test_conservative_shortconv_graph(backend, false, true) ||
+        !test_conservative_shortconv_graph(backend, false, false, true) ||
+        !test_conservative_shortconv_graph(backend, false, true, true) ||
+        !test_conservative_sdpa_graph(backend) ||
+        !test_conservative_sdpa_graph(backend, true) ||
+        !test_conservative_sdpa_graph(backend, true, 256) ||
+        !test_conservative_sdpa_graph(backend, true, 256, true) ||
+        !test_conservative_materialized_view_chain(backend) ||
+        !test_conservative_ple_graph(backend) ||
+        !test_ple_device_ops(backend) ||
+        !test_resident_routes(backend) ||
+        !test_nvfp4_system_memory(backend) ||
+        !test_nvfp4_moe_provider() ||
+        !test_gated_residual(backend) ||
+        !test_sigmoid_gr_reduce_graph(backend) ||
         !test_gdn(backend) ||
+        !test_gdn(backend, true) ||
         !test_decode_add_rms_norm(backend) ||
-        !test_lm_head_argmax(backend))
+        !test_lm_head_argmax(backend) || !test_q8_batch_head(backend) || !test_state_prefix_coverage(backend) ||
+        !test_ple_history_prefix(backend))
         return 1;
+    phase.name = "memory and fallback bridge";
     if (!test_memory_and_fallback_bridge(backend))
         return 1;
 
+    phase.name = "INT8 grouped matmul";
     constexpr int int8_group_size = 16;
     constexpr int int8_groups_per_row = k / int8_group_size;
     std::vector<int8_t> weight_int8(static_cast<size_t>(n) * k);
@@ -2096,6 +4445,7 @@ int main() {
     // Exercise the vectorized W8 per-channel decode path with more than one
     // vector-load iteration per lane.  Grouped W8 above continues to cover the
     // generic kernel.
+    phase.name = "W8 per-channel matmul";
     constexpr int w8pc_k = 256;
     std::vector<float> w8pc_activation(w8pc_k);
     std::vector<int8_t> w8pc_weight(static_cast<size_t>(n) * w8pc_k);
@@ -2236,6 +4586,7 @@ int main() {
     if (invalid_q4.device.buffer)
         return 1;
 
+    phase.name = "W4G32 matmul and activation caching";
     constexpr int k64 = 64;
     constexpr int groups32 = k64 / 32;
     std::vector<float> activation64(static_cast<size_t>(m) * k64);
@@ -2284,6 +4635,15 @@ int main() {
         !close_enough(actual, expected, 8e-3f))
         return 1;
     reference(activation64, q4_weight64, decode_expected, 1, n, k64);
+    // A repeated multi-row call must refresh its activations while retaining
+    // the immutable uploaded matrix, including after a preceding GEMV.
+    auto changed_activation64 = activation64;
+    for (float& value : changed_activation64) value = value * -0.5f + 0.125f;
+    reference(changed_activation64, q4_weight64, expected, m, n, k64);
+    if (!dispatch_matmul(
+            backend, q4_multi, changed_activation64, actual, m, n, k64) ||
+        !close_enough(actual, expected, 8e-3f))
+        return 1;
     if (!dispatch_matmul(
             backend, q4_multi, activation64, decode_actual, 1, n, k64) ||
         !close_enough(decode_actual, decode_expected, 8e-3f))
@@ -2350,14 +4710,84 @@ int main() {
     if (!check_cached_pair(4096) || !check_cached_pair(9216))
         return 1;
 
-    // Exercise the wide-output CUDA kernel selector with a ragged final
+    // The narrow-prefetch selector needs the actual model shape: smaller
+    // correctness cases do not exercise its opt-in branch.
+    // The backend keys immutable source identities by address. Do not recycle
+    // these fixture identities before constructing same-shaped wide weights.
+    std::vector<std::vector<Q4B8G32Block>> retained_narrow_sources;
+    for (const auto shape : {std::pair<int, int>{2560, 6144}, {320, 10240}, {640, 2560}}) {
+        const int narrow_n = shape.first, narrow_k = shape.second;
+        std::vector<Q4B8G32Block> packed((narrow_n / 8) * (narrow_k / 32));
+        for (size_t i = 0; i < packed.size(); ++i)
+            for (int row = 0; row < 8; ++row) {
+                packed[i].scales[row] = (1 + (i + row) % 17) / 37.f;
+                for (int pair = 0; pair < 16; ++pair)
+                    packed[i].q[row][pair] = (i * 19 + row * 7 + pair * 13) & 255;
+            }
+        std::vector<float> x(narrow_k), original, candidate;
+        for (int i = 0; i < narrow_k; ++i) x[i] = (i % 41 - 20) / 37.f;
+        Tensor dx = device_tensor(backend, narrow_k);
+        Tensor dw = device_tensor(backend, packed.size() * sizeof(Q4B8G32Block) / sizeof(float));
+        Tensor dy = device_tensor(backend, narrow_n);
+        if (!upload(backend, dx, x) || cudaMemcpy(dw.device.buffer, packed.data(),
+            packed.size() * sizeof(Q4B8G32Block), cudaMemcpyHostToDevice) != cudaSuccess) return 1;
+        auto* weights = static_cast<const Q4B8G32Block*>(dw.device.buffer);
+        auto* input = static_cast<const float*>(dx.device.buffer);
+        auto* output = static_cast<float*>(dy.device.buffer);
+        mollm_cuda::launch_q4_g32_prefetch_narrow_gemv(input, weights, output, narrow_n, narrow_k, 0);
+        if (!download(backend, dy, original)) return 1;
+        for (int distance : {1, 2, 4}) {
+            mollm_cuda::launch_q4_g32_prefetch_narrow_gemv(input, weights, output, narrow_n, narrow_k, distance);
+            if (!download(backend, dy, candidate) || std::memcmp(original.data(), candidate.data(), narrow_n * sizeof(float))) return 1;
+        }
+        mollm_cuda::launch_q4_g32_dense_gemv(input, weights, output, narrow_n, narrow_k);
+        if (!download(backend, dy, candidate) || std::memcmp(original.data(), candidate.data(), narrow_n * sizeof(float))) return 1;
+        Tensor dr = device_tensor(backend, packed.size() * sizeof(Q4B8G32Block) / sizeof(float));
+        auto* row_weights = static_cast<mollm_cuda::Q4RowG32*>(dr.device.buffer);
+        mollm_cuda::launch_repack_q4_row_g32(weights, row_weights, narrow_n, narrow_k);
+        mollm_cuda::launch_q4_row_g32_gemv(input, row_weights, output, narrow_n, narrow_k);
+        if (!download(backend, dy, candidate) || std::memcmp(original.data(), candidate.data(), narrow_n * sizeof(float))) return 1;
+        retained_narrow_sources.push_back(packed);
+        auto& canonical = retained_narrow_sources.back();
+        for (auto& block : canonical)
+            for (auto& row : block.q)
+                for (auto& byte : row) byte ^= 0x88;
+        Tensor narrow_weight = Tensor::create(Precision::INT4, MemoryType::EXTERNAL,
+            narrow_n, narrow_k, 1, 1, canonical.data());
+        narrow_weight.rowmajor_data = canonical.data();
+        narrow_weight.q4_g32_data = canonical.data();
+        narrow_weight.is_q4_g32_packed = true;
+        narrow_weight.group_size = 32;
+        narrow_weight.groups_per_row = narrow_k / 32;
+        backend.wrap_weight_int4(narrow_weight);
+        std::memset(canonical.data(), 0, canonical.size() * sizeof(canonical[0]));
+        if (!dispatch_matmul(backend, narrow_weight, x, candidate, 1, narrow_n, narrow_k) ||
+            std::memcmp(original.data(), candidate.data(), narrow_n * sizeof(float))) {
+            std::fprintf(stderr, "narrow decode fixture mismatch n=%d k=%d\n", narrow_n, narrow_k);
+            return 1;
+        }
+        for (bool cache : {false, true}) {
+            mollm_cuda::launch_q4_g32_pair_narrow_gemv(input, weights, output, narrow_n, narrow_k, cache);
+            if (!download(backend, dy, candidate) || !close_enough(candidate, original, 1e-3f)) return 1;
+        }
+        for (int splits : {2, 4, 8}) {
+            mollm_cuda::launch_q4_g32_split_pair_gemv(input, weights, output, narrow_n, narrow_k, splits);
+            if (!download(backend, dy, candidate) || !close_enough(candidate, original, 1e-3f)) return 1;
+        }
+    }
+
+    // Exercise the wide-output CUDA kernel selector at the model's K=2560
+    // with a ragged final
     // storage block. Compute the reference directly from the packed weights
     // so the test does not need a large expanded FP32 matrix.
-    constexpr int wide_n = 18439;
-    constexpr int wide_k = 2048;
-    constexpr int wide_groups = wide_k / 32;
+    const bool narrow_cache_fixture=std::getenv("MOLLM_TEST_CUDA_NARROW_CACHE")!=nullptr;
+    const bool hc_up_fixture=std::getenv("MOLLM_TEST_CUDA_HC_UP")!=nullptr;
+    const bool hc_down_fixture=std::getenv("MOLLM_TEST_CUDA_HC_DOWN_CACHE")!=nullptr;
+    const int wide_n = hc_up_fixture ? 10240 : hc_down_fixture ? 320 : narrow_cache_fixture ? 2560 : 18439;
+    const int wide_k = hc_up_fixture ? 320 : hc_down_fixture ? 10240 : narrow_cache_fixture ? 6144 : 2560;
+    const int wide_groups = wide_k / 32;
     constexpr int wide_rows_per_block = 8;
-    constexpr int wide_row_blocks =
+    const int wide_row_blocks =
         (wide_n + wide_rows_per_block - 1) / wide_rows_per_block;
     std::vector<float> wide_activation(wide_k);
     for (int inner = 0; inner < wide_k; ++inner)
@@ -2366,6 +4796,8 @@ int main() {
     std::vector<Q4B8G32Block> wide_blocks(
         static_cast<size_t>(wide_row_blocks) * wide_groups);
     std::vector<float> wide_expected(wide_n, 0.0f);
+    const int reference_lanes = hc_up_fixture ? 16 : 8;
+    std::vector<float> wide_lane_sums(static_cast<size_t>(wide_n) * reference_lanes, 0.0f);
     for (int row_block = 0; row_block < wide_row_blocks; ++row_block) {
         for (int group = 0; group < wide_groups; ++group) {
             auto& packed_block = wide_blocks[
@@ -2374,8 +4806,9 @@ int main() {
                  ++row_lane) {
                 const int row =
                     row_block * wide_rows_per_block + row_lane;
-                const float group_scale = 0.0078125f +
-                    ((row_block + group + row_lane) % 13) * 0.0005f;
+                const float group_scale = hc_up_fixture
+                    ? (1.f + ((row_block + group + row_lane) % 13) * .125f) / 7.f
+                    : 0.0078125f + ((row_block + group + row_lane) % 13) * 0.0005f;
                 packed_block.scales[row_lane] = group_scale;
                 for (int pair = 0; pair < 16; ++pair) {
                     const int low =
@@ -2391,6 +4824,20 @@ int main() {
                             wide_activation[inner] * low * group_scale;
                         wide_expected[row] +=
                             wide_activation[inner + 1] * high * group_scale;
+                        if (hc_up_fixture) {
+                            const float dot=std::fma(wide_activation[inner],static_cast<float>(low),wide_activation[inner+1]*static_cast<float>(high));
+                            float& partial=wide_lane_sums[static_cast<size_t>(row)*16+pair];
+                            partial=std::fma(dot,group_scale,partial);
+                        } else if (pair & 1) {
+                            const int previous_low = (row + group * 3 + (pair - 1) * 2) % 16 - 8;
+                            const int previous_high = (row + group * 3 + (pair - 1) * 2 + 1) % 16 - 8;
+                            float dot = std::fma(wide_activation[inner - 2], static_cast<float>(previous_low),
+                                wide_activation[inner - 1] * static_cast<float>(previous_high));
+                            dot = std::fma(wide_activation[inner], static_cast<float>(low), dot);
+                            dot = std::fma(wide_activation[inner + 1], static_cast<float>(high), dot);
+                            float& partial = wide_lane_sums[static_cast<size_t>(row) * 8 + pair / 2];
+                            partial = std::fma(dot, group_scale, partial);
+                        }
                     }
                 }
             }
@@ -2412,9 +4859,75 @@ int main() {
     if (!dispatch_matmul(
             backend, wide_q4, wide_activation, wide_actual,
             1, wide_n, wide_k) ||
-        !close_enough(wide_actual, wide_expected, 5e-3f))
+        !close_enough(wide_actual, wide_expected, 5e-3f)) {
+        std::fprintf(stderr, "wide decode fixture mismatch n=%d k=%d\n", wide_n, wide_k);
         return 1;
+    }
+    int wide_device = 0;
+    cudaDeviceProp wide_properties{};
+    cudaGetDevice(&wide_device);
+    cudaGetDeviceProperties(&wide_properties, wide_device);
+    if ((wide_n + 31) / 32 >= wide_properties.multiProcessorCount * 6) {
+        for (int row = 0; row < wide_n; ++row) {
+            const float* partial = wide_lane_sums.data() + static_cast<size_t>(row) * reference_lanes;
+            float old_result = ((partial[0] + partial[4]) + (partial[2] + partial[6])) +
+                ((partial[1] + partial[5]) + (partial[3] + partial[7]));
+            if(hc_up_fixture){
+                float tree[16];std::copy(partial,partial+16,tree);
+                for(int offset=8;offset;offset/=2)
+                    for(int lane=0;lane<offset;++lane)tree[lane]+=tree[lane+offset];
+                old_result=tree[0];
+            }
+            if (wide_actual[row] != old_result) {
+                std::fprintf(stderr, "wide W4 reduction-order mismatch at row %d: %.9g != %.9g\n",
+                    row, wide_actual[row], old_result);
+                return 1;
+            }
+        }
+    }
 
+    // The same private weight representation must support prefill after
+    // decode, including a ragged output tile and destroyed CPU backing.
+    std::vector<float> wide_prefill_activation(2 * wide_k);
+    std::vector<float> wide_prefill_expected(2 * wide_n), wide_prefill_actual(2 * wide_n);
+    for (int i = 0; i < wide_k; ++i) {
+        wide_prefill_activation[i] = wide_activation[i];
+        wide_prefill_activation[wide_k + i] = wide_activation[i] * 0.5f;
+    }
+    for (int i = 0; i < wide_n; ++i) {
+        wide_prefill_expected[i] = wide_expected[i];
+        wide_prefill_expected[wide_n + i] = wide_expected[i] * 0.5f;
+    }
+    if (!dispatch_matmul(backend, wide_q4, wide_prefill_activation, wide_prefill_actual,
+            2, wide_n, wide_k) ||
+        !close_enough(wide_prefill_actual, wide_prefill_expected, 5e-3f)) {
+        std::fprintf(stderr, "wide prefill fixture failed n=%d k=%d\n", wide_n, wide_k);
+        return 1;
+    }
+
+    // Reuse immutable uploaded weights across changed inputs and batch sizes.
+    // Enabled FP16 prefill caching must not retain activations or stale shapes;
+    // a small cache budget must also preserve the original scratch fallback.
+    for (int batch : {3, 17}) {
+        std::vector<float> changed_input(static_cast<size_t>(batch) * wide_k);
+        std::vector<float> changed_expected(static_cast<size_t>(batch) * wide_n);
+        std::vector<float> changed_output(changed_expected.size());
+        for (int token = 0; token < batch; ++token) {
+            const float multiplier = (token % 3 - 1) * .5f;
+            for (int col = 0; col < wide_k; ++col)
+                changed_input[static_cast<size_t>(token) * wide_k + col] = wide_activation[col] * multiplier;
+            for (int col = 0; col < wide_n; ++col)
+                changed_expected[static_cast<size_t>(token) * wide_n + col] = wide_expected[col] * multiplier;
+        }
+        if (!dispatch_matmul(backend, wide_q4, changed_input, changed_output,
+                batch, wide_n, wide_k) ||
+            !close_enough(changed_output, changed_expected, 5e-3f)) {
+            std::fprintf(stderr, "wide changed-input fixture failed n=%d k=%d batch=%d\n", wide_n, wide_k, batch);
+            return 1;
+        }
+    }
+
+    phase.name = "W4G128 single-group matmul";
     constexpr int k128 = 128;
     std::vector<float> activation128(static_cast<size_t>(m) * k128);
     for (size_t i = 0; i < activation128.size(); ++i)
@@ -2493,6 +5006,7 @@ int main() {
         !close_enough(padded_actual, padded_expected, 1.5e-2f))
         return 1;
 
+    phase.name = "W4G128 multi-group matmul";
     constexpr int k256 = 256;
     constexpr int groups128 = k256 / 128;
     std::vector<float> activation256(static_cast<size_t>(m) * k256);
@@ -2546,7 +5060,16 @@ int main() {
         !close_enough(decode_actual, decode_expected, 1.5e-2f))
         return 1;
 
+    phase.name = "grouped narrow stream";
+    if (!test_grouped_narrow_stream()) return 1;
+    phase.name = "FP16 conversion and NVFP4 sort streams";
+    if (!test_fp16_to_fp32_reference() || !test_nvfp4_sort_stream()) return 1;
+    phase.name = "Q4 pipeline and async streams";
+    if (!test_q4_wide_pipeline_stream() || !test_q4_wide_pipeline_stream(1) ||
+        !test_q4_wide_pipeline_stream(2) || !test_q4_async_stream()) return 1;
+    for (int mode = 3; mode <= 6; ++mode) if (!test_q4_wide_pipeline_stream(mode)) return 1;
     std::printf("CUDA device-resident ops, fallback views, FP16, W8, W4G32 "
                 "and W4G128 matmul tests passed\n");
+    phase.passed = true;
     return 0;
 }

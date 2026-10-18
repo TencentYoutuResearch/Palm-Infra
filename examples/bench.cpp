@@ -1,4 +1,6 @@
 #include "examples/cli_common.h"
+#include "examples/bench_prompt_prefix.h"
+#include "runtime/cuda_host_memory_watchdog.h"
 
 #include <algorithm>
 #include <chrono>
@@ -319,6 +321,16 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
             static_cast<unsigned long long>(mtp.sync_tokens), acceptance,
             mtp.total_ms, mtp.draft_ms, mtp.draft_model_ms,
             mtp.verify_ms, mtp.sample_ms, mtp.sync_ms);
+        std::printf(
+            "mtp_recurrent_checkpoint_bytes=%llu mtp_recurrent_rollbacks=%llu "
+            "mtp_recurrent_replay_tokens=%llu mtp_recurrent_checkpoint_ms=%.2f "
+            "mtp_recurrent_rollback_ms=%.2f\n",
+            static_cast<unsigned long long>(mtp.recurrent_checkpoint_bytes),
+            static_cast<unsigned long long>(mtp.recurrent_rollbacks),
+            static_cast<unsigned long long>(mtp.recurrent_replay_tokens),
+            mtp.recurrent_checkpoint_ms, mtp.recurrent_rollback_ms);
+        std::printf("mtp_recurrent_device_checkpoint_bytes=%llu\n",
+            static_cast<unsigned long long>(mtp.recurrent_device_checkpoint_bytes));
         std::printf("mtp_depth_stats=");
         bool first = true;
         for (size_t depth = 0;
@@ -408,6 +420,16 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
         human_row_int("mtp_accepted", (long long)mtp.accepted, "");
         human_row_int("mtp_verify_tokens", (long long)mtp.verify_tokens, "");
         human_row_int("mtp_sync_tokens", (long long)mtp.sync_tokens, "");
+        human_row_int("mtp_recurrent_device_checkpoint_bytes",
+                      (long long)mtp.recurrent_device_checkpoint_bytes, "bytes");
+        human_row_int("mtp_recurrent_checkpoint_bytes",
+                      (long long)mtp.recurrent_checkpoint_bytes, "bytes");
+        human_row_int("mtp_recurrent_rollbacks",
+                      (long long)mtp.recurrent_rollbacks, "");
+        human_row_int("mtp_recurrent_replay_tokens",
+                      (long long)mtp.recurrent_replay_tokens, "");
+        human_row("mtp_recurrent_checkpoint_ms", mtp.recurrent_checkpoint_ms, "ms");
+        human_row("mtp_recurrent_rollback_ms", mtp.recurrent_rollback_ms, "ms");
         human_row("mtp_acceptance_pct",
                   mtp.drafted ? 100.0 * mtp.accepted / mtp.drafted : 0.0,
                   "%");
@@ -525,14 +547,26 @@ int main(int argc, char** argv) {
     CliCommonOptions opts;
     std::string error;
     if (!parse_common_args(argc, argv, opts, error)) {
-        if (error != "help") std::fprintf(stderr, "bench: %s\n", error.c_str());
+        if (error != "help") {
+            std::fprintf(stderr, "bench: %s\nRun %s --help for usage.\n", error.c_str(), argv[0]);
+            return 1;
+        }
         print_common_usage(argv[0],
                            "Benchmark-specific notes:\n"
                            "  --warmup <int>            Warmup iterations before timed run\n"
+                           "  --repeat <int>            Timed runs after one load (default: 1)\n"
+                           "  --print-token-ids        Print generated IDs for cross-mode comparisons\n"
                            "  --output <kv|human>       Output format (default: kv)\n");
         return error == "help" ? 0 : 1;
     }
 
+    mollm_memory::CudaHostMemoryWatchdog memory_watchdog;
+    if (!memory_watchdog.start_from_environment(opts.device == Device::CUDA)) return 1;
+    int prompt_prefix=0;
+    if(!mollm_bench::parse_prompt_prefix(std::getenv("MOLLM_BENCH_PROMPT_PREFIX_TOKENS"),
+            opts.prompt_tokens>0,prompt_prefix,error)) {
+        std::fprintf(stderr,"bench: %s\n",error.c_str());return 1;
+    }
     if (opts.prompt.empty() && !opts.prompt_file.empty()) {
         std::ifstream prompt_stream(
             opts.prompt_file, std::ios::in | std::ios::binary);
@@ -590,6 +624,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "bench: prompt is empty after tokenization\n");
         return 1;
     }
+    if(!mollm_bench::apply_prompt_prefix(prompt_ids,prompt_prefix,error)) {
+        std::fprintf(stderr,"bench: %s\n",error.c_str());return 1;
+    }
+    if(prompt_prefix)std::fprintf(stderr,"bench: real tokenized prompt prefix=%d (diagnostic, chat suffix may be omitted)\n",prompt_prefix);
     // Long prompts are handled by chunked prefill (prefill() splits into
     // graph_seq_len-sized chunks). No upper bound check here — only the
     // per-chunk size matters, and that's enforced inside the engine.
@@ -605,66 +643,93 @@ int main(int argc, char** argv) {
         }
     }
 
-    mollm_reset_pack_counters();
-    mollm_reset_matmul_shape_profile();
-    mollm_reset_moe_profile();
-    engine.reset_moe_ssd_stats();
+    std::vector<int> first_tokens;
+    std::string first_text;
+    bool first_hit_eos = false;
+    for (int run = 0; run < opts.repeat; ++run) {
+        if (opts.repeat > 1) std::printf("benchmark_run=%d\n", run + 1);
+        mollm_reset_pack_counters();
+        mollm_reset_matmul_shape_profile();
+        mollm_reset_moe_profile();
+        engine.reset_moe_ssd_stats();
 
-    if (opts.profile) {
-        engine.reset_profiles();
-    }
-
-    GenerationResult result;
-    MoeSsdCache::Stats prefill_ssd;
-    auto total_start = std::chrono::steady_clock::now();
-    if (!generate_tokens(engine, tokenizer, prompt_ids, opts.max_new_tokens,
-                         benchmark_eos_id, result, error, {}, true, nullptr, -1,
-                         [&] {
-                             if (!engine.moe_ssd_offload_enabled()) return;
-                             prefill_ssd = engine.moe_ssd_stats();
-                             engine.reset_moe_ssd_stats();
-                         })) {
-        std::fprintf(stderr, "bench: %s\n", error.c_str());
-        return 1;
-    }
-    auto total_end = std::chrono::steady_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
-
-    GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
-    metrics.total_ms = total_ms;
-    const MoeSsdCache::Stats decode_ssd = engine.moe_ssd_stats();
-
-    // Pack-A profiling counters.
-    double pack_ms = mollm_pack_a_total_ms();
-    long long pack_calls = mollm_pack_a_calls();
-    double q8_quant_a_ms = mollm_q8_quant_a_total_ms();
-    long long q8_quant_a_calls = mollm_q8_quant_a_calls();
-    double mm_ms = mollm_matmul_total_ms();
-
-    // Dispatch to the selected output format. "kv" stays machine-parseable for
-    // benchmark scripts.
-    if (opts.output_format == "human") {
-        print_human_summary(load_ms, load_warmup_ms, load_warmup_bytes,
-                            metrics, result, total_ms, engine, opts,
-                            prefill_ssd, decode_ssd,
-                            pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
-    } else {
-        print_kv_summary(load_ms, load_warmup_ms, load_warmup_bytes,
-                         metrics, result, total_ms, engine, opts,
-                         prefill_ssd, decode_ssd,
-                         pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
-    }
-
-    if (opts.profile) {
-        print_profile_section("prefill_profile", engine.prefill_exec_ctx());
-        print_profile_section("decode_profile", engine.decode_exec_ctx());
-        if (mollm_matmul_shape_profile_enabled()) {
-            mollm_print_matmul_shape_profile("matmul_shape_profile", 24);
+        if (opts.profile) {
+            engine.reset_profiles();
         }
-        if (mollm_moe_profile_enabled()) {
-            mollm_print_moe_profile("moe_profile");
-        }
-    }
 
+        GenerationResult result;
+        MoeSsdCache::Stats prefill_ssd;
+        auto total_start = std::chrono::steady_clock::now();
+        if (!generate_tokens(engine, tokenizer, prompt_ids, opts.max_new_tokens,
+                             benchmark_eos_id, result, error, {}, true, nullptr, -1,
+                             [&] {
+                                 if (!engine.moe_ssd_offload_enabled()) return;
+                                 prefill_ssd = engine.moe_ssd_stats();
+                                 engine.reset_moe_ssd_stats();
+                             })) {
+            std::fprintf(stderr, "bench: %s\n", error.c_str());
+            return 1;
+        }
+        auto total_end = std::chrono::steady_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+        if (opts.repeat > 1 && opts.sampling.temperature == 0) {
+            if (run == 0) {
+                first_tokens = result.token_ids;
+                first_text = result.text;
+                first_hit_eos = result.hit_eos;
+            } else if (result.token_ids != first_tokens || result.text != first_text ||
+                       result.hit_eos != first_hit_eos) {
+                std::fprintf(stderr, "bench: greedy output differs in repeat %d\n", run + 1);
+                return 1;
+            }
+        }
+
+        GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
+        metrics.total_ms = total_ms;
+        const MoeSsdCache::Stats decode_ssd = engine.moe_ssd_stats();
+
+        // Pack-A profiling counters.
+        double pack_ms = mollm_pack_a_total_ms();
+        long long pack_calls = mollm_pack_a_calls();
+        double q8_quant_a_ms = mollm_q8_quant_a_total_ms();
+        long long q8_quant_a_calls = mollm_q8_quant_a_calls();
+        double mm_ms = mollm_matmul_total_ms();
+
+        // Dispatch to the selected output format. "kv" stays machine-parseable for
+        // benchmark scripts.
+        if (opts.print_token_ids) {
+            std::printf("generated_token_ids=");
+            for (size_t i = 0; i < result.token_ids.size(); ++i) {
+                if (i) std::printf(",");
+                std::printf("%d", result.token_ids[i]);
+            }
+            std::printf("\n");
+        }
+        if (opts.output_format == "human") {
+            print_human_summary(load_ms, load_warmup_ms, load_warmup_bytes,
+                                metrics, result, total_ms, engine, opts,
+                                prefill_ssd, decode_ssd,
+                                pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
+        } else {
+            print_kv_summary(load_ms, load_warmup_ms, load_warmup_bytes,
+                             metrics, result, total_ms, engine, opts,
+                             prefill_ssd, decode_ssd,
+                             pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
+        }
+
+        if (opts.profile) {
+            print_profile_section("prefill_profile", engine.prefill_exec_ctx());
+            print_profile_section("decode_profile", engine.decode_exec_ctx());
+            if (mollm_matmul_shape_profile_enabled()) {
+                mollm_print_matmul_shape_profile("matmul_shape_profile", 24);
+            }
+            if (mollm_moe_profile_enabled()) {
+                mollm_print_moe_profile("moe_profile");
+            }
+        }
+        // Keep model teardown diagnostics on stderr from being inserted
+        // into a buffered generated_text record when both streams share a log.
+        std::fflush(stdout);
+    }
     return 0;
 }

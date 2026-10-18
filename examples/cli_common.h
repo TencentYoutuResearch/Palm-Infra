@@ -21,12 +21,17 @@ struct CliCommonOptions {
     float rope_theta = 10000000.f;
     int num_threads = default_worker_threads();
     bool profile = false;
+    bool print_token_ids = false; // opt-in bench diagnostic, outside timed generation
     int warmup = 1;
+    int repeat = 1;             // benchmark timed runs after one model load
     bool static_padded = false;  // pad short prompts to graph_seq_len (A/B vs DYNAMIC)
     int prefill_chunk_size = 0;  // 0: package default; larger sizes require dynamic shapes
     Device device = Device::CPU;  // compute backend (--device cpu|metal|cuda)
     bool require_native = false;  // reject accelerator operator fallback
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
+    bool offload_ple = false;
+    bool cuda_prefill_reclaim = false;
+    bool cuda_prefill_logical_batch = false;
     bool load_warmup = true;     // touch mmap'd package weights after load
     // Needed because SSD offload suppresses the default whole-package warmup,
     // but an explicit --load-warmup can still warm only dense mmap weights.
@@ -46,6 +51,8 @@ struct CliCommonOptions {
     bool metal_ssd_full = false;    // full-Metal decode with direct Metal I/O
     std::string trace_path;      // optional Chrome Trace / Perfetto JSON output
     int mtp_draft_tokens = 0;    // >0: use packaged single-head MTP
+    std::string mtp_companion_dir;
+    std::string qsa_companion_dir;
 
     SamplingParams sampling;
 

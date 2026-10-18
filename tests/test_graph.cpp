@@ -92,7 +92,9 @@ int main() {
     CHECK((int)OpType::MATMUL_BATCH == 11, "MATMUL_BATCH=11");
     CHECK((int)OpType::SDPA == 50, "SDPA=50");
     CHECK((int)OpType::SDPA_MLA == 51, "SDPA_MLA=51");
-    CHECK((int)OpType::SDPA_MLA_ABSORB == 52, "SDPA_MLA_ABSORB=52");
+    CHECK((int)OpType::QSA_SDPA == 52, "QSA_SDPA=52");
+    CHECK((int)OpType::QSA_INDEXER == 53, "QSA_INDEXER=53");
+    CHECK((int)OpType::SDPA_MLA_ABSORB == 54, "SDPA_MLA_ABSORB=54");
 
     if (failures == 0) {
         printf("\nAll graph tests passed!\n");

@@ -18,6 +18,9 @@ struct ChatMessage {
 
 class Tokenizer {
 public:
+    // Read only validated package metadata/tokenizer/template sections. Never
+    // load model graphs, map weights, or initialize an accelerator backend.
+    bool load_package(const std::string& package_path);
     // Load the tokenizer and, when available, the package's authoritative
     // Jinja chat template. `architecture` is only a compatibility fallback
     // for old packages that did not embed their template.

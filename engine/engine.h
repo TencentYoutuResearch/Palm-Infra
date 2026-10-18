@@ -1,4 +1,5 @@
 #pragma once
+#include "core/qsa_limits.h"
 
 #include "graph/graph.h"
 #include "graph/execute.h"
@@ -72,6 +73,17 @@ struct EngineConfig {
     float rope_theta = 500000.f;
     int num_threads = default_worker_threads();
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
+    // CPU/CUDA resident mode: demand-page PLE, eagerly load and lock all experts,
+    // and wire dense weights/layouts instead of copying the entire package.
+    bool offload_ple = false;
+    // Opt-in bounded CUDA resident+PLE-offload temporary reclamation.
+    // Ordinary mode: context<=4096, sequence<=1024. Logical mode: independent
+    // context capacity, configurable sequence<=2048,
+    // and >=24GiB host guard.
+    bool cuda_prefill_reclaim = false;
+    // Experimental CUDA/Qwen3.8 batching: configurable chunks<=2048,
+    // independent context capacity. Long KV uses shape-eligible attention paths.
+    bool cuda_prefill_logical_batch = false;
     // Host-side MoE expert cache. A non-zero value enables SSD offload for
     // packages carrying `moe_expert_storage` metadata.
     size_t moe_ssd_cache_bytes = 0;
@@ -103,6 +115,10 @@ struct EngineConfig {
     // Experimental single-head MTP speculation. Zero keeps the ordinary
     // generation path even when the package contains an MTP graph.
     int mtp_draft_tokens = 0;
+    // Optional local streamed MTP bundle; shares target embedding/head.
+    std::string mtp_companion_dir;
+    // Missing QSA indexer weights; rewrites only the in-memory text graph.
+    std::string qsa_companion_dir;
 
     SamplingParams sampling;
 
@@ -216,6 +232,12 @@ public:
         uint64_t fallback_steps = 0;
         uint64_t verify_tokens = 0;
         uint64_t sync_tokens = 0;
+        uint64_t recurrent_checkpoint_bytes = 0;
+        uint64_t recurrent_device_checkpoint_bytes = 0;
+        uint64_t recurrent_rollbacks = 0;
+        uint64_t recurrent_replay_tokens = 0;
+        double recurrent_checkpoint_ms = 0.0;
+        double recurrent_rollback_ms = 0.0;
         std::array<uint64_t, kMaxDraftDepth> attempts_by_depth{};
         std::array<uint64_t, kMaxDraftDepth> drafted_by_depth{};
         std::array<uint64_t, kMaxDraftDepth> accepted_by_depth{};
@@ -359,6 +381,10 @@ private:
     // Valid until the next hidden-output call on this engine.
     std::vector<uint8_t> hidden_output_copy_;
     std::vector<uint8_t> mtp_hidden_output_copy_;
+    std::vector<uint8_t> target_mtp_state_copy_;
+    std::vector<uint8_t> draft_mtp_state_copy_;
+    Tensor target_mtp_state_;
+    Tensor draft_mtp_state_;
     Tensor mtp_draft_hidden_device_;
     std::vector<float> mtp_pending_hidden_;
 
@@ -446,7 +472,9 @@ private:
     void clear_model_state();
 
     /// Load a single graph and set up its CONSTANT nodes from shared weights.
-    bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path);
+    bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
+                    bool already_loaded = false);
+    bool load_mtp_companion();
     bool load_package(const std::string& path, std::string& pf_path,
                       std::string& dc_path, std::string& vi_path,
                       std::string& mtp_path,
@@ -462,6 +490,10 @@ private:
     /// Process a chunk within the limit validated by prefill().
     /// Called by prefill() in a loop for chunked prefill.
     int prefill_chunk(const std::vector<int>& token_ids, int past);
+    // Test-only bounded scheduling proof; two private runtime frames, no
+    // merged MoE or backend graph-local fusion metadata.
+    int prefill_window_schedule(const std::vector<int>& token_ids, int past,
+                                bool chunk_major_reference);
 
     // weight tensors
     Tensor* embed_weight_ = nullptr;   // [vocab_size, hidden_dim], row-major FP16/FP32 for lookup
