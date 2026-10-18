@@ -1,0 +1,9 @@
+春天的清晨，城市还没有完全醒来。街角的早餐店已经亮起灯，蒸汽从锅盖的缝隙里升起。一个学生背着书包走过桥，停下来观察河面的倒影。他想起昨天老师讲的道理：观察不仅是看见，还要分清事实、推测和结论。测量会有误差，重复实验能帮助我们判断结果是否可靠。
+
+计算十七乘以二十三，可以先计算十七乘以二十，得到三百四十，再加上十七乘以三得到的五十一，最终结果是三百九十一。验证时可以交换乘数的顺序，也可以使用另一种分解方法。一个答案说得很流畅，并不意味着它一定正确；重要的是步骤与结果能够被独立检查。
+
+A computer program transforms inputs into outputs according to explicit rules. Performance measurements should compare the same workload, use a warm-up period, and report repeated observations. A faster implementation is useful only when its numerical behavior remains suitable for the task. Floating-point calculations have finite precision, so changes in operation order can produce slightly different results. Quantization introduces another source of approximation and should be evaluated separately from memory layout changes.
+
+在一个图书馆里，书籍按照主题分类，读者通过索引寻找需要的资料。把常用资料放在近处，可以减少查找时间，但索引与原始内容必须保持一致。若资料来自远程存储，网络延迟和缓存状态也会影响速度。因此，判断一次优化是否有效，需要明确它改变了什么、保留了什么，以及实验覆盖了哪些情况。
+
+For a list of numbers, the arithmetic mean is the sum divided by the number of entries. The median is the middle value after sorting. These two statistics answer different questions: the mean includes every observation, while the median is less sensitive to unusually large or small values. Neither statistic replaces the original measurements, especially when the sample is small.

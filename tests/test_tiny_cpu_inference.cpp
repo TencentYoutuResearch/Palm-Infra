@@ -9,6 +9,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <sys/resource.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace {
 
@@ -61,7 +64,7 @@ int metadata_int(const LLMEngine& engine, const char* key, int fallback) {
 
 InferenceResult run_package(const char* path, const char* label,
                             const char* architecture, bool use_mmap,
-                            Device device = Device::CPU) {
+                            Device device = Device::CPU, bool offload_ple = false) {
     InferenceResult result;
     LLMEngine engine;
     EngineConfig config;
@@ -78,6 +81,7 @@ InferenceResult run_package(const char* path, const char* label,
     config.weight_loading = use_mmap
         ? WeightLoadingMode::MMAP : WeightLoadingMode::RESIDENT;
     config.sampling.temperature = 0.0f;
+    config.offload_ple = offload_ple;
 
     CHECK(engine.load(config), label);
     if (failures)
@@ -89,8 +93,12 @@ InferenceResult run_package(const char* path, const char* label,
               (!architecture || architecture_it->second == architecture),
           "package architecture is preserved");
     CHECK(engine.package_weights_mmap_backed() ==
-              (use_mmap || device == Device::CUDA),
+              (use_mmap || offload_ple || device == Device::CUDA),
           "requested package weight loading mode is honored");
+    if (offload_ple) {
+        CHECK(engine.warmup_package_weights() < 1024 * 1024,
+              "warmup excludes the 16 MiB PLE table");
+    }
     CHECK(engine.prefill({1, 2, 3}) >= 0, "prefill executes");
     CHECK(engine.past_len() == 3, "prefill advances KV state");
 
@@ -203,6 +211,93 @@ void test_unavailable_cuda_policy(const char* path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc >= 3 && std::strcmp(argv[1], "--nvfp4-calibration") == 0) {
+        LLMEngine engine;
+        EngineConfig config;
+        config.num_threads = 1;
+        config.n_ctx = 8;
+        config.moe_ssd_cache_bytes = 4096;
+        config.lock_moe_ssd_cache = false;
+        for (int i = 2; i < argc; ++i) {
+            config.package_path = argv[i];
+            CHECK(engine.load(config) == (i == 2),
+                  "NVFP4 package accepts valid calibration and rejects malformed calibration");
+        }
+        config.package_path = argv[2];
+        CHECK(engine.load(config) && engine.prefill({1, 2}) >= 0,
+              "calibrated package recovers after rejected loads");
+        return failures ? 1 : 0;
+    }
+    if (argc == 4 && std::strcmp(argv[1], "--ple-offload") == 0) {
+        const auto resident = run_package(argv[2], "load resident PLE fixture",
+                                          "qwen3", false);
+        const auto offloaded = run_package(argv[2], "load PLE offload fixture",
+                                           "qwen3", false, Device::CPU, true);
+        compare_values(offloaded.prefill_logits, resident.prefill_logits,
+                       0, 0, "PLE offload preserves prefill logits", true);
+        compare_values(offloaded.decode_logits, resident.decode_logits,
+                       0, 0, "PLE offload preserves decode logits", true);
+#ifdef MOLLM_CUDA
+        CudaBackend probe;
+        if (probe.available()) {
+            const auto cuda_resident = run_package(
+                argv[2], "load CUDA resident PLE fixture", "qwen3", false, Device::CUDA);
+            const auto cuda_offloaded = run_package(
+                argv[2], "load CUDA PLE offload fixture", "qwen3", false, Device::CUDA, true);
+            compare_values(cuda_offloaded.prefill_logits, cuda_resident.prefill_logits,
+                           0, 0, "CUDA PLE offload preserves prefill logits", true);
+            compare_values(cuda_offloaded.decode_logits, cuda_resident.decode_logits,
+                           0, 0, "CUDA PLE offload preserves decode logits", true);
+        }
+#endif
+
+        LLMEngine engine;
+        EngineConfig config;
+        config.package_path = argv[3];
+        config.num_threads = 1;
+        config.n_ctx = 8;
+        config.offload_ple = true;
+        CHECK(!engine.load(config), "reject PLE offload without PLE weights");
+        config.package_path = argv[2];
+        config.weight_loading = WeightLoadingMode::MMAP;
+        CHECK(!engine.load(config), "reject PLE offload with mmap mode");
+        config.weight_loading = WeightLoadingMode::RESIDENT;
+        config.moe_ssd_cache_bytes = 1024;
+        CHECK(!engine.load(config), "reject PLE offload with bounded expert cache");
+        config.moe_ssd_cache_bytes = 0;
+        config.device = Device::METAL;
+        CHECK(!engine.load(config), "reject PLE offload with Metal");
+        config.device = Device::CPU;
+        rlimit old_limit{};
+        CHECK(getrlimit(RLIMIT_MEMLOCK, &old_limit) == 0, "read memlock limit");
+        rlimit no_lock = old_limit;
+        no_lock.rlim_cur = 0;
+        CHECK(setrlimit(RLIMIT_MEMLOCK, &no_lock) == 0, "lower memlock soft limit");
+        // ASan intercepts mlock as a successful no-op; privileged processes can
+        // also bypass RLIMIT_MEMLOCK. Probe whether this failure injection works
+        // before expecting the engine to reject it. Inference/parity and reload
+        // checks still run in those environments.
+        const size_t probe_bytes = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        void* memlock_probe = mmap(nullptr, probe_bytes, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(memlock_probe != MAP_FAILED, "allocate memlock capability probe");
+        if (memlock_probe != MAP_FAILED) {
+            if (mlock(memlock_probe, probe_bytes) != 0) {
+                CHECK(!engine.load(config), "failed locking does not silently use mmap");
+            } else {
+                munlock(memlock_probe, probe_bytes);
+                std::printf("  SKIP: memlock failure injection unavailable (mlock succeeds at limit zero)\n");
+            }
+            munmap(memlock_probe, probe_bytes);
+        }
+        CHECK(setrlimit(RLIMIT_MEMLOCK, &old_limit) == 0, "restore memlock limit");
+        CHECK(engine.load(config), "engine recovers after failed resident load");
+        CHECK(engine.prefill({1, 2}) >= 0, "reloaded engine can infer");
+        config.offload_ple = false;
+        CHECK(engine.load(config) && !engine.package_weights_mmap_backed(),
+              "reload releases hybrid mappings and restores default resident mode");
+        return failures ? 1 : 0;
+    }
     const bool real_model = argc == 3 &&
         std::strcmp(argv[1], "--real-model") == 0;
     if (real_model) {
@@ -227,10 +322,10 @@ int main(int argc, char** argv) {
         return 77;
 #endif
     }
-    if (argc != 4) {
+    if (argc != 5) {
         std::fprintf(stderr,
                      "usage: %s <qwen3-fp16.mollm> <qwen3-w4.mollm> "
-                     "<qwen35-fp16.mollm>\n"
+                     "<qwen35-fp16.mollm> <w4-dequantized-reference.mollm>\n"
                      "       %s --real-model <dense.mollm>\n",
                      argv[0],
                      argv[0]);
@@ -269,7 +364,13 @@ int main(int argc, char** argv) {
             argv[2], "load tiny Qwen3 W4G32 package on CUDA", "qwen3",
             false, Device::CUDA);
         compare_cpu_cuda(fp16, fp16_cuda, "tiny Qwen3 FP16", false);
-        compare_cpu_cuda(w4, w4_cuda, "tiny Qwen3 W4G32", false);
+        const InferenceResult w4_reference = run_package(
+            argv[4], "load independently dequantized W4 reference", "qwen3", false);
+        // ARM W4A8 activation quantization is not part of CUDA W4's contract.
+        // Keep the strict floating-point tolerance against the same weights
+        // decoded independently, rather than widening it to hide that error.
+        compare_cpu_cuda(w4_reference, w4_cuda,
+                         "tiny Qwen3 W4G32/dequantized reference", false);
     }
 #endif
     test_unavailable_cuda_policy(argv[1]);

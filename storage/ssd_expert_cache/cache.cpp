@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -100,6 +102,14 @@ bool MoeSsdCache::clear_resident() {
         if (entry->is_loading() || entry->pins != 0) return false;
     }
     entries_.clear();
+    resident_arena_.reset();
+    for (auto& source : sources_) {
+        source.second.resident_device_views = false;
+        source.second.resident_nvfp4_mma_layout = false;
+        source.second.resident_nvfp4_gate_codes_kmajor = false;
+        source.second.resident_nvfp4_gate_scales_kmajor = false;
+    }
+    fully_resident_ = false;
     entry_locations_.clear();
     layer_entries_.clear();
     layer_resident_bytes_.clear();
@@ -179,6 +189,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         next_trace_id_ = 1;
         capacity_bytes_ = capacity_bytes;
         lock_expert_pages_ = lock_expert_pages;
+        fully_resident_ = false;
         resident_bytes_ = 0;
         clock_ = hits_ = misses_ = evictions_ = bytes_read_ = 0;
         demand_load_bytes_ = prefetch_load_bytes_ = 0;
@@ -197,6 +208,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         layer_layouts_.clear();
         layer_capacity_bytes_.clear();
         entries_.clear();
+        resident_arena_.reset();
         entry_locations_.clear();
         layer_entries_.clear();
         layer_resident_bytes_.clear();
@@ -219,6 +231,14 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
 
 bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if ((!spec.input_scales.empty() || spec.input_scales_per_expert != 0) &&
+        (spec.precision != Precision::NVFP4 || spec.num_experts <= 0 ||
+         (spec.input_scales_per_expert != 1 && spec.input_scales_per_expert != 2) ||
+         spec.input_scales.size() != static_cast<size_t>(spec.num_experts) * spec.input_scales_per_expert ||
+         std::any_of(spec.input_scales.begin(), spec.input_scales.end(),
+            [](float value) { return !std::isfinite(value) || value <= 0; }))) {
+        std::fprintf(stderr, "MoE SSD: invalid NVFP4 activation calibration\n"); return false;
+    }
     if (fd_ < 0 || spec.weight_ref.empty() || spec.layer < 0 ||
         spec.num_experts <= 0 || spec.rows <= 0 || spec.cols <= 0 ||
         spec.data_bytes == 0) {
@@ -334,6 +354,8 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
     source.cache = this;
     source.provider = this;
     source.layer = spec.layer;
+    source.nvfp4_input_scales = std::move(source.spec.input_scales);
+    source.nvfp4_input_scales_per_expert = spec.input_scales_per_expert;
     auto inserted = sources_.emplace(spec.weight_ref, std::move(source));
     if (!inserted.second) {
         std::fprintf(stderr, "MoE SSD: duplicate expert storage metadata for %s\n",
@@ -445,6 +467,164 @@ const MoeSsdTensorSource* MoeSsdCache::find_source(const std::string& weight_ref
         it = sources_.find("./" + weight_ref);
     }
     return it == sources_.end() ? nullptr : &it->second;
+}
+
+bool MoeSsdCache::load_resident(const std::vector<std::pair<
+                              const MoeSsdTensorSource*,
+                              const MoeSsdTensorSource*>>& pairs) {
+    size_t total = 0;
+    size_t arena_bytes = 0;
+    std::unordered_set<const MoeSsdTensorSource*> seen;
+    for (const auto& [gate, down] : pairs) {
+        size_t bytes = 0;
+        if (!valid_pair(gate, down, 0) ||
+            !seen.insert(gate).second || !seen.insert(down).second ||
+            !expert_pair_bytes(gate, down, bytes) ||
+            bytes > (std::numeric_limits<size_t>::max() - total) /
+                        static_cast<size_t>(gate->spec.num_experts))
+            return false;
+        total += bytes * static_cast<size_t>(gate->spec.num_experts);
+        size_t padded = 0;
+        for (uint64_t component : {gate->spec.data_bytes, gate->spec.scales_bytes,
+                                  down->spec.data_bytes, down->spec.scales_bytes}) {
+            if (component > std::numeric_limits<size_t>::max() - 63) return false;
+            const size_t aligned = (static_cast<size_t>(component) + 63) & ~size_t(63);
+            if (aligned > std::numeric_limits<size_t>::max() - padded) return false;
+            padded += aligned;
+        }
+        if (padded > (std::numeric_limits<size_t>::max() - arena_bytes) /
+                          static_cast<size_t>(gate->spec.num_experts)) return false;
+        arena_bytes += padded * static_cast<size_t>(gate->spec.num_experts);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (total == 0 || !entries_.empty() || seen.size() != sources_.size())
+            return false;
+        capacity_bytes_ = total;
+        global_capacity_pool_ = true;
+        lock_expert_pages_ = true;
+    }
+    const char* arena_option = std::getenv("MOLLM_RESIDENT_EXPERT_ARENA");
+    const bool device_arena = arena_option && std::strcmp(arena_option, "cuda-device") == 0;
+    const char* native_option = std::getenv("MOLLM_RESIDENT_NVFP4_MMA_LAYOUT");
+    const bool native_layout = native_option && std::strcmp(native_option, "1") == 0;
+    const char* code_option = std::getenv("MOLLM_RESIDENT_NVFP4_GATE_CODES_KMAJOR");
+    const bool gate_codes_kmajor = code_option && std::strcmp(code_option, "1") == 0;
+    const char* scale_option=std::getenv("MOLLM_TEST_RESIDENT_NVFP4_GATE_SCALES_KMAJOR");
+    // Gate-code resident preparation also owns the sole gate SF payload.
+    // The test-only 0 override retains the historical two-layout A/B path.
+    // Canonical/CPU/Metal/SSD sources do not acquire this layout implicitly.
+    const bool gate_scales_kmajor=gate_codes_kmajor&&
+        (!scale_option||!std::strcmp(scale_option,"1"));
+    if(scale_option&&!std::strcmp(scale_option,"1")&&!gate_codes_kmajor) {
+        std::fprintf(stderr,"MoE: resident gate scales K64-major requires gate codes K64-major\n");
+        return false;
+    }
+    const char* mma_option = std::getenv("MOLLM_CUDA_NVFP4_MMA");
+    const char* prefill_mma_option = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREFILL_ONLY");
+    const bool full_mma = mma_option && std::strcmp(mma_option, "1") == 0;
+    const bool prefill_mma = prefill_mma_option && std::strcmp(prefill_mma_option, "1") == 0;
+    if (gate_codes_kmajor && (!device_arena || native_layout || full_mma || !prefill_mma)) {
+        std::fprintf(stderr, "MoE: gate code view requires CUDA-device arena and canonical prefill-only MMA\n");
+        return false;
+    }
+    if (gate_codes_kmajor) {
+        for (const auto& [gate, down] : pairs)
+            if (gate->spec.precision != Precision::NVFP4 || gate->spec.rows != 1280 ||
+                gate->spec.cols != 2560 || down->spec.precision != Precision::NVFP4 ||
+                down->spec.rows != 2560 || down->spec.cols != 640) {
+                std::fprintf(stderr, "MoE: gate code view requires fixed NVFP4 gate1280/K2560 and down2560/K640\n");
+                return false;
+            }
+    }
+    if (full_mma || prefill_mma) {
+        if (full_mma && !native_layout) {
+            std::fprintf(stderr, "MoE: NVFP4 MMA requires native resident preparation\n");
+            return false;
+        }
+        for (const auto& [gate, down] : pairs) {
+            if (gate->nvfp4_input_scales_per_expert != 2 || down->nvfp4_input_scales_per_expert != 1 ||
+                gate->nvfp4_input_scales.size() != static_cast<size_t>(gate->spec.num_experts) * 2 ||
+                down->nvfp4_input_scales.size() != static_cast<size_t>(down->spec.num_experts)) {
+                std::fprintf(stderr, "MoE: NVFP4 MMA requires checkpoint activation calibration; reconvert the package\n");
+                return false;
+            }
+        }
+    }
+    if (native_layout || gate_codes_kmajor) {
+        if (!device_arena) return false;
+#if defined(MOLLM_CUDA)
+        int device = 0, pageable = 0, tables = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device) != cudaSuccess ||
+            !pageable || !tables) return false;
+#else
+        return false;
+#endif
+        for (const auto& pair : pairs) for (const auto* source : {pair.first, pair.second})
+            if (source->spec.precision != Precision::NVFP4 ||
+                source->spec.rows % 16 || source->spec.cols % 64) return false;
+    }
+    if (arena_option && (std::strcmp(arena_option, "1") == 0 || device_arena)) {
+        auto arena = std::make_shared<ResidentArena>();
+        if (!arena->create(arena_bytes, device_arena)) {
+            std::fprintf(stderr, "MoE: could not allocate %s resident arena\n",
+                device_arena ? "CUDA-device" : "locked large-page");
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        resident_arena_ = std::move(arena);
+        for (auto& source : sources_) {
+            source.second.resident_device_views = device_arena;
+            source.second.resident_nvfp4_mma_layout = native_layout;
+            source.second.resident_nvfp4_gate_codes_kmajor = gate_codes_kmajor &&
+                std::any_of(pairs.begin(), pairs.end(), [&](const auto& pair) {
+                    return pair.first == &source.second;
+                });
+            source.second.resident_nvfp4_gate_scales_kmajor = gate_scales_kmajor &&
+                source.second.resident_nvfp4_gate_codes_kmajor;
+        }
+        std::fprintf(stderr, "MoE: resident arena %.1f MB (%s, 64-byte slices)\n",
+            resident_arena_->capacity / 1e6,
+            device_arena ? "single CUDA-device allocation" : "large-page advice");
+        if (gate_codes_kmajor)
+            std::fprintf(stderr, "MoE: resident gate codes K64-major (gate-only, single payload, bounded host staging)\n");
+        if(gate_scales_kmajor)
+            std::fprintf(stderr,"MoE: resident gate scales K64-major (single payload, no prefill scale copy)\n");
+    }
+    std::fprintf(stderr, "MoE: loading %.1f MB of resident experts...\n", total / 1e6);
+    for (const auto& [gate, down] : pairs) {
+        std::vector<int> ids(gate->spec.num_experts);
+        for (size_t i = 0; i < ids.size(); ++i)
+            ids[i] = static_cast<int>(i);
+        if (!request_many(gate, down, ids))
+            return false;
+        for (int expert : ids) {
+            Tensor gate_tensor, down_tensor;
+            if (!acquire_impl(gate, down, expert, gate_tensor, down_tensor, nullptr, true))
+                return false;
+            std::lock_guard<std::mutex> lock(mutex_);
+            const Entry* entry = find_entry_locked(gate, down, expert);
+            const auto locked = [](const ByteBuffer& buffer) {
+                return buffer.empty() || buffer.locked;
+            };
+            if (!entry || !locked(entry->gate_up_data) ||
+                !locked(entry->gate_up_scales) || !locked(entry->down_data) ||
+                !locked(entry->down_scales)) {
+                std::fprintf(stderr, "MoE: could not lock all resident expert pages\n");
+                return false;
+            }
+        }
+    }
+    std::fprintf(stderr, "MoE: all experts %s (%.1f MB)\n",
+        device_arena ? "resident in CUDA memory" : "resident and locked", total / 1e6);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fully_resident_ = true;
+    }
+    reset_stats();
+    return true;
 }
 
 bool MoeSsdCache::valid_pair(const MoeSsdTensorSource* gate_up,
@@ -619,10 +799,17 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     entry->forward_epoch = forward_epoch_;
     entry->prediction_epoch = speculative ? forward_epoch_ : 0;
     entry->prediction_confidence = speculative ? prediction_confidence : 0.0f;
-    entry->gate_up_data.resize(static_cast<size_t>(gate_up->spec.data_bytes));
-    entry->gate_up_scales.resize(static_cast<size_t>(gate_up->spec.scales_bytes));
-    entry->down_data.resize(static_cast<size_t>(down->spec.data_bytes));
-    entry->down_scales.resize(static_cast<size_t>(down->spec.scales_bytes));
+    if (resident_arena_) {
+        if (!entry->gate_up_data.resize_in_arena(gate_up->spec.data_bytes, resident_arena_) ||
+            !entry->gate_up_scales.resize_in_arena(gate_up->spec.scales_bytes, resident_arena_) ||
+            !entry->down_data.resize_in_arena(down->spec.data_bytes, resident_arena_) ||
+            !entry->down_scales.resize_in_arena(down->spec.scales_bytes, resident_arena_)) return nullptr;
+    } else {
+        entry->gate_up_data.resize(static_cast<size_t>(gate_up->spec.data_bytes));
+        entry->gate_up_scales.resize(static_cast<size_t>(gate_up->spec.scales_bytes));
+        entry->down_data.resize(static_cast<size_t>(down->spec.data_bytes));
+        entry->down_scales.resize(static_cast<size_t>(down->spec.scales_bytes));
+    }
     resident_bytes_ += entry->bytes();
     layer_resident += entry->bytes();
     Entry* raw = entry.get();
@@ -835,6 +1022,9 @@ Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
         t.groups_per_row = s.groups_per_row;
         t.num_groups = static_cast<uint32_t>(s.rows) * s.groups_per_row;
     } else if (s.precision == Precision::NVFP4) {
+        t.nvfp4_mma_layout = source.resident_nvfp4_mma_layout;
+        t.nvfp4_gate_codes_kmajor = source.resident_nvfp4_gate_codes_kmajor;
+        t.nvfp4_gate_scales_kmajor = source.resident_nvfp4_gate_scales_kmajor;
         const size_t block_scale_bytes =
             static_cast<size_t>(s.rows) * s.groups_per_row;
         const size_t row_scale_bytes =
@@ -1164,6 +1354,11 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
                           int expert,
                           Tensor& gate_up_out,
                           Tensor& down_out) {
+    if ((gate_up && gate_up->resident_device_views) ||
+        (down && down->resident_device_views)) {
+        gate_up_out = {}; down_out = {};
+        return false; // CPU views require a lease owning their host copy.
+    }
     return acquire_impl(gate_up, down, expert, gate_up_out, down_out, nullptr, true);
 }
 

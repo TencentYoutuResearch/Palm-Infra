@@ -21,6 +21,8 @@
 // MoE expert.  The package converter emits byte-accurate slices for these
 // matrices in `moe_expert_storage`; this class reads only selected slices with
 // pread(2) and retains recently used expert pairs in an LRU cache.
+// load_resident() also supports eagerly loading and locking the complete
+// expert set, with the same tensor layouts and no capacity-driven evictions.
 struct MoeSsdTensorSpec {
     std::string weight_ref;
     int layer = -1;
@@ -41,6 +43,8 @@ struct MoeSsdTensorSpec {
     // Zero retains the legacy component-major layout, where each component's
     // own byte count is its stride.
     uint64_t expert_stride = 0;
+    std::vector<float> input_scales;
+    uint32_t input_scales_per_expert = 0;
 
     uint64_t data_file_offset(int expert) const {
         const uint64_t stride = expert_stride != 0
@@ -98,6 +102,8 @@ class MoeSsdCache : public ExpertProvider {
 public:
     bool borrow(const ExpertSource*, const ExpertSource*, int, ExpertLease&,
                 bool wait = true) override;
+    bool borrow_resident_layer(const ExpertSource*, const ExpertSource*,
+                               std::vector<ExpertLease>&) override;
     bool request_many(const ExpertSource*, const ExpertSource*,
                       const std::vector<int>&) override;
     bool retain_for_next_forward(const ExpertSource*, const ExpertSource*,
@@ -162,6 +168,11 @@ public:
               int io_workers = 8, bool enable_cross_layer_worker = false,
               bool lock_expert_pages = false);
     bool add_source(const MoeSsdTensorSpec& spec);
+    // Startup-only resident mode. Size the pool for every registered expert,
+    // eagerly read and lock all pairs, and fail if any page cannot be locked.
+    // Reuses the same per-expert layouts/scales as demand-paged execution.
+    bool load_resident(const std::vector<std::pair<
+                       const MoeSsdTensorSource*, const MoeSsdTensorSource*>>& pairs);
     // Switch from isolated per-layer quotas to one shared capacity pool.
     // Call before any expert I/O.
     bool set_global_capacity_pool(bool enabled);
@@ -259,6 +270,8 @@ private:
     bool acquire_impl(const MoeSsdTensorSource*, const MoeSsdTensorSource*, int,
                       Tensor&, Tensor&, Entry** pinned_entry, bool wait);
     struct ByteBuffer;
+    struct ResidentArena;
+    std::shared_ptr<ResidentArena> resident_arena_;
     struct LayerLayout {
         int num_experts = 0;
         size_t pair_bytes = 0;
@@ -363,6 +376,7 @@ private:
     std::condition_variable ready_cv_;
     bool stop_io_ = false;
     bool lock_expert_pages_ = false;
+    bool fully_resident_ = false;
     std::deque<IoJob> io_jobs_;
     std::deque<IoJob> low_priority_io_jobs_;
     std::deque<std::function<void()>> cross_layer_tasks_;

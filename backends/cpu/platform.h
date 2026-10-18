@@ -24,7 +24,9 @@ class ThreadPool;
 #define MOLLM_ARM_I8MM_KERNELS 0
 #endif
 
-#if MOLLM_CPU_ARM_NEON
+#if MOLLM_CPU_ARM_NEON && !defined(__CUDACC__)
+// CUDA translation units query the host provider but never use its SIMD
+// intrinsics. NVCC's device parser cannot parse GCC's ARM NEON definitions.
 #include <arm_neon.h>
 #endif
 

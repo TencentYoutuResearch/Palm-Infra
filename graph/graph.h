@@ -87,6 +87,8 @@ enum class OpType : uint32_t {
     // attention
     SDPA     = 50,
     SDPA_MLA = 51,
+    QSA_SDPA = 52,    // cached SDPA with selected-token IDs input6
+    QSA_INDEXER = 53, // projection/norm/frequency/raw+pooled/K metadata/mask -> IDs
 
     // shape (zero-copy views)
     RESHAPE  = 60,
@@ -158,6 +160,8 @@ inline const char* op_type_name(OpType op) {
     case OpType::ROTARY_EMBED: return "ROTARY_EMBED";
     case OpType::SDPA: return "SDPA";
     case OpType::SDPA_MLA: return "SDPA_MLA";
+    case OpType::QSA_SDPA: return "QSA_SDPA";
+    case OpType::QSA_INDEXER: return "QSA_INDEXER";
     case OpType::RESHAPE: return "RESHAPE";
     case OpType::PERMUTE: return "PERMUTE";
     case OpType::CONCAT: return "CONCAT";

@@ -1,4 +1,5 @@
 #include "examples/cli_common.h"
+#include "engine/logical_prefill.h"
 
 #include "graph/graph.h"
 #include "runtime/threading.h"
@@ -112,6 +113,12 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.profile = true;
         } else if (arg == "--static-padded") {
             opts.static_padded = true;
+        } else if (arg == "--prefill-chunk-size") {
+            if (!require_value(argc, argv, i, "--prefill-chunk-size", value, error)) return false;
+            if (!parse_int(value, opts.prefill_chunk_size) || opts.prefill_chunk_size < 0) {
+                error = "invalid value for --prefill-chunk-size";
+                return false;
+            }
         } else if (arg == "--device") {
             if (!require_value(argc, argv, i, "--device", value, error)) return false;
             std::string dev(value);
@@ -140,6 +147,12 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.require_native = true;
         } else if (arg == "--mmap") {
             opts.weight_loading = WeightLoadingMode::MMAP;
+        } else if (arg == "--offload-ple") {
+            opts.offload_ple = true;
+        } else if (arg == "--cuda-prefill-reclaim") {
+            opts.cuda_prefill_reclaim = true;
+        } else if (arg == "--cuda-prefill-logical-batch") {
+            opts.cuda_prefill_logical_batch = true;
         } else if (arg == "--ssd-cache-mb") {
             if (!require_value(argc, argv, i, "--ssd-cache-mb", value, error)) return false;
             if (!parse_int(value, opts.ssd_cache_mb) || opts.ssd_cache_mb < 1) {
@@ -176,6 +189,16 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 error = "--trace path must not be empty";
                 return false;
             }
+        } else if (arg == "--print-token-ids") {
+            opts.print_token_ids = true;
+        } else if (arg == "--qsa-companion") {
+            if (!require_value(argc, argv, i, "--qsa-companion", value, error)) return false;
+            if (!*value) { error = "--qsa-companion directory must not be empty"; return false; }
+            opts.qsa_companion_dir = value;
+        } else if (arg == "--mtp-companion") {
+            if (!require_value(argc, argv, i, "--mtp-companion", value, error)) return false;
+            if (!*value) { error = "--mtp-companion directory must not be empty"; return false; }
+            opts.mtp_companion_dir = value;
         } else if (arg == "--mtp-draft-tokens") {
             if (!require_value(argc, argv, i, "--mtp-draft-tokens", value, error)) return false;
             if (!parse_int(value, opts.mtp_draft_tokens) ||
@@ -197,6 +220,12 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.lock_expert_cache = true;
         } else if (arg == "--no-lock-expert-cache") {
             opts.lock_expert_cache = false;
+        } else if (arg == "--repeat") {
+            if (!require_value(argc, argv, i, "--repeat", value, error)) return false;
+            if (!parse_int(value, opts.repeat) || opts.repeat < 1 || opts.repeat > 10000) {
+                error = "invalid value for --repeat (expected 1..10000)";
+                return false;
+            }
         } else if (arg == "--warmup") {
             if (!require_value(argc, argv, i, "--warmup", value, error)) return false;
             if (!parse_int(value, opts.warmup) || opts.warmup < 0) {
@@ -282,6 +311,40 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
     }
     if (!validate_sampling_params(opts.sampling, &error))
         return false;
+    if (opts.offload_ple &&
+        (opts.device == Device::METAL ||
+         opts.weight_loading != WeightLoadingMode::RESIDENT ||
+         opts.ssd_cache_mb > 0)) {
+        error = "--offload-ple requires CPU/CUDA resident mode; incompatible with "
+                "--mmap, --ssd-cache-mb and Metal";
+        return false;
+    }
+    if (!opts.qsa_companion_dir.empty() &&
+        (opts.device != Device::CUDA || opts.n_ctx < 1 || opts.n_ctx > mollm_qsa::max_context ||
+         opts.static_padded || opts.mtp_draft_tokens || !opts.mtp_companion_dir.empty())) {
+        error = "--qsa-companion requires CUDA text, ctx1..262144, no MTP/padding";
+        return false;
+    }
+    // Context bounds retained KV history; chunk bounds transient batch work.
+    // Neither the context nor the prompt needs to equal the maximum chunk size.
+    if(opts.cuda_prefill_logical_batch&&
+        (!opts.cuda_prefill_reclaim||opts.device!=Device::CUDA||!opts.offload_ple||
+         opts.weight_loading!=WeightLoadingMode::RESIDENT||opts.ssd_cache_mb!=0||
+         opts.n_ctx<1||opts.static_padded||opts.mtp_draft_tokens||
+         !opts.mtp_companion_dir.empty()||
+         opts.prefill_chunk_size<0||opts.prefill_chunk_size>mollm_prefill::logical_max_tokens)) {
+        error="--cuda-prefill-logical-batch requires CUDA resident+offload-PLE+reclaim, positive context, dynamic shape, chunk0..2048, no MTP";
+        return false;
+    }
+    if (opts.cuda_prefill_reclaim &&
+        (opts.device != Device::CUDA || !opts.offload_ple ||
+         opts.weight_loading != WeightLoadingMode::RESIDENT || opts.ssd_cache_mb != 0 ||
+         (!opts.cuda_prefill_logical_batch&&opts.n_ctx > 4096) || opts.prefill_chunk_size > (opts.cuda_prefill_logical_batch?mollm_prefill::logical_max_tokens:1024))) {
+        error = "--cuda-prefill-reclaim requires CUDA resident+offload-PLE, context<=4096, chunk<=1024";
+        return false;
+    }
+    if (opts.offload_ple && !opts.load_warmup_explicit)
+        opts.load_warmup = false;  // Engine load already wires the working set.
     if (opts.ssd_cache_mb > 0) {
         // SSD offload uses explicit pread() rather than touching aggregate
         // expert mappings. Keep default startup light, but honour an explicit
@@ -310,9 +373,13 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
                 default_worker_threads());
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
+    std::printf("  --prefill-chunk-size N   Maximum tokens per prefill batch, not a required prompt length (0: package default, or 2048 with logical batching)\n");
     std::printf("  --device <cpu|metal|cuda> Compute backend (GPU backends require their build option)\n");
     std::printf("  --require-native         Reject accelerator operator fallback\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
+    std::printf("  --offload-ple           CPU/CUDA resident mode: page PLE only; lock all other weights in RAM\n");
+    std::printf("  --cuda-prefill-reclaim  Opt-in CUDA resident+PLE temporary reclamation; without logical batching: ctx<=4096, chunk<=1024; requires MOLLM_CUDA_HOST_HEADROOM_MB>=24576\n");
+    std::printf("  --cuda-prefill-logical-batch  Experimental Qwen3.8 batching; independent --n-ctx, chunk0..2048 (0 defaults to2048); short prompts/tail chunks are not padded; requires reclaim, bounded pool and disabled decode segments\n");
     std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache; pins dense weights by default\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --ssd-cross-layer-prefetch  Next-layer gate prefetch (default with global cache)\n");
@@ -323,6 +390,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --metal-ssd-full        Experimental full-Metal decode with direct Metal I/O\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --mtp-draft-tokens <int>  Experimental packaged MTP speculation (0..16)\n");
+    std::printf("  --mtp-companion <dir>    Local streamed MTP bundle sharing target weights\n");
+    std::printf("  --qsa-companion <dir>    Experimental CUDA QSA bundle; text, ctx<=262144, no MTP; memory-dependent\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
     std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
     std::printf("  --no-lock-dense-weights Keep dense mmap weights pageable\n");
@@ -330,6 +399,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --no-lock-expert-cache  Allow the OS to compress/page expert cache entries\n");
     std::printf("  --no-load-warmup        Skip mmap page-in warmup\n");
     std::printf("  --warmup <int>            Default: 1 (used by benchmark)\n");
+    std::printf("  --repeat <int>            Timed benchmark runs per model load (default: 1)\n");
     std::printf("  --temperature <float>     Default: 0.6 (0 = greedy)\n");
     std::printf("  --top-k <int>             Default: 50 (0 = disabled)\n");
     std::printf("  --top-p <float>           Default: 0.9 (0 = disabled)\n");
@@ -355,6 +425,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.num_threads = opts.num_threads;
     cfg.sampling = opts.sampling;
     cfg.static_padded = opts.static_padded;
+    cfg.prefill_chunk_size = opts.prefill_chunk_size;
     cfg.image_max_pixels = opts.image_max_pixels;
     cfg.device = opts.device;
     cfg.device_fallback = opts.device == Device::CPU
@@ -364,6 +435,9 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
         ? OperatorFallbackPolicy::REQUIRE_NATIVE
         : OperatorFallbackPolicy::ALLOW_REFERENCE;
     cfg.weight_loading = opts.weight_loading;
+    cfg.offload_ple = opts.offload_ple;
+    cfg.cuda_prefill_reclaim = opts.cuda_prefill_reclaim;
+    cfg.cuda_prefill_logical_batch = opts.cuda_prefill_logical_batch;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;
     cfg.moe_ssd_cross_layer_prefetch = opts.ssd_global_cache &&
@@ -373,6 +447,8 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.metal_ssd_full = opts.metal_ssd_full;
     cfg.trace_path = opts.trace_path;
     cfg.mtp_draft_tokens = opts.mtp_draft_tokens;
+    cfg.mtp_companion_dir = opts.mtp_companion_dir;
+    cfg.qsa_companion_dir = opts.qsa_companion_dir;
     cfg.lock_dense_weights = opts.lock_dense_weights;
     cfg.lock_moe_ssd_cache = opts.lock_expert_cache;
     return cfg;

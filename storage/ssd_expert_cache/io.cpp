@@ -1,6 +1,10 @@
 #include "storage/ssd_expert_cache/internal.h"
 
 #include "runtime/trace.h"
+#include "storage/mapped_file.h"
+#if defined(MOLLM_CUDA)
+#include "kernels/cuda/moe.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -166,6 +170,90 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
 
 bool MoeSsdCache::read_job(const IoJob& job) {
     if (job.entries.empty()) return false;
+#if defined(MOLLM_CUDA)
+    const auto owner = component_buffer(*job.entries.front(), 0).arena;
+    if (owner && owner->device_only) {
+        MoeCudaDeviceScope scope(owner->device_id);
+        if (!scope.ok) return false;
+        // Reuse one small uninitialized staging allocation per I/O worker.
+        // No model-sized host expert copy is ever materialized.
+        static thread_local std::unique_ptr<uint8_t[]> staging;
+        static thread_local size_t staging_capacity = 0;
+        auto read_components = [&](Entry& entry, uint8_t first, int count) {
+            ByteBuffer& data = component_buffer(entry, first);
+            ByteBuffer* scales = count == 2 ? &component_buffer(entry, first + 1) : nullptr;
+            const size_t extra = scales ? scales->size() : 0;
+            if (extra > std::numeric_limits<size_t>::max() - data.size()) return false;
+            const size_t bytes = data.size() + extra;
+            if (!bytes) return true;
+            if (bytes > staging_capacity) {
+                staging.reset(new uint8_t[bytes]);
+                staging_capacity = bytes;
+            }
+            const uint64_t offset = component_offset(entry, first);
+            if (scales && component_offset(entry, first + 1) == offset + data.size()) {
+                if (!read_exact(offset, staging.get(), bytes)) return false;
+            } else {
+                if (!data.empty() && !read_exact(offset, staging.get(), data.size())) return false;
+                if (extra && !read_exact(component_offset(entry, first + 1),
+                        staging.get() + data.size(), extra)) return false;
+            }
+            cudaError_t status = cudaSuccess;
+            const auto* tensor_source = first == 0 ? entry.gate_up : entry.down;
+            if (tensor_source->resident_nvfp4_mma_layout) {
+                if (count != 2 || !scales) return false;
+                const auto& spec = tensor_source->spec;
+                const size_t block_bytes = static_cast<size_t>(spec.rows) * spec.groups_per_row;
+                mollm_cuda::Nvfp4Projection input{staging.get(), staging.get() + data.size(),
+                    nullptr, nullptr, nullptr,
+                    (spec.flags & MappedFile::FLAG_NVFP4_Q8_PAIR) != 0};
+                status = mollm_cuda::launch_repack_nvfp4_mma(input, data.data(), scales->data(),
+                    spec.rows, spec.cols, cudaStreamPerThread);
+                if (status == cudaSuccess)
+                    status = cudaMemcpyAsync(scales->data() + block_bytes,
+                        staging.get() + data.size() + block_bytes,
+                        static_cast<size_t>(spec.rows) * sizeof(float),
+                        cudaMemcpyHostToDevice, cudaStreamPerThread);
+            } else if (first == 0 && tensor_source->resident_nvfp4_gate_codes_kmajor) {
+                const auto& spec = tensor_source->spec;
+                mollm_cuda::Nvfp4Projection input{};
+                input.weight = staging.get();
+                input.pair_layout = (spec.flags & MappedFile::FLAG_NVFP4_Q8_PAIR) != 0;
+                status = mollm_cuda::launch_repack_nvfp4_gate_codes(input, data.data(),
+                    spec.rows, spec.cols, cudaStreamPerThread);
+                if(status==cudaSuccess&&tensor_source->resident_nvfp4_gate_scales_kmajor) {
+                    const size_t block_bytes=size_t(spec.rows)*spec.groups_per_row;
+                    if(count!=2||!scales||extra!=block_bytes+size_t(spec.rows)*sizeof(float))return false;
+                    input.block_scales=staging.get()+data.size();
+                    status=mollm_cuda::launch_repack_nvfp4_gate_scales(input,scales->data(),
+                        spec.rows,spec.cols,cudaStreamPerThread);
+                    if(status==cudaSuccess)status=cudaMemcpyAsync(scales->data()+block_bytes,
+                        staging.get()+data.size()+block_bytes,size_t(spec.rows)*sizeof(float),
+                        cudaMemcpyHostToDevice,cudaStreamPerThread);
+                } else if (status == cudaSuccess && extra)
+                    status = cudaMemcpyAsync(scales->data(), staging.get() + data.size(), extra,
+                        cudaMemcpyHostToDevice, cudaStreamPerThread);
+            } else {
+                if (!data.empty()) status = cudaMemcpyAsync(data.data(), staging.get(),
+                    data.size(), cudaMemcpyHostToDevice, cudaStreamPerThread);
+                if (status == cudaSuccess && extra) status = cudaMemcpyAsync(scales->data(),
+                    staging.get() + data.size(), extra, cudaMemcpyHostToDevice, cudaStreamPerThread);
+            }
+            // The ready flag must not precede transfers on another worker's
+            // PTDS stream, even when the pageable staging copy is asynchronous.
+            const auto completion = cudaStreamSynchronize(cudaStreamPerThread);
+            if (status != cudaSuccess || completion != cudaSuccess) {
+                std::fprintf(stderr, "MoE: CUDA expert upload failed\n"); return false;
+            }
+            return true;
+        };
+        for (Entry* entry : job.entries) {
+            const uint8_t first = job.component == 4 ? 0 : job.component == 5 ? 2 : job.component;
+            if (!read_components(*entry, first, job.component >= 4 ? 2 : 1)) return false;
+        }
+        return true;
+    }
+#endif
     auto lock_buffer = [&](ByteBuffer& buffer) {
         if (!lock_expert_pages_ || buffer.lock()) return;
         static std::atomic<bool> warned{false};

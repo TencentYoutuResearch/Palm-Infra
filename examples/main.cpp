@@ -1,4 +1,5 @@
 #include "examples/cli_common.h"
+#include "runtime/cuda_host_memory_watchdog.h"
 
 #include <chrono>
 #include <cerrno>
@@ -273,6 +274,16 @@ LLMEngine::MtpStats mtp_stats_delta(
         delta(after.fallback_steps, before.fallback_steps);
     result.verify_tokens = delta(after.verify_tokens, before.verify_tokens);
     result.sync_tokens = delta(after.sync_tokens, before.sync_tokens);
+    result.recurrent_checkpoint_bytes = delta(
+        after.recurrent_checkpoint_bytes, before.recurrent_checkpoint_bytes);
+    result.recurrent_rollbacks = delta(
+        after.recurrent_rollbacks, before.recurrent_rollbacks);
+    result.recurrent_replay_tokens = delta(
+        after.recurrent_replay_tokens, before.recurrent_replay_tokens);
+    result.recurrent_checkpoint_ms =
+        after.recurrent_checkpoint_ms - before.recurrent_checkpoint_ms;
+    result.recurrent_rollback_ms =
+        after.recurrent_rollback_ms - before.recurrent_rollback_ms;
     for (size_t depth = 0;
          depth < LLMEngine::MtpStats::kMaxDraftDepth; ++depth) {
         result.attempts_by_depth[depth] = delta(
@@ -471,7 +482,10 @@ int main(int argc, char** argv) {
     CliCommonOptions opts;
     std::string error;
     if (!parse_common_args(argc, argv, opts, error)) {
-        if (error != "help") std::fprintf(stderr, "chat: %s\n", error.c_str());
+        if (error != "help") {
+            std::fprintf(stderr, "chat: %s\nRun %s --help for usage.\n", error.c_str(), argv[0]);
+            return 1;
+        }
         print_common_usage(argv[0],
                            "Commands in REPL:\n"
                            "  /reset   Reset conversation\n"
@@ -479,6 +493,8 @@ int main(int argc, char** argv) {
         return error == "help" ? 0 : 1;
     }
 
+    mollm_memory::CudaHostMemoryWatchdog memory_watchdog;
+    if (!memory_watchdog.start_from_environment(opts.device == Device::CUDA)) return 1;
     Tokenizer tokenizer;
     LLMEngine engine;
     if (!load_runtime(opts, tokenizer, engine, error)) {

@@ -5,10 +5,12 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 class ThreadPool;
 struct GraphNode;
+struct Graph;
 
 // ---------------------------------------------------------------------------
 // mollm — Backend abstraction
@@ -30,6 +32,16 @@ struct GraphNode;
 enum class ShapeMode {
     DYNAMIC,         // actual seq_len at runtime, no padding (CPU)
     STATIC_PADDED,   // pad input to compile-time seq_len (NPU future)
+};
+
+// Backend-owned immutable byte snapshot of plain recurrent state. KV control
+// metadata is not included. Optional hooks keep unsupported backends on the
+// existing host transfer path.
+class BackendStateSnapshot {
+public:
+    virtual ~BackendStateSnapshot() = default;
+    virtual bool restore() const = 0;
+    virtual size_t bytes() const = 0;
 };
 
 class Backend {
@@ -77,6 +89,72 @@ public:
     /// workspace storage are reused. This does not open a device command
     /// buffer: begin_graph()/end_graph() remain owned by the caller.
     virtual void begin_execution() {}
+    // Phase-scoped admission; does not override engine memory/length gates.
+    virtual bool set_logical_prefill_batch(bool enabled) { return !enabled; }
+    virtual bool logical_prefill_batch_enabled() const { return false; }
+
+    /// Optional execution-plan inspection. Graph/tensor storage stays owned by
+    /// the caller; no serialized graph or weight representation is changed.
+    virtual void prepare_graph(const Graph&) {}
+    // Drop pointer-bearing plans before a temporary graph/runtime is destroyed.
+    virtual void release_graph_plan(const Graph&) {}
+
+    // Optional stateless same-layer MoE aggregation. Outputs are independently
+    // allocated by the executor. False must leave both outputs/inputs untouched;
+    // true may signal a failed dispatch via dispatch_failed(). Default fallback
+    // executes each window normally. Caller owns begin_graph/end_graph.
+    virtual bool dispatch_moe_pair(const GraphNode&,
+        const std::vector<const Tensor*>&, const std::vector<const Tensor*>&,
+        Tensor*, Tensor*) { return false; }
+
+    // Opt-in stateful lifetime contract. -1 means unknown: retain everything.
+    // A nonnegative index names the ONLY mutated/persistent input. The output
+    // must have independent storage; every other input and the output are not
+    // retained by the backend beyond dispatch's ordered stream work. Returning
+    // buffers to the pool must preserve that stream ordering, including fallback.
+    // Planner still retains graph outputs/view owners and the mutable state's
+    // owner. This is not a promise that graph capture or model use is validated.
+    virtual int independent_stateful_mutable_input(const GraphNode&) const { return -1; }
+
+    // Multi-state version of the same contract (e.g. SDPA mutates both K/V).
+    // UINT64_MAX means unknown; zero explicitly declares no mutated inputs.
+    // Existing single-state backends keep their behavior; all set bits must
+    // identify valid input indices (at most63 inputs for this contract).
+    virtual uint64_t independent_stateful_mutable_inputs(const GraphNode& node) const {
+        const int index = independent_stateful_mutable_input(node);
+        return index >= 0 && index < 63 ? uint64_t(1) << index : UINT64_MAX;
+    }
+
+    // Optional adjacent SIGMOID -> GR_REDUCE fusion. The executor verifies
+    // exclusive consumption and preserves the original path for diagnostics.
+    // A false dispatch result must leave inputs/output untouched for fallback.
+    virtual bool supports_sigmoid_gr_reduce_fusion() const { return false; }
+    // Optional adjacent HC up -> sigmoid -> reduce. Inputs are normalized
+    // carry, low-rank activation, up weight. False must leave graph tensors
+    // untouched; executor retains up inputs and materializes original chain.
+    virtual bool supports_hc_up_reduce_fusion() const { return false; }
+    virtual int hc_up_reduce_max_rows() const { return 1024; }
+    virtual bool dispatch_hc_up_reduce(const GraphNode&,const GraphNode&,
+        const std::vector<const Tensor*>&,Tensor*,ThreadPool*) { return false; }
+    virtual bool dispatch_sigmoid_gr_reduce(
+        const GraphNode&, const std::vector<const Tensor*>&,
+        Tensor*, ThreadPool*) { return false; }
+
+    // Optional dual-output GR_INJECT -> GROUP_RMS_NORM fusion. Both the raw
+    // carry and normalized output remain materialized, including multi-users.
+    // Inputs are branch, residual, gates, norm weight. False means untouched.
+    virtual bool supports_gr_inject_rms_fusion() const { return false; }
+    virtual bool dispatch_gr_inject_rms(
+        const GraphNode&, const GraphNode&, const std::vector<const Tensor*>&,
+        Tensor*, Tensor*, ThreadPool*) { return false; }
+    // Executor-proven single-use, unexposed MOE branch followed by inject/RMS.
+    // Inputs remain live through RMS; false must leave every output untouched.
+    // Success need not materialize branch; carry and normalized remain logical
+    // outputs (device backends may use their established deferred contracts).
+    virtual bool supports_moe_gr_inject_rms_fusion() const { return false; }
+    virtual bool dispatch_moe_gr_inject_rms(const GraphNode&,const GraphNode&,
+        const GraphNode&,const std::vector<const Tensor*>&,
+        const std::vector<const Tensor*>&,Tensor*,Tensor*,Tensor*,ThreadPool*) { return false; }
 
     // -----------------------------------------------------------------------
     // Storage allocation hooks.
@@ -112,6 +190,23 @@ public:
     /// BufferPool memory. The executor uses this to classify borrowed views by
     /// op type instead of host-pointer equality.
     virtual bool is_device_resident() const { return false; }
+    // Optional exact, address-preserving reshape of a strided input. Must be
+    // pure and agree with dispatch: executor allocation and borrowed-owner
+    // reset/release classification all use this same predicate. Default keeps
+    // every other backend's existing materialization semantics unchanged.
+    virtual bool reshape_view_strides(const Tensor&, const Tensor&, size_t[4]) const {
+        return false;
+    }
+    virtual bool supports_state_snapshot(const std::vector<Tensor*>&) const {
+        return false;
+    }
+    // Optional post-token recurrent snapshots for speculative verification.
+    // restore must validate complete coverage before changing any state.
+    virtual bool begin_state_prefixes(const std::vector<Tensor*>&, int) { return false; }
+    virtual bool restore_state_prefix(int) { return false; }
+    virtual void end_state_prefixes() {}
+    virtual std::unique_ptr<BackendStateSnapshot> capture_state_snapshot(
+        const std::vector<Tensor*>&) { return nullptr; }
 
     /// Explicit tensor transfer boundary. Device backends override these;
     /// the CPU implementation copies from ordinary host storage. Offsets are

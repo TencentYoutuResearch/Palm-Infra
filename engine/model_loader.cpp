@@ -1,4 +1,6 @@
 #include "engine/engine.h"
+#include "engine/logical_prefill.h"
+#include "engine/qsa_companion.h"
 #include "backends/factory.h"
 #include "storage/byte_ranges.h"
 #include "engine/weight_metadata.h"
@@ -6,6 +8,7 @@
 #include "runtime/host_compute.h"
 #include "storage/ssd_expert_cache/cache.h"
 #include "runtime/trace.h"
+#include "runtime/cuda_host_memory_budget.h"
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -16,6 +19,9 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <filesystem>
+#include <fstream>
+#include <json.hpp>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -96,12 +102,6 @@ LLMEngine::~LLMEngine() {
 }
 
 void LLMEngine::clear_model_state() {
-    // Stop background readers before invalidating their package mapping and
-    // before serializing the final events they may have emitted.
-    moe_ssd_cache_.reset();
-    if (!cfg_.trace_path.empty())
-        mollm_trace::write();
-
     thread_pool_.park();
 
     // Graph tensors borrow package/shared-weight storage and backend buffers.
@@ -115,6 +115,12 @@ void LLMEngine::clear_model_state() {
     exec_ctx_vision_ = ExecContext{};
     exec_ctx_mtp_ = ExecContext{};
     accelerator_backend_.reset();
+    // Backends may hold long-lived resident expert leases. Drain device work
+    // and release those leases before stopping/destroying their provider.
+    // Readers still stop before invalidating the package mapping below.
+    moe_ssd_cache_.reset();
+    if (!cfg_.trace_path.empty())
+        mollm_trace::write();
 
     caches_.clear();
     mtp_caches_.clear();
@@ -125,6 +131,10 @@ void LLMEngine::clear_model_state() {
     persistent_pool_.clear();
     hidden_output_copy_.clear();
     mtp_hidden_output_copy_.clear();
+    target_mtp_state_copy_.clear();
+    draft_mtp_state_copy_.clear();
+    target_mtp_state_ = Tensor{};
+    draft_mtp_state_ = Tensor{};
     mtp_draft_hidden_device_ = Tensor{};
     mtp_pending_hidden_.clear();
     mtp_stats_ = MtpStats{};
@@ -218,7 +228,7 @@ size_t LLMEngine::warmup_package_weights() {
 }
 
 size_t LLMEngine::lock_dense_package_weights() {
-    if (!package_weights_mmap_backed() || !moe_ssd_cache_ ||
+    if (!package_weights_mmap_backed() || (!moe_ssd_cache_ && !cfg_.offload_ple) ||
         !locked_dense_ranges_.empty()) {
         return 0;
     }
@@ -346,13 +356,13 @@ size_t LLMEngine::lock_dense_package_weights() {
         for (const auto& range : locked_dense_ranges_)
             munlock(range.first, range.second);
         locked_dense_ranges_.clear();
-        std::fprintf(stderr, "Engine: could not lock dense mmap weights: %s\n",
+        std::fprintf(stderr, "Engine: could not lock package working set: %s\n",
                      std::strerror(err));
         return 0;
     }
     std::fprintf(
         stderr,
-        "Engine: locked %.1f MB of dense mmap weights and %.1f MB of CPU "
+        "Engine: locked %.1f MB of mapped weights and %.1f MB of CPU "
         "sidecars (FP8-Q8 %.1f MB, FP8-BF16 %.1f MB, other %.1f MB)\n",
         warmed / 1e6, locked_sidecar_bytes / 1e6,
         fp8_q8_sidecar_bytes / 1e6, fp8_bf16_sidecar_bytes / 1e6,
@@ -364,10 +374,167 @@ size_t LLMEngine::lock_dense_package_weights() {
 // load_graph — load one graph and set up CONSTANT nodes from shared weights
 // ---------------------------------------------------------------------------
 
-bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
-    if (!graph_load(g, path)) {
+bool LLMEngine::load_mtp_companion() {
+    namespace fs = std::filesystem;
+    using json = nlohmann::json;
+    auto fail = [](const std::string& reason) {
+        std::fprintf(stderr, "Engine: invalid MTP companion: %s\n", reason.c_str());
+        return false;
+    };
+    try {
+        const fs::path directory = fs::canonical(cfg_.mtp_companion_dir);
+        std::ifstream input(directory / "manifest.json");
+        if (!input) return fail("missing completion manifest");
+        const json manifest = json::parse(input);
+        if (manifest.at("format") != "mollm-mtp-weight-bundle-v1" ||
+            manifest.at("standalone_model") != false ||
+            manifest.at("graph") != "model_mtp.graph" ||
+            manifest.at("shared_target_weights") != json::array({"./embed_tokens.weights", "./lm_head.weights"}) ||
+            !manifest.at("weights").is_object()) return fail("unsupported manifest contract");
+        const int context = manifest.at("n_ctx").get<int>();
+        const int sequence = manifest.at("seq_len").get<int>();
+        if (context < cfg_.n_ctx || sequence <= 0) return fail("insufficient context or invalid sequence length");
+        const fs::path graph_file = fs::canonical(directory / "model_mtp.graph");
+        if (graph_file.parent_path() != directory) return fail("graph escapes bundle directory");
+        const std::string graph_path = graph_file.string();
+        if (!graph_load(graph_mtp_, graph_path.c_str())) return fail("invalid graph");
+        int64_t target_width = 0;
+        for (uint32_t id : graph_mtp_.graph_inputs) {
+            const auto& node = graph_mtp_.nodes[id];
+            if (!node.params.str.empty() && node.params.str[0] == "target_hidden") {
+                if (node.out_prec != Precision::FP32 || node.out_shape[1] != sequence ||
+                    node.out_shape[2] != 1 || node.out_shape[3] != 1) return fail("invalid target state input");
+                target_width = node.out_shape[0];
+            }
+        }
+        if (target_width <= 0) return fail("missing target state input");
+        if (graph_mtp_.graph_outputs.empty() || !lm_head_weight_) return fail("missing draft logits hidden/shared head");
+        const auto& logits_hidden = graph_mtp_.nodes[graph_mtp_.graph_outputs.back()];
+        if (logits_hidden.out_prec != Precision::FP32 || logits_hidden.out_shape[0] != lm_head_weight_->shape[1] ||
+            logits_hidden.out_shape[2] != 1 || logits_hidden.out_shape[3] != 1)
+            return fail("draft logits hidden width mismatch");
+        auto draft_tap = graph_mtp_.metadata.find("mtp_state_output_node");
+        if (draft_tap == graph_mtp_.metadata.end()) {
+            if (logits_hidden.out_shape[0] != target_width) return fail("missing wide recursive draft state");
+        } else {
+            size_t end = 0;
+            const auto id = std::stoul(draft_tap->second, &end);
+            if (end != draft_tap->second.size() || id >= graph_mtp_.nodes.size() ||
+                std::find(graph_mtp_.graph_outputs.begin(), graph_mtp_.graph_outputs.end(), id) == graph_mtp_.graph_outputs.end())
+                return fail("invalid retained draft state tap");
+            const auto& state = graph_mtp_.nodes[id];
+            if (state.out_prec != Precision::FP32 || state.out_shape[0] != target_width ||
+                state.out_shape[2] != 1 || state.out_shape[3] != 1) return fail("recursive draft state width mismatch");
+        }
+        for (const Graph* graph : {&graph_prefill_, &graph_decode_}) {
+            if (graph->graph_outputs.empty()) return fail("missing target output");
+            uint32_t id = graph->graph_outputs.back();
+            auto tap = graph->metadata.find("mtp_state_output_node");
+            if (tap != graph->metadata.end()) {
+                size_t end = 0;
+                const auto value = std::stoul(tap->second, &end);
+                if (end != tap->second.size() || value >= graph->nodes.size()) return fail("invalid target state tap");
+                id = static_cast<uint32_t>(value);
+                if (std::find(graph->graph_outputs.begin(), graph->graph_outputs.end(), id) == graph->graph_outputs.end())
+                    return fail("target state is not retained");
+            }
+            const auto& state = graph->nodes[id];
+            if (state.out_prec != Precision::FP32 || state.out_shape[0] != target_width ||
+                state.out_shape[2] != 1 || state.out_shape[3] != 1) return fail("target state width mismatch");
+        }
+        std::unordered_set<std::string> used;
+        for (auto& node : graph_mtp_.nodes) {
+            if (node.op_type != OpType::CONSTANT || node.params.str.empty()) continue;
+            const std::string reference = node.params.str[0];
+            if (reference == "./embed_tokens.weights" || reference == "./lm_head.weights") continue;
+            auto entry = manifest.at("weights").find(reference);
+            std::string filename;
+            const bool dedicated = entry != manifest.at("weights").end();
+            if (dedicated) {
+                filename = entry->at("file").get<std::string>();
+                if (reference != "./" + filename || package_weight_map_.count(reference))
+                    return fail("dedicated weight collides with target package");
+            } else {
+                // GraphBuilder materializes inline constants outside the
+                // streamed-weight manifest. Accept only its exact node-local
+                // scalar filename and FP32 shape, never an arbitrary file.
+                filename = "model_mtp_const_" + std::to_string(node.id) + ".weights";
+                if (reference != filename || node.out_prec != Precision::FP32 ||
+                    node.out_shape[0] != 1 || node.out_shape[1] != 1 || node.out_shape[2] != 1 || node.out_shape[3] != 1)
+                    return fail("unlisted weight reference");
+            }
+            if (filename.empty() || fs::path(filename).filename() != filename || filename == "." || filename == "..")
+                return fail("non-local weight path");
+            const fs::path file = fs::canonical(directory / filename);
+            if (file.parent_path() != directory) return fail("weight escapes bundle directory");
+            MappedFile weight;
+            if (!weight.open(file.c_str())) return fail("invalid weight header: " + filename);
+            const auto& header = weight.header();
+            if (header.precision != static_cast<uint32_t>(node.out_prec)) return fail("weight precision mismatch: " + filename);
+            for (int d = 0; d < 4; ++d)
+                if (node.out_shape[d] <= 0 || header.shape[d] != static_cast<uint64_t>(node.out_shape[d]))
+                    return fail("weight shape mismatch: " + filename);
+            if (dedicated) {
+                if (fs::file_size(file) != entry->at("bytes").get<uint64_t>()) return fail("weight size mismatch: " + filename);
+                const auto& shape = entry->at("shape");
+                if (!shape.is_array() || shape.empty() || shape.size() > 4) return fail("invalid manifest shape");
+                for (size_t d = 0; d < shape.size(); ++d)
+                    if (shape[d].get<uint64_t>() != header.shape[d]) return fail("manifest shape mismatch");
+                const std::string precision = header.precision == static_cast<uint32_t>(Precision::FP16) ? "FP16" :
+                    header.precision == static_cast<uint32_t>(Precision::FP32) ? "FP32" : "";
+                if (precision.empty() || entry->at("precision") != precision) return fail("unsupported manifest precision");
+                used.insert(reference);
+            }
+            node.params.str[0] = file.string();
+        }
+        if (used.size() != manifest.at("weights").size()) return fail("unused manifest weights");
+        if (!load_graph(graph_mtp_, exec_ctx_mtp_, graph_path.c_str(), true)) return false;
+        std::fprintf(stderr, "Engine: loaded MTP companion %s (%zu dedicated weights)\n", directory.c_str(), used.size());
+        return true;
+    } catch (const std::exception& exception) {
+        return fail(exception.what());
+    }
+}
+
+bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
+                           bool already_loaded) {
+    if (!already_loaded && !graph_load(g, path)) {
         fprintf(stderr, "Engine: failed to load graph %s\n", path);
         return false;
+    }
+
+    if (!cfg_.qsa_companion_dir.empty() && (&g == &graph_prefill_ || &g == &graph_decode_)) {
+        std::string error;
+        if (cfg_.device != Device::CUDA || cfg_.mtp_draft_tokens ||
+            !cfg_.mtp_companion_dir.empty() || cfg_.static_padded ||
+            package_metadata_["architecture"] != "qwen4-exp" ||
+            !attach_qsa_companion(g, cfg_.qsa_companion_dir, cfg_.n_ctx, error)) {
+            std::fprintf(stderr, "Engine: cannot attach CUDA text QSA companion: %s\n", error.c_str());
+            return false;
+        }
+        std::fprintf(stderr, "Engine: attached QSA companion to %s graph (context=%d)\n",
+                     &g == &graph_prefill_ ? "prefill" : "decode", cfg_.n_ctx);
+    }
+
+    // Old Qwen4 packages already contain the pre-collapse HC tensor. Retain
+    // that exact producer in memory, without rewriting weights or adding math.
+    if (!cfg_.mtp_companion_dir.empty() && (&g == &graph_prefill_ || &g == &graph_decode_) &&
+        !g.metadata.count("mtp_state_output_node") &&
+        package_metadata_["architecture"] == "qwen4-exp") {
+        if (g.graph_outputs.empty()) return false;
+        const auto& last = g.nodes[g.graph_outputs.back()];
+        if (last.op_type != OpType::GR_REDUCE || last.inputs.size() != 2) return false;
+        const auto& norm = g.nodes[last.inputs[0]];
+        if (norm.op_type != OpType::GROUP_RMS_NORM || norm.inputs.size() != 2) return false;
+        const auto& gamma = g.nodes[norm.inputs[1]];
+        if (gamma.op_type != OpType::CONSTANT || gamma.params.str.empty() ||
+            gamma.params.str[0] != "./model_language_model_hyper_connection_mixer_hc_norm_weight.weights") return false;
+        const auto& state = g.nodes[norm.inputs[0]];
+        if (state.op_type != OpType::GR_INJECT || state.out_prec != Precision::FP32 ||
+            state.out_shape[0] != norm.out_shape[0] || state.out_shape[2] != 1 || state.out_shape[3] != 1)
+            return false;
+        g.graph_outputs.insert(g.graph_outputs.end() - 1, state.id);
+        g.metadata["mtp_state_output_node"] = std::to_string(state.id);
     }
 
     // Resolve graph directory for relative weight paths
@@ -390,9 +557,14 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
     }
 
     const bool build_cpu_weight_sidecars =
-        !accelerator_backend_ ||
+        !(already_loaded && &g == &graph_mtp_ && cfg_.device == Device::CUDA) &&
+        (!accelerator_backend_ ||
         exec_ctx.backend != accelerator_backend_.get() ||
-        accelerator_backend_->wants_cpu_weight_sidecars();
+        accelerator_backend_->wants_cpu_weight_sidecars());
+    // Validated CUDA companions contain only canonical FP16/FP32 weights.
+    // GPU preparation consumes those directly; optional CPU fallback can also
+    // read the original row-major mapping. Do not create/lock another ~5 GiB
+    // of unused CPU expert layouts alongside the resident GPU draft.
 
     for (auto& node : g.nodes) {
         if (node.op_type != OpType::CONSTANT || node.params.str.empty())
@@ -405,6 +577,15 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         }
 
         auto& t = g.runtime.tensors[node.id];
+        if (already_loaded && &g == &graph_mtp_ &&
+            (wref == "./embed_tokens.weights" || wref == "./lm_head.weights")) {
+            const Tensor* shared = wref == "./embed_tokens.weights" ? embed_weight_ : lm_head_weight_;
+            if (!shared) return false;
+            for (int dim = 0; dim < 4; ++dim)
+                if (shared->shape[dim] != node.out_shape[dim]) return false;
+            t = *shared;
+            continue;
+        }
 
         // Helper: set up weight tensor.
         auto setup_weight = [&](void* data, Precision file_prec) {
@@ -456,6 +637,23 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     t, is_aggregate_expert);
             }
         };
+
+        if (wref == "__qsa_frequency__") {
+            if (node.out_prec != Precision::FP32 || node.out_shape[0] <= 0 ||
+                node.out_shape[1] != 1 || node.params.f32.size() != size_t(node.out_shape[0]))
+                return false;
+            const std::string key = "#qsa_frequency_" + std::to_string(node.out_shape[0]);
+            auto& storage = packed_weights_[key];
+            const size_t bytes = node.params.f32.size() * sizeof(float);
+            if (storage.empty()) {
+                storage.resize(bytes);
+                std::memcpy(storage.data(), node.params.f32.data(), bytes);
+            } else if (storage.size() != bytes || std::memcmp(storage.data(), node.params.f32.data(), bytes)) {
+                return false;
+            }
+            setup_weight(storage.data(), Precision::FP32);
+            continue;
+        }
 
         // Package mode: resolve weight from package mmap via offset map.
         // The weight path (e.g. "./foo.weights") is looked up in
@@ -732,6 +930,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
     // Find special externally-driven weights. lm_head is stored explicitly in
     // the package and is treated as a normal matmul weight.
     for (auto& node : g.nodes) {
+        if (already_loaded && &g == &graph_mtp_) break;
         if (node.op_type == OpType::CONSTANT && !node.params.str.empty()) {
             const std::string& wref = node.params.str[0];
             if (wref.find("embed_tokens") != std::string::npos) {
@@ -759,6 +958,31 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
 
 bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
                                 std::vector<CachePair>& caches, int n_ctx) {
+    // QSA auxiliary capacities follow runtime context, just like main KV.
+    // Package graph capacity is not a second hidden --n-ctx limit. The two
+    // graphs later share these buffers via the existing aux_state migration.
+    std::unordered_map<uint32_t,std::pair<int,int>> qsa_state_shapes;
+    for(const auto& node:g.nodes)if(node.op_type==OpType::QSA_INDEXER) {
+        const auto reject=[](){std::fprintf(stderr,"Engine: QSA requires CUDA text, ctx<=262144, no MTP/padding, valid independent auxiliary states\n");return false;};
+        if(cfg_.device!=Device::CUDA||n_ctx<1||n_ctx>mollm_qsa::max_context||cfg_.mtp_draft_tokens||
+           !cfg_.mtp_companion_dir.empty()||cfg_.static_padded||node.inputs.size()!=8||
+           node.params.i32.size()!=5||node.params.i32[0]<1||node.params.i32[0]>16||
+           node.params.i32[1]<2||node.params.i32[1]>256||node.params.i32[2]<2||
+           node.params.i32[2]>node.params.i32[1]||node.params.i32[2]%2||
+           node.params.i32[3]<1||node.params.i32[3]>16||node.params.i32[4]<1||
+           node.params.i32[4]>4096-node.params.i32[3]+1||node.params.i32[4]%node.params.i32[3]||
+           node.out_prec!=Precision::INT32||node.out_shape[0]!=node.params.i32[4]+node.params.i32[3]-1)return reject();
+        const int dimension=node.params.i32[1],ratio=node.params.i32[3];
+        for(int operand:{4,5}) {
+            const uint32_t id=node.inputs[operand];
+            if(id>=g.nodes.size())return reject();
+            const auto& state=g.nodes[id];
+            if(state.op_type!=OpType::INPUT||state.params.str.empty()||state.out_prec!=Precision::FP32||
+               parse_persistent_input(state.params.str[0]).kind!=PersistentInputKind::AUX_STATE||
+               state.out_shape[0]!=dimension||state.out_shape[2]!=1||state.out_shape[3]!=1||
+               !qsa_state_shapes.emplace(id,std::make_pair(dimension,operand==4?n_ctx:std::max(1,n_ctx/ratio))).second)return reject();
+        }
+    }
     // Find persistent INPUT nodes and initialise their tensor shapes.
     // All recurrent state follows this path: KV cache, GDN state, and RWKV
     // state.
@@ -773,6 +997,11 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
         Tensor& tensor = g.runtime.tensors[node.id];
         initialize_input_tensor(tensor, node);
         if (input.kind == PersistentInputKind::AUX_STATE) {
+            const auto qsa=qsa_state_shapes.find(node.id);
+            if(qsa!=qsa_state_shapes.end()) {
+                tensor.shape[0]=qsa->second.first;tensor.shape[1]=qsa->second.second;
+                tensor.compute_strides();
+            }
             auxiliary_states_[input.layer] = &tensor;
             continue;
         }
@@ -996,7 +1225,94 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 
 bool LLMEngine::load_impl(const EngineConfig& cfg) {
     cfg_ = cfg;
+    if (!cfg_.qsa_companion_dir.empty() &&
+        (cfg_.device != Device::CUDA || cfg_.n_ctx < 1 || cfg_.n_ctx > mollm_qsa::max_context ||
+         cfg_.static_padded || cfg_.mtp_draft_tokens || !cfg_.mtp_companion_dir.empty())) {
+        std::fprintf(stderr, "Engine: --qsa-companion requires CUDA text, ctx1..262144, no MTP/padding\n");
+        return false;
+    }
+    if(cfg_.cuda_prefill_logical_batch&&!mollm_prefill::logical_config_supported(cfg_)) {
+        std::fprintf(stderr,"Engine: logical prefill requires bounded CUDA resident+offload-PLE+reclaim, positive context, chunk0..2048, no MTP/padding/decode-as-prefill\n");
+        return false;
+    }
+    const char* window_mode=std::getenv("MOLLM_TEST_CUDA_PREFILL_WINDOW_SCHEDULE");
+    if(cfg_.cuda_prefill_logical_batch&&window_mode&&std::strcmp(window_mode,"0")) {
+        std::fprintf(stderr,"Engine: logical prefill is incompatible with window scheduling\n");return false;
+    }
+    const char* readonly_option=std::getenv("MOLLM_TEST_CUDA_PREFILL_STATEFUL_LAST_USE");
+    if (readonly_option && std::strcmp(readonly_option,"0") && std::strcmp(readonly_option,"1")) {
+        std::fprintf(stderr,"Engine: test-only stateful last-use selector must be0 or1\n");
+        return false;
+    }
+    if(cfg_.cuda_prefill_logical_batch&&readonly_option&&!std::strcmp(readonly_option,"0")) {
+        std::fprintf(stderr,"Engine: logical prefill cannot disable read-only last-use contracts\n");return false;
+    }
+    const bool readonly_last_use=cfg_.cuda_prefill_logical_batch||(readonly_option && !std::strcmp(readonly_option,"1"));
+    int readonly_sequence_cap=cfg_.cuda_prefill_logical_batch?2048:512;
+    const char* readonly_cap=std::getenv("MOLLM_TEST_CUDA_PREFILL_STATEFUL_MAX_SEQ");
+    if (readonly_cap) {
+        if(cfg_.cuda_prefill_logical_batch) {
+            std::fprintf(stderr,"Engine: logical prefill owns its2048 cap; unset legacy stateful max sequence\n");return false;
+        }
+        if (!readonly_last_use || (std::strcmp(readonly_cap,"512") && std::strcmp(readonly_cap,"1024"))) {
+            std::fprintf(stderr,"Engine: test-only stateful last-use max sequence requires selector1 and exact512 or1024\n");
+            return false;
+        }
+        if (!std::strcmp(readonly_cap,"1024")) readonly_sequence_cap=1024;
+    }
+    if (readonly_last_use) {
+        size_t headroom=0,pool_limit=0;
+        const char* arena=std::getenv("MOLLM_RESIDENT_EXPERT_ARENA");
+        const bool valid_headroom=mollm_memory::parse_cuda_host_headroom(
+            std::getenv("MOLLM_CUDA_HOST_HEADROOM_MB"),headroom);
+        const bool valid_pool=mollm_memory::parse_cuda_host_headroom(
+            std::getenv("MOLLM_CUDA_OUTPUT_POOL_MB"),pool_limit);
+        if (!cfg_.cuda_prefill_reclaim || cfg_.device!=Device::CUDA || !cfg_.offload_ple ||
+            cfg_.weight_loading!=WeightLoadingMode::RESIDENT || cfg_.moe_ssd_cache_bytes ||
+            cfg_.n_ctx<1 || (!cfg_.cuda_prefill_logical_batch&&cfg_.n_ctx>4096) || cfg_.prefill_chunk_size<0 ||
+            (!cfg_.cuda_prefill_logical_batch&&cfg_.prefill_chunk_size!=0 && cfg_.prefill_chunk_size!=256 && cfg_.prefill_chunk_size!=512 &&
+                !(cfg_.prefill_chunk_size==1024 && readonly_sequence_cap==1024)) ||
+            cfg_.mtp_draft_tokens || !cfg_.mtp_companion_dir.empty() ||
+            cfg_.use_decode_as_prefill || cfg_.static_padded ||
+            !arena || std::strcmp(arena,"cuda-device") ||
+            !valid_headroom || headroom<size_t(24576)*1024*1024 ||
+            !valid_pool || pool_limit==0 || pool_limit>size_t(4096)*1024*1024 ||
+            !std::getenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS")) {
+            std::fprintf(stderr,"Engine: test-only stateful last-use requires CUDA resident+offload-PLE+public reclaim, context<=4096, chunk0/256/512 (1024 only with explicit max sequence1024), no MTP/padding/decode-as-prefill, CUDA-device arena, >=24576 MiB headroom, output pool1..4096 MiB, and disabled decode segments\n");
+            return false;
+        }
+    }
+    if (cfg_.cuda_prefill_reclaim &&
+        (cfg_.device != Device::CUDA || !cfg_.offload_ple ||
+         cfg_.weight_loading != WeightLoadingMode::RESIDENT || cfg_.moe_ssd_cache_bytes != 0 ||
+         cfg_.n_ctx < 1 || (!cfg_.cuda_prefill_logical_batch&&cfg_.n_ctx > 4096) || cfg_.prefill_chunk_size > (cfg_.cuda_prefill_logical_batch?2048:1024))) {
+        std::fprintf(stderr, "Engine: CUDA prefill reclamation requires resident+offload-PLE, context<=4096, chunk<=1024\n");
+        return false;
+    }
+    if (cfg_.cuda_prefill_reclaim) {
+        const char* arena = std::getenv("MOLLM_RESIDENT_EXPERT_ARENA");
+        if (!arena || std::strcmp(arena, "cuda-device") != 0) {
+            std::fprintf(stderr, "Engine: CUDA prefill reclamation requires MOLLM_RESIDENT_EXPERT_ARENA=cuda-device\n");
+            return false;
+        }
+    }
+    if (cfg_.prefill_chunk_size < 0) {
+        std::fprintf(stderr, "Engine: prefill_chunk_size must be nonnegative\n");
+        return false;
+    }
     cfg_.num_threads = std::max(cfg_.num_threads, 1);
+    if (!cfg_.mtp_companion_dir.empty() && cfg_.mtp_draft_tokens <= 0) {
+        std::fprintf(stderr, "Engine: --mtp-companion requires --mtp-draft-tokens > 0\n");
+        return false;
+    }
+    if (cfg_.offload_ple &&
+        (cfg_.device == Device::METAL ||
+         cfg_.weight_loading != WeightLoadingMode::RESIDENT ||
+         cfg_.moe_ssd_cache_bytes != 0)) {
+        std::fprintf(stderr, "Engine: PLE offload requires CPU/CUDA resident mode "
+                             "without an SSD expert cache\n");
+        return false;
+    }
     if (cfg_.image_max_pixels < EngineConfig::kMinImageMaxPixels ||
         cfg_.image_max_pixels > EngineConfig::kAbsoluteImageMaxPixels) {
         std::fprintf(
@@ -1055,7 +1371,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_mtp_.moe_backend = nullptr;
     accelerator_backend_.reset();
     auto fallback_to_cpu = [&](const char* reason) {
-        if (cfg_.device_fallback ==
+        if (cfg_.cuda_prefill_reclaim || cfg_.device_fallback ==
             DeviceFallbackPolicy::REQUIRE_REQUESTED) {
             std::fprintf(
                 stderr, "Engine: %s; requested device is required\n",
@@ -1118,6 +1434,63 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     }
     exec_ctx_prefill_.reuse_static_workspace = false;
     exec_ctx_prefill_.reuse_same_shape_workspace = true;
+    exec_ctx_prefill_.conservative_stateful_liveness = false;
+    exec_ctx_prefill_.stateful_readonly_last_use = false;
+    exec_ctx_prefill_.conservative_liveness_seq_limit = 0;
+    // Retaining every materialized node is useful for repeated small shapes,
+    // but can dominate memory for long CUDA prefill. Opt out without changing
+    // decode/MTP workspace policy or weight layout. Freed device allocations
+    // remain reusable in the backend pool; this is not a global memory cap.
+    if (cfg_.device == Device::CUDA) {
+        const char* diagnostic = std::getenv("MOLLM_TEST_CUDA_PREFILL_LIVENESS");
+        const bool diagnostic_on = diagnostic && std::strcmp(diagnostic, "1") == 0;
+        if (cfg_.cuda_prefill_reclaim && diagnostic_on) {
+            std::fprintf(stderr, "Engine: do not combine public prefill reclamation with test-only selector\n");
+            return false;
+        }
+        if (cfg_.cuda_prefill_reclaim || diagnostic_on) {
+            // Explicit staged diagnostic only; do not allow arbitrary large
+            // sequences after the whole-host OOM incidents. Unset stays256.
+            const char* cap_option = std::getenv("MOLLM_TEST_CUDA_PREFILL_LIVENESS_MAX_SEQ");
+            if(cfg_.cuda_prefill_logical_batch&&cap_option) {
+                std::fprintf(stderr,"Engine: logical prefill owns its2048 cap; unset legacy liveness max sequence\n");return false;
+            }
+            int sequence_cap = readonly_last_use ? readonly_sequence_cap : cfg_.cuda_prefill_reclaim ? 1024 : 256;
+            if (diagnostic_on && cap_option) {
+                if (std::strcmp(cap_option, "1024") == 0) sequence_cap = 1024;
+                else if (std::strcmp(cap_option, "512") == 0) sequence_cap = 512;
+                else if (std::strcmp(cap_option, "256") != 0) {
+                    std::fprintf(stderr, "Engine: test-only liveness max sequence must be256,512 or1024\n");
+                    return false;
+                }
+            }
+            const char* headroom = std::getenv("MOLLM_CUDA_HOST_HEADROOM_MB");
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long mb = headroom ? std::strtoull(headroom, &end, 10) : 0;
+            if (!headroom || *headroom == '-' || errno || !end || *end || mb < 24576 ||
+                (!cfg_.cuda_prefill_logical_batch&&cfg_.n_ctx > 4096) || cfg_.prefill_chunk_size > sequence_cap) {
+                std::fprintf(stderr, "Engine: %s requires >=24576 MiB headroom, context<=4096, chunk<=%d\n",
+                    cfg_.cuda_prefill_reclaim ? "CUDA prefill reclamation" : "test-only liveness", sequence_cap);
+                return false;
+            }
+            exec_ctx_prefill_.conservative_stateful_liveness = true;
+            exec_ctx_prefill_.stateful_readonly_last_use = readonly_last_use;
+            exec_ctx_prefill_.conservative_liveness_seq_limit = sequence_cap;
+            exec_ctx_prefill_.reuse_same_shape_workspace = false;
+            std::fprintf(stderr, "Engine: %s, sequence cap%d\n",
+                cfg_.cuda_prefill_reclaim ? "CUDA prefill intermediate reclamation enabled" :
+                    "TEST-ONLY conservative prefill liveness", sequence_cap);
+            if (readonly_last_use)
+                std::fprintf(stderr,"Engine: TEST-ONLY prefill stateful read-only last-use contracts enabled; captured decode segments disabled\n");
+        }
+        const char* reuse = std::getenv("MOLLM_CUDA_PREFILL_REUSE_WORKSPACE");
+        if (reuse && std::strcmp(reuse, "0") == 0) {
+            exec_ctx_prefill_.reuse_same_shape_workspace = false;
+            std::fprintf(stderr,
+                "Engine: CUDA prefill cross-call workspace retention disabled\n");
+        }
+    }
     exec_ctx_decode_.reuse_static_workspace = true;
     exec_ctx_decode_.reuse_same_shape_workspace = false;
     exec_ctx_mtp_.reuse_static_workspace = false;
@@ -1145,7 +1518,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             cfg_.chat_template_path = jinja_tmp;
         }
     }
-    if (cfg_.mtp_draft_tokens > 0 && mtp_path.empty()) {
+    if (!cfg_.mtp_companion_dir.empty() && !mtp_path.empty()) {
+        std::fprintf(stderr, "Engine: cannot combine packaged MTP and an MTP companion\n");
+        return false;
+    }
+    if (cfg_.mtp_draft_tokens > 0 && mtp_path.empty() && cfg_.mtp_companion_dir.empty()) {
         fprintf(stderr,
                 "Engine: --mtp-draft-tokens requires a package with an MTP graph\n");
         return false;
@@ -1237,7 +1614,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                             "Engine: full-Metal SSD decode enabled; experts "
                             "load directly into Shared Metal buffers\n");
                 }
-            } else {
+            } else if (cfg_.device == Device::METAL) {
                 fprintf(
                     stderr,
                     "Engine: Metal/SSD hybrid adaptively selects CPU/Metal "
@@ -1257,6 +1634,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     const std::string& pf_path_load =
         cfg_.use_decode_as_prefill ? dc_path : pf_path;
     if (!load_graph(graph_prefill_, exec_ctx_prefill_, pf_path_load.c_str())) {
+        return false;
+    }
+    if(cfg_.cuda_prefill_logical_batch&&!mollm_prefill::logical_graph_supported(graph_prefill_)) {
+        std::fprintf(stderr,"Engine: logical prefill requires dynamic Qwen3.8 geometry:48 MoE2560/512/10/640 and12 D256 attention layers\n");
         return false;
     }
     if (!vi_path.empty() &&
@@ -1302,7 +1683,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         return false;
     }
     if (cfg_.mtp_draft_tokens > 0) {
-        if (!load_graph(graph_mtp_, exec_ctx_mtp_, mtp_path.c_str())) {
+        if ((!cfg_.mtp_companion_dir.empty() && !load_mtp_companion()) ||
+            (cfg_.mtp_companion_dir.empty() && !load_graph(graph_mtp_, exec_ctx_mtp_, mtp_path.c_str()))) {
             return false;
         }
         if (!allocate_caches(
@@ -1315,7 +1697,15 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     // records their source blobs as exclusions. Lock only after both graphs
     // have been prepared so those now-unused raw package pages are not pulled
     // into RAM and pinned alongside their sidecars.
-    if (cfg_.lock_dense_weights && moe_ssd_cache_) {
+    if (cfg_.offload_ple) {
+        // This mode promises a resident non-PLE working set. A failed mlock
+        // must fail the load rather than silently degrade to pageable mmap.
+        if (lock_dense_package_weights() == 0) {
+            std::fprintf(stderr, "Engine: --offload-ple needs enough RAM and "
+                                 "locked-memory allowance for all non-PLE weights\n");
+            return false;
+        }
+    } else if (cfg_.lock_dense_weights && moe_ssd_cache_) {
         lock_dense_package_weights();
     }
 

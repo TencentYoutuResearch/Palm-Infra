@@ -1,0 +1,94 @@
+请综合以下两组评审档案，给出统一风险清单、测量计划和验收条件。区分假设与实测。
+
+第一组档案：
+请综合以下两份工程评审材料，给出统一的风险分析与可执行验证方案。不要把假设当作测量结果。
+
+材料 A：
+请阅读以下工程评审材料，用中文归纳三个风险，并分别提出可执行的验证方法。不要把假设当作测量结果。
+
+一个推理服务使用统一内存设备。模型的专家参数常驻设备可访问内存，而词表查找参数由主机按需访问。启动时需要加载参数、分配工作区，并建立执行图。预填充处理整个输入序列，生成阶段每次处理一个新 token。工程师发现短请求的生成吞吐稳定，但长请求的首字延迟明显偏高。他希望同时改进吞吐、首字延迟和内存占用，却不能改变部署包格式或要求用户保留两份专家权重。
+
+第一份建议是按专家编号重新排列路由任务，让共享同一专家的输入连续出现。任务输出仍需写回原始路由槽位，不能改变归约顺序。排序键只能决定排列，不能替代对权重、缩放和布局元数据的校验。两个描述符即使具有相同的权重地址，也可能使用不同的解释方式；这种情况必须保持独立执行。输入缩放和输出乘数属于各个任务，不应被误当作专家共享属性。不同专家的最后一组不足一个完整批量时，也必须正确处理。
+
+第二份建议是使用低精度矩阵乘法。参数已经以四位格式保存，但激活原来是单精度浮点数。新的路径需要先为每个激活块寻找最大绝对值，再计算块缩放并量化。门控投影和上投影可能使用不同的全局缩放；下投影还需要保留各条路由的权重。矩阵指令的输出累加器可以是单精度，但这不意味着整个计算与原来的单精度激活路径等价。验证数值误差时，应先隔离权重布局变化，再隔离激活量化变化，最后评估真实模型的行为。
+
+第三份建议是缓存所有中间结果。评审者指出，缓存也有成本：工作区可能跨图重放被覆盖；中间状态可能与输入长度相关；不同请求之间不能共享有状态缓冲区。若使用推测生成，目标模型必须能够恢复到接受前缀对应的精确状态。只恢复注意力缓存而漏掉递归层、短卷积或词表相关的历史状态，会让后续 token 使用错误上下文。成功执行一次不等于恢复逻辑正确，必须测试接受零个、部分和全部草稿 token 的情况。
+
+The performance experiment uses one GPU and runs candidates sequentially. Both implementations must use the same model package, prompt, sampling settings and generated-token limit. Loading and graph construction are reported separately from steady-state execution. A warm-up run is followed by several measured repetitions. The experiment is then repeated in reverse order because temperature, clock variation and background memory activity can otherwise bias the comparison. Raw observations are retained, not only the fastest sample.
+
+For numerical validation, the first comparison checks independent projections against grouped projections using identical quantized inputs. It includes different input magnitudes, signed output multipliers, incomplete groups, multiple experts and both supported weight layouts. A graph replay test changes inputs between launches to detect stale buffers. Output pointers are deliberately arranged in reverse order so that a misplaced scatter cannot pass by coincidence. Exact equality in this comparison establishes compatibility with the reference low-precision path; it does not establish equivalence to the higher-precision model.
+
+A separate model-quality experiment measures token losses on unseen text. The prompt portion is processed with the candidate prefill path, while subsequent tokens use the unchanged decode path. The evaluator records the total loss and individual token losses, and also compares deterministic generated sequences. A small text fixture is useful for finding implementation bugs but cannot establish broad quality. The report should distinguish a layout-preserving optimization, a scheduling optimization and a precision-changing optimization.
+
+Finally, the deployment decision should account for request length and concurrency. A change that improves a long prompt may add overhead to short prompts. A change that speeds up prefill may leave decode unchanged. Allocating a second parameter copy can exceed available memory even when a microbenchmark looks impressive. A safe optional control should document its requirements and fallback behavior, and an unsupported configuration should fail clearly instead of silently using an incompatible kernel.
+
+请基于材料回答：你会优先测试哪三项风险？每项列出输入设计、比较基准与判定标准，并说明哪些结论仍需要更广泛的数据。
+
+材料 B（复核同一设计）：
+请阅读以下工程评审材料，用中文归纳三个风险，并分别提出可执行的验证方法。不要把假设当作测量结果。
+
+一个推理服务使用统一内存设备。模型的专家参数常驻设备可访问内存，而词表查找参数由主机按需访问。启动时需要加载参数、分配工作区，并建立执行图。预填充处理整个输入序列，生成阶段每次处理一个新 token。工程师发现短请求的生成吞吐稳定，但长请求的首字延迟明显偏高。他希望同时改进吞吐、首字延迟和内存占用，却不能改变部署包格式或要求用户保留两份专家权重。
+
+第一份建议是按专家编号重新排列路由任务，让共享同一专家的输入连续出现。任务输出仍需写回原始路由槽位，不能改变归约顺序。排序键只能决定排列，不能替代对权重、缩放和布局元数据的校验。两个描述符即使具有相同的权重地址，也可能使用不同的解释方式；这种情况必须保持独立执行。输入缩放和输出乘数属于各个任务，不应被误当作专家共享属性。不同专家的最后一组不足一个完整批量时，也必须正确处理。
+
+第二份建议是使用低精度矩阵乘法。参数已经以四位格式保存，但激活原来是单精度浮点数。新的路径需要先为每个激活块寻找最大绝对值，再计算块缩放并量化。门控投影和上投影可能使用不同的全局缩放；下投影还需要保留各条路由的权重。矩阵指令的输出累加器可以是单精度，但这不意味着整个计算与原来的单精度激活路径等价。验证数值误差时，应先隔离权重布局变化，再隔离激活量化变化，最后评估真实模型的行为。
+
+第三份建议是缓存所有中间结果。评审者指出，缓存也有成本：工作区可能跨图重放被覆盖；中间状态可能与输入长度相关；不同请求之间不能共享有状态缓冲区。若使用推测生成，目标模型必须能够恢复到接受前缀对应的精确状态。只恢复注意力缓存而漏掉递归层、短卷积或词表相关的历史状态，会让后续 token 使用错误上下文。成功执行一次不等于恢复逻辑正确，必须测试接受零个、部分和全部草稿 token 的情况。
+
+The performance experiment uses one GPU and runs candidates sequentially. Both implementations must use the same model package, prompt, sampling settings and generated-token limit. Loading and graph construction are reported separately from steady-state execution. A warm-up run is followed by several measured repetitions. The experiment is then repeated in reverse order because temperature, clock variation and background memory activity can otherwise bias the comparison. Raw observations are retained, not only the fastest sample.
+
+For numerical validation, the first comparison checks independent projections against grouped projections using identical quantized inputs. It includes different input magnitudes, signed output multipliers, incomplete groups, multiple experts and both supported weight layouts. A graph replay test changes inputs between launches to detect stale buffers. Output pointers are deliberately arranged in reverse order so that a misplaced scatter cannot pass by coincidence. Exact equality in this comparison establishes compatibility with the reference low-precision path; it does not establish equivalence to the higher-precision model.
+
+A separate model-quality experiment measures token losses on unseen text. The prompt portion is processed with the candidate prefill path, while subsequent tokens use the unchanged decode path. The evaluator records the total loss and individual token losses, and also compares deterministic generated sequences. A small text fixture is useful for finding implementation bugs but cannot establish broad quality. The report should distinguish a layout-preserving optimization, a scheduling optimization and a precision-changing optimization.
+
+Finally, the deployment decision should account for request length and concurrency. A change that improves a long prompt may add overhead to short prompts. A change that speeds up prefill may leave decode unchanged. Allocating a second parameter copy can exceed available memory even when a microbenchmark looks impressive. A safe optional control should document its requirements and fallback behavior, and an unsupported configuration should fail clearly instead of silently using an incompatible kernel.
+
+请基于材料回答：你会优先测试哪三项风险？每项列出输入设计、比较基准与判定标准，并说明哪些结论仍需要更广泛的数据。
+
+第二组档案：
+请综合以下两份工程评审材料，给出统一的风险分析与可执行验证方案。不要把假设当作测量结果。
+
+材料 A：
+请阅读以下工程评审材料，用中文归纳三个风险，并分别提出可执行的验证方法。不要把假设当作测量结果。
+
+一个推理服务使用统一内存设备。模型的专家参数常驻设备可访问内存，而词表查找参数由主机按需访问。启动时需要加载参数、分配工作区，并建立执行图。预填充处理整个输入序列，生成阶段每次处理一个新 token。工程师发现短请求的生成吞吐稳定，但长请求的首字延迟明显偏高。他希望同时改进吞吐、首字延迟和内存占用，却不能改变部署包格式或要求用户保留两份专家权重。
+
+第一份建议是按专家编号重新排列路由任务，让共享同一专家的输入连续出现。任务输出仍需写回原始路由槽位，不能改变归约顺序。排序键只能决定排列，不能替代对权重、缩放和布局元数据的校验。两个描述符即使具有相同的权重地址，也可能使用不同的解释方式；这种情况必须保持独立执行。输入缩放和输出乘数属于各个任务，不应被误当作专家共享属性。不同专家的最后一组不足一个完整批量时，也必须正确处理。
+
+第二份建议是使用低精度矩阵乘法。参数已经以四位格式保存，但激活原来是单精度浮点数。新的路径需要先为每个激活块寻找最大绝对值，再计算块缩放并量化。门控投影和上投影可能使用不同的全局缩放；下投影还需要保留各条路由的权重。矩阵指令的输出累加器可以是单精度，但这不意味着整个计算与原来的单精度激活路径等价。验证数值误差时，应先隔离权重布局变化，再隔离激活量化变化，最后评估真实模型的行为。
+
+第三份建议是缓存所有中间结果。评审者指出，缓存也有成本：工作区可能跨图重放被覆盖；中间状态可能与输入长度相关；不同请求之间不能共享有状态缓冲区。若使用推测生成，目标模型必须能够恢复到接受前缀对应的精确状态。只恢复注意力缓存而漏掉递归层、短卷积或词表相关的历史状态，会让后续 token 使用错误上下文。成功执行一次不等于恢复逻辑正确，必须测试接受零个、部分和全部草稿 token 的情况。
+
+The performance experiment uses one GPU and runs candidates sequentially. Both implementations must use the same model package, prompt, sampling settings and generated-token limit. Loading and graph construction are reported separately from steady-state execution. A warm-up run is followed by several measured repetitions. The experiment is then repeated in reverse order because temperature, clock variation and background memory activity can otherwise bias the comparison. Raw observations are retained, not only the fastest sample.
+
+For numerical validation, the first comparison checks independent projections against grouped projections using identical quantized inputs. It includes different input magnitudes, signed output multipliers, incomplete groups, multiple experts and both supported weight layouts. A graph replay test changes inputs between launches to detect stale buffers. Output pointers are deliberately arranged in reverse order so that a misplaced scatter cannot pass by coincidence. Exact equality in this comparison establishes compatibility with the reference low-precision path; it does not establish equivalence to the higher-precision model.
+
+A separate model-quality experiment measures token losses on unseen text. The prompt portion is processed with the candidate prefill path, while subsequent tokens use the unchanged decode path. The evaluator records the total loss and individual token losses, and also compares deterministic generated sequences. A small text fixture is useful for finding implementation bugs but cannot establish broad quality. The report should distinguish a layout-preserving optimization, a scheduling optimization and a precision-changing optimization.
+
+Finally, the deployment decision should account for request length and concurrency. A change that improves a long prompt may add overhead to short prompts. A change that speeds up prefill may leave decode unchanged. Allocating a second parameter copy can exceed available memory even when a microbenchmark looks impressive. A safe optional control should document its requirements and fallback behavior, and an unsupported configuration should fail clearly instead of silently using an incompatible kernel.
+
+请基于材料回答：你会优先测试哪三项风险？每项列出输入设计、比较基准与判定标准，并说明哪些结论仍需要更广泛的数据。
+
+材料 B（复核同一设计）：
+请阅读以下工程评审材料，用中文归纳三个风险，并分别提出可执行的验证方法。不要把假设当作测量结果。
+
+一个推理服务使用统一内存设备。模型的专家参数常驻设备可访问内存，而词表查找参数由主机按需访问。启动时需要加载参数、分配工作区，并建立执行图。预填充处理整个输入序列，生成阶段每次处理一个新 token。工程师发现短请求的生成吞吐稳定，但长请求的首字延迟明显偏高。他希望同时改进吞吐、首字延迟和内存占用，却不能改变部署包格式或要求用户保留两份专家权重。
+
+第一份建议是按专家编号重新排列路由任务，让共享同一专家的输入连续出现。任务输出仍需写回原始路由槽位，不能改变归约顺序。排序键只能决定排列，不能替代对权重、缩放和布局元数据的校验。两个描述符即使具有相同的权重地址，也可能使用不同的解释方式；这种情况必须保持独立执行。输入缩放和输出乘数属于各个任务，不应被误当作专家共享属性。不同专家的最后一组不足一个完整批量时，也必须正确处理。
+
+第二份建议是使用低精度矩阵乘法。参数已经以四位格式保存，但激活原来是单精度浮点数。新的路径需要先为每个激活块寻找最大绝对值，再计算块缩放并量化。门控投影和上投影可能使用不同的全局缩放；下投影还需要保留各条路由的权重。矩阵指令的输出累加器可以是单精度，但这不意味着整个计算与原来的单精度激活路径等价。验证数值误差时，应先隔离权重布局变化，再隔离激活量化变化，最后评估真实模型的行为。
+
+第三份建议是缓存所有中间结果。评审者指出，缓存也有成本：工作区可能跨图重放被覆盖；中间状态可能与输入长度相关；不同请求之间不能共享有状态缓冲区。若使用推测生成，目标模型必须能够恢复到接受前缀对应的精确状态。只恢复注意力缓存而漏掉递归层、短卷积或词表相关的历史状态，会让后续 token 使用错误上下文。成功执行一次不等于恢复逻辑正确，必须测试接受零个、部分和全部草稿 token 的情况。
+
+The performance experiment uses one GPU and runs candidates sequentially. Both implementations must use the same model package, prompt, sampling settings and generated-token limit. Loading and graph construction are reported separately from steady-state execution. A warm-up run is followed by several measured repetitions. The experiment is then repeated in reverse order because temperature, clock variation and background memory activity can otherwise bias the comparison. Raw observations are retained, not only the fastest sample.
+
+For numerical validation, the first comparison checks independent projections against grouped projections using identical quantized inputs. It includes different input magnitudes, signed output multipliers, incomplete groups, multiple experts and both supported weight layouts. A graph replay test changes inputs between launches to detect stale buffers. Output pointers are deliberately arranged in reverse order so that a misplaced scatter cannot pass by coincidence. Exact equality in this comparison establishes compatibility with the reference low-precision path; it does not establish equivalence to the higher-precision model.
+
+A separate model-quality experiment measures token losses on unseen text. The prompt portion is processed with the candidate prefill path, while subsequent tokens use the unchanged decode path. The evaluator records the total loss and individual token losses, and also compares deterministic generated sequences. A small text fixture is useful for finding implementation bugs but cannot establish broad quality. The report should distinguish a layout-preserving optimization, a scheduling optimization and a precision-changing optimization.
+
+Finally, the deployment decision should account for request length and concurrency. A change that improves a long prompt may add overhead to short prompts. A change that speeds up prefill may leave decode unchanged. Allocating a second parameter copy can exceed available memory even when a microbenchmark looks impressive. A safe optional control should document its requirements and fallback behavior, and an unsupported configuration should fail clearly instead of silently using an incompatible kernel.
+
+请基于材料回答：你会优先测试哪三项风险？每项列出输入设计、比较基准与判定标准，并说明哪些结论仍需要更广泛的数据。
+
+请按瓶颈、正确性、资源占用三个方面总结，避免重复论述。
+
