@@ -2197,26 +2197,18 @@ cudaError_t launch_nvfp4_mma_grouped(const Nvfp4Projection* jobs, int count,
     if(vector_quantize&&(!output_bf16||!async_weights||rows!=1280||inner!=2560||
         split_row!=640||max_batch_size!=32||minimum!=1))return cudaErrorInvalidValue;
     if(parallel_plan&&(compact_batches||specialized_prepared))return cudaErrorInvalidValue;
-    static const int requested_batch_warps = [] {
-        const char* value=std::getenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS");
-        if(value && std::strcmp(value,"2")==0)return 2;
-        if(value && std::strcmp(value,"8")==0)return 8;
-        return 4;
-    }();
+    constexpr int requested_batch_warps=4;
     if(early_inputs&&(!output_bf16||!async_weights||rows!=1280||inner!=2560||
         split_row!=640||max_batch_size!=32||minimum!=1||requested_batch_warps!=4))return cudaErrorInvalidValue;
     if(output_bf16) {
-        const char* option=std::getenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS");
         const bool down=rows==2560&&inner==640&&!split_row&&max_batch_size==8&&!async_weights;
         const bool gate=rows==1280&&inner==2560&&split_row==640&&max_batch_size==32&&async_weights;
         if(!canonical_weights||!packed_inputs||compact_batches||specialized_prepared||
-            prepare_singles||minimum!=1||(!down&&!gate)||requested_batch_warps!=4||
-            (option&&(!std::strcmp(option,"2")||!std::strcmp(option,"8"))))return cudaErrorInvalidValue;
+            prepare_singles||minimum!=1||(!down&&!gate)||requested_batch_warps!=4)
+            return cudaErrorInvalidValue;
     }
-    const char* warp_option=async_weights?std::getenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS"):nullptr;
     if(async_weights && (!canonical_weights || !packed_inputs || compact_batches ||
-        specialized_prepared || max_batch_size!=32 || rows!=1280 || inner!=2560 ||
-        (warp_option && (!std::strcmp(warp_option,"2") || !std::strcmp(warp_option,"8")))))
+        specialized_prepared || max_batch_size!=32 || rows!=1280 || inner!=2560))
         return cudaErrorInvalidValue;
     if (!jobs || !batches || count <= 0 || count > 65535 || rows <= 0 ||
         rows > 2147483584 || rows % 16 || inner <= 0 || inner > 2560 ||
@@ -2248,7 +2240,7 @@ cudaError_t launch_nvfp4_mma_grouped(const Nvfp4Projection* jobs, int count,
     else build_nvfp4_batches_cuda<8><<<(count + 127) / 128, 128, 0, stream>>>(jobs, count, batches, compact_batches, minimum);
     status = cudaGetLastError();
     if (status != cudaSuccess) return status;
-    const int batch_warps=split_row%(requested_batch_warps*16)==0?requested_batch_warps:4;
+    constexpr int batch_warps=4;
     const int batch_tile_rows=batch_warps*16;
     const dim3 batch_grid((static_cast<uint64_t>(rows)+batch_tile_rows-1)/batch_tile_rows,
         compact_batches ? (compact_grid_y ? compact_grid_y : (count + max_batch_size - 1) / max_batch_size) : count);
@@ -2470,10 +2462,7 @@ void launch_moe_resident_routes(const float* logits, int rows, int experts,
     float* activated, float* down, int hidden, int inter,
     Nvfp4Projection* gate_jobs, Nvfp4Projection* down_jobs, float* weights, cudaStream_t stream,
     int cached_best_override,bool down_output_bf16,bool gate_output_bf16) {
-    static const bool register_scores = [] {
-        const char* option = std::getenv("MOLLM_CUDA_REGISTER_ROUTES");
-        return option && std::strcmp(option, "1") == 0;
-    }();
+    constexpr bool register_scores=false;
     const auto launch = [&](auto packed,auto gate_packed) {
     constexpr bool bf16_down=decltype(packed)::value;
     constexpr bool bf16_gate=decltype(gate_packed)::value;

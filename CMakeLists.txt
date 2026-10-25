@@ -981,33 +981,8 @@ if(MOLLM_BUILD_TESTS)
             add_test(NAME test_cuda_dense_lt_policy COMMAND bench_cuda_dense_lt_gemm --policy-only)
             add_test(NAME test_cuda_dense_full_lt COMMAND bench_cuda_dense_lt_gemm --logical-policy-only)
             set_tests_properties(test_cuda_dense_full_lt PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_DENSE_WIDE_FULL_LT=1;MOLLM_TEST_CUDA_DENSE_WIDE_ROW_TILE=0"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_dense_full_lt_default COMMAND bench_cuda_dense_lt_gemm --logical-policy-only)
-            add_test(NAME test_cuda_dense_wide_tile23 COMMAND bench_cuda_dense_lt_gemm --logical-policy-only)
-            set_tests_properties(test_cuda_dense_wide_tile23 PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_DENSE_WIDE_FULL_LT=1;MOLLM_TEST_CUDA_DENSE_WIDE_ROW_TILE=0;MOLLM_TEST_CUDA_DENSE_WIDE_TILE=23"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_dense_wide_tile23_invalid COMMAND bench_cuda_dense_lt_gemm --logical-policy-only)
-            set_tests_properties(test_cuda_dense_wide_tile23_invalid PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_DENSE_WIDE_FULL_LT=1;MOLLM_TEST_CUDA_DENSE_WIDE_ROW_TILE=0;MOLLM_TEST_CUDA_DENSE_WIDE_TILE=24"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_dense_wide_tile23_short COMMAND bench_cuda_dense_lt_gemm --policy-only)
-            set_tests_properties(test_cuda_dense_wide_tile23_short PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_DENSE_WIDE_FULL_LT=1;MOLLM_TEST_CUDA_DENSE_WIDE_ROW_TILE=0;MOLLM_TEST_CUDA_DENSE_WIDE_TILE=23"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_dense_wide_tile23_without_full COMMAND bench_cuda_dense_lt_gemm --logical-policy-only)
-            set_tests_properties(test_cuda_dense_wide_tile23_without_full PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_DENSE_WIDE_FULL_LT=0;MOLLM_TEST_CUDA_DENSE_WIDE_ROW_TILE=0;MOLLM_TEST_CUDA_DENSE_WIDE_TILE=23"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            set_tests_properties(test_cuda_dense_full_lt_default PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_DENSE_WIDE_FULL_LT=0;MOLLM_TEST_CUDA_DENSE_WIDE_ROW_TILE=0"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             add_test(NAME test_cuda_dense_window_partition COMMAND bench_cuda_dense_lt_gemm --window-merge-check)
-            add_test(NAME test_cuda_dense_wide_row_tile COMMAND bench_cuda_dense_lt_gemm --window-merge-check)
-            set_tests_properties(test_cuda_dense_wide_row_tile PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_DENSE_WIDE_ROW_TILE=1024"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             add_test(NAME test_cuda_hc_gate_row_tile COMMAND bench_cuda_dense_lt_gemm --hc-gate-tile-check)
             set_tests_properties(test_cuda_hc_gate_row_tile PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
@@ -1180,7 +1155,7 @@ if(MOLLM_BUILD_TESTS)
         add_mollm_test(test_cuda_backend tests/test_cuda_backend.cpp)
         add_mollm_test(test_cuda_nvfp4_logical_batch tests/test_cuda_nvfp4_logical_batch.cpp)
         set_tests_properties(test_cuda_nvfp4_logical_batch PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_HOST_HEADROOM_MB=102400;MOLLM_CUDA_DISABLE_MOE_GRAPHS=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1;MOLLM_CUDA_NVFP4_MMA_PREFILL_ONLY=1;MOLLM_CUDA_NVFP4_MMA_PREFILL_BATCH=1;MOLLM_CUDA_NVFP4_MMA_PREFILL_BATCH_SMALL=1;MOLLM_CUDA_NVFP4_MMA_GATE_MIN_BATCH=1;MOLLM_CUDA_NVFP4_MMA_DOWN_MIN_BATCH=1;MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS=4;MOLLM_CUDA_NVFP4_MMA_BATCH_ROUTES=8;MOLLM_CUDA_NVFP4_MMA_GATE_BATCH_ROUTES=32;MOLLM_CUDA_NVFP4_PREFILL_TILED_GROUP=1;MOLLM_CUDA_NVFP4_N32_ASYNC_WEIGHTS=1;MOLLM_CUDA_NVFP4_ACTIVATION_PREPARE_FUSION=2;MOLLM_CUDA_NVFP4_PREFILL_BF16_GATE_OUTPUT=1;MOLLM_CUDA_NVFP4_PREFILL_BF16_DOWN_OUTPUT=1;MOLLM_CUDA_NVFP4_PREFILL_EARLY_INPUTS=1;MOLLM_CUDA_NVFP4_PREFILL_VECTOR_QUANTIZE=1;MOLLM_CUDA_NVFP4_PREFILL_PARALLEL_PLAN=1;MOLLM_CUDA_NVFP4_PREFILL_MMA_ACTIVATION_FUSED=1;MOLLM_CUDA_PREFILL_GATE_SCALE_CACHE_MB=16;MOLLM_CUDA_NVFP4_PREFILL_INPUT_SCALE_KMAJOR=1;MOLLM_CUDA_NVFP4_PREFILL_COMPACT_LOGITS=1;MOLLM_CUDA_NVFP4_PREFILL_TOKEN_QUANTIZE=1;MOLLM_CUDA_NVFP4_PREFILL_TOKEN_PAIR_WORDS=1"
+            ENVIRONMENT "MOLLM_CUDA_HOST_HEADROOM_MB=102400;MOLLM_CUDA_DISABLE_MOE_GRAPHS=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1;MOLLM_CUDA_PREFILL_GATE_SCALE_CACHE_MB=16;MOLLM_CUDA_NVFP4_PREFILL_INPUT_SCALE_KMAJOR=1;MOLLM_CUDA_NVFP4_PREFILL_COMPACT_LOGITS=1;MOLLM_CUDA_NVFP4_PREFILL_TOKEN_QUANTIZE=1;MOLLM_CUDA_NVFP4_PREFILL_TOKEN_PAIR_WORDS=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_mollm_test(test_cuda_segmented_execution tests/test_cuda_segmented_execution.cpp)
         add_test(NAME test_cuda_nvfp4_resident_gate_code_view COMMAND test_cuda_nvfp4_logical_batch)
@@ -1265,11 +1240,11 @@ if(MOLLM_BUILD_TESTS)
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_segmented_execution_gdn_quad COMMAND test_cuda_segmented_execution)
         set_tests_properties(test_cuda_segmented_execution_gdn_quad PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1;MOLLM_CUDA_GDN_PREFILL_PAIRED_VALUES=1;MOLLM_CUDA_GDN_PREFILL_QUAD_VALUES=1"
+            ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_segmented_execution_sdpa_validated COMMAND test_cuda_segmented_execution)
         set_tests_properties(test_cuda_segmented_execution_sdpa_validated PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SHARED_SCORE_LIMIT=1024;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_UNROLL=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
+            ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_segmented_execution_one_graph COMMAND test_cuda_segmented_execution)
         set_tests_properties(test_cuda_segmented_execution_one_graph PROPERTIES
@@ -1277,7 +1252,7 @@ if(MOLLM_BUILD_TESTS)
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_segmented_execution_one_graph_validated COMMAND test_cuda_segmented_execution)
         set_tests_properties(test_cuda_segmented_execution_one_graph_validated PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1;MOLLM_TEST_CUDA_SEGMENTED_ONE_GRAPH=1;MOLLM_CUDA_GDN_PREFILL_PAIRED_VALUES=1;MOLLM_CUDA_GDN_PREFILL_QUAD_VALUES=1;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SHARED_SCORE_LIMIT=1024;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_UNROLL=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
+            ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1;MOLLM_TEST_CUDA_SEGMENTED_ONE_GRAPH=1;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         if(MOLLM_CUDA_DECODE_SEGMENTS)
             target_compile_definitions(test_cuda_backend PRIVATE MOLLM_CUDA_DECODE_SEGMENTS=1)
@@ -1289,19 +1264,19 @@ if(MOLLM_BUILD_TESTS)
                 LABELS "cuda" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
         endforeach()
         set_tests_properties(test_cuda_shared_fp16_cache_disabled PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED=0;MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
         set_tests_properties(test_cuda_shared_fp16_cache_enabled PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED=1;MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
         set_tests_properties(test_cuda_shared_fp16_cache_invalid PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED=bad;MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
         set_tests_properties(test_cuda_shared_fp16_cache_limited PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED=1;MOLLM_CUDA_PREFILL_FP16_CACHE_MB=1")
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=1")
         set_tests_properties(test_cuda_shared_fp16_cache_partial PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED=1;MOLLM_CUDA_PREFILL_FP16_CACHE_MB=5")
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=5")
         set_tests_properties(test_cuda_shared_fp16_cache_zero PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED=1;MOLLM_CUDA_PREFILL_FP16_CACHE_MB=0")
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=0")
         set_tests_properties(test_cuda_shared_fp16_cache_compact PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED=1;MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128;MOLLM_CUDA_Q4_COMPACT=1")
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
         foreach(reshape_mode disabled enabled invalid capture)
             add_test(NAME test_cuda_strided_reshape_${reshape_mode} COMMAND test_cuda_backend --strided-reshape-only)
             set_tests_properties(test_cuda_strided_reshape_${reshape_mode} PROPERTIES
@@ -1324,7 +1299,6 @@ if(MOLLM_BUILD_TESTS)
             ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1")
         add_test(NAME test_cuda_backend_gdn_quad_values COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_gdn_quad_values PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_GDN_PREFILL_QUAD_VALUES=1;MOLLM_CUDA_GDN_PREFILL_PAIRED_VALUES=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_mollm_test(test_cuda_group_rms tests/test_cuda_group_rms.cpp)
         add_mollm_test(test_cuda_recurrent_prefix tests/test_cuda_recurrent_prefix.cpp)
@@ -1351,15 +1325,15 @@ if(MOLLM_BUILD_TESTS)
             LABELS "cuda" SKIP_RETURN_CODE 77)
         add_test(NAME test_cuda_backend_prefill_fp16_cache_compact COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_prefill_fp16_cache_compact PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128;MOLLM_CUDA_Q4_COMPACT=1;MOLLM_CUDA_Q4_COMPACT_13312=1"
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128"
             LABELS "cuda" SKIP_RETURN_CODE 77)
         add_test(NAME test_cuda_backend_prefill_fp16_cache_narrow COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_prefill_fp16_cache_narrow PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128;MOLLM_CUDA_PREFILL_FP16_CACHE_NARROW=1;MOLLM_TEST_CUDA_NARROW_CACHE=1"
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128;MOLLM_TEST_CUDA_NARROW_CACHE=1"
             LABELS "cuda" SKIP_RETURN_CODE 77)
         add_test(NAME test_cuda_backend_prefill_fp16_cache_narrow_limited COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_prefill_fp16_cache_narrow_limited PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=1;MOLLM_CUDA_PREFILL_FP16_CACHE_NARROW=1;MOLLM_TEST_CUDA_NARROW_CACHE=1"
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=1;MOLLM_TEST_CUDA_NARROW_CACHE=1"
             LABELS "cuda" SKIP_RETURN_CODE 77)
         add_test(NAME test_cuda_backend_register_routes COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_local16_probe COMMAND test_cuda_backend)
@@ -1370,17 +1344,15 @@ if(MOLLM_BUILD_TESTS)
         add_test(NAME test_cuda_backend_gdn_butterfly_key COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_gdn_paired_values COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_gdn_paired_values PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_GDN_PREFILL_PAIRED_VALUES=1"
             LABELS "cuda" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_gdn_butterfly_key PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_GDN_PREFILL_BUTTERFLY_KEY=1"
             LABELS "cuda" SKIP_RETURN_CODE 77)
         set_tests_properties(test_cuda_backend_prefill_fp16_cache_hc_down PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128;MOLLM_CUDA_PREFILL_FP16_CACHE_HC_DOWN=1;MOLLM_TEST_CUDA_HC_DOWN_CACHE=1"
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128;MOLLM_TEST_CUDA_HC_DOWN_CACHE=1"
             LABELS "cuda" SKIP_RETURN_CODE 77)
         add_test(NAME test_cuda_backend_prefill_fp16_cache_hc_down_limited COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_prefill_fp16_cache_hc_down_limited PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=1;MOLLM_CUDA_PREFILL_FP16_CACHE_HC_DOWN=1;MOLLM_TEST_CUDA_HC_DOWN_CACHE=1"
+            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=1;MOLLM_TEST_CUDA_HC_DOWN_CACHE=1"
             LABELS "cuda" SKIP_RETURN_CODE 77)
         add_test(NAME test_cuda_backend_exact_batch COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_exact_reuse COMMAND test_cuda_backend)
@@ -1395,7 +1367,6 @@ if(MOLLM_BUILD_TESTS)
         add_test(NAME test_cuda_backend_narrow_pipeline COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_gdn_register_state COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_gdn_register_state PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_GDN_REGISTER_STATE=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_backend_hc_projection COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_nvfp4_pipeline COMMAND test_cuda_backend)
@@ -1404,60 +1375,38 @@ if(MOLLM_BUILD_TESTS)
             ENVIRONMENT "MOLLM_CUDA_NVFP4_BATCH_PIPELINE=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_nvfp4_pipeline PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_NVFP4_SIMT_PIPELINE=1;MOLLM_CUDA_HC_PROJECTION_PAIR=1;MOLLM_CUDA_Q4_NARROW_PIPELINE=1;MOLLM_CUDA_MOE_SHARED_OVERLAP=1"
             SKIP_RETURN_CODE 77 LABELS "cuda")
         add_test(NAME test_cuda_backend_nvfp4_pipeline_direct COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_nvfp4_pipeline_direct PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_NVFP4_SIMT_PIPELINE=1;MOLLM_CUDA_MOE_SHARED_OVERLAP=1;MOLLM_CUDA_DISABLE_MOE_GRAPHS=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
+            ENVIRONMENT "MOLLM_CUDA_DISABLE_MOE_GRAPHS=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
             SKIP_RETURN_CODE 77 LABELS "cuda")
         set_tests_properties(test_cuda_backend_hc_projection PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_HC_PROJECTION_PAIR=1;MOLLM_CUDA_Q4_NARROW_PIPELINE=1;MOLLM_CUDA_MOE_SHARED_OVERLAP=1"
             SKIP_RETURN_CODE 77 LABELS "cuda")
         set_tests_properties(test_cuda_backend_narrow_pipeline PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_Q4_NARROW_PIPELINE=1"
             LABELS "cuda" SKIP_RETURN_CODE 77)
         add_test(NAME test_cuda_backend_shared_overlap COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_moe_prefill_half_reuse COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_moe_prefill_half_reuse PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_MOE_PREFILL_INPUT_HALF_REUSE=1;MOLLM_CUDA_MOE_SHARED_OVERLAP=1"
+            ENVIRONMENT "MOLLM_CUDA_MOE_PREFILL_INPUT_HALF_REUSE=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_shared_overlap PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_MOE_SHARED_OVERLAP=1"
             SKIP_RETURN_CODE 77 LABELS "cuda")
         add_test(NAME test_cuda_backend_shared_overlap_direct COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_shared_overlap_direct PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_MOE_SHARED_OVERLAP=1;MOLLM_CUDA_DISABLE_MOE_GRAPHS=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
+            ENVIRONMENT "MOLLM_CUDA_DISABLE_MOE_GRAPHS=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
             SKIP_RETURN_CODE 77 LABELS "cuda")
         set_tests_properties(test_cuda_backend_exact_reuse PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_Q4_SMALL_BATCH_EXACT=1;MOLLM_CUDA_Q4_SMALL_BATCH_EXACT_REUSE=1"
             SKIP_RETURN_CODE 77 LABELS "cuda")
         add_test(NAME test_cuda_backend_exact_attention COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_validated_prefix COMMAND test_cuda_backend)
-        add_test(NAME test_cuda_backend_sdpa_prefix_query_group COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_sdpa_full_batch COMMAND test_cuda_backend --sdpa-full-batch-only)
         set_tests_properties(test_cuda_backend_sdpa_full_batch PROPERTIES
-            ENVIRONMENT "MOLLM_TEST_CUDA_SDPA_PREFIX_QUERY_GROUP=2;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
+            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_backend_sdpa_head_group_on COMMAND test_cuda_backend --sdpa-head-group-only)
-        add_test(NAME test_cuda_backend_sdpa_native_pv_on COMMAND test_cuda_backend --sdpa-native-pv-only)
-        add_test(NAME test_cuda_backend_sdpa_native_pv_off COMMAND test_cuda_backend --sdpa-native-pv-only)
-        foreach(mid_mode IN ITEMS 0 1)
-            add_test(NAME test_cuda_backend_sdpa_mid_pv_${mid_mode}
-                COMMAND ${CMAKE_COMMAND} -E env MOLLM_TEST_CUDA_SDPA_MID_PV_GEMM=${mid_mode}
-                    $<TARGET_FILE:test_cuda_backend> --sdpa-native-pv-only)
-            set_tests_properties(test_cuda_backend_sdpa_mid_pv_${mid_mode} PROPERTIES
-                ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_HEAD_GROUP=4;MOLLM_TEST_CUDA_SDPA_PREFIX_QUERY_GROUP=4;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        endforeach()
-        add_test(NAME test_cuda_backend_sdpa_mid_pv_auto
-            COMMAND ${CMAKE_COMMAND} -E env --unset=MOLLM_TEST_CUDA_SDPA_MID_PV_GEMM
-                $<TARGET_FILE:test_cuda_backend> --sdpa-native-pv-only)
-        set_tests_properties(test_cuda_backend_sdpa_mid_pv_auto PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_HEAD_GROUP=4;MOLLM_TEST_CUDA_SDPA_PREFIX_QUERY_GROUP=4;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
-            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        add_test(NAME test_cuda_backend_sdpa_native_pv_auto
-            COMMAND ${CMAKE_COMMAND} -E env --unset=MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM $<TARGET_FILE:test_cuda_backend> --sdpa-native-pv-only)
-        set_tests_properties(test_cuda_backend_sdpa_native_pv_auto PROPERTIES
+        add_test(NAME test_cuda_backend_sdpa_native_pv COMMAND test_cuda_backend --sdpa-native-pv-only)
+        set_tests_properties(test_cuda_backend_sdpa_native_pv PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         foreach(attention_default IN ITEMS auto VALIDATED_PREFIX SKIP_ZERO_PV PV_PAIR)
@@ -1467,7 +1416,6 @@ if(MOLLM_BUILD_TESTS)
             endif()
             add_test(NAME test_cuda_backend_sdpa_defaults_${attention_default}
                 COMMAND ${CMAKE_COMMAND} -E env
-                    --unset=MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM
                     --unset=MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX
                     --unset=MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV
                     --unset=MOLLM_CUDA_SDPA_PREFILL_PV_PAIR
@@ -1476,85 +1424,32 @@ if(MOLLM_BUILD_TESTS)
                 ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         endforeach()
-        foreach(head_lanes IN ITEMS 1 2)
-            add_test(NAME test_cuda_backend_sdpa_head_lanes_${head_lanes}
-                COMMAND ${CMAKE_COMMAND} -E env
-                    --unset=MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM
-                    --unset=MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX
-                    --unset=MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV
-                    --unset=MOLLM_CUDA_SDPA_PREFILL_PV_PAIR
-                    MOLLM_TEST_CUDA_SDPA_PV_HEAD_LANES=${head_lanes}
-                    $<TARGET_FILE:test_cuda_backend> --sdpa-native-pv-only)
-            set_tests_properties(test_cuda_backend_sdpa_head_lanes_${head_lanes} PROPERTIES
-                ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        endforeach()
-        foreach(mask_scope IN ITEMS known_mask)
-            set(mask_option MOLLM_TEST_CUDA_SDPA_KNOWN_MASK)
-            foreach(mask_mode IN ITEMS on off default)
-                if(mask_mode STREQUAL "default")
-                    set(mask_override "--unset=${mask_option}")
-                elseif(mask_mode STREQUAL "on")
-                    set(mask_override "${mask_option}=1")
-                else()
-                    set(mask_override "${mask_option}=0")
-                endif()
-                add_test(NAME test_cuda_backend_sdpa_${mask_scope}_${mask_mode}
-                    COMMAND ${CMAKE_COMMAND} -E env
-                        --unset=MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM
-                        --unset=MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX
-                        --unset=MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV
-                        --unset=MOLLM_CUDA_SDPA_PREFILL_PV_PAIR
-                        ${mask_override} MOLLM_TEST_CUDA_SDPA_PV_HEAD_LANES=2
-                        $<TARGET_FILE:test_cuda_backend> --sdpa-native-pv-only)
-                set_tests_properties(test_cuda_backend_sdpa_${mask_scope}_${mask_mode} PROPERTIES
-                    ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
-                    SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            endforeach()
-        endforeach()
-        foreach(pv_mode IN ITEMS on off)
-            if(pv_mode STREQUAL "on")
-                set(pv_enabled 1)
-            else()
-                set(pv_enabled 0)
-            endif()
-            set_tests_properties(test_cuda_backend_sdpa_native_pv_${pv_mode} PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM=${pv_enabled};MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        endforeach()
         add_test(NAME test_cuda_backend_sdpa_head_group_off COMMAND test_cuda_backend --sdpa-head-group-only)
         set_tests_properties(test_cuda_backend_sdpa_head_group_on PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_HEAD_GROUP=4;MOLLM_TEST_CUDA_SDPA_PREFIX_QUERY_GROUP=4;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
+            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_sdpa_head_group_off PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_HEAD_GROUP=0;MOLLM_TEST_CUDA_SDPA_PREFIX_QUERY_GROUP=4;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
-            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        set_tests_properties(test_cuda_backend_sdpa_prefix_query_group PROPERTIES
-            ENVIRONMENT "MOLLM_TEST_CUDA_SDPA_PREFIX_QUERY_GROUP=4;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
-            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        add_test(NAME test_cuda_backend_sdpa_gemm_shadow COMMAND test_cuda_backend --sdpa-shadow-only)
-        set_tests_properties(test_cuda_backend_sdpa_gemm_shadow PROPERTIES
-            ENVIRONMENT "MOLLM_TEST_CUDA_SDPA_GEMM_SHADOW=1;MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
+            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_backend_validated_prefix_zero_pv COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_validated_prefix_pv_unroll COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_validated_prefix_pv_pair COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_validated_prefix_pv_pair PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_UNROLL=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
+            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_PAIR=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_validated_prefix_pv_unroll PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_PV_UNROLL=1"
+            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_validated_prefix_zero_pv PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_backend_validated_prefix_zero_pv_long_shared COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_validated_prefix_zero_pv_long_shared PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1;MOLLM_CUDA_SDPA_PREFILL_SHARED_SCORE_LIMIT=4096"
+            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_backend_validated_prefix_long_shared COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_validated_prefix_long_shared PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1;MOLLM_CUDA_SDPA_PREFILL_SHARED_SCORE_LIMIT=4096"
+            ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_validated_prefix PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1"
@@ -1585,7 +1480,6 @@ if(MOLLM_BUILD_TESTS)
             RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_register_routes PROPERTIES
             SKIP_RETURN_CODE 77
-            ENVIRONMENT "MOLLM_CUDA_REGISTER_ROUTES=1"
             LABELS "cuda"
             RUN_SERIAL TRUE)
         add_test(NAME test_cuda_backend_q4_prefetch COMMAND test_cuda_backend)
@@ -1613,30 +1507,6 @@ if(MOLLM_BUILD_TESTS)
             set_tests_properties(test_qsa_engine_e2e PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda;e2e" RUN_SERIAL TRUE TIMEOUT 180)
         endif()
-        if(TARGET test_cuda_qsa_graph)
-            add_test(NAME test_cuda_qsa_snapshot
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_qsa_snapshot_test.py
-                    $<TARGET_FILE:test_cuda_qsa_graph>)
-            set_tests_properties(test_cuda_qsa_snapshot PROPERTIES
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
-            add_test(NAME test_cuda_qsa_snapshot_bf16_diagnostic
-                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_qsa_snapshot_test.py
-                    $<TARGET_FILE:test_cuda_qsa_graph>)
-            set_tests_properties(test_cuda_qsa_snapshot_bf16_diagnostic PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_QSA_INDEXER_BF16=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
-            add_test(NAME test_cuda_qsa_graph_bf16_diagnostic COMMAND test_cuda_qsa_graph)
-            set_tests_properties(test_cuda_qsa_graph_bf16_diagnostic PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_CUDA_QSA_INDEXER_BF16=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
-            if(TARGET test_cuda_qsa_indexer)
-                add_test(NAME test_cuda_qsa_snapshot_replay
-                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_qsa_snapshot_replay_test.py
-                        $<TARGET_FILE:test_cuda_qsa_graph> $<TARGET_FILE:test_cuda_qsa_indexer>)
-                set_tests_properties(test_cuda_qsa_snapshot_replay PROPERTIES
-                    SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
-            endif()
-        endif()
         function(add_mollm_python_test name script)
             add_test(
                 NAME ${name}
@@ -1645,7 +1515,6 @@ if(MOLLM_BUILD_TESTS)
         endfunction()
         add_mollm_python_test(test_token_loss_compare test_token_loss_compare.py)
         add_mollm_python_test(test_qwen38_cuda_preset test_qwen38_cuda_preset.py)
-        add_mollm_python_test(test_qsa_snapshot_format test_qsa_snapshot_format.py)
         add_mollm_python_test(test_qsa_vllm_reference test_qsa_vllm_reference.py)
 
         add_mollm_python_test(test_shape_propagation

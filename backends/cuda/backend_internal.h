@@ -146,13 +146,9 @@ struct CudaBackend::Impl {
     size_t qsa_topk_ids_bytes = 0;
     size_t qsa_streaming_topk_enqueues = 0;
     size_t qsa_indexer_enqueues = 0, qsa_attention_enqueues = 0;
-    size_t qsa_bf16_indexer_enqueues = 0;
-    bool qsa_indexer_dump_done = false;
     void* qsa_selected_scores = nullptr;
     size_t qsa_selected_scores_bytes = 0;
     size_t qsa_gqa_enqueues = 0, qsa_split_enqueues = 0;
-    void* qsa_attention_shadow = nullptr;
-    size_t qsa_attention_shadow_bytes = 0;
     size_t attention_scores_bytes = 0;
     void* attention_prefix_valid = nullptr;
     size_t attention_prefix_valid_bytes = 0;
@@ -167,7 +163,6 @@ struct CudaBackend::Impl {
     size_t attention_pv_pointers_bytes = 0;
     size_t attention_pv_gemm_enqueues = 0;
     size_t attention_head_lane_pair_enqueues = 0;
-    size_t attention_query_slice_enqueues = 0;
     size_t attention_prefix_enqueues = 0;
     size_t attention_prefix_long_shared_enqueues = 0;
     size_t attention_prefix_zero_pv_enqueues = 0;
@@ -282,23 +277,19 @@ struct CudaBackend::Impl {
         std::vector<HcProjectionPair> pairs;
         float* slots = nullptr;
     };
-    bool hc_projection_enabled = [] {
-        const char* value = std::getenv("MOLLM_CUDA_HC_PROJECTION_PAIR");
-        return value && std::strcmp(value, "1") == 0;
-    }();
+    // Enabled for the qualified policy; disabled for differential reference
+    // backends that execute every node separately.
+    bool qualified_fusions = true;
+    // Qualified HC prefill/decode policy: pair the N320+N4 projections.
+    bool hc_projection_enabled = true;
     std::unordered_map<const Graph*, HcProjectionPlan> hc_projection_plans;
     std::unordered_map<const GraphNode*, HcProjectionPair*> hc_projection_nodes;
     std::unordered_map<const GraphNode*, HcProjectionPair*> hc_prefill_rms_nodes;
     bool hc_prefill_reuse_enabled = [] {
-        const char* value=std::getenv("MOLLM_CUDA_HC_PREFILL_ACTIVATION_REUSE");
         const char* diagnostic=std::getenv("MOLLM_CUDA_DENSE_PREFILL_FP32_REFERENCE");
-        return value && std::strcmp(value,"1")==0 &&
-            !(diagnostic && std::strcmp(diagnostic,"1")==0);
+        return !(diagnostic && std::strcmp(diagnostic,"1")==0);
     }();
-    bool hc_prefill_rms_half_enabled = [] {
-        const char* value=std::getenv("MOLLM_CUDA_HC_PREFILL_RMS_HALF");
-        return value && std::strcmp(value,"1")==0;
-    }();
+    bool hc_prefill_rms_half_enabled = true;
     void* hc_prefill_half = nullptr;
     size_t hc_prefill_half_bytes = 0;
     const HcProjectionPair* hc_prefill_owner = nullptr;
@@ -307,15 +298,9 @@ struct CudaBackend::Impl {
     uint64_t hc_prefill_epoch = 0, hc_prefill_reuses = 0;
     bool hc_prefill_from_rms = false;
     uint64_t hc_prefill_rms_half_calls = 0;
-    bool hc_deferred_enabled = [] {
-        const char* value=std::getenv("MOLLM_CUDA_HC_PREFILL_DEFERRED_RMS");
-        return value&&std::strcmp(value,"1")==0;
-    }();
+    bool hc_deferred_enabled = true;
     float* hc_deferred_inverses=nullptr;
-    bool hc_compact_enabled=[] {
-        const char* value=std::getenv("MOLLM_CUDA_HC_COMPACT_CARRY");
-        return value&&!std::strcmp(value,"1");
-    }();
+    bool hc_compact_enabled=true;
     struct HcAllocation {size_t bytes;uint64_t generation;};
     struct HcCompactCarry {int rows;uint64_t generation;};
     std::unordered_map<void*,HcAllocation> hc_allocations;
@@ -417,11 +402,6 @@ struct CudaBackend::Impl {
     uint64_t hc_execution_epoch = 0, hc_projection_enqueues = 0, hc_projection_copies = 0;
     uint64_t moe_graph_builds = 0, moe_graph_hits = 0;
     bool capture_audit = std::getenv("MOLLM_CUDA_CAPTURE_AUDIT") != nullptr;
-    bool attention_gemm_shadow = [] {
-        const char* value=std::getenv("MOLLM_TEST_CUDA_SDPA_GEMM_SHADOW");
-        return value&&!std::strcmp(value,"1");
-    }();
-    unsigned attention_gemm_shadow_count = 0;
     uint64_t attention_prefix_query_group_enqueues = 0;
     uint64_t attention_prefix_head_group_enqueues = 0;
     bool exact_scratch_growth = std::getenv("MOLLM_CUDA_DISABLE_GEOMETRIC_GROWTH") != nullptr;
@@ -471,12 +451,6 @@ struct CudaBackend::Impl {
         if (output_pool_limit_bytes)
             std::fprintf(stderr, "CudaBackend: output_pool_limit_bytes=%zu reclaims=%zu reclaimed_bytes=%zu\n",
                 output_pool_limit_bytes, output_pool_reclaims, output_pool_reclaimed_bytes);
-        const char* memory_audit = std::getenv("MOLLM_CUDA_MEMORY_AUDIT");
-        if (memory_audit && std::strcmp(memory_audit, "1") == 0) {
-            std::fprintf(stderr, "CudaBackend: output_pool_reserved_bytes=%zu\n",
-                mollm_cuda::device_buffer_pool_reserved_bytes(output_pool));
-            std::fprintf(stderr,"CudaBackend: attention_score_workspace_bytes=%zu\n",attention_scores_bytes);
-        }
         if (prefill_fp16_cache_bytes)
             std::fprintf(stderr, "CudaBackend: prefill FP16 weight cache bytes=%zu\n",
                 prefill_fp16_cache_bytes);
@@ -649,22 +623,17 @@ struct CudaBackend::Impl {
             std::fprintf(stderr,"CudaBackend: QSA streaming_topk=%zu workspace=%zu bytes\n",
                 qsa_streaming_topk_enqueues,qsa_topk_scores_bytes+qsa_topk_ids_bytes);
         if(qsa_selected_scores)cudaFree(qsa_selected_scores);
-        if(qsa_attention_shadow)cudaFree(qsa_attention_shadow);
         if(qsa_gqa_enqueues||qsa_split_enqueues)
             std::fprintf(stderr,"CudaBackend: QSA grouped=%zu split=%zu selected_workspace=%zu bytes\n",
                 qsa_gqa_enqueues,qsa_split_enqueues,qsa_selected_scores_bytes);
         if(qsa_indexer_enqueues||qsa_attention_enqueues)
             std::fprintf(stderr,"CudaBackend: QSA indexer=%zu attention=%zu query_workspace=%zu score_workspace=%zu bytes\n",
                 qsa_indexer_enqueues,qsa_attention_enqueues,qsa_query_bytes,qsa_scores_bytes);
-        if(qsa_bf16_indexer_enqueues)std::fprintf(stderr,
-            "CudaBackend: QSA diagnostic_bf16_post_projection=%zu\n",qsa_bf16_indexer_enqueues);
         if (attention_prefix_valid) cudaFree(attention_prefix_valid);
         if (attention_pv_handle) cublasDestroy(attention_pv_handle);
         if (attention_pv_values) cudaFree(attention_pv_values);
         if (attention_pv_output) cudaFree(attention_pv_output);
         if (attention_pv_pointers) cudaFree(attention_pv_pointers);
-        if(attention_query_slice_enqueues)
-            std::fprintf(stderr,"CudaBackend: query-sliced attention enqueues=%zu tile_rows=1024\n",attention_query_slice_enqueues);
         if(attention_head_lane_pair_enqueues)
             std::fprintf(stderr,"CudaBackend: native-probability head-lane-pair enqueues=%zu\n",attention_head_lane_pair_enqueues);
         if (attention_pv_gemm_enqueues)
@@ -820,18 +789,10 @@ struct CudaBackend::Impl {
             return end && !*end && mb <= 32768 ? static_cast<size_t>(mb) * 1024 * 1024 : size_t{0};
         }();
         auto& cached = found->second;
-        static const bool cache_narrow = [] {
-            const char* value=std::getenv("MOLLM_CUDA_PREFILL_FP16_CACHE_NARROW");
-            return value && std::strcmp(value,"1")==0;
-        }();
-        static const bool cache_hc_down = [] {
-            const char* value=std::getenv("MOLLM_CUDA_PREFILL_FP16_CACHE_HC_DOWN");
-            return value && std::strcmp(value,"1")==0;
-        }();
-        static const bool cache_shared = [] {
-            const char* value = std::getenv("MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED");
-            return value && !std::strcmp(value, "1");
-        }();
+        // Qualified dense-prefill cache shapes within the configured budget.
+        constexpr bool cache_narrow=true;
+        constexpr bool cache_hc_down=true;
+        constexpr bool cache_shared=true;
         const bool shared_shape = (n == 640 && k == 2560) || (n == 2560 && k == 640);
         const bool cache_q4 = cached.layout == WeightLayout::Q4Bg32Biased ||
             cached.layout == WeightLayout::Q4Bg32Compact ||
@@ -1120,22 +1081,13 @@ struct CudaBackend::Impl {
             }
 
             bool lt_handled=false;
-            static const bool hc_gate_row_tile = [] {
-                const char* value = std::getenv("MOLLM_TEST_CUDA_HC_GATE_ROW_TILE");
-                return value && !std::strcmp(value, "1024");
-            }();
-            static const bool hc_low_rank_row_tile = [] {
-                const char* value = std::getenv("MOLLM_TEST_CUDA_HC_LOW_RANK_ROW_TILE");
-                return value && !std::strcmp(value, "1024");
-            }();
             if(prefill_lt&&!use_fp32_reference&&linear_weight_type==CUDA_R_16F&&activation_type==CUDA_R_16F&&
                !prefill_lt->run(cublas,linear_weight,gemm_activation,device_c,m,n,k,lda,lt_handled))return false;
             if (!lt_handled&&!mollm_cuda::run_dense_matmul(
                     cublas, linear_weight, linear_weight_type,
                     gemm_activation, activation_type, device_c, m, n, k,
                     lda, use_fp32_reference,
-                    ((hc_gate_row_tile && n == 4) ||
-                     (hc_low_rank_row_tile && n == 320)) ? 1024 : 0))
+                    (n == 4 || n == 320) ? 1024 : 0))
                 return false;
         }
 

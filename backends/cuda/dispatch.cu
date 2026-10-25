@@ -22,144 +22,10 @@ using mollm::cuda_backend_detail::device_pointer_const;
 using mollm::cuda_backend_detail::fp32_contiguous;
 using mollm::cuda_backend_detail::same_shape;
 
-namespace {
-// Bounded, opt-in snapshot for an independent CPU indexer oracle. Never used
-// for throughput, never overwrite an existing artifact, and never substitute
-// diagnostic results for native outputs. Each backend emits at most one file.
-bool qsa_indexer_snapshot(const char* path,const std::vector<const Tensor*>& inputs,
-    const Tensor& output,const float* query,const float* scores,
-    const mollm_cuda::QsaIndexerParams& p,int budget) {
-    const int keys=p.past+p.queries,groups=keys/p.ratio,slots=budget+p.ratio-1;
-    const uint32_t header[]={uint32_t(p.queries),uint32_t(p.past),uint32_t(p.heads),
-        uint32_t(p.dimension),uint32_t(p.rope_dim),uint32_t(p.ratio),uint32_t(budget),
-        uint32_t(p.position_offset),uint32_t(p.score_stride),uint32_t(slots)};
-    const size_t width=size_t(p.heads+1)*p.dimension;
-    const size_t elements=size_t(p.queries)*(width+size_t(p.heads)*p.dimension+groups+slots)+
-        size_t(keys+groups)*p.dimension+2*p.dimension+p.rope_dim/2;
-    if(elements>size_t(64)*1024*1024/4) {
-        std::fprintf(stderr,"QSA snapshot exceeds64MiB bound\n");return false;
-    }
-    FILE* file=std::fopen(path,"wbx");
-    if(!file){std::fprintf(stderr,"QSA snapshot cannot exclusively create %s\n",path);return false;}
-    bool ok=std::fwrite(p.diagnostic_bf16?"QSAIDX2\0":"QSAIDX1\0",1,8,file)==8&&
-        std::fwrite(header,sizeof(uint32_t),10,file)==10&&std::fwrite(&p.eps,4,1,file)==1;
-    if(p.diagnostic_bf16){const uint32_t flags=1;ok=ok&&std::fwrite(&flags,4,1,file)==1;}
-    auto matrix=[&](const void* source,size_t rows,size_t columns,size_t pitch) {
-        if(!ok)return;
-        const size_t row_bytes=columns*4;
-        std::vector<uint32_t> host(rows*columns);
-        ok=mollm_cuda::report_cuda(cudaMemcpy2DAsync(host.data(),row_bytes,source,pitch,
-            row_bytes,rows,cudaMemcpyDeviceToHost,cudaStreamPerThread),"QSA snapshot copy")&&
-            mollm_cuda::report_cuda(cudaStreamSynchronize(cudaStreamPerThread),"QSA snapshot synchronize")&&
-            std::fwrite(host.data(),4,host.size(),file)==host.size();
-    };
-    matrix(device_pointer_const<float>(*inputs[0]),p.queries,width,p.projection_stride*4);
-    matrix(device_pointer_const<float>(*inputs[1]),1,p.dimension,p.dimension*4);
-    matrix(device_pointer_const<float>(*inputs[2]),1,p.dimension,p.dimension*4);
-    matrix(device_pointer_const<float>(*inputs[3]),1,p.rope_dim/2,p.rope_dim/2*4);
-    matrix(device_pointer_const<float>(*inputs[4]),keys,p.dimension,p.dimension*4);
-    matrix(query,p.queries,size_t(p.heads)*p.dimension,size_t(p.heads)*p.dimension*4);
-    matrix(device_pointer_const<float>(*inputs[5]),groups,p.dimension,p.dimension*4);
-    matrix(scores,p.queries,groups,size_t(p.score_stride)*4);
-    matrix(device_pointer_const<int32_t>(output),p.queries,slots,output.stride[1]);
-    if(std::fclose(file)!=0)ok=false;
-    if(ok)std::fprintf(stderr,"QSA snapshot written: %s queries=%d past=%d keys=%d\n",path,p.queries,p.past,keys);
-    else std::fprintf(stderr,"QSA snapshot incomplete: %s\n",path);
-    return ok;
-}
-
-// Bounded, non-captured diagnostic. Never substitute the candidate output or
-// use these synchronized runs for throughput. All scratch is private to this
-// invocation, so native attention scores/output and the KV cache stay intact.
-bool sdpa_gemm_shadow(uint32_t node,const float* query,const void* key,const void* value,
-    const float* native,const float* mask,const float* native_scores,const mollm_cuda::SdpaGemmPrefillParams& p) {
-    const size_t cap=(p.keys>2048?2048ull:p.queries<=1024?256ull:512ull)*1024*1024;
-    if(p.heads<1||p.heads>64||p.kv_heads<1||p.kv_heads>p.heads||p.queries<2||p.queries>2048||
-       p.keys<p.queries||p.keys>16384||p.dimension!=256||p.output_head_stride>cap/sizeof(float)||
-       p.output_position_stride>cap/sizeof(float))return false;
-    const size_t span=size_t(p.heads-1)*p.output_head_stride+size_t(p.queries-1)*p.output_position_stride+p.dimension;
-    const size_t score_count=size_t(p.heads)*p.queries*p.keys;
-    const size_t kv_count=size_t(p.kv_heads)*p.keys*p.dimension;
-    if(span>cap/sizeof(float)||score_count+2*kv_count+span>cap/sizeof(float))return false;
-    std::fprintf(stderr,"sdpa_gemm_shadow_payload node=%u direct_bytes=%zu cap_bytes=%zu pointer_bytes=%zu scope=excludes_cublas_internal_and_host_comparison_arrays\n",
-        node,(score_count+2*kv_count+span)*sizeof(float),cap,size_t(p.heads)*5*sizeof(float*));
-    struct Scratch {
-        float* scores=nullptr;float* k=nullptr;float* v=nullptr;float* out=nullptr;
-        float** pointers=nullptr;cublasHandle_t handle=nullptr;
-        ~Scratch(){if(handle)cublasDestroy(handle);cudaFree(pointers);cudaFree(out);cudaFree(v);cudaFree(k);cudaFree(scores);}
-    } scratch;
-    const auto ok=[](cudaError_t error){return mollm_cuda::report_cuda(error,"SDPA GEMM shadow");};
-    const auto allocate=[](auto& pointer,size_t bytes) {
-        return mollm_cuda::malloc_device(reinterpret_cast<void**>(&pointer),bytes,"SDPA GEMM shadow");
-    };
-    if(!allocate(scratch.scores,score_count*sizeof(float))||
-       !allocate(scratch.k,kv_count*sizeof(float))||!allocate(scratch.v,kv_count*sizeof(float))||
-       !allocate(scratch.out,span*sizeof(float))||!allocate(scratch.pointers,size_t(p.heads)*5*sizeof(float*)))return false;
-    if(cublasCreate(&scratch.handle)!=CUBLAS_STATUS_SUCCESS||
-       cublasSetStream(scratch.handle,cudaStreamPerThread)!=CUBLAS_STATUS_SUCCESS)return false;
-    std::vector<float> reference(span),candidate(span),after(span);
-    if(!ok(cudaMemcpy(reference.data(),native,span*sizeof(float),cudaMemcpyDeviceToHost)))return false;
-    for(int stage:{0,1,2}) {
-        const bool ordered_pv=stage==1;
-        // Shared-score kernels do not materialize probabilities in native_scores.
-        // The retained preset uses shared limit1024; only inspect global rows.
-        const char* shared_limit=std::getenv("MOLLM_CUDA_SDPA_PREFILL_SHARED_SCORE_LIMIT");
-        const bool global_scores=p.keys>1024&&(!shared_limit||!std::strcmp(shared_limit,"1024"));
-        if(stage==2&&!global_scores)continue;
-        cublasStatus_t status;
-        if(stage==2) {
-            if(!ok(cudaMemcpyAsync(scratch.scores,native_scores,score_count*sizeof(float),cudaMemcpyDeviceToDevice,cudaStreamPerThread)))return false;
-            // Pointer table and expanded immutable V were populated by stage0/1.
-            const float one=1.f,zero=0.f;
-            status=cublasGemmBatchedEx(scratch.handle,CUBLAS_OP_N,CUBLAS_OP_N,p.dimension,p.queries,p.keys,
-                &one,reinterpret_cast<const void* const*>(scratch.pointers+3*p.heads),CUDA_R_32F,p.dimension,
-                reinterpret_cast<const void* const*>(scratch.pointers+2*p.heads),CUDA_R_32F,p.keys,
-                &zero,reinterpret_cast<void* const*>(scratch.pointers+4*p.heads),CUDA_R_32F,int(p.output_position_stride),p.heads,
-                CUBLAS_COMPUTE_32F_PEDANTIC,CUBLAS_GEMM_DEFAULT);
-        } else status=mollm_cuda::launch_sdpa_prefill_fp32_gemm(scratch.handle,query,key,value,
-            scratch.scores,scratch.out,mask,scratch.k,scratch.v,p,cudaStreamPerThread,scratch.pointers,ordered_pv);
-        if(status!=CUBLAS_STATUS_SUCCESS){std::fprintf(stderr,"SDPA shadow cuBLAS status=%d\n",int(status));return false;}
-        if(!ok(cudaMemcpy(candidate.data(),scratch.out,span*sizeof(float),cudaMemcpyDeviceToHost)))return false;
-        size_t pv_changed=0;
-        if(ordered_pv)for(int head=0;head<p.heads;++head)for(int q=0;q<p.queries;++q)for(int d=0;d<p.dimension;++d) {
-            const size_t i=size_t(head)*p.output_head_stride+size_t(q)*p.output_position_stride+d;
-            pv_changed+=std::memcmp(&after[i],&candidate[i],sizeof(float))!=0;
-        }
-        if(!ok(cudaMemcpy(after.data(),native,span*sizeof(float),cudaMemcpyDeviceToHost)))return false;
-        const bool unchanged=!std::memcmp(reference.data(),after.data(),span*sizeof(float));
-        double maximum=0,relative=0,first=0,magnitude=0,square=0;
-        size_t half_changed=0,changed=0,count=0,nonfinite=0;
-        for(int head=0;head<p.heads;++head)for(int q=0;q<p.queries;++q)for(int d=0;d<p.dimension;++d) {
-            const size_t i=size_t(head)*p.output_head_stride+size_t(q)*p.output_position_stride+d;
-            const float x=reference[i],y=candidate[i];
-            if(!std::isfinite(x)||!std::isfinite(y)){++nonfinite;continue;}
-            const double error=std::fabs(double(x)-y);
-            maximum=std::max(maximum,error);relative=std::max(relative,error/(1+std::fabs(double(x))));
-            if(q==0)first=std::max(first,error);
-            magnitude=std::max(magnitude,std::fabs(double(x)));square+=error*error;++count;
-            changed+=std::memcmp(&x,&y,sizeof(float))!=0;
-            const __half hx=__float2half_rn(x),hy=__float2half_rn(y);
-            half_changed+=std::memcmp(&hx,&hy,sizeof(__half))!=0;
-        }
-        std::fprintf(stderr,"sdpa_gemm_shadow node=%u heads=%d kv_heads=%d queries=%d keys=%d past=%d capacity=%d q_position=%zu q_head=%zu mask_column=%zu mask_row=%zu out_position=%zu out_head=%zu scale=%.9g max_abs=%.9g max_relative=%.9g rms_error=%.9g first_query_max_abs=%.9g native_max_abs=%.9g changed=%zu half_changed=%zu count=%zu nonfinite=%zu native_unchanged=%d stage=%s scope=diagnostic_not_model_quality_or_tps\n",
-            node,p.heads,p.kv_heads,p.queries,p.keys,p.past,p.capacity,p.query_position_stride,p.query_head_stride,
-            p.mask_column_stride,p.mask_row_stride,p.output_position_stride,p.output_head_stride,p.scale,
-            maximum,relative,count?std::sqrt(square/count):0,first,magnitude,changed,half_changed,count,nonfinite,int(unchanged),stage==2?"native_probabilities_gemm_pv":ordered_pv?"gemm_qk_ordered_pv":"gemm_qk_gemm_pv");
-        if(!unchanged||nonfinite)return false;
-        if(ordered_pv)std::fprintf(stderr,"sdpa_gemm_pv_stage node=%u compared=%zu changed=%zu byte_exact=%d scope=same_GEMM_QK_softmax_not_native_equivalence\n",
-            node,count,pv_changed,int(!pv_changed));
-        else if(stage==0)after=candidate; // Reuse existing host buffer for the next stage comparison.
-    }
-    return true;
-}
-}
-
 bool CudaBackend::supports_sigmoid_gr_reduce_fusion() const {
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOLLM_CUDA_SIGMOID_GR_REDUCE_FUSION");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled && !impl_->capture_audit;
+    // Qualified prefill fusion; capture-audit and reference backends keep the
+    // separate nodes.
+    return impl_->qualified_fusions && !impl_->capture_audit;
 }
 
 int CudaBackend::hc_up_reduce_max_rows() const {
@@ -168,11 +34,8 @@ int CudaBackend::hc_up_reduce_max_rows() const {
 
 bool CudaBackend::supports_hc_up_reduce_fusion() const {
     const char* reference=std::getenv("MOLLM_CUDA_DENSE_PREFILL_FP32_REFERENCE");
-    static const bool enabled=[] {
-        const char* value=std::getenv("MOLLM_CUDA_HC_PREFILL_UP_REDUCE_FUSION");
-        return value&&!std::strcmp(value,"1");
-    }();
-    return enabled&&impl_->hc_deferred_enabled&&supports_sigmoid_gr_reduce_fusion()&&
+    return impl_->qualified_fusions&&impl_->hc_deferred_enabled&&
+        supports_sigmoid_gr_reduce_fusion()&&
         !(reference&&!std::strcmp(reference,"1"));
 }
 
@@ -248,15 +111,8 @@ bool CudaBackend::dispatch_hc_up_reduce(const GraphNode& up,const GraphNode& red
         (reinterpret_cast<uintptr_t>(impl_->hc_deferred_inverses)&3))return false;
     if(hc_byte_ranges_overlap(out,out_bytes,reinterpret_cast<uintptr_t>(half),elements*2)||
         hc_byte_ranges_overlap(out,out_bytes,reinterpret_cast<uintptr_t>(linear),size_t(10240)*320*2))return false;
-    static const int up_input_pitch=[] {
-        const char* value=std::getenv("MOLLM_CUDA_HC_PREFILL_UP_INPUT_PITCH");
-        return value&&!std::strcmp(value,"328")?328:
-            value&&!std::strcmp(value,"336")?336:320;
-    }();
-    static const bool up_wide_columns=[] {
-        const char* value=std::getenv("MOLLM_CUDA_HC_PREFILL_UP_TILE_COLUMNS");
-        return value&&!std::strcmp(value,"32");
-    }();
+    constexpr int up_input_pitch=320;
+    constexpr bool up_wide_columns=true;
     // Wider tiles lose on tiny tasks; ownership/shape/capture gates above
     // remain authoritative, and decode never enters this fusion.
     const int up_columns=up_wide_columns&&rows>=256?32:16;
@@ -319,19 +175,17 @@ bool CudaBackend::dispatch_sigmoid_gr_reduce(const GraphNode& node,
 }
 
 bool CudaBackend::supports_gr_inject_rms_fusion() const {
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOLLM_CUDA_GR_INJECT_RMS_FUSION");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled && !impl_->capture_audit;
+    // Qualified prefill fusion; capture-audit and reference backends keep the
+    // unfused nodes.
+    return impl_->qualified_fusions && !impl_->capture_audit;
 }
 
 size_t CudaBackend::gr_inject_rms_fused_calls() const {
     return impl_->gr_inject_rms_fused_calls;
 }
 bool CudaBackend::supports_moe_gr_inject_rms_fusion() const {
-    static const bool enabled=[] {const char* v=std::getenv("MOLLM_CUDA_MOE_GR_INJECT_RMS_FUSION");return v&&!std::strcmp(v,"1");}();
-    return enabled&&supports_gr_inject_rms_fusion()&&!impl_->segment_enabled&&!impl_->capture_audit&&
+    return impl_->qualified_fusions&&supports_gr_inject_rms_fusion()&&
+        !impl_->segment_enabled&&!impl_->capture_audit&&
         impl_->hc_deferred_enabled&&impl_->hc_compact_enabled;
 }
 size_t CudaBackend::moe_gr_inject_rms_fused_calls() const {return impl_->moe_gr_inject_rms_calls;}
@@ -826,10 +680,6 @@ void CudaBackend::dispatch(const GraphNode& node,
         p.heads=node.params.i32[0];p.dimension=node.params.i32[1];p.rope_dim=node.params.i32[2];
         p.ratio=node.params.i32[3];const int budget=node.params.i32[4];
         p.eps=graph_params::get_f32(node.params,0,1e-6f);
-        static const bool diagnostic_bf16=[] {
-            const char* value=std::getenv("MOLLM_TEST_CUDA_QSA_INDEXER_BF16");return value&&!std::strcmp(value,"1");
-        }();
-        p.diagnostic_bf16=diagnostic_bf16;
         if(p.heads<1||p.heads>16||p.dimension<2||p.dimension>256||p.rope_dim<2||
            p.rope_dim>p.dimension||p.rope_dim%2||p.ratio<1||p.ratio>16||budget<1||
            budget>4096-p.ratio+1||budget%p.ratio||inputs[0]->shape[1]<1||inputs[0]->shape[1]>65535||
@@ -880,10 +730,7 @@ void CudaBackend::dispatch(const GraphNode& node,
             fail("requires contiguous causal visibility; masked gaps are not implemented");return;
         }
         auto* query=static_cast<float*>(impl_->qsa_query);auto* scores=static_cast<float*>(impl_->qsa_scores);
-        static const bool force_streaming=[] {
-            const char* value=std::getenv("MOLLM_TEST_CUDA_QSA_FORCE_STREAMING_TOPK");return value&&!std::strcmp(value,"1");
-        }();
-        const bool streaming=keys/p.ratio>mollm_qsa::sort_tile_groups||force_streaming;
+        const bool streaming=keys/p.ratio>mollm_qsa::sort_tile_groups;
         if(streaming) {
             const size_t bytes=size_t(p.queries)*2*(budget/p.ratio)*4;
             if(!impl_->reserve(impl_->qsa_topk_scores,impl_->qsa_topk_scores_bytes,bytes,true)||
@@ -897,18 +744,10 @@ void CudaBackend::dispatch(const GraphNode& node,
            !mollm_cuda::report_cuda(mollm_cuda::launch_qsa_causal_block_topk(scores,device_pointer<int32_t>(*output),
             p.queries,keys,p.past,budget,p.ratio,p.score_stride,output->stride[1]/4,cudaStreamPerThread,
             streaming?static_cast<float*>(impl_->qsa_topk_scores):nullptr,
-            streaming?static_cast<int32_t*>(impl_->qsa_topk_ids):nullptr,force_streaming),"QSA top-k")) {
+            streaming?static_cast<int32_t*>(impl_->qsa_topk_ids):nullptr,false),"QSA top-k")) {
             fail("native launch");return;
         }
-        const char* snapshot_path=std::getenv("MOLLM_TEST_CUDA_QSA_DUMP");
-        if(snapshot_path&&*snapshot_path&&!impl_->qsa_indexer_dump_done&&
-           keys>budget+p.ratio&&keys<=8192&&p.queries<=2048) {
-            if(!qsa_indexer_snapshot(snapshot_path,inputs,*output,query,scores,p,budget)) {
-                fail("diagnostic snapshot failed");return;
-            }
-            impl_->qsa_indexer_dump_done=true;
-        }
-        ++impl_->qsa_indexer_enqueues;if(p.diagnostic_bf16)++impl_->qsa_bf16_indexer_enqueues;
+        ++impl_->qsa_indexer_enqueues;
         if(streaming)++impl_->qsa_streaming_topk_enqueues;record_native();return;
     }
 
@@ -1088,43 +927,9 @@ void CudaBackend::dispatch(const GraphNode& node,
                     p.selected_scores=static_cast<float*>(impl_->qsa_selected_scores);
                 }
                 if(!append_cache()){impl_->failed=true;return;}
-                static const bool qsa_compare=[] {
-                    const char* value=std::getenv("MOLLM_TEST_CUDA_QSA_COMPARE");return value&&!std::strcmp(value,"1");
-                }();
-                if(qsa_compare&&(p.reuse_gqa||p.partitions>1)) {
-                    const size_t bytes=output->view_span_bytes();
-                    if(!impl_->reserve(impl_->qsa_attention_shadow,impl_->qsa_attention_shadow_bytes,bytes,true)) {
-                        impl_->failed=true;return;
-                    }
-                    auto reference=p;reference.reuse_gqa=false;reference.partitions=1;reference.selected_scores=nullptr;
-                    if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_selected_attention(query_data,key_data,value_data,fp16_cache,
-                        device_pointer_const<int32_t>(*indices),static_cast<float*>(impl_->qsa_attention_shadow),reference,
-                        cudaStreamPerThread,mask_data),"QSA shadow reference")) {impl_->failed=true;return;}
-                }
                 if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_selected_attention(query_data,key_data,value_data,fp16_cache,
                    device_pointer_const<int32_t>(*indices),output_data,p,cudaStreamPerThread,mask_data),"QSA selected attention")) {
                     impl_->failed=true;return;
-                }
-                if(qsa_compare&&(p.reuse_gqa||p.partitions>1)) {
-                    const size_t bytes=output->view_span_bytes();
-                    std::vector<float> actual((bytes+3)/4),reference((bytes+3)/4);
-                    if(!mollm_cuda::report_cuda(cudaMemcpyAsync(actual.data(),output_data,bytes,cudaMemcpyDeviceToHost,cudaStreamPerThread),"QSA compare output")||
-                       !mollm_cuda::report_cuda(cudaMemcpyAsync(reference.data(),impl_->qsa_attention_shadow,bytes,cudaMemcpyDeviceToHost,cudaStreamPerThread),"QSA compare reference")||
-                       !mollm_cuda::report_cuda(cudaStreamSynchronize(cudaStreamPerThread),"QSA compare sync")) {impl_->failed=true;return;}
-                    float maximum=0.f,magnitude=0.f;double absolute=0;size_t where=0,changed=0;
-                    bool finite=true;
-                    for(int h=0;h<num_heads;++h)for(int r=0;r<query_length;++r)for(int d=0;d<value_dim;++d) {
-                        const size_t index=size_t(h)*p.output_head_stride+size_t(r)*p.output_position_stride+d;
-                        finite=finite&&std::isfinite(actual[index])&&std::isfinite(reference[index]);
-                        changed+=std::memcmp(&actual[index],&reference[index],sizeof(float))!=0;
-                        const float delta=std::fabs(actual[index]-reference[index]);
-                        magnitude=std::max(magnitude,std::fabs(reference[index]));absolute+=delta;
-                        if(delta>maximum){maximum=delta;where=index;}
-                    }
-                    std::fprintf(stderr,"QSA compare node=%u rows=%d keys=%d grouped=%d partitions=%d max_abs=%.9g mean_abs=%.9g reference_max=%.9g at=%zu changed=%zu finite=%d\n",
-                        node.id,query_length,key_length,int(p.reuse_gqa),p.partitions,maximum,
-                        absolute/(size_t(num_heads)*query_length*value_dim),magnitude,where,changed,int(finite));
-                    if(!finite||changed!=0){impl_->failed=true;return;}
                 }
                 ++impl_->qsa_attention_enqueues;
                 if(p.reuse_gqa)++impl_->qsa_gqa_enqueues;
@@ -1134,33 +939,6 @@ void CudaBackend::dispatch(const GraphNode& node,
             const size_t score_count = static_cast<size_t>(num_heads) *
                 query_length * key_length;
             const size_t score_bytes = score_count * sizeof(float);
-            static const bool slice_requested=[] {
-                const char* v=std::getenv("MOLLM_TEST_CUDA_SDPA_QUERY_SLICE_ROWS");
-                return v&&!std::strcmp(v,"1024");
-            }();
-            bool query_sliced=false;
-            const auto enabled_option=[](const char* name) {
-                const char* v=std::getenv(name);return !v||!std::strcmp(v,"1");
-            };
-            if(slice_requested&&!impl_->attention_gemm_shadow&&logical_prefill_batch_active_&&impl_->supports_sdpa_head_lane_pair&&
-               cached&&fp16_cache&&mask_data&&key_dim==256&&value_dim==256&&num_heads==24&&num_kv_heads==2&&
-               query_length>1024&&query_length<=2048&&key_length>4096&&key_length<=16384&&key_capacity<=32768&&
-               query.stride[0]==sizeof(float)&&output->stride[0]==sizeof(float)&&
-               output->stride[1]==256*sizeof(float)&&output->stride[2]==size_t(query_length)*256*sizeof(float)&&
-               enabled_option("MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX")&&
-               enabled_option("MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV")&&enabled_option("MOLLM_CUDA_SDPA_PREFILL_PV_PAIR")&&
-               enabled_option("MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM")&&enabled_option("MOLLM_TEST_CUDA_SDPA_KNOWN_MASK")) {
-                const char* shared=std::getenv("MOLLM_CUDA_SDPA_PREFILL_SHARED_SCORE_LIMIT");
-                const char* lanes=std::getenv("MOLLM_TEST_CUDA_SDPA_PV_HEAD_LANES");
-                if((!shared||(std::strcmp(shared,"2048")&&std::strcmp(shared,"4096")&&std::strcmp(shared,"8192")))&&
-                   (!lanes||!std::strcmp(lanes,"2"))) {
-                    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
-                    if(!mollm_cuda::report_cuda(cudaStreamIsCapturing(cudaStreamPerThread,&capture),"query-slice admission")) {
-                        impl_->failed=true;return;
-                    }
-                    query_sliced=capture==cudaStreamCaptureStatusNone;
-                }
-            }
             // Bounded logical chunks can require multi-GiB score matrices.
             // Power-of-two spare capacity (2.25 -> 4 GiB at 12K KV) can
             // consume the next chunk's admission margin. Retain high-water
@@ -1168,7 +946,7 @@ void CudaBackend::dispatch(const GraphNode& node,
             // geometric growth to avoid per-token allocator synchronization.
             if (!impl_->reserve(impl_->attention_scores,
                                 impl_->attention_scores_bytes,
-                                query_sliced?size_t(num_heads)*1024*key_length*sizeof(float):score_bytes,logical_prefill_batch_active_)) {
+                                score_bytes,logical_prefill_batch_active_)) {
                 impl_->failed = true;
                 return;
             }
@@ -1285,56 +1063,34 @@ void CudaBackend::dispatch(const GraphNode& node,
             if (validated_prefix && cached && fp16_cache && key_dim==256 &&
                 value_dim==256 && mask_data && query_length>1 &&
                 query.stride[0]==sizeof(float) && output->stride[0]==sizeof(float)) {
-                static const int prefix_shared_limit=[] {
-                    const char* value=std::getenv("MOLLM_CUDA_SDPA_PREFILL_SHARED_SCORE_LIMIT");
-                    if (value && std::strcmp(value,"2048")==0) return 2048;
-                    if (value && std::strcmp(value,"4096")==0) return 4096;
-                    if (value && std::strcmp(value,"8192")==0) return 8192;
-                    return 1024;
-                }();
+                constexpr int prefix_shared_limit=1024;
                 static const int prefix_skip_zero_pv_requested=[] {
                     const char* value=std::getenv("MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV");
                     return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
                 }();
                 const bool prefix_skip_zero_pv=prefix_skip_zero_pv_requested<0?
                     logical_prefill_batch_active_:prefix_skip_zero_pv_requested!=0;
-                static const bool prefix_unroll_pv=[] {
-                    const char* value=std::getenv("MOLLM_CUDA_SDPA_PREFILL_PV_UNROLL");
-                    return value && std::strcmp(value,"1")==0;
-                }();
+                // PV pair supersedes loop unrolling; retain the unroll branch
+                // only for callers that explicitly disable pair.
+                constexpr bool prefix_unroll_pv=false;
                 static const int prefix_pair_pv_requested=[] {
                     const char* value=std::getenv("MOLLM_CUDA_SDPA_PREFILL_PV_PAIR");
                     return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
                 }();
                 const bool prefix_pair_pv=prefix_pair_pv_requested<0?
                     logical_prefill_batch_active_:prefix_pair_pv_requested!=0;
-                static const int prefix_query_group=[] {
-                    const char* value=std::getenv("MOLLM_TEST_CUDA_SDPA_PREFIX_QUERY_GROUP");
-                    return value&&!std::strcmp(value,"4")?4:value&&!std::strcmp(value,"2")?2:0;
-                }();
+                // Qualified dense-prefill policy: four query heads share one
+                // KV head. Measured +4.6% prefill over ungrouped on GB10 with
+                // identical greedy output.
+                constexpr int prefix_query_group=4;
                 cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
                 if (!mollm_cuda::report_cuda(cudaStreamIsCapturing(cudaStreamPerThread,&capture),
                         "validated prefix capture check")) { impl_->failed=true;return; }
-                static const bool mid_pv_requested=[] {
-                    const char* v=std::getenv("MOLLM_TEST_CUDA_SDPA_MID_PV_GEMM");
-                    // Qualified logical SM121 default; private0 retains the
-                    // prior grouped-head path for diagnostics, not a new CLI.
-                    return !v||!std::strcmp(v,"1");
-                }();
-                static const bool pv_gemm_enabled=[] {
-                    const char* v=std::getenv("MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM");
-                    return !v||!std::strcmp(v,"1");
-                }();
-                // Full actual-long-history operator/model/daily/sanitizer
-                // qualification admits SM121 automatically. Other devices
-                // retain the accepted16K limit unless explicitly requested.
-                // This extends single-head PV, NOT two-head/mask-elision scope.
-                static const bool pv_long_requested=[] {
-                    const char* v=std::getenv("MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM");
-                    return v&&!std::strcmp(v,"1");
-                }();
-                const int pv_max_keys=(pv_long_requested||impl_->supports_sdpa_head_lane_pair)?32768:16384;
-                const bool mid_pv=mid_pv_requested&&pv_gemm_enabled&&logical_prefill_batch_active_&&
+                // Qualified logical SM121 default. Other devices retain the
+                // accepted16K limit; this extends single-head PV, not the
+                // two-head/mask-elision scope.
+                const int pv_max_keys=impl_->supports_sdpa_head_lane_pair?32768:16384;
+                const bool mid_pv=logical_prefill_batch_active_&&
                     impl_->supports_sdpa_head_lane_pair&&capture==cudaStreamCaptureStatusNone&&
                     prefix_skip_zero_pv&&prefix_pair_pv&&prefix_shared_limit==1024&&
                     num_heads==24&&num_kv_heads==2&&query_length>=32&&query_length<=2048&&
@@ -1343,10 +1099,10 @@ void CudaBackend::dispatch(const GraphNode& node,
                     output->stride[2]/sizeof(float)==size_t(query_length)*256;
                 const bool grouped_queries=!mid_pv&&prefix_query_group&&prefix_skip_zero_pv&&prefix_shared_limit==1024&&
                     query_length>=16&&query_length<=mollm_cuda::sdpa_prefill_group_max_queries&&key_length<=4096;
-                static const bool prefix_head_group=[] {
-                    const char* value=std::getenv("MOLLM_CUDA_SDPA_PREFILL_HEAD_GROUP");
-                    return value&&!std::strcmp(value,"4");
-                }();
+                // Qualified dense-prefill policy: four query heads share one
+                // KV head. Measured +1.5% prefill over ungrouped on GB10 with
+                // identical greedy output.
+                constexpr bool prefix_head_group=true;
                 // Experimental long/global-score-only reuse axis. Keep short
                 // windows and unsupported GQA ratios on their existing path.
                 const bool grouped_heads=prefix_head_group&&grouped_queries&&prefix_query_group==4&&
@@ -1372,31 +1128,21 @@ void CudaBackend::dispatch(const GraphNode& node,
                     // native score allocation and never cache expanded V across
                     // appends. Short/decode/captured/unsupported layouts retain
                     // their existing paths without allocating candidate scratch.
-                    const bool pv_gemm=pv_gemm_enabled&&logical_prefill_batch_active_&&
+                    const bool pv_gemm=logical_prefill_batch_active_&&
                         capture==cudaStreamCaptureStatusNone&&prefix_skip_zero_pv&&
                         prefix_shared_limit==1024&&use_pv_pair&&!grouped_queries&&!grouped_heads&&
                         num_heads==24&&num_kv_heads==2&&query_length>=32&&query_length<=2048&&
                         (mid_pv||(key_length>4096&&key_length<=pv_max_keys))&&key_capacity<=32768&&
                         params.output_position_stride==256&&
                         params.output_head_stride==size_t(query_length)*256;
-                    static const bool head_lane_pair_requested=[] {
-                        const char* value=std::getenv("MOLLM_TEST_CUDA_SDPA_PV_HEAD_LANES");
-                        // Qualified SM121 default; private1 retains the prior
-                        // head-per-block layout for A/B diagnostics.
-                        return !value||!std::strcmp(value,"2");
-                    }();
-                    static const int head_lane_max_keys=[] {
-                        const char* value=std::getenv("MOLLM_TEST_CUDA_SDPA_PV_HEAD_LANES");
-                        // Existing private2 requests the actual-long-KV probe.
-                        // Automatic admission stays16K until model/checker
-                        // qualification of the combined head/mask policy.
-                        return value&&!std::strcmp(value,"2")?32768:16384;
-                    }();
-                    const bool head_lane_pair=pv_gemm&&!mid_pv&&key_length<=head_lane_max_keys&&head_lane_pair_requested&&impl_->supports_sdpa_head_lane_pair;
+                    // Qualified SM121 long two-head layout. Automatic
+                    // admission stays16K pending model/checker qualification
+                    // of the combined head/mask policy.
+                    constexpr int head_lane_max_keys=16384;
+                    const bool head_lane_pair=pv_gemm&&!mid_pv&&key_length<=head_lane_max_keys&&impl_->supports_sdpa_head_lane_pair;
                     // Qualified SM121 long two-head and mid-KV single-head
-                    // paths share one policy. Private0 retains A/B control.
-                    const char* known_mask_option=std::getenv("MOLLM_TEST_CUDA_SDPA_KNOWN_MASK");
-                    const bool known_mask=(head_lane_pair||mid_pv)&&(!known_mask_option||!std::strcmp(known_mask_option,"1"));
+                    // paths share one policy.
+                    const bool known_mask=head_lane_pair||mid_pv;
                     if(pv_gemm) {
                         if(!impl_->reserve(impl_->attention_pv_values,impl_->attention_pv_values_bytes,
                                 size_t(num_kv_heads)*key_length*256*sizeof(float))||
@@ -1411,34 +1157,15 @@ void CudaBackend::dispatch(const GraphNode& node,
                             }
                         }
                     }
-                    bool sliced_launched=false;
-                    if(query_sliced&&pv_gemm&&head_lane_pair&&known_mask) {
-                        sliced_launched=mollm_cuda::try_launch_sdpa_prefill_query_slices(impl_->attention_pv_handle,
-                            query_data,key_data,value_data,scores,output_data,mask_data,
-                            static_cast<uint32_t*>(impl_->attention_prefix_valid),
-                            static_cast<float*>(impl_->attention_pv_values),static_cast<float*>(impl_->attention_pv_output),
-                            static_cast<float**>(impl_->attention_pv_pointers),params,1024,2,cudaStreamPerThread,&error);
-                        if(!mollm_cuda::report_cuda(error,"query-sliced attention")){impl_->failed=true;return;}
-                    }
-                    if(query_sliced&&!sliced_launched) {
-                        // Unsupported admission must restore full capacity BEFORE
-                        // any legacy/fallback kernel can use the score pointer.
-                        if(!impl_->reserve(impl_->attention_scores,impl_->attention_scores_bytes,score_bytes,true)) {
-                            impl_->failed=true;return;
-                        }
-                        scores=static_cast<float*>(impl_->attention_scores);query_sliced=false;
-                    }
-                    const bool launched=sliced_launched||mollm_cuda::try_launch_sdpa_prefill_validated_prefix(query_data,
+                    const bool launched=mollm_cuda::try_launch_sdpa_prefill_validated_prefix(query_data,
                         key_data,value_data,scores,output_data,mask_data,
                         static_cast<uint32_t*>(impl_->attention_prefix_valid),params,cudaStreamPerThread,&error,
                         prefix_shared_limit,prefix_skip_zero_pv,use_pv_unroll,use_pv_pair,grouped_queries,
                         grouped_queries?prefix_query_group:2,false,grouped_heads,pv_gemm,head_lane_pair?2:1,known_mask);
                     if (!mollm_cuda::report_cuda(error,"validated prefix attention")) { impl_->failed=true;return; }
                     if (launched) {
-                        if(sliced_launched)++impl_->attention_query_slice_enqueues;
                         if(pv_gemm) {
                             if(head_lane_pair)++impl_->attention_head_lane_pair_enqueues;
-                            if(!sliced_launched) {
                             const auto status=mollm_cuda::launch_sdpa_prefill_fp32_pv(impl_->attention_pv_handle,
                                 value_data,scores,static_cast<float*>(impl_->attention_pv_output),
                                 static_cast<float*>(impl_->attention_pv_values),
@@ -1451,7 +1178,6 @@ void CudaBackend::dispatch(const GraphNode& node,
                                 output_data,static_cast<uint32_t*>(impl_->attention_prefix_valid),params,cudaStreamPerThread);
                             if(!mollm_cuda::report_cuda(cudaGetLastError(),"native-probability PV copy")) {
                                 impl_->failed=true;return;
-                            }
                             }
                             ++impl_->attention_pv_gemm_enqueues;
                         }
@@ -1472,28 +1198,12 @@ void CudaBackend::dispatch(const GraphNode& node,
                                     sizeof(valid),cudaMemcpyDeviceToHost),"prefix validation trace")) {
                                 impl_->failed=true;return;
                             }
-                            std::fprintf(stderr,"sdpa_prefix_validation node=%u queries=%d keys=%d valid=%d known_mask=%d query_sliced=%d score_workspace_bytes=%zu pv_gemm=%d\n",
-                                node.id,query_length,key_length,int(valid!=0),int(known_mask),int(sliced_launched),impl_->attention_scores_bytes,int(pv_gemm));
-                        }
-                        if(impl_->attention_gemm_shadow&&impl_->attention_gemm_shadow_count<48) {
-                            if(capture!=cudaStreamCaptureStatusNone) {
-                                std::fprintf(stderr,"SDPA GEMM shadow requires non-captured execution; set MOLLM_DUMP_NODES=1 and MOLLM_DUMP_NODE_LIMIT=0 for this diagnostic\n");
-                                impl_->failed=true;return;
-                            }
-                            if(!sdpa_gemm_shadow(node.id,query_data,key_data,value_data,output_data,mask_data,scores,params)) {
-                                impl_->failed=true;return;
-                            }
-                            ++impl_->attention_gemm_shadow_count;
+                            std::fprintf(stderr,"sdpa_prefix_validation node=%u queries=%d keys=%d valid=%d known_mask=%d score_workspace_bytes=%zu pv_gemm=%d\n",
+                                node.id,query_length,key_length,int(valid!=0),int(known_mask),impl_->attention_scores_bytes,int(pv_gemm));
                         }
                         record_native();return;
                     }
                 }
-            }
-            if(query_sliced) {
-                if(!impl_->reserve(impl_->attention_scores,impl_->attention_scores_bytes,score_bytes,true)) {
-                    impl_->failed=true;return;
-                }
-                scores=static_cast<float*>(impl_->attention_scores);
             }
             if (mollm_cuda::try_launch_sdpa_prefill(
                     query_data, key_data, value_data, scores, output_data,
@@ -1835,10 +1545,8 @@ void CudaBackend::dispatch(const GraphNode& node,
                     input_data,weight_data,state_data,destination,prefixes,groups,
                     sequence_length,kernel_size,real_tokens,input.stride[0]/sizeof(float),
                     input.stride[1]/sizeof(float));
-                static const bool transpose_output = [] {
-                    const char* option = std::getenv("MOLLM_CUDA_SHORTCONV_TRANSPOSE");
-                    return option && std::strcmp(option, "1") == 0;
-                }();
+                // Qualified coalesced store mapping for unit feature stride.
+                constexpr bool transpose_output=true;
                 const int mapping = transpose_output && input.stride[0] == sizeof(float) &&
                     sequence_length >= 8 && sequence_length <= 65535 * 8 ? 2 : 0;
                 const bool launched = mollm_cuda::launch_shortconv(input_data,weight_data,state_data,destination,
@@ -2092,23 +1800,8 @@ void CudaBackend::dispatch(const GraphNode& node,
                     }
                 }
                 const float epsilon=graph_params::get_f32(node.params,0,1e-6f);
-                const char* deferred_selector=std::getenv("MOLLM_TEST_CUDA_HC_STANDALONE_DEFERRED_RMS");
-                const bool deferred=deferred_selector&&!std::strcmp(deferred_selector,"1")&&
-                    half&&hidden==2560&&x.shape[0]==10240&&rows<=mollm::hc::prefill_max_rows&&
-                    impl_->hc_deferred_enabled&&!impl_->segment_enabled&&rms_pair&&
-                    rms_pair->deferred_reduce&&impl_->hc_deferred_inverses&&
-                    supports_sigmoid_gr_reduce_fusion();
                 bool half_launched=false;
-                if(deferred) {
-                    if(!impl_->materialize_deferred_rms())return;
-                    half_launched=mollm_cuda::launch_group_rms_norm_deferred(source,other,half,
-                        impl_->hc_deferred_inverses,rows,epsilon);
-                    if(half_launched) {
-                        impl_->hc_deferred={rms_pair,destination,source,other,rows,impl_->hc_execution_epoch,false};
-                        ++impl_->hc_deferred_producers;
-                    }
-                }
-                if(!half_launched&&half) half_launched=mollm_cuda::launch_group_rms_norm_half(
+                if(half) half_launched=mollm_cuda::launch_group_rms_norm_half(
                     source,other,destination,half,hidden,x.shape[0]/hidden,rows,epsilon);
                 if (half_launched) {
                     impl_->hc_prefill_owner=rms_pair;

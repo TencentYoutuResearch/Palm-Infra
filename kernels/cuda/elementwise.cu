@@ -780,11 +780,8 @@ void launch_rms_norm(const float* input, const float* weight, float* output,
 void launch_group_rms_norm(const float* input, const float* weight,
                            float* output, int group_size, int groups,
                            int rows, float epsilon) {
-    static const bool cached = [] {
-        const char* value = std::getenv("MOLLM_CUDA_GROUP_RMS_CACHE");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    if (cached && rows == 1 && groups == 4 &&
+    // Single-token 4-group RMS uses the static unroll; other shapes fall back.
+    if (rows == 1 && groups == 4 &&
         launch_group_rms_norm_cached(input, weight, output, group_size,
                                      groups, rows, epsilon)) return;
     group_rms_norm_cuda<false><<<rows * groups, 256>>>(

@@ -1358,31 +1358,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         std::fprintf(stderr,"Engine: logical prefill requires bounded CUDA resident+offload-PLE+reclaim, positive context, chunk0..2048, no MTP/padding/decode-as-prefill\n");
         return false;
     }
-    const char* window_mode=std::getenv("MOLLM_TEST_CUDA_PREFILL_WINDOW_SCHEDULE");
-    if(cfg_.cuda_prefill_logical_batch&&window_mode&&std::strcmp(window_mode,"0")) {
-        std::fprintf(stderr,"Engine: logical prefill is incompatible with window scheduling\n");return false;
-    }
-    const char* readonly_option=std::getenv("MOLLM_TEST_CUDA_PREFILL_STATEFUL_LAST_USE");
-    if (readonly_option && std::strcmp(readonly_option,"0") && std::strcmp(readonly_option,"1")) {
-        std::fprintf(stderr,"Engine: test-only stateful last-use selector must be0 or1\n");
-        return false;
-    }
-    if(cfg_.cuda_prefill_logical_batch&&readonly_option&&!std::strcmp(readonly_option,"0")) {
-        std::fprintf(stderr,"Engine: logical prefill cannot disable read-only last-use contracts\n");return false;
-    }
-    const bool readonly_last_use=cfg_.cuda_prefill_logical_batch||(readonly_option && !std::strcmp(readonly_option,"1"));
-    int readonly_sequence_cap=cfg_.cuda_prefill_logical_batch?2048:512;
-    const char* readonly_cap=std::getenv("MOLLM_TEST_CUDA_PREFILL_STATEFUL_MAX_SEQ");
-    if (readonly_cap) {
-        if(cfg_.cuda_prefill_logical_batch) {
-            std::fprintf(stderr,"Engine: logical prefill owns its2048 cap; unset legacy stateful max sequence\n");return false;
-        }
-        if (!readonly_last_use || (std::strcmp(readonly_cap,"512") && std::strcmp(readonly_cap,"1024"))) {
-            std::fprintf(stderr,"Engine: test-only stateful last-use max sequence requires selector1 and exact512 or1024\n");
-            return false;
-        }
-        if (!std::strcmp(readonly_cap,"1024")) readonly_sequence_cap=1024;
-    }
+    const bool readonly_last_use=cfg_.cuda_prefill_logical_batch;
+    constexpr int readonly_sequence_cap=2048;
     if (readonly_last_use) {
         size_t headroom=0,pool_limit=0;
         const char* arena=std::getenv("MOLLM_RESIDENT_EXPERT_ARENA");
@@ -1392,16 +1369,14 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             std::getenv("MOLLM_CUDA_OUTPUT_POOL_MB"),pool_limit);
         if (!cfg_.cuda_prefill_reclaim || cfg_.device!=Device::CUDA || !cfg_.offload_ple ||
             cfg_.weight_loading!=WeightLoadingMode::RESIDENT || cfg_.moe_ssd_cache_bytes ||
-            cfg_.n_ctx<1 || (!cfg_.cuda_prefill_logical_batch&&cfg_.n_ctx>4096) || cfg_.prefill_chunk_size<0 ||
-            (!cfg_.cuda_prefill_logical_batch&&cfg_.prefill_chunk_size!=0 && cfg_.prefill_chunk_size!=256 && cfg_.prefill_chunk_size!=512 &&
-                !(cfg_.prefill_chunk_size==1024 && readonly_sequence_cap==1024)) ||
+            cfg_.n_ctx<1 || cfg_.prefill_chunk_size<0 ||
             cfg_.mtp_draft_tokens || !cfg_.mtp_companion_dir.empty() ||
             cfg_.use_decode_as_prefill || cfg_.static_padded ||
             !arena || std::strcmp(arena,"cuda-device") ||
             !valid_headroom || headroom<size_t(24576)*1024*1024 ||
             !valid_pool || pool_limit==0 || pool_limit>size_t(4096)*1024*1024 ||
             !std::getenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS")) {
-            std::fprintf(stderr,"Engine: test-only stateful last-use requires CUDA resident+offload-PLE+public reclaim, context<=4096, chunk0/256/512 (1024 only with explicit max sequence1024), no MTP/padding/decode-as-prefill, CUDA-device arena, >=24576 MiB headroom, output pool1..4096 MiB, and disabled decode segments\n");
+            std::fprintf(stderr,"Engine: --cuda-prefill-logical-batch requires CUDA resident+offload-PLE+reclaim, no MTP/padding/decode-as-prefill, CUDA-device arena, >=24576 MiB headroom, output pool1..4096 MiB, and disabled decode segments\n");
             return false;
         }
     }
@@ -1594,47 +1569,28 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     // decode/MTP workspace policy or weight layout. Freed device allocations
     // remain reusable in the backend pool; this is not a global memory cap.
     if (cfg_.device == Device::CUDA) {
-        const char* diagnostic = std::getenv("MOLLM_TEST_CUDA_PREFILL_LIVENESS");
-        const bool diagnostic_on = diagnostic && std::strcmp(diagnostic, "1") == 0;
-        if (cfg_.cuda_prefill_reclaim && diagnostic_on) {
-            std::fprintf(stderr, "Engine: do not combine public prefill reclamation with test-only selector\n");
-            return false;
-        }
-        if (cfg_.cuda_prefill_reclaim || diagnostic_on) {
-            // Explicit staged diagnostic only; do not allow arbitrary large
-            // sequences after the whole-host OOM incidents. Unset stays256.
-            const char* cap_option = std::getenv("MOLLM_TEST_CUDA_PREFILL_LIVENESS_MAX_SEQ");
-            if(cfg_.cuda_prefill_logical_batch&&cap_option) {
-                std::fprintf(stderr,"Engine: logical prefill owns its2048 cap; unset legacy liveness max sequence\n");return false;
-            }
-            int sequence_cap = readonly_last_use ? readonly_sequence_cap : cfg_.cuda_prefill_reclaim ? 1024 : 256;
-            if (diagnostic_on && cap_option) {
-                if (std::strcmp(cap_option, "1024") == 0) sequence_cap = 1024;
-                else if (std::strcmp(cap_option, "512") == 0) sequence_cap = 512;
-                else if (std::strcmp(cap_option, "256") != 0) {
-                    std::fprintf(stderr, "Engine: test-only liveness max sequence must be256,512 or1024\n");
-                    return false;
-                }
-            }
+        if (cfg_.cuda_prefill_reclaim) {
+            // Bounded reclamation: do not allow arbitrary large sequences
+            // after the whole-host OOM incidents.
+            const int sequence_cap = readonly_last_use ? readonly_sequence_cap : 1024;
             const char* headroom = std::getenv("MOLLM_CUDA_HOST_HEADROOM_MB");
             char* end = nullptr;
             errno = 0;
             const unsigned long long mb = headroom ? std::strtoull(headroom, &end, 10) : 0;
             if (!headroom || *headroom == '-' || errno || !end || *end || mb < 24576 ||
                 (!cfg_.cuda_prefill_logical_batch&&cfg_.n_ctx > 4096) || cfg_.prefill_chunk_size > sequence_cap) {
-                std::fprintf(stderr, "Engine: %s requires >=24576 MiB headroom, context<=4096, chunk<=%d\n",
-                    cfg_.cuda_prefill_reclaim ? "CUDA prefill reclamation" : "test-only liveness", sequence_cap);
+                std::fprintf(stderr, "Engine: CUDA prefill reclamation requires >=24576 MiB headroom, context<=4096, chunk<=%d\n",
+                    sequence_cap);
                 return false;
             }
             exec_ctx_prefill_.conservative_stateful_liveness = true;
             exec_ctx_prefill_.stateful_readonly_last_use = readonly_last_use;
             exec_ctx_prefill_.conservative_liveness_seq_limit = sequence_cap;
             exec_ctx_prefill_.reuse_same_shape_workspace = false;
-            std::fprintf(stderr, "Engine: %s, sequence cap%d\n",
-                cfg_.cuda_prefill_reclaim ? "CUDA prefill intermediate reclamation enabled" :
-                    "TEST-ONLY conservative prefill liveness", sequence_cap);
+            std::fprintf(stderr, "Engine: CUDA prefill intermediate reclamation enabled, sequence cap%d\n",
+                sequence_cap);
             if (readonly_last_use)
-                std::fprintf(stderr,"Engine: TEST-ONLY prefill stateful read-only last-use contracts enabled; captured decode segments disabled\n");
+                std::fprintf(stderr,"Engine: prefill stateful read-only last-use contracts enabled; captured decode segments disabled\n");
         }
         const char* reuse = std::getenv("MOLLM_CUDA_PREFILL_REUSE_WORKSPACE");
         if (reuse && std::strcmp(reuse, "0") == 0) {

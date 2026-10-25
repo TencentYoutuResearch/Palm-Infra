@@ -121,10 +121,8 @@ static void policy_check(cublasHandle_t classic,int m,int n,int padding=0){
         weight.p,CUDA_R_16F,k,input.p,CUDA_R_16F,lda,&beta,output,CUDA_R_32F,n,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));};
     bool selected=false;auto tuned=[&]{if(!policy.run(classic,weight.p,input.p,candidate.p,m,n,k,lda,selected))std::exit(5);if(!selected)original(candidate.p);};
     fill(x,471);upload(input.p,x);tuned();check(cudaStreamSynchronize(cudaStreamPerThread));const bool expected_selection=selected;
-    const char* full_flag=std::getenv("MOLLM_TEST_CUDA_DENSE_WIDE_FULL_LT");
-    if(full_flag&&!std::strcmp(full_flag,"1")&&m==1743&&n==16480&&!selected)std::exit(8);
-    const char* tile_flag=std::getenv("MOLLM_TEST_CUDA_DENSE_WIDE_TILE");
-    const bool expect_tile23=full_flag&&!std::strcmp(full_flag,"1")&&tile_flag&&!std::strcmp(tile_flag,"23")&&m>1024&&n==16480;
+    if(m>1024&&m<=2048&&n==16480&&!selected)std::exit(8);
+    const bool expect_tile23=m>1024&&m<=2048&&n==16480;
     if(expect_tile23&&!policy.wide_tile23_calls())std::exit(22);
     if(!expect_tile23&&policy.wide_tile23_calls())std::exit(23);
     if(m>1024&&n==13312&&selected)std::exit(8);
@@ -210,9 +208,6 @@ static void window_merge_check(cublasHandle_t classic,int n,int k,int nodes,bool
         }
     }
     if(selected_first!=first_plan||selected_second!=second_plan||selected_merged!=merged_plan||selected_tail!=tail_plan)std::exit(6);
-    const char* wide_tile=std::getenv("MOLLM_TEST_CUDA_DENSE_WIDE_ROW_TILE");
-    if(!balanced&&n==16480&&k==2560&&wide_tile&&!std::strcmp(wide_tile,"1024")&&
-       (!merged_plan||mismatches))std::exit(13);
     std::printf("dense_window_check n=%d k=%d declared_nodes=%d rows=%d+%d candidate_rows=%d+%d weight_sets=%d lt_split=%d,%d lt_merged=%d,%d changed_replays=3 bit_mismatches=%zu max_abs=%.9g finite=true guards=true scope=synthetic_dense_only_not_model_quality\n",
         n,k,nodes,first,second,balanced?896:rows,balanced?rows-896:0,sets,int(first_plan),int(second_plan),int(merged_plan),int(tail_plan),mismatches,max_abs);std::fflush(stdout);
     if(timing)for(int repeat=0;repeat<7;++repeat){

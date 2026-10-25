@@ -10,7 +10,10 @@
 // natively use an explicit D2H -> CPU reference -> H2D bridge.
 class CudaBackend final : public AcceleratorBackend {
 public:
-    CudaBackend();
+    // QUALIFIED selects the measured fusion policy. REFERENCE keeps the
+    // unfused node-by-node path for backend differential tests.
+    enum class FusionPolicy { QUALIFIED, REFERENCE };
+    explicit CudaBackend(FusionPolicy policy = FusionPolicy::QUALIFIED);
     ~CudaBackend() override;
 
     CudaBackend(const CudaBackend&) = delete;

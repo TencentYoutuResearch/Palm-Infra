@@ -19,60 +19,6 @@ struct Buffer {
     float* f(size_t offset=0){return static_cast<float*>(data)+offset;}
 };
 
-// Replay a bounded real snapshot without loading the full model. Rebuild all
-// pooled history from saved raw K, so changing normalization does not reuse
-// stale pooled values. Prefix Q is irrelevant to the retained current rows.
-void replay_snapshot(const char* input,const char* output) {
-    FILE* source=std::fopen(input,"rb");require(source,"open snapshot");
-    char magic[8];uint32_t h[10],flags;float eps;
-    require(std::fread(magic,1,8,source)==8&&!std::memcmp(magic,"QSAIDX2\0",8)&&
-        std::fread(h,4,10,source)==10&&std::fread(&eps,4,1,source)==1&&
-        std::fread(&flags,4,1,source)==1&&flags==1,"BF16 snapshot header");
-    require(h[0]>0&&h[0]<=2048&&h[1]<=8192&&h[0]+h[1]<=8192,"bounded query/past header");
-    const int q=h[0],past=h[1],heads=h[2],dim=h[3],rope=h[4],ratio=h[5],budget=h[6];
-    require(q>0&&q<=2048&&past>=0&&past+q<=8192&&heads>0&&heads<=16&&dim>1&&dim<=256&&
-        rope>=2&&rope<=dim&&rope%2==0&&ratio>0&&ratio<=16&&budget>0&&budget<=4096-ratio+1&&
-        budget%ratio==0&&h[7]<=262144&&std::isfinite(eps)&&eps>0,"bounded snapshot geometry");
-    const int keys=past+q,groups=keys/ratio,width=(heads+1)*dim,slots=budget+ratio-1;
-    require(keys>budget+ratio,"sparse replay history");
-    require(h[8]>=uint32_t(std::max(1,groups))&&h[9]==uint32_t(slots),"snapshot strides/slots");
-    const size_t elements=size_t(q)*(width+heads*dim+groups+slots)+size_t(keys+groups)*dim+2*dim+rope/2;
-    require(elements<=size_t(64)*1024*1024/4,"bounded payload");
-    std::vector<float> payload(elements);
-    require(std::fread(payload.data(),4,elements,source)==elements&&std::fgetc(source)==EOF,"complete snapshot payload");
-    std::fclose(source);
-    size_t cursor=0;
-    auto part=[&](size_t count){float* p=payload.data()+cursor;cursor+=count;return p;};
-    float* projection=part(size_t(q)*width),*qw=part(dim),*kw=part(dim),*freq=part(rope/2);
-    float* raw=part(size_t(keys)*dim),*query=part(size_t(q)*heads*dim),*pooled=part(size_t(groups)*dim);
-    float* scores=part(size_t(q)*groups);
-    auto* ids=reinterpret_cast<int32_t*>(payload.data()+cursor);
-    std::vector<float> full_projection(size_t(keys)*width,0.f);
-    for(int row=0;row<keys;++row)std::copy_n(raw+size_t(row)*dim,dim,full_projection.data()+size_t(row)*width+heads*dim);
-    std::copy_n(projection,size_t(q)*width,full_projection.data()+size_t(past)*width);
-    Buffer dp(full_projection.size()*4),dwq(dim*4),dwk(dim*4),df(rope/2*4),dr(size_t(keys)*dim*4);
-    Buffer dq(size_t(keys)*heads*dim*4),dk(size_t(groups)*dim*4),ds(size_t(keys)*groups*4),di(size_t(keys)*slots*4);
-    check(cudaMemcpy(dp.data,full_projection.data(),full_projection.size()*4,cudaMemcpyHostToDevice));
-    check(cudaMemcpy(dwq.data,qw,dim*4,cudaMemcpyHostToDevice));
-    check(cudaMemcpy(dwk.data,kw,dim*4,cudaMemcpyHostToDevice));
-    check(cudaMemcpy(df.data,freq,rope/2*4,cudaMemcpyHostToDevice));
-    mollm_cuda::QsaIndexerParams p{};p.heads=heads;p.dimension=dim;p.rope_dim=rope;p.ratio=ratio;
-    p.queries=p.capacity=keys;p.position_offset=h[7];p.eps=eps;p.projection_stride=width;p.score_stride=groups;p.diagnostic_bf16=true;
-    check(mollm_cuda::launch_qsa_indexer_update(dp.f(),dwq.f(),dwk.f(),df.f(),dr.f(),dk.f(),dq.f(),ds.f(),p));
-    check(mollm_cuda::launch_qsa_causal_block_topk(ds.f(),static_cast<int32_t*>(di.data),keys,keys,0,budget,ratio,groups,slots));
-    check(cudaMemcpy(raw,dr.data,size_t(keys)*dim*4,cudaMemcpyDeviceToHost));
-    check(cudaMemcpy(query,dq.f(size_t(past)*heads*dim),size_t(q)*heads*dim*4,cudaMemcpyDeviceToHost));
-    check(cudaMemcpy(pooled,dk.data,size_t(groups)*dim*4,cudaMemcpyDeviceToHost));
-    check(cudaMemcpy(scores,ds.f(size_t(past)*groups),size_t(q)*groups*4,cudaMemcpyDeviceToHost));
-    check(cudaMemcpy(ids,static_cast<int32_t*>(di.data)+size_t(past)*slots,size_t(q)*slots*4,cudaMemcpyDeviceToHost));
-    FILE* destination=std::fopen(output,"wbx");require(destination,"exclusively create replay output");
-    require(std::fwrite(magic,1,8,destination)==8&&std::fwrite(h,4,10,destination)==10&&
-        std::fwrite(&eps,4,1,destination)==1&&std::fwrite(&flags,4,1,destination)==1&&
-        std::fwrite(payload.data(),4,payload.size(),destination)==payload.size(),"write replay output");
-    require(std::fclose(destination)==0,"close replay output");
-    std::puts("QSA snapshot replay: rebuilt all pooled history and current rows");
-}
-
 std::vector<float> normalized_rotated(const float* input,const std::vector<float>& weight,
     const std::vector<float>& freq,int rope,int position) {
     const int dim=weight.size();
@@ -403,9 +349,6 @@ void projected_pipeline() {
 }
 int main(int argc,char** argv) {
     int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess||!count)return 77;
-    if(argc==4&&!std::strcmp(argv[1],"--snapshot-replay")) {
-        replay_snapshot(argv[2],argv[3]);return 0;
-    }
     if(argc==2&&std::strcmp(argv[1],"--long-only")==0){long_history();return 0;}
     if(argc==2&&std::strcmp(argv[1],"--extended-history-only")==0) {
         for(int keys:{65536,131072,262144})long_history(keys);

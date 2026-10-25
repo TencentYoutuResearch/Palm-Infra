@@ -122,8 +122,7 @@ bool CudaBackend::try_fp16_moe(const GraphNode& node,
 bool CudaBackend::dispatch_moe_pair(const GraphNode& node,
     const std::vector<const Tensor*>& a, const std::vector<const Tensor*>& b,
     Tensor* output_a, Tensor* output_b) {
-    const char* enabled = std::getenv("MOLLM_TEST_CUDA_MOE_WINDOW_MERGE");
-    if (!enabled || std::strcmp(enabled, "1") || impl_->segment_enabled ||
+    if (impl_->segment_enabled ||
         node.op_type != OpType::MOE || a.size() != 8 || b.size() != 8 ||
         !output_a || !output_b || !a[0] || !b[0] ||
         !fp32_contiguous(*a[0]) || !fp32_contiguous(*b[0]) ||
@@ -226,24 +225,14 @@ bool CudaBackend::try_nvfp4_moe(
     const ExpertSource* down_source = inputs[3]->moe_ssd_source;
     if (!gate_source || !down_source || !gate_source->provider ||
         gate_source->provider != down_source->provider) return false;
-    static const bool full_mma = [] {
-        const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    static const bool prefill_mma = [] {
-        const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREFILL_ONLY");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    const bool native_mma = full_mma || (prefill_mma && inputs[0]->shape[1] > 1);
-    static const bool simt_pipeline = [] {
-        const char* value = std::getenv("MOLLM_CUDA_NVFP4_SIMT_PIPELINE");
-        return value && std::strcmp(value, "1") == 0;
-    }();
+    // Prefer calibrated native NVFP4 prefill MMA when the device and package
+    // support it; unsupported configurations fall back to the SIMT path.
+    bool native_mma = inputs[0]->shape[1] > 1;
+    constexpr bool simt_pipeline=true;
     static const bool batch_pipeline = [] {
         const char* value=std::getenv("MOLLM_CUDA_NVFP4_BATCH_PIPELINE");
         return value && std::strcmp(value,"1")==0;
     }();
-    const bool canonical_mma = native_mma && !gate_source->resident_nvfp4_mma_layout;
     const bool gate_codes_kmajor = gate_source->resident_nvfp4_gate_codes_kmajor;
     const bool gate_scales_kmajor=gate_source->resident_nvfp4_gate_scales_kmajor;
     if((gate_scales_kmajor&&!gate_codes_kmajor)||down_source->resident_nvfp4_gate_scales_kmajor)
@@ -259,18 +248,17 @@ bool CudaBackend::try_nvfp4_moe(
         if (value && std::strcmp(value, "8") == 0) return 8;
         return 1;
     }();
-    if (full_mma || prefill_mma) {
-        if (!impl_->supports_native_nvfp4_mma ||
-            (full_mma && (!gate_source->resident_nvfp4_mma_layout || !down_source->resident_nvfp4_mma_layout)) ||
-            gate_source->resident_nvfp4_mma_layout != down_source->resident_nvfp4_mma_layout ||
-            hidden > 2560 || inter > 2560 || hidden % 64 || inter % 64 ||
-            gate_source->nvfp4_input_scales_per_expert != 2 || down_source->nvfp4_input_scales_per_expert != 1 ||
-            gate_source->nvfp4_input_scales.size() != static_cast<size_t>(experts) * 2 ||
-            down_source->nvfp4_input_scales.size() != static_cast<size_t>(experts)) {
-            std::fprintf(stderr, "CudaBackend: experimental NVFP4 MMA requires SM120/121, compatible resident layouts and checkpoint activation calibration (full MMA requires native layout)\n");
-            return false;
-        }
+    if (native_mma &&
+        (!impl_->supports_native_nvfp4_mma ||
+         gate_source->resident_nvfp4_mma_layout != down_source->resident_nvfp4_mma_layout ||
+         hidden > 2560 || inter > 2560 || hidden % 64 || inter % 64 ||
+         gate_source->nvfp4_input_scales_per_expert != 2 ||
+         down_source->nvfp4_input_scales_per_expert != 1 ||
+         gate_source->nvfp4_input_scales.size() != static_cast<size_t>(experts) * 2 ||
+         down_source->nvfp4_input_scales.size() != static_cast<size_t>(experts))) {
+        native_mma = false;
     }
+    const bool canonical_mma = native_mma && !gate_source->resident_nvfp4_mma_layout;
     for (int index : {1, 4, 5, 6, 7}) {
         const auto* prepared = impl_->find_weight(*inputs[index]);
         const int n = index == 1 ? experts : index == 6 ? hidden : index == 7 ? 1 : shared_inter;
@@ -409,7 +397,7 @@ bool CudaBackend::try_nvfp4_moe(
                 for (int i = 0; i < experts; ++i) {
                     tables[i] = projection(resident.leases[i].gate_up, nullptr, nullptr);
                     tables[experts + i] = projection(resident.leases[i].down, nullptr, nullptr);
-                    if (full_mma || prefill_mma) {
+                    if (native_mma) {
                         tables[i].input_global = gate_source->nvfp4_input_scales[i * 2];
                         tables[i].input_global_second = gate_source->nvfp4_input_scales[i * 2 + 1];
                         tables[experts + i].input_global = down_source->nvfp4_input_scales[i];
@@ -445,30 +433,19 @@ bool CudaBackend::try_nvfp4_moe(
             found->second.hidden == hidden && found->second.inter == inter &&
             found->second.leases.size() == static_cast<size_t>(experts)) {
             static const bool no_grouping = std::getenv("MOLLM_CUDA_DISABLE_NVFP4_GROUPING") != nullptr;
-            static const bool batch_prefill = [] {
-                const char* option = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREFILL_BATCH");
-                return option && std::strcmp(option, "1") == 0;
-            }();
+            // Qualified grouped batched prefill; per-shape guards below.
+            constexpr bool batch_prefill=true;
             // Canonical and native fragment loads may have different crossover
             // points. Keep established defaults and permit bounded tuning.
-            static const int batch_gate_min = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_GATE_MIN_BATCH");
-                return value && value[0] >= '1' && value[0] <= '8' && !value[1]
-                    ? value[0] - '0' : 4;
-            }();
-            static const int batch_down_min = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_DOWN_MIN_BATCH");
-                return value && value[0] >= '1' && value[0] <= '8' && !value[1]
-                    ? value[0] - '0' : 8;
-            }();
+            // Qualified grouped-MMA policy: no scalar singleton fallback.
+            constexpr int batch_gate_min=1;
+            constexpr int batch_down_min=1;
             static const bool prepare_singles = [] {
                 const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREPARE_SINGLES");
                 return value && std::strcmp(value, "1") == 0;
             }();
-            static const bool batch_small_prefill = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREFILL_BATCH_SMALL");
-                return value && std::strcmp(value, "1") == 0;
-            }();
+            // Admit grouped batching from 32 rows so short prompts benefit.
+            constexpr bool batch_small_prefill=true;
             static const int sort_override = [] {
                 const char* option = std::getenv("MOLLM_CUDA_NVFP4_PREFILL_SORT");
                 if (!option) option = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREFILL_SORT");
@@ -480,14 +457,9 @@ bool CudaBackend::try_nvfp4_moe(
             const bool batch_candidate = native_mma && batch_prefill &&
                 rows >= (batch_small_prefill ? 32 : 128) && native_gate_parts == 1;
             const bool sort_candidate = sort_prefill && rows >= 128;
-            static const bool tiled_large_group = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_PREFILL_TILED_GROUP");
-                return value && std::strcmp(value, "1") == 0;
-            }();
-            static const bool radix_prefill_group = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_PREFILL_RADIX_GROUP");
-                return value && std::strcmp(value, "1") == 0;
-            }();
+            // Qualified large-route grouping (removes the 4096-route cliff).
+            constexpr bool tiled_large_group=true;
+            constexpr bool radix_prefill_group=false;
             const bool extended_group = (tiled_large_group || radix_prefill_group) &&
                 (batch_candidate || sort_candidate) && routes > 4096 && routes <= 65535;
             const bool group_jobs = !no_grouping && rows > 1 &&
@@ -503,79 +475,42 @@ bool CudaBackend::try_nvfp4_moe(
                     !impl_->reserve(impl_->moe_radix_group_scratch,
                         impl_->moe_radix_group_scratch_bytes, scratch_bytes)) return fail();
             }
-            static const int compact_scope = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_COMPACT_BATCHES");
-                if (value && std::strcmp(value, "1") == 0) return 3;
-                if (value && std::strcmp(value, "gate") == 0) return 1;
-                if (value && std::strcmp(value, "down") == 0) return 2;
-                return 0;
-            }();
+            constexpr int compact_scope=0;
             const bool compact_gate_dispatch = (compact_scope & 1) != 0;
             const bool compact_down_dispatch = (compact_scope & 2) != 0;
             const bool compact_dispatch = compact_scope != 0;
-            static const int mma_batch_routes = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_BATCH_ROUTES");
-                return value && std::strcmp(value, "16") == 0 ? 16 : 8;
-            }();
-            static const int requested_gate_routes = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_GATE_BATCH_ROUTES");
-                if (value && std::strcmp(value,"32")==0) return 32;
-                if (value && std::strcmp(value,"16")==0) return 16;
-                if (value && std::strcmp(value,"8")==0) return 8;
-                return 0; // Unset/invalid preserves the existing shared selector.
-            }();
-            const int gate_batch_routes = requested_gate_routes ? requested_gate_routes : mma_batch_routes;
-            static const bool specialized_prepared = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREPARED_SPECIALIZED");
-                return value && std::strcmp(value, "1") == 0;
-            }();
-            static const bool async_gate_requested = [] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_N32_ASYNC_WEIGHTS");
-                return value && !std::strcmp(value,"1");
-            }();
-            static const bool async_gate_four_warps = [] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS");
-                return !value || (std::strcmp(value,"2") && std::strcmp(value,"8"));
-            }();
+            constexpr int mma_batch_routes=8;
+            // Gate/up use the qualified width-32 grouped MMA.
+            constexpr int gate_batch_routes=32;
+            constexpr bool specialized_prepared=false;
+            // Qualified N32 async gate staging.
+            constexpr bool async_gate_requested=true;
+            constexpr bool async_gate_four_warps=true;
             const bool async_gate = async_gate_requested && async_gate_four_warps &&
                 rows>=16 && hidden==2560 && inter==640 && canonical_mma &&
                 gate_batch_routes==32 && !compact_gate_dispatch && !specialized_prepared &&
                 found->second.gate_async_aligned;
-            static const int activation_prepare_fusion = [] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_ACTIVATION_PREPARE_FUSION");
-                if (value && std::strcmp(value,"1")==0) return 1;
-                if (value && std::strcmp(value,"2")==0) return 2;
-                return 0;
-            }();
-            static const bool bf16_gate_requested = [] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_BF16_GATE_OUTPUT");
-                return value && !std::strcmp(value,"1");
-            }();
+            // Qualified fused prepare: packed-only mode 2.
+            constexpr int activation_prepare_fusion=2;
+            // Qualified BF16 gate/up epilogue boundary.
+            constexpr bool bf16_gate_requested=true;
             const bool gate_output_bf16=bf16_gate_requested && rows<=4096 &&
                 async_gate && use_batched && batch_gate_min==1 && !prepare_singles &&
                 activation_prepare_fusion;
-            static const bool early_inputs_requested = [] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_EARLY_INPUTS");
-                return value && !std::strcmp(value,"1");
-            }();
+            // Qualified early input-fragment loads before the weight wait.
+            constexpr bool early_inputs_requested=true;
             const bool gate_early_inputs=early_inputs_requested && gate_output_bf16 &&
                 found->second.gate_pair_layout;
-            static const bool vector_quantize_requested = [] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_VECTOR_QUANTIZE");
-                return value && !std::strcmp(value,"1");
-            }();
+            // Qualified vectorized gate input quantization.
+            constexpr bool vector_quantize_requested=true;
             const bool gate_vector_quantize=vector_quantize_requested && gate_output_bf16;
-            static const bool parallel_plan_requested = [] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_PARALLEL_PLAN");
-                return value && !std::strcmp(value,"1");
-            }();
+            // Qualified warp-ballot plan builder.
+            constexpr bool parallel_plan_requested=true;
             const bool parallel_plan=parallel_plan_requested && rows>=16 && rows<=4096 &&
                 use_batched && canonical_mma && !compact_gate_dispatch && !compact_down_dispatch &&
                 !specialized_prepared && !prepare_singles;
-            static const bool bf16_down_requested = [] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_BF16_DOWN_OUTPUT");
-                return value && !std::strcmp(value,"1");
-            }();
+            // Qualified BF16 down epilogue boundary.
+            constexpr bool bf16_down_requested=true;
             // Pair the tightly packed producer and consumer; every unsupported
             // configuration retains FLOAT output. Reuse existing scratch, no
             // additional model cache or weight layout/conversion changes.
@@ -584,10 +519,8 @@ bool CudaBackend::try_nvfp4_moe(
                 canonical_mma && mma_batch_routes==8 && batch_down_min==1 &&
                 !prepare_singles && !compact_down_dispatch && !specialized_prepared &&
                 async_gate_four_warps;
-            static const bool mma_activation_requested=[] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_MMA_ACTIVATION_FUSED");
-                return value&&!std::strcmp(value,"1");
-            }();
+            // Qualified fused MMA/activation/quantize dataflow.
+            constexpr bool mma_activation_requested=true;
             const mollm_cuda::Nvfp4PrefillBatchPolicy batch_policy{
                 logical_prefill_batch_active_,moe_window_merge_active_};
             static const int input_scale_kmajor_override=[] {

@@ -195,7 +195,16 @@ std::unique_ptr<BackendStateSnapshot> CudaBackend::capture_state_snapshot(
     return snapshot;
 }
 
-CudaBackend::CudaBackend() : impl_(std::make_unique<Impl>()) {
+CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) {
+    if (policy == FusionPolicy::REFERENCE) {
+        impl_->qualified_fusions = false;
+        impl_->hc_projection_enabled = false;
+        impl_->hc_prefill_reuse_enabled = false;
+        impl_->hc_prefill_rms_half_enabled = false;
+        impl_->hc_deferred_enabled = false;
+        impl_->hc_compact_enabled = false;
+        impl_->strided_reshape_views = false;
+    }
     if (const char* flag = std::getenv("MOLLM_CUDA_STRIDED_RESHAPE_VIEWS"))
         impl_->strided_reshape_views = !std::strcmp(flag, "1");
     if (const char* option = std::getenv("MOLLM_CUDA_OUTPUT_POOL_MB")) {
@@ -226,17 +235,14 @@ CudaBackend::CudaBackend() : impl_(std::make_unique<Impl>()) {
             cublasSetStream(impl_->cublas, cudaStreamPerThread), "cublasSetStream"))
         return;
 #endif
-    const char* shared_overlap = std::getenv("MOLLM_CUDA_MOE_SHARED_OVERLAP");
-    if (shared_overlap && std::strcmp(shared_overlap, "1") == 0) {
-        // Allocate before any graph capture; the independent branch uses
-        // explicit fork/join events both outside and inside CUDA Graphs.
-        if (!mollm_cuda::report_cuda(cudaStreamCreateWithFlags(&impl_->moe_shared_stream,
-                cudaStreamNonBlocking), "shared expert stream") ||
-            !mollm_cuda::report_cuda(cudaEventCreateWithFlags(&impl_->moe_shared_ready,
-                cudaEventDisableTiming), "shared expert ready event") ||
-            !mollm_cuda::report_cuda(cudaEventCreateWithFlags(&impl_->moe_shared_done,
-                cudaEventDisableTiming), "shared expert done event")) return;
-    }
+    // Allocate before any graph capture; the independent shared-expert
+    // branch uses explicit fork/join events outside and inside CUDA Graphs.
+    if (!mollm_cuda::report_cuda(cudaStreamCreateWithFlags(&impl_->moe_shared_stream,
+            cudaStreamNonBlocking), "shared expert stream") ||
+        !mollm_cuda::report_cuda(cudaEventCreateWithFlags(&impl_->moe_shared_ready,
+            cudaEventDisableTiming), "shared expert ready event") ||
+        !mollm_cuda::report_cuda(cudaEventCreateWithFlags(&impl_->moe_shared_done,
+            cudaEventDisableTiming), "shared expert done event")) return;
     impl_->ok = true;
     int pageable = 0, host_tables = 0;
     if (cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0) == cudaSuccess &&
@@ -248,8 +254,7 @@ CudaBackend::CudaBackend() : impl_(std::make_unique<Impl>()) {
         impl_->supports_extended_nvfp4_prefill_sort = properties.major == 12 && properties.minor == 1;
         impl_->supports_sdpa_head_lane_pair=properties.major==12&&properties.minor==1&&
             properties.maxThreadsPerBlock>=512&&properties.regsPerBlock>=32768;
-        const char* lt_option=std::getenv("MOLLM_CUDA_PREFILL_LT_GEMM");
-        if(properties.major==12&&properties.minor==1&&lt_option&&!std::strcmp(lt_option,"1"))
+        if(properties.major==12&&properties.minor==1)
             impl_->prefill_lt=std::make_unique<mollm_cuda::PrefillLtGemm>();
         std::fprintf(stderr, "CudaBackend: using %s (sm_%d%d)\n",
                      properties.name, properties.major, properties.minor);
@@ -257,9 +262,6 @@ CudaBackend::CudaBackend() : impl_(std::make_unique<Impl>()) {
 }
 
 CudaBackend::~CudaBackend() {
-    if (std::getenv("MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED"))
-        std::fprintf(stderr, "CUDA shared FP16 cache: bytes=%zu hits=%zu\n",
-                     impl_->prefill_shared_cache_bytes, impl_->prefill_shared_cache_hits);
     if (std::getenv("MOLLM_CUDA_STRIDED_RESHAPE_VIEWS"))
         std::fprintf(stderr, "CUDA strided reshape views: enabled=%d calls=%zu\n",
                      impl_->strided_reshape_views, impl_->strided_reshape_calls);
@@ -558,14 +560,9 @@ void CudaBackend::wrap_weight_int4(Tensor& tensor,
         tensor.groups_per_row == static_cast<uint32_t>(k / 32)) {
         const size_t bytes = static_cast<size_t>((n + 7) / 8) * (k / 32) *
             sizeof(Q4B8G32Block);
-        static const bool compact_enabled = [] {
-            const char* value = std::getenv("MOLLM_CUDA_Q4_COMPACT");
-            return value && std::strcmp(value, "1") == 0;
-        }();
-        static const bool compact_integer_enabled = [] {
-            const char* value = std::getenv("MOLLM_CUDA_Q4_COMPACT_13312");
-            return value && std::strcmp(value, "1") == 0;
-        }();
+        // Lossless compact layouts; each scale must round-trip exactly.
+        constexpr bool compact_enabled=true;
+        constexpr bool compact_integer_enabled=true;
         const bool integer_layout = compact_integer_enabled && n == 13312;
         // Independent geometry opt-ins; every scale must round-trip exactly.
         if (((compact_enabled && n == 16480) || integer_layout) && k == 2560 &&

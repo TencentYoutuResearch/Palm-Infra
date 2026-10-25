@@ -194,19 +194,8 @@ int main(int argc,char** argv) {
     // Deferred RMS is deliberately not a graph output. Its intermediate
     // allocation must be returned to a cache before captured execution.
     setenv("MOLLM_CUDA_OUTPUT_POOL_MB","1024",1);
-    setenv("MOLLM_CUDA_HC_COMPACT_CARRY","0",1);
-    setenv("MOLLM_CUDA_HC_PROJECTION_PAIR", "0", 1);
-    setenv("MOLLM_CUDA_HC_PREFILL_ACTIVATION_REUSE", "0", 1);
-    setenv("MOLLM_CUDA_HC_PREFILL_RMS_HALF", "0", 1);
-    CudaBackend serial;
-    setenv("MOLLM_CUDA_HC_PROJECTION_PAIR", "1", 1);
-    setenv("MOLLM_CUDA_HC_PREFILL_ACTIVATION_REUSE", "1", 1);
-    setenv("MOLLM_CUDA_HC_PREFILL_RMS_HALF", "1", 1);
-    setenv("MOLLM_CUDA_GR_INJECT_RMS_FUSION", "1", 1);
-    setenv("MOLLM_CUDA_SIGMOID_GR_REDUCE_FUSION", "1", 1);
-    setenv("MOLLM_CUDA_HC_PREFILL_DEFERRED_RMS", "1", 1);
     setenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS", "1", 1);
-    setenv("MOLLM_CUDA_HC_COMPACT_CARRY",compact?"1":"0",1);
+    CudaBackend serial(CudaBackend::FusionPolicy::REFERENCE);
     CudaBackend fused;
     if (!serial.available() || !fused.available()) return 1;
     serial.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
@@ -366,22 +355,16 @@ int main(int argc,char** argv) {
         for(const auto& n:deferred_candidate.graph.nodes)if(n.id==uint32_t(id))return n;
         std::abort();
     };
-    // Exercise the same lifetime/fallback contracts for both producers:
-    // fused inject/RMS and an independent RMS following a scheduling cut.
-    for(int producer=0;producer<2;++producer) for(int mode=0;mode<7;++mode) {
-        unsetenv("MOLLM_TEST_CUDA_HC_STANDALONE_DEFERRED_RMS");
+    // Exercise the lifetime/fallback contracts for the fused inject/RMS
+    // producer. Independent RMS nodes use the ordinary half/normal path.
+    for(int mode=0;mode<7;++mode) {
         if(!deferred_reference.input(17,40+mode)||!deferred_candidate.input(17,40+mode)||
            !deferred_reference.run()||!deferred_candidate.run())return 1;
         auto& t=deferred_candidate.graph.runtime.tensors;
         fused.begin_execution();
         const auto before=fused.deferred_rms_materializations();
         const auto producers_before=fused.deferred_rms_producer_calls();
-        if(producer==0) {
-            if(!fused.dispatch_gr_inject_rms(node(11),node(8),{&t[9],&t[0],&t[10],&t[7]},&t[11],&t[8],nullptr))return 1;
-        } else {
-            setenv("MOLLM_TEST_CUDA_HC_STANDALONE_DEFERRED_RMS","1",1);
-            if(!deferred_candidate.dispatch_node(8))return 1;
-        }
+        if(!fused.dispatch_gr_inject_rms(node(11),node(8),{&t[9],&t[0],&t[10],&t[7]},&t[11],&t[8],nullptr))return 1;
         if(fused.deferred_rms_producer_calls()!=producers_before+1)return 1;
         std::vector<float> normalized(t[8].nelements());
         if(!serial.copy_to_host(deferred_reference.graph.runtime.tensors[8],normalized.data(),normalized.size()*4))return 1;
@@ -429,7 +412,6 @@ int main(int argc,char** argv) {
         if(!fused.copy_to_host(t[8],actual.data(),actual.size()*4)||
            std::memcmp(actual.data(),normalized.data(),actual.size()*4))return 1;
     }
-    unsetenv("MOLLM_TEST_CUDA_HC_STANDALONE_DEFERRED_RMS");
     if(compact) {
         const auto registrations=fused.compact_carry_allocation_registrations();
         for(int rows:{1,2,15,2049}) {
@@ -505,7 +487,7 @@ int main(int argc,char** argv) {
         std::printf("Compact HC backend rows=%d: residual continuation, packed-owner free/address reuse, partial host read/write/zero byte-exact PASS\n",rows);
         }
     }
-    std::printf("Deferred HC RMS backend: two producers x fallback/view/overwrite/epoch/replacement/release cases=14 materializations=%zu exact=1\n",fused.deferred_rms_materializations());
+    std::printf("Deferred HC RMS backend: fused producer x fallback/view/overwrite/epoch/replacement/release cases=7 materializations=%zu exact=1\n",fused.deferred_rms_materializations());
     std::printf("GR inject RMS backend: dual-output/HC projections byte-exact, changed-input graph replay, shape fallback; handled_calls=%zu\n",fused.gr_inject_rms_fused_calls());
     std::puts("HC projection backend: bit-exact RMS shadow/projections, graph replays, partial-pass invalidation, M2 fallback and plan replacement passed");
     return 0;

@@ -378,6 +378,10 @@ pooled cache不变、新跨chunk group/独立scalar scores/cutoff通过。
 日志 `qsa-extended-indexer-correctness-1.log`。这是preinitialized prefix
 continuation的证据，不是完整262K prefill/真实checkpoint认证。
 
+> 2026-10-18：`MOLLM_TEST_CUDA_QSA_FORCE_STREAMING_TOPK` 已在测试开关清理中
+> 删除。GB10 上512-token A/B（1290.3 vs 1270.2/1297.0 t/s）落在基线噪声内，
+> 因此保留“历史超过8192 groups才使用streaming”的自动阈值。以下为历史记录。
+
 `MOLLM_TEST_CUDA_QSA_FORCE_STREAMING_TOPK=1` 强制现有短历史也走新
 selector，用于质量A/B。实际7046-token完整checkpoint运行
 `qsa-streaming-quality-7k-1.csv/.log` 完成0，与SIMT参考7045项CE
@@ -468,6 +472,9 @@ MTP/padding 等范围限制及原始BF16全模型质量认证仍未宣告完成�
 launcher、CLI/tokenize、导出及独立算法参考；不是全仓库回归结果。
 
 ## 真实 indexer 激活的独立 PyTorch 对照（2026-10-15）
+
+> 2026-10-18：本节记录的快照诊断开关与 `tools/check_qsa_indexer_snapshot.py`
+> 已在测试开关清理中删除；以下命令仅作历史记录，不能在当前树中运行。
 
 新增默认关闭的 `MOLLM_TEST_CUDA_QSA_DUMP=<new-file>`。每个 backend
 最多输出一次，选择首次 keys>budget+ratio 的 sparse dispatch，且限

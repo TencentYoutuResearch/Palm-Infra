@@ -613,64 +613,63 @@ bool MoeSsdCache::load_resident(const std::vector<std::pair<
     const bool device_arena = arena_option && std::strcmp(arena_option, "cuda-device") == 0;
     const char* native_option = std::getenv("MOLLM_RESIDENT_NVFP4_MMA_LAYOUT");
     const bool native_layout = native_option && std::strcmp(native_option, "1") == 0;
-    const char* code_option = std::getenv("MOLLM_RESIDENT_NVFP4_GATE_CODES_KMAJOR");
-    const bool gate_codes_kmajor = code_option && std::strcmp(code_option, "1") == 0;
-    const char* scale_option=std::getenv("MOLLM_TEST_RESIDENT_NVFP4_GATE_SCALES_KMAJOR");
-    // Gate-code resident preparation also owns the sole gate SF payload.
-    // The test-only 0 override retains the historical two-layout A/B path.
-    // Canonical/CPU/Metal/SSD sources do not acquire this layout implicitly.
-    const bool gate_scales_kmajor=gate_codes_kmajor&&
-        (!scale_option||!std::strcmp(scale_option,"1"));
-    if(scale_option&&!std::strcmp(scale_option,"1")&&!gate_codes_kmajor) {
-        std::fprintf(stderr,"MoE: resident gate scales K64-major requires gate codes K64-major\n");
-        return false;
-    }
-    const char* mma_option = std::getenv("MOLLM_CUDA_NVFP4_MMA");
-    const char* prefill_mma_option = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREFILL_ONLY");
-    const bool full_mma = mma_option && std::strcmp(mma_option, "1") == 0;
-    const bool prefill_mma = prefill_mma_option && std::strcmp(prefill_mma_option, "1") == 0;
-    if (gate_codes_kmajor && (!device_arena || native_layout || full_mma || !prefill_mma)) {
-        std::fprintf(stderr, "MoE: gate code view requires CUDA-device arena and canonical prefill-only MMA\n");
-        return false;
-    }
+    // Gate-code K-major views are enabled automatically for the CUDA-device
+    // arena when the package geometry and activation calibration match.
+    bool gate_codes_kmajor = device_arena && !native_layout;
     if (gate_codes_kmajor) {
         for (const auto& [gate, down] : pairs)
             if (gate->spec.precision != Precision::NVFP4 || gate->spec.rows != 1280 ||
                 gate->spec.cols != 2560 || down->spec.precision != Precision::NVFP4 ||
-                down->spec.rows != 2560 || down->spec.cols != 640) {
-                std::fprintf(stderr, "MoE: gate code view requires fixed NVFP4 gate1280/K2560 and down2560/K640\n");
-                return false;
-            }
-    }
-    if (full_mma || prefill_mma) {
-        if (full_mma && !native_layout) {
-            std::fprintf(stderr, "MoE: NVFP4 MMA requires native resident preparation\n");
-            return false;
-        }
-        for (const auto& [gate, down] : pairs) {
-            if (gate->nvfp4_input_scales_per_expert != 2 || down->nvfp4_input_scales_per_expert != 1 ||
+                down->spec.rows != 2560 || down->spec.cols != 640 ||
+                gate->nvfp4_input_scales_per_expert != 2 ||
+                down->nvfp4_input_scales_per_expert != 1 ||
                 gate->nvfp4_input_scales.size() != static_cast<size_t>(gate->spec.num_experts) * 2 ||
                 down->nvfp4_input_scales.size() != static_cast<size_t>(down->spec.num_experts)) {
-                std::fprintf(stderr, "MoE: NVFP4 MMA requires checkpoint activation calibration; reconvert the package\n");
+                gate_codes_kmajor = false;
+                break;
+            }
+    }
+    if (native_layout) {
+        for (const auto& [gate, down] : pairs)
+            if (gate->nvfp4_input_scales_per_expert != 2 ||
+                down->nvfp4_input_scales_per_expert != 1 ||
+                gate->nvfp4_input_scales.size() != static_cast<size_t>(gate->spec.num_experts) * 2 ||
+                down->nvfp4_input_scales.size() != static_cast<size_t>(down->spec.num_experts)) {
+                std::fprintf(stderr, "MoE: native NVFP4 MMA requires checkpoint activation calibration; reconvert the package\n");
                 return false;
             }
-        }
     }
     if (native_layout || gate_codes_kmajor) {
-        if (!device_arena) return false;
+        if (!device_arena) {
+            if (native_layout) return false;
+            gate_codes_kmajor = false;
+        } else {
 #if defined(MOLLM_CUDA)
-        int device = 0, pageable = 0, tables = 0;
-        if (cudaGetDevice(&device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device) != cudaSuccess ||
-            !pageable || !tables) return false;
+            int device = 0, pageable = 0, tables = 0, major = 0, minor = 0;
+            if (cudaGetDevice(&device) != cudaSuccess ||
+                cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device) != cudaSuccess ||
+                cudaDeviceGetAttribute(&tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device) != cudaSuccess ||
+                !pageable || !tables) {
+                if (native_layout) return false;
+                gate_codes_kmajor = false;
+            } else if (gate_codes_kmajor &&
+                (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+                 cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
+                 major != 12 || minor > 1)) {
+                gate_codes_kmajor = false;
+            }
 #else
-        return false;
+            if (native_layout) return false;
+            gate_codes_kmajor = false;
 #endif
-        for (const auto& pair : pairs) for (const auto* source : {pair.first, pair.second})
-            if (source->spec.precision != Precision::NVFP4 ||
-                source->spec.rows % 16 || source->spec.cols % 64) return false;
+        }
+        if (gate_codes_kmajor || native_layout)
+            for (const auto& pair : pairs) for (const auto* source : {pair.first, pair.second})
+                if (source->spec.precision != Precision::NVFP4 ||
+                    source->spec.rows % 16 || source->spec.cols % 64) return false;
     }
+    // Gate-code resident preparation also owns the sole gate SF payload.
+    const bool gate_scales_kmajor=gate_codes_kmajor;
     if (arena_option && (std::strcmp(arena_option, "1") == 0 || device_arena)) {
         auto arena = std::make_shared<ResidentArena>();
         if (!arena->create(arena_bytes, device_arena)) {

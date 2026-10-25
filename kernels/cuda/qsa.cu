@@ -18,12 +18,6 @@ __global__ void validate_causal_mask(const float* mask,uint32_t* invalid,
     // though mask==0 treats it as invisible. Reject before mutating state.
     if(col<=past+row?value!=0.f:!(value<0.f))atomicOr(invalid,1u);
 }
-template<bool BF16>
-__device__ float indexer_round(float value) {
-    if constexpr(BF16)return __bfloat162float(__float2bfloat16_rn(value));
-    return value;
-}
-template<bool BF16>
 __device__ void indexer_norm_rotate(float value,const float* weight,
     const float* frequency,float* output,int dim,int rope_dim,int position,
     float eps,float* normalized,float* reduction) {
@@ -31,7 +25,7 @@ __device__ void indexer_norm_rotate(float value,const float* weight,
     const float square=d<dim?__fmul_rn(value,value):0.f;
     const float variance=mollm_cuda::detail::block_reduce_sum<256>(square,reduction)/dim;
     const float inverse=rsqrtf(variance+eps);
-    if(d<dim)normalized[d]=indexer_round<BF16>(__fmul_rn(__fmul_rn(value,inverse),__fadd_rn(1.f,weight[d])));
+    if(d<dim)normalized[d]=__fmul_rn(__fmul_rn(value,inverse),__fadd_rn(1.f,weight[d]));
     __syncthreads();
     if(d<dim) {
         float x=normalized[d];
@@ -39,31 +33,27 @@ __device__ void indexer_norm_rotate(float value,const float* weight,
             const int half=rope_dim/2,offset=d%half;
             float sine,cosine;
             sincosf(float(position)*frequency[offset],&sine,&cosine);
-            sine=indexer_round<BF16>(sine);cosine=indexer_round<BF16>(cosine);
             const float rotated=d<half?-normalized[d+half]:normalized[d-half];
-            x=indexer_round<BF16>(__fadd_rn(indexer_round<BF16>(__fmul_rn(x,cosine)),
-                indexer_round<BF16>(__fmul_rn(rotated,sine))));
+            x=__fadd_rn(__fmul_rn(x,cosine),__fmul_rn(rotated,sine));
         }
         output[d]=x;
     }
 }
 
-template<bool BF16>
 __global__ void qsa_append_query_raw(const float* projection,const float* weight,
     const float* frequency,float* raw,float* query,mollm_cuda::QsaIndexerParams p) {
     const int row=blockIdx.x,head=blockIdx.y,d=threadIdx.x;
     const float* source=projection+size_t(row)*p.projection_stride+head*p.dimension;
     if(head==p.heads) {
-        if(d<p.dimension)raw[size_t(p.past+row)*p.dimension+d]=indexer_round<BF16>(source[d]);
+        if(d<p.dimension)raw[size_t(p.past+row)*p.dimension+d]=source[d];
         return;
     }
     __shared__ float normalized[256],reduction[256];
-    indexer_norm_rotate<BF16>(d<p.dimension?indexer_round<BF16>(source[d]):0.f,weight,frequency,
+    indexer_norm_rotate(d<p.dimension?source[d]:0.f,weight,frequency,
         query+(size_t(row)*p.heads+head)*p.dimension,p.dimension,p.rope_dim,
         p.position_offset+p.past+row,p.eps,normalized,reduction);
 }
 
-template<bool BF16>
 __global__ void qsa_pool_complete(const float* raw,const float* weight,
     const float* frequency,float* pooled,mollm_cuda::QsaIndexerParams p) {
     const int group=p.past/p.ratio+blockIdx.x,d=threadIdx.x;
@@ -73,7 +63,7 @@ __global__ void qsa_pool_complete(const float* raw,const float* weight,
         value/=p.ratio;
     }
     __shared__ float normalized[256],reduction[256];
-    indexer_norm_rotate<BF16>(indexer_round<BF16>(value),weight,frequency,pooled+size_t(group)*p.dimension,
+    indexer_norm_rotate(value,weight,frequency,pooled+size_t(group)*p.dimension,
         p.dimension,p.rope_dim,p.position_offset+group*p.ratio,p.eps,normalized,reduction);
 }
 
@@ -423,14 +413,11 @@ cudaError_t mollm_cuda::launch_qsa_indexer_update(const float* projection,const 
     if(p.projection_stride>limit/size_t(p.queries)||p.score_stride>limit/size_t(p.queries)||
        size_t(p.capacity)>limit/size_t(p.dimension)||
        size_t(p.queries)>limit/size_t(p.heads*p.dimension))return cudaErrorInvalidValue;
-    if(p.diagnostic_bf16)
-        qsa_append_query_raw<true><<<dim3(p.queries,p.heads+1),256,0,stream>>>(projection,q_norm,frequency,raw,query,p);
-    else qsa_append_query_raw<false><<<dim3(p.queries,p.heads+1),256,0,stream>>>(projection,q_norm,frequency,raw,query,p);
+    qsa_append_query_raw<<<dim3(p.queries,p.heads+1),256,0,stream>>>(projection,q_norm,frequency,raw,query,p);
     auto error=cudaGetLastError();if(error!=cudaSuccess)return error;
     const int complete=(p.past+p.queries)/p.ratio,new_groups=complete-p.past/p.ratio;
     if(new_groups) {
-        if(p.diagnostic_bf16)qsa_pool_complete<true><<<new_groups,256,0,stream>>>(raw,k_norm,frequency,pooled,p);
-        else qsa_pool_complete<false><<<new_groups,256,0,stream>>>(raw,k_norm,frequency,pooled,p);
+        qsa_pool_complete<<<new_groups,256,0,stream>>>(raw,k_norm,frequency,pooled,p);
         error=cudaGetLastError();if(error!=cudaSuccess)return error;
     }
     if(complete) {

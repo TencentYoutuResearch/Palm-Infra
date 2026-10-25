@@ -21,8 +21,7 @@ class PresetTests(unittest.TestCase):
         (self.root / "build_cuda").mkdir()
         chat = self.root / "build_cuda/mollm_chat"
         chat.write_text(f"#!{sys.executable}\nimport json,os,sys\n"
-                        "diagnostics={k:v for k,v in os.environ.items() if k.startswith('MOLLM_TEST_CUDA_QSA_')}\n"
-                        "print(json.dumps(dict(args=sys.argv[1:],cache=os.environ['MOLLM_CUDA_PREFILL_FP16_CACHE_MB'],diagnostics=diagnostics)))\n")
+                        "print(json.dumps(dict(args=sys.argv[1:],cache=os.environ['MOLLM_CUDA_PREFILL_FP16_CACHE_MB'])))\n")
         chat.chmod(0o755)
 
     def run_case(self, *args, cache=None):
@@ -121,15 +120,6 @@ class PresetTests(unittest.TestCase):
                                 text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("conflicts", result.stderr)
-
-    def test_diagnostic_environment_is_not_inherited(self):
-        from unittest.mock import patch
-        with patch.dict(os.environ, {"MOLLM_TEST_CUDA_QSA_DUMP": "unwanted-file",
-                                    "MOLLM_TEST_CUDA_QSA_COMPARE": "1",
-                                    "MOLLM_TEST_CUDA_QSA_INDEXER_BF16": "1",
-                                    "MOLLM_TEST_CUDA_QSA_FORCE_STREAMING_TOPK": "1"}):
-            self.assertEqual(self.run_case()["diagnostics"], {})
-
 
 if __name__ == "__main__":
     unittest.main()

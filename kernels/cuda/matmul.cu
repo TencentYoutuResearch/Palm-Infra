@@ -1636,10 +1636,7 @@ void launch_q4_g32_dense_gemv(
                 const char* option = std::getenv("MOLLM_CUDA_Q4_NARROW_PREFETCH");
                 return option && std::strcmp(option, "1") == 0;
             }();
-            static const bool narrow_pipeline = [] {
-                const char* option = std::getenv("MOLLM_CUDA_Q4_NARROW_PIPELINE");
-                return option && std::strcmp(option, "1") == 0;
-            }();
+            constexpr bool narrow_pipeline=true;
             const bool pipeline_shape = (columns == 2560 && inner == 6144) ||
                 (columns == 320 && inner == 10240) || (columns == 640 && inner == 2560);
             if (narrow_pipeline && pipeline_shape &&

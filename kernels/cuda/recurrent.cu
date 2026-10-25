@@ -973,29 +973,17 @@ bool launch_gdn(
             num_value_heads);
         constexpr int recurrence_threads =
             gdn_value_warps_per_block * gdn_warp_size;
-        static const bool butterfly_key_prefill = [] {
-            const char* value=std::getenv("MOLLM_CUDA_GDN_PREFILL_BUTTERFLY_KEY");
-            const bool enabled=value && std::strcmp(value,"1")==0;
-            if (enabled) std::fprintf(stderr,"CUDA GDN: prefill butterfly key reduction enabled\n");
-            return enabled;
-        }();
-        const auto recurrence_kernel = butterfly_key_prefill
-            ? gdn_recurrence_rows_128_cuda<false,2,true>
-            : gdn_recurrence_rows_128_cuda<false,2,false>;
-        static const bool paired_values_prefill = [] {
-            const char* value = std::getenv("MOLLM_CUDA_GDN_PREFILL_PAIRED_VALUES");
-            return value && std::strcmp(value, "1") == 0;
-        }();
-        static const bool quad_values_prefill = [] {
-            const char* value=std::getenv("MOLLM_CUDA_GDN_PREFILL_QUAD_VALUES");
-            return value && std::strcmp(value,"1")==0;
-        }();
-        if(quad_values_prefill && !butterfly_key_prefill && sequence_length>=16 &&
+        const auto recurrence_kernel = gdn_recurrence_rows_128_cuda<false,2,false>;
+        // Qualified prefill policy: quad values first, paired values as the
+        // 8-byte-aligned fallback. Both preserve per-column arithmetic order.
+        constexpr bool paired_values_prefill=true;
+        constexpr bool quad_values_prefill=true;
+        if(quad_values_prefill && sequence_length>=16 &&
             !(reinterpret_cast<uintptr_t>(state)&15))
             gdn_recurrence_quads_128_cuda<<<dim3(16,num_value_heads),recurrence_threads>>>(
                 qkv,normalized_query,normalized_key,query_key_dot,decay,beta,state,raw_output,
                 num_heads,num_value_heads,sequence_length,process_length,scale);
-        else if (paired_values_prefill && !butterfly_key_prefill && sequence_length >= 16 &&
+        else if (paired_values_prefill && sequence_length >= 16 &&
             !(reinterpret_cast<uintptr_t>(state) & 7))
             gdn_recurrence_pairs_128_cuda<<<dim3(32, num_value_heads), recurrence_threads>>>(
                 qkv, normalized_query, normalized_key, query_key_dot, decay,
@@ -1014,11 +1002,8 @@ bool launch_gdn(
     constexpr size_t state_cache_bytes =
         gdn_head_dim * gdn_head_dim * sizeof(float);
     static const bool shared_state_configured = configure_gdn_shared_state<>();
-    static const bool register_decode = [] {
-        const char* value = std::getenv("MOLLM_CUDA_GDN_REGISTER_STATE");
-        return value && std::strcmp(value,"1") == 0;
-    }();
-    if (register_decode && sequence_length == 1) {
+    // Single-token decode keeps the 128-value state in registers.
+    if (sequence_length == 1) {
         gdn_128_cuda<true,false,true><<<num_value_heads,gdn_head_dim>>>(
             qkv, a, b, z, a_log, dt_bias, norm_weight, state, output,
             num_heads, num_value_heads, sequence_length, process_length,

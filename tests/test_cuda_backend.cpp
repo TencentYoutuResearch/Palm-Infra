@@ -3967,12 +3967,11 @@ int main(int argc, char** argv) {
     const bool shared_cache_only=argc==2 && !std::strcmp(argv[1],"--shared-cache-only");
     const bool reshape_only=argc==2 && !std::strcmp(argv[1],"--strided-reshape-only");
     const bool contracts_only=argc==2 && !std::strcmp(argv[1],"--stateful-contract-only");
-    const bool shadow_only=argc==2 && !std::strcmp(argv[1],"--sdpa-shadow-only");
     const bool head_group_only=argc==2 && !std::strcmp(argv[1],"--sdpa-head-group-only");
     const bool native_pv_only=argc==2 && !std::strcmp(argv[1],"--sdpa-native-pv-only");
     const bool full_batch_only=argc==2 && !std::strcmp(argv[1],"--sdpa-full-batch-only");
-    if (argc!=1 && !contracts_only && !shadow_only && !head_group_only && !native_pv_only && !full_batch_only && !reshape_only && !shared_cache_only) {
-        std::fprintf(stderr,"usage: %s [--stateful-contract-only|--sdpa-shadow-only|--sdpa-head-group-only|--sdpa-native-pv-only|--sdpa-full-batch-only|--strided-reshape-only|--shared-cache-only]\n",argv[0]);
+    if (argc!=1 && !contracts_only && !head_group_only && !native_pv_only && !full_batch_only && !reshape_only && !shared_cache_only) {
+        std::fprintf(stderr,"usage: %s [--stateful-contract-only|--sdpa-head-group-only|--sdpa-native-pv-only|--sdpa-full-batch-only|--strided-reshape-only|--shared-cache-only]\n",argv[0]);
         return 2;
     }
     {
@@ -4068,8 +4067,7 @@ int main(int argc, char** argv) {
     }
     if(native_pv_only) {
         if(!backend.set_logical_prefill_batch(true))return 1;
-        const char* mode=std::getenv("MOLLM_TEST_CUDA_SDPA_NATIVE_PV_GEMM");
-        const bool enabled=(!mode||!std::strcmp(mode,"1"))&&
+        const bool enabled=
             mollm_cuda::logical_prefill_option(std::getenv("MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX"),true)&&
             mollm_cuda::logical_prefill_option(std::getenv("MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV"),true)&&
             mollm_cuda::logical_prefill_option(std::getenv("MOLLM_CUDA_SDPA_PREFILL_PV_PAIR"),true);
@@ -4077,16 +4075,10 @@ int main(int argc, char** argv) {
         if(cudaGetDevice(&current_device)!=cudaSuccess||cudaGetDeviceProperties(&properties,current_device)!=cudaSuccess)return 1;
         const bool long_pv_qualified=properties.major==12&&properties.minor==1&&
             properties.maxThreadsPerBlock>=512&&properties.regsPerBlock>=32768;
-        const bool actual_long_selected=long_pv_qualified||(mode&&!std::strcmp(mode,"1"));
-        const char* head_option=std::getenv("MOLLM_TEST_CUDA_SDPA_PV_HEAD_LANES");
-        const int head_max_keys=head_option&&!std::strcmp(head_option,"2")?32768:16384;
-        const bool head_pair=properties.major==12&&properties.minor==1&&
-            properties.maxThreadsPerBlock>=512&&properties.regsPerBlock>=32768&&
-            (!head_option||!std::strcmp(head_option,"2"));
-        const char* mid_option=std::getenv("MOLLM_TEST_CUDA_SDPA_MID_PV_GEMM");
-        const bool mid_pair=(!mid_option||!std::strcmp(mid_option,"1"))&&
-            properties.major==12&&properties.minor==1&&
-            properties.maxThreadsPerBlock>=512&&properties.regsPerBlock>=32768;
+        const bool actual_long_selected=long_pv_qualified;
+        const int head_max_keys=16384;
+        const bool head_pair=long_pv_qualified;
+        const bool mid_pair=long_pv_qualified;
         size_t expected_score_peak=0;
         auto run=[&](int keys,int rows,int ratio,bool selected,int capacity=0) {
             expected_score_peak=std::max(expected_score_peak,size_t(2*ratio)*rows*keys*sizeof(float));
@@ -4116,8 +4108,7 @@ int main(int argc, char** argv) {
         return passed&&ordinary&&restored?0:1;
     }
     if(head_group_only) {
-        const char* mode=std::getenv("MOLLM_CUDA_SDPA_PREFILL_HEAD_GROUP");
-        const bool enabled=mode&&!std::strcmp(mode,"4");
+        constexpr bool enabled=true;
         auto run=[&](int past,int current,int dim,int ratio,bool selected) {
             const auto before=backend.attention_head_group_calls();
             return test_wide_cached_sdpa(backend,Precision::FP16,past,current,true,2,dim,true,ratio)&&
@@ -4132,16 +4123,6 @@ int main(int argc, char** argv) {
             test_wide_cached_sdpa(backend,Precision::FP16,0,1743,true,1,256,true,4)&&
             backend.attention_head_group_calls()-before_full==size_t(enabled);
         std::puts(passed?"CUDA long head-group selector/reference fixtures passed":"CUDA long head-group selector/reference fixtures FAILED");
-        return passed?0:1;
-    }
-    if(shadow_only) {
-        if(!std::getenv("MOLLM_TEST_CUDA_SDPA_GEMM_SHADOW"))return 2;
-        const bool passed=test_wide_cached_sdpa(backend,Precision::FP16,0,17,true,2,256,true)&&
-            test_wide_cached_sdpa(backend,Precision::FP16,511,17,true,2,256,true)&&
-            test_wide_cached_sdpa(backend,Precision::FP16,1280,17,true,2,256,true)&&
-            test_wide_cached_sdpa(backend,Precision::FP16,0,17,true,2,256,false)&&
-            test_wide_cached_sdpa(backend,Precision::FP16,0,1743,true,1,256,true);
-        std::puts(passed?"CUDA SDPA diagnostic shadow fixtures passed":"CUDA SDPA diagnostic shadow fixtures FAILED");
         return passed?0:1;
     }
     {

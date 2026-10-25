@@ -311,7 +311,9 @@ int main() {
                 native_spec.scales_offset = 512; native_spec.scales_bytes = 128;
                 native_spec.expert_stride = 640;
                 native_spec.flags = MappedFile::FLAG_EXPERT_INTERLEAVED | MappedFile::FLAG_NVFP4_Q8_PAIR;
+                native_spec.input_scales={1.f,1.f}; native_spec.input_scales_per_expert=2;
                 auto down_spec = native_spec;
+                down_spec.input_scales={1.f}; down_spec.input_scales_per_expert=1;
                 down_spec.weight_ref = "native_down"; down_spec.data_offset = 640;
                 down_spec.scales_offset = 1152;
                 check(cache.open(native_path, 1) && cache.add_source(native_spec) && cache.add_source(down_spec),
@@ -347,17 +349,14 @@ int main() {
             std::remove(native_path.c_str());
         }
         {
-            const char* names[]={"MOLLM_RESIDENT_NVFP4_GATE_CODES_KMAJOR",
-                "MOLLM_CUDA_NVFP4_MMA_PREFILL_ONLY","MOLLM_RESIDENT_NVFP4_MMA_LAYOUT",
-                "MOLLM_TEST_RESIDENT_NVFP4_GATE_SCALES_KMAJOR"};
+            const char* names[]={"MOLLM_RESIDENT_NVFP4_MMA_LAYOUT"};
             std::vector<std::string> saved;
             std::vector<bool> present;
             for(const char* name:names){const char* value=std::getenv(name);present.push_back(value!=nullptr);saved.emplace_back(value?value:"");}
-            setenv(names[0],"1",1);setenv(names[1],"1",1);setenv(names[2],"0",1);
+            setenv(names[0],"0",1);
             const std::string code_path="/tmp/mollm_test_moe_gate_codes.bin";
-            for(const char* scale_mode:{"0","1",static_cast<const char*>(nullptr)})for(bool pair:{false,true}) {
-                const bool scale_view=!scale_mode||!std::strcmp(scale_mode,"1");
-                if(scale_mode)setenv(names[3],scale_mode,1);else unsetenv(names[3]);
+            for(bool pair:{false,true}) {
+                constexpr bool scale_view=true;
                 auto gate_spec=spec("code_gate",0);
                 gate_spec.num_experts=1;gate_spec.rows=1280;gate_spec.cols=2560;
                 gate_spec.precision=Precision::NVFP4;gate_spec.group_size=16;
@@ -388,9 +387,11 @@ int main() {
                 MoeSsdCache cache;
                 check(cache.open(code_path,1)&&cache.add_source(gate_spec)&&cache.add_source(down_spec),"create bounded gate-code cache fixture");
                 const auto* gate=cache.find_source("code_gate");const auto* down=cache.find_source("code_down");
-                setenv(names[2],"1",1);
-                check(!cache.load_resident({{gate,down}}),"reject conflicting native-MMA and K64-major layouts");
-                setenv(names[2],"0",1);
+                setenv(names[0],"1",1);
+                check(cache.load_resident({{gate,down}})&&!gate->resident_nvfp4_gate_codes_kmajor,
+                    "native MMA layout takes precedence over K64-major gate codes");
+                check(cache.clear_resident(),"clear native layout before gate-code reload");
+                setenv(names[0],"0",1);
                 const bool loaded=cache.load_resident({{gate,down}});
                 check(loaded,"load gate-code view into existing arena");
                 if(loaded) {

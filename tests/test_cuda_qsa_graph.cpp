@@ -116,12 +116,8 @@ struct Frame {
             }
             selections.insert(selections.end(),ids.begin()+r*slots,ids.begin()+(r+1)*slots);
         }
-        const char* bf16_option=std::getenv("MOLLM_TEST_CUDA_QSA_INDEXER_BF16");
-        const bool bf16=bf16_option&&!std::strcmp(bf16_option,"1");
         auto raw=read(ts[4]);for(int r=0;r<rows;++r)for(int d=0;d<dim;++d) {
-            float expected=projection[r*(heads+1)*dim+heads*dim+d];
-            if(bf16){uint32_t bits;std::memcpy(&bits,&expected,4);bits+=0x7fffu+((bits>>16)&1u);
-                bits&=0xffff0000u;std::memcpy(&expected,&bits,4);}
+            const float expected=projection[r*(heads+1)*dim+heads*dim+d];
             require(raw[(past+r)*dim+d]==expected,"raw K graph state");
         }
     }
@@ -147,17 +143,7 @@ int main(int argc,char** argv) {
     setenv("MOLLM_CUDA_QSA_GQA_REUSE","1",1);
     setenv("MOLLM_CUDA_QSA_DECODE_SPLIT","1",1);
     CudaBackend probe;if(!probe.available())return 77;
-    if(argc==3&&!std::strcmp(argv[1],"--snapshot")) {
-        setenv("MOLLM_TEST_CUDA_QSA_DUMP",argv[2],1);
-        Frame frame(true,2);
-        std::vector<float> output;std::vector<int32_t> selected;
-        frame.pass(0,29,7,0,output,selected);
-        // A second eligible invocation must not write/overwrite again.
-        frame.pass(29,1,7,0,output,selected);
-        std::puts("QSA graph snapshot: native sparse prefill and continuation pass");
-        return 0;
-    }
-    require(argc==1,"usage: test_cuda_qsa_graph [--snapshot new-file]");
+    require(argc==1,"usage: test_cuda_qsa_graph");
     for(bool half:{false,true})for(int mode:{0,1,2})run(half,mode);
     for(int bad:{1,2,3}){Frame f(true,2);std::vector<float> out;std::vector<int32_t> ids;f.pass(0,13,7,bad,out,ids);}
     // Exercise both backend selectors: grouped whole prefill, then grouped

@@ -43,34 +43,7 @@ public:
     bool run(cublasHandle_t classic,const void* weight,const void* input,float* output,
              int m,int n,int k,int lda,bool& handled){
         handled=false;
-        static const bool wide_row_tile=[] {
-            const char* value=std::getenv("MOLLM_TEST_CUDA_DENSE_WIDE_ROW_TILE");
-            return value&&!std::strcmp(value,"1024");
-        }();
-        static const bool wide_full_lt=[] {
-            const char* value=std::getenv("MOLLM_TEST_CUDA_DENSE_WIDE_FULL_LT");
-            return value&&!std::strcmp(value,"1");
-        }();
-        static const bool wide_tile23=[] {
-            const char* value=std::getenv("MOLLM_TEST_CUDA_DENSE_WIDE_TILE");
-            return value&&!std::strcmp(value,"23");
-        }();
-        // Keep logical prompt execution whole while recovering existing Lt
-        // choices for this particular projection. No new tuning/workspace.
-        if(wide_row_tile&&handle_&&weight&&input&&output&&m>1024&&m<=2048&&
-           n==16480&&k==2560&&lda>=k) {
-            for(int offset=0;offset<m;offset+=1024) {
-                const int rows=std::min(1024,m-offset);
-                const auto* activation=static_cast<const __half*>(input)+size_t(offset)*lda;
-                auto* destination=output+size_t(offset)*n;
-                bool selected=false;
-                if(!run(classic,weight,activation,destination,rows,n,k,lda,selected))return false;
-                if(!selected&&!run_dense_matmul(classic,weight,CUDA_R_16F,
-                        activation,CUDA_R_16F,destination,rows,n,k,lda))return false;
-            }
-            handled=true;return true;
-        }
-        const bool full_wide=wide_full_lt&&m>1024&&m<=2048&&n==16480;
+        const bool full_wide=m>1024&&m<=2048&&n==16480;
         if(!handle_||!weight||!input||!output||m<512||(m>1024&&!full_wide)||k!=2560||(n!=13312&&n!=16480)||lda<k)return true;
         const int align=std::min({alignment(weight),alignment(input),alignment(output)});
         if(align<16){++fallbacks_;return true;}
@@ -111,7 +84,7 @@ public:
             // Copy the existing qualified configuration; change only its tile.
             // Validate geometry/alignment through the same layouts/preferences.
             // On unavailable/unsupported candidates retain the original plan.
-            if(p->selected&&full_wide&&wide_tile23){
+            if(p->selected&&full_wide){
                 auto candidate=p->algo;const int tile=23;
                 cublasLtMatmulHeuristicResult_t checked{};
                 bool aligned=cublasLtMatmulAlgoConfigSetAttribute(&candidate,CUBLASLT_ALGO_CONFIG_TILE_ID,&tile,sizeof(tile))==CUBLAS_STATUS_SUCCESS;

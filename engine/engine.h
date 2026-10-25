@@ -490,10 +490,6 @@ private:
     /// Process a chunk within the limit validated by prefill().
     /// Called by prefill() in a loop for chunked prefill.
     int prefill_chunk(const std::vector<int>& token_ids, int past);
-    // Test-only bounded scheduling proof; two private runtime frames, no
-    // merged MoE or backend graph-local fusion metadata.
-    int prefill_window_schedule(const std::vector<int>& token_ids, int past,
-                                bool chunk_major_reference);
 
     // weight tensors
     Tensor* embed_weight_ = nullptr;   // [vocab_size, hidden_dim], row-major FP16/FP32 for lookup
