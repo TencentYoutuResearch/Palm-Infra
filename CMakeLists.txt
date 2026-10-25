@@ -472,13 +472,26 @@ endif()
 # ---------------------------------------------------------------------------
 
 if(MOLLM_CUDA)
+    set(MOLLM_CUDA_AUTO_ARCHITECTURES OFF)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        # Emit SASS for common datacenter/consumer generations and retain PTX
-        # for forward-compatible driver JIT on newer GPUs.
-        set(CMAKE_CUDA_ARCHITECTURES 75 80 86)
+        if(NOT "$ENV{CUDAARCHS}" STREQUAL "")
+            set(CMAKE_CUDA_ARCHITECTURES "$ENV{CUDAARCHS}")
+        else()
+            # Bootstrap compiler detection without requiring a visible GPU.
+            # Replace this non-cache default after the toolkit is available.
+            set(CMAKE_CUDA_ARCHITECTURES 75 80 86)
+            set(MOLLM_CUDA_AUTO_ARCHITECTURES ON)
+        endif()
     endif()
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    if(MOLLM_CUDA_AUTO_ARCHITECTURES)
+        include(cmake/MollmCudaArchitectures.cmake)
+        mollm_detect_cuda_architectures(CMAKE_CUDA_ARCHITECTURES)
+    else()
+        message(STATUS "CUDA architectures (explicit override): ${CMAKE_CUDA_ARCHITECTURES}")
+    endif()
+    set_property(TARGET mollm_lib PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     target_sources(mollm_lib PRIVATE
         backends/cuda/backend.cu
         backends/cuda/device_runtime.cu
@@ -690,6 +703,8 @@ add_custom_target(mollm_quantize_weight DEPENDS mollm-quantize)
 
 if(MOLLM_BUILD_TESTS)
     enable_testing()
+    add_test(NAME test_cuda_architectures
+        COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_architectures.cmake)
 
     configure_file(
         cmake/RunPackageConsumer.cmake.in
