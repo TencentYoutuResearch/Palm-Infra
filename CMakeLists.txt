@@ -1632,6 +1632,9 @@ if(MOLLM_BUILD_TESTS)
             LABELS "cuda"
             RUN_SERIAL TRUE)
     endif()
+    if(NOT DEFINED Python3_FIND_STRATEGY)
+        set(Python3_FIND_STRATEGY LOCATION)
+    endif()
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME test_sha256_streaming
@@ -1645,11 +1648,10 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda;e2e" RUN_SERIAL TRUE TIMEOUT 180)
         endif()
         function(add_mollm_python_test name script)
-            set(test_command ${CMAKE_CURRENT_SOURCE_DIR}/tests/${script})
-            if(DEFINED ENV{GITHUB_ACTIONS})
-                set(test_command ${CMAKE_CURRENT_SOURCE_DIR}/tests/report_python_test.py ${test_command})
-            endif()
-            add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE} ${test_command})
+            add_test(
+                NAME ${name}
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/${script})
         endfunction()
         add_mollm_python_test(test_token_loss_compare test_token_loss_compare.py)
         add_mollm_python_test(test_qwen38_cuda_preset test_qwen38_cuda_preset.py)
