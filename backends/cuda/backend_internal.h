@@ -529,7 +529,7 @@ struct CudaBackend::Impl {
         Tensor* tensors = nullptr;
         size_t count = 0;
         int active_width = 0, max_width = 5;
-        std::array<VerificationWorkspaceSlot, 9> slots;
+        VerificationWorkspaceSlot slots[9];
         uint64_t switches = 0, hits = 0;
         size_t peak_output_bytes = 0;
     };

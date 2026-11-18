@@ -29,7 +29,8 @@ int main(){
     for(int c=0;c<65536;++c)NEED(same(table[c*2],table[c*2+1]));scales.guards();
     std::puts("scale_lookup_all65536 native_division_exact=1 guards=1");
     int cases=0;
-    for(auto shape:{std::pair<int,int>{4129,32},{4129,2560},{4129,4096},{16448,2560},{16480,2560}})for(int weight_offset:{0,4}){
+    const std::pair<int,int> shapes[]={{4129,32},{4129,2560},{4129,4096},{16448,2560},{16480,2560}};
+    for(const auto& shape:shapes)for(int weight_offset:{0,4}){
         const int n=shape.first,k=shape.second,modes=k==2560?3:2;
         std::vector<mollm_cuda::Q4CompactG32> weights(size_t((n+7)/8)*(k/32));std::vector<float> input(k);
         Buffer w(weights.size()*sizeof(weights[0])+weight_offset),x(k*4);std::unique_ptr<Buffer> y[3];for(int m=0;m<modes;++m)y[m]=std::make_unique<Buffer>(n*4);
