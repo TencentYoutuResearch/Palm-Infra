@@ -717,6 +717,10 @@ add_custom_target(mollm_quantize_weight DEPENDS mollm-quantize)
 
 if(MOLLM_BUILD_TESTS)
     enable_testing()
+    if(DEFINED ENV{GITHUB_STEP_SUMMARY})
+        file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
+            "set(CTEST_CUSTOM_POST_TEST \"/bin/sh -c 'cat Testing/Temporary/LastTest.log > $ENV{GITHUB_STEP_SUMMARY}'\")\n")
+    endif()
     add_test(NAME test_cuda_architectures
         COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_architectures.cmake)
 
