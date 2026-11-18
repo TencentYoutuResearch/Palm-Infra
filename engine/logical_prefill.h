@@ -10,7 +10,14 @@ inline bool logical_config_supported(const EngineConfig& c) {
     return c.device==Device::CUDA&&c.offload_ple&&c.cuda_prefill_reclaim&&
         c.weight_loading==WeightLoadingMode::RESIDENT&&!c.moe_ssd_cache_bytes&&
         c.n_ctx>0&&c.prefill_chunk_size>=0&&c.prefill_chunk_size<=logical_max_tokens&&
-        !c.static_padded&&!c.use_decode_as_prefill&&!c.mtp_draft_tokens&&c.mtp_companion_dir.empty();
+        !c.static_padded&&!c.use_decode_as_prefill;
+}
+// Extra admission margin, in addition to the allocator/watchdog host floor.
+// A verification batch of at most eight tokens does not need the workspace
+// margin of a full 2048-token prefill. Recurrent checkpoints are allocated
+// before verification; every new CUDA allocation still checks the host floor.
+inline size_t logical_transient_margin(int rows) {
+    return rows>0&&rows<=8 ? size_t(256)<<20 : size_t(4)<<30;
 }
 inline bool logical_length_supported(int rows,int past,int context) {
     return rows>0&&past>=0&&context>0&&

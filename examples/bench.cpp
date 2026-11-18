@@ -331,6 +331,9 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
             mtp.recurrent_checkpoint_ms, mtp.recurrent_rollback_ms);
         std::printf("mtp_recurrent_device_checkpoint_bytes=%llu\n",
             static_cast<unsigned long long>(mtp.recurrent_device_checkpoint_bytes));
+        std::printf("mtp_recurrent_prefix_only_steps=%llu mtp_recurrent_prefix_plan_fallbacks=%llu\n",
+            static_cast<unsigned long long>(mtp.recurrent_prefix_only_steps),
+            static_cast<unsigned long long>(mtp.recurrent_prefix_plan_fallbacks));
         std::printf("mtp_depth_stats=");
         bool first = true;
         for (size_t depth = 0;
@@ -424,6 +427,10 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
                       (long long)mtp.recurrent_device_checkpoint_bytes, "bytes");
         human_row_int("mtp_recurrent_checkpoint_bytes",
                       (long long)mtp.recurrent_checkpoint_bytes, "bytes");
+        human_row_int("mtp_recurrent_prefix_only_steps",
+                      (long long)mtp.recurrent_prefix_only_steps, "");
+        human_row_int("mtp_recurrent_prefix_plan_fallbacks",
+                      (long long)mtp.recurrent_prefix_plan_fallbacks, "");
         human_row_int("mtp_recurrent_rollbacks",
                       (long long)mtp.recurrent_rollbacks, "");
         human_row_int("mtp_recurrent_replay_tokens",

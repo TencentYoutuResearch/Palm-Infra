@@ -731,10 +731,17 @@ __global__ void gdn_128_cuda(
              (1.0f + expf(-z_value)));
         if constexpr (StorePrefixes) {
             float* snapshot=prefixes+(static_cast<size_t>(token)*num_value_heads+value_head)*gdn_head_dim*gdn_head_dim;
-            for(int row=0;row<gdn_head_dim;++row) {
-                const size_t index=static_cast<size_t>(row)*gdn_head_dim+dimension;
-                if constexpr (RegisterState) snapshot[index]=register_state[row];
-                else snapshot[index]=CacheState?state_cache[index]:head_state[index];
+            if constexpr (RegisterState) {
+                // Keep the state in registers while emitting each exact prefix.
+                // Dynamic indexing here would materialize the array in local memory.
+#pragma unroll
+                for (int row = 0; row < gdn_head_dim; ++row)
+                    snapshot[static_cast<size_t>(row) * gdn_head_dim + dimension] = register_state[row];
+            } else {
+                for (int row = 0; row < gdn_head_dim; ++row) {
+                    const size_t index = static_cast<size_t>(row) * gdn_head_dim + dimension;
+                    snapshot[index] = CacheState ? state_cache[index] : head_state[index];
+                }
             }
         }
         __syncthreads();
@@ -1037,6 +1044,13 @@ bool launch_gdn_prefixes(
         num_heads<=0||num_value_heads<=0||num_value_heads%num_heads||
         sequence_length<1||sequence_length>8||real_tokens<1||real_tokens>sequence_length)
         return false;
+    {
+        gdn_128_cuda<true,true,true><<<num_value_heads,128>>>(
+            qkv,a,b,z,a_log,dt_bias,norm_weight,state,output,num_heads,num_value_heads,
+            sequence_length,real_tokens,(flags&1)!=0,rms_epsilon,l2_epsilon,scale,
+            a_row_stride,b_row_stride,z_row_stride,(flags&2)!=0,prefixes);
+        return cudaGetLastError()==cudaSuccess;
+    }
     static const bool cached=configure_gdn_shared_state<true>();
     if(cached)
         gdn_128_cuda<true,true><<<num_value_heads,128,128*128*sizeof(float)>>>(

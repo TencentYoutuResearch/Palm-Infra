@@ -494,11 +494,16 @@ if(MOLLM_CUDA)
     set_property(TARGET mollm_lib PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
     target_sources(mollm_lib PRIVATE
         backends/cuda/backend.cu
+        backends/cuda/verification_workspace.cpp
+        backends/cuda/fp16_expert_palette.cpp
         backends/cuda/device_runtime.cu
         backends/cuda/dispatch.cu
         backends/cuda/lm_head.cu
         backends/cuda/moe.cu
         kernels/cuda/attention.cu
+        kernels/cuda/draft_compact_head.cu
+        kernels/cuda/fp16_expert_palette.cu
+        kernels/cuda/q8_head_screen.cu
         kernels/cuda/qsa.cu
         kernels/cuda/matmul.cu
         kernels/cuda/moe.cu
@@ -527,6 +532,15 @@ if(MOLLM_CUDA)
         set_target_properties(bench_cuda_dense_lt_gemm PROPERTIES CUDA_STANDARD 17)
         add_executable(bench_cuda_projections tests/bench_cuda_projections.cpp)
         target_link_libraries(bench_cuda_projections PRIVATE mollm_lib)
+        add_executable(bench_cuda_q6_screen tests/bench_cuda_q6_screen.cu)
+        target_link_libraries(bench_cuda_q6_screen PRIVATE mollm_lib)
+        set_target_properties(bench_cuda_q6_screen PROPERTIES CUDA_STANDARD 17)
+        add_executable(test_cuda_q4_scale_lookup tests/test_cuda_q4_scale_lookup.cu)
+        target_link_libraries(test_cuda_q4_scale_lookup PRIVATE mollm_lib)
+        set_target_properties(test_cuda_q4_scale_lookup PROPERTIES CUDA_STANDARD 17)
+        add_executable(test_cuda_q8_head_screen_batch tests/test_cuda_q8_head_screen_batch.cu)
+        target_link_libraries(test_cuda_q8_head_screen_batch PRIVATE mollm_lib)
+        set_target_properties(test_cuda_q8_head_screen_batch PROPERTIES CUDA_STANDARD 17)
         add_executable(bench_cuda_q8_traffic tests/bench_cuda_q8_traffic.cu)
         target_link_libraries(bench_cuda_q8_traffic PRIVATE mollm_lib)
         set_target_properties(bench_cuda_q8_traffic PROPERTIES CUDA_STANDARD 17)
@@ -787,8 +801,12 @@ if(MOLLM_BUILD_TESTS)
         PASS_REGULAR_EXPRESSION "dump does not modify output" FAIL_REGULAR_EXPRESSION "ROW graph=")
     add_mollm_test(test_hc_deferred_rms_plan tests/test_hc_deferred_rms_plan.cpp)
     add_mollm_test(test_cuda_prefill_batch_policy tests/test_cuda_prefill_batch_policy.cpp)
+    # CUDA prefix planning inspects metadata only; run it without a toolkit/GPU too.
+    add_mollm_test(test_cuda_prefix_plan tests/test_cuda_prefix_plan.cpp)
     add_mollm_test(test_cuda_host_memory_watchdog tests/test_cuda_host_memory_watchdog.cpp)
     add_mollm_test(test_engine        tests/test_engine.cpp)
+    add_mollm_test(test_routed_expert_weight tests/test_routed_expert_weight.cpp)
+    add_mollm_test(test_mtp_draft_policy tests/test_mtp_draft_policy.cpp)
     add_mollm_test(test_recurrent_checkpoint tests/test_recurrent_checkpoint.cpp)
     if(MOLLM_CUDA)
         add_test(NAME test_recurrent_checkpoint_device COMMAND test_recurrent_checkpoint)
@@ -833,6 +851,8 @@ if(MOLLM_BUILD_TESTS)
         target_link_libraries(test_cuda_qsa_selected_attention PRIVATE mollm_lib)
         set_target_properties(test_cuda_qsa_selected_attention PROPERTIES CUDA_STANDARD 17)
         add_test(NAME test_cuda_qsa_selected_attention COMMAND test_cuda_qsa_selected_attention)
+        add_test(NAME test_cuda_qsa_selected_attention_gathered COMMAND test_cuda_qsa_selected_attention --gathered)
+        set_tests_properties(test_cuda_qsa_selected_attention_gathered PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_qsa_streaming_topk COMMAND test_cuda_qsa_selected_attention --streaming-topk-only)
         set_tests_properties(test_cuda_qsa_streaming_topk PROPERTIES
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
@@ -858,6 +878,15 @@ if(MOLLM_BUILD_TESTS)
             set_tests_properties(test_cuda_nvfp4_gate_code_repack PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             add_test(NAME test_cuda_nvfp4_gate_code_decode COMMAND test_cuda_nvfp4_gate_code_decode)
+            foreach(gate_routes IN ITEMS 30 50)
+                foreach(gate_scale_view IN ITEMS 0 1)
+                    set(gate_subgroup_test test_cuda_nvfp4_gate_subgroup_${gate_routes}_scale${gate_scale_view})
+                    add_test(NAME ${gate_subgroup_test} COMMAND test_cuda_nvfp4_gate_code_decode)
+                    set_tests_properties(${gate_subgroup_test} PROPERTIES
+                        ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_CODE_ROUTES=${gate_routes};MOLLM_TEST_NVFP4_GATE_CODE_SUBGROUP=1;MOLLM_TEST_NVFP4_RESIDENT_GATE_SCALE_VIEW=${gate_scale_view}"
+                        SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+                endforeach()
+            endforeach()
             add_test(NAME test_cuda_nvfp4_gate_scale_repack COMMAND test_cuda_nvfp4_gate_scale_repack)
             set_tests_properties(test_cuda_nvfp4_gate_scale_repack PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
@@ -1168,6 +1197,40 @@ if(MOLLM_BUILD_TESTS)
         set_tests_properties(test_cuda_gr_inject_tiled PROPERTIES
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_mollm_test(test_cuda_backend tests/test_cuda_backend.cpp)
+        if(MOLLM_CUDA_DECODE_SEGMENTS)
+            add_mollm_test(test_cuda_verification_workspace tests/test_cuda_verification_workspace.cpp)
+            set_tests_properties(test_cuda_verification_workspace PROPERTIES
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+            add_test(NAME test_cuda_verify_workspace_pool COMMAND test_cuda_backend --verify-workspace-only)
+            set_tests_properties(test_cuda_verify_workspace_pool PROPERTIES
+                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_CUDA_OUTPUT_POOL_MB=3072;MOLLM_CUDA_MTP_DEVICE_CHECKPOINT=1"
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+            add_test(NAME test_cuda_verify_workspace_unbounded COMMAND test_cuda_backend --verify-workspace-only)
+            set_tests_properties(test_cuda_verify_workspace_unbounded PROPERTIES
+                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_CUDA_OUTPUT_POOL_MB=0"
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+            add_test(NAME test_cuda_verify_segment_prefixes COMMAND test_cuda_backend --moe-provider-only)
+            set_tests_properties(test_cuda_verify_segment_prefixes PROPERTIES
+                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1"
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+            add_test(NAME test_cuda_verify_segment_prefixes_wide COMMAND test_cuda_backend --moe-provider-only)
+            set_tests_properties(test_cuda_verify_segment_prefixes_wide PROPERTIES
+                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_TEST_CUDA_VERIFY_WIDTH=5;MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1"
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+            add_test(NAME test_cuda_verify_segment_prefixes_width4 COMMAND test_cuda_backend --moe-provider-only)
+            set_tests_properties(test_cuda_verify_segment_prefixes_width4 PROPERTIES
+                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_TEST_CUDA_VERIFY_WIDTH=4;MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1"
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+            foreach(width IN ITEMS 6 7 8)
+                add_test(NAME test_cuda_verify_segment_prefixes_width${width} COMMAND test_cuda_backend --moe-provider-only)
+                set_tests_properties(test_cuda_verify_segment_prefixes_width${width} PROPERTIES
+                    ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_TEST_CUDA_VERIFY_WIDTH=${width};MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1"
+                    SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+            endforeach()
+        endif()
+        add_test(NAME test_cuda_moe_provider_lifecycle COMMAND test_cuda_backend --moe-provider-only)
+        set_tests_properties(test_cuda_moe_provider_lifecycle PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_mollm_test(test_cuda_nvfp4_logical_batch tests/test_cuda_nvfp4_logical_batch.cpp)
         set_tests_properties(test_cuda_nvfp4_logical_batch PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_HOST_HEADROOM_MB=102400;MOLLM_CUDA_DISABLE_MOE_GRAPHS=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1;MOLLM_CUDA_PREFILL_GATE_SCALE_CACHE_MB=16;MOLLM_CUDA_NVFP4_PREFILL_INPUT_SCALE_KMAJOR=1;MOLLM_CUDA_NVFP4_PREFILL_COMPACT_LOGITS=1;MOLLM_CUDA_NVFP4_PREFILL_TOKEN_QUANTIZE=1;MOLLM_CUDA_NVFP4_PREFILL_TOKEN_PAIR_WORDS=1"
@@ -1319,12 +1382,89 @@ if(MOLLM_BUILD_TESTS)
         add_mollm_test(test_cuda_recurrent_prefix tests/test_cuda_recurrent_prefix.cpp)
         set_tests_properties(test_cuda_recurrent_prefix PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda")
         set_tests_properties(test_cuda_group_rms PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda")
+        add_mollm_test(test_cuda_q4_narrow_row tests/test_cuda_q4_narrow_row.cpp)
+        set_tests_properties(test_cuda_q4_narrow_row PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_mollm_test(test_cuda_q4_hc_adjacent tests/test_cuda_q4_hc_adjacent.cpp)
+        set_tests_properties(test_cuda_q4_hc_adjacent PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_mollm_test(test_cuda_hc_projection tests/test_cuda_hc_projection.cpp)
         set_tests_properties(test_cuda_hc_projection PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda")
+        add_test(NAME test_cuda_hc_projection_small_batch COMMAND test_cuda_hc_projection --small-batch)
+        set_tests_properties(test_cuda_hc_projection_small_batch PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_test(NAME test_cuda_hc_compact_backend COMMAND test_cuda_hc_projection --compact)
         set_tests_properties(test_cuda_hc_compact_backend PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_mollm_test(test_cuda_fp16_moe tests/test_cuda_fp16_moe.cpp)
         add_mollm_test(test_cuda_q4_small_batch tests/test_cuda_q4_small_batch.cpp)
+        add_mollm_test(test_cuda_q4_m3_adjacent tests/test_cuda_q4_m3_adjacent.cpp)
+        set_tests_properties(test_cuda_q4_m3_adjacent PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q4_m3_adjacent_backend COMMAND test_cuda_q4_m3_adjacent --backend)
+        set_tests_properties(test_cuda_q4_m3_adjacent_backend PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q4_m3_fixed COMMAND test_cuda_q4_m3_adjacent --fixed)
+        set_tests_properties(test_cuda_q4_m3_fixed PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q4_m3_fixed_backend COMMAND test_cuda_q4_m3_adjacent --fixed --backend)
+        set_tests_properties(test_cuda_q4_m3_fixed_backend PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_mollm_test(test_cuda_nvfp4_gate_m1_proven tests/test_cuda_nvfp4_gate_m1_proven.cpp)
+        set_tests_properties(test_cuda_nvfp4_gate_m1_proven PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        foreach(routes 1 10 50)
+            add_test(NAME test_cuda_nvfp4_gate_m1_proven_routes${routes} COMMAND test_cuda_nvfp4_gate_m1_proven ${routes})
+            set_tests_properties(test_cuda_nvfp4_gate_m1_proven_routes${routes} PROPERTIES
+                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        endforeach()
+        add_mollm_test(test_cuda_nvfp4_gate_paired8 tests/test_cuda_nvfp4_gate_paired8.cpp)
+        set_tests_properties(test_cuda_nvfp4_gate_paired8 PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        foreach(routes 1 10 30 50 51 63 64 65 80)
+            add_test(NAME test_cuda_nvfp4_gate_paired8_routes${routes} COMMAND test_cuda_nvfp4_gate_paired8 ${routes})
+            set_tests_properties(test_cuda_nvfp4_gate_paired8_routes${routes} PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        endforeach()
+        add_mollm_test(test_cuda_draft_q2_head tests/test_cuda_draft_q2_head.cu)
+        set_target_properties(test_cuda_draft_q2_head PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+        set_tests_properties(test_cuda_draft_q2_head PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_draft_q2_head_large COMMAND test_cuda_draft_q2_head --large)
+        set_tests_properties(test_cuda_draft_q2_head_large PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_mollm_test(test_cuda_draft_compact_head tests/test_cuda_draft_compact_head.cpp)
+        set_tests_properties(test_cuda_draft_compact_head PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_mollm_test(test_cuda_draft_fitted_q4 tests/test_cuda_draft_fitted_q4.cpp)
+        set_tests_properties(test_cuda_draft_fitted_q4 PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_mollm_test(test_cuda_draft_energy_screen tests/test_cuda_draft_energy_screen.cpp)
+        set_tests_properties(test_cuda_draft_energy_screen PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_mollm_test(test_cuda_q8_batch_argmax tests/test_cuda_q8_batch_argmax.cpp)
+        set_tests_properties(test_cuda_q8_batch_argmax PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_mollm_test(test_cuda_fp16_expert_palette tests/test_cuda_fp16_expert_palette.cpp)
+        set_tests_properties(test_cuda_fp16_expert_palette PROPERTIES
+            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_executable(test_cuda_q8_head_screen_scalar tests/test_cuda_q8_head_screen_scalar.cpp)
+        target_link_libraries(test_cuda_q8_head_screen_scalar PRIVATE mollm_lib)
+        add_test(NAME test_cuda_q8_head_screen_q4 COMMAND test_cuda_q8_head_screen_scalar --q4)
+        add_test(NAME test_cuda_q8_head_screen_q4_large COMMAND test_cuda_q8_head_screen_scalar --q4 --large)
+        set_tests_properties(test_cuda_q8_head_screen_q4 test_cuda_q8_head_screen_q4_large
+            PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q8_q4_shape_fallback COMMAND test_cuda_q8_batch_argmax)
+        set_tests_properties(test_cuda_q8_q4_shape_fallback PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q8_q4_batch_interleave COMMAND test_cuda_q8_batch_argmax --screen-shape)
+        set_tests_properties(test_cuda_q8_q4_batch_interleave PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q8_screen_cache_4 COMMAND test_cuda_q8_batch_argmax --screen-cache-lifecycle)
+        set_tests_properties(test_cuda_q8_screen_cache_4 PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q8_batch_screen COMMAND test_cuda_q8_batch_argmax --screen-shape)
+        set_tests_properties(test_cuda_q8_batch_screen PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_mollm_test(test_cuda_qsa_projection tests/test_cuda_qsa_projection.cpp)
+        set_tests_properties(test_cuda_qsa_projection PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_qsa_projection_segments COMMAND test_cuda_qsa_projection --segments)
+        set_tests_properties(test_cuda_qsa_projection_segments PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q4_scale_lookup COMMAND test_cuda_q4_scale_lookup)
+        set_tests_properties(test_cuda_q4_scale_lookup PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q8_head_screen COMMAND bench_cuda_q6_screen)
+        set_tests_properties(test_cuda_q8_head_screen PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q8_head_screen_large COMMAND bench_cuda_q6_screen --large-numeric)
+        set_tests_properties(test_cuda_q8_head_screen_large PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q4_m6 COMMAND test_cuda_q4_small_batch --m6-only)
+        set_tests_properties(test_cuda_q4_m6 PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q4_small_reduction COMMAND test_cuda_q4_small_batch --small-reduction-only)
+        set_tests_properties(test_cuda_q4_small_reduction PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        add_test(NAME test_cuda_q8_head_screen_batch COMMAND test_cuda_q8_head_screen_batch)
+        set_tests_properties(test_cuda_q8_head_screen_batch PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        foreach(width IN ITEMS 4 5 6 7 8)
+            add_test(NAME test_cuda_q8_head_screen_batch${width} COMMAND test_cuda_q8_head_screen_batch ${width})
+            set_tests_properties(test_cuda_q8_head_screen_batch${width} PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
+        endforeach()
         add_executable(probe_cuda_verify_consistency tests/probe_cuda_verify_consistency.cpp)
         target_link_libraries(probe_cuda_verify_consistency PRIVATE mollm_lib)
         set_tests_properties(test_cuda_q4_small_batch PROPERTIES SKIP_RETURN_CODE 77)
@@ -1470,12 +1610,11 @@ if(MOLLM_BUILD_TESTS)
             ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_exact_attention PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_SDPA_SMALL_BATCH_EXACT=1;MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1"
+            ENVIRONMENT "MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1"
             SKIP_RETURN_CODE 77 LABELS "cuda")
         set_tests_properties(test_cuda_backend_exact_batch PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_Q4_SMALL_BATCH_EXACT=1"
             SKIP_RETURN_CODE 77 LABELS "cuda")
-        add_test(NAME test_cuda_backend_narrow_prefetch COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_row_major COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_row_major_extended COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_row_major_extended PROPERTIES
@@ -1488,25 +1627,8 @@ if(MOLLM_BUILD_TESTS)
             ENVIRONMENT "MOLLM_CUDA_Q4_ROW_MAJOR=1"
             LABELS "cuda"
             RUN_SERIAL TRUE)
-        set_tests_properties(test_cuda_backend_narrow_prefetch PROPERTIES
-            SKIP_RETURN_CODE 77
-            ENVIRONMENT "MOLLM_CUDA_Q4_NARROW_PREFETCH=1"
-            LABELS "cuda"
-            RUN_SERIAL TRUE)
         set_tests_properties(test_cuda_backend_register_routes PROPERTIES
             SKIP_RETURN_CODE 77
-            LABELS "cuda"
-            RUN_SERIAL TRUE)
-        add_test(NAME test_cuda_backend_q4_prefetch COMMAND test_cuda_backend)
-        set_tests_properties(test_cuda_backend_q4_prefetch PROPERTIES
-            SKIP_RETURN_CODE 77
-            ENVIRONMENT "MOLLM_CUDA_Q4_PREFETCH=1"
-            LABELS "cuda"
-            RUN_SERIAL TRUE)
-        add_test(NAME test_cuda_backend_q4_no_prefetch COMMAND test_cuda_backend)
-        set_tests_properties(test_cuda_backend_q4_no_prefetch PROPERTIES
-            SKIP_RETURN_CODE 77
-            ENVIRONMENT "MOLLM_CUDA_Q4_PREFETCH=0"
             LABELS "cuda"
             RUN_SERIAL TRUE)
     endif()
@@ -1620,6 +1742,13 @@ if(MOLLM_BUILD_TESTS)
                              $<TARGET_FILE:test_recurrent_mtp>)
             set_tests_properties(test_recurrent_mtp_device_e2e PROPERTIES
                 ENVIRONMENT "MOLLM_CUDA_MTP_DEVICE_CHECKPOINT=1"
+                SKIP_RETURN_CODE 77 LABELS "cuda")
+            add_test(NAME test_recurrent_mtp_prefix_e2e
+                     COMMAND ${Python3_EXECUTABLE}
+                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_recurrent_mtp_e2e.py
+                             $<TARGET_FILE:test_recurrent_mtp>)
+            set_tests_properties(test_recurrent_mtp_prefix_e2e PROPERTIES
+                ENVIRONMENT "MOLLM_CUDA_MTP_DEVICE_CHECKPOINT=1;MOLLM_CUDA_MTP_STATE_PREFIXES=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda")
         endif()
         target_link_libraries(test_tiny_cpu_inference PRIVATE mollm_lib)

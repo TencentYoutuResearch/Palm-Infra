@@ -1,9 +1,11 @@
 #include "backends/cuda/backend_internal.h"
 #include "backends/cuda/prefill_batch_policy.h"
 #include "kernels/cuda/moe.h"
+#include "kernels/cuda/fp16_expert_palette.h"
 #include "kernels/cpu/moe/moe_routing.h"
 #include "runtime/expert_provider.h"
 #include <cmath>
+#include <cstdlib>
 
 size_t CudaBackend::nvfp4_activation_fused_calls() const {return impl_->moe_mma_activation_fused_prefill_calls;}
 size_t CudaBackend::nvfp4_gate_scale_cache_bytes() const {return impl_->prefill_gate_scale_cache_bytes;}
@@ -44,11 +46,20 @@ bool CudaBackend::try_fp16_moe(const GraphNode& node,
         return false;
     const auto* gate_weight = impl_->find_weight(*inputs[2]);
     const auto* down_weight = impl_->find_weight(*inputs[3]);
-    if (!gate_weight || !down_weight || gate_weight->type != CUDA_R_16F || down_weight->type != CUDA_R_16F ||
-        gate_weight->layout != Impl::WeightLayout::Dense || down_weight->layout != Impl::WeightLayout::Dense ||
-        gate_weight->n != experts * 2 * inter || gate_weight->k != hidden ||
-        down_weight->n != experts * hidden || down_weight->k != inter ||
+    const auto* gate_palette = impl_->find_fp16_expert_palette(*inputs[2]);
+    const auto* down_palette = impl_->find_fp16_expert_palette(*inputs[3]);
+    const auto valid = [&](const auto* palette, const Impl::DeviceWeight* weight,
+                           int expert_rows, int inner) {
+        return palette ? (expert_rows % 128 == 0 && inner % 128 == 0 &&
+                          palette->rows == experts * expert_rows && palette->inner == inner)
+                       : (weight && weight->type == CUDA_R_16F && weight->layout == Impl::WeightLayout::Dense &&
+                          weight->n == experts * expert_rows && weight->k == inner);
+    };
+    if (!valid(gate_palette, gate_weight, 2 * inter, hidden) ||
+        !valid(down_palette, down_weight, hidden, inter) ||
         inputs[2]->device.offset || inputs[3]->device.offset) return false;
+    const void* gate_data = gate_palette ? static_cast<const void*>(gate_palette->codes) : gate_weight->data;
+    const void* down_data = down_palette ? static_cast<const void*>(down_palette->codes) : down_weight->data;
     for (int index : {1, 4, 5, 6, 7}) {
         const auto* weight = impl_->find_weight(*inputs[index]);
         const int n = index == 1 ? experts : index == 6 ? hidden : index == 7 ? 1 : shared_inter;
@@ -68,22 +79,26 @@ bool CudaBackend::try_fp16_moe(const GraphNode& node,
         !impl_->reserve(impl_->moe_jobs, impl_->moe_jobs_bytes,
                         static_cast<size_t>(routes) * 2 * sizeof(mollm_cuda::Nvfp4Projection))) return fail();
     auto found = std::find_if(impl_->fp16_moe_tables.begin(), impl_->fp16_moe_tables.end(),
-        [&](const auto& t) { return t.gate == gate_weight->data && t.down == down_weight->data &&
+        [&](const auto& t) { return t.gate == gate_data && t.down == down_data &&
             t.experts == experts && t.hidden == hidden && t.inter == inter; });
     if (found == impl_->fp16_moe_tables.end()) {
         std::vector<mollm_cuda::Nvfp4Projection> tables(2 * experts);
         for (int e = 0; e < experts; ++e) {
-            tables[e].weight = static_cast<const uint8_t*>(gate_weight->data) +
-                static_cast<size_t>(e) * 2 * inter * hidden * sizeof(__half);
-            tables[experts + e].weight = static_cast<const uint8_t*>(down_weight->data) +
-                static_cast<size_t>(e) * hidden * inter * sizeof(__half);
+            tables[e].weight = static_cast<const uint8_t*>(gate_data) +
+                static_cast<size_t>(e) * 2 * inter * hidden * (gate_palette ? 1 : sizeof(__half));
+            if (gate_palette) tables[e].block_scales = reinterpret_cast<const uint8_t*>(
+                gate_palette->palette + size_t(e) * 2 * inter * hidden / 16384 * 256);
+            tables[experts + e].weight = static_cast<const uint8_t*>(down_data) +
+                static_cast<size_t>(e) * hidden * inter * (down_palette ? 1 : sizeof(__half));
+            if (down_palette) tables[experts + e].block_scales = reinterpret_cast<const uint8_t*>(
+                down_palette->palette + size_t(e) * hidden * inter / 16384 * 256);
         }
         void* device_tables = nullptr;
         if (!mollm_cuda::malloc_device(&device_tables, tables.size() * sizeof(tables[0]), "FP16 expert tables")) return fail();
         impl_->device_allocations.push_back(device_tables);
         if (!mollm_cuda::copy_memory(device_tables, tables.data(), tables.size() * sizeof(tables[0]),
                                     cudaMemcpyHostToDevice, "FP16 expert tables")) return fail();
-        impl_->fp16_moe_tables.push_back({gate_weight->data, down_weight->data, experts, hidden, inter,
+        impl_->fp16_moe_tables.push_back({gate_data, down_data, experts, hidden, inter,
                                         static_cast<mollm_cuda::Nvfp4Projection*>(device_tables)});
         found = impl_->fp16_moe_tables.end() - 1;
     }
@@ -107,10 +122,10 @@ bool CudaBackend::try_fp16_moe(const GraphNode& node,
         graph_params::get_i32(p, 6, 1) != 0, graph_params::get_f32(p, 0, 1),
         found->tables, x, gate_up, activated, down, hidden, inter,
         jobs, jobs + routes, route_weights);
-    if (!mollm_cuda::report_cuda(mollm_cuda::launch_fp16_expert_projections(jobs, routes, 2 * inter, hidden), "FP16 expert gate/up")) return fail();
+    if (!mollm_cuda::report_cuda((gate_palette ? mollm_cuda::launch_fp16_palette_projections : mollm_cuda::launch_fp16_expert_projections)(jobs, routes, 2 * inter, hidden, nullptr), "FP16 expert gate/up")) return fail();
     mollm_cuda::launch_moe_activation(gate_up, gate_up + inter, route_weights,
                                      activated, routes, inter, 2 * inter);
-    if (!mollm_cuda::report_cuda(mollm_cuda::launch_fp16_expert_projections(jobs + routes, routes, hidden, inter), "FP16 expert down")) return fail();
+    if (!mollm_cuda::report_cuda((down_palette ? mollm_cuda::launch_fp16_palette_projections : mollm_cuda::launch_fp16_expert_projections)(jobs + routes, routes, hidden, inter, nullptr), "FP16 expert down")) return fail();
     if (!matmul(x, 4, shared_g, shared_inter, hidden) || !matmul(x, 5, shared_u, shared_inter, hidden)) return fail();
     mollm_cuda::launch_moe_activation(shared_g, shared_u, nullptr, shared_a, rows, shared_inter, shared_inter);
     if (!matmul(shared_a, 6, shared_d, hidden, shared_inter) || !matmul(x, 7, shared_scale, 1, hidden)) return fail();
@@ -226,8 +241,10 @@ bool CudaBackend::try_nvfp4_moe(
     if (!gate_source || !down_source || !gate_source->provider ||
         gate_source->provider != down_source->provider) return false;
     // Prefer calibrated native NVFP4 prefill MMA when the device and package
-    // support it; unsupported configurations fall back to the SIMT path.
-    bool native_mma = inputs[0]->shape[1] > 1;
+    // support it. Qualified Qwen3.8 verification batches retain the exact SIMT
+    // path used by decode; other geometries keep the existing MMA threshold.
+    const int mma_min_rows = hidden == 2560 && inter == 640 && top_k == 10 ? 9 : 2;
+    bool native_mma = inputs[0]->shape[1] >= mma_min_rows;
     constexpr bool simt_pipeline=true;
     static const bool batch_pipeline = [] {
         const char* value=std::getenv("MOLLM_CUDA_NVFP4_BATCH_PIPELINE");
@@ -404,6 +421,15 @@ bool CudaBackend::try_nvfp4_moe(
                     }
                 }
                 resident.gate_pair_layout=std::all_of(tables.begin(),tables.begin()+experts,
+                    [](const mollm_cuda::Nvfp4Projection& job){return job.pair_layout;});
+                resident.gate_m1_layout_proven=gate_codes_kmajor&&
+                    std::all_of(tables.begin(),tables.begin()+experts,[](const auto& job) {
+                        return job.weight&&job.block_scales&&job.row_scales&&job.pair_layout&&
+                            job.gate_scales_kmajor&&!job.mma_layout&&
+                            !(reinterpret_cast<uintptr_t>(job.weight)&15)&&
+                            !(reinterpret_cast<uintptr_t>(job.block_scales)&3);
+                    });
+                resident.down_pair_layout=std::all_of(tables.begin()+experts,tables.end(),
                     [](const mollm_cuda::Nvfp4Projection& job){return job.pair_layout;});
                 // Check the actual descriptors uploaded for this resident layer,
                 // not a checkpoint-wide assumption. Different expert/up scales
@@ -839,10 +865,31 @@ bool CudaBackend::try_nvfp4_moe(
                             static_cast<float*>(impl_->moe_mma_partial), native_gate_parts, canonical_mma,
                             nullptr,nullptr,gate_codes_kmajor), "NVFP4 gate/up MMA")) return fail();
                 } else if (gate_codes_kmajor) {
-                    if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_gate_code_projections(
-                            gate_jobs,routes,2*inter,hidden,
-                            (simt_pipeline&&rows==1)||(batch_pipeline&&rows>=2&&rows<=8),
-                            execution_stream), "NVFP4 gate code SIMT")) return fail();
+                    const bool pipeline=(simt_pipeline&&rows==1)||
+                        (batch_pipeline&&rows>=2&&rows<=8);
+                    const bool paired=impl_->prefer_nvfp4_mtp_gate_pairs &&
+                        rows>=2 && rows<=verification_workspace_max_rows() && top_k==10 && hidden==2560 && inter==640 && !pipeline;
+                    const bool subgroup=impl_->prefer_nvfp4_gate_subgroup &&
+                        rows>=2 && rows<=verification_workspace_max_rows() && top_k==10 && !pipeline;
+                    const bool paired_eight=paired&&impl_->prefer_nvfp4_mtp_gate_eight&&
+                        gate_scales_kmajor&&found->second.gate_pair_layout;
+                    const bool proven_m1=impl_->prefer_nvfp4_gate_m1_proven&&
+                        rows==1&&routes==10&&pipeline&&hidden==2560&&inter==640&&
+                        found->second.gate_m1_layout_proven&&!(reinterpret_cast<uintptr_t>(x)&15);
+                    const auto status=proven_m1
+                        ? mollm_cuda::launch_nvfp4_gate_code_m1_proven_projections(
+                            gate_jobs,routes,2*inter,hidden,execution_stream)
+                        : paired_eight
+                        ? mollm_cuda::launch_nvfp4_gate_paired8_projections(
+                            gate_jobs,routes,2*inter,hidden,execution_stream)
+                        : paired && rows<=5 ? mollm_cuda::launch_nvfp4_gate_paired_projections(
+                            gate_jobs,routes,2*inter,hidden,execution_stream)
+                        : subgroup ? mollm_cuda::launch_nvfp4_gate_code_subgroup_projections(
+                            gate_jobs,routes,2*inter,hidden,execution_stream)
+                        : mollm_cuda::launch_nvfp4_gate_code_projections(
+                            gate_jobs,routes,2*inter,hidden,pipeline,execution_stream);
+                    if(!mollm_cuda::report_cuda(status,"NVFP4 gate code SIMT"))return fail();
+                    if(paired)++impl_->moe_mtp_gate_pair_dispatches;
                 } else if (((simt_pipeline && rows == 1) ||
                     (batch_pipeline && rows >= 2 && rows <= 8)) && !gate_source->resident_nvfp4_mma_layout) {
                     if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_pipelined_projections(
@@ -887,9 +934,25 @@ bool CudaBackend::try_nvfp4_moe(
                     }();
                     const int load_hint = prefetch_down_row_scale && rows == 1 &&
                         hidden == 2560 && inter == 640 ? 7 : 0;
-                    if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_pipelined_projections(
+                    const bool exact_m1_down = impl_->prefer_nvfp4_m1_down_subwarp &&
+                        rows == 1 && top_k == 10 && hidden == 2560 && inter == 640 &&
+                        found->second.down_pair_layout && load_hint == 0;
+                    const auto down_status = exact_m1_down
+                        ? mollm_cuda::launch_nvfp4_exact_subwarp(
+                            down_jobs, routes, hidden, inter, 8, execution_stream)
+                        : mollm_cuda::launch_nvfp4_pipelined_projections(
                             down_jobs, routes, hidden, inter, true, execution_stream,
-                            false, load_hint), "NVFP4 pipelined down")) return fail();
+                            false, load_hint);
+                    if (!mollm_cuda::report_cuda(down_status,
+                            exact_m1_down ? "NVFP4 exact M1 down" : "NVFP4 pipelined down")) return fail();
+                } else if (impl_->prefer_nvfp4_mtp_down_subwarp && rows >= 2 && rows <= verification_workspace_max_rows() &&
+                           top_k == 10 && hidden == 2560 && inter == 640 &&
+                           found->second.down_pair_layout &&
+                           !down_source->resident_nvfp4_mma_layout) {
+                    if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_exact_subwarp(
+                            down_jobs, routes, hidden, inter, 8, execution_stream),
+                            "NVFP4 small-batch exact down")) return fail();
+                    ++impl_->moe_mtp_down_subwarp_dispatches;
                 } else mollm_cuda::launch_nvfp4_projections(down_jobs, routes, hidden, inter, execution_stream,
                     down_source->resident_nvfp4_mma_layout);
                 if (parallel_shared) {

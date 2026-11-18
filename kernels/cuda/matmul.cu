@@ -64,13 +64,6 @@ int cuda_multiprocessor_count() {
 }
 
 bool cuda_q4_prefetch_enabled() {
-    static const int override_mode = [] {
-        const char* option = std::getenv("MOLLM_CUDA_Q4_PREFETCH");
-        if (option && std::strcmp(option, "1") == 0) return 1;
-        if (option && std::strcmp(option, "0") == 0) return 0;
-        return -1;
-    }();
-    if (override_mode >= 0) return override_mode != 0;
     // Only the SM121 K2560 path has full-model performance evidence.
     // Cache by current device, not by the first GPU seen by the process.
     thread_local int cached_device = -1;
@@ -91,6 +84,66 @@ bool cuda_q4_prefetch_enabled() {
         cached_device = device;
     }
     return supported;
+}
+
+bool cuda_q4_small_batch_tiled_reduction_enabled() {
+    // Only the measured SM121 small projections select this reduction.
+    thread_local int cached_device = -1;
+    thread_local bool supported = false;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    if (device != cached_device) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
+            return false;
+        supported = major == 12 && minor == 1;
+        cached_device = device;
+    }
+    return supported;
+}
+
+bool cuda_q4_batch_vector_loads_enabled() {
+    // The aligned M5 N2560/K6144 path has full-model evidence on SM121.
+    // Cache by current device, not by the first GPU seen by the process.
+    thread_local int cached_device = -1;
+    thread_local bool supported = false;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (device != cached_device) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        supported = major == 12 && minor == 1;
+        cached_device = device;
+    }
+    return supported;
+}
+
+// Full-scale lookup is qualified only for the SM121 GDN input projection.
+bool cuda_q4_full_scale_lookup_enabled() {
+    thread_local int cached_device=-1;
+    thread_local bool supported=false;
+    int device=-1;
+    if(cudaGetDevice(&device)!=cudaSuccess)return false;
+    if(device!=cached_device) {
+        int major=0,minor=0;
+        if(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device)!=cudaSuccess||
+           cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device)!=cudaSuccess)return false;
+        supported=major==12&&minor==1;cached_device=device;
+    }
+    return supported;
+}
+
+// The caller already proves SM121 and the qualified compact full-scale shape.
+bool cuda_q4_async_weights_enabled() {
+    return true;
 }
 
 __global__ void fp16_to_fp32_reference(const __half* source, float* destination, size_t count) {
@@ -444,26 +497,69 @@ __global__ void q4_row_g32_gemv_cuda(const float* activation,
     if (threadIdx.x == 0) output[row] = total;
 }
 
-template<int Batch, bool ParallelReduction = false>
-__global__ void q4_g32_small_batch_cuda(const float* activation,
-    const Q4B8G32Block* weight, float* output, int tokens, int inner, int lda, int ldc) {
+template<int Batch, bool ParallelReduction = false, bool VectorInput = false,
+         class Block = Q4B8G32Block, int ReductionTile = 0>
+__device__ __forceinline__ void q4_g32_small_batch_compute(const float* activation,
+    const Block* weight, float* output, int tokens, int inner, int lda, int ldc, int row) {
     constexpr int threads = 256;
-    const int row = blockIdx.x;
     const int groups = inner / 32;
     float sums[Batch] = {};
     for (int pair = threadIdx.x; pair < inner / 2; pair += threads) {
-        const auto& block = weight[static_cast<size_t>(row / 8) * groups + pair / 16];
-        const uint8_t packed = block.q[row % 8][pair % 16];
+        uint8_t packed;
+        float scale;
+        if constexpr (std::is_same<Block, mollm_cuda::Q4RowG32>::value) {
+            const auto& group = weight[static_cast<size_t>(row) * groups + pair / 16];
+            packed = group.q[pair % 16];
+            scale = group.scale;
+        } else {
+            const auto& block = weight[static_cast<size_t>(row / 8) * groups + pair / 16];
+            packed = block.q[row % 8][pair % 16];
+            scale = block.scales[row % 8];
+        }
         const float low = biased_q4_g32_nibble(packed);
         const float high = biased_q4_g32_nibble(packed >> 4);
-        const float scale = block.scales[row % 8];
 #pragma unroll
         for (int token = 0; token < Batch; ++token) {
             if (token >= tokens) continue;
-            const float* x = activation + static_cast<size_t>(token) * lda + 2 * pair;
-            const float dot = fmaf(x[0], low, x[1] * high);
+            float dot;
+            if constexpr (VectorInput) {
+                // The dispatcher proves 8-byte input and row alignment. Load
+                // both floats together while retaining the original FP32 FMA.
+                const float2 x = reinterpret_cast<const float2*>(
+                    activation + static_cast<size_t>(token) * lda)[pair];
+                dot = fmaf(x.x, low, x.y * high);
+            } else {
+                const float* x = activation + static_cast<size_t>(token) * lda + 2 * pair;
+                dot = fmaf(x[0], low, x[1] * high);
+            }
             sums[token] = fmaf(dot, scale, sums[token]);
         }
+    }
+    if constexpr (ReductionTile > 0) {
+        static_assert(ReductionTile <= threads / 32 && Batch % ReductionTile == 0);
+        __shared__ float tile[ReductionTile][threads];
+#pragma unroll
+        for (int first_token = 0; first_token < Batch; first_token += ReductionTile) {
+            if (first_token >= tokens) continue;
+#pragma unroll
+            for (int local = 0; local < ReductionTile; ++local)
+                if (first_token + local < tokens)
+                    tile[local][threadIdx.x] = sums[first_token + local];
+            __syncthreads();
+            const int local = threadIdx.x / 32, lane = threadIdx.x % 32;
+            if (local < ReductionTile && first_token + local < tokens) {
+                // Each warp retains the original 128,64,32,16,... sum tree.
+                // No other warp consumes its final result.
+                const float* r = tile[local] + lane;
+                const float first = (r[0] + r[128]) + (r[64] + r[192]);
+                const float second = (r[32] + r[160]) + (r[96] + r[224]);
+                const float total = mollm_cuda::detail::warp_reduce_sum(first + second);
+                if (!lane) output[static_cast<size_t>(first_token + local) * ldc + row] = total;
+            }
+            // Retire all readers before the next tile overwrites shared memory.
+            if (first_token + ReductionTile < tokens) __syncthreads();
+        }
+        return;
     }
     __shared__ float reduction[ParallelReduction ? Batch * threads : threads];
     if constexpr (ParallelReduction) {
@@ -494,9 +590,101 @@ __global__ void q4_g32_small_batch_cuda(const float* activation,
     }
 }
 
-template<int Batch, class Block = Q4B8G32Block>
+// Keep the runtime batch bound at eight: specializing five live tokens raises
+// register pressure and regresses when weights rotate out of cache.
+__global__ void q4_g32_small_batch_vector_cuda(const float* activation,
+    const Q4B8G32Block* weight, float* output, int tokens, int inner, int lda, int ldc) {
+    q4_g32_small_batch_compute<8, false, true>(
+        activation, weight, output, tokens, inner, lda, ldc, blockIdx.x);
+}
+
+template<int Batch, bool ParallelReduction = false>
+__global__ void q4_g32_small_batch_cuda(const float* activation,
+    const Q4B8G32Block* weight, float* output, int tokens, int inner, int lda, int ldc) {
+    q4_g32_small_batch_compute<Batch, ParallelReduction>(
+        activation, weight, output, tokens, inner, lda, ldc, blockIdx.x);
+}
+
+__global__ void q4_g32_small_batch_tiled_reduction_cuda(const float* activation,
+    const Q4B8G32Block* weight, float* output, int tokens, int inner, int lda, int ldc) {
+    q4_g32_small_batch_compute<8, false, false, Q4B8G32Block, 4>(
+        activation, weight, output, tokens, inner, lda, ldc, blockIdx.x);
+}
+
+// Optional row views share the original batch FMA chains and reduction tree.
+template<int Batch, bool ParallelReduction, bool VectorInput>
+__global__ void q4_g32_narrow_row_batch_cuda(const float* activation,
+    const mollm_cuda::Q4RowG32* weight, float* output, int tokens, int inner, int lda, int ldc) {
+    q4_g32_small_batch_compute<Batch, ParallelReduction, VectorInput>(
+        activation, weight, output, tokens, inner, lda, ldc, blockIdx.x);
+}
+
+// The host selects this kernel only for exactly three tokens. Supplying the
+// fixed batch to the native helper removes redundant token masks while keeping
+// its 256-lane FP32 FMA chains and reduction tree.
+__global__ void q4_g32_m3_fixed_cuda(const float* activation,
+    const Q4B8G32Block* weight, float* output, int inner, int lda, int ldc) {
+    q4_g32_small_batch_compute<3, true>(
+        activation, weight, output, 3, inner, lda, ldc, blockIdx.x);
+}
+
+
+__global__ void q4_g32_small_batch_token_parallel_cuda(const float* activation,
+    const Q4B8G32Block* weight, float* output, int inner, int lda, int ldc) {
+    const size_t token = blockIdx.y;
+    q4_g32_small_batch_compute<1, true>(activation + token * lda,
+        weight, output + token * ldc, 1, inner, lda, ldc, blockIdx.x);
+}
+
+template<int Batch>
+__global__ void q4_g32_pair_rows_small_batch_cuda(const float* activation,
+    const Q4B8G32Block* weight, float* output, int columns, int inner, int lda, int ldc) {
+    const int lane = threadIdx.x & 31, row = threadIdx.x / 16, pair = threadIdx.x & 15;
+    const int column = blockIdx.x * 8 + row, groups = inner / 32;
+    float sums[Batch] = {};
+    for (int group = 0; group < groups; ++group) {
+        const auto& block = weight[size_t(blockIdx.x) * groups + group];
+        const uint8_t packed = block.q[row][pair];
+        const float low = biased_q4_g32_nibble(packed);
+        const float high = biased_q4_g32_nibble(packed >> 4);
+        const float scale = block.scales[row];
+#pragma unroll
+        for (int token = 0; token < Batch; ++token) {
+            const float2 value = reinterpret_cast<const float2*>(
+                activation + size_t(token) * lda + group * 32)[pair];
+            const float dot = fmaf(value.x, low, value.y * high);
+            sums[token] = fmaf(dot, scale, sums[token]);
+        }
+    }
+#pragma unroll
+    for (int token = 0; token < Batch; ++token) {
+        float sum = sums[token];
+        for (int offset = 8; offset; offset /= 2)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset, 16);
+        if ((lane & 15) == 0 && column < columns)
+            output[size_t(token) * ldc + column] = sum;
+    }
+}
+
+template<int Batch>
+__global__ void q4_g32_small_batch_unequal_cuda(const float* activation,
+    const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
+    float* first_output, float* second_output, int tokens, int inner, int lda,
+    int first_columns, int first_ldc, int second_ldc) {
+    const bool first = blockIdx.x < first_columns;
+    // CTA-uniform selection shares the exact same per-row computation as the
+    // separate projections. The narrow output no longer needs its own launch.
+    q4_g32_small_batch_compute<Batch, true>(activation,
+        first ? first_weight : second_weight, first ? first_output : second_output,
+        tokens, inner, lda, first ? first_ldc : second_ldc,
+        first ? blockIdx.x : blockIdx.x - first_columns);
+}
+
+template<int Batch, class Block = Q4B8G32Block, int FixedTokens = 0, int PrefetchDistance = 0>
 __global__ void q4_g32_small_batch_wide_cuda(const float* activation,
-    const Block* weight, float* output, int tokens, int columns, int inner, int lda, int ldc) {
+    const Block* weight, float* output, int runtime_tokens, int columns, int inner, int lda, int ldc) {
+    static_assert(FixedTokens >= 0 && FixedTokens <= Batch);
+    const int tokens = FixedTokens ? FixedTokens : runtime_tokens;
     const int lane = threadIdx.x & 31;
     const int column = blockIdx.x * 32 + threadIdx.x / 4;
     const int storage_block = column / 8;
@@ -504,6 +692,12 @@ __global__ void q4_g32_small_batch_wide_cuda(const float* activation,
     const int row = column % 8, pair = lane % 4, groups = inner / 32;
     float sums[Batch] = {}, seconds[Batch] = {};
     for (int group = 0; group < groups; ++group) {
+        if constexpr (PrefetchDistance > 0) {
+            if (group + PrefetchDistance < groups) {
+                const auto* next = &weight[static_cast<size_t>(storage_block) * groups + group + PrefetchDistance];
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(&next->q[row][pair * 4]));
+            }
+        }
         const auto& block = weight[static_cast<size_t>(storage_block) * groups + group];
         const uint32_t packed = reinterpret_cast<const uint32_t*>(block.q[row])[pair];
         const uint32_t first = __shfl_sync(0xffffffffu, packed, pair / 2, 4) >> ((pair & 1) * 16);
@@ -709,20 +903,28 @@ template<bool PipelineInputs, class Block = Q4B8G32Block>
 __device__ __forceinline__ Q4NarrowPacket q4_narrow_packet(const float* activation,
     const Block* weight, int row, int inner, int pair) {
     if (pair >= inner / 2) return {};
-    const auto& block = weight[static_cast<size_t>(row / 8) * (inner / 32) + pair / 16];
-    Q4NarrowPacket result{block.q[row % 8][pair % 16], 0.f, {}};
-    if constexpr (std::is_same<Block,mollm_cuda::Q4CompactG32>::value) {
-        const unsigned code=block.scales[row%8], exponent=(code>>7)&255u, mantissa=code&127u;
-        if(exponent<=3u || exponent==255u)
-            result.scale=__fdiv_rn(__uint_as_float(code<<16),7.f);
-        else {
-            const unsigned numerator=(128u+mantissa)<<(mantissa>=96u?18:19);
-            result.scale=__uint_as_float(((code&0x8000u)<<16)|
-                ((exponent-(mantissa>=96u?2u:3u))<<23)|(((numerator+3u)/7u)&0x7fffffu));
-        }
-    } else result.scale=block.scales[row%8];
-    if constexpr (PipelineInputs) result.input = reinterpret_cast<const float2*>(activation)[pair];
-    return result;
+    if constexpr (std::is_same<Block, mollm_cuda::Q4RowG32>::value) {
+        const auto& group = weight[static_cast<size_t>(row) * (inner / 32) + pair / 16];
+        Q4NarrowPacket result{group.q[pair % 16], group.scale, {}};
+        if constexpr (PipelineInputs)
+            result.input = reinterpret_cast<const float2*>(activation)[pair];
+        return result;
+    } else {
+        const auto& block = weight[static_cast<size_t>(row / 8) * (inner / 32) + pair / 16];
+        Q4NarrowPacket result{block.q[row % 8][pair % 16], 0.f, {}};
+        if constexpr (std::is_same<Block,mollm_cuda::Q4CompactG32>::value) {
+            const unsigned code=block.scales[row%8], exponent=(code>>7)&255u, mantissa=code&127u;
+            if(exponent<=3u || exponent==255u)
+                result.scale=__fdiv_rn(__uint_as_float(code<<16),7.f);
+            else {
+                const unsigned numerator=(128u+mantissa)<<(mantissa>=96u?18:19);
+                result.scale=__uint_as_float(((code&0x8000u)<<16)|
+                    ((exponent-(mantissa>=96u?2u:3u))<<23)|(((numerator+3u)/7u)&0x7fffffu));
+            }
+        } else result.scale=block.scales[row%8];
+        if constexpr (PipelineInputs) result.input = reinterpret_cast<const float2*>(activation)[pair];
+        return result;
+    }
 }
 
 __global__ void q4_g32_dual_lane_pipeline_cuda(const float* activation,
@@ -831,6 +1033,70 @@ __global__ void compact_warp_table_cuda(const float* x,
     __shared__ float reduction[256];
     const float total = mollm_cuda::detail::block_reduce_sum<256>(sum, reduction);
     if (!threadIdx.x) output[row] = total;
+}
+
+// M3 keeps two adjacent original logical-lane FMA chains per thread.
+// Only the qualified narrow shapes use this mapping; wide grids retain native256.
+__global__ void q4_g32_m3_adjacent_cuda(const float* activation,const Q4B8G32Block* weight,float* output,int inner,int columns) {
+ const int row=blockIdx.x;float sums[3][2]={};
+ for(int pair=2*threadIdx.x;pair<inner/2;pair+=256) {
+  const auto& block=weight[size_t(row/8)*(inner/32)+pair/16];
+  const unsigned codes=*reinterpret_cast<const uint16_t*>(block.q[row%8]+pair%16);
+  const float scale=block.scales[row%8];
+  const float lo0=biased_q4_g32_nibble(codes&255),hi0=biased_q4_g32_nibble((codes&255)>>4);
+  const float lo1=biased_q4_g32_nibble(codes>>8),hi1=biased_q4_g32_nibble(codes>>12);
+#pragma unroll
+  for(int token=0;token<3;++token) {
+   const float4 x=*reinterpret_cast<const float4*>(activation+size_t(token)*inner+2*pair);
+   const float dot0=fmaf(x.x,lo0,x.y*hi0),dot1=fmaf(x.z,lo1,x.w*hi1);
+   sums[token][0]=fmaf(dot0,scale,sums[token][0]);sums[token][1]=fmaf(dot1,scale,sums[token][1]);
+  }
+ }
+ __shared__ __align__(16) float partial[3*256];
+#pragma unroll
+ for(int token=0;token<3;++token)*reinterpret_cast<float2*>(partial+token*256+2*threadIdx.x)=make_float2(sums[token][0],sums[token][1]);
+ __syncthreads();
+ if(threadIdx.x<32) {
+#pragma unroll
+  for(int token=0;token<3;++token){const float total=q4_shared_reduce_256(partial+token*256);if(!threadIdx.x)output[size_t(token)*columns+row]=total;}
+ }
+}
+
+// Pair adjacent logical lanes on 128 physical threads. Every logical lane keeps
+// its original FMA chain; scatter to the original 256-slot reduction tree.
+struct Q4HcAdjacentPacket {unsigned codes;float scale;float4 input;};
+__device__ __forceinline__ Q4HcAdjacentPacket q4_hc_adjacent_packet(const float* x,const Q4B8G32Block* w,int row,int inner,int pair) {
+ if(pair>=inner/2)return {};
+ const auto& block=w[size_t(row/8)*(inner/32)+pair/16];
+ return {*reinterpret_cast<const uint16_t*>(block.q[row%8]+pair%16),block.scales[row%8],*reinterpret_cast<const float4*>(x+pair*2)};
+}
+__device__ __forceinline__ void q4_hc_adjacent_compute(const float* x,const Q4B8G32Block* w,float* y,int inner,int row) {
+ float sums[2]={};
+ Q4HcAdjacentPacket pending{};
+ pending=q4_hc_adjacent_packet(x,w,row,inner,2*threadIdx.x);
+ for(int pair=2*threadIdx.x;pair<inner/2;pair+=256) {
+  Q4HcAdjacentPacket next{};
+  next=q4_hc_adjacent_packet(x,w,row,inner,pair+256);
+  const auto p=pending;
+  const unsigned a=p.codes&255,b=p.codes>>8;
+  const float first=fmaf(p.input.x,biased_q4_g32_nibble(a),p.input.y*biased_q4_g32_nibble(a>>4));
+  const float second=fmaf(p.input.z,biased_q4_g32_nibble(b),p.input.w*biased_q4_g32_nibble(b>>4));
+  sums[0]=fmaf(first,p.scale,sums[0]);sums[1]=fmaf(second,p.scale,sums[1]);
+  pending=next;
+ }
+ __shared__ __align__(16) float partial[256];
+ *reinterpret_cast<float2*>(partial+2*threadIdx.x)=make_float2(sums[0],sums[1]);
+ __syncthreads();
+ if(threadIdx.x<32) {
+  const float total=q4_shared_reduce_256(partial);
+  if(!threadIdx.x)y[row]=total;
+ }
+
+}
+
+__global__ void q4_g32_hc_adjacent_projections_cuda(const float* x,const Q4B8G32Block* a,const Q4B8G32Block* b,float* ay,float* by,int na,int inner) {
+ const int row=blockIdx.x;const bool first=row<na;
+ q4_hc_adjacent_compute(x,first?a:b,first?ay:by,inner,first?row:row-na);
 }
 
 __global__ void q4_g32_unequal_projections_cuda(const float* activation,
@@ -1082,11 +1348,34 @@ __device__ __align__(128) const uint32_t q4_global_scale_mantissas[128] = {
 1198373u,1273271u,1348169u,1423067u,1497966u,1572864u,1647762u,1722661u,1797559u,1872457u,1947355u,2022254u,2097152u,2172050u,2246949u,2321847u,2396745u,2471643u,2546542u,2621440u,2696338u,2771237u,2846135u,2921033u,2995931u,3070830u,3145728u,3220626u,3295525u,3370423u,3445321u,3520219u,3595118u,3670016u,3744914u,3819813u,3894711u,3969609u,4044507u,4119406u,4194304u,4269202u,4344101u,4418999u,4493897u,4568795u,4643694u,4718592u,4793490u,4868389u,4943287u,5018185u,5093083u,5167982u,5242880u,5317778u,5392677u,5467575u,5542473u,5617371u,5692270u,5767168u,5842066u,5916965u,5991863u,6066761u,6141659u,6216558u,6291456u,6366354u,6441253u,6516151u,6591049u,6665947u,6740846u,6815744u,6890642u,6965541u,7040439u,7115337u,7190235u,7265134u,7340032u,7414930u,7489829u,7564727u,7639625u,7714523u,7789422u,7864320u,7939218u,8014117u,8089015u,8163913u,8238811u,8313710u,0u,37449u,74898u,112347u,149797u,187246u,224695u,262144u,299593u,337042u,374491u,411941u,449390u,486839u,524288u,561737u,599186u,636635u,674085u,711534u,748983u,786432u,823881u,861330u,898779u,936229u,973678u,1011127u,1048576u,1086025u,1123474u,1160923u
 };
 
+// Exact BF16max/7 bits. Division by seven has no halfway integer ties.
+// Tiny exponents are rounded in units of the FP32 subnormal spacing.
+// Compile-time construction keeps capture/allocation paths free of setup work.
+struct Q4ScaleBits { uint32_t values[65536]; };
+constexpr Q4ScaleBits make_q4_scale_bits(){
+ Q4ScaleBits table{};
+ for(unsigned code=0;code<65536;++code){unsigned sign=(code&0x8000u)<<16,e=(code>>7)&255u,m=code&127u,value=0;
+  if(e==255)value=m?0x7fffffffu:(sign|0x7f800000u);
+  else if(e==0)value=sign|(((m<<16)+3u)/7u);
+  else if(e<=3)value=sign|((((128u+m)<<(e+15))+3u)/7u);
+  else {unsigned numerator=(128u+m)<<(m>=96?18:19);value=sign|((e-(m>=96?2u:3u))<<23)|(((numerator+3u)/7u)&0x7fffffu);}
+  table.values[code]=value;
+ }
+ return table;
+}
+__device__ __align__(128) const Q4ScaleBits q4_full_scales=make_q4_scale_bits();
+__global__ void q4_scale_lookup_check_cuda(float* result) {
+    for(unsigned code=blockIdx.x*blockDim.x+threadIdx.x;code<65536;code+=gridDim.x*blockDim.x) {
+        result[code*2]=__fdiv_rn(__uint_as_float(code<<16),7.f);
+        result[code*2+1]=__uint_as_float(q4_full_scales.values[code]);
+    }
+}
+
 template <bool CacheActivation, bool Swizzled = false, int PrefetchDistance = 0,
           class Block = Q4B8G32Block, int LoadHint = 0, bool AsyncWeights = false,
           bool PrefetchScales = false, bool RegisterLookahead = false, bool PrefetchL1 = false,
           bool DirectCompactScale = false, bool CombineInitBarrier = false,
-          int Warps = 4, bool GlobalCompactTable = false, bool ConstantCompactTable = false>
+          int Warps = 4, bool GlobalCompactTable = false, bool ConstantCompactTable = false, bool FullScaleLookup = false>
 __global__ void q4_g32_oct_rows_gemv_cuda(
     const float* __restrict__ activation,
     const Block* __restrict__ weight,
@@ -1107,9 +1396,9 @@ __global__ void q4_g32_oct_rows_gemv_cuda(
         storage_blocks_per_cuda_block * q4_g32_rows_per_storage_block + row;
     extern __shared__ float activation_cache[];
     constexpr bool compact = std::is_same<Block, mollm_cuda::Q4CompactG32>::value;
-    __shared__ uint32_t scale_mantissas[compact && !DirectCompactScale && !GlobalCompactTable ? 128 : 1];
-    __shared__ __align__(16) Q4B8G32Block staged_weights[AsyncWeights ? 2 : 1][AsyncWeights ? 4 : 1][AsyncWeights ? 4 : 1];
-    if constexpr (compact && !DirectCompactScale && !GlobalCompactTable) {
+    __shared__ uint32_t scale_mantissas[compact && !DirectCompactScale && !GlobalCompactTable && !FullScaleLookup ? 128 : 1];
+    __shared__ __align__(16) Block staged_weights[AsyncWeights ? 2 : 1][AsyncWeights ? 4 : 1][AsyncWeights ? 4 : 1];
+    if constexpr (compact && !DirectCompactScale && !GlobalCompactTable && !FullScaleLookup) {
         for (unsigned table_index = threadIdx.x; table_index < 128; table_index += blockDim.x) {
             // Exact rounded significand of (1 + m/128)/7. Division by
             // seven cannot tie, so integer rounding needs no FP division.
@@ -1130,15 +1419,20 @@ __global__ void q4_g32_oct_rows_gemv_cuda(
         return;
     const int groups = inner / 32;
     const auto stage = [&](int buffer, int first_group) {
-        for (int ordinal = threadIdx.x; ordinal < 160; ordinal += blockDim.x) {
-            const int local_block = ordinal / 40;
-            const int group = first_group + (ordinal % 40) / 10;
-            const int packet = ordinal % 10;
+        // Four groups per storage block; compact blocks contain nine 16-byte
+        // packets, while the existing FP32-scale layout contains ten.
+        constexpr int Packets = sizeof(Block) / 16;
+        constexpr int Items = 4 * Packets;
+        static_assert(sizeof(Block) % 16 == 0);
+        for (int ordinal = threadIdx.x; ordinal < 4 * Items; ordinal += blockDim.x) {
+            const int local_block = ordinal / Items;
+            const int group = first_group + (ordinal % Items) / Packets;
+            const int packet = ordinal % Packets;
             const int source_block = blockIdx.x * 4 + local_block;
             const bool valid = source_block * 8 < columns && group < groups;
             const auto* source = reinterpret_cast<const uint8_t*>(weight) +
                 (valid ? (static_cast<size_t>(source_block) * groups + group) * sizeof(Block) + packet * 16 : 0);
-            auto* destination = reinterpret_cast<uint8_t*>(&staged_weights[buffer][local_block][(ordinal % 40) / 10]) + packet * 16;
+            auto* destination = reinterpret_cast<uint8_t*>(&staged_weights[buffer][local_block][(ordinal % Items) / Packets]) + packet * 16;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
             const unsigned address = static_cast<unsigned>(__cvta_generic_to_shared(destination));
             const int bytes = valid ? 16 : 0;
@@ -1154,7 +1448,7 @@ __global__ void q4_g32_oct_rows_gemv_cuda(
 #endif
     };
     if constexpr (AsyncWeights) {
-        static_assert(!compact && !Swizzled && !LoadHint && !PrefetchDistance);
+        static_assert(!Swizzled && !LoadHint && (compact || !PrefetchDistance));
         stage(0, 0);
         q4_wait_staged_weights();
         __syncthreads();
@@ -1204,6 +1498,8 @@ __global__ void q4_g32_oct_rows_gemv_cuda(
         if constexpr (RegisterLookahead && !compact) scale = __uint_as_float(pending.y);
         else if constexpr (compact) {
             const uint16_t code = RegisterLookahead ? pending.y : block.scales[block_row];
+            if constexpr (FullScaleLookup) scale=__uint_as_float(__ldg(q4_full_scales.values+code));
+            else {
             const uint32_t mantissa = code & 127u, exponent = (code >> 7) & 255u;
             uint32_t fractional;
             if constexpr (DirectCompactScale) {
@@ -1217,6 +1513,7 @@ __global__ void q4_g32_oct_rows_gemv_cuda(
                 ? __fdiv_rn(__uint_as_float(static_cast<uint32_t>(code) << 16), 7.f)
                 : __uint_as_float((static_cast<uint32_t>(code & 0x8000u) << 16) |
                     ((exponent - (mantissa >= 96 ? 2 : 3)) << 23) | fractional);
+            }
         } else {
             if constexpr (LoadHint) scale = __uint_as_float(q4_load_packet<LoadHint>(&block.scales[block_row]));
             else scale = block.scales[block_row];
@@ -1382,6 +1679,20 @@ void launch_q4_g32_swizzled_gemv(const float* activation,
 
 void launch_q4_g32_compact_gemv(const float* activation,
     const Q4CompactG32* weight, float* output, int columns, int inner, cudaStream_t stream) {
+    if(columns==16480&&inner==2560&&
+       reinterpret_cast<uintptr_t>(activation)%alignof(float4)==0&&
+       reinterpret_cast<uintptr_t>(weight)%alignof(uint32_t)==0&&cuda_q4_full_scale_lookup_enabled()) {
+        if (reinterpret_cast<uintptr_t>(weight) % 16 == 0 && cuda_q4_async_weights_enabled()) {
+            // Double-buffer four groups while preserving every original FP32
+            // accumulator and reduction. No extra resident weight view.
+            q4_g32_oct_rows_gemv_cuda<true,false,4,Q4CompactG32,0,true,false,false,false,false,false,4,false,false,true><<<
+                (columns+31)/32,128,size_t(inner)*sizeof(float),stream>>>(activation,weight,output,columns,inner);
+        } else {
+            q4_g32_oct_rows_gemv_cuda<true,false,4,Q4CompactG32,0,false,false,false,false,false,false,4,false,false,true><<<
+                (columns+31)/32,128,size_t(inner)*sizeof(float),stream>>>(activation,weight,output,columns,inner);
+        }
+        return;
+    }
     if(columns==10240 && inner==320 && reinterpret_cast<uintptr_t>(activation)%alignof(float2)==0) {
         q4_g32_pair_rows_gemv_cuda<false,false,0,Q4CompactG32,true><<<1280,128,320,stream>>>(activation,weight,output,columns,inner);
         return;
@@ -1404,6 +1715,23 @@ cudaError_t launch_q4_compact_pair_probe(const float* activation,
     else if(pipeline==2)q4_g32_pair_rows_gemv_cuda<false,false,2,Q4CompactG32><<<(columns+7)/8,128,0,stream>>>(activation,weight,output,columns,inner);
     else if(pipeline==1)q4_g32_pair_rows_gemv_cuda<false,false,1,Q4CompactG32><<<(columns+7)/8,128,0,stream>>>(activation,weight,output,columns,inner);
     else q4_g32_pair_rows_gemv_cuda<false,false,0,Q4CompactG32><<<(columns+7)/8,128,0,stream>>>(activation,weight,output,columns,inner);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_q4_compact_scale_gemv_probe(const float* activation,
+    const Q4CompactG32* weight,float* output,int columns,int inner,bool lookup,cudaStream_t stream) {
+    if(!activation||!weight||!output||columns<=4096||columns>INT32_MAX-31||inner<=0||inner>4096||inner%32||
+       reinterpret_cast<uintptr_t>(activation)%alignof(float4)||reinterpret_cast<uintptr_t>(weight)%alignof(uint32_t)||
+       reinterpret_cast<uintptr_t>(output)%alignof(float))return cudaErrorInvalidValue;
+    const dim3 grid((columns+31)/32);const size_t shared=size_t(inner)*sizeof(float);
+    if(lookup)q4_g32_oct_rows_gemv_cuda<true,false,4,Q4CompactG32,0,false,false,false,false,false,false,4,false,false,true><<<grid,128,shared,stream>>>(activation,weight,output,columns,inner);
+    else q4_g32_oct_rows_gemv_cuda<true,false,4,Q4CompactG32><<<grid,128,shared,stream>>>(activation,weight,output,columns,inner);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_q4_compact_scale_check(float* result,cudaStream_t stream) {
+    if(!result||reinterpret_cast<uintptr_t>(result)%alignof(float))return cudaErrorInvalidValue;
+    q4_scale_lookup_check_cuda<<<64,256,0,stream>>>(result);
     return cudaGetLastError();
 }
 
@@ -1624,32 +1952,14 @@ void launch_q4_g32_dense_gemv(
         // hundreds of K groups serial in each lane. Parallelize the dot
         // within each row rather than wasting the rest of the GPU.
         if (columns <= 4096 && inner >= 2048) {
-            static const bool grouped_narrow = [] {
-                const char* option = std::getenv("MOLLM_CUDA_Q4_GROUPED_NARROW");
-                return option && std::strcmp(option, "1") == 0;
-            }();
-            if (grouped_narrow && columns == 320 && inner == 10240) {
-                launch_q4_g32_grouped_narrow_gemv(activation, weight, output, columns, inner, 2, stream);
-                return;
-            }
-            static const bool narrow_prefetch = [] {
-                const char* option = std::getenv("MOLLM_CUDA_Q4_NARROW_PREFETCH");
-                return option && std::strcmp(option, "1") == 0;
-            }();
-            constexpr bool narrow_pipeline=true;
             const bool pipeline_shape = (columns == 2560 && inner == 6144) ||
                 (columns == 320 && inner == 10240) || (columns == 640 && inner == 2560);
-            if (narrow_pipeline && pipeline_shape &&
-                !(narrow_prefetch && columns == 2560 && inner == 6144)) {
+            if (pipeline_shape) {
                 q4_g32_pipelined_narrow_cuda<1,true><<<columns,256,0,stream>>>(activation,weight,output,inner);
-                return;
-            }
-            if (narrow_prefetch && columns == 2560 && inner == 6144)
-                q4_g32_row_parallel_gemv_cuda<256, false, 4><<<columns, 256, 0, stream>>>(
-                    activation, weight, output, inner);
-            else
+            } else {
                 q4_g32_row_parallel_gemv_cuda<256><<<columns, 256, 0, stream>>>(
                     activation, weight, output, inner);
+            }
             return;
         }
         constexpr int quad_threads = 128;
@@ -1728,6 +2038,8 @@ cudaError_t launch_q4_g32_small_batch(const float* activation,
         return launch_q4_g32_small_batch_reduced(activation, weight, output, tokens, columns, inner, lda, ldc, stream);
     if (tokens == 2)
         q4_g32_small_batch_cuda<2><<<columns, 256, 0, stream>>>(activation, weight, output, tokens, inner, lda, ldc);
+    else if (tokens == 3)
+        q4_g32_small_batch_cuda<3><<<columns, 256, 0, stream>>>(activation,weight,output,tokens,inner,lda,ldc);
     else if (tokens <= 4)
         q4_g32_small_batch_cuda<4><<<columns, 256, 0, stream>>>(activation, weight, output, tokens, inner, lda, ldc);
     else
@@ -1745,6 +2057,8 @@ cudaError_t launch_q4_g32_small_batch_wide(const float* activation,
     const int blocks = (columns + 31) / 32;
     if (tokens == 2)
         q4_g32_small_batch_wide_cuda<2><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
+    else if (tokens == 3)
+        q4_g32_small_batch_wide_cuda<3><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
     else if (tokens <= 4)
         q4_g32_small_batch_wide_cuda<4><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
     else
@@ -1760,17 +2074,55 @@ cudaError_t launch_q4_g32_small_batch_exact(const float* activation,
         lda < inner || ldc < columns) return cudaErrorInvalidValue;
     const bool aligned_pair = lda % 2 == 0 &&
         reinterpret_cast<uintptr_t>(activation) % alignof(float2) == 0;
-    // Experimental grouped narrow decode can have a different reduction tree.
-    const char* grouped = std::getenv("MOLLM_CUDA_Q4_GROUPED_NARROW");
-    if (aligned_pair && columns <= 4096 && inner >= 2048 &&
-        !(grouped && std::strcmp(grouped, "1") == 0)) {
+    // These tiny projections otherwise expose only one/four CTAs and reduce
+    // every token in sequence. Independent token CTAs preserve each output's
+    // 256-lane FMA/reduction order while providing a larger grid. Keep the
+    // measured shapes separate from wider projections that benefit from reuse.
+    if (aligned_pair && ((columns == 4 && inner == 10240) ||
+                         (columns == 1 && inner == 2560))) {
+        q4_g32_small_batch_token_parallel_cuda<<<dim3(columns, tokens),256,0,stream>>>(
+            activation, weight, output, inner, lda, ldc);
+        return cudaGetLastError();
+    }
+    // Short-K decode uses a 16-lane row tree, unlike the narrow 256-lane
+    // kernel above. Reuse weights across the batch without changing that tree
+    // or launching a separate GEMV for every token. Limit dispatch to the
+    // qualified HC-up and shared-expert-down shapes.
+    if (aligned_pair && ((columns == 10240 && inner == 320) ||
+                         (columns == 2560 && inner == 640))) {
+        const int blocks = (columns + 7) / 8;
+        switch (tokens) {
+            case 2: q4_g32_pair_rows_small_batch_cuda<2><<<blocks,128,0,stream>>>(activation,weight,output,columns,inner,lda,ldc); break;
+            case 3: q4_g32_pair_rows_small_batch_cuda<3><<<blocks,128,0,stream>>>(activation,weight,output,columns,inner,lda,ldc); break;
+            case 4: q4_g32_pair_rows_small_batch_cuda<4><<<blocks,128,0,stream>>>(activation,weight,output,columns,inner,lda,ldc); break;
+            case 5: q4_g32_pair_rows_small_batch_cuda<5><<<blocks,128,0,stream>>>(activation,weight,output,columns,inner,lda,ldc); break;
+            case 6: q4_g32_pair_rows_small_batch_cuda<6><<<blocks,128,0,stream>>>(activation,weight,output,columns,inner,lda,ldc); break;
+            case 7: q4_g32_pair_rows_small_batch_cuda<7><<<blocks,128,0,stream>>>(activation,weight,output,columns,inner,lda,ldc); break;
+            case 8: q4_g32_pair_rows_small_batch_cuda<8><<<blocks,128,0,stream>>>(activation,weight,output,columns,inner,lda,ldc); break;
+        }
+        return cudaGetLastError();
+    }
+    if (aligned_pair && columns <= 4096 && inner >= 2048) {
         if (tokens <= 4)
             return launch_q4_g32_small_batch_reduced(activation, weight, output,
                 tokens, columns, inner, lda, ldc, stream);
+        if ((tokens == 5 || tokens == 6) &&
+            ((columns == 320 && inner == 10240) ||
+             ((columns == 640 || columns == 512) && inner == 2560)) &&
+            cuda_q4_small_batch_tiled_reduction_enabled()) {
+            q4_g32_small_batch_tiled_reduction_cuda<<<columns,256,0,stream>>>(
+                activation, weight, output, tokens, inner, lda, ldc);
+            return cudaGetLastError();
+        }
         // The single-barrier variant regresses at M8. The original row tree
         // still matches decode and reuses weights without that bottleneck.
-        q4_g32_small_batch_cuda<8><<<columns,256,0,stream>>>(
-            activation,weight,output,tokens,inner,lda,ldc);
+        if ((tokens == 5 || tokens == 6) && columns == 2560 && inner == 6144 &&
+            cuda_q4_batch_vector_loads_enabled())
+            q4_g32_small_batch_vector_cuda<<<columns,256,0,stream>>>(
+                activation,weight,output,tokens,inner,lda,ldc);
+        else
+            q4_g32_small_batch_cuda<8><<<columns,256,0,stream>>>(
+                activation,weight,output,tokens,inner,lda,ldc);
         return cudaGetLastError();
     }
     const unsigned blocks = static_cast<unsigned>((columns + 31) / 32);
@@ -1790,7 +2142,8 @@ cudaError_t launch_q4_g32_small_batch_exact(const float* activation,
 
 cudaError_t launch_q4_compact_small_batch_exact(const float* activation,
     const Q4CompactG32* weight, float* output, int tokens, int columns,
-    int inner, int lda, int ldc, bool integer_scale, cudaStream_t stream) {
+    int inner, int lda, int ldc, bool integer_scale, cudaStream_t stream,
+    bool fixed_m5) {
     if (!activation || !weight || !output || tokens < 2 || tokens > 8 ||
         columns <= 0 || columns > INT32_MAX - 31 || inner <= 0 || inner % 32 ||
         lda < inner || ldc < columns) return cudaErrorInvalidValue;
@@ -1800,8 +2153,33 @@ cudaError_t launch_q4_compact_small_batch_exact(const float* activation,
         const int blocks = (columns + 31) / 32;
         if (tokens == 2)
             q4_g32_small_batch_wide_cuda<2,Q4CompactG32><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
-        else if (tokens <= 4)
-            q4_g32_small_batch_wide_cuda<4,Q4CompactG32><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
+        else if (tokens == 3) {
+            // The SM121 M3 wide path benefits from the same weight-latency
+            // overlap used by single-token projections. Keep other strides
+            // on the qualified generic path; the existing override applies.
+            if (lda == 2560 && ldc == columns && cuda_q4_prefetch_enabled())
+                q4_g32_small_batch_wide_cuda<3,Q4CompactG32,0,2><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
+            else
+                q4_g32_small_batch_wide_cuda<3,Q4CompactG32><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
+        }
+        else if (tokens <= 4) {
+            // All four rows are live here: specialize the existing PF2 kernel
+            // without changing its FP32 FMA chains or reduction tree.
+            if (lda == 2560 && ldc == columns && cuda_q4_prefetch_enabled())
+                q4_g32_small_batch_wide_cuda<4,Q4CompactG32,4,2><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
+            else
+                q4_g32_small_batch_wide_cuda<4,Q4CompactG32><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
+        }
+        else if (tokens == 5 && fixed_m5) {
+            // Keep the decode FMA chains and reduction tree, while making
+            // the five live rows visible to the compiler.
+            if (lda == 2560 && ldc == columns && cuda_q4_prefetch_enabled())
+                q4_g32_small_batch_wide_cuda<8,Q4CompactG32,5,2><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
+            else
+                q4_g32_small_batch_wide_cuda<8,Q4CompactG32,5><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
+        }
+        else if (tokens == 6 && lda == 2560 && ldc == columns && cuda_q4_prefetch_enabled())
+            q4_g32_small_batch_wide_cuda<8,Q4CompactG32,6,2><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
         else
             q4_g32_small_batch_wide_cuda<8,Q4CompactG32><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
     } else {
@@ -1827,6 +2205,8 @@ cudaError_t launch_q4_g32_small_batch_reduced(const float* activation,
         return cudaErrorInvalidValue;
     if (tokens == 2)
         q4_g32_small_batch_cuda<2,true><<<columns,256,0,stream>>>(activation,weight,output,tokens,inner,lda,ldc);
+    else if (tokens == 3)
+        q4_g32_small_batch_cuda<3,true><<<columns,256,0,stream>>>(activation,weight,output,tokens,inner,lda,ldc);
     else if (tokens <= 4)
         q4_g32_small_batch_cuda<4,true><<<columns,256,0,stream>>>(activation,weight,output,tokens,inner,lda,ldc);
     else
@@ -1837,6 +2217,34 @@ cudaError_t launch_q4_g32_small_batch_reduced(const float* activation,
 void launch_q4_row_g32_gemv(const float* activation, const Q4RowG32* weight,
     float* output, int columns, int inner, cudaStream_t stream) {
     q4_row_g32_gemv_cuda<<<columns, 256, 0, stream>>>(activation, weight, output, inner);
+}
+
+bool q4_narrow_row_eligible(const float* activation, int tokens,
+    int columns, int inner, int lda, int ldc) {
+    if (!activation || columns != 2560 || inner != 6144 || lda < inner ||
+        ldc < columns || lda % 2 || reinterpret_cast<uintptr_t>(activation) % alignof(float2))
+        return false;
+    // The cache is independent of legacy row-major metadata and M2/M3 dispatch.
+    return tokens == 1 || tokens == 4 ||
+        ((tokens == 5 || tokens == 6) && cuda_q4_batch_vector_loads_enabled());
+}
+
+cudaError_t launch_q4_narrow_row(const float* activation, const Q4RowG32* weight,
+    float* output, int tokens, int columns, int inner, int lda, int ldc, cudaStream_t stream) {
+    if (!weight || !output || reinterpret_cast<uintptr_t>(weight) % alignof(Q4RowG32) ||
+        reinterpret_cast<uintptr_t>(output) % alignof(float) ||
+        !q4_narrow_row_eligible(activation, tokens, columns, inner, lda, ldc))
+        return cudaErrorInvalidValue;
+    if (tokens == 1)
+        q4_g32_pipelined_narrow_cuda<1, true, Q4RowG32><<<columns, 256, 0, stream>>>(
+            activation, weight, output, inner);
+    else if (tokens == 4)
+        q4_g32_narrow_row_batch_cuda<4, true, false><<<columns, 256, 0, stream>>>(
+            activation, weight, output, tokens, inner, lda, ldc);
+    else
+        q4_g32_narrow_row_batch_cuda<8, false, true><<<columns, 256, 0, stream>>>(
+            activation, weight, output, tokens, inner, lda, ldc);
+    return cudaGetLastError();
 }
 
 void launch_repack_q4_row_g32(const Q4B8G32Block* source, Q4RowG32* target,
@@ -1896,6 +2304,33 @@ cudaError_t launch_q4_g32_single_barrier_gemv(const float* activation,
     return cudaGetLastError();
 }
 
+cudaError_t launch_q4_g32_small_batch_unequal_projections(const float* activation,
+    const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
+    float* first_output, float* second_output, int tokens, int first_columns,
+    int second_columns, int inner, int lda, int first_ldc, int second_ldc,
+    cudaStream_t stream) {
+    if (!activation || !first_weight || !second_weight || !first_output || !second_output ||
+        tokens < 2 || tokens > 8 || first_columns <= 0 || first_columns > 4096 ||
+        second_columns <= 0 || second_columns > 4096 || inner < 2048 ||
+        inner > INT32_MAX - 2048 || inner % 32 || lda < inner ||
+        first_ldc < first_columns || second_ldc < second_columns ||
+        reinterpret_cast<uintptr_t>(activation) % alignof(float2)) return cudaErrorInvalidValue;
+    const int blocks = first_columns + second_columns;
+    if (tokens == 2)
+        q4_g32_small_batch_unequal_cuda<2><<<blocks,256,0,stream>>>(activation,first_weight,second_weight,
+            first_output,second_output,tokens,inner,lda,first_columns,first_ldc,second_ldc);
+    else if (tokens == 3)
+        q4_g32_small_batch_unequal_cuda<3><<<blocks,256,0,stream>>>(activation,first_weight,second_weight,
+            first_output,second_output,tokens,inner,lda,first_columns,first_ldc,second_ldc);
+    else if (tokens == 4)
+        q4_g32_small_batch_unequal_cuda<4><<<blocks,256,0,stream>>>(activation,first_weight,second_weight,
+            first_output,second_output,tokens,inner,lda,first_columns,first_ldc,second_ldc);
+    else
+        q4_g32_small_batch_unequal_cuda<8><<<blocks,256,0,stream>>>(activation,first_weight,second_weight,
+            first_output,second_output,tokens,inner,lda,first_columns,first_ldc,second_ldc);
+    return cudaGetLastError();
+}
+
 cudaError_t launch_q4_g32_unequal_projections(const float* activation,
     const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
     float* first_output, float* second_output, int first_columns, int second_columns,
@@ -1906,6 +2341,48 @@ cudaError_t launch_q4_g32_unequal_projections(const float* activation,
         reinterpret_cast<uintptr_t>(activation) % alignof(float2)) return cudaErrorInvalidValue;
     q4_g32_unequal_projections_cuda<<<first_columns + second_columns, 256, 0, stream>>>(
         activation, first_weight, second_weight, first_output, second_output, first_columns, inner);
+    return cudaGetLastError();
+}
+
+
+cudaError_t launch_q4_g32_m3_fixed(const float* activation,
+    const Q4B8G32Block* weight, float* output, int columns, int inner, cudaStream_t stream) {
+    if (!activation || !weight || !output ||
+        !((columns == 2560 && inner == 6144) || (columns == 512 && inner == 2560)) ||
+        reinterpret_cast<uintptr_t>(activation) % alignof(float4) ||
+        reinterpret_cast<uintptr_t>(weight) % alignof(Q4B8G32Block) ||
+        reinterpret_cast<uintptr_t>(output) % alignof(float)) return cudaErrorInvalidValue;
+    q4_g32_m3_fixed_cuda<<<columns, 256, 0, stream>>>(
+        activation, weight, output, inner, inner, columns);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_q4_g32_m3_adjacent(const float* activation,
+    const Q4B8G32Block* weight, float* output, int columns, int inner, cudaStream_t stream) {
+    if (!activation || !weight || !output ||
+        !((columns == 320 && inner == 10240) || (columns == 640 && inner == 2560)) ||
+        reinterpret_cast<uintptr_t>(activation) % alignof(float4) ||
+        reinterpret_cast<uintptr_t>(weight) % alignof(Q4B8G32Block) ||
+        reinterpret_cast<uintptr_t>(output) % alignof(float)) return cudaErrorInvalidValue;
+    q4_g32_m3_adjacent_cuda<<<columns, 128, 0, stream>>>(activation, weight, output, inner, columns);
+    return cudaGetLastError();
+}
+
+cudaError_t configure_q4_g32_hc_adjacent_cache() {
+    return cudaFuncSetCacheConfig(q4_g32_hc_adjacent_projections_cuda,cudaFuncCachePreferL1);
+}
+
+cudaError_t launch_q4_g32_hc_adjacent_projections(const float* activation,
+    const Q4B8G32Block* down_weight,const Q4B8G32Block* inject_weight,
+    float* down_output,float* inject_output,cudaStream_t stream) {
+    if(!activation||!down_weight||!inject_weight||!down_output||!inject_output||
+       reinterpret_cast<uintptr_t>(activation)%alignof(float4)||
+       reinterpret_cast<uintptr_t>(down_weight)%alignof(Q4B8G32Block)||
+       reinterpret_cast<uintptr_t>(inject_weight)%alignof(Q4B8G32Block)||
+       reinterpret_cast<uintptr_t>(down_output)%alignof(float)||
+       reinterpret_cast<uintptr_t>(inject_output)%alignof(float))return cudaErrorInvalidValue;
+    q4_g32_hc_adjacent_projections_cuda<<<324,128,0,stream>>>(activation,down_weight,inject_weight,
+        down_output,inject_output,320,10240);
     return cudaGetLastError();
 }
 

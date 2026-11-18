@@ -3,6 +3,7 @@
 #include "runtime/cuda_host_memory_budget.h"
 #include "engine/input_prep.h"
 #include "engine/recurrent_checkpoint.h"
+#include "engine/mtp_draft_policy.h"
 #include "engine/sampler.h"
 #include "core/fp16.h"
 #include "runtime/host_compute.h"
@@ -149,6 +150,13 @@ void invalidate_workspace_key(ExecContext& ctx) {
     ctx.workspace_padded_seq_len = -1;
 }
 
+bool prepare_prefill_phase(Graph& graph, ExecContext& ctx) {
+    return ctx.backend && ctx.backend->prepare_prefill_phase([&] {
+        release_graph_temporaries(graph, ctx.backend);
+        invalidate_workspace_key(ctx);
+    }, &graph, &ctx);
+}
+
 void finish_graph_temporaries(Graph& graph, ExecContext& ctx) {
     if (ctx.reuse_static_workspace || ctx.reuse_same_shape_workspace) {
         clear_graph_borrowed_views(graph);
@@ -277,6 +285,12 @@ bool LLMEngine::set_cache_lengths(
 // ---------------------------------------------------------------------------
 
 void LLMEngine::reset() {
+    if (exec_ctx_prefill_.backend &&
+        !exec_ctx_prefill_.backend->release_verification_workspaces(graph_prefill_, exec_ctx_prefill_)) {
+        std::fprintf(stderr, "verification workspace release failed\n");
+        return;
+    }
+
     release_graph_temporaries(graph_decode_, exec_ctx_decode_.backend);
     invalidate_workspace_key(exec_ctx_decode_);
     release_graph_temporaries(graph_mtp_, exec_ctx_mtp_.backend);
@@ -301,7 +315,7 @@ void LLMEngine::reset() {
     Backend* backend = persistent_backend();
     bool storage_reset = backend
         ? set_cache_lengths(caches_, 0) && set_cache_lengths(mtp_caches_, 0)
-        : caches_.empty() && mtp_caches_.empty() && auxiliary_states_.empty();
+        : caches_.empty() && mtp_caches_.empty() && auxiliary_states_.empty() && mtp_auxiliary_states_.empty();
     for (auto& cp : caches_) {
         if (cp.gdn_state) {
             size_t sz = (size_t)cp.gdn_v_dim * cp.gdn_k_dim * cp.gdn_num_heads *
@@ -322,11 +336,13 @@ void LLMEngine::reset() {
                 storage_reset = false;
         }
     }
-    for (const auto& entry : auxiliary_states_) {
-        Tensor* state = entry.second;
-        if (state && state->data &&
-            (!backend || !backend->zero_tensor(*state, state->nbytes())))
-            storage_reset = false;
+    for (const auto* states : {&auxiliary_states_, &mtp_auxiliary_states_}) {
+        for (const auto& entry : *states) {
+            Tensor* state = entry.second;
+            if (state && state->data &&
+                (!backend || !backend->zero_tensor(*state, state->nbytes())))
+                storage_reset = false;
+        }
     }
     if (!storage_reset)
         std::fprintf(stderr, "Engine: failed to reset persistent state\n");
@@ -759,10 +775,10 @@ void LLMEngine::set_cache_length(std::vector<CachePair>& caches, int length) {
 Tensor LLMEngine::run_mtp_tokens(const std::vector<int>& token_ids,
                                   const Tensor& target_hidden,
                                   int position,
-                                  int* draft_token) {
+                                  int* draft_token, float* draft_probability) {
     Tensor output;
     if (!execute_mtp_tokens(token_ids, target_hidden, position, false,
-                            &output, draft_token))
+                            &output, draft_token, draft_probability))
         return Tensor();
     return output;
 }
@@ -777,7 +793,8 @@ bool LLMEngine::update_mtp_cache(const std::vector<int>& token_ids,
 bool LLMEngine::execute_mtp_tokens(
     const std::vector<int>& token_ids, const Tensor& target_hidden,
     int position, bool cache_only, Tensor* hidden_output,
-    int* draft_token) {
+    int* draft_token, float* draft_probability) {
+    if (draft_probability) *draft_probability = -1.0f;
     if (!has_mtp() || token_ids.empty() || !target_hidden.data ||
         target_hidden.shape[1] != static_cast<int64_t>(token_ids.size())) {
         return false;
@@ -798,7 +815,8 @@ bool LLMEngine::execute_mtp_tokens(
     int stop_after_node_index = -1;
     if (cache_only) {
         for (size_t i = 0; i < graph_mtp_.nodes.size(); ++i) {
-            if (graph_mtp_.nodes[i].op_type == OpType::SDPA) {
+            if (graph_mtp_.nodes[i].op_type == OpType::SDPA ||
+                graph_mtp_.nodes[i].op_type == OpType::QSA_SDPA) {
                 stop_after_node_index = static_cast<int>(i);
                 break;
             }
@@ -845,6 +863,12 @@ bool LLMEngine::execute_mtp_tokens(
         }
         device_hidden_copy = &mtp_draft_hidden_device_;
     }
+    struct AttentionCacheScope {
+        Backend* backend=nullptr;
+        ~AttentionCacheScope() { if(backend)backend->set_attention_cache_only(false); }
+    } cache_scope;
+    if(cache_only && exec_ctx_mtp_.backend->set_attention_cache_only(true))
+        cache_scope.backend=exec_ctx_mtp_.backend;
     Tensor out = run_graph(
         graph_mtp_, exec_ctx_mtp_, token_hidden, mask, cos, sin,
         nullptr, fuse_accelerator_lm_head, &target_hidden, position,
@@ -858,9 +882,9 @@ bool LLMEngine::execute_mtp_tokens(
             // greedy top-k=1 drafts, so copying the full vocabulary to CPU
             // would add a host transfer, allocation, and scan every depth.
             *draft_token =
-                accelerator_backend_->lm_head_argmax_device_and_end_graph(
+                accelerator_backend_->lm_head_draft_argmax_device_and_end_graph(
                 out, static_cast<size_t>(n - 1) * hidden,
-                *lm_head_weight_, vocab, hidden, 0, device_hidden_copy);
+                *lm_head_weight_, vocab, hidden, 0, device_hidden_copy, draft_probability);
         } else {
             // run_graph() deliberately left the accelerator graph open for the
             // fused tail; close it even on a malformed/failed graph output.
@@ -936,7 +960,9 @@ bool LLMEngine::sync_mtp(const std::vector<int>& token_ids,
 
     // Drafting may have written a longer tail. The first drafted input uses
     // the exact pending target hidden state, so callers may preserve that KV
-    // entry and overwrite only the recursively predicted suffix.
+    // entry and overwrite only the recursively predicted suffix. QSA raw
+    // rows and completed pools follow the same causal length: future groups
+    // are invisible and are rebuilt when their completion is reached again.
     if (preserved_prefix > 0 && mtp_past_len_ < resume_position)
         return false;
     mtp_past_len_ = resume_position;
@@ -1007,6 +1033,12 @@ void LLMEngine::prepare_accelerator_prefill_weights() {
 }
 
 void LLMEngine::release_prefill_buffers() {
+    if (exec_ctx_prefill_.backend &&
+        !exec_ctx_prefill_.backend->release_verification_workspaces(graph_prefill_, exec_ctx_prefill_)) {
+        std::fprintf(stderr, "verification workspace release failed\n");
+        return;
+    }
+
     release_graph_temporaries(graph_prefill_, exec_ctx_prefill_.backend);
     invalidate_workspace_key(exec_ctx_prefill_);
 }
@@ -1028,11 +1060,12 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0)
         return -1;
+    if (!prepare_prefill_phase(graph_prefill_, exec_ctx_prefill_)) return -1;
     if(cfg_.cuda_prefill_logical_batch&&
         (!mollm_prefill::logical_length_supported(n,past_len_,cfg_.n_ctx)||active_vision_||
          exec_ctx_prefill_.profile_enabled||
-         !mollm_memory::cuda_host_allocation_allowed(size_t(4)<<30,"logical prefill extra transient admission"))) {
-        std::fprintf(stderr,"prefill: logical batch requires inputs fitting remaining context, no vision/profile, and4GiB transient headroom above the host guard\n");
+         !mollm_memory::cuda_host_allocation_allowed(mollm_prefill::logical_transient_margin(n),"logical prefill extra transient admission"))) {
+        std::fprintf(stderr,"prefill: logical batch requires inputs fitting remaining context, no vision/profile, and batch-sized transient headroom above the host guard\n");
         return -1;
     }
     mollm_prefill::LogicalBatchScope logical_scope(exec_ctx_prefill_.backend,cfg_.cuda_prefill_logical_batch);
@@ -1148,12 +1181,48 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     int n = (int)token_ids.size();
     if (n == 0)
         return Tensor();
+    if (!prepare_prefill_phase(graph_prefill_, exec_ctx_prefill_)) return Tensor();
     if(cfg_.cuda_prefill_logical_batch&&
         (!mollm_prefill::logical_length_supported(n,past_len_,cfg_.n_ctx)||n>mollm_prefill::logical_chunk_limit(cfg_)||active_vision_||
          exec_ctx_prefill_.profile_enabled||
-         !mollm_memory::cuda_host_allocation_allowed(size_t(4)<<30,"logical hidden prefill extra transient admission"))) {
+         !mollm_memory::cuda_host_allocation_allowed(mollm_prefill::logical_transient_margin(n),"logical hidden prefill extra transient admission"))) {
         std::fprintf(stderr,"prefill_hidden: logical batch length/mode/headroom admission rejected\n");return Tensor();
     }
+    // Captured verification keeps owned outputs until shape/phase changes.
+    // Backend admission also requires its bounded, immutable prefix bank.
+    struct VerifyWorkspaceScope {
+        Graph& graph;
+        ExecContext& ctx;
+        bool previous;
+        bool entered=false;
+        VerifyWorkspaceScope(Graph& g, ExecContext& c, bool enabled, int rows)
+            : graph(g), ctx(c), previous(c.reuse_same_shape_workspace) {
+            if (!enabled) return;
+            const bool reusable=ctx.workspace_shape_valid && ctx.workspace_runtime_seq_len==rows &&
+                ctx.workspace_runtime_batch==ctx.runtime_batch && !ctx.workspace_static_padded && ctx.workspace_padded_seq_len==-1;
+            if(!ctx.backend || !ctx.backend->set_retained_verification(true,reusable))return;
+            entered=true;
+            if (!reusable) {
+                release_graph_temporaries(graph, ctx.backend);
+                invalidate_workspace_key(ctx);
+                // No materialized or borrowed outputs remain. Seed the key
+                // so first execution also suppresses per-node release queues.
+                ctx.workspace_shape_valid = true;
+                ctx.workspace_runtime_seq_len = rows;
+                ctx.workspace_runtime_batch = ctx.runtime_batch;
+                ctx.workspace_static_padded = false;
+                ctx.workspace_padded_seq_len = -1;
+            }
+            ctx.reuse_same_shape_workspace = true;
+        }
+        ~VerifyWorkspaceScope() {
+            ctx.reuse_same_shape_workspace=previous;
+            if(entered)ctx.backend->set_retained_verification(false,false);
+        }
+    } verify_workspace(graph_prefill_, exec_ctx_prefill_,
+        cfg_.device == Device::CUDA && cfg_.cuda_prefill_logical_batch &&
+        n >= 2 && n <= 8 && all_top1, n);
+
     mollm_prefill::LogicalBatchScope logical_scope(exec_ctx_prefill_.backend,cfg_.cuda_prefill_logical_batch);
     if(!logical_scope.entered){std::fprintf(stderr,"prefill_hidden: backend rejected logical batch admission\n");return Tensor();}
     if (past_len_ > cfg_.n_ctx || n > cfg_.n_ctx - past_len_) {
@@ -1318,7 +1387,10 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     }
 
     finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
-    if (moe_ssd_cache_) {
+    // A resident expert provider also uses this cache object. The admitted
+    // verification scope owns retained CUDA outputs; its next shape/phase
+    // transition retires graphs before those outputs can be recycled.
+    if (moe_ssd_cache_ && !verify_workspace.entered) {
         release_graph_temporaries(graph_prefill_,
                                   exec_ctx_prefill_.backend);
         invalidate_workspace_key(exec_ctx_prefill_);
@@ -1340,7 +1412,7 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     if(cfg_.cuda_prefill_logical_batch&&
        (!mollm_prefill::logical_length_supported(n,past,cfg_.n_ctx)||
         n>mollm_prefill::logical_chunk_limit(cfg_)||
-        !mollm_memory::cuda_host_allocation_allowed(size_t(4)<<30,"logical prefill chunk transient admission"))) {
+        !mollm_memory::cuda_host_allocation_allowed(mollm_prefill::logical_transient_margin(n),"logical prefill chunk transient admission"))) {
         std::fprintf(stderr,"prefill_chunk: logical batch length/headroom admission rejected\n");
         return -1;
     }
@@ -1598,6 +1670,9 @@ bool LLMEngine::speculative_decode(int token_id,
     const int hidden = static_cast<int>(mtp_pending_hidden_.size());
     const int vocab = static_cast<int>(lm_head_weight_->shape[0]);
     const bool plain_argmax = sampler_.uses_plain_argmax();
+    mollm::detail::MtpDraftPolicy draft_policy(
+        plain_argmax && cfg_.device == Device::CUDA ? 0.4 : 0.0,
+        plain_argmax && cfg_.device == Device::CUDA ? 0.5 : 0.0);
     Tensor state_tensor = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, hidden, 1, 1, 1,
         mtp_pending_hidden_.data());
@@ -1618,11 +1693,13 @@ bool LLMEngine::speculative_decode(int token_id,
         ++mtp_stats_.attempts_by_depth[static_cast<size_t>(i)];
         mollm_trace::ScopedEvent trace_draft("inference", "mtp.draft");
         int draft = -1;
+        float draft_probability = -1.0f;
         draft_input[0] = current;
         const auto draft_model_start = MtpClock::now();
         Tensor mtp_hidden = run_mtp_tokens(
             draft_input, state_tensor, mtp_start + i,
-            plain_argmax ? &draft : nullptr);
+            plain_argmax ? &draft : nullptr,
+            draft_policy.needs_probability() ? &draft_probability : nullptr);
         if (!mtp_hidden.data)
             return false;
         mtp_current_cached = true;
@@ -1648,8 +1725,11 @@ bool LLMEngine::speculative_decode(int token_id,
             std::chrono::duration<double, std::milli>(
                 MtpClock::now() - draft_model_start).count();
 
+        const auto decision = draft_policy.take(i, draft_probability);
+        if (!decision.propose) break;
         drafts.push_back(draft);
         ++mtp_stats_.drafted_by_depth[static_cast<size_t>(i)];
+        if (!decision.more) break;
         current = draft;
         draft_history.push_back(draft);
         const Tensor& next_state = draft_mtp_state_.data
@@ -1684,15 +1764,25 @@ bool LLMEngine::speculative_decode(int token_id,
     mtp_stats_.drafted += drafts.size();
     mtp_stats_.verify_tokens += inputs.size();
 
+    if (cfg_.device == Device::CUDA && cfg_.cuda_prefill_logical_batch &&
+        plain_argmax && exec_ctx_prefill_.backend &&
+        (cfg_.mtp_draft_tokens <= 4 ||
+         (cfg_.mtp_draft_tokens <= 7 && exec_ctx_prefill_.backend->verification_workspace_max_rows() >=
+             cfg_.mtp_draft_tokens + 1)) &&
+        !exec_ctx_prefill_.backend->select_verification_workspace(
+            graph_prefill_, exec_ctx_prefill_, static_cast<int>(inputs.size()))) return false;
+
     // KV payload can be rewound by length, but GDN/conv/RWKV/plain auxiliary
     // buffers contain the state after the entire verification batch. Keep the
-    // pre-verification state so rejected drafts cannot leak into generation.
+    // pre-verification state unless a complete prefix plan proves that every
+    // possible accepted prefix can be restored directly.
     mollm::detail::RecurrentCheckpoint recurrent_checkpoint;
     Backend* state_backend = persistent_backend();
     struct PrefixStateScope {
         Backend* backend=nullptr;
         ~PrefixStateScope(){if(backend)backend->end_state_prefixes();}
     } prefix_scope;
+    bool prefix_only = false;
     if (inputs.size() > 1) {
         const auto checkpoint_start = MtpClock::now();
         std::vector<Tensor*> states;
@@ -1702,9 +1792,36 @@ bool LLMEngine::speculative_decode(int token_id,
                                  cache.rwkv_ffn_shift})
                 if (state) states.push_back(state);
         }
+        // QSA only appends raw rows and newly completed pooled groups.
+        // A rewind hides future rows/groups; completing a rejected partial
+        // group overwrites its pooled row before it can become visible again.
+        // Snapshotting these buffers would copy O(context) bytes every step
+        // and also prevent recurrent prefix restoration from being used.
         for (const auto& state : auxiliary_states_)
-            if (state.second) states.push_back(state.second);
-        if (!states.empty() &&
+            if (state.second && !qsa_append_states_.count(state.first))
+                states.push_back(state.second);
+        const bool request_prefix_only = cfg_.device == Device::CUDA &&
+            cfg_.cuda_prefill_logical_batch && !cfg_.static_padded && plain_argmax &&
+            inputs.size() >= 2 && inputs.size() <= 8;
+        // Only a completed same-width retained workspace is a valid graph
+        // preflight. First use and every shape/phase change keep the backup.
+        const auto& workspace = exec_ctx_prefill_;
+        const bool prepared = workspace.workspace_shape_valid &&
+            (workspace.runtime_batch == -1 || workspace.runtime_batch == 1) &&
+            workspace.workspace_runtime_seq_len == static_cast<int>(inputs.size()) &&
+            workspace.workspace_runtime_batch == workspace.runtime_batch &&
+            !workspace.workspace_static_padded && workspace.workspace_padded_seq_len == -1;
+        if (request_prefix_only && prepared && state_backend &&
+            state_backend->begin_state_prefixes(states,static_cast<int>(inputs.size()))) {
+            prefix_scope.backend = state_backend;
+            prefix_only = state_backend->state_prefixes_cover_graph(
+                graph_prefill_,states,static_cast<int>(inputs.size()));
+        }
+        if (request_prefix_only) {
+            if (prefix_only) ++mtp_stats_.recurrent_prefix_only_steps;
+            else ++mtp_stats_.recurrent_prefix_plan_fallbacks;
+        }
+        if (!states.empty() && !prefix_only &&
             (!state_backend ||
              !recurrent_checkpoint.capture(*state_backend, states))) {
             fprintf(stderr, "speculative_decode: recurrent checkpoint failed\n");
@@ -1716,7 +1833,8 @@ bool LLMEngine::speculative_decode(int token_id,
         mtp_stats_.recurrent_checkpoint_ms +=
             std::chrono::duration<double, std::milli>(
                 MtpClock::now() - checkpoint_start).count();
-        if(state_backend && state_backend->begin_state_prefixes(states,static_cast<int>(inputs.size())))
+        if(!prefix_scope.backend && state_backend &&
+           state_backend->begin_state_prefixes(states,static_cast<int>(inputs.size())))
             prefix_scope.backend=state_backend;
     }
 
@@ -1742,6 +1860,12 @@ bool LLMEngine::speculative_decode(int token_id,
     if (!gpu_top1 &&
         logits.size() != inputs.size() * static_cast<size_t>(vocab))
         return false;
+    if (prefix_only && !state_backend->state_prefixes_complete()) {
+        // A proven plan failing its postcondition is an execution error.
+        // Reject before touching sampler/output; there is no stale backup.
+        fprintf(stderr,"speculative_decode: incomplete recurrent prefix plan\n");
+        return false;
+    }
 
 
     int kept = 0;
@@ -1791,10 +1915,10 @@ bool LLMEngine::speculative_decode(int token_id,
 
     std::vector<int> verified_inputs(inputs.begin(), inputs.begin() + kept);
     if (kept < static_cast<int>(inputs.size()) &&
-        !recurrent_checkpoint.empty()) {
+        (!recurrent_checkpoint.empty() || prefix_only)) {
         const auto rollback_start = MtpClock::now();
         const bool restored_prefix=prefix_scope.backend && state_backend->restore_state_prefix(kept);
-        if (!restored_prefix && !recurrent_checkpoint.restore(*state_backend)) {
+        if (!restored_prefix && (prefix_only || !recurrent_checkpoint.restore(*state_backend))) {
             fprintf(stderr, "speculative_decode: recurrent restore failed\n");
             return false;
         }

@@ -7,6 +7,7 @@
 #include "backends/cpu/backend.h"
 #include "backends/cuda/backend.h"
 #include "backends/cuda/device_runtime.h"
+#include "backends/cuda/fp16_expert_palette.h"
 #include "backends/cuda/dense_lt_gemm.h"
 #include "runtime/cuda_host_memory_budget.h"
 #include "core/activation.h"
@@ -37,6 +38,13 @@ struct CudaBackend::Impl {
         Q4Bg32CompactInteger,
     };
 
+    enum class DraftCompactHeadKind : int {
+        None = 0,
+        Q2 = 2,
+        Q4 = 4,
+        FittedQ4 = 0x104,
+    };
+
     struct DeviceWeight {
         void* data = nullptr;
         float* scales = nullptr;
@@ -48,6 +56,8 @@ struct CudaBackend::Impl {
         WeightLayout layout = WeightLayout::Dense;
         mollm_cuda::Q4RowG32* row_g32 = nullptr;
         void* prefill_fp16 = nullptr;
+        size_t data_bytes = 0;
+        mollm_cuda::Q4RowG32* narrow_row_g32 = nullptr; // Cache, not a primary layout.
     };
 
     struct StatePrefix {
@@ -56,14 +66,32 @@ struct CudaBackend::Impl {
         void* storage = nullptr;
         size_t bytes = 0;
         bool captured = false;
+        int tokens = 0; // Allocation extent: storage owns bytes * tokens.
     };
     std::vector<StatePrefix> state_prefixes;
+    // One immutable binding bank, including each lease's allocation width.
+    // Width3 admits <=512MiB; width5 admits <=1GiB. Smaller tails use scoped
+    // leases; upgrading width or replacing an owner retires old graphs first.
+    // Pool reservation/reused allocation capacity can exceed this payload.
+    // Graphs are destroyed before these owned pool leases are returned.
+    std::vector<StatePrefix> verify_prefix_bank;
+    bool verify_prefix_bank_active = false, retained_verification = false;
+    bool verification_pool_retained = false;
+    bool verify_prefix_bank_proven = false;
+    uint64_t verify_warmups = 0, verify_segment_builds = 0, verify_segment_hits = 0;
+    uint64_t verify_entries=0,verify_tiles=0,verify_ready=0,verify_fallbacks=0;
+    const bool verify_segments_requested = true;
     int state_prefix_tokens = 0;
     size_t state_prefix_peak_payload_bytes = 0;
     float* state_prefix_output(void* pointer, size_t bytes, int tokens) {
         if(tokens!=state_prefix_tokens)return nullptr;
-        for(auto& entry:state_prefixes)if(entry.pointer==pointer && entry.bytes==bytes) {
-            entry.captured=true;return static_cast<float*>(entry.storage);
+        for(auto& entry:state_prefixes)if(entry.pointer==pointer && entry.bytes==bytes && entry.tokens==tokens) {
+            entry.captured=true;
+            if(segment_mode==SegmentMode::CAPTURE && active_segment && !active_segment->records.empty()) {
+                auto& writes=active_segment->records.back().prefix_writes;
+                if(std::find(writes.begin(),writes.end(),pointer)==writes.end())writes.push_back(pointer);
+            }
+            return static_cast<float*>(entry.storage);
         }
         return nullptr;
     }
@@ -90,11 +118,24 @@ struct CudaBackend::Impl {
 
     bool ok = false;
     bool failed = false;
+    bool prefer_fp16_expert_palette = false;
+    // Member destruction follows Impl's synchronization/graph teardown.
+    mollm::cuda_backend_detail::Fp16ExpertPaletteCache fp16_expert_palettes;
     bool strided_reshape_views = false;
     size_t strided_reshape_calls = 0;
     std::unordered_map<const Tensor*, const Graph*> strided_reshape_targets;
     bool coherent_host_weights = false;
     bool supports_native_nvfp4_mma = false;
+    bool prefer_q4_narrow_row_cache = false; // Exact narrow projection views on qualified devices.
+    bool prefer_q4_m3_specializations = false; // Qualified SM121 M3 projection policy.
+    bool prefer_q4_fixed_m5 = false; // Qualified SM121 compact-wide M5 policy.
+    bool prefer_q4_hc_adjacent = false; // Qualified SM121 paired-HC policy.
+    bool prefer_nvfp4_gate_m1_proven = false; // Qualified SM121 resident M1 policy.
+    bool prefer_nvfp4_gate_subgroup = false; // Qualified SM121 tiny-batch policy.
+    bool prefer_nvfp4_mtp_gate_pairs = false; // Exact small-batch gate expert reuse.
+    bool prefer_nvfp4_mtp_gate_eight = false; // Qualified SM121 PAIR gate coalescing.
+    bool prefer_nvfp4_m1_down_subwarp = false; // Exact eight-lane resident M1 down policy.
+    bool prefer_nvfp4_mtp_down_subwarp = false; // Exact eight-lane small-batch down policy.
     bool supports_sdpa_head_lane_pair = false;
     bool supports_extended_nvfp4_prefill_sort = false;
     cublasHandle_t cublas = nullptr;
@@ -106,6 +147,7 @@ struct CudaBackend::Impl {
     size_t prefill_shared_cache_bytes = 0, prefill_shared_cache_hits = 0;
     std::vector<void*> device_allocations;
     size_t row_g32_bytes = 0;
+    size_t narrow_row_g32_weights = 0, narrow_row_g32_bytes = 0;
     size_t row_g32_weights = 0;
     mollm_cuda::DeviceBufferPool* output_pool =
         mollm_cuda::create_device_buffer_pool();
@@ -129,6 +171,35 @@ struct CudaBackend::Impl {
     size_t diagnostic_weight_fp32_bytes = 0;
     void* output = nullptr;
     size_t output_bytes = 0;
+    // Optional greedy Q8 head screening; original weights stay authoritative.
+    void* q8_head_packed = nullptr;
+    size_t q8_head_packed_bytes = 0;
+    void* q8_head_scratch = nullptr;
+    size_t q8_head_scratch_bytes = 0;
+    const void* q8_head_source = nullptr;
+    int q8_head_rows = 0;
+    // Scalar Q4/Q5 share storage keyed by format; batch verification reads Q6.
+    void* q8_head_scalar_packed = nullptr;
+    size_t q8_head_scalar_packed_bytes = 0;
+    const void* q8_head_scalar_source = nullptr;
+    int q8_head_scalar_rows = 0, q8_head_scalar_bits = 0;
+    size_t q8_head_scalar_calls = 0, q8_head_scalar_packs = 0;
+    bool draft_head_request = false;
+    float* draft_probability_output = nullptr;
+    void* draft_q4_head = nullptr;
+    size_t draft_q4_head_bytes = 0;
+    const void* draft_q4_head_source = nullptr;
+    int draft_q4_rows = 0;
+    int draft_q4_inner = 0;
+    // Packing policy belongs in the cache key even when the Q4 layout is shared.
+    DraftCompactHeadKind draft_compact_head_kind = DraftCompactHeadKind::None;
+    // Opt-in approximate draft vocabulary screen; no extra weight view.
+    void* draft_screen_scratch = nullptr;
+    size_t draft_screen_scratch_bytes = 0;
+    void* draft_screen_sort = nullptr;
+    size_t draft_screen_sort_bytes = 0;
+    bool draft_screen_initialized = false;
+    size_t draft_screen_calls = 0;
     void* argmax_partial = nullptr;
     size_t argmax_partial_bytes = 0;
     void* argmax_result = nullptr;
@@ -186,6 +257,8 @@ struct CudaBackend::Impl {
         float gate_input_global = 1.f;
         bool gate_async_aligned = false;
         bool gate_pair_layout = false;
+        bool gate_m1_layout_proven = false;
+        bool down_pair_layout = false;
         const ExpertSource* down_source = nullptr;
         int hidden = 0, inter = 0;
         std::vector<ExpertLease> leases;
@@ -224,6 +297,8 @@ struct CudaBackend::Impl {
     size_t moe_gate_async_weights_calls = 0;
     size_t moe_gate_compact_prefill_calls = 0;
     size_t moe_down_compact_prefill_calls = 0;
+    size_t moe_mtp_gate_pair_dispatches = 0; // Host dispatches, including graph capture.
+    size_t moe_mtp_down_subwarp_dispatches = 0; // Host dispatches, including graph capture.
     size_t sigmoid_gr_reduce_fused_calls = 0;
     size_t gr_inject_rms_fused_calls = 0;
     // Atomic dispatch_moe_gr_inject_rms scope only; never survives a graph op.
@@ -272,6 +347,7 @@ struct CudaBackend::Impl {
         const float* computed_input = nullptr;
         const DeviceWeight* computed_weight = nullptr;
         uint64_t computed_epoch = 0;
+        int computed_rows = 0;
     };
     struct HcProjectionPlan {
         std::vector<HcProjectionPair> pairs;
@@ -282,6 +358,10 @@ struct CudaBackend::Impl {
     bool qualified_fusions = true;
     // Qualified HC prefill/decode policy: pair the N320+N4 projections.
     bool hc_projection_enabled = true;
+    static constexpr int hc_projection_cached_tokens = 8;
+    bool hc_small_batch_pair_enabled = false;
+    // Indexer top-k is sensitive to changes in GEMM accumulation order.
+    std::unordered_map<const GraphNode*, const Graph*> qsa_projection_graphs;
     std::unordered_map<const Graph*, HcProjectionPlan> hc_projection_plans;
     std::unordered_map<const GraphNode*, HcProjectionPair*> hc_projection_nodes;
     std::unordered_map<const GraphNode*, HcProjectionPair*> hc_prefill_rms_nodes;
@@ -415,6 +495,11 @@ struct CudaBackend::Impl {
     };
     std::unordered_map<const GraphNode*, CaptureSignature> capture_signatures;
     std::unordered_map<uint32_t, CaptureAuditCounts> capture_audit_counts;
+    // A fused reduction receives raw logits, unlike ordinary GR_REDUCE.
+    // Preserve the fused dispatch semantics for replay and invalidation recovery.
+    static constexpr uint64_t sigmoid_gr_segment_tag=0x5349474752ULL;
+    size_t sigmoid_gr_segment_replays=0,sigmoid_gr_segment_recoveries=0;
+    enum class SegmentDispatch { Ordinary, SigmoidGrReduce };
     struct SegmentRecord {
         const GraphNode* node = nullptr;
         std::vector<const Tensor*> inputs;
@@ -422,12 +507,36 @@ struct CudaBackend::Impl {
         ThreadPool* thread_pool = nullptr;
         CaptureSignature signature;
         bool rounded = false;
+        std::vector<void*> prefix_writes;
+        SegmentDispatch dispatch_kind=SegmentDispatch::Ordinary;
     };
     struct DecodeSegment {
         cudaGraphExec_t graph = nullptr;
         std::vector<SegmentRecord> records;
     };
     std::unordered_map<const GraphNode*, DecodeSegment> decode_segments;
+    struct VerificationWorkspaceSlot {
+        std::vector<Tensor> outputs;
+        std::vector<Tensor> leases;
+        std::unordered_map<const GraphNode*, DecodeSegment> segments;
+        std::vector<StatePrefix> prefixes;
+        bool prepared = false, proven = false;
+        uint64_t warmups = 0;
+    };
+    struct VerificationWorkspaces {
+        Graph* graph = nullptr;
+        const GraphNode* nodes = nullptr;
+        Tensor* tensors = nullptr;
+        size_t count = 0;
+        int active_width = 0, max_width = 5;
+        std::array<VerificationWorkspaceSlot, 9> slots;
+        uint64_t switches = 0, hits = 0;
+        size_t peak_output_bytes = 0;
+    };
+    std::unique_ptr<VerificationWorkspaces> verification_workspaces;
+    int verification_rows_limit = 5; // Wider admission is qualified on SM121.
+    bool verification_cache_suspended = false;
+    const bool verification_cache_requested = true;
     DecodeSegment* active_segment = nullptr;
     enum class SegmentMode { NONE, CAPTURE, REPLAY };
     SegmentMode segment_mode = SegmentMode::NONE;
@@ -441,8 +550,16 @@ struct CudaBackend::Impl {
 #else
         false;
 #endif
+    // Preserve user/build policy while logical prefill temporarily suspends
+    // capture and permits stream-ordered intermediate reclamation.
+    const bool segment_requested = segment_enabled;
 
     ~Impl() {
+        if (fp16_expert_palettes.size())
+            std::fprintf(stderr, "CudaBackend: FP16 expert palettes weights=%zu bytes=%zu\n",
+                         fp16_expert_palettes.size(), fp16_expert_palettes.bytes());
+        if(sigmoid_gr_segment_replays||sigmoid_gr_segment_recoveries)
+            std::fprintf(stderr,"CudaBackend: sigmoid GR segment replays=%zu recoveries=%zu\n",sigmoid_gr_segment_replays,sigmoid_gr_segment_recoveries);
         if(hc_compact_enabled)std::fprintf(stderr,
             "CudaBackend compact HC: producers=%llu consumers=%llu residual_reads=%llu restorations=%llu scratch_bytes=%zu live_tags=%zu allocation_registrations=%llu\n",
             static_cast<unsigned long long>(hc_compact_producers),static_cast<unsigned long long>(hc_compact_consumers),
@@ -473,6 +590,9 @@ struct CudaBackend::Impl {
         if (prefill_token_pair_word_calls)
             std::fprintf(stderr,"CudaBackend: prefill paired token word calls=%llu\n",
                 static_cast<unsigned long long>(prefill_token_pair_word_calls));
+        if (narrow_row_g32_weights)
+            std::fprintf(stderr, "CudaBackend Q4 narrow row cache: weights=%zu bytes=%zu\n",
+                narrow_row_g32_weights, narrow_row_g32_bytes);
         if (row_g32_weights)
             std::fprintf(stderr, "CudaBackend Q4 row-major sidecars: weights=%zu bytes=%zu\n",
                 row_g32_weights, row_g32_bytes);
@@ -494,8 +614,32 @@ struct CudaBackend::Impl {
             if (unfinished) cudaGraphDestroy(unfinished);
         }
         if (ok) cudaDeviceSynchronize();
+        // Destructor fallback also handles a failed cache teardown. Destroy
+        // every captured reader before either prefix/output pool is released.
+        if (verification_workspaces)
+            for (auto& slot : verification_workspaces->slots)
+                for (auto& entry : slot.segments)
+                    if (entry.second.graph) cudaGraphExecDestroy(entry.second.graph);
         for (auto& entry : decode_segments)
             if (entry.second.graph) cudaGraphExecDestroy(entry.second.graph);
+        for (auto& entry : resident_experts) {
+            if (entry.second.graph) cudaGraphExecDestroy(entry.second.graph);
+            entry.second.graph = nullptr;
+        }
+        if (verification_workspaces) {
+            for (auto& slot : verification_workspaces->slots)
+                for (auto& binding : slot.prefixes)
+                    if (binding.storage) mollm_cuda::release_device_buffer(state_snapshot_pool.get(), binding.storage);
+            verification_workspaces.reset();
+        }
+        if(verify_segments_requested)std::fprintf(stderr,"CUDA verify segments: builds=%llu hits=%llu\n",
+            (unsigned long long)verify_segment_builds,(unsigned long long)verify_segment_hits);
+        if(verify_segments_requested)std::fprintf(stderr,"CUDA verify eligibility: entries=%llu tiles=%llu warmups=%llu ready=%llu fallbacks=%llu bank=%zu\n",
+            (unsigned long long)verify_entries,(unsigned long long)verify_tiles,(unsigned long long)verify_warmups,
+            (unsigned long long)verify_ready,(unsigned long long)verify_fallbacks,verify_prefix_bank.size());
+        for(auto& entry:verify_prefix_bank)
+            if(entry.storage)mollm_cuda::release_device_buffer(state_snapshot_pool.get(),entry.storage);
+        verify_prefix_bank.clear();
         if (segment_enabled)
             std::fprintf(stderr, "CudaBackend decode segments: builds=%llu hits=%llu invalidations=%llu\n",
                 static_cast<unsigned long long>(segment_builds),
@@ -539,6 +683,10 @@ struct CudaBackend::Impl {
             std::fprintf(stderr, "CudaBackend: compact gate NVFP4 prefill calls=%zu\n", moe_gate_compact_prefill_calls);
         if (moe_down_compact_prefill_calls)
             std::fprintf(stderr, "CudaBackend: compact down NVFP4 prefill calls=%zu\n", moe_down_compact_prefill_calls);
+        if (moe_mtp_gate_pair_dispatches)
+            std::fprintf(stderr, "CudaBackend: NVFP4 small-batch gate pair host dispatches=%zu\n", moe_mtp_gate_pair_dispatches);
+        if (moe_mtp_down_subwarp_dispatches)
+            std::fprintf(stderr, "CudaBackend: NVFP4 small-batch down subwarp host dispatches=%zu\n", moe_mtp_down_subwarp_dispatches);
         if (gr_inject_rms_fused_calls)
             std::fprintf(stderr, "CudaBackend: GR_INJECT RMS fused calls=%zu\n", gr_inject_rms_fused_calls);
         if(moe_gr_inject_rms_calls)
@@ -608,6 +756,18 @@ struct CudaBackend::Impl {
             cudaFree(diagnostic_weight_fp32);
         if (output)
             cudaFree(output);
+        if (draft_q4_head) cudaFree(draft_q4_head);
+        if (draft_screen_calls)
+            std::fprintf(stderr, "CudaBackend: draft energy screen calls=%zu scratch_bytes=%zu\n",
+                draft_screen_calls, draft_screen_scratch_bytes + draft_screen_sort_bytes);
+        if (draft_screen_scratch) cudaFree(draft_screen_scratch);
+        if (draft_screen_sort) cudaFree(draft_screen_sort);
+        if (q8_head_scalar_calls)
+            std::fprintf(stderr, "CudaBackend: Q8 scalar Q%d screen calls=%zu packs=%zu bytes=%zu q6_bytes=%zu\n",
+                q8_head_scalar_bits, q8_head_scalar_calls, q8_head_scalar_packs, q8_head_scalar_packed_bytes, q8_head_packed_bytes);
+        if (q8_head_scalar_packed) cudaFree(q8_head_scalar_packed);
+        if (q8_head_packed) cudaFree(q8_head_packed);
+        if (q8_head_scratch) cudaFree(q8_head_scratch);
         if (argmax_partial)
             cudaFree(argmax_partial);
         if (argmax_result)
@@ -714,6 +874,17 @@ struct CudaBackend::Impl {
         return true;
     }
 
+    const mollm::cuda_backend_detail::Fp16ExpertPaletteCache::View*
+    find_fp16_expert_palette(const Tensor& tensor) const {
+        if (tensor.prec != Precision::FP16 || tensor.device.buffer || tensor.device.offset ||
+            !tensor.is_contiguous() || tensor.shape[0] <= 0 || tensor.shape[0] > INT32_MAX ||
+            tensor.shape[1] <= 0 || tensor.shape[1] > INT32_MAX ||
+            tensor.shape[2] != 1 || tensor.shape[3] != 1) return nullptr;
+        return fp16_expert_palettes.find(static_cast<const uint16_t*>(
+            tensor.rowmajor_data ? tensor.rowmajor_data : tensor.data),
+            static_cast<int>(tensor.shape[0]), static_cast<int>(tensor.shape[1]));
+    }
+
     const DeviceWeight* find_weight(const Tensor& tensor) const {
         if (!tensor.device.buffer)
             return nullptr;
@@ -774,11 +945,30 @@ struct CudaBackend::Impl {
                 row_g32_bytes += row_bytes;
                 ++row_g32_weights;
             }
+            mollm_cuda::Q4RowG32* narrow_row_g32 = nullptr;
+            // Preserve legacy layout metadata: HC fusion and exact batch reuse
+            // make independent decisions from row_g32. This cache only supplies
+            // the qualified M1 and M4..6 kernels, retaining the original payload.
+            if (prefer_q4_narrow_row_cache && !row_g32 &&
+                layout == WeightLayout::Q4Bg32Biased && n == 2560 && k == 6144) {
+                const size_t row_bytes = static_cast<size_t>(n) * (k / 32) * sizeof(mollm_cuda::Q4RowG32);
+                if (!mollm_cuda::malloc_device(reinterpret_cast<void**>(&narrow_row_g32), row_bytes,
+                        "cudaMalloc Q4 narrow row cache")) { cudaFree(device); return false; }
+                mollm_cuda::launch_repack_q4_row_g32(static_cast<const Q4B8G32Block*>(device), narrow_row_g32, n, k);
+                if (!mollm_cuda::report_cuda(cudaGetLastError(), "repack Q4 narrow row cache")) {
+                    cudaFree(narrow_row_g32); cudaFree(device); return false;
+                }
+                device_allocations.push_back(narrow_row_g32);
+                narrow_row_g32_bytes += row_bytes;
+                ++narrow_row_g32_weights;
+            }
             device_allocations.push_back(device);
             found = weights.emplace(
                 cache_key,
                 DeviceWeight{device, nullptr, type, n, k, 0, 0, layout, row_g32})
                         .first;
+            found->second.data_bytes = bytes;
+            found->second.narrow_row_g32 = narrow_row_g32;
             weights_by_device.emplace(device, &found->second);
         }
         static const size_t prefill_cache_limit = [] {
@@ -909,13 +1099,28 @@ struct CudaBackend::Impl {
             if (exact_reuse && compact_reuse && compact_q4_g32) {
                 if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_compact_small_batch_exact(
                         device_a, static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data),
-                        device_c, m, n, k, lda, ldc, integer_compact, stream), "q4_compact_batch_reuse"))
+                        device_c, m, n, k, lda, ldc, integer_compact, stream,
+                        prefer_q4_fixed_m5), "q4_compact_batch_reuse"))
                     return false;
             } else if (exact_reuse && !compact_q4_g32 && !prepared->row_g32) {
-                if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_g32_small_batch_exact(
-                        device_a, static_cast<const Q4B8G32Block*>(prepared->data),
-                        device_c, m, n, k, lda, ldc, stream), "q4_small_batch_exact_reuse"))
-                    return false;
+                const bool specialized = prefer_q4_m3_specializations && m == 3 && lda == k &&
+                    reinterpret_cast<uintptr_t>(device_a) % alignof(float4) == 0;
+                cudaError_t status;
+                if (prepared->narrow_row_g32 &&
+                    mollm_cuda::q4_narrow_row_eligible(device_a, m, n, k, lda, ldc)) {
+                    status = mollm_cuda::launch_q4_narrow_row(device_a,
+                        prepared->narrow_row_g32, device_c, m, n, k, lda, ldc, stream);
+                } else if (specialized && ((n == 320 && k == 10240) || (n == 640 && k == 2560))) {
+                    status = mollm_cuda::launch_q4_g32_m3_adjacent(device_a,
+                        static_cast<const Q4B8G32Block*>(prepared->data), device_c, n, k, stream);
+                } else if (specialized && ((n == 2560 && k == 6144) || (n == 512 && k == 2560))) {
+                    status = mollm_cuda::launch_q4_g32_m3_fixed(device_a,
+                        static_cast<const Q4B8G32Block*>(prepared->data), device_c, n, k, stream);
+                } else {
+                    status = mollm_cuda::launch_q4_g32_small_batch_exact(device_a,
+                        static_cast<const Q4B8G32Block*>(prepared->data), device_c, m, n, k, lda, ldc, stream);
+                }
+                if (!mollm_cuda::report_cuda(status, "q4_small_batch_exact_reuse")) return false;
             } else {
                 // Diagnostic: run each token through the exact decode projection,
                 // including small router/shared weights, without FP16 expansion.
@@ -929,7 +1134,11 @@ struct CudaBackend::Impl {
                     } else if (compact_q4_g32)
                         mollm_cuda::launch_q4_g32_compact_gemv(a,
                             static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data), c, n, k, stream);
-                    else if (prepared->row_g32 && reinterpret_cast<uintptr_t>(a) % alignof(float2) == 0)
+                    else if (prepared->narrow_row_g32 &&
+                        mollm_cuda::q4_narrow_row_eligible(a, 1, n, k, lda, ldc)) {
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_narrow_row(a,
+                            prepared->narrow_row_g32, c, 1, n, k, lda, ldc, stream), "q4_narrow_row")) return false;
+                    } else if (prepared->row_g32 && reinterpret_cast<uintptr_t>(a) % alignof(float2) == 0)
                         mollm_cuda::launch_q4_row_g32_gemv(a, prepared->row_g32, c, n, k, stream);
                     else
                         mollm_cuda::launch_q4_g32_dense_gemv(a,
@@ -960,7 +1169,11 @@ struct CudaBackend::Impl {
                     mollm_cuda::launch_q4_g32_compact_gemv(device_a,
                         static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data),
                         device_c, n, k, stream);
-                else if (prepared->row_g32 && reinterpret_cast<uintptr_t>(device_a) % alignof(float2) == 0)
+                else if (prepared->narrow_row_g32 &&
+                    mollm_cuda::q4_narrow_row_eligible(device_a, 1, n, k, lda, ldc)) {
+                    if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_narrow_row(device_a,
+                        prepared->narrow_row_g32, device_c, 1, n, k, lda, ldc, stream), "q4_narrow_row")) return false;
+                } else if (prepared->row_g32 && reinterpret_cast<uintptr_t>(device_a) % alignof(float2) == 0)
                     mollm_cuda::launch_q4_row_g32_gemv(device_a, prepared->row_g32,
                         device_c, n, k, stream);
                 else

@@ -28,6 +28,8 @@ public:
     void clear_dispatch_error() override;
     void begin_execution() override;
     bool set_logical_prefill_batch(bool enabled) override;
+    bool set_retained_verification(bool enabled, bool reusable) override;
+    bool set_attention_cache_only(bool enabled) override;
     bool logical_prefill_batch_enabled() const override { return logical_prefill_batch_active_; }
     void prepare_graph(const Graph& graph) override;
     void release_graph_plan(const Graph& graph) override;
@@ -82,12 +84,25 @@ public:
     bool reshape_view_strides(const Tensor& source, const Tensor& target,
                               size_t strides[4]) const override;
     size_t strided_reshape_view_calls() const;
+    // Includes live checkpoints and dormant prefix banks owned by this backend.
+    size_t state_snapshot_pool_reserved_bytes() const;
     size_t prefill_shared_cache_bytes() const;
     size_t prefill_shared_cache_hits() const;
+    size_t q4_narrow_cache_bytes() const;
     bool supports_state_snapshot(const std::vector<Tensor*>& states) const override;
     bool begin_state_prefixes(const std::vector<Tensor*>& states, int tokens) override;
+    bool state_prefixes_cover_graph(const Graph&, const std::vector<Tensor*>&, int) const override;
+    bool state_prefixes_complete() const override;
     bool restore_state_prefix(int kept) override;
     void end_state_prefixes() override;
+    bool prepare_prefill_phase(const std::function<void()>& release_workspace) override {
+        return prepare_prefill_phase(release_workspace, nullptr, nullptr);
+    }
+    bool prepare_prefill_phase(const std::function<void()>& release_workspace,
+                              Graph*, ExecContext*) override;
+    int verification_workspace_max_rows() const override;
+    bool select_verification_workspace(Graph&, ExecContext&, int rows) override;
+    bool release_verification_workspaces(Graph&, ExecContext&) override;
     std::unique_ptr<BackendStateSnapshot> capture_state_snapshot(
         const std::vector<Tensor*>& states) override;
     bool copy_to_host(const Tensor& source, void* destination,
@@ -101,7 +116,7 @@ public:
     void synchronize_for_host_read() override;
     void begin_graph() override;
     void end_graph() override;
-    // Explicit between-call diagnostic. No automatic policy/CLI activation.
+    // Between-call reclamation, also used by the bounded verification policy.
     // Rejects active segment/capture, synchronizes work, invalidates owned
     // graph caches, then frees only returned output-pool blocks.
     bool trim_cached_outputs(size_t* reclaimed_bytes, size_t* invalidated_graphs);
@@ -112,6 +127,8 @@ public:
 
     bool register_weight_region(void* base, size_t size) override;
     void wrap_weight(Tensor& tensor) override;
+    void wrap_routed_expert_weight(Tensor& tensor, int rows_per_expert) override;
+    size_t fp16_expert_palette_bytes() const;
     void wrap_weight_int4(Tensor& tensor,
                           bool keep_native_experts = false) override;
     void alloc_persistent(
@@ -134,12 +151,19 @@ public:
         const Tensor& activation, size_t activation_element_offset,
         const Tensor& weight, float* output_host, int n, int k,
         int activation_kind = 0) override;
+    int lm_head_draft_argmax_device_and_end_graph(
+        const Tensor& activation, size_t activation_element_offset,
+        const Tensor& weight, int n, int k, int activation_kind = 0,
+        Tensor* hidden_copy = nullptr, float* probability = nullptr) override;
     int lm_head_argmax_device_and_end_graph(
         const Tensor& activation, size_t activation_element_offset,
         const Tensor& weight, int n, int k, int activation_kind = 0,
         Tensor* hidden_copy = nullptr) override;
 
 private:
+    bool retire_cached_output_graphs(size_t* invalidated_graphs);
+    bool retire_verify_prefix_bank();
+    bool clear_verification_workspaces(Graph*, ExecContext*);
     bool try_decode_segment(const GraphNode& node,
         const std::vector<const Tensor*>& inputs, Tensor* output, ThreadPool* thread_pool,
         uint64_t fusion_tag = 0, const void* fusion_weight = nullptr,
@@ -154,4 +178,5 @@ private:
     std::unique_ptr<Impl> impl_;
     bool moe_window_merge_active_ = false;
     bool logical_prefill_batch_active_ = false;
+    bool attention_cache_only_ = false;
 };

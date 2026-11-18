@@ -65,8 +65,15 @@ static bool run(const char* path, Device device, const char* companion = nullptr
             std::fprintf(stderr,"CUDA MTP did not use device checkpoints for every state\n");
             return false;
         }
-        if (!stats.recurrent_rollbacks || !stats.recurrent_replay_tokens ||
-            !stats.recurrent_checkpoint_bytes) return false;
+        const char* prefix_option=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
+        const bool expect_prefix=device==Device::CUDA && prefix_option &&
+            !std::strcmp(prefix_option,"1");
+        if (!stats.recurrent_rollbacks || !stats.recurrent_checkpoint_bytes ||
+            (expect_prefix ? stats.recurrent_replay_tokens!=0 : stats.recurrent_replay_tokens==0)) {
+            std::fprintf(stderr,"MTP rollback path mismatch: prefix=%d replay=%llu\n",
+                int(expect_prefix),static_cast<unsigned long long>(stats.recurrent_replay_tokens));
+            return false;
+        }
         // The next hidden state tests more than matching greedy IDs: a
         // corrupted recurrent state may leave argmax unchanged for a while.
         Tensor expected = reference.decode_hidden(current);

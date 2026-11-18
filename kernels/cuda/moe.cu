@@ -1519,10 +1519,16 @@ struct Nvfp4SimtPacket {
     uint8_t scale;
     float4 input;
 };
-template<bool Inputs, bool Interleaved = false, int LoadHint = 0, bool WarpPacket = false, bool AlignedPackets = false, bool PairOnly = false, bool BroadcastScale = false, bool TiledScale = false, bool NativeMmaLayout = false, bool KmajorCodes = false>
+enum class Nvfp4PacketBounds { Checked, Gate2560Proven };
+
+template<bool Inputs, bool Interleaved = false, int LoadHint = 0, bool WarpPacket = false, bool AlignedPackets = false, bool PairOnly = false, bool BroadcastScale = false, bool TiledScale = false, bool NativeMmaLayout = false, bool KmajorCodes = false, Nvfp4PacketBounds Bounds = Nvfp4PacketBounds::Checked>
 __device__ __forceinline__ Nvfp4SimtPacket nvfp4_simt_packet(
     const mollm_cuda::Nvfp4Projection& job, int row, int inner, int quad) {
-    if (quad >= inner / 4) return {};
+    static_assert(Bounds == Nvfp4PacketBounds::Checked || (Inputs && KmajorCodes),
+                  "unchecked packets require the proven gate loop");
+    if constexpr (Bounds == Nvfp4PacketBounds::Checked) {
+        if (quad >= inner / 4) return {};
+    }
     const int groups = inner / 16, group = quad / 4;
     static_assert(!NativeMmaLayout || (!Interleaved && !LoadHint && !WarpPacket && !AlignedPackets && !PairOnly && !BroadcastScale && !TiledScale));
     const int col = quad * 4;
@@ -1746,7 +1752,7 @@ __global__ void nvfp4_gate_activation_cuda(const mollm_cuda::Nvfp4Projection* jo
 template<int PrefetchIterations = 0, bool NativeMmaLayout = false, bool PairedJobs = false,
          int PlannedSize = 0, int Pipeline = 0, int PipelineDepth = 1, bool Interleaved = false,
          bool CacheInput = false, int LoadHint = 0, bool DirectFp4 = false, bool InlinePairs = false,
-         bool RankPairs = false, int FixedInner = 0, bool WarpPacket = false, bool AlignedPackets = false, bool DirectScale = false, bool RouteMajor = false, bool PairOnly = false, bool BroadcastScale = false, bool TiledScale = false, bool KmajorCodes = false>
+         bool RankPairs = false, int FixedInner = 0, bool WarpPacket = false, bool AlignedPackets = false, bool DirectScale = false, bool RouteMajor = false, bool PairOnly = false, bool BroadcastScale = false, bool TiledScale = false, bool KmajorCodes = false, bool ProvenDescriptor = false>
 __global__ void nvfp4_projections_cuda(
     const mollm_cuda::Nvfp4Projection* jobs, int rows, int dynamic_inner, int count = 0,
     const mollm_cuda::Nvfp4MmaBatch* plan = nullptr) {
@@ -1780,6 +1786,14 @@ __global__ void nvfp4_projections_cuda(
         }
     }
     auto job = jobs[first];
+    static_assert(!ProvenDescriptor || (Pipeline == 2 && AlignedPackets && KmajorCodes &&
+        !NativeMmaLayout && !PairedJobs && !PlannedSize && !Interleaved));
+    if constexpr (ProvenDescriptor) {
+        // The resident backend validates every weight descriptor at table
+        // construction and each routed input before this specialization.
+        job.pair_layout = true;
+        job.gate_scales_kmajor = true;
+    }
     float early_row_scale = 0.f;
     if constexpr (LoadHint == 8) {
         if (lane == 0 && row < rows)
@@ -1920,6 +1934,295 @@ __global__ void nvfp4_projections_cuda(
             for (int offset = lanes / 2; offset; offset /= 2)
                 second_sum += __shfl_down_sync(mask, second_sum, offset, lanes);
             if (lane == 0) second.output[row] = second_sum * second.row_scales[row];
+        }
+    }
+}
+
+// Two virtual 32-lane FMA chains per physical 16-lane row. The merge is
+// the original stride16 add, followed by the remaining 8/4/2/1 shuffle tree.
+// K64-major gate codes only; the launcher fixes N1280/K2560, so every CTA
+// is full and both virtual chains have complete iterations.
+// Host admission fixes1280 rows/K2560. Each physical lane owns the same
+// two32-logical-lane FMA chains as before; only packet access control changes.
+template<bool Aligned>
+__device__ __forceinline__ void nvfp4_gate_code_subgroup_compute(
+    const mollm_cuda::Nvfp4Projection& job,int row,int lane) {
+    constexpr int inner=2560,quads=inner/4;
+    const auto packet=[&](int quad) {
+        return nvfp4_simt_packet<true,false,0,false,Aligned,false,false,false,false,true,
+            Nvfp4PacketBounds::Gate2560Proven>(job,row,inner,quad);
+    };
+    const auto accumulate=[](const Nvfp4SimtPacket& p,float sum) {
+        const float2 low=e2m1_pair(p.packed&255),high=e2m1_pair(p.packed>>8);
+        float dot=p.input.x*low.x;
+        dot=fmaf(p.input.y,low.y,dot);
+        dot=fmaf(p.input.z,high.x,dot);
+        dot=fmaf(p.input.w,high.y,dot);
+        return fmaf(dot,e4m3_scale(p.scale),sum);
+    };
+    auto first=packet(lane),second=packet(lane+16);
+    float first_sum=0.f,second_sum=0.f;
+    // lane0..15,19lookaheads: first<=623,second<=639. The final
+    // pending packets cover608..639; no unused out-of-range tail load.
+#pragma unroll 1
+    for(int quad=lane;quad<quads-32;quad+=32) {
+        const auto next_first=packet(quad+32),next_second=packet(quad+48);
+        first_sum=accumulate(first,first_sum);
+        second_sum=accumulate(second,second_sum);
+        first=next_first;second=next_second;
+    }
+    first_sum=accumulate(first,first_sum);
+    second_sum=accumulate(second,second_sum);
+    float sum=first_sum+second_sum;
+    for(int offset=8;offset;offset/=2)
+        sum+=__shfl_down_sync(0xffffffffu,sum,offset,16);
+    if(!lane)job.output[row]=sum*job.row_scales[row];
+}
+
+__global__ void nvfp4_gate_code_subgroup_cuda(const mollm_cuda::Nvfp4Projection* jobs,
+    int rows,int inner) {
+    (void)inner; // The unchanged public entry validates K2560 before launch.
+    const int lane=threadIdx.x&15,row=blockIdx.x*8+threadIdx.x/16;
+    if(row>=rows)return;
+    const auto job=jobs[blockIdx.y];
+    // Every K-major code offset is even and each input quartet offset
+    // is a16-byte multiple. Unqualified descriptors retain safe loads.
+    if((reinterpret_cast<uintptr_t>(job.weight)&1)==0 &&
+       (reinterpret_cast<uintptr_t>(job.input)&15)==0)
+        nvfp4_gate_code_subgroup_compute<true>(job,row,lane);
+    else nvfp4_gate_code_subgroup_compute<false>(job,row,lane);
+}
+
+// Pair equal canonical gate experts in place; retain every input/output address.
+__device__ bool same_nvfp4_gate_expert(const mollm_cuda::Nvfp4Projection& a,
+                               const mollm_cuda::Nvfp4Projection& b) {
+    return same_nvfp4_expert(a,b) && a.gate_scales_kmajor==b.gate_scales_kmajor;
+}
+struct Nvfp4GatePairPacket { Nvfp4SimtPacket first; float4 second; };
+template<bool Aligned,bool ScaleMajor>
+__device__ __forceinline__ void nvfp4_gate_pair_compute(
+    const mollm_cuda::Nvfp4Projection& source,const mollm_cuda::Nvfp4Projection& other,
+    int row,int lane) {
+    auto job=source;
+    if constexpr(ScaleMajor)job.gate_scales_kmajor=true;
+    const auto packet=[&](int q) {
+        Nvfp4GatePairPacket p;
+        p.first=nvfp4_simt_packet<true,false,0,false,Aligned,false,false,false,false,true,
+            Nvfp4PacketBounds::Gate2560Proven>(job,row,2560,q);
+        const float* x=other.input+4*q;
+        p.second=(Aligned||(reinterpret_cast<uintptr_t>(x)&15)==0)
+            ?*reinterpret_cast<const float4*>(x):make_float4(x[0],x[1],x[2],x[3]);
+        return p;
+    };
+    const auto accumulate=[](const Nvfp4GatePairPacket& p,float& a,float& b) {
+        const float2 low=e2m1_pair(p.first.packed&255),high=e2m1_pair(p.first.packed>>8);
+        const float scale=e4m3_scale(p.first.scale);
+        float dot=p.first.input.x*low.x;
+        dot=fmaf(p.first.input.y,low.y,dot);dot=fmaf(p.first.input.z,high.x,dot);
+        dot=fmaf(p.first.input.w,high.y,dot);a=fmaf(dot,scale,a);
+        float second=p.second.x*low.x;
+        second=fmaf(p.second.y,low.y,second);second=fmaf(p.second.z,high.x,second);
+        second=fmaf(p.second.w,high.y,second);b=fmaf(second,scale,b);
+    };
+    auto first=packet(lane),second=packet(lane+16);
+    float a0=0.f,a1=0.f,b0=0.f,b1=0.f;
+#pragma unroll 1
+    for(int q=lane;q<608;q+=32) {
+        const auto next0=packet(q+32),next1=packet(q+48);
+        accumulate(first,a0,b0);accumulate(second,a1,b1);
+        first=next0;second=next1;
+    }
+    accumulate(first,a0,b0);accumulate(second,a1,b1);
+    float a=a0+a1,b=b0+b1;
+    for(int offset=8;offset;offset/=2) {
+        a+=__shfl_down_sync(0xffffffffu,a,offset,16);
+        b+=__shfl_down_sync(0xffffffffu,b,offset,16);
+    }
+    if(!lane){job.output[row]=a*job.row_scales[row];other.output[row]=b*other.row_scales[row];}
+}
+
+// One launch: two warps compare at most50 cached job descriptors per CTA.
+// Original descriptors/output addresses stay in place. No scratch or host readback.
+template<int MinBlocks>
+__global__ __launch_bounds__(128,MinBlocks) void nvfp4_gate_paired_cuda(
+    const mollm_cuda::Nvfp4Projection* jobs,int count) {
+    __shared__ unsigned masks[2];
+    const int route=int(blockIdx.y),thread=int(threadIdx.x);
+    const auto a=jobs[route];
+    if(thread<64) {
+        const bool match=thread<count&&same_nvfp4_gate_expert(a,jobs[thread]);
+        const unsigned mask=__ballot_sync(0xffffffffu,match);
+        if(!(thread&31))masks[thread/32]=mask;
+    }
+    __syncthreads();
+    const unsigned long long bits=static_cast<unsigned long long>(masks[0])|
+        (static_cast<unsigned long long>(masks[1])<<32);
+    const int before=__popcll(bits&((1ull<<route)-1));
+    if(before&1)return; // every thread in this CTA makes the same decision
+    const unsigned long long after=bits&~((1ull<<(route+1))-1);
+    const int partner=after?__ffsll(static_cast<long long>(after))-1:-1;
+    const int lane=thread&15,row=int(blockIdx.x)*8+thread/16;
+    if(partner<0) {
+        if((reinterpret_cast<uintptr_t>(a.weight)&1)==0&&(reinterpret_cast<uintptr_t>(a.input)&15)==0)
+            nvfp4_gate_code_subgroup_compute<true>(a,row,lane);
+        else nvfp4_gate_code_subgroup_compute<false>(a,row,lane);
+        return;
+    }
+    const auto b=jobs[partner];
+    const bool aligned=(reinterpret_cast<uintptr_t>(a.weight)&1)==0&&
+        (reinterpret_cast<uintptr_t>(a.input)&15)==0&&(reinterpret_cast<uintptr_t>(b.input)&15)==0;
+    if(aligned)nvfp4_gate_pair_compute<true,false>(a,b,row,lane);
+    else nvfp4_gate_pair_compute<false,false>(a,b,row,lane);
+}
+
+// PAIR code coalescing: retain the original FP32 tree in four virtual chains.
+template<bool Aligned,bool Pair>
+__device__ __forceinline__ void nvfp4_gate_eight_compute(
+    const mollm_cuda::Nvfp4Projection& job,const mollm_cuda::Nvfp4Projection& other,
+    int row,int lane) {
+    const auto packet=[&](int q) {
+        Nvfp4GatePairPacket p{};
+        p.first=nvfp4_simt_packet<true,false,0,false,Aligned,false,false,false,false,true,
+            Nvfp4PacketBounds::Gate2560Proven>(job,row,2560,q);
+        if constexpr(Pair) {
+            const float* x=other.input+4*q;
+            p.second=(Aligned||(reinterpret_cast<uintptr_t>(x)&15)==0)
+                ?*reinterpret_cast<const float4*>(x):make_float4(x[0],x[1],x[2],x[3]);
+        }
+        return p;
+    };
+    const auto accumulate=[](const Nvfp4GatePairPacket& p,float& a,float& b) {
+        const float2 low=e2m1_pair(p.first.packed&255),high=e2m1_pair(p.first.packed>>8);
+        const float scale=e4m3_scale(p.first.scale);
+        float dot=p.first.input.x*low.x;
+        dot=fmaf(p.first.input.y,low.y,dot);dot=fmaf(p.first.input.z,high.x,dot);
+        dot=fmaf(p.first.input.w,high.y,dot);a=fmaf(dot,scale,a);
+        if constexpr(Pair) {
+            float second=p.second.x*low.x;
+            second=fmaf(p.second.y,low.y,second);second=fmaf(p.second.z,high.x,second);
+            second=fmaf(p.second.w,high.y,second);b=fmaf(second,scale,b);
+        }
+    };
+    float a[4]{},b[4]{};
+    // Four independent original32-lane chains, each with the same K order.
+#pragma unroll 1
+    for(int base=0;base<640;base+=32) {
+#pragma unroll
+        for(int c=0;c<4;++c)accumulate(packet(base+lane+c*8),a[c],b[c]);
+    }
+    // Original16-physical-lane result first combines logical lane r with
+    // r+16, then the offset8 shuffle adds logical r+8/r+24. Keep this tree.
+    float sum=(a[0]+a[2])+(a[1]+a[3]);
+    float second=0.f;if constexpr(Pair)second=(b[0]+b[2])+(b[1]+b[3]);
+    for(int offset=4;offset;offset/=2) {
+        sum+=__shfl_down_sync(0xffffffffu,sum,offset,8);
+        if constexpr(Pair)second+=__shfl_down_sync(0xffffffffu,second,offset,8);
+    }
+    if(!lane){job.output[row]=sum*job.row_scales[row];if constexpr(Pair)other.output[row]=second*other.row_scales[row];}
+}
+__global__ __launch_bounds__(128,6) void nvfp4_gate_paired8_cuda(
+    const mollm_cuda::Nvfp4Projection* jobs,int count) {
+    __shared__ unsigned masks[2];
+    const int route=int(blockIdx.y),thread=int(threadIdx.x);
+    const auto a=jobs[route];
+    if(thread<64) {
+        const bool match=thread<count&&same_nvfp4_gate_expert(a,jobs[thread]);
+        const unsigned mask=__ballot_sync(0xffffffffu,match);
+        if(!(thread&31))masks[thread/32]=mask;
+    }
+    __syncthreads();
+    const unsigned long long bits=static_cast<unsigned long long>(masks[0])|
+        (static_cast<unsigned long long>(masks[1])<<32);
+    const int before=__popcll(bits&((1ull<<route)-1));
+    if(before&1)return; // every thread in this CTA makes the same decision
+    const unsigned long long after=bits&~((1ull<<(route+1))-1);
+    const int partner=after?__ffsll(static_cast<long long>(after))-1:-1;
+
+    const auto b=partner<0?a:jobs[partner];
+    // ROW layouts retain the original16-lane mapping: the source-derived
+    // sector audit shows8 lanes makes their code traffic worse.
+    if(a.pair_layout) {
+        const int lane=thread&7,row=int(blockIdx.x)*16+thread/8;
+        const bool aligned=(reinterpret_cast<uintptr_t>(a.weight)&1)==0&&
+            (reinterpret_cast<uintptr_t>(a.input)&15)==0&&
+            (partner<0||(reinterpret_cast<uintptr_t>(b.input)&15)==0);
+        if(partner<0) {
+            if(aligned)nvfp4_gate_eight_compute<true,false>(a,a,row,lane);
+            else nvfp4_gate_eight_compute<false,false>(a,a,row,lane);
+        } else {
+            if(aligned)nvfp4_gate_eight_compute<true,true>(a,b,row,lane);
+            else nvfp4_gate_eight_compute<false,true>(a,b,row,lane);
+        }
+        return;
+    }
+    const int lane=thread&15,first_row=int(blockIdx.x)*16+thread/16;
+#pragma unroll
+    for(int half=0;half<2;++half) {
+        const int row=first_row+half*8;
+        if(partner<0) {
+            if((reinterpret_cast<uintptr_t>(a.weight)&1)==0&&(reinterpret_cast<uintptr_t>(a.input)&15)==0)
+                nvfp4_gate_code_subgroup_compute<true>(a,row,lane);
+            else nvfp4_gate_code_subgroup_compute<false>(a,row,lane);
+        } else {
+            const bool aligned=(reinterpret_cast<uintptr_t>(a.weight)&1)==0&&
+                (reinterpret_cast<uintptr_t>(a.input)&15)==0&&(reinterpret_cast<uintptr_t>(b.input)&15)==0;
+            if(aligned)nvfp4_gate_pair_compute<true,false>(a,b,row,lane);
+            else nvfp4_gate_pair_compute<false,false>(a,b,row,lane);
+        }
+    }
+}
+
+__global__ __launch_bounds__(128,6) void nvfp4_gate_paired8_wide_cuda(
+    const mollm_cuda::Nvfp4Projection* jobs,int count) {
+    // All four warps participate. Rank and partner search use word-local
+    // shifts, including routes63/64; no shift reaches the integer bit width.
+    __shared__ unsigned masks[4];
+    const int route=int(blockIdx.y),thread=int(threadIdx.x);
+    const auto a=jobs[route];
+    const bool match=thread<count&&same_nvfp4_gate_expert(a,jobs[thread]);
+    const unsigned mask=__ballot_sync(0xffffffffu,match);
+    if(!(thread&31))masks[thread/32]=mask;
+    __syncthreads();
+    const int word=route/32,bit=route%32;
+    int before=0;
+    for(int i=0;i<word;++i)before+=__popc(masks[i]);
+    before+=__popc(masks[word]&((1u<<bit)-1u));
+    if(before&1)return;
+    const unsigned after=masks[word]&~static_cast<unsigned>((1ull<<(bit+1))-1ull);
+    int partner=after?word*32+__ffs(after)-1:-1;
+    for(int i=word+1;i<4;++i)
+        if(partner<0&&masks[i])partner=i*32+__ffs(masks[i])-1;
+
+    const auto b=partner<0?a:jobs[partner];
+    // ROW layouts retain the original16-lane mapping: the source-derived
+    // sector audit shows8 lanes makes their code traffic worse.
+    if(a.pair_layout) {
+        const int lane=thread&7,row=int(blockIdx.x)*16+thread/8;
+        const bool aligned=(reinterpret_cast<uintptr_t>(a.weight)&1)==0&&
+            (reinterpret_cast<uintptr_t>(a.input)&15)==0&&
+            (partner<0||(reinterpret_cast<uintptr_t>(b.input)&15)==0);
+        if(partner<0) {
+            if(aligned)nvfp4_gate_eight_compute<true,false>(a,a,row,lane);
+            else nvfp4_gate_eight_compute<false,false>(a,a,row,lane);
+        } else {
+            if(aligned)nvfp4_gate_eight_compute<true,true>(a,b,row,lane);
+            else nvfp4_gate_eight_compute<false,true>(a,b,row,lane);
+        }
+        return;
+    }
+    const int lane=thread&15,first_row=int(blockIdx.x)*16+thread/16;
+#pragma unroll
+    for(int half=0;half<2;++half) {
+        const int row=first_row+half*8;
+        if(partner<0) {
+            if((reinterpret_cast<uintptr_t>(a.weight)&1)==0&&(reinterpret_cast<uintptr_t>(a.input)&15)==0)
+                nvfp4_gate_code_subgroup_compute<true>(a,row,lane);
+            else nvfp4_gate_code_subgroup_compute<false>(a,row,lane);
+        } else {
+            const bool aligned=(reinterpret_cast<uintptr_t>(a.weight)&1)==0&&
+                (reinterpret_cast<uintptr_t>(a.input)&15)==0&&(reinterpret_cast<uintptr_t>(b.input)&15)==0;
+            if(aligned)nvfp4_gate_pair_compute<true,false>(a,b,row,lane);
+            else nvfp4_gate_pair_compute<false,false>(a,b,row,lane);
         }
     }
 }
@@ -2596,6 +2899,45 @@ cudaError_t launch_nvfp4_gate_code_projections(const Nvfp4Projection* jobs,
     else
         nvfp4_projections_cuda<0,false,false,0,0,1,false,false,0,false,false,false,0,false,false,false,false,false,false,false,true>
             <<<grid,128,0,stream>>>(jobs,rows,inner);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_nvfp4_gate_code_m1_proven_projections(const Nvfp4Projection* jobs,
+    int count, int rows, int inner, cudaStream_t stream) {
+    if (!jobs || count < 1 || count > 50 || rows != 1280 || inner != 2560 ||
+        reinterpret_cast<uintptr_t>(jobs) % alignof(Nvfp4Projection))
+        return cudaErrorInvalidValue;
+    // Retain runtime bounds and the original pending-packet schedule.
+    nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,0,false,true,false,false,false,false,false,true,true>
+        <<<dim3(320,count),128,0,stream>>>(jobs,rows,inner);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_nvfp4_gate_code_subgroup_projections(const Nvfp4Projection* jobs,
+    int count,int rows,int inner,cudaStream_t stream) {
+    if(!jobs || count<1 || count>65535 || rows!=1280 || inner!=2560 ||
+       reinterpret_cast<uintptr_t>(jobs)%alignof(Nvfp4Projection))
+        return cudaErrorInvalidValue;
+    nvfp4_gate_code_subgroup_cuda<<<dim3(rows/8,count),128,0,stream>>>(jobs,rows,inner);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_nvfp4_gate_paired_projections(const Nvfp4Projection* jobs,
+    int count, int rows, int inner, cudaStream_t stream) {
+    if (!jobs || count < 1 || count > 50 || rows != 1280 || inner != 2560 ||
+        reinterpret_cast<uintptr_t>(jobs) % alignof(Nvfp4Projection))
+        return cudaErrorInvalidValue;
+    nvfp4_gate_paired_cuda<8><<<dim3(rows / 8, count), 128, 0, stream>>>(jobs, count);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_nvfp4_gate_paired8_projections(const Nvfp4Projection* jobs,
+    int count,int rows,int inner,cudaStream_t stream) {
+    if(!jobs||count<1||count>80||rows!=1280||inner!=2560||
+       reinterpret_cast<uintptr_t>(jobs)%alignof(Nvfp4Projection))
+        return cudaErrorInvalidValue;
+    if(count<=50)nvfp4_gate_paired8_cuda<<<dim3(rows/16,count),128,0,stream>>>(jobs,count);
+    else nvfp4_gate_paired8_wide_cuda<<<dim3(rows/16,count),128,0,stream>>>(jobs,count);
     return cudaGetLastError();
 }
 

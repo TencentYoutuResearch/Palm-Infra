@@ -407,9 +407,24 @@ python3 tools/export_qwen4_qsa_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
 其他 bundle。CLI 参数可覆盖预设，例如 `--prefill-chunk-size 512`。
 
 QSA 支持范围：仅文本、连续因果历史最多 262,144 tokens（受内存限制），不支持
-MTP、static padding、vision 或非规范 mask。不支持的配置会直接拒绝，而不是
+static padding、vision 或非规范 mask。不支持的配置会直接拒绝，而不是
 静默使用 dense attention。companion 必须与所选 checkpoint 匹配。Launcher
 会在启动时检查 GPU 空闲与 host 内存；admission check 不是内存预留。
+
+可选的 QSA + MTP 需要先导出独立 draft，再使用对应预设：
+
+```bash
+python3 tools/export_qwen4_mtp_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
+  ../qwen38_mtp_qsa_bundle --qsa --n-ctx 32768
+./chat-qwen38-cuda-mtp.sh
+```
+
+默认使用 32K context 和两个 draft tokens，可由 `--n-ctx` 与
+`--mtp-draft-tokens` 覆盖。两个 launcher 默认启用已测量的 greedy 优化；
+MTP 还使用紧凑 draft head、无损 FP16 expert palette 与验证缓存。draft 的
+近似计算不会替代原始权重的 target verification。生产后端按设备能力和
+shape 选择相应策略，不支持的配置保留通用路径。测量结果与限制见
+[性能说明](docs/performance.md)。
 
 对于 Qwen3.8-Flash-Next 之外的模型，CUDA 是 native/fallback 混合实现：图输出、
 持久状态、dense elementwise、norm、RoPE、SDPA 与 decode `lm_head` 在 CUDA

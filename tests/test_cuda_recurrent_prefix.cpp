@@ -176,12 +176,17 @@ static bool gdn(int sequence,int real,int flags,int heads,int values) {
     for(float*p:{q,single_q,da,db,dz,dl,dt,dn,state,output,prefix})cudaFree(p);
     return true;
 }
-int main() {
+int main(int argc, char** argv) {
+    const bool sanitizer_checks=argc==2&&!std::strcmp(argv[1],"--gdn-sanitizer");
+    const bool gdn_only=sanitizer_checks||(argc==2&&!std::strcmp(argv[1],"--gdn-only"));
+    if(argc!=1&&!gdn_only)return 2;
     int count=0;if(cudaGetDeviceCount(&count)!=cudaSuccess||!count)return 77;
     if(mollm_cuda::launch_shortconv_prefixes(nullptr,nullptr,nullptr,nullptr,nullptr,7,2,4,2,1,7))return 1;
-    for(int groups:{7,257})for(int sequence:{2,3,4,5,7,8})for(int kernel:{2,4,8})
+    if(!gdn_only)for(int groups:{7,257})for(int sequence:{2,3,4,5,6,7,8})for(int kernel:{2,4,8})
         for(int real:{sequence-1,sequence})if(!run(groups,sequence,kernel,real))return 1;
-    for(int sequence:{2,3,4,5,7,8})for(int real:{sequence-1,sequence})for(int flags:{0,1,2,3})
+    for(int sequence:{2,3,4,5,6,7,8})for(int real:{sequence-1,sequence})for(int flags:{0,1,2,3})
         for(int heads:{1,2})if(!gdn(sequence,real,flags,heads,heads*2))return 1;
-    std::puts("72 shortconv and 96 GDN prefix-state/output/guard fixtures passed; GDN graph replay/changed input exact");return 0;
+    for(int sequence:sanitizer_checks?std::vector<int>{3}:std::vector<int>{2,3,4,8})for(int real:{sequence-1,sequence})for(int flags:{1,3})
+        if(!gdn(sequence,real,flags,16,48))return 1;
+    std::printf("%d shortconv and %d GDN prefix-state/output/guard fixtures passed; GDN graph replay/changed input exact\n",gdn_only?0:72,sanitizer_checks?100:112);return 0;
 }

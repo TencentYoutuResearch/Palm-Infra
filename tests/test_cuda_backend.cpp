@@ -1408,6 +1408,175 @@ bool test_shortconv(CudaBackend& backend) {
         close_enough(actual_state, expected_state, 1e-6f);
 }
 
+bool test_verification_workspace_pool() {
+    auto fail = [](int line) { std::fprintf(stderr, "verification pool assertion at line %d\n", line); return false; };
+    CudaBackend backend;
+    const char* pool_limit=std::getenv("MOLLM_CUDA_OUTPUT_POOL_MB");
+    const bool bounded=pool_limit&&std::atoi(pool_limit)>0;
+    int releases=0;
+    if(!backend.prepare_prefill_phase([&]{++releases;})||releases)return fail(__LINE__);
+    Tensor state=Tensor::create(Precision::FP32,MemoryType::NONE,32);
+    backend.alloc_persistent(state,state.nbytes(),PersistentHostAccess::NONE);
+    const std::vector<float> initial(32,.5f);
+    if(!upload(backend,state,initial)||!backend.begin_state_prefixes({&state},3))return fail(__LINE__);
+    backend.end_state_prefixes();
+    if(!backend.prepare_prefill_phase([&]{++releases;})||releases||
+       !backend.begin_state_prefixes({&state},3))return fail(__LINE__);
+    Tensor cached=device_tensor(backend,2048);
+    backend.free_output(cached,nullptr);
+    if(!backend.set_retained_verification(true,false)||
+       !backend.prepare_prefill_phase([&]{++releases;})||releases)return fail(__LINE__);
+    size_t reclaimed=0,invalidated=0;
+    // Observe retained bytes through explicit reclamation, rather than
+    // assuming a recycled CUDA address proves that cudaFree was avoided.
+    if(!backend.trim_cached_outputs(&reclaimed,&invalidated)||
+       reclaimed!=(bounded?8192u:0u))return fail(__LINE__);
+    if(!backend.set_retained_verification(false,false))return fail(__LINE__);
+    backend.end_state_prefixes();
+    if(!bounded) {
+        if(!backend.prepare_prefill_phase([&]{++releases;})||releases)return fail(__LINE__);
+    } else {
+        cached=device_tensor(backend,2048);backend.free_output(cached,nullptr);
+        Tensor live=device_tensor(backend,4096);
+        auto release=[&]{++releases;backend.free_output(live,nullptr);};
+        if(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)!=cudaSuccess)return fail(__LINE__);
+        const bool rejected=!backend.prepare_prefill_phase(release)&&releases==0;
+        cudaGraph_t graph=nullptr;
+        if(cudaStreamEndCapture(cudaStreamPerThread,&graph)!=cudaSuccess)return fail(__LINE__);
+        if(graph)cudaGraphDestroy(graph);
+        if(!rejected||backend.prepare_prefill_phase({})||releases)return fail(__LINE__);
+        if(!backend.prepare_prefill_phase(release)||releases!=1||
+           !backend.trim_cached_outputs(&reclaimed,&invalidated)||reclaimed)return fail(__LINE__);
+        if(!backend.prepare_prefill_phase([&]{++releases;})||releases!=1)return fail(__LINE__);
+    }
+    std::vector<float> actual;
+    if(!download(backend,state,actual)||actual!=initial)return fail(__LINE__);
+    if (bounded) {
+        // Full prefill must release free prefix storage as well as outputs.
+        // Keep an independent live checkpoint in that same pool: trimming it
+        // would corrupt rollback even if the global free-memory check passed.
+        constexpr int elements = 2 * 1024 * 1024;
+        Tensor large = Tensor::create(Precision::FP32, MemoryType::NONE, elements);
+        backend.alloc_persistent(large, large.nbytes(), PersistentHostAccess::NONE);
+        const std::vector<float> expected(elements, .25f);
+        if (!upload(backend, large, expected)) return fail(__LINE__);
+        auto checkpoint = backend.capture_state_snapshot({&large});
+        if (!checkpoint || !backend.begin_state_prefixes({&large}, 3) ||
+            !backend.set_retained_verification(true, false)) return fail(__LINE__);
+        if (!backend.set_retained_verification(false, false)) return fail(__LINE__);
+        backend.end_state_prefixes();
+        // Unified-memory free space also changes with unrelated host activity.
+        // Observe this backend's actual pool allocations: bookkeeping is only
+        // removed after cudaFree succeeds. The live checkpoint must remain.
+        const size_t before = backend.state_snapshot_pool_reserved_bytes();
+        if (!backend.prepare_prefill_phase([] {})) return fail(__LINE__);
+        const size_t after = backend.state_snapshot_pool_reserved_bytes();
+        if (before < after || before - after < large.nbytes() * 3 ||
+            after != large.nbytes()) return fail(__LINE__);
+        std::printf("CUDA verification prefix reclamation: freed=%zu checkpoint=%zu bytes\n",
+            before - after, after);
+        if (!backend.zero_tensor(large, large.nbytes()) || !checkpoint->restore() ||
+            !download(backend, large, actual) || actual != expected) return fail(__LINE__);
+        std::puts("CUDA verification prefix pool: dormant banks reclaimed, live checkpoint exact PASS");
+    }
+    std::printf("CUDA verification pool: bounded=%d scoped retention, prefill reclaim, capture rejection and persistent state PASS\n",int(bounded));
+    return true;
+}
+
+bool test_prefix_plan_backend_contract(int tokens = 3) {
+    CudaBackend backend;
+    backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+    Graph graph;
+    graph.nodes.resize(4);graph.runtime.tensors.resize(4);
+    auto& t=graph.runtime.tensors;
+    t[0]=device_tensor(backend,8,8);t[1]=device_tensor(backend,4,8);
+    t[2]=device_tensor(backend,8,3);t[3]=device_tensor(backend,8,8);
+    t[0].shape[1]=t[3].shape[1]=tokens;t[0].compute_strides();t[3].compute_strides();
+    for(uint32_t i=0;i<4;++i){graph.nodes[i].id=i;graph.nodes[i].op_type=OpType::INPUT;}
+    auto& conv=graph.nodes[3];conv.op_type=OpType::SHORTCONV;
+    conv.inputs={0,1,2};conv.params.i32={4,tokens};
+    const std::vector<Tensor*> states{&t[2]};
+    const std::vector<float> input(8*tokens,1.f),weights(32,.25f),initial(24,.5f);
+    if(!upload(backend,t[0],input)||!upload(backend,t[1],weights)||!upload(backend,t[2],initial)||
+       !backend.begin_state_prefixes(states,tokens)||backend.state_prefixes_cover_graph(graph,states,tokens))return false;
+    backend.dispatch(conv,{&t[0],&t[1],&t[2]},&t[3],nullptr);
+    std::vector<float> actual;
+    if(!download(backend,t[2],actual)||!backend.state_prefixes_complete())return false;
+    backend.end_state_prefixes();
+    if(!backend.begin_state_prefixes(states,tokens)||backend.state_prefixes_complete()||
+       !backend.state_prefixes_cover_graph(graph,states,tokens)||
+       backend.state_prefixes_cover_graph(graph,{},tokens))return false;
+    if(backend.restore_state_prefix(1))return false;
+    Tensor clone=t[2];
+    if(backend.state_prefixes_cover_graph(graph,{&clone},tokens))return false;
+    conv.params.i32[1]=2;
+    if(backend.state_prefixes_cover_graph(graph,states,tokens))return false;
+    conv.params.i32[1]=tokens;
+    conv.op_type=OpType::RWKV7;
+    if(backend.state_prefixes_cover_graph(graph,states,tokens))return false;
+    conv.op_type=OpType::SHORTCONV;
+    if(!upload(backend,t[2],initial))return false;
+    backend.dispatch(conv,{&t[0],&t[1],&t[2]},&t[3],nullptr);
+    if(!backend.state_prefixes_complete()||!backend.restore_state_prefix(1)||
+       !download(backend,t[2],actual))return false;
+    for(int group=0;group<8;++group)for(int tap=0;tap<3;++tap)
+        if(actual[group*3+tap]!=(tap<2?.5f:1.f))return false;
+    backend.end_state_prefixes();
+    // A missing producer must revoke the next admission, including all-pass
+    // verification where the engine does not otherwise restore a prefix.
+    if(!backend.begin_state_prefixes(states,tokens))return false;
+    backend.end_state_prefixes();
+    if(!backend.begin_state_prefixes(states,tokens)||backend.state_prefixes_cover_graph(graph,states,tokens))return false;
+    backend.end_state_prefixes();
+    // Same owners and addresses, different allocation widths. Upgrade3->4->5
+    // and keep its bank across a smaller tail; each scoped prefix still has
+    // the current width's extent and must reproduce the complete history.
+    if(tokens==3) {
+        int transition=0;
+        int retained_width=3;
+        for(int width:{4,3,4,5,6,7,8,5,8,4,3}) {
+            if(width>backend.verification_workspace_max_rows())continue;
+            retained_width=std::max(retained_width,width);
+            t[0].shape[1]=t[3].shape[1]=width;t[0].compute_strides();t[3].compute_strides();
+            conv.params.i32[1]=width;
+            std::vector<float> values(8*width);
+            for(size_t i=0;i<values.size();++i)values[i]=float(int((i+transition)%13)-6)/16.f;
+            if(!upload(backend,t[0],values)||!upload(backend,t[2],initial)||
+               !backend.begin_state_prefixes(states,width)||backend.state_prefixes_cover_graph(graph,states,width))return false;
+            if(width<retained_width && backend.set_retained_verification(true,true))return false;
+            backend.dispatch(conv,{&t[0],&t[1],&t[2]},&t[3],nullptr);
+            if(!backend.state_prefixes_complete())return false;
+            for(int kept=1;kept<=width;++kept) {
+                if(!backend.restore_state_prefix(kept)||!download(backend,t[2],actual))return false;
+                for(int group=0;group<8;++group)for(int tap=0;tap<3;++tap) {
+                    const int token=kept-3+tap;
+                    if(actual[group*3+tap]!=(token<0?.5f:values[token*8+group]))return false;
+                }
+            }
+            backend.end_state_prefixes();++transition;
+        }
+        // A bank upgrade inside a foreign capture must leave the original
+        // bindings intact. A fresh backend exercises rejection before upgrade.
+        CudaBackend captured_backend;Graph foreign;foreign.nodes.resize(4);foreign.runtime.tensors.resize(4);auto& ft=foreign.runtime.tensors;
+        ft[0]=device_tensor(captured_backend,8,3);ft[1]=device_tensor(captured_backend,4,8);ft[2]=device_tensor(captured_backend,8,3);ft[3]=device_tensor(captured_backend,8,3);
+        for(uint32_t i=0;i<4;++i){foreign.nodes[i].id=i;foreign.nodes[i].op_type=OpType::INPUT;}
+        auto& node=foreign.nodes[3];node.op_type=OpType::SHORTCONV;node.inputs={0,1,2};node.params.i32={4,3};
+        if(!upload(captured_backend,ft[0],std::vector<float>(24,1.f))||!upload(captured_backend,ft[1],weights)||!upload(captured_backend,ft[2],initial)||!captured_backend.begin_state_prefixes({&ft[2]},3))return false;
+        captured_backend.dispatch(node,{&ft[0],&ft[1],&ft[2]},&ft[3],nullptr);captured_backend.end_graph();captured_backend.end_state_prefixes();
+        if(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)!=cudaSuccess)return false;
+        const bool rejected=!captured_backend.begin_state_prefixes({&ft[2]},5);
+        cudaGraph_t capture=nullptr;const auto ended=cudaStreamEndCapture(cudaStreamPerThread,&capture);if(capture)cudaGraphDestroy(capture);
+        if(!rejected||ended!=cudaSuccess||!captured_backend.begin_state_prefixes({&ft[2]},3)||!captured_backend.state_prefixes_cover_graph(foreign,{&ft[2]},3))return false;
+        captured_backend.end_state_prefixes();
+        Tensor rebound=t[2];
+        if(!backend.begin_state_prefixes({&rebound},5)||backend.state_prefixes_complete()||backend.state_prefixes_cover_graph(graph,states,5))return false;
+        backend.end_state_prefixes();
+
+    }
+    std::puts("CUDA prefix plan: first-use fallback, full coverage, changed writers and missing-producer revocation PASS");
+    return true;
+}
+
 bool test_nvfp4_moe_provider() {
     int pageable = 0, host_tables = 0;
     cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0);
@@ -1631,6 +1800,17 @@ bool test_nvfp4_moe_provider() {
         segment_moe.op_type = OpType::MOE;
         for (int pass = 0; pass < 12; ++pass) {
             if (pass == 9) {
+                // A later prefill must retire existing decode executables
+                // before recycling any intermediate addresses. Its stateful
+                // last-use contract is available only while capture is off.
+                GraphNode recurrent_contract;
+                recurrent_contract.op_type = OpType::GATED_DELTANET_PREFILL;
+                recurrent_contract.out_prec = Precision::FP32;
+                recurrent_contract.inputs.resize(8);
+                const int decode_contract = graph_backend.independent_stateful_mutable_input(recurrent_contract);
+                if (!graph_backend.set_logical_prefill_batch(true) ||
+                    !graph_backend.logical_prefill_batch_enabled() ||
+                    graph_backend.independent_stateful_mutable_input(recurrent_contract) != 7) return false;
                 // Force automatic limit-triggered reclamation while resident
                 // and segment caches from the preceding passes exist.
                 Tensor cached = device_tensor(graph_backend, 768 * 1024 / sizeof(float));
@@ -1647,7 +1827,10 @@ bool test_nvfp4_moe_provider() {
                 graph_backend.begin_graph();
                 graph_backend.dispatch(prefill, {&large_x, &qr, &gate, &down, &qg, &qu, &qd, &qs}, &large_y, nullptr);
                 graph_backend.end_graph();
-                if (graph_backend.dispatch_failed()) return false;
+                if (graph_backend.dispatch_failed() ||
+                    !graph_backend.set_logical_prefill_batch(false) ||
+                    graph_backend.logical_prefill_batch_enabled() ||
+                    graph_backend.independent_stateful_mutable_input(recurrent_contract) != decode_contract) return false;
             }
             std::vector<float> input(32, .25f + pass / 32.f), transformed(32), expected(32), actual;
             for (int i = 0; i < 32; ++i) transformed[i] = 1.f / (1.f + std::exp(-input[i]));
@@ -1680,7 +1863,9 @@ bool test_nvfp4_moe_provider() {
                 size_t reclaimed = 0, invalidated = 0;
                 if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return false;
                 const bool rejected = !graph_backend.trim_cached_outputs(&reclaimed, &invalidated) &&
-                    reclaimed == 0 && invalidated == 0;
+                    reclaimed == 0 && invalidated == 0 &&
+                    !graph_backend.set_logical_prefill_batch(true) &&
+                    !graph_backend.logical_prefill_batch_enabled();
                 cudaGraph_t capture = nullptr;
                 const cudaError_t ended = cudaStreamEndCapture(cudaStreamPerThread, &capture);
                 if (capture) cudaGraphDestroy(capture);
@@ -1694,6 +1879,192 @@ bool test_nvfp4_moe_provider() {
                 // Later changed-input passes must rebuild caches and still
                 // match the complete CPU output, including BF16 rounding.
             }
+        }
+        if(graph_backend.verification_workspace_max_rows() > 0 &&
+           !std::getenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS")) {
+            setenv("MOLLM_CUDA_MTP_STATE_PREFIXES", "1", 1);
+            const char* width_env=std::getenv("MOLLM_TEST_CUDA_VERIFY_WIDTH");
+            const int width=width_env?std::atoi(width_env):3;
+            if((width<3 || width>8)||!test_prefix_plan_backend_contract(width))return false;
+            if(graph_backend.begin_state_prefixes({nullptr},3)||
+               graph_backend.set_retained_verification(true,true))return false;
+            graph_backend.end_state_prefixes();
+            Tensor vx=device_tensor(graph_backend,32,width),vt=device_tensor(graph_backend,32,width);
+            Tensor vy=device_tensor(graph_backend,32,width),vo=device_tensor(graph_backend,32,width);
+            Tensor filter=device_tensor(graph_backend,4,32),state=device_tensor(graph_backend,3,32);
+            std::vector<float> weights(128,.25f),initial(96,.5f),input(32*width);
+            if(!upload(graph_backend,filter,weights))return false;
+            GraphNode conv;conv.op_type=OpType::SHORTCONV;conv.params.i32={4,width};
+            // Compare captured GDN state to an independent, uncaptured GPU
+            // evaluation of each real prefix. Nonzero Q/K exercise updates.
+            CudaBackend reference_backend;
+            Tensor gq=device_tensor(graph_backend,384,width),ga=device_tensor(graph_backend,1,width);
+            Tensor gb=device_tensor(graph_backend,1,width),gz=device_tensor(graph_backend,128,width);
+            Tensor gal=device_tensor(graph_backend,1),gdt=device_tensor(graph_backend,1);
+            Tensor gn=device_tensor(graph_backend,128),gs=device_tensor(graph_backend,128,128);
+            Tensor gout=device_tensor(graph_backend,128,width);
+            Tensor rq=device_tensor(reference_backend,384,width),ra=device_tensor(reference_backend,1,width);
+            Tensor rb=device_tensor(reference_backend,1,width),rz=device_tensor(reference_backend,128,width);
+            Tensor ral=device_tensor(reference_backend,1),rdt=device_tensor(reference_backend,1);
+            Tensor rn=device_tensor(reference_backend,128),rs=device_tensor(reference_backend,128,128);
+            Tensor rout=device_tensor(reference_backend,128,width);
+            std::vector<float> qkv(384*width),av(width),bv(width),zv(128*width,.25f);
+            for(int i=0;i<width;++i){av[i]=float(i-1)*.2f;bv[i]=float(i+1)*.1f;}
+            std::vector<float> al={-1.f},dt={.1f},norm(128,1.f),state_initial(128*128);
+            for(size_t i=0;i<state_initial.size();++i)state_initial[i]=float(int(i%19)-9)/97.f;
+            for(auto* device:{&graph_backend,&reference_backend}) {
+                const bool target=device==&graph_backend;
+                if(!upload(*device,target?ga:ra,av)||!upload(*device,target?gb:rb,bv)||
+                   !upload(*device,target?gz:rz,zv)||!upload(*device,target?gal:ral,al)||
+                   !upload(*device,target?gdt:rdt,dt)||!upload(*device,target?gn:rn,norm))return false;
+            }
+            GraphNode gdn;gdn.op_type=OpType::GATED_DELTANET_PREFILL;
+            gdn.params.i32={1,128,128,width,1,4,width,1};gdn.params.f32={1e-6f,1e-6f,1.f/std::sqrt(128.f)};
+            Tensor gr_raw=device_tensor(graph_backend,32,width),gr_out=device_tensor(graph_backend,8,width);
+            Tensor gr_ref_x=device_tensor(reference_backend,32,width),gr_ref_raw=device_tensor(reference_backend,32,width);
+            Tensor gr_ref_gate=device_tensor(reference_backend,32,width),gr_ref_out=device_tensor(reference_backend,8,width);
+            GraphNode gr_node;gr_node.op_type=OpType::GR_REDUCE;gr_node.params.i32={8,4};
+            GraphNode gr_sigmoid;gr_sigmoid.op_type=OpType::SIGMOID;
+            for(int pass=0;pass<7;++pass) {
+                for(int i=0;i<32*width;++i)input[i]=float((i+pass)%37-18)/32.f;
+                for(size_t i=0;i<qkv.size();++i)qkv[i]=float(int((i+pass*7)%29)-14)/41.f;
+                if(!upload(graph_backend,gq,qkv)||!upload(reference_backend,rq,qkv)||
+                   !upload(graph_backend,gs,state_initial)||
+                   !upload(graph_backend,vx,input)||!upload(graph_backend,state,initial)||
+                   !graph_backend.begin_state_prefixes({&state,&gs},width))return false;
+                if(pass==0) {
+                    if(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)!=cudaSuccess)return false;
+                    const bool rejected=!graph_backend.set_retained_verification(true,true);
+                    cudaGraph_t capture=nullptr;
+                    const auto ended=cudaStreamEndCapture(cudaStreamPerThread,&capture);
+                    if(capture)cudaGraphDestroy(capture);
+                    if(!rejected || ended!=cudaSuccess)return false;
+                }
+                std::vector<float> gr_upload(32*width);
+                for(size_t j=0;j<gr_upload.size();++j)gr_upload[j]=float(int((j+pass*11)%31)-15)/17.f;
+                if(!upload(graph_backend,gr_raw,gr_upload))return false;
+                if(!graph_backend.set_retained_verification(true,pass>0)||
+                   !graph_backend.set_logical_prefill_batch(true))return false;
+                graph_backend.begin_graph();
+                graph_backend.dispatch(tile,{&vx},&vt,nullptr);
+                graph_backend.set_operator_fallback_policy(OperatorFallbackPolicy::ALLOW_REFERENCE);
+                graph_backend.dispatch(lookup,{&ids,&history,&table,&table_scales,&vocabularies,&offsets},&ple_output,nullptr);
+                graph_backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+                graph_backend.dispatch(conv,{&vt,&filter,&state},&vy,nullptr);
+                graph_backend.dispatch(gdn,{&gq,&ga,&gb,&gz,&gal,&gdt,&gn,&gs},&gout,nullptr);
+                std::vector<float> gr_logits(32*width);
+                for(size_t j=0;j<gr_logits.size();++j)gr_logits[j]=float(int((j+pass*11)%31)-15)/17.f;
+                // Transfers belong before capture. This upload is staged above.
+                if(!graph_backend.dispatch_sigmoid_gr_reduce(gr_node,{&vy,&gr_raw},&gr_out,nullptr)||
+                   !graph_backend.round_to_bf16(gr_out))return false;
+                // Change a later signature after the fused record was matched.
+                segment_moe.params.f32[0]=pass>=3?.5f:.75f;
+                graph_backend.dispatch(segment_moe,{&vy,&qr,&gate,&down,&qg,&qu,&qd,&qs},&vo,nullptr);
+                graph_backend.end_graph();
+                std::vector<float> gr_input,gr_actual,gr_expected;
+                if(!download(graph_backend,vy,gr_input)||!download(graph_backend,gr_out,gr_actual)||
+                   !upload(reference_backend,gr_ref_x,gr_input)||!upload(reference_backend,gr_ref_raw,gr_logits))return false;
+                reference_backend.begin_graph();
+                reference_backend.dispatch(gr_sigmoid,{&gr_ref_raw},&gr_ref_gate,nullptr);
+                reference_backend.dispatch(gr_node,{&gr_ref_x,&gr_ref_gate},&gr_ref_out,nullptr);
+                if(!reference_backend.round_to_bf16(gr_ref_out))return false;
+                reference_backend.end_graph();
+                if(!download(reference_backend,gr_ref_out,gr_expected)||gr_actual.size()!=gr_expected.size()||
+                   std::memcmp(gr_actual.data(),gr_expected.data(),gr_actual.size()*sizeof(float))) {
+                    std::fprintf(stderr,"sigmoid GR segment round/recovery byte mismatch pass=%d\n",pass);return false;
+                }
+                std::printf("sigmoid_gr_segment_fixture pass=%d width=%d bytes_exact=1 external_bf16=1 late_signature=%d\n",pass,width,pass>=3);
+
+                if(graph_backend.dispatch_failed())return false;
+                for(int kept=1;kept<=width;++kept) {
+                    std::vector<float> actual;
+                    if(!graph_backend.restore_state_prefix(kept)||!download(graph_backend,state,actual))return false;
+                    for(int group=0;group<32;++group)for(int tap=0;tap<3;++tap) {
+                        const int token=kept-3+tap;
+                        if(actual[group*3+tap]!=(token<0?.5f:input[token*32+group]))return false;
+                    }
+                    if(!upload(reference_backend,rs,state_initial))return false;
+                    GraphNode partial=gdn;partial.params.i32[6]=kept;
+                    reference_backend.dispatch(partial,{&rq,&ra,&rb,&rz,&ral,&rdt,&rn,&rs},&rout,nullptr);
+                    reference_backend.end_graph();
+                    std::vector<float> expected_gdn,actual_gdn;
+                    if(reference_backend.dispatch_failed()||!download(reference_backend,rs,expected_gdn)||
+                       !download(graph_backend,gs,actual_gdn)||!close_enough(actual_gdn,expected_gdn,1e-6f))return false;
+                }
+                if(!graph_backend.set_logical_prefill_batch(false)||
+                   !graph_backend.set_retained_verification(false,false))return false;
+                graph_backend.end_state_prefixes();
+                if(pass==3) {
+                    // A different width cannot borrow the width3 bank. Normal
+                    // prefill retires graphs before an owned output is reused.
+                    if(!graph_backend.begin_state_prefixes({&state,&gs},2)||
+                       graph_backend.set_retained_verification(true,true)||
+                       !graph_backend.set_logical_prefill_batch(true))return false;
+                    graph_backend.free_output(vo,nullptr);
+                    if(!graph_backend.alloc_output(vo,32*width*sizeof(float),nullptr)||
+                       !graph_backend.set_logical_prefill_batch(false))return false;
+                    graph_backend.end_state_prefixes();
+                }
+            }
+            for(Tensor* t:{&gr_raw,&gr_out})graph_backend.free_output(*t,nullptr);
+            for(Tensor* t:{&gr_ref_x,&gr_ref_raw,&gr_ref_gate,&gr_ref_out})reference_backend.free_output(*t,nullptr);
+            auto begin_verify=[&](bool reusable) {
+                if(!upload(graph_backend,state,initial)||!upload(graph_backend,gs,state_initial)||
+                   !graph_backend.begin_state_prefixes({&state,&gs},width)||
+                   !graph_backend.set_retained_verification(true,reusable)||
+                   !graph_backend.set_logical_prefill_batch(true))return false;
+                graph_backend.begin_graph();
+                graph_backend.dispatch(tile,{&vx},&vt,nullptr);
+                graph_backend.set_operator_fallback_policy(OperatorFallbackPolicy::ALLOW_REFERENCE);
+                graph_backend.dispatch(lookup,{&ids,&history,&table,&table_scales,&vocabularies,&offsets},&ple_output,nullptr);
+                graph_backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
+                graph_backend.dispatch(conv,{&vt,&filter,&state},&vy,nullptr);
+                graph_backend.dispatch(gdn,{&gq,&ga,&gb,&gz,&gal,&gdt,&gn,&gs},&gout,nullptr);
+                return !graph_backend.dispatch_failed();
+            };
+            auto leave_verify=[&]() {
+                const bool restored=graph_backend.set_logical_prefill_batch(false)&&
+                    graph_backend.set_retained_verification(false,false);
+                graph_backend.end_state_prefixes();return restored;
+            };
+            // Re-warm after invalidation, then reject an allocation while a
+            // graph is actually being captured. The request exceeds the tiny
+            // fixture pool limit; no real OOM or driver fault is induced.
+            if(!begin_verify(false))return false;
+            graph_backend.dispatch(segment_moe,{&vy,&qr,&gate,&down,&qg,&qu,&qd,&qs},&vo,nullptr);
+            graph_backend.end_graph();if(!leave_verify()||!begin_verify(true))return false;
+            cudaStreamCaptureStatus status=cudaStreamCaptureStatusNone;
+            if(cudaStreamIsCapturing(cudaStreamPerThread,&status)!=cudaSuccess||status!=cudaStreamCaptureStatusActive)return false;
+            Tensor rejected=Tensor::create(Precision::FP32,MemoryType::NONE,524288);
+            if(graph_backend.alloc_output(rejected,2*1024*1024,nullptr)||!graph_backend.dispatch_failed())return false;
+            // Match the engine's actual RAII destruction order.
+            const bool phase_restored=graph_backend.set_logical_prefill_batch(false);
+            const bool owner_restored=graph_backend.set_retained_verification(false,false);
+            if(cudaStreamIsCapturing(cudaStreamPerThread,&status)!=cudaSuccess)return false;
+            const bool closed=status==cudaStreamCaptureStatusNone;
+            if(!closed) {
+                // Keep the intentionally failing pre-fix test well behaved.
+                cudaGraph_t discarded=nullptr;cudaStreamEndCapture(cudaStreamPerThread,&discarded);
+                if(discarded)cudaGraphDestroy(discarded);cudaGetLastError();
+            }
+            if(!closed) {
+                std::fprintf(stderr,"verify allocation failure left stream capture open\n");
+                graph_backend.clear_dispatch_error();leave_verify();return false;
+            }
+            if(!phase_restored||!owner_restored||graph_backend.logical_prefill_batch_enabled()||
+               graph_backend.restore_state_prefix(1))return false;
+            graph_backend.clear_dispatch_error();
+            std::vector<float> unchanged;
+            if(!download(graph_backend,state,unchanged)||unchanged!=initial||!leave_verify())return false;
+            if(!begin_verify(true))return false;
+            graph_backend.dispatch(segment_moe,{&vy,&qr,&gate,&down,&qg,&qu,&qd,&qs},&vo,nullptr);
+            graph_backend.end_graph();
+            if(graph_backend.dispatch_failed()||!graph_backend.restore_state_prefix(1)||
+               !download(graph_backend,state,unchanged))return false;
+            for(int group=0;group<32;++group)for(int tap=0;tap<3;++tap)
+                if(unchanged[group*3+tap]!=(tap<2?.5f:input[group]))return false;
+            if(!leave_verify())return false;
+            std::printf("CUDA captured verification: width=%d SHORTCONV/GDN prefixes1..%d, width transition, output reuse and failed-capture recovery PASS\n",width,width);
         }
     }
     if (provider.pins != 0) return false;
@@ -3964,14 +4335,16 @@ bool test_shared_fp16_cache(CudaBackend& backend) {
 }
 
 int main(int argc, char** argv) {
+    const bool verify_workspace_only=argc==2 && !std::strcmp(argv[1],"--verify-workspace-only");
+    const bool moe_provider_only=argc==2 && !std::strcmp(argv[1],"--moe-provider-only");
     const bool shared_cache_only=argc==2 && !std::strcmp(argv[1],"--shared-cache-only");
     const bool reshape_only=argc==2 && !std::strcmp(argv[1],"--strided-reshape-only");
     const bool contracts_only=argc==2 && !std::strcmp(argv[1],"--stateful-contract-only");
     const bool head_group_only=argc==2 && !std::strcmp(argv[1],"--sdpa-head-group-only");
     const bool native_pv_only=argc==2 && !std::strcmp(argv[1],"--sdpa-native-pv-only");
     const bool full_batch_only=argc==2 && !std::strcmp(argv[1],"--sdpa-full-batch-only");
-    if (argc!=1 && !contracts_only && !head_group_only && !native_pv_only && !full_batch_only && !reshape_only && !shared_cache_only) {
-        std::fprintf(stderr,"usage: %s [--stateful-contract-only|--sdpa-head-group-only|--sdpa-native-pv-only|--sdpa-full-batch-only|--strided-reshape-only|--shared-cache-only]\n",argv[0]);
+    if (argc!=1 && !contracts_only && !head_group_only && !native_pv_only && !full_batch_only && !reshape_only && !shared_cache_only && !moe_provider_only && !verify_workspace_only) {
+        std::fprintf(stderr,"usage: %s [--stateful-contract-only|--sdpa-head-group-only|--sdpa-native-pv-only|--sdpa-full-batch-only|--strided-reshape-only|--shared-cache-only|--moe-provider-only|--verify-workspace-only]\n",argv[0]);
         return 2;
     }
     {
@@ -3994,6 +4367,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "CUDA device unavailable; skipping\n");
         return 77;
     }
+    if(moe_provider_only) {
+        const char* option=std::getenv("MOLLM_TEST_CUDA_VERIFY_WIDTH");
+        const int requested=option?std::atoi(option):3;
+        if(requested>5 && backend.verification_workspace_max_rows()<requested) {
+            std::fprintf(stderr,"Wider retained verification unavailable; skipping\n");
+            return 77;
+        }
+    }
+    if(verify_workspace_only)return test_verification_workspace_pool()?0:1;
+    if (moe_provider_only) return test_nvfp4_moe_provider() ? 0 : 1;
     if (shared_cache_only) return test_shared_fp16_cache(backend) ? 0 : 1;
     if (reshape_only) {
         if (!backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE)) return 1;

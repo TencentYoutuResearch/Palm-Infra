@@ -41,6 +41,9 @@ int main() {
     if (!parse({"bench", "--package", "fixture.mollm", "--cuda-prefill-reclaim"}, 1, false)) return 1;
     if (!parse({"bench", "--package", "fixture.mollm", "--offload-ple", "--cuda-prefill-reclaim"}, 1, false)) return 1;
 #ifdef MOLLM_CUDA
+    if(!parse({"bench","--package","fixture.mollm","--device","cuda","--offload-ple",
+        "--cuda-prefill-reclaim","--cuda-prefill-logical-batch","--n-ctx","32768",
+        "--qsa-companion","qsa","--mtp-companion","draft-qsa","--mtp-draft-tokens","2"},1,true))return 1;
     for(const char* context:{"1","2048","16384","32768"})for(const char* chunk:{"0","1","128","512","1024","1743","2048"}) {
         std::vector<std::string> args{"bench","--package","fixture.mollm","--device","cuda",
             "--offload-ple","--cuda-prefill-reclaim","--cuda-prefill-logical-batch",

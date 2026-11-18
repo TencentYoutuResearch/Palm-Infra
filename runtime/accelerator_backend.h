@@ -64,6 +64,12 @@ public:
     // region or upload individual constants.
     virtual bool register_weight_region(void* base, size_t size) = 0;
     virtual void wrap_weight(Tensor& tensor) = 0;
+    // Optional preparation for immutable FP16 constants whose consumers are
+    // exclusively routed MoE projections. Preserve existing backend dispatch
+    // by default; this hint does not change the tensor's serialized format.
+    virtual void wrap_routed_expert_weight(Tensor& tensor, int rows_per_expert) {
+        wrap_weight(tensor);
+    }
     virtual void wrap_weight_int4(Tensor& tensor,
                                   bool keep_native_experts = false) = 0;
     // CPU-specific repacks are optional when a backend owns every prepared
@@ -99,6 +105,18 @@ public:
         const Tensor&, size_t, const Tensor&, int, int, int = 0,
         Tensor* = nullptr) {
         return -1;
+    }
+    // Draft proposals alone may use a cheaper head; target verification must
+    // use the exact entry above. Default delegation preserves other backends.
+    virtual int lm_head_draft_argmax_device_and_end_graph(
+        const Tensor& input, size_t offset, const Tensor& weight,
+        int n, int k, int activation = 0, Tensor* hidden_copy = nullptr,
+        float* probability = nullptr) {
+        // Negative means unavailable; optional draft policy must preserve its
+        // fixed-depth behavior when a backend cannot supply confidence.
+        if (probability) *probability = -1.0f;
+        return lm_head_argmax_device_and_end_graph(
+            input, offset, weight, n, k, activation, hidden_copy);
     }
     // Optional small-batch projection used by speculative verification.
     // Backends advertise support before the engine leaves a graph open for

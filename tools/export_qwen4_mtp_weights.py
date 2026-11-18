@@ -18,18 +18,20 @@ def main():
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--n-ctx", type=int, default=2048)
+    parser.add_argument("--qsa", action="store_true", help="Include draft QSA indexer for long contexts")
     parser.add_argument("--refresh-graph", action="store_true",
                         help="Regenerate only graph/inline scalars in an existing validated bundle; never rewrite model weights")
     args = parser.parse_args()
     if not args.refresh_graph and args.output_dir.exists() and (not args.output_dir.is_dir() or any(args.output_dir.iterdir())):
         parser.error("output directory must be new or empty; existing files are never overwritten")
     cfg = json.loads((args.model_dir / "config.json").read_text())
-    graph = build_mtp_graph(".", cfg, args.seq_len, args.n_ctx)
+    graph = build_mtp_graph(".", cfg, args.seq_len, args.n_ctx, enable_qsa=args.qsa)
     if args.refresh_graph:
         manifest = json.loads((args.output_dir / "manifest.json").read_text())
         if (manifest["format"] != "mollm-mtp-weight-bundle-v1" or
                 manifest["source_model_dir"] != str(args.model_dir.resolve()) or
-                manifest["seq_len"] != args.seq_len or manifest["n_ctx"] != args.n_ctx):
+                manifest["seq_len"] != args.seq_len or manifest["n_ctx"] != args.n_ctx or
+                bool(manifest.get("qsa", False)) != args.qsa):
             raise ValueError("existing bundle does not match requested source/graph geometry")
         refs = {node.weight_path for node in graph._nodes if node.weight_path}
         shared = set(manifest["shared_target_weights"])
@@ -51,7 +53,7 @@ def main():
         graph.save(str(args.output_dir / "model_mtp"))
         print("Refreshed graph/inline constants only; all streamed model weight files unchanged.")
         return
-    weights = build_mtp_streamed_weights(args.model_dir, cfg)
+    weights = build_mtp_streamed_weights(args.model_dir, cfg, enable_qsa=args.qsa)
     shared = {"./embed_tokens.weights", "./lm_head.weights"}
     refs = {node.weight_path for node in graph._nodes if node.weight_path}
     if refs - shared != set(weights):
@@ -64,7 +66,7 @@ def main():
     manifest = {"format": "mollm-mtp-weight-bundle-v1", "standalone_model": False,
                 "shared_target_weights": sorted(shared), "graph": "model_mtp.graph",
                 "source_model_dir": str(args.model_dir.resolve()),
-                "seq_len": args.seq_len, "n_ctx": args.n_ctx, "weights": {}}
+                "seq_len": args.seq_len, "n_ctx": args.n_ctx, "qsa": args.qsa, "weights": {}}
     for ref, weight in weights.items():
         name = Path(ref).name
         if ref != "./" + name or not name.endswith(".weights"):

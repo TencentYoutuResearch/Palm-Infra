@@ -5,12 +5,14 @@
 
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <vector>
 
 class ThreadPool;
 struct GraphNode;
 struct Graph;
+struct ExecContext;
 
 // ---------------------------------------------------------------------------
 // mollm — Backend abstraction
@@ -94,6 +96,34 @@ public:
     // Phase-scoped admission; does not override engine memory/length gates.
     virtual bool set_logical_prefill_batch(bool enabled) { return !enabled; }
     virtual bool logical_prefill_batch_enabled() const { return false; }
+
+    // Before prefill admission, a backend may synchronously release the
+    // caller's temporary workspace and reclaim cached storage. Persistent
+    // state and active verification scopes must remain intact.
+    virtual bool prepare_prefill_phase(const std::function<void()>&) { return true; }
+    // Preserve dispatch to existing backends that override the original hook.
+    virtual bool prepare_prefill_phase(const std::function<void()>& release,
+                                       Graph*, ExecContext*) {
+        return prepare_prefill_phase(release);
+    }
+    // Optional bounded, per-width verifier workspace. Unsupported backends
+    // leave all tensors/keys unchanged. Select runs before prefix preflight;
+    // release retires captured readers before returning owned temporary leases.
+    // Largest qualified retained verifier width; zero means no capability.
+    // Existing narrow select/release hooks remain usable by legacy backends.
+    virtual int verification_workspace_max_rows() const { return 0; }
+    virtual bool select_verification_workspace(Graph&, ExecContext&, int) { return true; }
+    virtual bool release_verification_workspaces(Graph&, ExecContext&) { return true; }
+    // Opt-in, bounded target verification ownership. Unsupported backends
+    // reject entry and accept restoration; ordinary prefill is unchanged.
+    virtual bool set_retained_verification(bool enabled, bool reusable) { return !enabled; }
+
+    /// Optional partial-pass optimization: cached SDPA/QSA may update KV and
+    /// initialize a disposable output without computing attention. Indexer and
+    /// other persistent updates still execute. The caller must stop at the
+    /// attention node and restore normal mode before consuming graph outputs.
+    /// Unsupported backends leave execution unchanged and return false.
+    virtual bool set_attention_cache_only(bool enabled) { return !enabled; }
 
     /// Optional execution-plan inspection. Graph/tensor storage stays owned by
     /// the caller; no serialized graph or weight representation is changed.
@@ -205,6 +235,13 @@ public:
     // Optional post-token recurrent snapshots for speculative verification.
     // restore must validate complete coverage before changing any state.
     virtual bool begin_state_prefixes(const std::vector<Tensor*>&, int) { return false; }
+    // Optional proof for an already prepared, same-width dynamic graph.
+    // Admission must cover every state and reject unknown writers/aliases.
+    virtual bool state_prefixes_cover_graph(const Graph&, const std::vector<Tensor*>&, int) const {
+        return false;
+    }
+    // Nonmutating post-verification check, required even when all drafts pass.
+    virtual bool state_prefixes_complete() const { return false; }
     virtual bool restore_state_prefix(int) { return false; }
     virtual void end_state_prefixes() {}
     virtual std::unique_ptr<BackendStateSnapshot> capture_state_snapshot(

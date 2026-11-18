@@ -427,11 +427,37 @@ original model semantics. `--dense-bringup` skips QSA for diagnostic A/B, and
 preset, for example `--prefill-chunk-size 512`.
 
 Supported QSA scope: text only, continuous causal history up to 262,144 tokens
-(memory permitting), no MTP, static padding, vision, or noncanonical masks.
+(memory permitting), no static padding, vision, or noncanonical masks.
 Unsupported configurations reject rather than silently use dense attention.
 The companion must match the selected checkpoint. The launcher checks for an
 idle GPU and sufficient host memory at startup; admission checks are not
 memory reservations.
+
+For optional QSA + MTP, export the separate draft once and start its preset:
+
+```bash
+python3 tools/export_qwen4_mtp_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
+  ../qwen38_mtp_qsa_bundle --qsa --n-ctx 32768
+./chat-qwen38-cuda-mtp.sh
+```
+
+This uses a 32K context and two draft tokens; `--n-ctx` and
+`--mtp-draft-tokens` override those defaults. QSA draft caches follow the
+runtime context without re-exporting weights. Speedup depends on acceptance
+and generation length.
+
+Both presets enable the measured greedy optimizations by default: exact Q8
+argmax screening, the stable narrow-row cache, and architecture/shape-guarded
+small-batch kernels. MTP additionally uses compact draft heads, lossless FP16
+expert palettes, and cached verification. Draft approximations never replace
+target verification with the original weights. Production backends select the
+same guarded policies by capability and shape; unsupported configurations keep
+their generic paths.
+
+With `-DMOLLM_CUDA_DECODE_SEGMENTS=ON`, eligible greedy verification also uses
+cached workspaces and proven recurrent prefixes. Other configurations retain
+the previous policy. See
+[measured results and limitations](docs/performance.md).
 
 For models other than Qwen3.8-Flash-Next, CUDA is a mixed native/fallback
 implementation: graph outputs, persistent state, dense elementwise ops, norms,

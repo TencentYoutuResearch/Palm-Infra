@@ -3,6 +3,7 @@
 #include "backends/cuda/backend.h"
 #include "backends/cuda/backend_internal.h"
 #include "backends/cuda/device_runtime.h"
+#include "backends/cuda/state_prefix_plan.h"
 #include "graph/hc_deferred_rms.h"
 
 #include <algorithm>
@@ -13,9 +14,14 @@
 #include <memory>
 #include <limits>
 #include <string>
+#include <unordered_set>
 
 using mollm::cuda_backend_detail::device_pointer;
 using mollm::cuda_backend_detail::device_pointer_const;
+
+size_t CudaBackend::q4_narrow_cache_bytes() const {
+    return impl_->narrow_row_g32_bytes;
+}
 
 bool CudaBackend::reshape_view_strides(const Tensor& source, const Tensor& target,
                                      size_t strides[4]) const {
@@ -42,6 +48,9 @@ bool CudaBackend::reshape_view_strides(const Tensor& source, const Tensor& targe
 }
 
 size_t CudaBackend::strided_reshape_view_calls() const { return impl_->strided_reshape_calls; }
+size_t CudaBackend::state_snapshot_pool_reserved_bytes() const {
+    return mollm_cuda::device_buffer_pool_reserved_bytes(impl_->state_snapshot_pool.get());
+}
 size_t CudaBackend::prefill_shared_cache_bytes() const { return impl_->prefill_shared_cache_bytes; }
 size_t CudaBackend::prefill_shared_cache_hits() const { return impl_->prefill_shared_cache_hits; }
 
@@ -102,9 +111,46 @@ private:
 } // namespace
 
 void CudaBackend::end_state_prefixes() {
+    if (!impl_->state_prefixes.empty())
+        impl_->verify_prefix_bank_proven = !dispatch_failed() && impl_->verify_prefix_bank_active &&
+            std::all_of(impl_->state_prefixes.begin(),impl_->state_prefixes.end(),
+                        [](const auto& entry){return entry.captured;});
     for(auto& entry:impl_->state_prefixes)
-        if(entry.storage)mollm_cuda::release_device_buffer(impl_->state_snapshot_pool.get(),entry.storage);
+        if(entry.storage && !impl_->verify_prefix_bank_active)
+            mollm_cuda::release_device_buffer(impl_->state_snapshot_pool.get(),entry.storage);
     impl_->state_prefixes.clear();impl_->state_prefix_tokens=0;
+    impl_->verify_prefix_bank_active=false;
+}
+
+bool CudaBackend::retire_verify_prefix_bank() {
+    if (impl_->active_segment || impl_->segment_mode != Impl::SegmentMode::NONE) return false;
+    for (cudaStream_t stream : {cudaStreamPerThread, impl_->moe_capture_stream, impl_->moe_shared_stream}) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (!mollm_cuda::report_cuda(cudaStreamIsCapturing(stream, &capture), "prefix bank capture check") ||
+            capture != cudaStreamCaptureStatusNone) return false;
+    }
+    if (!mollm_cuda::report_cuda(cudaDeviceSynchronize(), "prefix bank retire readers")) return false;
+    // Executables own references to snapshot addresses. Destroy every such
+    // reference before returning a lease, including same-address pool reuse.
+    for (auto& entry : impl_->decode_segments) {
+        if (!entry.second.graph) continue;
+        if (!mollm_cuda::report_cuda(cudaGraphExecDestroy(entry.second.graph), "prefix bank retire graph")) return false;
+        entry.second.graph = nullptr;
+        ++impl_->segment_invalidations;
+    }
+    impl_->decode_segments.clear();
+    impl_->segment_candidate = impl_->segment_ready = impl_->segment_disabled = false;
+    impl_->segment_cursor = 0;
+    impl_->verify_warmups = 0;
+    for (auto& entry : impl_->verify_prefix_bank)
+        if (entry.storage) mollm_cuda::release_device_buffer(impl_->state_snapshot_pool.get(), entry.storage);
+    impl_->verify_prefix_bank.clear();
+    impl_->verify_prefix_bank_active = impl_->verify_prefix_bank_proven = impl_->retained_verification = false;
+    return true;
+}
+
+int CudaBackend::verification_workspace_max_rows() const {
+    return available() ? impl_->verification_rows_limit : 0;
 }
 
 bool CudaBackend::begin_state_prefixes(const std::vector<Tensor*>& states,int tokens) {
@@ -112,10 +158,9 @@ bool CudaBackend::begin_state_prefixes(const std::vector<Tensor*>& states,int to
     const char* flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
     if(!flag||std::strcmp(flag,"1")||tokens<2||tokens>8||states.empty())return false;
     finish_decode_segment();
-    if(!impl_->state_snapshot_pool)
-        impl_->state_snapshot_pool=std::shared_ptr<mollm_cuda::DeviceBufferPool>(
-            mollm_cuda::create_device_buffer_pool(),mollm_cuda::destroy_device_buffer_pool);
-    if(!impl_->state_snapshot_pool)return false;
+    std::vector<Impl::StatePrefix> bindings;
+    bindings.reserve(states.size());
+    size_t payload=0;
     for(Tensor* tensor:states) {
         if(!tensor)continue;
         void* pointer=device_pointer<uint8_t>(*tensor);
@@ -128,28 +173,124 @@ bool CudaBackend::begin_state_prefixes(const std::vector<Tensor*>& states,int to
                 "CUDA prefix unavailable: bytes=%zu precision=%d contiguous=%d device=%d mirror=%d\n",
                 bytes,int(tensor->prec),tensor->is_contiguous(),pointer!=nullptr,
                 int(impl_->persistent_host_mirrors.count(tensor->device.buffer)));
-            end_state_prefixes();return false;
+            return false;
         }
-        auto duplicate=std::find_if(impl_->state_prefixes.begin(),impl_->state_prefixes.end(),
+        const auto duplicate=std::find_if(bindings.begin(),bindings.end(),
             [pointer](const auto& entry){return entry.pointer==pointer;});
-        if(duplicate!=impl_->state_prefixes.end()) {
-            if(duplicate->bytes!=bytes){end_state_prefixes();return false;}
+        if(duplicate!=bindings.end()) {
+            if(duplicate->bytes!=bytes)return false;
             continue;
         }
-        void* storage=mollm_cuda::acquire_device_buffer(impl_->state_snapshot_pool.get(),bytes*tokens);
-        if(!storage){end_state_prefixes();return false;}
-        impl_->state_prefixes.push_back({tensor,pointer,storage,bytes,false});
+        const size_t extent=bytes*size_t(tokens);
+        if(extent>std::numeric_limits<size_t>::max()-payload)return false;
+        payload+=extent;
+        bindings.push_back({tensor,pointer,nullptr,bytes,false,tokens});
+    }
+    if(bindings.empty())return false;
+    if(!impl_->state_snapshot_pool)
+        impl_->state_snapshot_pool=std::shared_ptr<mollm_cuda::DeviceBufferPool>(
+            mollm_cuda::create_device_buffer_pool(),mollm_cuda::destroy_device_buffer_pool);
+    if(!impl_->state_snapshot_pool)return false;
+    // Account all inactive immutable banks before admitting another width.
+    if (impl_->verification_workspaces) {
+        size_t retained = payload;
+        const size_t limit = mollm::cuda_backend_detail::verification_prefix_budget_bytes(
+            impl_->verification_workspaces->max_width);
+        if (retained > limit) return false;
+        for (const auto& slot : impl_->verification_workspaces->slots)
+            for (const auto& entry : slot.prefixes) {
+                const size_t extent = entry.bytes * size_t(entry.tokens);
+                if (extent > limit - retained) return false;
+                retained += extent;
+            }
+    }
+    const size_t bank_limit=tokens <= verification_workspace_max_rows() ?
+        mollm::cuda_backend_detail::retained_prefix_bank_limit_bytes(tokens, bool(impl_->verification_workspaces)) : 0;
+    const bool bank_requested=impl_->verify_segments_requested && impl_->segment_requested && bank_limit;
+    if(bank_requested && !impl_->verify_prefix_bank.empty()) {
+        const int bank_tokens=impl_->verify_prefix_bank.front().tokens;
+        const bool valid_width=bank_tokens <= verification_workspace_max_rows() &&
+            mollm::cuda_backend_detail::retained_prefix_bank_limit_bytes(bank_tokens, bool(impl_->verification_workspaces)) &&
+            std::all_of(impl_->verify_prefix_bank.begin(),impl_->verify_prefix_bank.end(),
+                [bank_tokens](const auto& entry){return entry.tokens==bank_tokens;});
+        const bool matches=valid_width && bindings.size()==impl_->verify_prefix_bank.size() &&
+            std::all_of(bindings.begin(),bindings.end(),[&](const auto& binding){
+                return std::any_of(impl_->verify_prefix_bank.begin(),impl_->verify_prefix_bank.end(),
+                    [&](const auto& entry){return entry.tensor==binding.tensor && entry.pointer==binding.pointer && entry.bytes==binding.bytes;});
+            });
+        if(matches && bank_tokens==tokens) {
+            impl_->state_prefixes=impl_->verify_prefix_bank;
+            for(auto& entry:impl_->state_prefixes)entry.captured=false;
+            impl_->state_prefix_tokens=tokens;
+            impl_->verify_prefix_bank_active=true;
+            return true;
+        }
+        // Prefer the largest qualified width seen. Short tails must not
+        // replace its bindings. A new owner or an admissible wider batch
+        // retires the old executables and their bank before allocating anew.
+        if(!matches || (tokens>bank_tokens && payload<=bank_limit))
+            if(!retire_verify_prefix_bank())return false;
+    }
+    for(auto& binding:bindings) {
+        binding.storage=mollm_cuda::acquire_device_buffer(impl_->state_snapshot_pool.get(),binding.bytes*size_t(tokens));
+        if(!binding.storage){end_state_prefixes();return false;}
+        impl_->state_prefixes.push_back(binding);
     }
     impl_->state_prefix_tokens=tokens;
-    size_t payload=0;for(const auto& entry:impl_->state_prefixes)payload+=entry.bytes*size_t(tokens);
+    if(bank_requested && impl_->verify_prefix_bank.empty() && payload<=bank_limit) {
+        impl_->verify_prefix_bank=impl_->state_prefixes;
+        impl_->verify_prefix_bank_active=true;
+    }
     impl_->state_prefix_peak_payload_bytes=std::max(impl_->state_prefix_peak_payload_bytes,payload);
-    return !impl_->state_prefixes.empty();
+    return true;
+}
+
+bool CudaBackend::state_prefixes_complete() const {
+    if (dispatch_failed() || impl_->state_prefixes.empty()) return false;
+    return std::all_of(impl_->state_prefixes.begin(),impl_->state_prefixes.end(),[&](const auto& entry) {
+        return entry.tokens==impl_->state_prefix_tokens && entry.captured && entry.tensor && entry.tensor->view_span_bytes() == entry.bytes &&
+            device_pointer<uint8_t>(*entry.tensor) == entry.pointer;
+    });
+}
+
+bool CudaBackend::state_prefixes_cover_graph(const Graph& graph,
+    const std::vector<Tensor*>& states, int tokens) const {
+    if (!available() || dispatch_failed() || tokens > verification_workspace_max_rows() ||
+        !mollm::cuda_backend_detail::retained_prefix_bank_limit_bytes(tokens, bool(impl_->verification_workspaces)) ||
+        tokens != impl_->state_prefix_tokens || !impl_->verify_prefix_bank_active ||
+        !impl_->verify_prefix_bank_proven) return false;
+    for (const auto& entry : impl_->state_prefixes)
+        if (entry.tokens != tokens || !entry.tensor || entry.tensor->view_span_bytes() != entry.bytes ||
+            device_pointer<uint8_t>(*entry.tensor) != entry.pointer) return false;
+    std::unordered_set<void*> seen;
+    for (Tensor* state : states) {
+        if (!state || !state->view_span_bytes()) continue;
+        void* pointer = device_pointer<uint8_t>(*state);
+        if (std::none_of(impl_->state_prefixes.begin(),impl_->state_prefixes.end(),[&](const auto& entry) {
+                return entry.tensor == state && entry.pointer == pointer &&
+                    entry.bytes == state->view_span_bytes();
+            })) return false;
+        seen.insert(pointer);
+    }
+    if (seen.size() != impl_->state_prefixes.size()) return false;
+    return mollm::cuda_backend_detail::complete_state_prefix_plan(graph,states,tokens,
+        [&](const Tensor& tensor) {
+            // Quantized device payloads have their own packed geometry; the
+            // logical byte strides can overestimate or underestimate them.
+            const auto found = impl_->weights_by_device.find(tensor.device.buffer);
+            if (found != impl_->weights_by_device.end() && found->second->data_bytes) {
+                const size_t bytes = found->second->data_bytes;
+                return tensor.device.offset <= bytes ? bytes-tensor.device.offset :
+                    std::numeric_limits<size_t>::max();
+            }
+            return tensor.view_span_bytes();
+        });
 }
 
 bool CudaBackend::restore_state_prefix(int kept) {
-    if(kept<1||kept>impl_->state_prefix_tokens||impl_->state_prefixes.empty())return false;
+    if(dispatch_failed()||kept<1||kept>impl_->state_prefix_tokens||impl_->state_prefixes.empty())return false;
     for(const auto& entry:impl_->state_prefixes)
-        if(!entry.captured||entry.tensor->view_span_bytes()!=entry.bytes||
+        if(entry.tokens!=impl_->state_prefix_tokens||!entry.captured||entry.tensor->view_span_bytes()!=entry.bytes||
             device_pointer<uint8_t>(*entry.tensor)!=entry.pointer) {
             static int reports=0;if(reports++<4)std::fprintf(stderr,
                 "CUDA prefix incomplete: tokens=%d bytes=%zu captured=%d shape=%lld,%lld,%lld,%lld\n",
@@ -250,7 +391,24 @@ CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) 
         impl_->coherent_host_weights = pageable && host_tables;
     cudaDeviceProp properties{};
     if (cudaGetDeviceProperties(&properties, 0) == cudaSuccess) {
+        impl_->prefer_fp16_expert_palette = properties.major == 12 && properties.minor == 1;
+        impl_->verification_rows_limit = properties.major == 12 && properties.minor == 1 ? 8 : 5;
         impl_->supports_native_nvfp4_mma = properties.major == 12 && properties.minor <= 1;
+        impl_->prefer_nvfp4_gate_m1_proven = properties.major == 12 && properties.minor == 1;
+        impl_->prefer_nvfp4_gate_subgroup = properties.major == 12 && properties.minor == 1;
+        impl_->prefer_nvfp4_mtp_gate_pairs = properties.major == 12 && properties.minor == 1;
+        impl_->prefer_nvfp4_mtp_gate_eight = properties.major == 12 && properties.minor == 1;
+        impl_->prefer_nvfp4_m1_down_subwarp = properties.major == 12 && properties.minor == 1;
+        impl_->prefer_nvfp4_mtp_down_subwarp = properties.major == 12 && properties.minor == 1;
+        impl_->prefer_q4_narrow_row_cache = properties.major == 12 && properties.minor == 1;
+        impl_->prefer_q4_m3_specializations = properties.major == 12 && properties.minor == 1;
+        impl_->prefer_q4_fixed_m5 = properties.major == 12 && properties.minor == 1;
+        if(properties.major==12&&properties.minor==1) {
+            const auto status=mollm_cuda::configure_q4_g32_hc_adjacent_cache();
+            impl_->prefer_q4_hc_adjacent=status==cudaSuccess;
+            if(status!=cudaSuccess)cudaGetLastError(); // Keep the existing native path available.
+        }
+
         impl_->supports_extended_nvfp4_prefill_sort = properties.major == 12 && properties.minor == 1;
         impl_->supports_sdpa_head_lane_pair=properties.major==12&&properties.minor==1&&
             properties.maxThreadsPerBlock>=512&&properties.regsPerBlock>=32768;
@@ -262,6 +420,10 @@ CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) 
 }
 
 CudaBackend::~CudaBackend() {
+    // Engine graph storage may already be gone. Active outputs remain owned
+    // by output_pool; only dormant leases can be inspected in this mode.
+    if (!clear_verification_workspaces(nullptr, nullptr))
+        std::fprintf(stderr, "CUDA verification cache: deferred failed teardown to Impl\n");
     if (std::getenv("MOLLM_CUDA_STRIDED_RESHAPE_VIEWS"))
         std::fprintf(stderr, "CUDA strided reshape views: enabled=%d calls=%zu\n",
                      impl_->strided_reshape_views, impl_->strided_reshape_calls);
@@ -274,12 +436,79 @@ CudaBackend::~CudaBackend() {
 
 bool CudaBackend::available() const { return impl_ && impl_->ok; }
 
+bool CudaBackend::set_retained_verification(bool enabled, bool reusable) {
+    if(!enabled){
+        if(impl_->active_segment) {
+            if(dispatch_failed())abandon_decode_segment();else finish_decode_segment();
+        }
+        impl_->retained_verification=false;return true;
+    }
+    if(!available() || dispatch_failed() || !impl_->verify_segments_requested ||
+       !impl_->segment_requested || !impl_->verify_prefix_bank_active || impl_->verify_prefix_bank.empty() ||
+       impl_->state_prefix_tokens > verification_workspace_max_rows() ||
+       !mollm::cuda_backend_detail::retained_prefix_bank_limit_bytes(impl_->state_prefix_tokens, bool(impl_->verification_workspaces)) ||
+       impl_->verify_prefix_bank.front().tokens!=impl_->state_prefix_tokens || impl_->active_segment) return false;
+    for(cudaStream_t stream:{cudaStreamPerThread,impl_->moe_capture_stream,impl_->moe_shared_stream}) {
+        cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+        if(!mollm_cuda::report_cuda(cudaStreamIsCapturing(stream,&capture),"verify policy capture check") ||
+           capture!=cudaStreamCaptureStatusNone)return false;
+    }
+    ++impl_->verify_entries;
+    if(!reusable) {
+        size_t reclaimed=0,invalidated=0;
+        // Retire executables before reusing their addresses, but preserve
+        // bounded free blocks across small verification shape changes.
+        if(impl_->output_pool_limit_bytes) {
+            if(!retire_cached_output_graphs(&invalidated))return false;
+        } else if(!trim_cached_outputs(&reclaimed,&invalidated))return false;
+        impl_->verify_warmups=0;
+    }
+    impl_->retained_verification=true;
+    if(impl_->output_pool_limit_bytes)impl_->verification_pool_retained=true;
+    return true;
+}
+
 bool CudaBackend::set_logical_prefill_batch(bool enabled) {
+    // LogicalBatchScope unwinds before retained ownership. Close our failed
+    // capture first so its saved phase can be restored on the error path.
+    if(!enabled && impl_->failed && impl_->active_segment)abandon_decode_segment();
     if(logical_prefill_batch_active_==enabled)return true;
     cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
     if(!mollm_cuda::report_cuda(cudaStreamIsCapturing(cudaStreamPerThread,&capture),
             "logical prefill policy capture check")||capture!=cudaStreamCaptureStatusNone)return false;
+    // Changing reclamation policy inside an unfinished segment would leave
+    // skipped dispatches or captured operands with ambiguous lifetimes.
+    if (impl_->active_segment || impl_->segment_mode != Impl::SegmentMode::NONE)
+        return false;
+    if (enabled && !impl_->retained_verification && !impl_->decode_segments.empty()) {
+        // A later conversation turn may recycle prefill allocations at the
+        // same addresses. Retire executable graphs before any such reuse,
+        // including ABA reuse that a pointer-only replay signature misses.
+        if (!mollm_cuda::report_cuda(cudaDeviceSynchronize(),
+                "logical prefill retire decode segments")) return false;
+        for (auto& entry : impl_->decode_segments) {
+            if (!entry.second.graph) continue;
+            if (!mollm_cuda::report_cuda(cudaGraphExecDestroy(entry.second.graph),
+                    "logical prefill destroy decode segment")) return false;
+            entry.second.graph = nullptr;
+            ++impl_->segment_invalidations;
+        }
+        impl_->decode_segments.clear();
+    }
+    impl_->segment_enabled = impl_->segment_requested && (!enabled || impl_->retained_verification);
+    impl_->segment_candidate = impl_->segment_ready = impl_->segment_disabled = false;
+    impl_->segment_cursor = 0;
     logical_prefill_batch_active_=enabled;
+    return true;
+}
+
+bool CudaBackend::set_attention_cache_only(bool enabled) {
+    // Always restore normal execution, including after a failed partial pass.
+    if(!enabled){attention_cache_only_=false;return true;}
+    cudaStreamCaptureStatus capture=cudaStreamCaptureStatusNone;
+    if(!mollm_cuda::report_cuda(cudaStreamIsCapturing(cudaStreamPerThread,&capture),
+            "attention cache-only scope")||capture!=cudaStreamCaptureStatusNone)return false;
+    attention_cache_only_=enabled;
     return true;
 }
 
@@ -336,6 +565,10 @@ int CudaBackend::independent_stateful_mutable_input(const GraphNode& node) const
 }
 
 void CudaBackend::release_graph_plan(const Graph& graph) {
+    for (auto it = impl_->qsa_projection_graphs.begin(); it != impl_->qsa_projection_graphs.end();) {
+        if (it->second == &graph) it = impl_->qsa_projection_graphs.erase(it);
+        else ++it;
+    }
     for (auto it = impl_->strided_reshape_targets.begin(); it != impl_->strided_reshape_targets.end();) {
         if (it->second == &graph) it = impl_->strided_reshape_targets.erase(it);
         else ++it;
@@ -416,9 +649,25 @@ void CudaBackend::prepare_graph(const Graph& graph) {
             if (safe) impl_->strided_reshape_targets[&graph.runtime.tensors[n.id]] = &graph;
         }
     }
-    if (!impl_->hc_projection_enabled && !impl_->hc_prefill_reuse_enabled) return;
     std::unordered_map<uint32_t, const GraphNode*> producers;
     for (const auto& node : graph.nodes) producers[node.id] = &node;
+    for (auto it = impl_->qsa_projection_graphs.begin(); it != impl_->qsa_projection_graphs.end();) {
+        if (it->second == &graph) it = impl_->qsa_projection_graphs.erase(it);
+        else ++it;
+    }
+    for (const auto& node : graph.nodes) {
+        if (node.op_type != OpType::QSA_INDEXER || node.inputs.size() != 8) continue;
+        const auto found = producers.find(node.inputs[0]);
+        if (found == producers.end()) continue;
+        const auto* projection = found->second;
+        if (projection->op_type == OpType::MATMUL && projection->inputs.size() == 2 &&
+            projection->out_prec == Precision::FP32 &&
+            graph_params::get_i32(projection->params, 0, 0) == 0 &&
+            graph_params::get_i32(projection->params, 1, 0) == 0 &&
+            graph_params::get_i32(projection->params, 2, -1) == -1)
+            impl_->qsa_projection_graphs[projection] = &graph;
+    }
+    if (!impl_->hc_projection_enabled && !impl_->hc_prefill_reuse_enabled) return;
     std::unique_ptr<HcDeferredGraphIndex> deferred_index;
     if(impl_->hc_deferred_enabled&&!impl_->segment_enabled)
         deferred_index=std::make_unique<HcDeferredGraphIndex>(graph);
@@ -484,23 +733,26 @@ void CudaBackend::prepare_graph(const Graph& graph) {
     }
     float* slots = nullptr;
     if (!mollm_cuda::malloc_device(reinterpret_cast<void**>(&slots),
-            plan.pairs.size() * 4 * sizeof(float), "HC projection slots")) return;
+            plan.pairs.size() * 4 * Impl::hc_projection_cached_tokens * sizeof(float), "HC projection slots")) return;
     impl_->device_allocations.push_back(slots);
     auto& stored = impl_->hc_projection_plans.emplace(&graph, std::move(plan)).first->second;
     stored.slots = slots;
     for (size_t i = 0; i < stored.pairs.size(); ++i) {
         auto& pair = stored.pairs[i];
-        pair.cache = slots + 4 * i;
+        pair.cache = slots + 4 * Impl::hc_projection_cached_tokens * i;
         impl_->hc_projection_nodes[pair.first] = &pair;
         impl_->hc_projection_nodes[pair.second] = &pair;
         if (pair.rms) impl_->hc_prefill_rms_nodes[pair.rms] = &pair;
     }
     std::fprintf(stderr, "CudaBackend HC projection plan: pairs=%zu slot_bytes=%zu\n",
-        stored.pairs.size(), stored.pairs.size() * 4 * sizeof(float));
+        stored.pairs.size(), stored.pairs.size() * 4 * Impl::hc_projection_cached_tokens * sizeof(float));
 }
 
 void CudaBackend::clear_dispatch_error() {
-    if(impl_->failed)impl_->hc_deferred={}; // failed operands may already be released
+    if(impl_->failed) {
+        impl_->hc_deferred={}; // failed operands may already be released
+        if(impl_->active_segment)abandon_decode_segment();
+    }
     impl_->failed = false;
     impl_->cpu.clear_dispatch_error();
 }
@@ -516,6 +768,26 @@ bool CudaBackend::set_operator_fallback_policy(
 }
 
 bool CudaBackend::register_weight_region(void*, size_t) { return true; }
+
+void CudaBackend::wrap_routed_expert_weight(Tensor& tensor, int rows_per_expert) {
+    if (available() && impl_->prefer_fp16_expert_palette && tensor.data &&
+        tensor.prec == Precision::FP16 && !tensor.device.buffer && !tensor.device.offset &&
+        tensor.is_contiguous() && tensor.shape[2] == 1 && tensor.shape[3] == 1 &&
+        rows_per_expert > 0 && rows_per_expert % 128 == 0 &&
+        tensor.shape[0] > 0 && tensor.shape[0] <= INT32_MAX &&
+        tensor.shape[0] % rows_per_expert == 0 && tensor.shape[0] / rows_per_expert <= 1024 &&
+        tensor.shape[1] > 0 && tensor.shape[1] <= INT32_MAX && tensor.shape[1] % 128 == 0) {
+        using Cache = mollm::cuda_backend_detail::Fp16ExpertPaletteCache;
+        const auto* source = static_cast<const uint16_t*>(tensor.rowmajor_data ? tensor.rowmajor_data : tensor.data);
+        const auto result = impl_->fp16_expert_palettes.prepare(
+            source, static_cast<int>(tensor.shape[0]), static_cast<int>(tensor.shape[1]));
+        if (result == Cache::Result::Ready) return;
+        if (result == Cache::Result::Error) { impl_->failed = true; return; }
+    }
+    wrap_weight(tensor);
+}
+
+size_t CudaBackend::fp16_expert_palette_bytes() const { return impl_->fp16_expert_palettes.bytes(); }
 
 void CudaBackend::wrap_weight(Tensor& tensor) {
     if (!available() || !tensor.data || tensor.shape[0] <= 0 ||
@@ -930,6 +1202,22 @@ void CudaBackend::begin_graph() {
 void CudaBackend::abandon_decode_segment() {
     auto* segment = impl_->active_segment;
     const size_t count = impl_->segment_cursor;
+    if(impl_->segment_mode==Impl::SegmentMode::CAPTURE) {
+        // An allocation/dispatch error may exit before finish_decode_segment.
+        // End and discard our unfinished capture before forgetting its mode.
+        // finish_decode_segment may also arrive here after ending capture,
+        // so inspect the stream rather than ending it twice.
+        cudaStreamCaptureStatus status=cudaStreamCaptureStatusNone;
+        if(!mollm_cuda::report_cuda(cudaStreamIsCapturing(cudaStreamPerThread,&status),
+                "abandon segment capture status"))impl_->failed=true;
+        if(status!=cudaStreamCaptureStatusNone) {
+            cudaGraph_t discarded=nullptr;
+            const auto ended=cudaStreamEndCapture(cudaStreamPerThread,&discarded);
+            if(discarded)cudaGraphDestroy(discarded);
+            if(ended!=cudaSuccess)cudaGetLastError();
+        }
+    }
+    if(impl_->failed)for(auto& entry:impl_->state_prefixes)entry.captured=false;
     impl_->segment_disabled = true;
     impl_->segment_mode = Impl::SegmentMode::NONE;
     impl_->active_segment = nullptr;
@@ -939,8 +1227,13 @@ void CudaBackend::abandon_decode_segment() {
     segment->graph = nullptr;
     for (size_t i = 0; i < count && !impl_->failed; ++i) {
         const auto& record = segment->records[i];
-        dispatch(*record.node, record.inputs, record.output, record.thread_pool);
-        if (record.rounded) round_to_bf16(*record.output);
+        if(record.dispatch_kind==Impl::SegmentDispatch::SigmoidGrReduce) {
+            ++impl_->sigmoid_gr_segment_recoveries;
+            if(!dispatch_sigmoid_gr_reduce(*record.node,record.inputs,record.output,record.thread_pool)) {
+                impl_->failed=true;break;
+            }
+        } else dispatch(*record.node, record.inputs, record.output, record.thread_pool);
+        if (record.rounded&&!impl_->failed) round_to_bf16(*record.output);
     }
     segment->records.clear();
 }
@@ -956,6 +1249,7 @@ void CudaBackend::finish_decode_segment() {
         if (!mollm_cuda::report_cuda(cudaGraphLaunch(segment->graph, cudaStreamPerThread), "decode segment replay"))
             impl_->failed = true;
         ++impl_->segment_hits;
+        if(impl_->retained_verification)++impl_->verify_segment_hits;
     } else if (impl_->segment_mode == Impl::SegmentMode::CAPTURE) {
         cudaGraph_t graph = nullptr;
         const cudaError_t captured = cudaStreamEndCapture(cudaStreamPerThread, &graph);
@@ -975,6 +1269,7 @@ void CudaBackend::finish_decode_segment() {
         if (!mollm_cuda::report_cuda(cudaGraphLaunch(segment->graph, cudaStreamPerThread), "decode segment initial launch"))
             impl_->failed = true;
         ++impl_->segment_builds;
+        if(impl_->retained_verification)++impl_->verify_segment_builds;
     }
     impl_->active_segment = nullptr;
     impl_->segment_mode = Impl::SegmentMode::NONE;
@@ -986,7 +1281,9 @@ bool CudaBackend::try_decode_segment(const GraphNode& node,
     uint64_t fusion_tag, const void* fusion_weight, const void* fusion_cache) {
     // Prefix buffers are scoped leases; never cache their addresses in a
     // persistent decode segment or replay a graph that omits prefix stores.
-    if (impl_->state_prefix_tokens>0 || !impl_->segment_enabled || !impl_->segment_ready || impl_->segment_disabled) return false;
+    if (attention_cache_only_ || (impl_->state_prefix_tokens>0 &&
+        !(impl_->retained_verification && impl_->verify_prefix_bank_active && !impl_->verify_prefix_bank.empty() &&
+           impl_->verify_prefix_bank.front().tokens==impl_->state_prefix_tokens)) || !impl_->segment_enabled || !impl_->segment_ready || impl_->segment_disabled) return false;
     if (!impl_->active_segment) {
         auto& segment = impl_->decode_segments[&node];
         impl_->active_segment = &segment;
@@ -1018,6 +1315,10 @@ bool CudaBackend::try_decode_segment(const GraphNode& node,
             }
         };
         append(output);
+        if(impl_->retained_verification) {
+            emit(static_cast<uint64_t>(impl_->state_prefix_tokens));
+            emit(reinterpret_cast<uint64_t>(impl_->verify_prefix_bank.data()));
+        }
         for (const auto* input : inputs) append(input);
         for (const void* scratch : {impl_->moe_scratch, impl_->moe_jobs,
              impl_->recurrent_scratch, impl_->activation_fp16,
@@ -1046,6 +1347,12 @@ bool CudaBackend::try_decode_segment(const GraphNode& node,
             abandon_decode_segment();
             return false;
         }
+        for(void* pointer:segment.records[index].prefix_writes) {
+            auto entry=std::find_if(impl_->state_prefixes.begin(),impl_->state_prefixes.end(),
+                [pointer](const auto& e){return e.pointer==pointer;});
+            if(entry==impl_->state_prefixes.end()){abandon_decode_segment();return false;}
+            entry->captured=true;
+        }
         ++impl_->segment_cursor;
         return true;
     }
@@ -1055,6 +1362,8 @@ bool CudaBackend::try_decode_segment(const GraphNode& node,
     signature.i32 = node.params.i32;
     signature.f32 = node.params.f32;
     segment.records.push_back({&node, inputs, output, thread_pool, std::move(signature), false});
+    if(fusion_tag==Impl::sigmoid_gr_segment_tag)
+        segment.records.back().dispatch_kind=Impl::SegmentDispatch::SigmoidGrReduce;
     ++impl_->segment_cursor;
     return false;
 }
@@ -1064,7 +1373,41 @@ void CudaBackend::end_graph() { finish_decode_segment(); synchronize_for_host_re
 bool CudaBackend::trim_cached_outputs(size_t* reclaimed_bytes, size_t* invalidated_graphs) {
     if (reclaimed_bytes) *reclaimed_bytes = 0;
     if (invalidated_graphs) *invalidated_graphs = 0;
-    if (!available() || !reclaimed_bytes || !invalidated_graphs || dispatch_failed() ||
+    if (!reclaimed_bytes || !invalidated_graphs ||
+        !retire_cached_output_graphs(invalidated_graphs)) return false;
+    return mollm_cuda::trim_free_device_buffers(impl_->output_pool, cudaStreamPerThread, reclaimed_bytes);
+}
+
+bool CudaBackend::prepare_prefill_phase(const std::function<void()>& release_workspace,
+                                       Graph* graph, ExecContext* ctx) {
+    if (impl_->verification_workspaces && impl_->state_prefixes.empty()) {
+        if (!graph || !ctx || !clear_verification_workspaces(graph, ctx)) return false;
+        // Reclaim newly returned dormant leases before ordinary prefill admission.
+        impl_->verification_pool_retained = true;
+    }
+    if (impl_->state_prefixes.empty()) impl_->verification_cache_suspended = false;
+    // Prefix scopes identify verification, which retains its small workspace.
+    // A subsequent full prefill must recover this memory BEFORE admission.
+    if (!impl_->verification_pool_retained || !impl_->state_prefixes.empty()) return true;
+    size_t invalidated = 0, reclaimed = 0;
+    // Reject unfinished/foreign capture before invoking the caller's release.
+    if (!release_workspace || !retire_cached_output_graphs(&invalidated)) return false;
+    release_workspace();
+    // Verification prefixes use a separate pool from graph outputs. Retire
+    // their graph readers and return dormant banks before full-prefill admission.
+    // Live externally owned snapshots keep their leases and remain restorable.
+    if (!retire_verify_prefix_bank()) return false;
+    if (!mollm_cuda::trim_free_device_buffers(impl_->output_pool, cudaStreamPerThread, &reclaimed)) return false;
+    if (impl_->state_snapshot_pool &&
+        !mollm_cuda::trim_free_device_buffers(impl_->state_snapshot_pool.get(),
+                                             cudaStreamPerThread, &reclaimed)) return false;
+    impl_->verification_pool_retained = false;
+    return true;
+}
+
+bool CudaBackend::retire_cached_output_graphs(size_t* invalidated_graphs) {
+    if (invalidated_graphs) *invalidated_graphs = 0;
+    if (!available() || !invalidated_graphs || dispatch_failed() ||
         impl_->segment_mode != Impl::SegmentMode::NONE || impl_->active_segment) return false;
     // Backend calls are serialized. External captures using these allocations
     // are not supported; inspect every stream owned/used by this backend.
@@ -1102,7 +1445,7 @@ bool CudaBackend::trim_cached_outputs(size_t* reclaimed_bytes, size_t* invalidat
     impl_->hc_prefill_epoch = 0;
     for (auto& entry : impl_->hc_projection_plans)
         for (auto& pair : entry.second.pairs) pair.computed_epoch = 0;
-    return mollm_cuda::trim_free_device_buffers(impl_->output_pool, cudaStreamPerThread, reclaimed_bytes);
+    return true;
 }
 
 void CudaBackend::alloc_persistent(

@@ -47,7 +47,10 @@ static void scale_view_copy_check(){
     }
     copy(tables.p,descriptors);
     auto expected_tables=descriptors;
-    for(int e=0;e<experts;++e)expected_tables[e].block_scales=target.p+size_t(e)*204800;
+    for(int e=0;e<experts;++e) {
+        expected_tables[e].block_scales=target.p+size_t(e)*204800;
+        expected_tables[e].gate_scales_kmajor=true;
+    }
     for(int replay=0;replay<2;++replay){
         for(size_t i=0;i<bytes;++i)raw[i]=uint8_t(i*37+(i/160)*11+replay*73);
         for(int e=0;e<experts;++e)for(int row=0;row<1280;++row)for(int g=0;g<40;++g)
@@ -221,6 +224,7 @@ static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bo
             for(int set=0;set<sets;++set) {
                 auto d=descriptors[size_t(sets+set)*count+route];
                 d.block_scales=sf_view.p+size_t(set*experts+expert)*sbytes;
+                d.gate_scales_kmajor=true;
                 sf_descriptors[size_t(set)*count+route]=d;
             }
         copy(sf_jobs.p,sf_descriptors);
@@ -246,13 +250,10 @@ static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bo
     check(cudaMemset(bf.p,0x5a,(values+8)*2));check(cudaMemset(plan.p,0x5a,(count+1)*sizeof(*plan.p)));
     int rejects=0;for(int id=0;id<12;++id){
         const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+sets*count,count,plan.p,
-            id==0?2560:h,id==1?640:k,id==2?0:inner,cudaStreamPerThread,packed.p,scales.p,
+            id==0?2560:id==11?1296:h,id==1?640:k,id==2?0:inner,cudaStreamPerThread,packed.p,scales.p,
             id==3?2:1,id!=4,id==5,id==6?plan.p:nullptr,0,id==7?8:32,id==8,id==9,id!=10,true);
         if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
-        // id11 explicitly exercises a non-four-warp environment on next call.
-        if(id==10)setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","8",1);
     }
-    setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","4",1);
     if(early){
         for(int id=0;id<12;++id){
             const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+sets*count,count,plan.p,
@@ -263,16 +264,14 @@ static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bo
     }
     if(vector){
         for(int id=0;id<18;++id){
-            if(id==17)setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","8",1);
             const auto status=mollm_cuda::launch_nvfp4_mma_grouped(
                 id==12?nullptr:jobs.p+sets*count,id==16?0:count,id==13?nullptr:plan.p,
-                id==0?2560:h,id==1?640:k,id==2?0:inner,cudaStreamPerThread,
+                id==0?2560:id==17?1296:h,id==1?640:k,id==2?0:inner,cudaStreamPerThread,
                 id==14?nullptr:packed.p,id==15?nullptr:scales.p,id==3?2:1,
                 id!=4,id==5,id==6?plan.p:nullptr,0,id==7?8:32,
                 id==8,id==9,id!=10,id!=11,false,false,true);
             if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
         }
-        setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","4",1);
     }
     if(fused)for(int id=0;id<11;++id){
         const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
@@ -607,7 +606,7 @@ int main(int argc,char** argv){
         if(runs.size()!=512||std::accumulate(runs.begin(),runs.end(),0)!=std::atoi(argv[2])*10)return 64;
     }
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;cudaDeviceProp prop{};check(cudaGetDeviceProperties(&prop,0));if(prop.major!=12||prop.minor>1)return 77;
-    setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","4",1);setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);
+    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);
     if(!mollm_memory::cuda_host_allocation_allowed(size_t(5)<<30,"bounded BF16 gate diagnostic"))return 1;
     const char* option=std::getenv("MOLLM_TEST_NVFP4_EARLY_INPUTS");
     const bool early=option&&!std::strcmp(option,"1");

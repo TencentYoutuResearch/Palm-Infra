@@ -24,10 +24,10 @@ struct QsaSelectedAttentionParams {
     // Opt-in ordered FP32 GQA kernel: stages each selected KV tile
     // once for all query heads sharing that KV head. D256, groups2..16.
     bool reuse_gqa=false;
-    // Split independent QK scores for small batches; PV keeps original order.
+    // Split independent QK scores for small batches; PV retains ordered FMA.
     int partitions=1;
     // Ordered optimized path: caller owns [queries,heads,slots] FP32 scores.
-    // Preserve legacy normalization/PV FMA order, important around subsequent
+    // Preserve legacy normalization and PV FMA order around subsequent
     // low-precision quantization boundaries. No full-history dense scores.
     float* selected_scores=nullptr;
 };
@@ -43,6 +43,27 @@ cudaError_t launch_qsa_selected_attention(const float* query, const void* key,
     const void* value, bool fp16_cache, const int32_t* indices, float* output,
     const QsaSelectedAttentionParams& p, cudaStream_t stream=nullptr,
     const float* mask=nullptr);
+
+// Caller-owned selected-value staging, disjoint from scores/inputs/output.
+// values holds FP16 [queries,kv_heads,slots,value_dim]; active holds INT32
+// [queries,slots]. Capacities are BYTES; values/active need 2/4-byte alignment.
+struct QsaSelectedValueWorkspace {
+    void* values=nullptr;
+    size_t values_bytes=0;
+    int32_t* active=nullptr;
+    size_t active_bytes=0;
+};
+// Geometry-only size query; resets both outputs to zero on failure.
+// Does not allocate or access a CUDA context.
+bool qsa_gathered_fp16_workspace_bytes(const QsaSelectedAttentionParams& p,
+    size_t& values_bytes,size_t& active_bytes);
+// Allocation-free FP16-cache attention with staged selected V. Requires
+// ordered split QK (partitions>1), no GQA reuse, and queries<=8.
+// Preserves the original ascending-slot PV FMA order, including zero weights.
+cudaError_t launch_qsa_selected_attention_gathered_fp16(const float* query,
+    const void* key,const void* value,const int32_t* indices,float* output,
+    const QsaSelectedAttentionParams& p,const QsaSelectedValueWorkspace& workspace,
+    cudaStream_t stream=nullptr,const float* mask=nullptr);
 
 // Flag is reset by this launch. 0=canonical contiguous causal visibility,
 // 1=unsupported gaps/future visibility/nonnegative or NaN future mask.

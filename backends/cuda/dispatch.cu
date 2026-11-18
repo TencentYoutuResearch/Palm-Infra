@@ -17,6 +17,7 @@
 #include <cstring>
 #include <vector>
 
+
 using mollm::cuda_backend_detail::device_pointer;
 using mollm::cuda_backend_detail::device_pointer_const;
 using mollm::cuda_backend_detail::fp32_contiguous;
@@ -129,7 +130,7 @@ bool CudaBackend::dispatch_hc_up_reduce(const GraphNode& up,const GraphNode& red
 }
 
 bool CudaBackend::dispatch_sigmoid_gr_reduce(const GraphNode& node,
-    const std::vector<const Tensor*>& inputs, Tensor* output, ThreadPool*) {
+    const std::vector<const Tensor*>& inputs, Tensor* output, ThreadPool* thread_pool) {
     if (!supports_sigmoid_gr_reduce_fusion() || node.op_type != OpType::GR_REDUCE ||
         inputs.size() != 2 || !inputs[0] || !inputs[1] || !output) return false;
     const auto& x = *inputs[0];
@@ -146,6 +147,20 @@ bool CudaBackend::dispatch_sigmoid_gr_reduce(const GraphNode& node,
     const auto* raw = device_pointer_const<float>(logits);
     auto* destination = device_pointer<float>(*output);
     if (!source || !raw || !destination) return false;
+    // Keep the fusion in the same ordered record stream as ordinary ops.
+    // Replay must not submit it again against not-yet-replayed inputs.
+    {
+        if(impl_->hc_deferred.owner||!impl_->hc_compact_carries.empty()) {
+            // A deferred/compact materialization is not part of this record.
+            finish_decode_segment();
+        } else if(try_decode_segment(node,inputs,output,thread_pool,Impl::sigmoid_gr_segment_tag)) {
+            ++impl_->sigmoid_gr_segment_replays;
+            ++impl_->sigmoid_gr_reduce_fused_calls;
+            ++impl_->native_ops[static_cast<uint32_t>(node.op_type)];
+            return true;
+        }
+        if(impl_->failed)return true;
+    }
     if(!impl_->restore_hc_compact(source,x.view_span_bytes())||
        !impl_->restore_hc_compact(raw,logits.view_span_bytes())||
        !impl_->restore_hc_compact(destination,output->view_span_bytes()))return true;
@@ -418,6 +433,13 @@ void CudaBackend::dispatch(const GraphNode& node,
     auto record_native = [&]() {
         ++impl_->native_ops[static_cast<uint32_t>(node.op_type)];
     };
+    if(impl_->retained_verification && node.op_type==OpType::TILE) {
+        ++impl_->verify_tiles;
+    }
+    if(impl_->retained_verification && impl_->segment_enabled && node.op_type==OpType::TILE &&
+       !inputs.empty() && inputs[0] && inputs[0]->shape[1]==impl_->state_prefix_tokens) {
+        impl_->segment_candidate=++impl_->verify_warmups>1 && !impl_->resident_experts.empty();
+    }
     if (impl_->segment_enabled && node.op_type == OpType::TILE &&
         !inputs.empty() && inputs[0] && inputs[0]->shape[1] == 1) {
         if (impl_->segment_decode_node != &node) {
@@ -512,9 +534,11 @@ void CudaBackend::dispatch(const GraphNode& node,
         if (node.op_type != OpType::MATMUL || inputs.size() != 2 ||
             inputs[0] != hc_pair->input || !inputs[1] || !output ||
             !fp32_contiguous(*inputs[0]) || !fp32_contiguous(*output) ||
-            inputs[0]->shape[0] != 10240 || inputs[0]->shape[1] != 1 ||
+            inputs[0]->shape[0] != 10240 || inputs[0]->shape[1] < 1 ||
+            inputs[0]->shape[1] > Impl::hc_projection_cached_tokens ||
+            (inputs[0]->shape[1] > 1 && (!impl_->hc_small_batch_pair_enabled || impl_->segment_enabled)) ||
             inputs[0]->shape[2] != 1 || inputs[0]->shape[3] != 1 ||
-            output->shape[0] != (first ? 320 : 4) || output->shape[1] != 1 ||
+            output->shape[0] != (first ? 320 : 4) || output->shape[1] != inputs[0]->shape[1] ||
             output->shape[2] != 1 || output->shape[3] != 1 ||
             graph_params::get_i32(node.params, 0, 0) != 0 ||
             graph_params::get_i32(node.params, 1, 0) != 0 ||
@@ -531,6 +555,7 @@ void CudaBackend::dispatch(const GraphNode& node,
             return inputs[1] == hc_pair->second_weight &&
                 hc_pair->computed_epoch == impl_->hc_execution_epoch &&
                 hc_pair->computed_input == activation &&
+                hc_pair->computed_rows == inputs[0]->shape[1] &&
                 hc_pair->computed_weight == hc_second_weight ? 2 : 0;
         }
         hc_first_weight = impl_->find_weight(*inputs[1]);
@@ -538,13 +563,20 @@ void CudaBackend::dispatch(const GraphNode& node,
             hc_first_weight->layout != Impl::WeightLayout::Q4Bg32Biased ||
             hc_first_weight->n != 320 || hc_first_weight->k != 10240) return 0;
         hc_pair->computed_input = activation;
+        hc_pair->computed_rows = inputs[0]->shape[1];
         hc_pair->computed_weight = hc_second_weight;
         hc_pair->computed_epoch = impl_->hc_execution_epoch;
         return 1;
     };
+    // Segment recovery redispatches copied nodes, which do not carry graph
+    // producer identity. Keep the short indexer projection outside segments
+    // so recovery cannot silently switch its accumulation order.
+    const bool short_qsa_projection = impl_->qsa_projection_graphs.count(&node) &&
+        !inputs.empty() && inputs[0] && inputs[0]->shape[1] >= 2 && inputs[0]->shape[1] <= 8;
+    if (short_qsa_projection) finish_decode_segment();
     uint64_t hc_tag = hc_action();
     const uint64_t invalidations_before = impl_->segment_invalidations;
-    if (node.op_type != OpType::SDPA && node.op_type != OpType::SDPA_MLA &&
+    if (!short_qsa_projection && node.op_type != OpType::SDPA && node.op_type != OpType::SDPA_MLA &&
         node.op_type != OpType::QSA_INDEXER && node.op_type != OpType::QSA_SDPA &&
         node.op_type != OpType::PLE_LOOKUP &&
         try_decode_segment(node, inputs, output, thread_pool, hc_tag,
@@ -556,14 +588,31 @@ void CudaBackend::dispatch(const GraphNode& node,
     // epoch after that recovery instead of trusting pre-recovery host state.
     if (impl_->segment_invalidations != invalidations_before) hc_tag = hc_action();
     if (hc_tag) {
-        const cudaError_t result = hc_tag == 1
-            ? mollm_cuda::launch_q4_g32_unequal_projections(
-                hc_pair->computed_input,
-                static_cast<const Q4B8G32Block*>(hc_first_weight->data),
+        cudaError_t result;
+        const int rows = hc_pair->computed_rows;
+        if (hc_tag == 2) {
+            result = cudaMemcpyAsync(device_pointer<float>(*output), hc_pair->cache,
+                size_t(rows) * 4 * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        } else if (rows == 1) {
+            if(impl_->prefer_q4_hc_adjacent&&
+               reinterpret_cast<uintptr_t>(hc_pair->computed_input)%alignof(float4)==0) {
+                result=mollm_cuda::launch_q4_g32_hc_adjacent_projections(
+                    hc_pair->computed_input,static_cast<const Q4B8G32Block*>(hc_first_weight->data),
+                    static_cast<const Q4B8G32Block*>(hc_second_weight->data),
+                    device_pointer<float>(*output),hc_pair->cache,cudaStreamPerThread);
+            } else {
+            result = mollm_cuda::launch_q4_g32_unequal_projections(
+                hc_pair->computed_input, static_cast<const Q4B8G32Block*>(hc_first_weight->data),
                 static_cast<const Q4B8G32Block*>(hc_second_weight->data),
-                device_pointer<float>(*output), hc_pair->cache, 320, 4, 10240, cudaStreamPerThread)
-            : cudaMemcpyAsync(device_pointer<float>(*output), hc_pair->cache,
-                4 * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+                device_pointer<float>(*output), hc_pair->cache, 320, 4, 10240, cudaStreamPerThread);
+            }
+        } else {
+            result = mollm_cuda::launch_q4_g32_small_batch_unequal_projections(
+                hc_pair->computed_input, static_cast<const Q4B8G32Block*>(hc_first_weight->data),
+                static_cast<const Q4B8G32Block*>(hc_second_weight->data),
+                device_pointer<float>(*output), hc_pair->cache, rows, 320, 4, 10240, 10240, 320, 4,
+                cudaStreamPerThread);
+        }
         if (!mollm_cuda::report_cuda(result, "HC paired projection")) impl_->failed = true;
         else if (hc_tag == 1) ++impl_->hc_projection_enqueues;
         else ++impl_->hc_projection_copies;
@@ -900,6 +949,10 @@ void CudaBackend::dispatch(const GraphNode& node,
                    mask->stride[0]%4||mask->stride[1]%4) {
                     std::fprintf(stderr,"CudaBackend: QSA attention invalid operands/layout\n");impl_->failed=true;return;
                 }
+                if(attention_cache_only_) {
+                    if(!append_cache()||!zero_tensor(*output,output->nbytes()))impl_->failed=true;
+                    record_native();return;
+                }
                 mollm_cuda::QsaSelectedAttentionParams p{};
                 p.heads=num_heads;p.kv_heads=num_kv_heads;p.queries=query_length;p.keys=key_length;p.past=past_length;
                 p.key_dim=key_dim;p.value_dim=value_dim;p.slots=indices->shape[0];p.scale=scale;
@@ -916,24 +969,64 @@ void CudaBackend::dispatch(const GraphNode& node,
                 }();
                 const int group=num_heads/num_kv_heads;
                 p.reuse_gqa=grouped&&query_length>=32&&key_dim==256&&value_dim==256&&group>=2&&group<=16;
-                if(split&&query_length==1&&p.slots>=128) {
+                const bool exact_short_queries=query_length>1&&query_length<=8;
+                if(split&&(query_length==1||exact_short_queries)&&p.slots>=128) {
                     p.partitions=16;
                 }
+                // Gather amortization depends on both selected tokens and
+                // verification width. Preserve the direct PV path for tiny
+                // selections; wider batches need more work to cover staging.
+                const int short_min_slots=query_length<=2?512:query_length==3?768:
+                    query_length==4?1024:1280;
+                const bool short_gather=query_length<=5&&
+                    std::min(key_length,p.slots)>=short_min_slots;
+                const bool gather_values=fp16_cache&&query_length>0&&query_length<=8&&
+                    (key_length>=4096||short_gather)&&
+                    num_heads==24&&num_kv_heads==2&&key_dim==256&&value_dim==256&&
+                    p.slots>=128&&p.slots<=4096&&p.partitions>1&&!p.reuse_gqa;
+                mollm_cuda::QsaSelectedValueWorkspace value_workspace{};
                 if(p.reuse_gqa||p.partitions>1) {
-                    const size_t bytes=size_t(query_length)*num_heads*p.slots*sizeof(float);
+                    size_t bytes=size_t(query_length)*num_heads*p.slots*sizeof(float);
+                    size_t value_offset=0,active_offset=0;
+                    // Carve disjoint score, selected-value and validity regions
+                    // from the existing score workspace allocation.
+                    if(gather_values) {
+                        if(!mollm_cuda::qsa_gathered_fp16_workspace_bytes(p,value_workspace.values_bytes,value_workspace.active_bytes)) {
+                            impl_->failed=true;return;
+                        }
+                        value_offset=(bytes+127)&~size_t(127);
+                        active_offset=(value_offset+value_workspace.values_bytes+127)&~size_t(127);
+                        bytes=active_offset+value_workspace.active_bytes;
+                    }
                     if(!impl_->reserve(impl_->qsa_selected_scores,impl_->qsa_selected_scores_bytes,bytes,true)) {
                         impl_->failed=true;return;
                     }
                     p.selected_scores=static_cast<float*>(impl_->qsa_selected_scores);
+                    if(gather_values) {
+                        auto* scratch=static_cast<uint8_t*>(impl_->qsa_selected_scores);
+                        value_workspace.values=scratch+value_offset;
+                        value_workspace.active=reinterpret_cast<int32_t*>(scratch+active_offset);
+                    }
                 }
                 if(!append_cache()){impl_->failed=true;return;}
-                if(!mollm_cuda::report_cuda(mollm_cuda::launch_qsa_selected_attention(query_data,key_data,value_data,fp16_cache,
-                   device_pointer_const<int32_t>(*indices),output_data,p,cudaStreamPerThread,mask_data),"QSA selected attention")) {
+                // Split QK, normalization and ordered PV support multiple
+                // queries directly; preserve decode arithmetic without one
+                // set of kernel launches per verified token.
+                const auto status=gather_values?
+                    mollm_cuda::launch_qsa_selected_attention_gathered_fp16(
+                        query_data,key_data,value_data,device_pointer_const<int32_t>(*indices),output_data,p,value_workspace,cudaStreamPerThread,mask_data):
+                    mollm_cuda::launch_qsa_selected_attention(
+                        query_data,key_data,value_data,fp16_cache,device_pointer_const<int32_t>(*indices),output_data,p,cudaStreamPerThread,mask_data);
+                if(!mollm_cuda::report_cuda(status,"QSA selected attention")) {
                     impl_->failed=true;return;
                 }
                 ++impl_->qsa_attention_enqueues;
                 if(p.reuse_gqa)++impl_->qsa_gqa_enqueues;
                 if(p.partitions>1)++impl_->qsa_split_enqueues;
+                record_native();return;
+            }
+            if(attention_cache_only_ && cached && node.op_type==OpType::SDPA) {
+                if(!append_cache()||!zero_tensor(*output,output->nbytes()))impl_->failed=true;
                 record_native();return;
             }
             const size_t score_count = static_cast<size_t>(num_heads) *
@@ -955,11 +1048,7 @@ void CudaBackend::dispatch(const GraphNode& node,
             // softmax and value reductions for each short causal query.
             // Appending the whole cache above is safe: each query is limited
             // to its own prefix, so later keys cannot enter its reduction.
-            static const bool exact_small_attention = [] {
-                const char* value = std::getenv("MOLLM_CUDA_SDPA_SMALL_BATCH_EXACT");
-                return value && std::strcmp(value, "1") == 0;
-            }();
-            if (exact_small_attention && cached && causal &&
+            if (cached && causal &&
                 query_length > 1 && query_length <= 8 &&
                 current_length == query_length) {
                 for (int token = 0; token < query_length; ++token) {
@@ -1288,6 +1377,27 @@ void CudaBackend::dispatch(const GraphNode& node,
             graph_params::get_i32(node.params, 0, 0));
         const float* device_a = device_pointer_const<float>(a);
         float* device_c = device_pointer<float>(*output);
+        // cuBLAS may choose a different reduction tree for M>1. In an
+        // indexer even a one-ULP change can replace a selected KV group.
+        // Match single-token projection for MTP-sized FP16 batches only.
+        if (m >= 2 && m <= 8 && activation_kind == Activation::NONE &&
+            matmul_weight->layout == Impl::WeightLayout::Dense &&
+            matmul_weight->type == CUDA_R_16F &&
+            impl_->qsa_projection_graphs.count(&node) &&
+            fp32_contiguous(a) && fp32_contiguous(*output) &&
+            a.shape[2] == 1 && a.shape[3] == 1 &&
+            output->shape[1] == m && output->shape[2] == 1 && output->shape[3] == 1 &&
+            device_a && device_c && lda == k && ldc == n) {
+            for (int token = 0; token < m; ++token) {
+                if (!impl_->run_matmul_device(device_a + size_t(token) * lda, lda, weight,
+                        device_c + size_t(token) * ldc, ldc, 1, n, k, Activation::NONE, 0, -1)) {
+                    impl_->failed = true;
+                    return;
+                }
+            }
+            record_native();
+            return;
+        }
         Impl::HcProjectionPair* prefill_pair = nullptr;
         __half* shared_half = nullptr;
         bool shared_ready = false, shared_first = false;
@@ -2056,6 +2166,10 @@ void CudaBackend::dispatch(const GraphNode& node,
         --impl_->segment_cursor;
     }
     finish_decode_segment();
+    if(impl_->retained_verification && node.op_type!=OpType::PLE_LOOKUP) {
+        ++impl_->verify_fallbacks;
+        if(impl_->verify_fallbacks<=3)std::fprintf(stderr,"CUDA verify fallback boundary: %s\n",op_type_name(node.op_type));
+    }
     if (node.op_type != OpType::PLE_LOOKUP) impl_->segment_disabled = true;
     impl_->segment_ready = false;
     if (impl_->operator_fallback ==
@@ -2189,6 +2303,8 @@ void CudaBackend::dispatch(const GraphNode& node,
         return;
     }
     ++impl_->fallback_ops[static_cast<uint32_t>(node.op_type)];
-    if (node.op_type == OpType::PLE_LOOKUP && impl_->segment_candidate && !impl_->segment_disabled)
+    if (node.op_type == OpType::PLE_LOOKUP && impl_->segment_candidate && !impl_->segment_disabled) {
         impl_->segment_ready = true;
+        if(impl_->retained_verification)++impl_->verify_ready;
+    }
 }

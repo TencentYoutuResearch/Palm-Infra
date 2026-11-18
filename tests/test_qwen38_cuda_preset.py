@@ -21,14 +21,16 @@ class PresetTests(unittest.TestCase):
         (self.root / "build_cuda").mkdir()
         chat = self.root / "build_cuda/mollm_chat"
         chat.write_text(f"#!{sys.executable}\nimport json,os,sys\n"
-                        "print(json.dumps(dict(args=sys.argv[1:],cache=os.environ['MOLLM_CUDA_PREFILL_FP16_CACHE_MB'])))\n")
+                        "print(json.dumps(dict(args=sys.argv[1:],cache=os.environ['MOLLM_CUDA_PREFILL_FP16_CACHE_MB'],segments_disabled=os.environ.get('MOLLM_CUDA_DISABLE_DECODE_SEGMENTS'),policy={k:v for k,v in os.environ.items() if k.startswith('MOLLM_')})))\n")
         chat.chmod(0o755)
 
-    def run_case(self, *args, cache=None):
-        env = os.environ.copy()
-        env.pop("MOLLM_CUDA_PREFILL_FP16_CACHE_MB", None)
+    def run_case(self, *args, cache=None, segments_disabled=None, overrides=None):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MOLLM_")}
+        if segments_disabled is not None:
+            env["MOLLM_CUDA_DISABLE_DECODE_SEGMENTS"] = segments_disabled
         if cache is not None:
             env["MOLLM_CUDA_PREFILL_FP16_CACHE_MB"] = cache
+        env.update(overrides or {})
         # --help deliberately bypasses all GPU/process/memory checks.
         result = subprocess.run(["bash", str(self.root / SCRIPT.name), "--help", *args],
                                 env=env, text=True, capture_output=True)
@@ -37,6 +39,56 @@ class PresetTests(unittest.TestCase):
 
     def chunk(self, result):
         return [result["args"][i+1] for i, arg in enumerate(result["args"][:-1]) if arg == "--prefill-chunk-size"]
+
+    def run_mtp_case(self, *args, overrides=None):
+        script = self.root / "chat-qwen38-cuda-mtp.sh"
+        shutil.copyfile(SCRIPT.with_name(script.name), script)
+        mock_bin = self.root / "mock-tools"
+        mock_bin.mkdir(exist_ok=True)
+        for name in ("nvidia-smi", "awk"):
+            tool = mock_bin / name
+            tool.write_text("#!/bin/sh\nexit 0\n")
+            tool.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MOLLM_")}
+        env["PATH"] = str(mock_bin) + os.pathsep + env["PATH"]
+        env.update(overrides or {})
+        result = subprocess.run(["bash", str(script), *args], env=env,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["args"][-len(args):] if args else [], list(args))
+        self.assertEqual(data["cache"], "2048")
+        return data
+
+    def test_no_experiment_environment(self):
+        removed = (
+            "MOLLM_CUDA_FP16_EXPERT_PALETTE", "MOLLM_CUDA_GDN_REGISTER_PREFIXES",
+            "MOLLM_CUDA_HC_SMALL_BATCH_PAIR", "MOLLM_CUDA_MTP_CONFIDENCE_PRODUCT",
+            "MOLLM_CUDA_MTP_CONTINUE_PRODUCT", "MOLLM_CUDA_MTP_DRAFT_COMPACT_Q2",
+            "MOLLM_CUDA_MTP_DRAFT_COMPACT_Q4", "MOLLM_CUDA_MTP_DRAFT_ENERGY_GROUPS",
+            "MOLLM_CUDA_MTP_DRAFT_ENERGY_SCREEN", "MOLLM_CUDA_MTP_DRAFT_FITTED_Q4",
+            "MOLLM_CUDA_MTP_PREFIX_ONLY", "MOLLM_CUDA_MTP_VERIFY_SEGMENTS",
+            "MOLLM_CUDA_MTP_WIDTH_CACHE", "MOLLM_CUDA_NVFP4_MMA_MIN_ROWS",
+            "MOLLM_CUDA_Q4_BATCH_VECTOR_LOADS", "MOLLM_CUDA_Q4_GROUPED_NARROW",
+            "MOLLM_CUDA_Q4_NARROW_PREFETCH", "MOLLM_CUDA_Q4_NARROW_ROW_CACHE",
+            "MOLLM_CUDA_Q4_PREFETCH", "MOLLM_CUDA_Q8_HEAD_SCREEN",
+            "MOLLM_CUDA_Q8_HEAD_SCREEN_BITS", "MOLLM_CUDA_QSA_SPLIT_VALUES",
+            "MOLLM_CUDA_SDPA_SMALL_BATCH_EXACT",
+        )
+        for data in (self.run_case(), self.run_mtp_case()):
+            for name in removed:
+                self.assertNotIn(name, data["policy"])
+        self.assertEqual(self.run_mtp_case()["policy"]["MOLLM_CUDA_MTP_STATE_PREFIXES"], "1")
+
+    def test_qualified_decode_segment_policy(self):
+        for context in ("2048", "16384", "32768"):
+            self.assertIsNone(self.run_case("--n-ctx", context)["segments_disabled"])
+        for value in ("1", "0", ""):
+            # The backend tests presence: even zero/empty intentionally disable.
+            self.assertEqual(self.run_case(segments_disabled=value)["segments_disabled"], value)
+        for args in (("--n-ctx", "32769"), ("--dense-bringup",),
+                     ("--package", "custom.mollm", "--qsa-companion", "bundle")):
+            self.assertEqual(self.run_case(*args)["segments_disabled"], "1")
 
     def test_existing_small_context_unchanged(self):
         for args in ((), ("--qsa-companion", "bundle", "--n-ctx", "65536")):

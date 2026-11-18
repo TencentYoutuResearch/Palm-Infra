@@ -1,5 +1,6 @@
 #include "engine/engine.h"
 #include "engine/logical_prefill.h"
+#include "engine/routed_expert_weight.h"
 #include "engine/qsa_companion.h"
 #include "backends/factory.h"
 #include "storage/byte_ranges.h"
@@ -136,6 +137,8 @@ void LLMEngine::clear_model_state() {
     caches_.clear();
     mtp_caches_.clear();
     auxiliary_states_.clear();
+    mtp_auxiliary_states_.clear();
+    qsa_append_states_.clear();
     embed_weight_ = nullptr;
     lm_head_weight_ = nullptr;
     vision_pos_embed_ = nullptr;
@@ -411,11 +414,24 @@ bool LLMEngine::load_mtp_companion() {
             !manifest.at("weights").is_object()) return fail("unsupported manifest contract");
         const int context = manifest.at("n_ctx").get<int>();
         const int sequence = manifest.at("seq_len").get<int>();
-        if (context < cfg_.n_ctx || sequence <= 0) return fail("insufficient context or invalid sequence length");
+        if (context <= 0 || sequence <= 0) return fail("invalid context or sequence length");
         const fs::path graph_file = fs::canonical(directory / "model_mtp.graph");
         if (graph_file.parent_path() != directory) return fail("graph escapes bundle directory");
         const std::string graph_path = graph_file.string();
         if (!graph_load(graph_mtp_, graph_path.c_str())) return fail("invalid graph");
+        const auto has_qsa = [](const Graph& graph) {
+            return std::any_of(graph.nodes.begin(), graph.nodes.end(),
+                [](const auto& node) { return node.op_type == OpType::QSA_INDEXER; });
+        };
+        // QSA state capacity is allocated from runtime n_ctx just like target
+        // KV. Its exported capacity is not an additional context ceiling.
+        // Dense drafts retain the export-time attention-budget restriction.
+        if (context < cfg_.n_ctx && !has_qsa(graph_mtp_))
+            return fail("insufficient dense draft context");
+        if (has_qsa(graph_mtp_) != manifest.value("qsa", false))
+            return fail("draft QSA graph/manifest mismatch");
+        if (has_qsa(graph_prefill_) != has_qsa(graph_mtp_))
+            return fail("target and draft must both enable QSA or both use dense attention");
         int64_t target_width = 0;
         for (uint32_t id : graph_mtp_.graph_inputs) {
             const auto& node = graph_mtp_.nodes[id];
@@ -475,10 +491,17 @@ bool LLMEngine::load_mtp_companion() {
             } else {
                 // GraphBuilder materializes inline constants outside the
                 // streamed-weight manifest. Accept only its exact node-local
-                // scalar filename and FP32 shape, never an arbitrary file.
+                // scalar or QSA frequency filename/FP32 shape, never an arbitrary file.
                 filename = "model_mtp_const_" + std::to_string(node.id) + ".weights";
+                const bool qsa_frequency = std::any_of(graph_mtp_.nodes.begin(), graph_mtp_.nodes.end(),
+                    [&](const auto& user) {
+                        return user.op_type == OpType::QSA_INDEXER && user.inputs.size() == 8 &&
+                            user.inputs[3] == node.id && user.params.i32.size() == 5 &&
+                            user.params.i32[2] >= 2 && user.params.i32[2] <= 256 &&
+                            node.out_shape[0] == user.params.i32[2] / 2;
+                    });
                 if (reference != filename || node.out_prec != Precision::FP32 ||
-                    node.out_shape[0] != 1 || node.out_shape[1] != 1 || node.out_shape[2] != 1 || node.out_shape[3] != 1)
+                    (node.out_shape[0] != 1 && !qsa_frequency) || node.out_shape[1] != 1 || node.out_shape[2] != 1 || node.out_shape[3] != 1)
                     return fail("unlisted weight reference");
             }
             if (filename.empty() || fs::path(filename).filename() != filename || filename == "." || filename == "..")
@@ -576,8 +599,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
     }
     if (!cfg_.qsa_companion_dir.empty() && (&g == &graph_prefill_ || &g == &graph_decode_)) {
         std::string error;
-        if (cfg_.device != Device::CUDA || cfg_.mtp_draft_tokens ||
-            !cfg_.mtp_companion_dir.empty() || cfg_.static_padded ||
+        if (cfg_.device != Device::CUDA || cfg_.static_padded ||
             package_metadata_["architecture"] != "qwen4-exp" ||
             !attach_qsa_companion(g, cfg_.qsa_companion_dir, cfg_.n_ctx, error)) {
             std::fprintf(stderr, "Engine: cannot attach CUDA text QSA companion: %s\n", error.c_str());
@@ -627,6 +649,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
         }
     }
 
+    const auto routed_expert_rows = mollm::routed_fp16_expert_rows(g);
     const bool build_cpu_weight_sidecars =
         !(already_loaded && &g == &graph_mtp_ && cfg_.device == Device::CUDA) &&
         (!accelerator_backend_ ||
@@ -691,8 +714,13 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
             if (accelerator_backend_ &&
                 exec_ctx.backend == accelerator_backend_.get() &&
                 t.prec != Precision::INT4 &&
-                t.prec != Precision::INT8)
-                accelerator_backend_->wrap_weight(t);
+                t.prec != Precision::INT8) {
+                const auto expert = routed_expert_rows.find(node.id);
+                if (t.prec == Precision::FP16 && expert != routed_expert_rows.end())
+                    accelerator_backend_->wrap_routed_expert_weight(t, expert->second);
+                else
+                    accelerator_backend_->wrap_weight(t);
+            }
         };
 
         // Quantized layout metadata is only known after parsing the weight
@@ -1043,6 +1071,11 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
     exec_ctx.graph = &g;
     exec_ctx.pool = &g.runtime.pool;
     exec_ctx.thread_pool = &thread_pool_;
+    // Prepare liveness and reshape-view contracts under the same policy used
+    // by execution. Decode plans retain their conservative captured lifetimes.
+    mollm_prefill::LogicalBatchScope logical_scope(exec_ctx.backend,
+        cfg_.cuda_prefill_logical_batch && &g == &graph_prefill_);
+    if (!logical_scope.entered) return false;
     prepare_execution(exec_ctx);
 
     return true;
@@ -1054,14 +1087,14 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
 
 bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
                                 std::vector<CachePair>& caches, int n_ctx) {
+    auto& auxiliary_states = &g == &graph_mtp_ ? mtp_auxiliary_states_ : auxiliary_states_;
     // QSA auxiliary capacities follow runtime context, just like main KV.
     // Package graph capacity is not a second hidden --n-ctx limit. The two
     // graphs later share these buffers via the existing aux_state migration.
     std::unordered_map<uint32_t,std::pair<int,int>> qsa_state_shapes;
     for(const auto& node:g.nodes)if(node.op_type==OpType::QSA_INDEXER) {
-        const auto reject=[](){std::fprintf(stderr,"Engine: QSA requires CUDA text, ctx<=262144, no MTP/padding, valid independent auxiliary states\n");return false;};
-        if(cfg_.device!=Device::CUDA||n_ctx<1||n_ctx>mollm_qsa::max_context||cfg_.mtp_draft_tokens||
-           !cfg_.mtp_companion_dir.empty()||cfg_.static_padded||node.inputs.size()!=8||
+        const auto reject=[](){std::fprintf(stderr,"Engine: QSA requires CUDA text, ctx<=262144, no padding, valid independent auxiliary states\n");return false;};
+        if(cfg_.device!=Device::CUDA||n_ctx<1||n_ctx>mollm_qsa::max_context||cfg_.static_padded||node.inputs.size()!=8||
            node.params.i32.size()!=5||node.params.i32[0]<1||node.params.i32[0]>16||
            node.params.i32[1]<2||node.params.i32[1]>256||node.params.i32[2]<2||
            node.params.i32[2]>node.params.i32[1]||node.params.i32[2]%2||
@@ -1097,8 +1130,9 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
             if(qsa!=qsa_state_shapes.end()) {
                 tensor.shape[0]=qsa->second.first;tensor.shape[1]=qsa->second.second;
                 tensor.compute_strides();
+                if (&g != &graph_mtp_) qsa_append_states_.insert(input.layer);
             }
-            auxiliary_states_[input.layer] = &tensor;
+            auxiliary_states[input.layer] = &tensor;
             continue;
         }
         // Cache storage is selected by the active execution backend. This
@@ -1317,7 +1351,7 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
                     return false;
             }
     }
-    for (const auto& entry : auxiliary_states_) {
+    for (const auto& entry : auxiliary_states) {
         Tensor* state = entry.second;
         if (!state || state->data)
             continue;
@@ -1350,12 +1384,12 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     cfg_ = cfg;
     if (!cfg_.qsa_companion_dir.empty() &&
         (cfg_.device != Device::CUDA || cfg_.n_ctx < 1 || cfg_.n_ctx > mollm_qsa::max_context ||
-         cfg_.static_padded || cfg_.mtp_draft_tokens || !cfg_.mtp_companion_dir.empty())) {
-        std::fprintf(stderr, "Engine: --qsa-companion requires CUDA text, ctx1..262144, no MTP/padding\n");
+         cfg_.static_padded)) {
+        std::fprintf(stderr, "Engine: --qsa-companion requires CUDA text, ctx1..262144, no padding\n");
         return false;
     }
     if(cfg_.cuda_prefill_logical_batch&&!mollm_prefill::logical_config_supported(cfg_)) {
-        std::fprintf(stderr,"Engine: logical prefill requires bounded CUDA resident+offload-PLE+reclaim, positive context, chunk0..2048, no MTP/padding/decode-as-prefill\n");
+        std::fprintf(stderr,"Engine: logical prefill requires bounded CUDA resident+offload-PLE+reclaim, positive context, chunk0..2048, no padding/decode-as-prefill\n");
         return false;
     }
     const bool readonly_last_use=cfg_.cuda_prefill_logical_batch;
@@ -1370,13 +1404,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         if (!cfg_.cuda_prefill_reclaim || cfg_.device!=Device::CUDA || !cfg_.offload_ple ||
             cfg_.weight_loading!=WeightLoadingMode::RESIDENT || cfg_.moe_ssd_cache_bytes ||
             cfg_.n_ctx<1 || cfg_.prefill_chunk_size<0 ||
-            cfg_.mtp_draft_tokens || !cfg_.mtp_companion_dir.empty() ||
             cfg_.use_decode_as_prefill || cfg_.static_padded ||
             !arena || std::strcmp(arena,"cuda-device") ||
             !valid_headroom || headroom<size_t(24576)*1024*1024 ||
-            !valid_pool || pool_limit==0 || pool_limit>size_t(4096)*1024*1024 ||
-            !std::getenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS")) {
-            std::fprintf(stderr,"Engine: --cuda-prefill-logical-batch requires CUDA resident+offload-PLE+reclaim, no MTP/padding/decode-as-prefill, CUDA-device arena, >=24576 MiB headroom, output pool1..4096 MiB, and disabled decode segments\n");
+            !valid_pool || pool_limit==0 || pool_limit>size_t(4096)*1024*1024) {
+            std::fprintf(stderr,"Engine: --cuda-prefill-logical-batch requires CUDA resident+offload-PLE+reclaim, no padding/decode-as-prefill, CUDA-device arena, >=24576 MiB headroom, output pool1..4096 MiB, with decode segments suspended during prefill\n");
             return false;
         }
     }
@@ -1590,7 +1622,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             std::fprintf(stderr, "Engine: CUDA prefill intermediate reclamation enabled, sequence cap%d\n",
                 sequence_cap);
             if (readonly_last_use)
-                std::fprintf(stderr,"Engine: prefill stateful read-only last-use contracts enabled; captured decode segments disabled\n");
+                std::fprintf(stderr,"Engine: prefill stateful read-only last-use contracts enabled; captured decode segments suspended during prefill\n");
         }
         const char* reuse = std::getenv("MOLLM_CUDA_PREFILL_REUSE_WORKSPACE");
         if (reuse && std::strcmp(reuse, "0") == 0) {

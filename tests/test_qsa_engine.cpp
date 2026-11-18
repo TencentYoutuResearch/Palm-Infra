@@ -22,8 +22,43 @@ std::vector<float> hidden(LLMEngine& e,const std::vector<int>& ids) {
 }
 }
 int main(int argc,char** argv) {
-    require(argc==4 || argc==5,"native package, dense package and companion arguments");
+    require(argc==4 || argc==5 || argc==6 || argc==7,"native package, dense package and companion arguments");
     CudaBackend probe;if(!probe.available())return 77;
+    if (argc>=6) {
+        for (int chunk : {3,17}) {
+            LLMEngine serial, speculative;
+            auto cfg=config(argv[5],chunk);
+            require(serial.load(cfg),"load serial QSA reference");
+            cfg.mtp_draft_tokens=3;
+            if(argc==7)cfg.mtp_companion_dir=argv[6];
+            require(speculative.load(cfg),"load QSA draft with independent auxiliary state");
+            for (int repeat=0;repeat<2;++repeat) {
+                serial.reset();speculative.reset();
+                std::vector<int> prompt;for(int i=0;i<29;++i)prompt.push_back(1+i%31);
+                int current=serial.prefill(prompt);
+                require(current>=0&&speculative.prefill(prompt)==current,"QSA MTP initial logits");
+                for(int step=0;step<7;++step) {
+                    std::vector<int> outputs;
+                    require(speculative.speculative_decode(current,outputs,4)&&!outputs.empty(),"QSA speculative step");
+                    for(int token:outputs) {
+                        require(serial.decode(current)==token,"QSA verification versus serial greedy");
+                        current=token;
+                    }
+                    require(serial.past_len()==speculative.past_len(),"QSA rewind position");
+                }
+                const auto stats=speculative.mtp_stats();
+                require(stats.accepted<stats.drafted,"fixture exercises rejected QSA drafts");
+                require(stats.recurrent_checkpoint_bytes==0,"append-only QSA does not snapshot full history");
+                const auto expected=hidden(serial,{current});
+                const auto actual=hidden(speculative,{current});
+                require(expected.size()==actual.size(),"subsequent QSA state size");
+                for(size_t i=0;i<expected.size();++i)
+                    require(std::fabs(expected[i]-actual[i])<2e-4f,"subsequent hidden after QSA rollback");
+            }
+        }
+        std::puts("QSA MTP: independent draft state, rejection, pooling boundaries and reset pass");
+        return 0;
+    }
     if (argc==5) {
         auto bad=config(argv[2],3);bad.qsa_companion_dir=argv[3];
         LLMEngine rejected;require(!rejected.load(bad),"invalid companion must fail closed");

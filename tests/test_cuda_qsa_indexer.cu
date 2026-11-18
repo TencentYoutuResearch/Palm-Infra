@@ -49,6 +49,7 @@ void fixture(int n,int dim,int heads,int rope,int budget) {
     Buffer dp(projection.size()*4),dq((size_t(n)*heads*dim+16)*4),dr((size_t(capacity)*dim+16)*4);
     Buffer db((size_t(capacity/ratio)*dim+16)*4),ds((n*ss+16)*4),di((n*is+16)*4);
     Buffer dwq(dim*4),dwk(dim*4),df(freq.size()*4);
+    Buffer rejected(projection.size()*4), speculative_q(size_t(n)*heads*dim*4), speculative_scores(n*ss*4);
     check(cudaMemcpy(dwq.data,qw.data(),dim*4,cudaMemcpyHostToDevice));
     check(cudaMemcpy(dwk.data,kw.data(),dim*4,cudaMemcpyHostToDevice));
     check(cudaMemcpy(df.data,freq.data(),freq.size()*4,cudaMemcpyHostToDevice));
@@ -58,6 +59,9 @@ void fixture(int n,int dim,int heads,int rope,int budget) {
     for(int variant=0;variant<2;++variant) {
         if(variant)for(float& x:projection)x=x*-.7f+.13f;
         check(cudaMemcpy(dp.data,projection.data(),projection.size()*4,cudaMemcpyHostToDevice));
+        auto rejected_projection = projection;
+        for (float& value : rejected_projection) value = -3.f * value + .75f;
+        check(cudaMemcpy(rejected.data,rejected_projection.data(),rejected_projection.size()*4,cudaMemcpyHostToDevice));
         // Independent scalar reference recomputes complete groups, never
         // treats partial groups as permanent pooled keys.
         std::vector<float> expected_q(size_t(n)*heads*dim),expected_pooled(size_t(n/ratio)*dim);
@@ -76,8 +80,8 @@ void fixture(int n,int dim,int heads,int rope,int budget) {
             std::copy(k.begin(),k.end(),expected_pooled.begin()+size_t(b)*dim);
         }
         const std::vector<std::vector<int>> schedules=n<100?
-            std::vector<std::vector<int>>{{n},{3,2,1,5,7},{1}}:
-            std::vector<std::vector<int>>{{n},{3,511,1,2,1024},{31,32,33}};
+            std::vector<std::vector<int>>{{n},{3,2,1,5,7},{1},{1,2,3}}:
+            std::vector<std::vector<int>>{{n},{3,511,1,2,1024},{31,32,33},{1,2,3}};
         for(size_t schedule=0;schedule<schedules.size();++schedule) {
             const float guard=12345.f;
             auto poison=[&](Buffer& b,size_t count){std::vector<float> v(count+16,guard);check(cudaMemcpy(b.data,v.data(),v.size()*4,cudaMemcpyHostToDevice));};
@@ -108,6 +112,16 @@ void fixture(int n,int dim,int heads,int rope,int budget) {
                     bad=p;bad.rope_dim=dim+2;
                     require(mollm_cuda::launch_qsa_indexer_update(dp.f(),dwq.f(),dwk.f(),df.f(),
                         dr.f(8),db.f(8),dq.f(8),ds.f(8),bad,stream)==cudaErrorInvalidValue,"reject wrong main RoPE width");
+                }
+                if(schedule==3) {
+                    // Speculate across complete-pool boundaries, reject that
+                    // suffix, then overwrite only the accepted prefix. No raw
+                    // or pooled snapshot: future groups must stay invisible
+                    // and be recomputed when their completion is reached again.
+                    auto speculative = p;
+                    speculative.queries = std::min(8,n-past);
+                    check(mollm_cuda::launch_qsa_indexer_update(rejected.f(past*ps),dwq.f(),dwk.f(),df.f(),
+                        dr.f(8),db.f(8),speculative_q.f(),speculative_scores.f(),speculative,stream));
                 }
                 if(schedule==1) {
                     cudaGraph_t graph;cudaGraphExec_t exec;

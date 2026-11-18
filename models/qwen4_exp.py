@@ -251,11 +251,11 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
         index_heads = int(tc.get("indexer_n_heads", 4))
         index_dim = int(tc.get("indexer_head_dim", 128))
         index_ratio = int(tc.get("indexer_compress_ratio", 4))
-        if (_mtp_mode or int(tc.get("indexer_kv_heads", 1)) != 1 or
+        if (int(tc.get("indexer_kv_heads", 1)) != 1 or
                 not 1 <= n_ctx <= 262144 or not 1 <= index_heads <= 16 or
                 not rope_dim <= index_dim <= 256 or not 1 <= index_ratio <= 16 or
                 qsa_budget < 1 or qsa_budget % index_ratio or qsa_budget + index_ratio - 1 > 4096):
-            raise ValueError("unsupported native QSA geometry/context/MTP")
+            raise ValueError("unsupported native QSA geometry/context")
         g.metadata["qsa"] = "contiguous-causal-fp32-v1"
     linear_num_heads = int(tc["linear_num_key_heads"])
     linear_num_v_heads = int(tc["linear_num_value_heads"])
@@ -427,12 +427,12 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
 
 
 def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 8,
-                    n_ctx: int = 2048) -> GraphBuilder:
+                    n_ctx: int = 2048, *, enable_qsa: bool = False) -> GraphBuilder:
     """Build the single-layer Qwen4Exp draft; weight export is separate.
 
     Uses shared token embeddings/head, no PLE, and independent MTP attention,
     MoE and hyper-connection weights. Never mutates the main model config.
-    Contexts above QSA budget and non-final target-layer taps remain unsupported.
+    Contexts above QSA budget require QSA; non-final target-layer taps remain unsupported.
     """
     draft_cfg = copy.deepcopy(cfg)
     tc = draft_cfg["text_config"] if "text_config" in draft_cfg else draft_cfg
@@ -456,7 +456,8 @@ def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 8,
     if "rope_theta" in mtp:
         tc["rope_parameters"]["rope_theta"] = mtp["rope_theta"]
     graph = build_graph(weights_dir, draft_cfg, seq_len, n_ctx,
-                        is_prefill=True, export_mtp_state=True, _mtp_mode=True)
+                        is_prefill=True, export_mtp_state=True, _mtp_mode=True,
+                        enable_qsa=enable_qsa)
     for node in graph._nodes:
         if node.weight_path:
             for old, new in (
@@ -654,14 +655,15 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
     return streamed
 
 
-def build_mtp_streamed_weights(model_dir: str | Path, cfg: dict):
+def build_mtp_streamed_weights(model_dir: str | Path, cfg: dict, *, enable_qsa: bool = False):
     """MTP-only FP16 baseline descriptors, excluding shared embedding/head.
 
     Source experts use E4M3FN with BF16/F32 128x128 scales. Decoding is bounded
     to 128 rows at a time, not a full FP32 expert arena. These weights still
     require package integration and an appropriate native expert backend.
     """
-    build_mtp_graph(".", cfg, seq_len=1, n_ctx=1)  # validate supported contract
+    build_mtp_graph(".", cfg, seq_len=1, n_ctx=1,
+                    enable_qsa=enable_qsa)  # validate supported contract
     source = SafeTensorIndex(model_dir)
     def checkpoint_name(name):
         return name.replace("model.language_model.layers.0.", "mtp.layers.0.").replace(
@@ -686,6 +688,22 @@ def build_mtp_streamed_weights(model_dir: str | Path, cfg: dict):
             source, f"mtp.{name}.weight")
     for name in ("fc_embedding", "fc_hidden"):
         weights[_ref(f"mtp_{name}_weight")] = dense_streamed_weight(source, f"mtp.{name}.weight")
+    if enable_qsa:
+        prefix = "mtp.layers.0.self_attn.indexer"
+        index_dim = int(tc.get("indexer_head_dim", 128))
+        index_heads = int(tc.get("indexer_n_heads", 4))
+        for name in ("index_qk_proj", "q_layernorm", "k_layernorm"):
+            original = f"{prefix}.{name}.weight"
+            tensor = source.tensor(original)
+            expected = (((index_heads + 1) * index_dim, int(tc["hidden_size"]))
+                        if name == "index_qk_proj" else (index_dim,))
+            if tensor.shape != expected:
+                raise ValueError(f"MTP QSA weight shape mismatch: {original}")
+            if name == "index_qk_proj" and tensor.dtype not in ("BF16", "F16"):
+                raise ValueError("MTP QSA projection requires BF16/FP16 source")
+            weight = (dense_streamed_weight(source, original) if name == "index_qk_proj"
+                      else fp32_streamed_weight(source, original))
+            weights[_ref(f"mtp_layers_0_self_attn_indexer_{name}_weight")] = weight
     return weights
 
 

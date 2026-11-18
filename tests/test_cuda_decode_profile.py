@@ -13,6 +13,14 @@ SCRIPT = Path(__file__).resolve().parents[1] / "tools/analyze_cuda_decode_profil
 
 
 class DecodeProfileTest(unittest.TestCase):
+    def test_draft_screen_kernels_have_draft_role(self):
+        classify = runpy.run_path(str(SCRIPT))["kernel_family"]
+        for name in ("q4_draft_screen_groups_cuda", "q4_draft_screen_dot_cuda<false>",
+                     "q4_draft_screen_dot_cuda<true>", "q4_draft_screen_initialize_cuda"):
+            self.assertEqual(classify(name), "draft_head")
+        # CUB also serves MoE grouping; names alone cannot assign it to heads.
+        self.assertNotEqual(classify("cub::DeviceRadixSortOnesweepKernel"), "draft_head")
+
     def test_indexed_kernel_overlap_matches_exhaustive_integer_reference(self):
         build = runpy.run_path(str(SCRIPT))["kernel_overlap_lookup"]
         # Boundaries, gaps, adjacent intervals and large Nsight timestamps;
@@ -59,6 +67,33 @@ class DecodeProfileTest(unittest.TestCase):
     def test_name_families_and_exact_totals(self):
         module = runpy.run_path(str(SCRIPT))
         families = {
+            "void selected_values_prefetched<__half>": "qsa_pv",
+            "void selected_values_split<float>": "qsa_pv",
+            "normalize_selected_scores": "qsa_normalize",
+            "void selected_scores_partitioned<__half>": "qsa_qk",
+            "qsa_block_topk<8>": "qsa_indexer",
+            "nvfp4_projections_cuda<0, false>": "nvfp4_projection",
+            "nvfp4_gate_code_subgroup_cuda": "nvfp4_projection",
+            "void nvfp4_gate_paired_cuda<(int)8>": "nvfp4_projection",
+            "nvfp4_gate_paired8_cuda": "nvfp4_projection",
+            "nvfp4_gate_paired8_wide_cuda": "nvfp4_projection",
+            "fp16_expert_projections_cuda": "fp16_expert_projection",
+            "fp16_palette_projections_cuda": "fp16_expert_projection",
+            "void nvfp4_exact_subwarp_cuda<(int)8, (bool)0>": "nvfp4_projection",
+            "void nvfp4_exact_subwarp_cuda<(int)16, (bool)1>": "nvfp4_projection",
+            "q2_draft_head_gemv_cuda": "draft_head",
+            "q4_g32_small_batch_wide_cuda<3>": "q4_projection",
+            "q4_g32_hc_adjacent_projections_cuda": "q4_projection",
+            "q4_g32_m3_adjacent_cuda": "q4_projection",
+            "q4_g32_m3_fixed_cuda": "q4_projection",
+            "q4_g128_rows_gemv_cuda": "q4_projection",
+            "q8_per_channel_dense_gemv_cuda<0>": "q8_projection",
+            "q8_small_batch_exact_cuda<3>": "q8_projection",
+            "q8_head_approximate_batch<4>": "q8_head_screen",
+            "q4_approximate<2>": "q8_head_screen",
+            "scalar_head_anchor_threshold<4>": "q8_head_screen",
+            "scalar_head_select_rows<4>": "q8_head_screen",
+            "q8_head_approximate_batchILi5EE": "q8_head_screen",
             "void sdpa_prefill_pair_queries_cuda": "attention",
             "validate_sdpa_prefix_cuda": "attention",
             "nvfp4_n32_fused_activation_cuda": "moe_gate",
@@ -74,6 +109,7 @@ class DecodeProfileTest(unittest.TestCase):
             "prepare_q4_g32_dense_gemm_cuda": "dense_prepare",
             "cutlass::Kernel2": "dense_gemm",
             "nvjet_sm121_hss_mma": "dense_gemm",
+            "internal::gemvx::kernel<cublasGemvParamsEx<int>>": "dense_gemv",
             "contiguous_cuda": "other",
         }
         for name, expected in families.items():
@@ -84,6 +120,27 @@ class DecodeProfileTest(unittest.TestCase):
         self.assertEqual(summary["other"], [5, 1011])
         self.assertEqual(sum(value[0] for value in summary.values()), 2*len(families)+3)
         self.assertEqual(sum(value[1] for value in summary.values()), 1000*len(families)+11)
+
+    def test_real_mtp_projection_names_keep_separate_families(self):
+        module = runpy.run_path(str(SCRIPT))
+        # Names and durations from a decode-only CUPTI window. Keep low-bit
+        # target experts, FP16 experts and generic cuBLAS GEMV distinguishable;
+        # a kernel name alone does not establish target versus draft ownership.
+        rows = [
+            ("_ZN38_GLOBAL__N__c5986809_6_moe_cu_8d6f79af28nvfp4_gate_paired8_wide_cudaEPKN10mollm_cuda15Nvfp4ProjectionEi",
+             3760, 1225902000),
+            ("_ZN38_GLOBAL__N__c5986809_6_moe_cu_8d6f79af28nvfp4_gate_paired8_wide_cudaEPKN10mollm_cuda15Nvfp4ProjectionEi",
+             128, 51339000),
+            ("_ZN38_GLOBAL__N__c5986809_6_moe_cu_8d6f79af28fp16_expert_projections_cudaEPKN10mollm_cuda15Nvfp4ProjectionEii",
+             481, 148724461),
+            ("_ZN8internal5gemvx6kernelIii6__halffffLb0ELb1ELb1ELb0ELi6ELb0E18cublasGemvParamsExIi30cublasGemvTensorStridedBatchedIKS2_ES4_IKfES4_IfEfEEENSt9enable_ifIXntT5_EvE4typeET11_",
+             493, 190193000),
+        ]
+        self.assertEqual(module["summarize_families"](rows), {
+            "nvfp4_projection": [3888, 1277241000],
+            "fp16_expert_projection": [481, 148724461],
+            "dense_gemv": [493, 190193000],
+        })
 
     def shared_cost(self, events, pairs=1):
         function = runpy.run_path(str(SCRIPT))["serial_moe_shared_cost"]
@@ -114,7 +171,45 @@ class DecodeProfileTest(unittest.TestCase):
             function([(1, 3, "nvfp4_native_batched8_mma_cuda", 0, 1, 7),
                       (4, 6, "gemm", 0, 1, 8), (7, 8, "moe_combine_cuda", 0, 1, 7)], 1)
 
-    def analyze(self, graph=None, node=False, graph_table=True, geometry=False, grouped=False, coverage=False, runtime=False, runtime_table=False, prefill_chunks=None, prefill_prompts=None, extra_args=None):
+    def test_gpu_activity_union_clips_and_filters_owners(self):
+        function = runpy.run_path(str(SCRIPT))["gpu_activity_coverage"]
+        for offset in (0, 2**60):
+            with closing(sqlite3.connect(":memory:")) as db:
+                db.execute("CREATE TABLE StringIds(id INTEGER,value TEXT)")
+                db.executemany("INSERT INTO StringIds VALUES(?,?)", [(1, "head"), (2, "expert")])
+                for table in ("KERNEL", "MEMCPY", "MEMSET"):
+                    db.execute(f"""CREATE TABLE CUPTI_ACTIVITY_KIND_{table}(
+                        start INTEGER,end INTEGER,deviceId INTEGER,contextId INTEGER,
+                        globalPid INTEGER,demangledName INTEGER)""")
+                for table, events in (
+                    ("KERNEL", [(0, 10, 1), (90, 100, 1), (20, 40, 2), (45, 50, 2)]),
+                    ("MEMCPY", [(0, 25, 0), (36, 44, 0)]),
+                    ("MEMSET", [(48, 60, 0), (58, 110, 0)]),
+                ):
+                    db.executemany(f"INSERT INTO CUPTI_ACTIVITY_KIND_{table} VALUES(?,?,0,7,11,?)",
+                                   [(a+offset, b+offset, name) for a, b, name in events])
+                    # Other contexts, devices or processes must not fill gaps.
+                    for owner in ((0, 7, 12), (1, 7, 11), (0, 8, 11)):
+                        db.execute(f"INSERT INTO CUPTI_ACTIVITY_KIND_{table} VALUES(?,?,?,?,?,2)",
+                                   (10+offset, 100+offset, *owner))
+                result = function(db, 10+offset, 100+offset, "head")
+                self.assertEqual(result["kernel_union_ns"], 35)
+                self.assertEqual(result["memcpy_union_ns"], 23)
+                self.assertEqual(result["memset_union_ns"], 52)
+                self.assertEqual(result["union_ns"], 89)
+                self.assertEqual(result["memory_outside_kernel_ns"], 54)
+                self.assertEqual(result["no_recorded_activity_ns"], 1)
+                db.execute("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES(20,30,0,7,12,1)")
+                with self.assertRaisesRegex(ValueError, "one device/context/process"):
+                    function(db, 10+offset, 100+offset, "head")
+
+    def test_gpu_activity_requires_complete_export(self):
+        function = runpy.run_path(str(SCRIPT))["gpu_activity_coverage"]
+        with closing(sqlite3.connect(":memory:")) as db:
+            with self.assertRaisesRegex(ValueError, "requires CUPTI_ACTIVITY_KIND_KERNEL"):
+                function(db, 10, 100, "head")
+
+    def analyze(self, graph=None, node=False, graph_table=True, geometry=False, grouped=False, coverage=False, runtime=False, runtime_table=False, prefill_chunks=None, prefill_prompts=None, extra_args=None, mtp_cycles=None, activity=False):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "trace.sqlite"
             with closing(sqlite3.connect(database)) as db, db:
@@ -127,6 +222,12 @@ class DecodeProfileTest(unittest.TestCase):
                     INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES
                         (0,10,1,0,1,7,NULL),(90,100,1,0,1,7,NULL);
                 """)
+                if mtp_cycles is not None:
+                    db.executescript("""
+                        INSERT INTO StringIds VALUES(5,'draft_head'),(6,'state_sync');
+                        INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES
+                            (45,50,5,0,1,7,NULL),(55,60,6,0,1,7,NULL);
+                    """)
                 if graph_table:
                     db.execute("""CREATE TABLE CUPTI_ACTIVITY_KIND_GRAPH_TRACE(
                         start INTEGER,end INTEGER,deviceId INTEGER,contextId INTEGER,streamId INTEGER)""")
@@ -153,13 +254,50 @@ class DecodeProfileTest(unittest.TestCase):
                         db.execute("""INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL
                             (start,end,demangledName,deviceId,contextId,streamId,graphNodeId,gridX,blockX)
                             VALUES(40,80,2,0,1,7,43,20,128)""")
+                if activity:
+                    db.execute("ALTER TABLE CUPTI_ACTIVITY_KIND_KERNEL ADD COLUMN globalPid INTEGER DEFAULT 11")
+                    for table in ("MEMCPY", "MEMSET"):
+                        db.execute(f"""CREATE TABLE CUPTI_ACTIVITY_KIND_{table}(
+                            start INTEGER,end INTEGER,deviceId INTEGER,contextId INTEGER,globalPid INTEGER)""")
+                    db.executescript("""
+                        INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES(0,25,0,1,11);
+                        INSERT INTO CUPTI_ACTIVITY_KIND_MEMSET VALUES(78,95,0,1,11);
+                    """)
             return subprocess.run([sys.executable, str(SCRIPT), str(database),
-                                   *( ["--prefill-prompts", str(prefill_prompts)] if prefill_prompts is not None else
+                                   *( ["--mtp-cycles", str(mtp_cycles)] if mtp_cycles is not None else
+                                      ["--prefill-prompts", str(prefill_prompts)] if prefill_prompts is not None else
                                       ["--decode-tokens", "1"] if prefill_chunks is None else
                                       ["--prefill-chunks", str(prefill_chunks)] )] + (["--group-by-grid"] if grouped else []) +
                                   (["--kernel-coverage"] if coverage else []) +
                                   (["--runtime-api"] if runtime else []) + (extra_args or []),
                                   capture_output=True, text=True)
+
+    def test_gpu_activity_cli_reports_recorded_memory_not_cpu_overhead(self):
+        result = self.analyze(node=True, activity=True, extra_args=["--gpu-activity-coverage"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gpu_activity_union_ms=0.000090", result.stdout)
+        self.assertIn("memory_outside_kernel_ms=0.000020", result.stdout)
+        self.assertIn("no_recorded_activity_ms=0.000000", result.stdout)
+        self.assertIn("not_hardware_utilization_or_causal_cpu_overhead", result.stdout)
+        rejected = self.analyze(extra_args=["--gpu-activity-coverage"])
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("requires CUPTI_ACTIVITY_KIND_KERNEL", rejected.stderr)
+
+    def test_mtp_cycle_includes_drafts_and_state_sync(self):
+        result = self.analyze(node=True, mtp_cycles=1, extra_args=[
+            "--head-pattern", "%q8_per_channel_dense_gemv%", "--expected-head-events", "2"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mtp_cycles=1", result.stdout)
+        self.assertIn("gpu_time_per_cycle_ms=", result.stdout)
+        self.assertNotIn("gpu_time_per_token_ms=", result.stdout)
+        self.assertIn("draft_head", result.stdout)
+        self.assertIn("state_sync", result.stdout)
+
+    def test_mtp_cycle_requires_explicit_boundary_contract(self):
+        for extra in ([], ["--head-pattern", "%q8%"], ["--expected-head-events", "2"]):
+            result = self.analyze(mtp_cycles=1, extra_args=extra)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("MTP cycles require", result.stderr)
 
     def test_prefill_spans_both_chunks(self):
         result = self.analyze(node=True, prefill_chunks=2, coverage=True)

@@ -50,7 +50,6 @@ class GuardTests(unittest.TestCase):
             "MOLLM_RESIDENT_EXPERT_ARENA": (None, "managed"),
             "MOLLM_CUDA_HOST_HEADROOM_MB": (None, "", "0", "24575", "-1", "+24576", " 24576", "24576x", "184467440737095516160"),
             "MOLLM_CUDA_OUTPUT_POOL_MB": (None, "", "0", "4097", "-1", "2048x", "184467440737095516160"),
-            "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS": (None,),
         }
         for name, values in cases.items():
             for value in values:
@@ -62,15 +61,24 @@ class GuardTests(unittest.TestCase):
                         self.assertIn("--cuda-prefill-logical-batch requires", error)
                     self.assertNotIn("CudaBackend:", error)
 
-    def test_mtp_padding_and_missing_public_reclaim_rejected(self):
-        variants = [BASE + ["--mtp-draft-tokens", "1"],
-                    BASE + ["--static-padded"],
+    def test_padding_and_missing_public_reclaim_rejected(self):
+        variants = [BASE + ["--static-padded"],
                     [arg for arg in BASE if arg != "--cuda-prefill-reclaim"]]
         for args in variants:
             with self.subTest(args=args):
                 error = self.run_case(args=args)
                 self.assertIn("--cuda-prefill-logical-batch requires", error)
                 self.assertNotIn("CudaBackend:", error)
+
+    def test_mtp_and_automatic_segment_policy_accepted(self):
+        error = self.run_case({"MOLLM_CUDA_DISABLE_DECODE_SEGMENTS": None},
+                              BASE + ["--mtp-draft-tokens", "1"])
+        if "CUDA backend unavailable" in error or "built without MOLLM_CUDA" in error:
+            self.skipTest("CUDA backend unavailable")
+        self.assertNotIn("--cuda-prefill-logical-batch requires", error)
+        self.assertIn("sequence cap2048", error)
+        self.assertIn("captured decode segments suspended during prefill", error)
+        self.assertNotIn("MoE: loading", error)
 
     def test_invalid_context_and_chunk_rejected(self):
         for option, value, message in (

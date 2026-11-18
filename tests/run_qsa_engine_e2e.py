@@ -10,7 +10,7 @@ try:
 except ImportError:
     sys.exit(77)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "models"))
-from qwen4_exp import build_graph
+from qwen4_exp import build_graph, build_mtp_graph
 from transpile import Precision, save_package, _write_weight_file
 
 
@@ -25,13 +25,14 @@ def main():
               shared_expert_intermediate_size=8, num_experts=8, num_experts_per_tok=2,
               vocab_size=64, ple_layer_ids=[], eos_token_id=63)
     # Package ctx32, runtime ctx64: auxiliary states must resize with main KV.
-    pf = build_graph(".", tc, seq_len=17, n_ctx=32, is_prefill=True, enable_qsa=True)
-    dc = build_graph(".", tc, seq_len=1, n_ctx=32, enable_qsa=True)
+    pf = build_graph(".", tc, seq_len=17, n_ctx=32, is_prefill=True, enable_qsa=True, export_mtp_state=True)
+    dc = build_graph(".", tc, seq_len=1, n_ctx=32, enable_qsa=True, export_mtp_state=True)
+    draft = build_mtp_graph(".", tc, seq_len=8, n_ctx=32, enable_qsa=True)
     with tempfile.TemporaryDirectory(prefix="mollm_qsa_engine_") as directory:
         root = Path(directory)
         rng = np.random.default_rng(91273)
         written = set()
-        for graph in (pf, dc):
+        for graph in (pf, dc, draft):
             for node in graph._nodes:
                 if not node.weight_path or node.weight_path in written:
                     continue
@@ -47,6 +48,23 @@ def main():
                         n_ctx=32, prefill_seq_len=17, rope_dim=4, rope_theta=1000000)
         package = root / "qsa.mollm"
         save_package(str(package), pf, dc, str(root), metadata)
+        mtp_package = root / "qsa_mtp.mollm"
+        save_package(str(mtp_package), pf, dc, str(root), metadata, g_mtp=draft)
+        mtp_bundle = root / "mtp_companion"
+        mtp_bundle.mkdir()
+        mtp_manifest = dict(format="mollm-mtp-weight-bundle-v1", standalone_model=False,
+                            graph="model_mtp.graph", qsa=True, n_ctx=32, seq_len=8,
+                            shared_target_weights=["./embed_tokens.weights", "./lm_head.weights"], weights={})
+        for node in draft._nodes:
+            if not node.weight_path or node.weight_path in mtp_manifest["shared_target_weights"]:
+                continue
+            name = Path(node.weight_path).name
+            payload = (root / name).read_bytes()
+            (mtp_bundle / name).write_bytes(payload)
+            mtp_manifest["weights"][node.weight_path] = dict(file=name, bytes=len(payload),
+                shape=list(node.out_shape), precision=node.out_prec.name)
+        draft.save(str(mtp_bundle / "model_mtp"))
+        (mtp_bundle / "manifest.json").write_text(json.dumps(mtp_manifest))
         # Same main weights, legacy dense graph, missing indexer supplied separately.
         dense_tc = dict(tc, indexer_budget=64)
         dense_pf = build_graph(".", dense_tc, seq_len=17, n_ctx=32, is_prefill=True)
@@ -75,6 +93,10 @@ def main():
         if result.returncode == 77:
             return 77
         result.check_returncode()
+        subprocess.run([sys.argv[1], str(package), str(dense_package), str(bundle),
+                        "--mtp", str(mtp_package)], check=True)
+        subprocess.run([sys.argv[1], str(package), str(dense_package), str(bundle),
+                        "--mtp", str(package), str(mtp_bundle)], check=True)
         # Failure paths must not silently revert to dense attention.
         reference = next(iter(manifest["weights"]))
         for mutate in (lambda m: m["weights"][reference].update(sha256="0" * 64),

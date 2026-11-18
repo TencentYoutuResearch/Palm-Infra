@@ -96,6 +96,13 @@ if (( ! preset_help )); then
     exit 1
   fi
 fi
+# Qualified Qwen3.8 QSA contexts can replay decode segments between logical
+# prefill phases. Respect the caller's presence-based disable switch. Keep
+# custom packages, dense diagnostics and larger contexts on the prior policy.
+preset_segment_env=(MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1)
+if (( preset_default && preset_qsa && preset_context>0 && preset_context<=32768 )); then
+  preset_segment_env=()
+fi
 # The guarded array expansions below also support Bash 3.2 + nounset, where
 # expanding an empty array directly raises an unbound-variable error.
 exec env \
@@ -103,7 +110,7 @@ exec env \
   MOLLM_CUDA_PREFILL_FP16_CACHE_MB="$preset_fp16_cache" \
   MOLLM_CUDA_HOST_HEADROOM_MB=24576 \
   MOLLM_CUDA_OUTPUT_POOL_MB=4096 \
-  MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1 \
+  ${preset_segment_env[@]+"${preset_segment_env[@]}"} \
   build_cuda/mollm_chat \
   --package ../qwen38_flash_next_nvfp4_calibrated.mollm \
   ${preset_companion_args[@]+"${preset_companion_args[@]}"} \

@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -233,6 +234,8 @@ public:
         uint64_t verify_tokens = 0;
         uint64_t sync_tokens = 0;
         uint64_t recurrent_checkpoint_bytes = 0;
+        uint64_t recurrent_prefix_only_steps = 0;
+        uint64_t recurrent_prefix_plan_fallbacks = 0;
         uint64_t recurrent_device_checkpoint_bytes = 0;
         uint64_t recurrent_rollbacks = 0;
         uint64_t recurrent_replay_tokens = 0;
@@ -424,6 +427,9 @@ private:
     // Plain model-specific persistent tensors keyed by their serialized
     // `aux_state<N>` input id.
     std::unordered_map<int, Tensor*> auxiliary_states_;
+    std::unordered_map<int, Tensor*> mtp_auxiliary_states_;
+    // Append-only QSA states are causally bounded by KV length, unlike recurrent state.
+    std::unordered_set<int> qsa_append_states_;
 
     /// Embed tokens.
     Tensor embed(const std::vector<int>& token_ids, int pad_to = 0);
@@ -455,13 +461,13 @@ private:
 
     Tensor run_mtp_tokens(const std::vector<int>& token_ids,
                           const Tensor& target_hidden, int position,
-                          int* draft_token = nullptr);
+                          int* draft_token = nullptr, float* draft_probability = nullptr);
     bool update_mtp_cache(const std::vector<int>& token_ids,
                           const Tensor& target_hidden, int position);
     bool execute_mtp_tokens(const std::vector<int>& token_ids,
                             const Tensor& target_hidden, int position,
                             bool cache_only, Tensor* hidden_output,
-                            int* draft_token);
+                            int* draft_token, float* draft_probability = nullptr);
     bool sync_mtp(const std::vector<int>& token_ids,
                   const Tensor& verified_hidden, int position,
                   int preserved_prefix = 0);

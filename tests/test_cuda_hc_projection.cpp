@@ -188,7 +188,12 @@ bool equal(Fixture& a, Fixture& b) {
 
 int main(int argc,char** argv) {
     const bool compact=argc==2&&!std::strcmp(argv[1],"--compact");
-    if(argc!=1&&!compact)return 2;
+    const bool small_batch=argc==2&&!std::strcmp(argv[1],"--small-batch");
+    if(argc!=1&&!compact&&!small_batch)return 2;
+    if(small_batch){
+        setenv("MOLLM_CUDA_Q4_SMALL_BATCH_EXACT","1",1);
+        setenv("MOLLM_CUDA_Q4_SMALL_BATCH_EXACT_REUSE","1",1);
+    }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
     // Deferred RMS is deliberately not a graph output. Its intermediate
@@ -229,6 +234,25 @@ int main(int argc,char** argv) {
     for (int m : {2, 1}) {
         if (!reference.input(m, 4) || !candidate.input(m, 4) ||
             !reference.run() || !candidate.run() || !equal(reference, candidate)) return 1;
+    }
+    if(small_batch)for(int rows:{2,3,4,5,7,8,9,1}) {
+        if(!reference.input(rows,21)||!candidate.input(rows,21)||
+           !reference.run()||!candidate.run()||!equal(reference,candidate))return 1;
+        cudaGraph_t batch_graph=nullptr;cudaGraphExec_t batch_exec=nullptr;
+        if(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)!=cudaSuccess||
+           !candidate.run()||cudaStreamEndCapture(cudaStreamPerThread,&batch_graph)!=cudaSuccess||
+           cudaGraphInstantiateWithFlags(&batch_exec,batch_graph,0)!=cudaSuccess)return 1;
+        for(int variant:{22,23}) {
+            if(!reference.input(rows,variant)||!candidate.input(rows,variant)||!reference.run()||
+               cudaGraphLaunch(batch_exec,cudaStreamPerThread)!=cudaSuccess||
+               cudaStreamSynchronize(cudaStreamPerThread)!=cudaSuccess||!equal(reference,candidate))return 1;
+        }
+        cudaGraphExecDestroy(batch_exec);cudaGraphDestroy(batch_graph);
+        // The delayed second projection cannot reuse results from a previous
+        // execution, including across changes in the speculative batch size.
+        if(!reference.input(rows,24)||!candidate.input(rows,24)||!reference.run())return 1;
+        fused.begin_execution();
+        if(!candidate.dispatch_node(5)||!equal_nodes(reference,candidate,{5}))return 1;
     }
     // Prefill conversion reuse must remain fresh across shape changes and
     // graph replays. Compare entire FP32 projection outputs byte-for-byte.

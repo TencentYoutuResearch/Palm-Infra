@@ -33,6 +33,14 @@ cudaError_t launch_q4_compact_pair_probe(const float* activation,
 // (table decoder only). Hints 4/5 use two/eight warps with the table decoder.
 // Hint 6 overlaps the next compact packet/scale load with current-group work.
 // Hint 7 uses that overlap without the baseline's explicit L2 prefetch.
+// Diagnostic exhaustive BF16max/7 oracle:65536 pairs of native division and
+// lookup values. Caller provides131072 floats;finite values match bitwise.
+// Diagnostic wide-row comparison, original vs full-scale lookup. Both use
+// the original four-lane, two-accumulator FP32 tree;weights are unchanged.
+cudaError_t launch_q4_compact_scale_gemv_probe(const float* activation,
+    const Q4CompactG32* weight,float* output,int columns,int inner,bool lookup,
+    cudaStream_t stream=nullptr);
+cudaError_t launch_q4_compact_scale_check(float* result,cudaStream_t stream=nullptr);
 cudaError_t launch_q4_compact_cache_probe(const float* activation,
     const Q4CompactG32* weight, float* output, int columns, int inner,
     bool integer_scale, int hint, cudaStream_t stream = nullptr);
@@ -53,6 +61,13 @@ struct Q4RowG32 {
 static_assert(sizeof(Q4RowG32) == 20);
 void launch_q4_row_g32_gemv(const float* activation, const Q4RowG32* weight,
     float* output, int columns, int inner, cudaStream_t stream = nullptr);
+// Read-only cache for N2560/K6144; original weights remain available to prefill
+// and other batch widths. Explicit global kernel overrides retain precedence.
+bool q4_narrow_row_eligible(const float* activation, int tokens,
+    int columns, int inner, int lda, int ldc);
+cudaError_t launch_q4_narrow_row(const float* activation, const Q4RowG32* weight,
+    float* output, int tokens, int columns, int inner, int lda, int ldc,
+    cudaStream_t stream = nullptr);
 void launch_repack_q4_row_g32(const Q4B8G32Block* source, Q4RowG32* target,
     int columns, int inner);
 
@@ -124,7 +139,8 @@ cudaError_t launch_q4_g32_small_batch_exact(const float* activation,
     int inner, int lda, int ldc, cudaStream_t stream = nullptr);
 cudaError_t launch_q4_compact_small_batch_exact(const float* activation,
     const Q4CompactG32* weight, float* output, int tokens, int columns,
-    int inner, int lda, int ldc, bool integer_scale, cudaStream_t stream = nullptr);
+    int inner, int lda, int ldc, bool integer_scale, cudaStream_t stream = nullptr,
+    bool fixed_m5 = false);
 // Diagnostic: preserve the narrow-row reduction tree without end-of-kernel barriers.
 void launch_q4_g32_grouped_narrow_gemv(const float* activation,
     const Q4B8G32Block* weight, float* output, int columns, int inner, int rows,
@@ -156,10 +172,35 @@ cudaError_t launch_q4_g32_shared_activation(const float* activation,
     const Q4B8G32Block* gate_weight, const Q4B8G32Block* up_weight,
     float* output, int columns, int inner, cudaStream_t stream = nullptr);
 // Diagnostic unequal projections sharing an input; independent canonical weights.
+// Exact small-batch form; both outputs use their own row stride.
+cudaError_t launch_q4_g32_small_batch_unequal_projections(const float* activation,
+    const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
+    float* first_output, float* second_output, int tokens, int first_columns,
+    int second_columns, int inner, int lda, int first_ldc, int second_ldc,
+    cudaStream_t stream = nullptr);
 cudaError_t launch_q4_g32_unequal_projections(const float* activation,
     const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
     float* first_output, float* second_output, int first_columns, int second_columns,
     int inner, cudaStream_t stream = nullptr);
+// Fixed three-token contiguous BG32 projections, N2560/K6144 or N512/K2560.
+// Uses the native 256-thread FMA/reduction with a compile-time token count.
+// Input must be 16-byte aligned; output has 3 * columns floats.
+cudaError_t launch_q4_g32_m3_fixed(const float* activation,
+    const Q4B8G32Block* weight, float* output, int columns, int inner,
+    cudaStream_t stream = nullptr);
+// Fixed three-token contiguous BG32 projections, N320/K10240 or N640/K2560.
+// Retains the original 256-logical-lane FP32 arithmetic/tree on 128 threads.
+// Input must be 16-byte aligned; output has 3 * columns floats.
+cudaError_t launch_q4_g32_m3_adjacent(const float* activation,
+    const Q4B8G32Block* weight, float* output, int columns, int inner,
+    cudaStream_t stream = nullptr);
+// Fixed canonical HC down/inject pair: N320 + N4, K10240. Retains the original
+// 256-logical-lane FP32 arithmetic/tree on 128 threads; input must be 16-byte aligned.
+cudaError_t launch_q4_g32_hc_adjacent_projections(const float* activation,
+    const Q4B8G32Block* down_weight,const Q4B8G32Block* inject_weight,
+    float* down_output,float* inject_output,cudaStream_t stream=nullptr);
+// Call outside CUDA Graph capture; scoped to this kernel on the current device.
+cudaError_t configure_q4_g32_hc_adjacent_cache();
 // Diagnostic register lookahead of one/two/four original narrow iterations.
 cudaError_t launch_q4_g32_pipelined_narrow_gemv(const float* activation,
     const Q4B8G32Block* weight, float* output, int columns, int inner, int depth,

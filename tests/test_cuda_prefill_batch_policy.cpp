@@ -46,7 +46,12 @@ int main(int argc,char** argv) {
                 p.kmajor_rows(rows)!=(rows<=2048&&((logical&&rows>=16)||(merged&&rows>1024))))return 1;
         }
     }
+    for(int rows:{1,2,3,8})
+        if(mollm_prefill::logical_transient_margin(rows)!=(size_t(256)<<20))return 20;
+    for(int rows:{-1,0,9,256,2048})
+        if(mollm_prefill::logical_transient_margin(rows)!=(size_t(4)<<30))return 21;
     CPUBackend cpu;
+    if(cpu.set_retained_verification(true,false)||!cpu.set_retained_verification(false,false))return 29;
     if(cpu.set_logical_prefill_batch(true)||!cpu.set_logical_prefill_batch(false)||
         cpu.logical_prefill_batch_enabled())return 2;
     EngineConfig c;c.device=Device::CUDA;c.offload_ple=true;c.cuda_prefill_reclaim=true;c.n_ctx=2048;
@@ -56,7 +61,7 @@ int main(int argc,char** argv) {
         if(!mollm_prefill::logical_config_supported(supported)||
            mollm_prefill::logical_chunk_limit(supported)!=(chunk?chunk:2048))return 17;
     }
-    for(int change=0;change<12;++change) {
+    for(int change=0;change<10;++change) {
         auto bad=c;
         switch(change) {
             case 0:bad.device=Device::CPU;break;
@@ -69,11 +74,12 @@ int main(int argc,char** argv) {
             case 7:bad.prefill_chunk_size=2049;break;
             case 8:bad.static_padded=true;break;
             case 9:bad.use_decode_as_prefill=true;break;
-            case 10:bad.mtp_draft_tokens=1;break;
-            case 11:bad.mtp_companion_dir="test";break;
         }
         if(mollm_prefill::logical_config_supported(bad))return 4;
     }
+    auto speculative=c;speculative.n_ctx=32768;speculative.mtp_draft_tokens=2;
+    speculative.mtp_companion_dir="draft-qsa";
+    if(!mollm_prefill::logical_config_supported(speculative))return 19;
     for(int context:{2048,16384,32768})for(int rows:{-1,0,1,128,2048,4096,16384})
         for(int past:{-1,0,2048,8192,16384,32768}) {
             const bool expected=rows>0&&past>=0&&past<=context&&rows<=context-past;

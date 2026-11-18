@@ -276,6 +276,10 @@ LLMEngine::MtpStats mtp_stats_delta(
     result.sync_tokens = delta(after.sync_tokens, before.sync_tokens);
     result.recurrent_checkpoint_bytes = delta(
         after.recurrent_checkpoint_bytes, before.recurrent_checkpoint_bytes);
+    result.recurrent_prefix_only_steps = delta(
+        after.recurrent_prefix_only_steps, before.recurrent_prefix_only_steps);
+    result.recurrent_prefix_plan_fallbacks = delta(
+        after.recurrent_prefix_plan_fallbacks, before.recurrent_prefix_plan_fallbacks);
     result.recurrent_rollbacks = delta(
         after.recurrent_rollbacks, before.recurrent_rollbacks);
     result.recurrent_replay_tokens = delta(

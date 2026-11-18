@@ -72,7 +72,7 @@ struct Frame {
         auto& t=graph.runtime.tensors[id];if(t.data)backend.free_output(t,nullptr);
         t=allocate(d,rows,h);write(t,x);
     }
-    void pass(int past,int rows,int seed,int bad_mask,std::vector<float>& output,std::vector<int32_t>& selections) {
+    void pass(int past,int rows,int seed,int bad_mask,std::vector<float>& output,std::vector<int32_t>& selections,bool cache_only=false) {
         auto& ts=graph.runtime.tensors;
         for(int i:{6,11}) {
             uint64_t length=past;require(backend.copy_from_host(&length,ts[i],sizeof(length),offsetof(CacheMetadata,current_seq_len)),"set logical cache position");
@@ -95,7 +95,9 @@ struct Frame {
         bind(8,dim,rows,heads,q);bind(9,dim,rows,1,k);bind(10,vdim,rows,1,v);
         ctx.runtime_seq_len=rows;inject_runtime_shapes(ctx);
         auto raw_before=read(ts[4]);auto pooled_before=read(ts[5]);
+        require(backend.set_attention_cache_only(cache_only),"set cache-only attention mode");
         backend.clear_dispatch_error();backend.begin_graph();execute_graph(ctx);backend.end_graph();
+        require(backend.set_attention_cache_only(false),"restore attention mode");
         if(bad_mask) {
             require(ctx.execution_failed&&backend.dispatch_failed(),"unsupported mask fails explicitly");
             require(read(ts[4])==raw_before&&read(ts[5])==pooled_before,"failed mask does not mutate QSA state");return;
@@ -112,7 +114,7 @@ struct Frame {
                 for(int id:selected){double dot=0;for(int d=0;d<dim;++d)dot+=double(q[(h*rows+r)*dim+d])*keys[id*dim+d];logits.push_back(dot/std::sqrt(double(dim)));maximum=std::max(maximum,logits.back());}
                 for(auto& x:logits){x=std::exp(x-maximum);sum+=x;}
                 for(int d=0;d<vdim;++d){double expected=0;for(size_t s=0;s<selected.size();++s)expected+=logits[s]/sum*values[selected[s]*vdim+d];
-                    const float got=actual[(h*rows+r)*vdim+d];require(std::isfinite(got)&&std::fabs(got-expected)<3e-6,"cached sparse output versus scalar");output.push_back(got);}
+                    const float got=actual[(h*rows+r)*vdim+d];require(std::isfinite(got)&&(cache_only?got==0.f:std::fabs(got-expected)<3e-6),"cached sparse output versus scalar");output.push_back(got);}
             }
             selections.insert(selections.end(),ids.begin()+r*slots,ids.begin()+(r+1)*slots);
         }
@@ -136,26 +138,56 @@ void run(bool half,int liveness) {
     chunk.pass(0,13,71,0,reset,ir);
     Frame fresh(half,liveness);fresh.pass(0,13,71,0,reference,ix);
     require(reset==reference&&ir==ix,"reset graph fresh exact");
+    Frame cache_updates(half,liveness);
+    std::vector<float> discarded;std::vector<int32_t> ignored;
+    cache_updates.pass(0,13,71,0,discarded,ignored,true);
+    std::vector<float> next,expected_next;std::vector<int32_t> ni,ei;
+    cache_updates.pass(13,3,71,0,next,ni);
+    fresh.pass(13,3,71,0,expected_next,ei);
+    require(next==expected_next&&ni==ei,"cache-only prefill preserves subsequent QSA attention");
 }
 }
 int main(int argc,char** argv) {
     setenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS","1",1);
     setenv("MOLLM_CUDA_QSA_GQA_REUSE","1",1);
     setenv("MOLLM_CUDA_QSA_DECODE_SPLIT","1",1);
+    const auto equivalent=[&](const std::vector<float>& a,const std::vector<float>& b) {
+        return a==b;
+    };
     CudaBackend probe;if(!probe.available())return 77;
     require(argc==1,"usage: test_cuda_qsa_graph");
     for(bool half:{false,true})for(int mode:{0,1,2})run(half,mode);
     for(int bad:{1,2,3}){Frame f(true,2);std::vector<float> out;std::vector<int32_t> ids;f.pass(0,13,7,bad,out,ids);}
     // Exercise both backend selectors: grouped whole prefill, then grouped
     // chunk, legacy small tail and split QK decode. Optimized paths preserve
-    // the legacy normalization/PV order, so outputs must be exact.
+    // selection, cache contents and ordered PV arithmetic.
     dim=vdim=256;heads=12;capacity=128;slots=131;
     for(bool half:{false,true}) {
         Frame whole(half,2),chunk(half,2);
         std::vector<float> a,b;std::vector<int32_t> ia,ib;
         whole.pass(0,64,17,0,a,ia);
         chunk.pass(0,32,17,0,b,ib);chunk.pass(32,31,17,0,b,ib);chunk.pass(63,1,17,0,b,ib);
-        require(ia==ib&&a==b,"optimized backend exact selection/cache/output equivalence");
+        require(ia==ib&&equivalent(a,b),"optimized backend selection/cache/output equivalence");
+        Frame verification(half,2);
+        std::vector<float> verified;std::vector<int32_t> iv;
+        for(int past=0;past<64;past+=7)
+            verification.pass(past,std::min(7,64-past),17,0,verified,iv);
+        require(ia==iv&&equivalent(a,verified),"small-batch QSA verification versus full prefill");
+        Frame serial(half,2);
+        std::vector<float> decoded;std::vector<int32_t> is;
+        for(int past=0;past<64;++past)serial.pass(past,1,17,0,decoded,is);
+        require(is==iv&&decoded==verified,"small-batch verification matches single-token arithmetic exactly");
+    }
+    // A verification batch straddling the short-history cutoff must match
+    // individual tokens even though their cache lengths choose different paths.
+    dim=8;vdim=5;heads=2;capacity=288;slots=259;
+    for(bool half:{false,true}) {
+        Frame serial(half,2),batch(half,2);
+        std::vector<float> a,b;std::vector<int32_t> ia,ib;
+        serial.pass(0,252,17,0,a,ia);batch.pass(0,252,17,0,b,ib);
+        for(int past=252;past<260;++past)serial.pass(past,1,17,0,a,ia);
+        batch.pass(252,8,17,0,b,ib);
+        require(a==b&&ia==ib,"verification crossing 256 keys matches serial exactly");
     }
     std::puts("QSA graph: native FP16/FP32 KV, liveness, chunk/reset and mask rejection pass");
 }

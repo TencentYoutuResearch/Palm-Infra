@@ -190,6 +190,27 @@ propagate_dim_exprs(draft._nodes)
 state_node = draft._nodes[int(draft.metadata["mtp_state_output_node"])]
 check(state_node.dim_expr[1].kind == DimKind.SEQ,
       "MTP retained-state output has dynamic token count")
+# Long-context drafts require their own indexer and independent persistent inputs.
+for context in (8192, 32768):
+    sparse_draft = build_mtp_graph(".", draft_config, seq_len=8,
+                                   n_ctx=context, enable_qsa=True)
+    sparse_inputs = {n.params_str[0]: n for n in sparse_draft._nodes
+                     if n.op_type == OpType.INPUT}
+    check(sparse_inputs["aux_state0"].out_shape[:2] == (128, context),
+          "draft raw indexer capacity follows context")
+    check(sparse_inputs["aux_state1"].out_shape[:2] == (128, context // 4),
+          "draft pooled indexer capacity follows context")
+    check(sum(n.op_type == OpType.QSA_INDEXER for n in sparse_draft._nodes) == 1,
+          "long-context draft uses QSA")
+    sparse_refs = [n.weight_path for n in sparse_draft._nodes if n.weight_path]
+    check(sum("mtp_layers_0_self_attn_indexer_" in ref for ref in sparse_refs) == 3,
+          "draft indexer uses its own three weights")
+    check(draft_config == original_config, "QSA draft preserves target config")
+try:
+    build_mtp_graph(".", draft_config, seq_len=8, n_ctx=8192)
+    raise AssertionError("dense draft must reject context beyond QSA budget")
+except ValueError:
+    pass
 for overrides in (
     {"mtp": {"num_hidden_layers": 2}},
     {"mtp": {"mtp_use_hidden_state_from_layer": 0}},

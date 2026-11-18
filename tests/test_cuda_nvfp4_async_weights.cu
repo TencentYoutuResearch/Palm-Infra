@@ -33,7 +33,6 @@ int main() {
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;
     cudaDeviceProp prop{};check(cudaGetDeviceProperties(&prop,0));
     if(prop.major!=12 || prop.minor>1)return 77;
-    setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","4",1);
     const char* code_option=std::getenv("MOLLM_TEST_NVFP4_GROUP_CODE_KMAJOR");
     const bool code_kmajor=code_option&&!std::strcmp(code_option,"1");
     const char* scale_option=std::getenv("MOLLM_TEST_NVFP4_RESIDENT_GATE_SCALE_VIEW");
@@ -84,11 +83,15 @@ int main() {
             case 15:bad.hint=1;break;
             case 16:bad.count=65536;break;
             case 17:bad.prepared=true;break;
-            case 18:setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","2",1);break;
-            case 19:setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","8",1);break;
+            case 18:bad.rows=1296;break;
+            case 19:bad.inner=2496;break;
         }
-        if(launch(bad,true)!=cudaErrorInvalidValue)return 1;
-        setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","4",1);++rejects;
+        const auto status=launch(bad,true);
+        if(status!=cudaErrorInvalidValue) {
+            std::fprintf(stderr,"async invalid case=%d status=%s\n",id,cudaGetErrorString(status));
+            return 1;
+        }
+        ++rejects;
     }
     if(code_kmajor) {
         check(cudaStreamEndCapture(cudaStreamPerThread,&reject_graph));

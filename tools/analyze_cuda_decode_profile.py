@@ -4,6 +4,10 @@
 The caller must establish that each token has exactly one matching LM-head
 kernel, and supply the final run's decode count (excluding its prefill token).
 Kernel-time sums are not uninstrumented benchmark measurements.
+For --mtp-cycles, match only target-verification heads, not draft heads.
+The window spans complete cycles (including drafts and state synchronization)
+and its per-cycle time must not be interpreted as per-output-token latency.
+The caller supplies an explicit head pattern and verified total head count.
 For --prefill-chunks, the caller must establish one matching LM-head per
 chunk and that the final events are prefill, not decode. This includes all
 specified chunks rather than silently reporting only the final tail chunk.
@@ -12,6 +16,9 @@ including all interleaved windows of a layer-major scheduler. The caller must
 verify this contract; kernel names alone do not establish phase boundaries.
 CUDA Graph runs must be captured with --cuda-graph-trace=node; whole-graph
 intervals without their kernel events cannot establish kernel percentages.
+--gpu-activity-coverage also includes recorded GPU memcpy/memset intervals
+for the matching heads' device/context/process. Its remaining gaps do not
+establish hardware utilization or causal CPU overhead.
 """
 import argparse
 from bisect import bisect_right
@@ -44,8 +51,35 @@ def kernel_overlap_lookup(intervals):
 
 def kernel_family(name):
     """Name-based time grouping, not a hardware bottleneck classifier."""
+    if "selected_values_" in name:
+        return "qsa_pv"
+    if "normalize_selected_scores" in name:
+        return "qsa_normalize"
+    if "selected_scores_" in name:
+        return "qsa_qk"
+    if "qsa_" in name:
+        return "qsa_indexer"
     if "sdpa_" in name:
         return "attention"
+    if ("nvfp4_projections_cuda" in name or "nvfp4_gate_code_subgroup_cuda" in name
+            or "nvfp4_exact_subwarp_cuda" in name or "nvfp4_gate_paired_cuda" in name
+            or "nvfp4_gate_paired8_cuda" in name
+            or "nvfp4_gate_paired8_wide_cuda" in name):
+        return "nvfp4_projection"
+    if "fp16_expert_projections_cuda" in name or "fp16_palette_projections_cuda" in name:
+        return "fp16_expert_projection"
+    # Generic projection kernels can serve several model roles. Do not call
+    # every Q8 GEMV an LM head without validating its source/window contract.
+    if "q2_draft_head_gemv_cuda" in name or "q4_draft_screen_" in name:
+        return "draft_head"
+    if "q4_g32_" in name or "q4_g128_" in name:
+        return "q4_projection" if "prepare_q4" not in name else "dense_prepare"
+    if any(part in name for part in (
+            "q8_head_approximate_batch", "q4_approximate",
+            "scalar_head_anchor_", "scalar_head_select_rows")):
+        return "q8_head_screen"
+    if "q8_per_channel_dense_gemv" in name or "q8_small_batch_exact" in name:
+        return "q8_projection"
     if "nvfp4_n32_fused_activation_cuda" in name or "nvfp4_n32_async_weights_cuda" in name:
         return "moe_gate"
     if "nvfp4_native_batched8_mma_cuda" in name:
@@ -65,6 +99,8 @@ def kernel_family(name):
         return "moe_auxiliary"
     if "prepare_q4" in name or "prepare_q8" in name:
         return "dense_prepare"
+    if "cublasGemvParams" in name or "gemvx::kernel" in name:
+        return "dense_gemv"
     if "cutlass" in name or "nvjet" in name or "gemm" in name:
         return "dense_gemm"
     return "other"
@@ -178,15 +214,47 @@ def kernel_interval_coverage(intervals, start, end):
     return covered, gaps
 
 
+def gpu_activity_coverage(db, start, end, head_pattern):
+    """Union of recorded CUDA work in one verified head owner, not utilization."""
+    owner = ("deviceId", "contextId", "globalPid")
+    tables = ("CUPTI_ACTIVITY_KIND_KERNEL", "CUPTI_ACTIVITY_KIND_MEMCPY",
+              "CUPTI_ACTIVITY_KIND_MEMSET")
+    for table in tables:
+        fields = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        if not {"start", "end", *owner}.issubset(fields):
+            raise ValueError(f"GPU activity coverage requires {table} with timestamps and owner IDs")
+    owners = db.execute("""SELECT DISTINCT k.deviceId,k.contextId,k.globalPid
+        FROM CUPTI_ACTIVITY_KIND_KERNEL k JOIN StringIds s ON s.id=k.demangledName
+        WHERE s.value LIKE ?""", (head_pattern,)).fetchall()
+    if len(owners) != 1 or any(value is None for value in owners[0]):
+        raise ValueError("GPU activity coverage requires matching heads in one device/context/process")
+    intervals = []
+    result = dict(zip(owner, owners[0]))
+    for table, label in zip(tables, ("kernel", "memcpy", "memset")):
+        events = db.execute(f"""SELECT start,end FROM {table}
+            WHERE start<? AND end>? AND deviceId=? AND contextId=? AND globalPid=?""",
+                            (end, start, *owners[0])).fetchall()
+        if any(b <= a for a, b in events):
+            raise ValueError("GPU activity export contains an invalid interval")
+        result[label + "_events"] = len(events)
+        result[label + "_union_ns"] = kernel_interval_coverage(events, start, end)[0]
+        intervals.extend(events)
+    result["union_ns"], gaps = kernel_interval_coverage(intervals, start, end)
+    result["no_recorded_activity_ns"] = sum(gaps)
+    result["memory_outside_kernel_ns"] = result["union_ns"] - result["kernel_union_ns"]
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("database", type=Path)
     window = parser.add_mutually_exclusive_group(required=True)
     window.add_argument("--decode-tokens", type=int)
+    window.add_argument("--mtp-cycles", type=int, help="complete target verification cycles, including drafts and sync")
     window.add_argument("--prefill-chunks", type=int)
     window.add_argument("--prefill-prompts", type=int,
                         help="complete prompts with one final head each, including all scheduled windows")
-    parser.add_argument("--head-pattern", default="%q8_per_channel_dense_gemv%")
+    parser.add_argument("--head-pattern", help="SQL LIKE pattern; default: %%q8_per_channel_dense_gemv%%")
     parser.add_argument("--expected-head-events", type=int,
                         help="reject missing/extra matching heads in the entire capture; "
                              "caller still establishes their semantic meaning")
@@ -196,6 +264,8 @@ def main():
                         help="name-based kernel-time groups; not hardware bottleneck attribution")
     parser.add_argument("--kernel-coverage", action="store_true",
                         help="report interval union and gaps, not hardware utilization")
+    parser.add_argument("--gpu-activity-coverage", action="store_true",
+                        help="include scoped GPU memcpy/memset intervals; requires all three activity tables")
     parser.add_argument("--attention-pv-pairs", type=int,
                         help="attribute verified same-stream PV bind/copy ranges; exact expected pairs")
     parser.add_argument("--runtime-api", action="store_true",
@@ -205,9 +275,14 @@ def main():
     parser.add_argument("--expected-moe-events", type=int,
                         help="exact expected down/combine pairs for --serial-moe-shared")
     args = parser.parse_args()
+    mtp = args.mtp_cycles is not None
+    if mtp and (args.head_pattern is None or args.expected_head_events is None):
+        parser.error("MTP cycles require an explicit --head-pattern and --expected-head-events")
+    if args.head_pattern is None:
+        args.head_pattern = "%q8_per_channel_dense_gemv%"
     prompts = args.prefill_prompts is not None
     prefill = prompts or args.prefill_chunks is not None
-    units = args.prefill_prompts if prompts else args.prefill_chunks if prefill else args.decode_tokens
+    units = args.prefill_prompts if prompts else args.prefill_chunks if prefill else args.mtp_cycles if mtp else args.decode_tokens
     if units <= 0:
         parser.error("window count must be positive")
     if args.expected_head_events is not None and args.expected_head_events <= 0:
@@ -280,13 +355,29 @@ def main():
                   f"kernel_ms={shared['kernel_ns']/1e6:.6f} span_ms={shared['span_ns']/1e6:.6f} "
                   f"kernel_over_window_pct={shared['kernel_ns']/(end-start)*100:.6f} "
                   "scope=source_verified_serial_down_to_combine_not_overlap_speedup")
-        count_label = "prefill_prompts" if prompts else "prefill_chunks" if prefill else "decode_tokens"
-        unit_label = "prompt" if prompts else "chunk" if prefill else "token"
+        count_label = "prefill_prompts" if prompts else "prefill_chunks" if prefill else "mtp_cycles" if mtp else "decode_tokens"
+        unit_label = "prompt" if prompts else "chunk" if prefill else "cycle" if mtp else "token"
         print(f"{count_label}={units} window_ms={(end-start)/1e6:.3f} "
               f"summed_gpu_ms={total/1e6:.3f} gpu_time_per_{unit_label}_ms={total/1e6/units:.3f} "
               f"kernel_sum_over_window_pct={total/(end-start)*100:.3f}")
         print(f"matching_head_events_total={len(heads)} selected_window_heads={units} "
               "scope=matching_kernel_events_not_semantic_phase_validation")
+        if args.gpu_activity_coverage:
+            try:
+                activity = gpu_activity_coverage(db, start, end, args.head_pattern)
+            except ValueError as error:
+                parser.error(str(error))
+            print("gpu_activity_scope=recorded_kernel_memcpy_memset_one_device_context_process; "
+                  "not_hardware_utilization_or_causal_cpu_overhead")
+            print(" ".join(f"{key}={activity[key]}" for key in ("deviceId", "contextId", "globalPid")))
+            print(" ".join(f"activity_{kind}_events={activity[kind + '_events']} "
+                           f"activity_{kind}_union_ms={activity[kind + '_union_ns']/1e6:.6f}"
+                           for kind in ("kernel", "memcpy", "memset")))
+            print(f"gpu_activity_union_ms={activity['union_ns']/1e6:.6f} "
+                  f"memory_outside_kernel_ms={activity['memory_outside_kernel_ns']/1e6:.6f} "
+                  f"no_recorded_activity_ms={activity['no_recorded_activity_ns']/1e6:.6f} "
+                  f"no_recorded_activity_per_{unit_label}_us="
+                  f"{activity['no_recorded_activity_ns']/1000/units:.6f}")
         if args.kernel_coverage:
             intervals = db.execute("""SELECT start,end FROM CUPTI_ACTIVITY_KIND_KERNEL
                 WHERE start<? AND end>? ORDER BY start""", (end, start)).fetchall()

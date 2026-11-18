@@ -6,19 +6,42 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <vector>
 
 namespace {
 void check(cudaError_t e) {
     if(e!=cudaSuccess){std::fprintf(stderr,"CUDA: %s\n",cudaGetErrorString(e));std::exit(1);}
 }
-void require(bool value){if(!value){std::fprintf(stderr,"QSA assertion failed\n");std::exit(2);}}
+void require_at(bool value,int line){if(!value){std::fprintf(stderr,"QSA assertion failed at line %d\n",line);std::exit(2);}}
+#define require(value) require_at((value),__LINE__)
 struct Buffer {
     void* data=nullptr;
     explicit Buffer(size_t bytes){check(cudaMalloc(&data,bytes));}
     ~Buffer(){if(data)cudaFree(data);}
     Buffer(const Buffer&)=delete;
 };
+
+mollm_cuda::QsaSelectedValueWorkspace gathered_workspace{};
+unsigned long long gathered_calls=0;
+cudaError_t launch_selected_for_test(const float* q,const void* k,const void* v,bool half,
+    const int32_t* ids,float* out,const mollm_cuda::QsaSelectedAttentionParams& p,
+    cudaStream_t stream=nullptr,const float* mask=nullptr) {
+    if(gathered_workspace.values&&half&&p.queries>0&&p.queries<=8&&p.slots>0&&p.slots<=4096&&
+       p.partitions>1&&!p.reuse_gqa) {
+        auto invalid=gathered_workspace;invalid.values_bytes=0;
+        require(mollm_cuda::launch_qsa_selected_attention_gathered_fp16(q,k,v,ids,out,p,invalid,stream,mask)==cudaErrorInvalidValue);
+        invalid=gathered_workspace;invalid.active_bytes=0;
+        require(mollm_cuda::launch_qsa_selected_attention_gathered_fp16(q,k,v,ids,out,p,invalid,stream,mask)==cudaErrorInvalidValue);
+        invalid=gathered_workspace;invalid.values=static_cast<unsigned char*>(invalid.values)+1;
+        require(mollm_cuda::launch_qsa_selected_attention_gathered_fp16(q,k,v,ids,out,p,invalid,stream,mask)==cudaErrorInvalidValue);
+        invalid=gathered_workspace;invalid.active=reinterpret_cast<int32_t*>(reinterpret_cast<unsigned char*>(invalid.active)+1);
+        require(mollm_cuda::launch_qsa_selected_attention_gathered_fp16(q,k,v,ids,out,p,invalid,stream,mask)==cudaErrorInvalidValue);
+        if(!gathered_calls++)std::puts("gathered_fp16_path=active");
+        return mollm_cuda::launch_qsa_selected_attention_gathered_fp16(q,k,v,ids,out,p,gathered_workspace,stream,mask);
+    }
+    return mollm_cuda::launch_qsa_selected_attention(q,k,v,half,ids,out,p,stream,mask);
+}
 
 void selected_nan_underflow(bool half) {
     mollm_cuda::QsaSelectedAttentionParams p;
@@ -39,8 +62,8 @@ void selected_nan_underflow(bool half) {
     check(cudaMemcpy(dv.data,half?static_cast<void*>(hv.data()):static_cast<void*>(v.data()),half?1024:2048,cudaMemcpyHostToDevice));
     check(cudaMemcpy(di.data,ids,8,cudaMemcpyHostToDevice));
     for(int mode:{0,1,2}) {
-        p.reuse_gqa=mode==1;p.partitions=mode==2?2:1;p.selected_scores=static_cast<float*>(scores.data);
-        check(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
+        p.reuse_gqa=mode==1;p.partitions=mode>=2?2:1;p.selected_scores=static_cast<float*>(scores.data);
+        check(launch_selected_for_test(static_cast<float*>(dq.data),dk.data,dv.data,half,
             static_cast<int32_t*>(di.data),static_cast<float*>(out.data),p));
         check(cudaMemcpy(actual.data(),out.data,2048,cudaMemcpyDeviceToHost));
         for(int h=0;h<2;++h) {
@@ -63,6 +86,7 @@ void topk(int keys,int budget=2048,int ratio=4,int start=-1,bool force=false) {
     std::vector<int32_t> id_guard(count+16,12345);
     check(cudaMemcpy(candidates.data,candidate_guard.data(),candidate_guard.size()*4,cudaMemcpyHostToDevice));
     check(cudaMemcpy(candidate_ids.data,id_guard.data(),id_guard.size()*4,cudaMemcpyHostToDevice));
+    check(cudaStreamSynchronize(nullptr));
     cudaStream_t stream;check(cudaStreamCreate(&stream));
     cudaGraph_t graph;cudaGraphExec_t exec;
     check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
@@ -76,9 +100,9 @@ void topk(int keys,int budget=2048,int ratio=4,int start=-1,bool force=false) {
             scores[r*ss+b]=future?std::numeric_limits<float>::quiet_NaN():
                 variant==0?float(b):variant==1?1.f:-float(b);
         }
-        check(cudaMemcpy(ds.data,scores.data(),scores.size()*4,cudaMemcpyHostToDevice));
+        check(cudaMemcpyAsync(ds.data,scores.data(),scores.size()*4,cudaMemcpyHostToDevice,stream));
         std::vector<int32_t> actual(rows*is+16,12345);
-        check(cudaMemcpy(di.data,actual.data(),actual.size()*4,cudaMemcpyHostToDevice));
+        check(cudaMemcpyAsync(di.data,actual.data(),actual.size()*4,cudaMemcpyHostToDevice,stream));
         if(variant==0)check(mollm_cuda::launch_qsa_causal_block_topk(static_cast<float*>(ds.data),
             static_cast<int32_t*>(di.data)+8,rows,keys,past,budget,ratio,ss,is,stream,cs,ci,force));
         else check(cudaGraphLaunch(exec,stream));
@@ -109,7 +133,7 @@ void topk(int keys,int budget=2048,int ratio=4,int start=-1,bool force=false) {
     check(cudaGraphExecDestroy(exec));check(cudaGraphDestroy(graph));check(cudaStreamDestroy(stream));
 }
 
-void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bool interleaved,bool use_mask=false,bool reuse=false,int partitions=1,float stress_scale=1.f) {
+void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bool interleaved,bool use_mask=false,bool reuse=false,int partitions=1,float stress_scale=1.f,bool reverse_ids=false,bool mutate_selection=false) {
     mollm_cuda::QsaSelectedAttentionParams p{};
     p.reuse_gqa=reuse;
     p.partitions=partitions;
@@ -174,6 +198,8 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
             if(r<rows-1)ids[r*p.index_position_stride+slots-2]=keys-1; // future
         }
     }
+    if(reverse_ids)for(int r=0;r<rows;++r)
+        std::reverse(ids.begin()+r*p.index_position_stride,ids.begin()+r*p.index_position_stride+slots);
     Buffer dq(query.size()*4),dk(kn*(half?2:4)),dv(vn*(half?2:4)),di(ids.size()*4),out((on+16)*4);
     Buffer dm(mask.size()*4);
     const float* device_mask=use_mask?static_cast<float*>(dm.data):nullptr;
@@ -189,20 +215,32 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
         check(cudaMemcpy(dk.data,key.data(),kn*4,cudaMemcpyHostToDevice));
         check(cudaMemcpy(dv.data,value.data(),vn*4,cudaMemcpyHostToDevice));
     }
+    // Initial copies use the default stream; replay updates below belong to
+    // the graph stream. Do not rely on implicit cross-stream ordering under PTDS.
+    check(cudaStreamSynchronize(nullptr));
     cudaStream_t stream;check(cudaStreamCreate(&stream));
     cudaGraph_t graph;cudaGraphExec_t exec;
     check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-    check(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
+    check(launch_selected_for_test(static_cast<float*>(dq.data),dk.data,dv.data,half,
           static_cast<int32_t*>(di.data),static_cast<float*>(out.data)+8,p,stream,device_mask));
     check(cudaStreamEndCapture(stream,&graph));
     check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
     for(int variant=0;variant<3;++variant) {
+        // Replay the same graph as indices change from a valid prefix to
+        // holes and then an empty selection. The legacy API is the bitwise
+        // oracle; the FP64 reference below independently checks the result.
+        if(mutate_selection) {
+            if(variant==1)for(int r=0;r<rows;++r)
+                std::swap(ids[r*p.index_position_stride],ids[r*p.index_position_stride+slots-1]);
+            if(variant==2)std::fill(ids.begin(),ids.end(),-1);
+            check(cudaMemcpyAsync(di.data,ids.data(),ids.size()*4,cudaMemcpyHostToDevice,stream));
+        }
         for(size_t i=0;i<query.size();++i)query[i]=std::sin(float(i+17*variant)*.019f)*.4f;
-        check(cudaMemcpy(dq.data,query.data(),query.size()*4,cudaMemcpyHostToDevice));
+        check(cudaMemcpyAsync(dq.data,query.data(),query.size()*4,cudaMemcpyHostToDevice,stream));
         std::vector<float> actual(on+16,12345.f);
-        check(cudaMemcpy(out.data,actual.data(),actual.size()*4,cudaMemcpyHostToDevice));
+        check(cudaMemcpyAsync(out.data,actual.data(),actual.size()*4,cudaMemcpyHostToDevice,stream));
         if(variant==0)
-            check(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
+            check(launch_selected_for_test(static_cast<float*>(dq.data),dk.data,dv.data,half,
                   static_cast<int32_t*>(di.data),static_cast<float*>(out.data)+8,p,stream,device_mask));
         else check(cudaGraphLaunch(exec,stream));
         check(cudaStreamSynchronize(stream));
@@ -211,9 +249,9 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
         if(p.reuse_gqa||p.partitions>1) {
             Buffer reference_output(actual.size()*4);
             std::vector<float> reference(actual.size(),12345.f);
-            check(cudaMemcpy(reference_output.data,reference.data(),reference.size()*4,cudaMemcpyHostToDevice));
+            check(cudaMemcpyAsync(reference_output.data,reference.data(),reference.size()*4,cudaMemcpyHostToDevice,stream));
             auto legacy=p;legacy.reuse_gqa=false;legacy.partitions=1;legacy.selected_scores=nullptr;
-            check(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
+            check(launch_selected_for_test(static_cast<float*>(dq.data),dk.data,dv.data,half,
                 static_cast<int32_t*>(di.data),static_cast<float*>(reference_output.data)+8,legacy,stream,device_mask));
             check(cudaStreamSynchronize(stream));
             check(cudaMemcpy(reference.data(),reference_output.data,reference.size()*4,cudaMemcpyDeviceToHost));
@@ -246,7 +284,7 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
         for(size_t i=0;i<on;++i)if(!written[i])require(actual[8+i]==12345.f);
     }
     auto bad=p;bad.slots=4097;
-    require(mollm_cuda::launch_qsa_selected_attention(static_cast<float*>(dq.data),dk.data,dv.data,half,
+    require(launch_selected_for_test(static_cast<float*>(dq.data),dk.data,dv.data,half,
          static_cast<int32_t*>(di.data),static_cast<float*>(out.data)+8,bad,stream)==cudaErrorInvalidValue);
     check(cudaGraphExecDestroy(exec));check(cudaGraphDestroy(graph));check(cudaStreamDestroy(stream));
 }
@@ -254,6 +292,37 @@ void run(bool half,int keys,int rows,int heads,int kv,int kd,int vd,int slots,bo
 int main(int argc,char** argv) {
     int count=0;
     if(cudaGetDeviceCount(&count)!=cudaSuccess||count==0)return 77;
+    std::unique_ptr<Buffer> gathered_values,gathered_active;
+    if(argc>1&&!std::strcmp(argv[1],"--gathered")) {
+        --argc;++argv;
+        mollm_cuda::QsaSelectedAttentionParams geometry{};
+        geometry.queries=1;geometry.kv_heads=2;geometry.slots=2051;geometry.value_dim=256;
+        size_t values_bytes=1,active_bytes=1;
+        require(mollm_cuda::qsa_gathered_fp16_workspace_bytes(geometry,values_bytes,active_bytes));
+        require(values_bytes==size_t(2)*2051*256*2&&active_bytes==2051*4);
+        geometry.queries=0;
+        require(!mollm_cuda::qsa_gathered_fp16_workspace_bytes(geometry,values_bytes,active_bytes));
+        require(values_bytes==0&&active_bytes==0);
+        geometry.queries=8;geometry.kv_heads=65535;geometry.slots=4096;geometry.value_dim=4096;
+        require(!mollm_cuda::qsa_gathered_fp16_workspace_bytes(geometry,values_bytes,active_bytes));
+        require(values_bytes==0&&active_bytes==0);
+        gathered_values=std::make_unique<Buffer>(64*1024*1024);
+        gathered_active=std::make_unique<Buffer>(128*1024);
+        gathered_workspace={gathered_values->data,64*1024*1024,static_cast<int32_t*>(gathered_active->data),128*1024};
+        for(bool interleaved:{false,true}) {
+            run(true,131,5,24,2,256,256,131,interleaved,true,false,16);
+            run(true,19,8,4,2,17,13,9,interleaved,true,false,16);
+            run(true,131,5,24,2,256,256,131,interleaved,false,false,16,1.f,false,true);
+            run(true,19,8,4,2,17,13,9,interleaved,false,false,16,1.f,false,true);
+        }
+        // Short-history decode and verification, including PV routing
+        // crossover boundaries. Compare changing prefix/hole/empty selections
+        // bitwise with legacy arithmetic and against the FP64 reference.
+        for(int keys:{511,512,767,768,1023,1024,1279,1280,1759,3005,4095})
+            for(int rows:{1,2,3,4,5,8})
+                run(true,keys,rows,24,2,256,256,2051,false,true,false,16,1.f,false,true);
+    }
+
     if(argc==2&&!std::strcmp(argv[1],"--streaming-topk-only")) {
         for(int keys:{32772,32775,65536,131071,262144})topk(keys);
         topk(65536,2048,4,0);
@@ -263,6 +332,14 @@ int main(int argc,char** argv) {
         std::puts("QSA streaming top-k: boundaries, all merge widths, ties, tails, guards and capture pass");return 0;
     }
     for(bool half:{false,true})selected_nan_underflow(half);
+    // One-token prefetched PV: a non-multiple-of-eight selection, masked
+    // poison, odd feature tails and both cache/output layouts.
+    for(bool half:{false,true})for(bool interleaved:{false,true}) {
+        run(half,2054,1,4,2,17,13,2051,interleaved,true,false,16);
+        run(half,131,1,24,2,256,256,131,interleaved,true,false,16);
+        run(half,2054,1,4,2,17,13,2051,interleaved,true,false,16,1.f,true);
+        run(half,131,3,24,2,256,256,131,interleaved,true,true,1,1.f,true);
+    }
     if(argc==2&&!std::strcmp(argv[1],"--optimized-small-only")) {
         for(bool half:{false,true})for(bool interleaved:{false,true}) {
             run(half,131,3,24,2,256,256,131,interleaved,true,true);
