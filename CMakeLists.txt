@@ -717,12 +717,6 @@ add_custom_target(mollm_quantize_weight DEPENDS mollm-quantize)
 
 if(MOLLM_BUILD_TESTS)
     enable_testing()
-    if(DEFINED ENV{GITHUB_ACTIONS})
-        configure_file(tests/report_ctest_failures.py report_ctest_failures.py COPYONLY)
-        file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
-            "set(CTEST_CUSTOM_PRE_TEST \"/bin/rm -f Testing/Temporary/LastTestsFailed.log\")\n"
-            "set(CTEST_CUSTOM_POST_TEST \"/bin/sh -c 'test ! -f Testing/Temporary/LastTestsFailed.log || python3 ${CMAKE_BINARY_DIR}/report_ctest_failures.py'\")\n")
-    endif()
     add_test(NAME test_cuda_architectures
         COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_architectures.cmake)
 
@@ -1651,10 +1645,11 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda;e2e" RUN_SERIAL TRUE TIMEOUT 180)
         endif()
         function(add_mollm_python_test name script)
-            add_test(
-                NAME ${name}
-                COMMAND ${Python3_EXECUTABLE}
-                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/${script})
+            set(test_command ${CMAKE_CURRENT_SOURCE_DIR}/tests/${script})
+            if(DEFINED ENV{GITHUB_ACTIONS})
+                set(test_command ${CMAKE_CURRENT_SOURCE_DIR}/tests/report_python_test.py ${test_command})
+            endif()
+            add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE} ${test_command})
         endfunction()
         add_mollm_python_test(test_token_loss_compare test_token_loss_compare.py)
         add_mollm_python_test(test_qwen38_cuda_preset test_qwen38_cuda_preset.py)
