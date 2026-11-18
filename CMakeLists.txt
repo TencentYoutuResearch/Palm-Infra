@@ -718,8 +718,9 @@ add_custom_target(mollm_quantize_weight DEPENDS mollm-quantize)
 if(MOLLM_BUILD_TESTS)
     enable_testing()
     if(DEFINED ENV{GITHUB_ACTIONS})
+        configure_file(tests/report_ctest_failures.py report_ctest_failures.py COPYONLY)
         file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
-            "set(CTEST_CUSTOM_POST_TEST \"/bin/sh -c 'sed s/^/::error::/ Testing/Temporary/LastTestsFailed.log'\")\n")
+            "set(CTEST_CUSTOM_POST_TEST \"/bin/sh -c 'test ! -f Testing/Temporary/LastTestsFailed.log || python3 ${CMAKE_BINARY_DIR}/report_ctest_failures.py'\")\n")
     endif()
     add_test(NAME test_cuda_architectures
         COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_architectures.cmake)
