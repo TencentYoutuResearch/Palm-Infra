@@ -94,9 +94,6 @@ public:
     bool state_prefixes_complete() const override;
     bool restore_state_prefix(int kept) override;
     void end_state_prefixes() override;
-    bool prepare_prefill_phase(const std::function<void()>& release_workspace) override {
-        return prepare_prefill_phase(release_workspace, nullptr, nullptr);
-    }
     bool prepare_prefill_phase(const std::function<void()>& release_workspace,
                               Graph*, ExecContext*) override;
     int verification_workspace_max_rows() const override;

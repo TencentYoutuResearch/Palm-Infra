@@ -1,4 +1,4 @@
-#include "backends/cuda/fp16_expert_palette.h"
+#include "backends/cuda/fp16_expert_palette_cache.h"
 #include "backends/cuda/device_runtime.h"
 
 #include <algorithm>

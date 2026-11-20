@@ -1,4 +1,4 @@
-#include "backends/cuda/fp16_expert_palette.h"
+#include "backends/cuda/fp16_expert_palette_cache.h"
 #include "backends/cuda/backend.h"
 #include "kernels/cuda/fp16_expert_palette.h"
 #include "kernels/cuda/moe.h"

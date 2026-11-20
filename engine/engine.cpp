@@ -150,6 +150,51 @@ void invalidate_workspace_key(ExecContext& ctx) {
     ctx.workspace_padded_seq_len = -1;
 }
 
+// True when ctx's retained workspace was built for exactly `rows` dynamic
+// tokens at the current runtime batch, so its outputs can be reused in place.
+bool workspace_key_matches(const ExecContext& ctx, int rows) {
+    return ctx.workspace_shape_valid && ctx.workspace_runtime_seq_len == rows &&
+        ctx.workspace_runtime_batch == ctx.runtime_batch &&
+        !ctx.workspace_static_padded && ctx.workspace_padded_seq_len == -1;
+}
+
+// Captured verification keeps owned outputs until shape/phase changes.
+// Backend admission also requires its bounded, immutable prefix bank.
+class VerifyWorkspaceScope {
+public:
+    VerifyWorkspaceScope(Graph& graph, ExecContext& ctx, bool enabled, int rows)
+        : ctx_(ctx), previous_(ctx.reuse_same_shape_workspace) {
+        if (!enabled || !ctx.backend) return;
+        const bool reusable = workspace_key_matches(ctx, rows);
+        if (!ctx.backend->set_retained_verification(true, reusable)) return;
+        entered_ = true;
+        if (!reusable) {
+            release_graph_temporaries(graph, ctx.backend);
+            invalidate_workspace_key(ctx);
+            // No materialized or borrowed outputs remain. Seed the key so the
+            // first execution also suppresses per-node release queues.
+            ctx.workspace_shape_valid = true;
+            ctx.workspace_runtime_seq_len = rows;
+            ctx.workspace_runtime_batch = ctx.runtime_batch;
+            ctx.workspace_static_padded = false;
+            ctx.workspace_padded_seq_len = -1;
+        }
+        ctx.reuse_same_shape_workspace = true;
+    }
+    ~VerifyWorkspaceScope() {
+        ctx_.reuse_same_shape_workspace = previous_;
+        if (entered_) ctx_.backend->set_retained_verification(false, false);
+    }
+    VerifyWorkspaceScope(const VerifyWorkspaceScope&) = delete;
+    VerifyWorkspaceScope& operator=(const VerifyWorkspaceScope&) = delete;
+    bool entered() const { return entered_; }
+
+private:
+    ExecContext& ctx_;
+    bool previous_;
+    bool entered_ = false;
+};
+
 bool prepare_prefill_phase(Graph& graph, ExecContext& ctx) {
     return ctx.backend && ctx.backend->prepare_prefill_phase([&] {
         release_graph_temporaries(graph, ctx.backend);
@@ -1189,40 +1234,10 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
          !mollm_memory::cuda_host_allocation_allowed(mollm_prefill::logical_transient_margin(n),"logical hidden prefill extra transient admission"))) {
         std::fprintf(stderr,"prefill_hidden: logical batch length/mode/headroom admission rejected\n");return Tensor();
     }
-    // Captured verification keeps owned outputs until shape/phase changes.
-    // Backend admission also requires its bounded, immutable prefix bank.
-    struct VerifyWorkspaceScope {
-        Graph& graph;
-        ExecContext& ctx;
-        bool previous;
-        bool entered=false;
-        VerifyWorkspaceScope(Graph& g, ExecContext& c, bool enabled, int rows)
-            : graph(g), ctx(c), previous(c.reuse_same_shape_workspace) {
-            if (!enabled) return;
-            const bool reusable=ctx.workspace_shape_valid && ctx.workspace_runtime_seq_len==rows &&
-                ctx.workspace_runtime_batch==ctx.runtime_batch && !ctx.workspace_static_padded && ctx.workspace_padded_seq_len==-1;
-            if(!ctx.backend || !ctx.backend->set_retained_verification(true,reusable))return;
-            entered=true;
-            if (!reusable) {
-                release_graph_temporaries(graph, ctx.backend);
-                invalidate_workspace_key(ctx);
-                // No materialized or borrowed outputs remain. Seed the key
-                // so first execution also suppresses per-node release queues.
-                ctx.workspace_shape_valid = true;
-                ctx.workspace_runtime_seq_len = rows;
-                ctx.workspace_runtime_batch = ctx.runtime_batch;
-                ctx.workspace_static_padded = false;
-                ctx.workspace_padded_seq_len = -1;
-            }
-            ctx.reuse_same_shape_workspace = true;
-        }
-        ~VerifyWorkspaceScope() {
-            ctx.reuse_same_shape_workspace=previous;
-            if(entered)ctx.backend->set_retained_verification(false,false);
-        }
-    } verify_workspace(graph_prefill_, exec_ctx_prefill_,
-        cfg_.device == Device::CUDA && cfg_.cuda_prefill_logical_batch &&
-        n >= 2 && n <= 8 && all_top1, n);
+    VerifyWorkspaceScope verify_workspace(graph_prefill_, exec_ctx_prefill_,
+        cfg_.device == Device::CUDA && cfg_.cuda_prefill_logical_batch && all_top1 &&
+        exec_ctx_prefill_.backend && n >= 2 &&
+        n <= exec_ctx_prefill_.backend->verification_workspace_max_rows(), n);
 
     mollm_prefill::LogicalBatchScope logical_scope(exec_ctx_prefill_.backend,cfg_.cuda_prefill_logical_batch);
     if(!logical_scope.entered){std::fprintf(stderr,"prefill_hidden: backend rejected logical batch admission\n");return Tensor();}
@@ -1391,7 +1406,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     // A resident expert provider also uses this cache object. The admitted
     // verification scope owns retained CUDA outputs; its next shape/phase
     // transition retires graphs before those outputs can be recycled.
-    if (moe_ssd_cache_ && !verify_workspace.entered) {
+    if (moe_ssd_cache_ && !verify_workspace.entered()) {
         release_graph_temporaries(graph_prefill_,
                                   exec_ctx_prefill_.backend);
         invalidate_workspace_key(exec_ctx_prefill_);
@@ -1765,11 +1780,11 @@ bool LLMEngine::speculative_decode(int token_id,
     mtp_stats_.drafted += drafts.size();
     mtp_stats_.verify_tokens += inputs.size();
 
+    // Select a cached workspace only when the configured draft depth fits the
+    // backend's widest qualified verification batch.
     if (cfg_.device == Device::CUDA && cfg_.cuda_prefill_logical_batch &&
         plain_argmax && exec_ctx_prefill_.backend &&
-        (cfg_.mtp_draft_tokens <= 4 ||
-         (cfg_.mtp_draft_tokens <= 7 && exec_ctx_prefill_.backend->verification_workspace_max_rows() >=
-             cfg_.mtp_draft_tokens + 1)) &&
+        exec_ctx_prefill_.backend->verification_workspace_max_rows() >= cfg_.mtp_draft_tokens + 1 &&
         !exec_ctx_prefill_.backend->select_verification_workspace(
             graph_prefill_, exec_ctx_prefill_, static_cast<int>(inputs.size()))) return false;
 
@@ -1807,11 +1822,9 @@ bool LLMEngine::speculative_decode(int token_id,
         // Only a completed same-width retained workspace is a valid graph
         // preflight. First use and every shape/phase change keep the backup.
         const auto& workspace = exec_ctx_prefill_;
-        const bool prepared = workspace.workspace_shape_valid &&
+        const bool prepared =
             (workspace.runtime_batch == -1 || workspace.runtime_batch == 1) &&
-            workspace.workspace_runtime_seq_len == static_cast<int>(inputs.size()) &&
-            workspace.workspace_runtime_batch == workspace.runtime_batch &&
-            !workspace.workspace_static_padded && workspace.workspace_padded_seq_len == -1;
+            workspace_key_matches(workspace, static_cast<int>(inputs.size()));
         if (request_prefix_only && prepared && state_backend &&
             state_backend->begin_state_prefixes(states,static_cast<int>(inputs.size()))) {
             prefix_scope.backend = state_backend;

@@ -28,19 +28,19 @@ void launch_q4_g32_compact_gemv(const float* activation, const Q4CompactG32* wei
 cudaError_t launch_q4_compact_pair_probe(const float* activation,
     const Q4CompactG32* weight,float* output,int columns,int inner,int pipeline,
     cudaStream_t stream = nullptr);
+// Diagnostic wide-row comparison, native division vs full-scale lookup. Both
+// use the same four-lane, two-accumulator FP32 tree; weights are unchanged.
+cudaError_t launch_q4_compact_scale_gemv_probe(const float* activation,
+    const Q4CompactG32* weight, float* output, int columns, int inner, bool lookup,
+    cudaStream_t stream = nullptr);
+// Diagnostic exhaustive BF16max/7 oracle: 65536 pairs of native division and
+// lookup values. Caller provides 131072 floats; finite values match bitwise.
+cudaError_t launch_q4_compact_scale_check(float* result, cudaStream_t stream = nullptr);
 // Diagnostic only: exact cached-wide compact arithmetic. Hints 1/2 use
 // cg/cs reads; hint 3 combines table/activation initialization barriers
 // (table decoder only). Hints 4/5 use two/eight warps with the table decoder.
 // Hint 6 overlaps the next compact packet/scale load with current-group work.
 // Hint 7 uses that overlap without the baseline's explicit L2 prefetch.
-// Diagnostic exhaustive BF16max/7 oracle:65536 pairs of native division and
-// lookup values. Caller provides131072 floats;finite values match bitwise.
-// Diagnostic wide-row comparison, original vs full-scale lookup. Both use
-// the original four-lane, two-accumulator FP32 tree;weights are unchanged.
-cudaError_t launch_q4_compact_scale_gemv_probe(const float* activation,
-    const Q4CompactG32* weight,float* output,int columns,int inner,bool lookup,
-    cudaStream_t stream=nullptr);
-cudaError_t launch_q4_compact_scale_check(float* result,cudaStream_t stream=nullptr);
 cudaError_t launch_q4_compact_cache_probe(const float* activation,
     const Q4CompactG32* weight, float* output, int columns, int inner,
     bool integer_scale, int hint, cudaStream_t stream = nullptr);

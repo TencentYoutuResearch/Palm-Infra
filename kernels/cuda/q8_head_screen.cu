@@ -1,4 +1,5 @@
 #include "kernels/cuda/q8_head_screen.h"
+#include "kernels/cuda/device_span.h"
 #include <cmath>
 #include <climits>
 
@@ -234,19 +235,6 @@ __global__ void scalar_head_select_rows(const float* a,const float* scales,const
         indices[atomicAdd(count,1u)]=row;
 }
 
-struct HeadSpan { const void* pointer; size_t bytes; };
-bool head_spans_disjoint(const HeadSpan* spans,size_t count) {
-    for(size_t i=0;i<count;++i) {
-        const uintptr_t begin=reinterpret_cast<uintptr_t>(spans[i].pointer);
-        if(!begin||spans[i].bytes>UINTPTR_MAX-begin)return false;
-        for(size_t j=0;j<i;++j) {
-            const uintptr_t other=reinterpret_cast<uintptr_t>(spans[j].pointer);
-            if(begin<other+spans[j].bytes&&other<begin+spans[i].bytes)return false;
-        }
-    }
-    return true;
-}
-
 // threshold() strides its int row index by 65536; keep the final step in range.
 constexpr int max_screen_rows=INT32_MAX-65536;
 
@@ -284,8 +272,8 @@ cudaError_t pack_scalar_head(const int8_t* weights,uint8_t* packed,
     int rows,cudaStream_t stream) {
     if(rows<512||rows>max_screen_rows||uintptr_t(weights)%4||uintptr_t(packed)%4)
         return cudaErrorInvalidValue;
-    const HeadSpan spans[]={{weights,size_t(rows)*2560},{packed,size_t(rows)*320*Bits}};
-    if(!head_spans_disjoint(spans,2))return cudaErrorInvalidValue;
+    const mollm_cuda::DeviceSpan spans[]={{weights,size_t(rows)*2560},{packed,size_t(rows)*320*Bits}};
+    if(!mollm_cuda::device_spans_disjoint(spans,2))return cudaErrorInvalidValue;
     static_assert(Bits==4,"scalar screen bits");
     q4_pack<<<256,256,0,stream>>>(weights,packed,size_t(rows)*2560/4);
     return cudaGetLastError();
@@ -300,11 +288,11 @@ cudaError_t launch_scalar_head(const float* input,const int8_t* weights,
        uintptr_t(s.approximate)%4||uintptr_t(s.lower)%4||uintptr_t(s.norm)%8||
        uintptr_t(s.count)%4||uintptr_t(s.indices)%4)return cudaErrorInvalidValue;
     const size_t bytes=size_t(rows)*4;
-    const HeadSpan spans[]={{input,2560*sizeof(float)},{weights,size_t(rows)*2560},
+    const mollm_cuda::DeviceSpan spans[]={{input,2560*sizeof(float)},{weights,size_t(rows)*2560},
         {packed,size_t(rows)*320*Bits},{scales,bytes},{output,bytes},
         {s.approximate,bytes},{s.lower,257*sizeof(float)},{s.norm,sizeof(double)},
         {s.count,sizeof(unsigned)},{s.indices,bytes}};
-    if(!head_spans_disjoint(spans,10))return cudaErrorInvalidValue;
+    if(!mollm_cuda::device_spans_disjoint(spans,10))return cudaErrorInvalidValue;
     bool prefetch=false;
     auto status=scalar_screen_prefetch(rows,prefetch);
     if(status!=cudaSuccess)return status;

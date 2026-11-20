@@ -1414,18 +1414,18 @@ bool test_verification_workspace_pool() {
     const char* pool_limit=std::getenv("MOLLM_CUDA_OUTPUT_POOL_MB");
     const bool bounded=pool_limit&&std::atoi(pool_limit)>0;
     int releases=0;
-    if(!backend.prepare_prefill_phase([&]{++releases;})||releases)return fail(__LINE__);
+    if(!backend.prepare_prefill_phase([&]{++releases;}, nullptr, nullptr)||releases)return fail(__LINE__);
     Tensor state=Tensor::create(Precision::FP32,MemoryType::NONE,32);
     backend.alloc_persistent(state,state.nbytes(),PersistentHostAccess::NONE);
     const std::vector<float> initial(32,.5f);
     if(!upload(backend,state,initial)||!backend.begin_state_prefixes({&state},3))return fail(__LINE__);
     backend.end_state_prefixes();
-    if(!backend.prepare_prefill_phase([&]{++releases;})||releases||
+    if(!backend.prepare_prefill_phase([&]{++releases;}, nullptr, nullptr)||releases||
        !backend.begin_state_prefixes({&state},3))return fail(__LINE__);
     Tensor cached=device_tensor(backend,2048);
     backend.free_output(cached,nullptr);
     if(!backend.set_retained_verification(true,false)||
-       !backend.prepare_prefill_phase([&]{++releases;})||releases)return fail(__LINE__);
+       !backend.prepare_prefill_phase([&]{++releases;}, nullptr, nullptr)||releases)return fail(__LINE__);
     size_t reclaimed=0,invalidated=0;
     // Observe retained bytes through explicit reclamation, rather than
     // assuming a recycled CUDA address proves that cudaFree was avoided.
@@ -1434,20 +1434,20 @@ bool test_verification_workspace_pool() {
     if(!backend.set_retained_verification(false,false))return fail(__LINE__);
     backend.end_state_prefixes();
     if(!bounded) {
-        if(!backend.prepare_prefill_phase([&]{++releases;})||releases)return fail(__LINE__);
+        if(!backend.prepare_prefill_phase([&]{++releases;}, nullptr, nullptr)||releases)return fail(__LINE__);
     } else {
         cached=device_tensor(backend,2048);backend.free_output(cached,nullptr);
         Tensor live=device_tensor(backend,4096);
         auto release=[&]{++releases;backend.free_output(live,nullptr);};
         if(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)!=cudaSuccess)return fail(__LINE__);
-        const bool rejected=!backend.prepare_prefill_phase(release)&&releases==0;
+        const bool rejected=!backend.prepare_prefill_phase(release, nullptr, nullptr)&&releases==0;
         cudaGraph_t graph=nullptr;
         if(cudaStreamEndCapture(cudaStreamPerThread,&graph)!=cudaSuccess)return fail(__LINE__);
         if(graph)cudaGraphDestroy(graph);
-        if(!rejected||backend.prepare_prefill_phase({})||releases)return fail(__LINE__);
-        if(!backend.prepare_prefill_phase(release)||releases!=1||
+        if(!rejected||backend.prepare_prefill_phase({}, nullptr, nullptr)||releases)return fail(__LINE__);
+        if(!backend.prepare_prefill_phase(release, nullptr, nullptr)||releases!=1||
            !backend.trim_cached_outputs(&reclaimed,&invalidated)||reclaimed)return fail(__LINE__);
-        if(!backend.prepare_prefill_phase([&]{++releases;})||releases!=1)return fail(__LINE__);
+        if(!backend.prepare_prefill_phase([&]{++releases;}, nullptr, nullptr)||releases!=1)return fail(__LINE__);
     }
     std::vector<float> actual;
     if(!download(backend,state,actual)||actual!=initial)return fail(__LINE__);
@@ -1469,7 +1469,7 @@ bool test_verification_workspace_pool() {
         // Observe this backend's actual pool allocations: bookkeeping is only
         // removed after cudaFree succeeds. The live checkpoint must remain.
         const size_t before = backend.state_snapshot_pool_reserved_bytes();
-        if (!backend.prepare_prefill_phase([] {})) return fail(__LINE__);
+        if (!backend.prepare_prefill_phase([] {}, nullptr, nullptr)) return fail(__LINE__);
         const size_t after = backend.state_snapshot_pool_reserved_bytes();
         if (before < after || before - after < large.nbytes() * 3 ||
             after != large.nbytes()) return fail(__LINE__);

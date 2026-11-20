@@ -1,6 +1,8 @@
 #include "backends/cuda/state_prefix_plan.h"
 #include "backends/cpu/backend.h"
+#include <climits>
 #include <cstdio>
+#include <limits>
 
 using mollm::cuda_backend_detail::complete_state_prefix_plan;
 

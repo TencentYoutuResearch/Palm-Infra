@@ -99,22 +99,20 @@ public:
 
     // Before prefill admission, a backend may synchronously release the
     // caller's temporary workspace and reclaim cached storage. Persistent
-    // state and active verification scopes must remain intact.
-    virtual bool prepare_prefill_phase(const std::function<void()>&) { return true; }
-    // Preserve dispatch to existing backends that override the original hook.
-    virtual bool prepare_prefill_phase(const std::function<void()>& release,
-                                       Graph*, ExecContext*) {
-        return prepare_prefill_phase(release);
+    // state and active verification scopes must remain intact. graph/ctx
+    // identify the prefill graph whose cached verifier workspaces may be
+    // retired; they may be null when no such graph exists.
+    virtual bool prepare_prefill_phase(const std::function<void()>&, Graph*, ExecContext*) {
+        return true;
     }
     // Optional bounded, per-width verifier workspace. Unsupported backends
     // leave all tensors/keys unchanged. Select runs before prefix preflight;
     // release retires captured readers before returning owned temporary leases.
     // Largest qualified retained verifier width; zero means no capability.
-    // Existing narrow select/release hooks remain usable by legacy backends.
     virtual int verification_workspace_max_rows() const { return 0; }
     virtual bool select_verification_workspace(Graph&, ExecContext&, int) { return true; }
     virtual bool release_verification_workspaces(Graph&, ExecContext&) { return true; }
-    // Opt-in, bounded target verification ownership. Unsupported backends
+    // Optional bounded target verification ownership. Unsupported backends
     // reject entry and accept restoration; ordinary prefill is unchanged.
     virtual bool set_retained_verification(bool enabled, bool reusable) { return !enabled; }
 

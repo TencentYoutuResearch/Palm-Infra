@@ -2,6 +2,7 @@
 
 #include "backends/cpu/platform.h"
 #include "kernels/cpu/matmul/matmul.h"
+#include "kernels/cpu/reduction.h"
 
 void host_matmul_fp32(const Tensor& input, const Tensor& weight,
                       Tensor& output, ThreadPool* thread_pool,
@@ -42,4 +43,8 @@ size_t host_packed_int4_g128_bytes(int rows, int columns) {
 
 void host_set_matmul_profile_phase(const char* phase) {
     mollm_set_matmul_profile_phase(phase);
+}
+
+int host_argmax_token(const float* logits, int vocab_size) {
+    return kernel_argmax(logits, vocab_size);
 }

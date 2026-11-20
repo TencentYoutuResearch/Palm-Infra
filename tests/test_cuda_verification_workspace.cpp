@@ -48,14 +48,6 @@ void history(const std::vector<float>& actual, const std::vector<float>& input, 
         }
     }
 }
-struct LegacyPrefillBackend final : Backend {
-    ShapeMode shape_mode() const override { return ShapeMode::DYNAMIC; }
-    void dispatch(const GraphNode&, const std::vector<const Tensor*>&, Tensor*, ThreadPool*) override {}
-    bool prepare_prefill_phase(const std::function<void()>& release) override {
-        release();
-        return true;
-    }
-};
 struct Captures {
     std::map<int, cudaGraphExec_t> graphs;
     void clear() {
@@ -237,11 +229,6 @@ int run() {
                 !other_context.workspace_shape_valid, "unsupported backend changed workspace");
     }
     {
-        LegacyPrefillBackend legacy;
-        Backend& generic = legacy;
-        bool released = false;
-        require(generic.prepare_prefill_phase([&] { released = true; }, &graph, &context) && released,
-                "context overload bypassed the legacy backend hook");
         auto check_unsupported = [&](CudaBackend& unsupported, int batch = -1) {
             ExecContext empty;
             empty.runtime_batch = batch;

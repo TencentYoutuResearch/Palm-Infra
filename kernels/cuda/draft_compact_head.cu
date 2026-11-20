@@ -1,4 +1,5 @@
 #include "kernels/cuda/draft_compact_head.h"
+#include "kernels/cuda/device_span.h"
 #include "kernels/cuda/reduction.cuh"
 
 #include <climits>
@@ -209,24 +210,12 @@ constexpr int screen_inner = 2560;
 constexpr int screen_candidates = 1024;
 
 // Fixed-size scratch spans are checked before any kernel is submitted.
-struct ScreenSpan { const void* pointer; size_t bytes; };
-bool screen_spans_disjoint(const ScreenSpan* spans, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        const uintptr_t begin = uintptr_t(spans[i].pointer);
-        if (!begin || begin % 4 || spans[i].bytes > UINTPTR_MAX - begin) return false;
-        for (size_t j = 0; j < i; ++j) {
-            const uintptr_t other = uintptr_t(spans[j].pointer);
-            if (begin < other + spans[j].bytes && other < begin + spans[i].bytes) return false;
-        }
-    }
-    return true;
-}
 bool screen_scratch_valid(const mollm_cuda::DraftHeadScreenScratch& scratch, bool temporary) {
     constexpr size_t bytes = size_t(screen_rows) * 4;
-    const ScreenSpan spans[] = {{scratch.coarse, bytes}, {scratch.sorted, bytes},
+    const mollm_cuda::DeviceSpan spans[] = {{scratch.coarse, bytes}, {scratch.sorted, bytes},
         {scratch.ids, bytes}, {scratch.sorted_ids, bytes}, {scratch.groups, 32 * sizeof(int)},
         {scratch.sort_temp, scratch.sort_bytes}};
-    return screen_spans_disjoint(spans, temporary ? 6 : 5) &&
+    return mollm_cuda::device_spans_disjoint(spans, temporary ? 6 : 5, 4) &&
         (!temporary || (scratch.sort_bytes && uintptr_t(scratch.sort_temp) % 256 == 0));
 }
 
@@ -400,12 +389,12 @@ cudaError_t mollm_cuda::launch_draft_head_screen(const float* input,
         inner != screen_inner || uintptr_t(input) % 16 ||
         !screen_scratch_valid(scratch, true)) return cudaErrorInvalidValue;
     constexpr size_t bytes = size_t(screen_rows) * 4;
-    const ScreenSpan spans[] = {{input, screen_inner * sizeof(float)},
+    const mollm_cuda::DeviceSpan spans[] = {{input, screen_inner * sizeof(float)},
         {weights, size_t(screen_rows / 8) * (screen_inner / 32) * sizeof(Q4CompactG32)},
         {output, bytes}, {scratch.coarse, bytes}, {scratch.sorted, bytes},
         {scratch.ids, bytes}, {scratch.sorted_ids, bytes}, {scratch.groups, 32 * sizeof(int)},
         {scratch.sort_temp, scratch.sort_bytes}};
-    if (!screen_spans_disjoint(spans, 9)) return cudaErrorInvalidValue;
+    if (!mollm_cuda::device_spans_disjoint(spans, 9, 4)) return cudaErrorInvalidValue;
     size_t required = 0;
     auto status = draft_head_screen_temp_bytes(scratch, required);
     if (status != cudaSuccess) return status;

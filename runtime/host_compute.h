@@ -15,7 +15,7 @@ using HostPackedWeightMap =
     std::unordered_map<std::string, std::vector<uint8_t>>;
 
 // Host calculations used by model loading and accelerator fallback. The CPU
-// kernel layer provides the implementation; engine code depends only on this contract.
+// backend owns the implementation; engine code depends only on this contract.
 void host_matmul_fp32(const Tensor& input, const Tensor& weight,
                       Tensor& output, ThreadPool* thread_pool,
                       bool force_fp32_acc = false);

@@ -63,7 +63,10 @@ endif()
 set(SOURCES
     # Metal-specific weight conversion is written in portable C++ so it can
     # also be validated by the CPU-only test target.
-    kernels/metal/weight_layout.cpp
+    backends/metal/weight_layout.cpp
+    # CUDA state-prefix planning only inspects graph metadata; the CPU-only
+    # test_cuda_prefix_plan target links it without a toolkit.
+    backends/cuda/state_prefix_plan.cpp
     # runtime
     runtime/host_buffer_pool.cpp
     runtime/threading.cpp
@@ -126,6 +129,7 @@ set(SOURCES
     engine/input_prep.cpp
     engine/model_loader.cpp
     engine/qsa_companion.cpp
+    engine/routed_expert_weight.cpp
     engine/package.cpp
     engine/sampler.cpp
     engine/tokenizer.cpp
@@ -496,7 +500,7 @@ if(MOLLM_CUDA)
     target_sources(mollm_lib PRIVATE
         backends/cuda/backend.cu
         backends/cuda/verification_workspace.cpp
-        backends/cuda/fp16_expert_palette.cpp
+        backends/cuda/fp16_expert_palette_cache.cpp
         backends/cuda/device_runtime.cu
         backends/cuda/dispatch.cu
         backends/cuda/lm_head.cu

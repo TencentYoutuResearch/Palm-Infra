@@ -1,8 +1,10 @@
-#include "runtime/host_compute.h"
+#include "kernels/cpu/reduction.h"
 
 #include "backends/cpu/platform.h"
 
-int host_argmax_token(const float* logits, int vocab_size) {
+#include <cstdint>
+
+int kernel_argmax(const float* logits, int vocab_size) {
 #if HAS_NEON
     if (vocab_size >= 4) {
         static const int32_t kLaneOffsetsData[4] = {0, 1, 2, 3};

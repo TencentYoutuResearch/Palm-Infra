@@ -7,7 +7,7 @@
 #include "backends/cpu/backend.h"
 #include "backends/cuda/backend.h"
 #include "backends/cuda/device_runtime.h"
-#include "backends/cuda/fp16_expert_palette.h"
+#include "backends/cuda/fp16_expert_palette_cache.h"
 #include "backends/cuda/dense_lt_gemm.h"
 #include "runtime/cuda_host_memory_budget.h"
 #include "core/activation.h"

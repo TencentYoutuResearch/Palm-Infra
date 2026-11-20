@@ -241,9 +241,12 @@ bool CudaBackend::try_nvfp4_moe(
     if (!gate_source || !down_source || !gate_source->provider ||
         gate_source->provider != down_source->provider) return false;
     // Prefer calibrated native NVFP4 prefill MMA when the device and package
-    // support it. Qualified Qwen3.8 verification batches retain the exact SIMT
-    // path used by decode; other geometries keep the existing MMA threshold.
-    const int mma_min_rows = hidden == 2560 && inter == 640 && top_k == 10 ? 9 : 2;
+    // support it. On the qualified hidden2560/inter640/top-10 geometry, MTP
+    // verification batches (at most 8 rows) keep the exact SIMT arithmetic
+    // used by decode; other geometries switch to MMA from two rows.
+    constexpr int qualified_verify_max_rows = 8;
+    const bool qualified_geometry = hidden == 2560 && inter == 640 && top_k == 10;
+    const int mma_min_rows = qualified_geometry ? qualified_verify_max_rows + 1 : 2;
     bool native_mma = inputs[0]->shape[1] >= mma_min_rows;
     constexpr bool simt_pipeline=true;
     static const bool batch_pipeline = [] {

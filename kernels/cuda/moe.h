@@ -21,6 +21,8 @@ struct Nvfp4MmaBatch;
 // only after the backend has checked pageable-memory/host-page-table support.
 struct Nvfp4Projection {
     const uint8_t* weight;
+    // FP8 block scales. FP16 palette jobs (launch_fp16_palette_projections)
+    // store their __half palette here instead, keeping the descriptor ABI.
     const uint8_t* block_scales;
     const float* row_scales;
     const float* input;
