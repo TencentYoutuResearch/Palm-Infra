@@ -202,6 +202,22 @@ void test_sigmoid_accuracy(ThreadPool& pool) {
     check(output[0] == 0.f && output[1] == 1.f && output[2] == 0.5f,
           "SIGMOID infinities and zero");
 
+    // Three-element rows force the strided path's scalar tail at the allocation end.
+    std::vector<float> strided_input(12), strided_output(6);
+    for (size_t i = 0; i < strided_input.size(); ++i)
+        strided_input[i] = -2.f + .5f * i;
+    Tensor strided_base = external_tensor(strided_input, 6, 2);
+    Tensor strided = strided_base.view_2d(3, 2);
+    Tensor strided_out = external_tensor(strided_output, 3, 2);
+    run_elementwise(OpType::SIGMOID, {&strided}, &strided_out, &pool);
+    bool strided_accurate = true;
+    for (int row = 0; row < 2; ++row) for (int col = 0; col < 3; ++col) {
+        const double reference = 1. / (1. + std::exp(-double(strided_input[row * 6 + col])));
+        strided_accurate &= std::abs(strided_output[row * 3 + col] - reference) <=
+                            5e-7 * reference + 1e-38;
+    }
+    check(strided_accurate, "SIGMOID strided scalar tail");
+
     input[0] = -30.f;
     input[1] = 30.f;
     run_elementwise(OpType::SILU, {&in}, &out, &pool);

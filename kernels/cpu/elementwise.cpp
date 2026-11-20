@@ -82,7 +82,7 @@ static inline void unary_stride_aware(float* dst, const Tensor& src,
             vst1q_f32(dst + i, kernel_4(v));
         }
         for (; i < N; i++) {
-            float32x4_t v = vld1q_f32(sp + i);
+            float32x4_t v = vdupq_n_f32(sp[i]);
             float32x4_t r = kernel_4(v);
             dst[i] = vgetq_lane_f32(r, 0);
         }
@@ -105,7 +105,7 @@ static inline void unary_stride_aware(float* dst, const Tensor& src,
                     vst1q_f32(dst_row + i, kernel_4(v));
                 }
                 for (; i < n_inner; i++) {
-                    float32x4_t v = vld1q_f32(sp + i);
+                    float32x4_t v = vdupq_n_f32(sp[i]);
                     float32x4_t r = kernel_4(v);
                     dst_row[i] = vgetq_lane_f32(r, 0);
                 }
