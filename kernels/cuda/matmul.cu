@@ -2091,8 +2091,8 @@ cudaError_t launch_q4_compact_small_batch_exact(const float* activation,
             q4_g32_small_batch_wide_cuda<2,Q4CompactG32><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
         else if (tokens == 3) {
             // The SM121 M3 wide path benefits from the same weight-latency
-            // overlap used by single-token projections. Keep other strides
-            // on the qualified generic path; the existing override applies.
+            // overlap used by single-token projections. Other strides keep
+            // the generic path.
             if (lda == 2560 && ldc == columns && cuda_q4_prefetch_enabled())
                 q4_g32_small_batch_wide_cuda<3,Q4CompactG32,0,2><<<blocks,128,0,stream>>>(activation,weight,output,tokens,columns,inner,lda,ldc);
             else

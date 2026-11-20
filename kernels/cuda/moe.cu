@@ -2041,10 +2041,9 @@ __device__ __forceinline__ void nvfp4_gate_pair_compute(
     if(!lane){job.output[row]=a*job.row_scales[row];other.output[row]=b*other.row_scales[row];}
 }
 
-// One launch: two warps compare at most50 cached job descriptors per CTA.
+// One launch: two warps compare at most 50 cached job descriptors per CTA.
 // Original descriptors/output addresses stay in place. No scratch or host readback.
-template<int MinBlocks>
-__global__ __launch_bounds__(128,MinBlocks) void nvfp4_gate_paired_cuda(
+__global__ __launch_bounds__(128,8) void nvfp4_gate_paired_cuda(
     const mollm_cuda::Nvfp4Projection* jobs,int count) {
     __shared__ unsigned masks[2];
     const int route=int(blockIdx.y),thread=int(threadIdx.x);
@@ -2927,7 +2926,7 @@ cudaError_t launch_nvfp4_gate_paired_projections(const Nvfp4Projection* jobs,
     if (!jobs || count < 1 || count > 50 || rows != 1280 || inner != 2560 ||
         reinterpret_cast<uintptr_t>(jobs) % alignof(Nvfp4Projection))
         return cudaErrorInvalidValue;
-    nvfp4_gate_paired_cuda<8><<<dim3(rows / 8, count), 128, 0, stream>>>(jobs, count);
+    nvfp4_gate_paired_cuda<<<dim3(rows / 8, count), 128, 0, stream>>>(jobs, count);
     return cudaGetLastError();
 }
 

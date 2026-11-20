@@ -9,36 +9,12 @@
 using mollm::cuda_backend_detail::device_pointer_const;
 
 namespace {
-bool q8_head_screen_enabled() { return true; }
-int q8_head_screen_bits() { return 4; }
-// SM121 qualifies both wider screened heads and fitted draft packing. Cache
-// attributes by current device so a context/device switch cannot reuse policy.
-cudaError_t sm121_head_policy_supported(bool& supported) {
-    int device=-1;
-    cudaError_t status=cudaGetDevice(&device);
-    if(status!=cudaSuccess)return status;
-    thread_local int cached_device=-1;
-    thread_local bool cached_support=false;
-    if(device!=cached_device) {
-        int major=0,minor=0;
-        status=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device);
-        if(status!=cudaSuccess)return status;
-        status=cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device);
-        if(status!=cudaSuccess)return status;
-        cached_support=major==12&&minor==1;
-        cached_device=device;
-    }
-    supported=cached_support;
-    return cudaSuccess;
-}
-cudaError_t fitted_draft_q4_supported(bool& supported) {
-    return sm121_head_policy_supported(supported);
-}
-bool draft_compact_q2_enabled() { return true; }
-bool draft_compact_q4_enabled() { return true; }
-bool draft_energy_screen_enabled() { return true; }
-int draft_energy_screen_groups() { return 16; }
-}
+// The screened and compact heads are qualified for this vocabulary/hidden
+// shape on SM121 only; every other shape keeps the exact Q8 GEMV.
+constexpr int qualified_head_rows = 248320;
+constexpr int qualified_head_inner = 2560;
+constexpr int draft_energy_screen_groups = 16;
+}  // namespace
 
 bool CudaBackend::supports_lm_head(const Tensor& weight) const {
     return impl_->find_weight(weight) != nullptr;
@@ -84,12 +60,10 @@ bool CudaBackend::lm_head_small_batch_argmax_device_and_end_graph(
     // Scalar and batch screening share one auxiliary weight copy. Admit this
     // measured target-head shape only with compact-Q4 drafting: otherwise a
     // screened scalar draft could evict the target copy on every MTP round.
-    const bool screen_candidate=q8_head_screen_enabled()&&draft_compact_q4_enabled()&&
-        !impl_->draft_head_request&&tokens>=3&&tokens<=verification_workspace_max_rows()&&columns==248320&&inner==2560&&
-        uintptr_t(source)%16==0;
-    bool wide_screen=false;
-    if(screen_candidate&&!mollm_cuda::report_cuda(sm121_head_policy_supported(wide_screen),
-            "Q8 batch head screen device")) {impl_->failed=true;return false;}
+    const bool screen_candidate=!impl_->draft_head_request&&tokens>=3&&
+        tokens<=verification_workspace_max_rows()&&columns==qualified_head_rows&&
+        inner==qualified_head_inner&&uintptr_t(source)%16==0;
+    const bool wide_screen=impl_->prefer_screened_heads;
     const bool screen=screen_candidate&&(tokens==3||wide_screen);
     if(screen) {
         // Reserve the maximum admitted width on the first screened batch;
@@ -231,24 +205,22 @@ int CudaBackend::lm_head_argmax_device_and_end_graph(
         return -1;
     }
     const auto* prepared=impl_->find_weight(weight);
-    const bool screen=q8_head_screen_enabled()&&prepared&&
+    const bool screen=prepared&&
         prepared->layout==Impl::WeightLayout::Q8RowMajor&&prepared->scales&&
         prepared->groups_per_row==1&&prepared->group_size>=k&&
         n>=65536&&k==2560&&activation_kind==0&&uintptr_t(source)%16==0;
-    const bool draft_q4=draft_compact_q4_enabled()&&impl_->draft_head_request&&prepared&&
+    const bool draft_q4=impl_->draft_head_request&&prepared&&
         prepared->layout==Impl::WeightLayout::Q8RowMajor&&prepared->scales&&
         prepared->groups_per_row==1&&prepared->group_size>=k&&prepared->n==n&&prepared->k==k&&
         k>0&&k%32==0&&n<=INT32_MAX-7&&uintptr_t(source)%16==0&&activation_kind==0;
     bool computed=false;
     if(draft_q4) {
-        // Confidence requests retain Q4 logits/probabilities. Q2 is a scoped,
-        // opt-in refinement of the existing compact greedy draft preset.
-        const int bits=draft_compact_q2_enabled()&&!impl_->draft_probability_output&&
-            n==248320&&k==2560 ? 2 : 4;
-        bool fitted_q4 = false;
-        if (bits == 4 && impl_->draft_probability_output && n == 248320 && k == 2560 &&
-            !mollm_cuda::report_cuda(fitted_draft_q4_supported(fitted_q4),
-                "fitted Q4 draft head device")) {impl_->failed=true;return -1;}
+        // Confidence requests need Q4 logits/probabilities; plain greedy drafts
+        // on the qualified shape use the smaller Q2 head.
+        const bool qualified_shape=n==qualified_head_rows&&k==qualified_head_inner;
+        const int bits=!impl_->draft_probability_output&&qualified_shape ? 2 : 4;
+        const bool fitted_q4=bits==4&&impl_->draft_probability_output&&qualified_shape&&
+            impl_->prefer_screened_heads;
         const auto kind = bits == 2 ? Impl::DraftCompactHeadKind::Q2 :
             fitted_q4 ? Impl::DraftCompactHeadKind::FittedQ4 : Impl::DraftCompactHeadKind::Q4;
         const size_t block_bytes=bits==2 ? sizeof(mollm_cuda::Q2DraftG32) : sizeof(mollm_cuda::Q4CompactG32);
@@ -274,14 +246,10 @@ int CudaBackend::lm_head_argmax_device_and_end_graph(
             source,static_cast<const mollm_cuda::Q2DraftG32*>(impl_->draft_q4_head),
             static_cast<float*>(impl_->output),n,k,cudaStreamPerThread),"Q2 draft head");
         else {
-            bool use_screen = false;
-            if (draft_energy_screen_enabled() && fitted_q4 &&
-                !mollm_cuda::report_cuda(sm121_head_policy_supported(use_screen),
-                    "draft energy screen device")) {impl_->failed=true;return -1;}
-            if (use_screen) {
-                // This branch already requires a fitted Q4 probability request
-                // with N248320/K2560. Scratch persists across eager draft calls.
-                constexpr size_t array_bytes = size_t(248320) * sizeof(float);
+            if (fitted_q4) {
+                // Fitted Q4 implies a probability request on the qualified
+                // shape. Scratch persists across eager draft calls.
+                constexpr size_t array_bytes = size_t(qualified_head_rows) * sizeof(float);
                 constexpr size_t bytes = array_bytes * 4 + 32 * sizeof(int);
                 if (!impl_->reserve(impl_->draft_screen_scratch,
                         impl_->draft_screen_scratch_bytes, bytes, true)) {impl_->failed=true;return -1;}
@@ -309,7 +277,7 @@ int CudaBackend::lm_head_argmax_device_and_end_graph(
                 computed = mollm_cuda::report_cuda(mollm_cuda::launch_draft_head_screen(
                     source, static_cast<const mollm_cuda::Q4CompactG32*>(impl_->draft_q4_head),
                     static_cast<float*>(impl_->output), n, k, scratch, cudaStreamPerThread,
-                    draft_energy_screen_groups()),
+                    draft_energy_screen_groups),
                     "draft energy screen");
                 if (computed) ++impl_->draft_screen_calls;
             } else {
@@ -319,13 +287,10 @@ int CudaBackend::lm_head_argmax_device_and_end_graph(
             }
         }
     } else if(screen) {
-        int bits=q8_head_screen_bits();
-        bool scalar_alternative=false;
-        if (bits!=6 && n == 248320 && prepared->n == n && prepared->k == k &&
-            !mollm_cuda::report_cuda(sm121_head_policy_supported(scalar_alternative), "scalar head screen device")) {
-            impl_->failed = true; return -1;
-        }
-        if(!scalar_alternative)bits=6;
+        // The qualified shape uses the smaller Q4 screen; others keep Q6.
+        const bool scalar_alternative=impl_->prefer_screened_heads&&
+            n==qualified_head_rows&&prepared->n==n&&prepared->k==k;
+        const int bits=scalar_alternative ? 4 : 6;
         // Allocate only the scalar format in use. MTP can additionally create
         // its independent Q6 batch view without changing or evicting this one.
         void*& packed = scalar_alternative ? impl_->q8_head_scalar_packed : impl_->q8_head_packed;

@@ -4,7 +4,9 @@
 #include <cstddef>
 
 namespace mollm_cuda {
-// Experimental greedy-head screen. Fixed K=2560, per-row Q8 scales.
+// Exact greedy-head screen: a packed approximation bounds every row score, and
+// candidate rows are rescored with the original Q8 weights. Fixed K=2560,
+// per-row Q8 scales.
 // Keep original Q8 weights: this auxiliary packed copy is not a model format.
 struct Q8HeadScreenScratch {
     float* approximate; // rows
@@ -47,7 +49,7 @@ struct Q8HeadScreenBatch3Scratch {
 cudaError_t launch_q8_head_screen_batch3(const float* input, const int8_t* weights,
     const uint8_t* packed, const float* scales, float* output, int rows,
     Q8HeadScreenBatch3Scratch scratch, cudaStream_t stream);
-// Four or five contiguous K=2560 queries. Capacities count elements, not bytes;
+// Four to eight contiguous K=2560 queries. Capacities count elements, not bytes;
 // separate fields reject a scalar/three-query workspace before launching work.
 // Arrays must not overlap; float/unsigned/int arrays require 4-byte alignment,
 // norm requires 8-byte alignment. Input and output have queries*2560 and

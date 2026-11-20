@@ -70,8 +70,9 @@ struct CudaBackend::Impl {
     };
     std::vector<StatePrefix> state_prefixes;
     // One immutable binding bank, including each lease's allocation width.
-    // Width3 admits <=512MiB; width5 admits <=1GiB. Smaller tails use scoped
-    // leases; upgrading width or replacing an owner retires old graphs first.
+    // retained_prefix_bank_limit_bytes() bounds its payload per width. Smaller
+    // tails use scoped leases; upgrading width or replacing an owner retires
+    // old graphs first.
     // Pool reservation/reused allocation capacity can exceed this payload.
     // Graphs are destroyed before these owned pool leases are returned.
     std::vector<StatePrefix> verify_prefix_bank;
@@ -80,7 +81,8 @@ struct CudaBackend::Impl {
     bool verify_prefix_bank_proven = false;
     uint64_t verify_warmups = 0, verify_segment_builds = 0, verify_segment_hits = 0;
     uint64_t verify_entries=0,verify_tiles=0,verify_ready=0,verify_fallbacks=0;
-    const bool verify_segments_requested = true;
+    uint64_t verification_width_switches = 0, verification_width_hits = 0;
+    size_t verification_peak_output_bytes = 0;
     int state_prefix_tokens = 0;
     size_t state_prefix_peak_payload_bytes = 0;
     float* state_prefix_output(void* pointer, size_t bytes, int tokens) {
@@ -126,6 +128,7 @@ struct CudaBackend::Impl {
     std::unordered_map<const Tensor*, const Graph*> strided_reshape_targets;
     bool coherent_host_weights = false;
     bool supports_native_nvfp4_mma = false;
+    bool prefer_screened_heads = false; // Q4 screen and compact draft heads.
     bool prefer_q4_narrow_row_cache = false; // Exact narrow projection views on qualified devices.
     bool prefer_q4_m3_specializations = false; // Qualified SM121 M3 projection policy.
     bool prefer_q4_fixed_m5 = false; // Qualified SM121 compact-wide M5 policy.
@@ -193,7 +196,7 @@ struct CudaBackend::Impl {
     int draft_q4_inner = 0;
     // Packing policy belongs in the cache key even when the Q4 layout is shared.
     DraftCompactHeadKind draft_compact_head_kind = DraftCompactHeadKind::None;
-    // Opt-in approximate draft vocabulary screen; no extra weight view.
+    // Fitted-Q4 draft vocabulary screen scratch; no extra weight view.
     void* draft_screen_scratch = nullptr;
     size_t draft_screen_scratch_bytes = 0;
     void* draft_screen_sort = nullptr;
@@ -536,7 +539,6 @@ struct CudaBackend::Impl {
     std::unique_ptr<VerificationWorkspaces> verification_workspaces;
     int verification_rows_limit = 5; // Wider admission is qualified on SM121.
     bool verification_cache_suspended = false;
-    const bool verification_cache_requested = true;
     DecodeSegment* active_segment = nullptr;
     enum class SegmentMode { NONE, CAPTURE, REPLAY };
     SegmentMode segment_mode = SegmentMode::NONE;
@@ -632,11 +634,23 @@ struct CudaBackend::Impl {
                     if (binding.storage) mollm_cuda::release_device_buffer(state_snapshot_pool.get(), binding.storage);
             verification_workspaces.reset();
         }
-        if(verify_segments_requested)std::fprintf(stderr,"CUDA verify segments: builds=%llu hits=%llu\n",
-            (unsigned long long)verify_segment_builds,(unsigned long long)verify_segment_hits);
-        if(verify_segments_requested)std::fprintf(stderr,"CUDA verify eligibility: entries=%llu tiles=%llu warmups=%llu ready=%llu fallbacks=%llu bank=%zu\n",
-            (unsigned long long)verify_entries,(unsigned long long)verify_tiles,(unsigned long long)verify_warmups,
-            (unsigned long long)verify_ready,(unsigned long long)verify_fallbacks,verify_prefix_bank.size());
+        if (verify_entries || verify_segment_builds) {
+            std::fprintf(stderr, "CudaBackend verify segments: builds=%llu hits=%llu\n",
+                static_cast<unsigned long long>(verify_segment_builds),
+                static_cast<unsigned long long>(verify_segment_hits));
+            std::fprintf(stderr, "CudaBackend verify eligibility: entries=%llu tiles=%llu warmups=%llu "
+                "ready=%llu fallbacks=%llu bank=%zu\n",
+                static_cast<unsigned long long>(verify_entries),
+                static_cast<unsigned long long>(verify_tiles),
+                static_cast<unsigned long long>(verify_warmups),
+                static_cast<unsigned long long>(verify_ready),
+                static_cast<unsigned long long>(verify_fallbacks), verify_prefix_bank.size());
+        }
+        if (verification_width_switches || verification_width_hits)
+            std::fprintf(stderr, "CudaBackend verification width cache: switches=%llu hits=%llu peak_output_bytes=%zu\n",
+                static_cast<unsigned long long>(verification_width_switches),
+                static_cast<unsigned long long>(verification_width_hits),
+                verification_peak_output_bytes);
         for(auto& entry:verify_prefix_bank)
             if(entry.storage)mollm_cuda::release_device_buffer(state_snapshot_pool.get(),entry.storage);
         verify_prefix_bank.clear();

@@ -2157,10 +2157,8 @@ void CudaBackend::dispatch(const GraphNode& node,
         --impl_->segment_cursor;
     }
     finish_decode_segment();
-    if(impl_->retained_verification && node.op_type!=OpType::PLE_LOOKUP) {
+    if (impl_->retained_verification && node.op_type != OpType::PLE_LOOKUP)
         ++impl_->verify_fallbacks;
-        if(impl_->verify_fallbacks<=3)std::fprintf(stderr,"CUDA verify fallback boundary: %s\n",op_type_name(node.op_type));
-    }
     if (node.op_type != OpType::PLE_LOOKUP) impl_->segment_disabled = true;
     impl_->segment_ready = false;
     if (impl_->operator_fallback ==

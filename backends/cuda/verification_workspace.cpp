@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 bool computed(const GraphNode& node) {
@@ -41,7 +44,7 @@ std::vector<Tensor> output_leases(const Graph& graph) {
     }
     // A contiguous list avoids one host allocation per graph node on every
     // width transition. Persistent owners win ties; otherwise preserve the
-    // earliest topological owner, exactly as the original set-based scan did.
+    // earliest topological owner.
     std::sort(buffers.begin(), buffers.end(), [](const Buffer& a, const Buffer& b) {
         if (a.address != b.address) return a.address < b.address;
         if (a.persistent != b.persistent) return a.persistent;
@@ -143,22 +146,23 @@ bool CudaBackend::clear_verification_workspaces(Graph* graph, ExecContext* ctx) 
     // reclamation pending so the next ordinary prefill trims these free blocks
     // before checking its host-memory admission margin.
     impl_->verification_pool_retained = graph != nullptr;
-    std::fprintf(stderr, "CUDA verification width cache: switches=%llu hits=%llu peak_output_bytes=%zu\n",
-                 static_cast<unsigned long long>(cache.switches),
-                 static_cast<unsigned long long>(cache.hits), cache.peak_output_bytes);
+    impl_->verification_width_switches += cache.switches;
+    impl_->verification_width_hits += cache.hits;
+    impl_->verification_peak_output_bytes =
+        std::max(impl_->verification_peak_output_bytes, cache.peak_output_bytes);
     impl_->verification_workspaces.reset();
     return true;
 }
 
 bool CudaBackend::select_verification_workspace(Graph& graph, ExecContext& ctx, int rows) {
-    if (!impl_->verification_cache_requested || impl_->verification_cache_suspended) return true;
+    if (impl_->verification_cache_suspended) return true;
     if (rows < 2 || rows > verification_workspace_max_rows()) return clear_verification_workspaces(&graph, &ctx);
     if (ctx.graph != &graph || ctx.backend != this || !available() || dispatch_failed() ||
         !impl_->state_prefixes.empty()) return false;
     // Unsupported execution modes retain their existing workspace policy.
     const char* prefix_policy = std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
     if (ctx.static_padded || ctx.profile_enabled ||
-        (ctx.runtime_batch != -1 && ctx.runtime_batch != 1) || !impl_->verify_segments_requested ||
+        (ctx.runtime_batch != -1 && ctx.runtime_batch != 1) ||
         !impl_->segment_requested || !prefix_policy || std::strcmp(prefix_policy, "1") ||
         !impl_->output_pool_limit_bytes || impl_->output_pool_limit_bytes > (size_t(3) << 30))
         return clear_verification_workspaces(&graph, &ctx);

@@ -88,7 +88,6 @@ public:
     size_t state_snapshot_pool_reserved_bytes() const;
     size_t prefill_shared_cache_bytes() const;
     size_t prefill_shared_cache_hits() const;
-    size_t q4_narrow_cache_bytes() const;
     bool supports_state_snapshot(const std::vector<Tensor*>& states) const override;
     bool begin_state_prefixes(const std::vector<Tensor*>& states, int tokens) override;
     bool state_prefixes_cover_graph(const Graph&, const std::vector<Tensor*>&, int) const override;

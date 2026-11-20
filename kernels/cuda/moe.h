@@ -77,18 +77,17 @@ cudaError_t launch_nvfp4_gate_code_projections(const Nvfp4Projection* jobs,
     int count, int rows, int inner, bool pipeline_inputs = true,
     cudaStream_t stream = nullptr);
 
-// Backend-qualified resident M1 gate, N1280/K2560 and 1..50 jobs.
-// Every descriptor must be PAIR, SF K-major, non-MMA, with 16-byte aligned
-// code/input pointers and 4-byte aligned block scales. The resident backend
-// proves all weight descriptors once and checks input alignment per call.
-// General or mixed-layout callers retain launch_nvfp4_gate_code_projections.
-// Original runtime bounds, FP32 FMA chains, reduction and row scaling remain.
+// Resident M1 gate, N1280/K2560 and 1..50 jobs, without per-descriptor checks.
+// PRECONDITION: every descriptor is PAIR, SF K-major and non-MMA, with 16-byte
+// aligned code/input pointers and 4-byte aligned block scales. The kernel does
+// not verify this; any other layout produces wrong results silently. Callers
+// that cannot guarantee it must use launch_nvfp4_gate_code_projections.
+// FP32 FMA chains, reduction and row scaling match that general entry point.
 cudaError_t launch_nvfp4_gate_code_m1_proven_projections(const Nvfp4Projection* jobs,
     int count, int rows, int inner, cudaStream_t stream = nullptr);
 
-// Same fixed K64-major gate view and exact32-lane arithmetic as above,
-// scheduled as two independent chains in each physical16-lane row.
-// The old entrypoint remains unchanged; backend policy chooses this variant.
+// Same fixed K64-major gate view and exact 32-lane arithmetic as above,
+// scheduled as two independent chains in each physical 16-lane row.
 cudaError_t launch_nvfp4_gate_code_subgroup_projections(const Nvfp4Projection* jobs,
     int count,int rows,int inner,cudaStream_t stream = nullptr);
 // Exact canonical ROW/PAIR gate codes in K64-major order, N1280/K2560;
@@ -97,7 +96,7 @@ cudaError_t launch_nvfp4_gate_code_subgroup_projections(const Nvfp4Projection* j
 cudaError_t launch_nvfp4_gate_paired_projections(const Nvfp4Projection* jobs,
     int count, int rows, int inner, cudaStream_t stream = nullptr);
 // Same exact canonical K64-major gate arithmetic; PAIR rows use eight lanes.
-// ROW descriptors retain the original16-lane tree inside each16-row tile.
+// ROW descriptors keep the 16-lane tree inside each 16-row tile.
 cudaError_t launch_nvfp4_gate_paired8_projections(const Nvfp4Projection* jobs,
     int count,int rows,int inner,cudaStream_t stream = nullptr);
 

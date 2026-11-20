@@ -19,10 +19,6 @@
 using mollm::cuda_backend_detail::device_pointer;
 using mollm::cuda_backend_detail::device_pointer_const;
 
-size_t CudaBackend::q4_narrow_cache_bytes() const {
-    return impl_->narrow_row_g32_bytes;
-}
-
 bool CudaBackend::reshape_view_strides(const Tensor& source, const Tensor& target,
                                      size_t strides[4]) const {
     if (!impl_->strided_reshape_views || impl_->segment_enabled || !strides ||
@@ -206,7 +202,7 @@ bool CudaBackend::begin_state_prefixes(const std::vector<Tensor*>& states,int to
     }
     const size_t bank_limit=tokens <= verification_workspace_max_rows() ?
         mollm::cuda_backend_detail::retained_prefix_bank_limit_bytes(tokens, bool(impl_->verification_workspaces)) : 0;
-    const bool bank_requested=impl_->verify_segments_requested && impl_->segment_requested && bank_limit;
+    const bool bank_requested=impl_->segment_requested && bank_limit;
     if(bank_requested && !impl_->verify_prefix_bank.empty()) {
         const int bank_tokens=impl_->verify_prefix_bank.front().tokens;
         const bool valid_width=bank_tokens <= verification_workspace_max_rows() &&
@@ -391,29 +387,33 @@ CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) 
         impl_->coherent_host_weights = pageable && host_tables;
     cudaDeviceProp properties{};
     if (cudaGetDeviceProperties(&properties, 0) == cudaSuccess) {
-        impl_->prefer_fp16_expert_palette = properties.major == 12 && properties.minor == 1;
-        impl_->verification_rows_limit = properties.major == 12 && properties.minor == 1 ? 8 : 5;
+        // Decode specializations below were qualified on SM121 only; every
+        // other device keeps the generic paths.
+        const bool sm121 = properties.major == 12 && properties.minor == 1;
+        impl_->prefer_fp16_expert_palette = sm121;
+        impl_->verification_rows_limit = sm121 ? 8 : 5;
         impl_->supports_native_nvfp4_mma = properties.major == 12 && properties.minor <= 1;
-        impl_->prefer_nvfp4_gate_m1_proven = properties.major == 12 && properties.minor == 1;
-        impl_->prefer_nvfp4_gate_subgroup = properties.major == 12 && properties.minor == 1;
-        impl_->prefer_nvfp4_mtp_gate_pairs = properties.major == 12 && properties.minor == 1;
-        impl_->prefer_nvfp4_mtp_gate_eight = properties.major == 12 && properties.minor == 1;
-        impl_->prefer_nvfp4_m1_down_subwarp = properties.major == 12 && properties.minor == 1;
-        impl_->prefer_nvfp4_mtp_down_subwarp = properties.major == 12 && properties.minor == 1;
-        impl_->prefer_q4_narrow_row_cache = properties.major == 12 && properties.minor == 1;
-        impl_->prefer_q4_m3_specializations = properties.major == 12 && properties.minor == 1;
-        impl_->prefer_q4_fixed_m5 = properties.major == 12 && properties.minor == 1;
-        if(properties.major==12&&properties.minor==1) {
-            const auto status=mollm_cuda::configure_q4_g32_hc_adjacent_cache();
-            impl_->prefer_q4_hc_adjacent=status==cudaSuccess;
-            if(status!=cudaSuccess)cudaGetLastError(); // Keep the existing native path available.
+        impl_->prefer_screened_heads = sm121;
+        impl_->prefer_nvfp4_gate_m1_proven = sm121;
+        impl_->prefer_nvfp4_gate_subgroup = sm121;
+        impl_->prefer_nvfp4_mtp_gate_pairs = sm121;
+        impl_->prefer_nvfp4_mtp_gate_eight = sm121;
+        impl_->prefer_nvfp4_m1_down_subwarp = sm121;
+        impl_->prefer_nvfp4_mtp_down_subwarp = sm121;
+        impl_->prefer_q4_narrow_row_cache = sm121;
+        impl_->prefer_q4_m3_specializations = sm121;
+        impl_->prefer_q4_fixed_m5 = sm121;
+        if (sm121) {
+            const auto status = mollm_cuda::configure_q4_g32_hc_adjacent_cache();
+            impl_->prefer_q4_hc_adjacent = status == cudaSuccess;
+            if (status != cudaSuccess) cudaGetLastError(); // Keep the generic path available.
         }
 
-        impl_->supports_extended_nvfp4_prefill_sort = properties.major == 12 && properties.minor == 1;
-        impl_->supports_sdpa_head_lane_pair=properties.major==12&&properties.minor==1&&
-            properties.maxThreadsPerBlock>=512&&properties.regsPerBlock>=32768;
-        if(properties.major==12&&properties.minor==1)
-            impl_->prefill_lt=std::make_unique<mollm_cuda::PrefillLtGemm>();
+        impl_->supports_extended_nvfp4_prefill_sort = sm121;
+        impl_->supports_sdpa_head_lane_pair = sm121 &&
+            properties.maxThreadsPerBlock >= 512 && properties.regsPerBlock >= 32768;
+        if (sm121)
+            impl_->prefill_lt = std::make_unique<mollm_cuda::PrefillLtGemm>();
         std::fprintf(stderr, "CudaBackend: using %s (sm_%d%d)\n",
                      properties.name, properties.major, properties.minor);
     }
@@ -423,7 +423,7 @@ CudaBackend::~CudaBackend() {
     // Engine graph storage may already be gone. Active outputs remain owned
     // by output_pool; only dormant leases can be inspected in this mode.
     if (!clear_verification_workspaces(nullptr, nullptr))
-        std::fprintf(stderr, "CUDA verification cache: deferred failed teardown to Impl\n");
+        std::fprintf(stderr, "CudaBackend: verification cache cleanup failed; releasing at shutdown\n");
     if (std::getenv("MOLLM_CUDA_STRIDED_RESHAPE_VIEWS"))
         std::fprintf(stderr, "CUDA strided reshape views: enabled=%d calls=%zu\n",
                      impl_->strided_reshape_views, impl_->strided_reshape_calls);
@@ -443,8 +443,7 @@ bool CudaBackend::set_retained_verification(bool enabled, bool reusable) {
         }
         impl_->retained_verification=false;return true;
     }
-    if(!available() || dispatch_failed() || !impl_->verify_segments_requested ||
-       !impl_->segment_requested || !impl_->verify_prefix_bank_active || impl_->verify_prefix_bank.empty() ||
+    if(!available() || dispatch_failed() || !impl_->segment_requested || !impl_->verify_prefix_bank_active || impl_->verify_prefix_bank.empty() ||
        impl_->state_prefix_tokens > verification_workspace_max_rows() ||
        !mollm::cuda_backend_detail::retained_prefix_bank_limit_bytes(impl_->state_prefix_tokens, bool(impl_->verification_workspaces)) ||
        impl_->verify_prefix_bank.front().tokens!=impl_->state_prefix_tokens || impl_->active_segment) return false;
