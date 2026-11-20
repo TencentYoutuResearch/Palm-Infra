@@ -714,15 +714,9 @@ __fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K,
     pack_fp16_into(B_original, dst, N, K, K_weight);
     return dst;
 }
-
-// ---------------------------------------------------------------------------
-// A interleaved packing — FP32 [K, M] column-major → FP16 [M/8, K, 8].
-//
-// For each M-tile of 8 rows, 8 M values at the same k are stored consecutively.
-// Enables vld1q_f16 contiguous load of A + vfmlalq_laneq_f16 lane-broadcast.
-// FP32→FP16 conversion happens during pack (one-time precision loss).
-// ---------------------------------------------------------------------------
 #else
+// Byte-identical scalar layout for API completeness and direct layout tests;
+// non-NEON CPU providers never select this layout for inference.
 __fp16* pack_b_interleaved_full(const __fp16* source, int rows, int cols,
                                 int source_stride) {
     if (!source || rows < 0 || cols < 0 || source_stride < cols)
@@ -743,3 +737,11 @@ __fp16* pack_b_interleaved_full(const __fp16* source, int rows, int cols,
     return packed;
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// A interleaved packing — FP32 [K, M] column-major → FP16 [M/8, K, 8].
+//
+// For each M-tile of 8 rows, 8 M values at the same k are stored consecutively.
+// Enables vld1q_f16 contiguous load of A + vfmlalq_laneq_f16 lane-broadcast.
+// FP32→FP16 conversion happens during pack (one-time precision loss).
+// ---------------------------------------------------------------------------

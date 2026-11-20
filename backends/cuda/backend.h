@@ -93,15 +93,16 @@ public:
     size_t prefill_shared_cache_hits() const;
     bool supports_state_snapshot(const std::vector<Tensor*>& states) const override;
     bool begin_state_prefixes(const std::vector<Tensor*>& states, int tokens) override;
-    bool state_prefixes_cover_graph(const Graph&, const std::vector<Tensor*>&, int) const override;
+    bool state_prefixes_cover_graph(const Graph& graph, const std::vector<Tensor*>& states,
+                                    int tokens) const override;
     bool state_prefixes_complete() const override;
     bool restore_state_prefix(int kept) override;
     void end_state_prefixes() override;
     bool prepare_prefill_phase(const std::function<void()>& release_workspace,
-                              Graph*, ExecContext*) override;
+                              Graph* graph, ExecContext* ctx) override;
     int verification_workspace_max_rows() const override;
-    bool select_verification_workspace(Graph&, ExecContext&, int rows) override;
-    bool release_verification_workspaces(Graph&, ExecContext&) override;
+    bool select_verification_workspace(Graph& graph, ExecContext& ctx, int rows) override;
+    bool release_verification_workspaces(Graph& graph, ExecContext& ctx) override;
     std::unique_ptr<BackendStateSnapshot> capture_state_snapshot(
         const std::vector<Tensor*>& states) override;
     bool copy_to_host(const Tensor& source, void* destination,

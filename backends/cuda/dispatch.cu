@@ -17,7 +17,6 @@
 #include <cstring>
 #include <vector>
 
-
 using mollm::cuda_backend_detail::device_pointer;
 using mollm::cuda_backend_detail::device_pointer_const;
 using mollm::cuda_backend_detail::fp32_contiguous;

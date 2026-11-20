@@ -11,13 +11,6 @@
 
 class ThreadPool;
 
-namespace mollm::cpu {
-void matmul_int4_packed_scalar_range(const Tensor& A, const Tensor& B,
-                                     Tensor& C, int lda, int ldc,
-                                     int m_begin, int m_end,
-                                     int n_begin, int n_end);
-}
-
 constexpr int MATMUL_Q8_BLOCK = 32;
 
 enum class W8ScaleMode {
@@ -162,6 +155,14 @@ void matmul_int8_q8dot_neon_8x8_repacked_i8mm_range(
     int N, int K, int K_padded, int ldc, int m_begin, int m_end, int n_begin,
     int n_end);
 #endif
+namespace mollm::cpu {
+// Portable scalar INT4 (BG32/BG128) GEMM over rows [m_begin, m_end) and
+// columns [n_begin, n_end); used by the scalar and x86 CPU providers.
+void matmul_int4_packed_scalar_range(const Tensor& A, const Tensor& B,
+                                     Tensor& C, int lda, int ldc,
+                                     int m_begin, int m_end,
+                                     int n_begin, int n_end);
+}  // namespace mollm::cpu
 void quantize_a_q8_blocks_even_odd(const float* A, int K,
                                    std::vector<int8_t>& qA_even,
                                    std::vector<int8_t>& qA_odd,

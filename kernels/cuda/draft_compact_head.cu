@@ -9,6 +9,12 @@
 
 namespace {
 
+// Round FP32 bits to the nearest-even BF16 bits. NaN inputs are not
+// special-cased; callers that must preserve NaN check for it first.
+__device__ __forceinline__ uint16_t bf16_bits_round_nearest_even(unsigned bits) {
+    return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
 __global__ void draft_probability_partial(
     const float* logits, int count, const mollm_cuda::DraftHeadResult* result,
     float* partial) {
@@ -58,8 +64,7 @@ __global__ void pack_q8_draft_head_compact_cuda(
         block.q[row % 8][lane / 2] = uint8_t(code | (next << 4));
     if (!lane) {
         const unsigned bits = __float_as_uint(float(maximum) * scales[row]);
-        block.scales[row % 8] = uint16_t(
-            (bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+        block.scales[row % 8] = bf16_bits_round_nearest_even(bits);
     }
 }
 
@@ -106,7 +111,7 @@ __global__ void pack_q8_draft_head_compact_fitted_cuda(
         block.scales[row % 8] =
             (bits & 0x7f800000u) == 0x7f800000u && (bits & 0x7fffffu)
             ? uint16_t(0x7fc0u)
-            : uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+            : bf16_bits_round_nearest_even(bits);
     }
 }
 
@@ -162,8 +167,7 @@ __global__ void pack_q8_draft_head_q2_cuda(
     }
     if (!lane) {
         const unsigned bits = __float_as_uint(__fmul_rn(fitted_maximum, scales[row]));
-        block.scales[row % 8] = uint16_t(
-            (bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+        block.scales[row % 8] = bf16_bits_round_nearest_even(bits);
     }
 }
 
@@ -203,7 +207,6 @@ __global__ void q2_draft_head_gemv_cuda(
     sum += __shfl_down_sync(0xffffffffu, sum, 1, 4);
     if (!pair) output[row] = sum;
 }
-
 
 constexpr int screen_rows = 248320;
 constexpr int screen_inner = 2560;
@@ -250,8 +253,8 @@ __global__ void q4_draft_screen_groups_cuda(const float* input, int* output) {
 }
 
 // Four physical lanes retain the original eight logical FP32 chains: each
-// lane owns two sums, merges them, then uses the same stride2/1 shuffle tree.
-// Only the coarse pass changes the K32 groups; selected rescoring uses all80.
+// lane owns two sums, merges them, then uses the same stride-2/1 shuffle tree.
+// Only the coarse pass changes the K32 groups; selected rescoring uses all 80.
 template<bool Selected, int Groups = 32>
 __global__ void q4_draft_screen_dot_cuda(const float* x,
     const mollm_cuda::Q4CompactG32* weights, float* output,
@@ -344,7 +347,7 @@ cudaError_t mollm_cuda::pack_q8_draft_head_q2(
         return cudaErrorInvalidValue;
     const size_t blocks = size_t(rows / 4) * (inner / 32);
     if (blocks > INT_MAX) return cudaErrorInvalidValue;
-    pack_q8_draft_head_q2_cuda<<<unsigned(blocks),128,0,stream>>>(
+    pack_q8_draft_head_q2_cuda<<<unsigned(blocks), 128, 0, stream>>>(
         weights, scales, output, rows, inner);
     return cudaGetLastError();
 }
@@ -356,11 +359,10 @@ cudaError_t mollm_cuda::launch_q2_draft_head_gemv(
         rows % 8 || inner <= 0 || inner > 2560 || inner % 32 ||
         uintptr_t(input) % 16 || uintptr_t(weights) % alignof(Q2DraftG32) ||
         uintptr_t(output) % alignof(float)) return cudaErrorInvalidValue;
-    q2_draft_head_gemv_cuda<<<(rows+31)/32,128,size_t(inner)*sizeof(float),stream>>>(
+    q2_draft_head_gemv_cuda<<<(rows + 31) / 32, 128, size_t(inner) * sizeof(float), stream>>>(
         input, weights, output, rows, inner);
     return cudaGetLastError();
 }
-
 
 cudaError_t mollm_cuda::draft_head_screen_temp_bytes(
     const DraftHeadScreenScratch& scratch, size_t& bytes) {

@@ -1075,7 +1075,10 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path,
     // by execution. Decode plans retain their conservative captured lifetimes.
     mollm_prefill::LogicalBatchScope logical_scope(exec_ctx.backend,
         cfg_.cuda_prefill_logical_batch && &g == &graph_prefill_);
-    if (!logical_scope.entered) return false;
+    if (!logical_scope.entered) {
+        std::fprintf(stderr, "Engine: backend rejected logical prefill batching\n");
+        return false;
+    }
     prepare_execution(exec_ctx);
 
     return true;

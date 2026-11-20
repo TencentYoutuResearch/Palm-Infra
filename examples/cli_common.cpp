@@ -335,7 +335,7 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
     if (!opts.qsa_companion_dir.empty() &&
         (opts.device != Device::CUDA || opts.n_ctx < 1 || opts.n_ctx > mollm_qsa::max_context ||
          opts.static_padded)) {
-        error = "--qsa-companion requires CUDA text, ctx1..262144, no padding";
+        error = "--qsa-companion requires CUDA text, ctx 1..262144, no padding";
         return false;
     }
     // Context bounds retained KV history; chunk bounds transient batch work.
@@ -345,7 +345,7 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
          opts.weight_loading!=WeightLoadingMode::RESIDENT||opts.ssd_cache_mb!=0||
          opts.n_ctx<1||opts.static_padded||
          opts.prefill_chunk_size<0||opts.prefill_chunk_size>mollm_prefill::logical_max_tokens)) {
-        error="--cuda-prefill-logical-batch requires CUDA resident+offload-PLE+reclaim, positive context, dynamic shape, chunk0..2048";
+        error="--cuda-prefill-logical-batch requires CUDA resident+offload-PLE+reclaim, positive context, dynamic shape, chunk 0..2048";
         return false;
     }
     if (opts.cuda_prefill_reclaim &&
@@ -392,7 +392,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
     std::printf("  --offload-ple           CPU/CUDA resident mode: page PLE only; lock all other weights in RAM\n");
     std::printf("  --cuda-prefill-reclaim  Opt-in CUDA resident+PLE temporary reclamation; without logical batching: ctx<=4096, chunk<=1024; requires MOLLM_CUDA_HOST_HEADROOM_MB>=24576\n");
-    std::printf("  --cuda-prefill-logical-batch  Experimental Qwen3.8 batching; independent --n-ctx, chunk0..2048 (0 defaults to2048); short prompts/tail chunks are not padded; requires reclaim and bounded pool; decode segments are suspended during prefill\n");
+    std::printf("  --cuda-prefill-logical-batch  Experimental Qwen3.8 batching; independent --n-ctx, chunk 0..2048 (0 defaults to 2048); short prompts/tail chunks are not padded; requires reclaim and bounded pool; decode segments are suspended during prefill\n");
     std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache; pins dense weights by default\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --ssd-cross-layer-prefetch  Next-layer gate prefetch (default with global cache)\n");
