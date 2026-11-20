@@ -247,17 +247,20 @@ bool head_spans_disjoint(const HeadSpan* spans,size_t count) {
     return true;
 }
 
+// threshold() strides its int row index by 65536; keep the final step in range.
+constexpr int max_screen_rows=INT32_MAX-65536;
+
 } // namespace
 namespace mollm_cuda {
 cudaError_t pack_q8_head_screen(const int8_t* weights,uint8_t* packed,int rows,cudaStream_t stream){
-    if(!weights||!packed||rows<=0||rows>INT32_MAX-255||uintptr_t(packed)%4)return cudaErrorInvalidValue;
+    if(!weights||!packed||rows<=0||rows>max_screen_rows||uintptr_t(packed)%4)return cudaErrorInvalidValue;
     pack<<<256,256,0,stream>>>(weights,packed,size_t(rows)*2560/4);
     return cudaGetLastError();
 }
 cudaError_t launch_q8_head_screen(const float* input,const int8_t* weights,
     const uint8_t* packed,const float* scales,float* output,int rows,
     Q8HeadScreenScratch s,cudaStream_t stream){
-    if(!input||!weights||!packed||!scales||!output||rows<=0||rows>INT32_MAX-255||
+    if(!input||!weights||!packed||!scales||!output||rows<=0||rows>max_screen_rows||
        uintptr_t(input)%16||uintptr_t(weights)%4||uintptr_t(packed)%4||
        !s.approximate||!s.lower||!s.norm||!s.count||!s.indices)return cudaErrorInvalidValue;
     bool prefetch=false;
@@ -279,7 +282,7 @@ cudaError_t launch_q8_head_screen(const float* input,const int8_t* weights,
 template<int Bits>
 cudaError_t pack_scalar_head(const int8_t* weights,uint8_t* packed,
     int rows,cudaStream_t stream) {
-    if(rows<512||rows>INT32_MAX-65536||uintptr_t(weights)%4||uintptr_t(packed)%4)
+    if(rows<512||rows>max_screen_rows||uintptr_t(weights)%4||uintptr_t(packed)%4)
         return cudaErrorInvalidValue;
     const HeadSpan spans[]={{weights,size_t(rows)*2560},{packed,size_t(rows)*320*Bits}};
     if(!head_spans_disjoint(spans,2))return cudaErrorInvalidValue;
@@ -291,9 +294,8 @@ template<int Bits>
 cudaError_t launch_scalar_head(const float* input,const int8_t* weights,
     const uint8_t* packed,const float* scales,float* output,int rows,
     Q8HeadScreenScratch s,cudaStream_t stream) {
-    // Anchor IDs occupy indices[0..511]. Leave room for threshold's final
-    // 65536-element stride even when it exits without reading another row.
-    if(rows<512||rows>INT32_MAX-65536||uintptr_t(input)%16||uintptr_t(weights)%4||
+    // Anchor IDs occupy indices[0..511].
+    if(rows<512||rows>max_screen_rows||uintptr_t(input)%16||uintptr_t(weights)%4||
        uintptr_t(packed)%4||uintptr_t(scales)%4||uintptr_t(output)%4||
        uintptr_t(s.approximate)%4||uintptr_t(s.lower)%4||uintptr_t(s.norm)%8||
        uintptr_t(s.count)%4||uintptr_t(s.indices)%4)return cudaErrorInvalidValue;
@@ -327,7 +329,7 @@ cudaError_t launch_q8_head_screen_q4(const float* input,const int8_t* weights,
     return launch_scalar_head<4>(input,weights,packed,scales,output,rows,s,stream);
 }
 cudaError_t launch_q8_head_screen_batch3(const float* input,const int8_t* weights,const uint8_t* packed,const float* scales,float* output,int rows,Q8HeadScreenBatch3Scratch s,cudaStream_t stream){
- if(!input||!weights||!packed||!scales||!output||rows<=0||rows>INT32_MAX-255||uintptr_t(input)%16||uintptr_t(weights)%4||uintptr_t(packed)%4||!s.approximate||!s.lower||!s.norm||!s.count||!s.indices)return cudaErrorInvalidValue;
+ if(!input||!weights||!packed||!scales||!output||rows<=0||rows>max_screen_rows||uintptr_t(input)%16||uintptr_t(weights)%4||uintptr_t(packed)%4||!s.approximate||!s.lower||!s.norm||!s.count||!s.indices)return cudaErrorInvalidValue;
  cudaError_t e=cudaMemsetAsync(s.count,0,3*sizeof(unsigned),stream);if(e!=cudaSuccess)return e;
  input_norm<true><<<3,256,0,stream>>>(input,s.norm,2560);
  approximate_batch3<<<(rows+7)/8,256,0,stream>>>(input,packed,scales,s.approximate,rows);
@@ -338,8 +340,7 @@ cudaError_t launch_q8_head_screen_batch3(const float* input,const int8_t* weight
  return cudaGetLastError();
 }
 cudaError_t launch_q8_head_screen_batch(const float* x,const int8_t* w,const uint8_t* packed,const float* sf,float* y,int queries,int rows,Q8HeadScreenBatchScratch s,cudaStream_t stream){
- // Leave room for threshold's final 65536-element stride before its loop exits.
- if((queries<4||queries>8)||rows<=0||rows>INT32_MAX-65536||!x||!w||!packed||!sf||!y||
+ if((queries<4||queries>8)||rows<=0||rows>max_screen_rows||!x||!w||!packed||!sf||!y||
  uintptr_t(x)%16||uintptr_t(w)%4||uintptr_t(packed)%4||uintptr_t(sf)%4||uintptr_t(y)%4||
  !s.approximate||!s.lower||!s.norm||!s.count||!s.indices||
  uintptr_t(s.approximate)%4||uintptr_t(s.lower)%4||uintptr_t(s.norm)%8||uintptr_t(s.count)%4||uintptr_t(s.indices)%4||

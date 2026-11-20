@@ -63,9 +63,10 @@ int cuda_multiprocessor_count() {
     return count;
 }
 
-bool cuda_q4_prefetch_enabled() {
-    // Only the SM121 K2560 path has full-model performance evidence.
-    // Cache by current device, not by the first GPU seen by the process.
+// The SM121 specializations below were qualified only on that architecture.
+// Cache by current device, not by the first GPU seen by the process. A failed
+// query selects the generic path and must not leak a sticky launch error.
+bool current_device_is_sm121() {
     thread_local int cached_device = -1;
     thread_local bool supported = false;
     int device = -1;
@@ -86,65 +87,14 @@ bool cuda_q4_prefetch_enabled() {
     return supported;
 }
 
-bool cuda_q4_small_batch_tiled_reduction_enabled() {
-    // Only the measured SM121 small projections select this reduction.
-    thread_local int cached_device = -1;
-    thread_local bool supported = false;
-    int device = -1;
-    if (cudaGetDevice(&device) != cudaSuccess) return false;
-    if (device != cached_device) {
-        int major = 0, minor = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
-            return false;
-        supported = major == 12 && minor == 1;
-        cached_device = device;
-    }
-    return supported;
-}
-
-bool cuda_q4_batch_vector_loads_enabled() {
-    // The aligned M5 N2560/K6144 path has full-model evidence on SM121.
-    // Cache by current device, not by the first GPU seen by the process.
-    thread_local int cached_device = -1;
-    thread_local bool supported = false;
-    int device = -1;
-    if (cudaGetDevice(&device) != cudaSuccess) {
-        cudaGetLastError();
-        return false;
-    }
-    if (device != cached_device) {
-        int major = 0, minor = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-        supported = major == 12 && minor == 1;
-        cached_device = device;
-    }
-    return supported;
-}
-
-// Full-scale lookup is qualified only for the SM121 GDN input projection.
-bool cuda_q4_full_scale_lookup_enabled() {
-    thread_local int cached_device=-1;
-    thread_local bool supported=false;
-    int device=-1;
-    if(cudaGetDevice(&device)!=cudaSuccess)return false;
-    if(device!=cached_device) {
-        int major=0,minor=0;
-        if(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device)!=cudaSuccess||
-           cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device)!=cudaSuccess)return false;
-        supported=major==12&&minor==1;cached_device=device;
-    }
-    return supported;
-}
-
-// The caller already proves SM121 and the qualified compact full-scale shape.
-bool cuda_q4_async_weights_enabled() {
-    return true;
-}
+// K2560 activation prefetch.
+bool cuda_q4_prefetch_enabled() { return current_device_is_sm121(); }
+// Tiled reduction for the small decode projections.
+bool cuda_q4_small_batch_tiled_reduction_enabled() { return current_device_is_sm121(); }
+// Aligned vector loads for the M5 N2560/K6144 path.
+bool cuda_q4_batch_vector_loads_enabled() { return current_device_is_sm121(); }
+// Full-scale lookup for the GDN input projection.
+bool cuda_q4_full_scale_lookup_enabled() { return current_device_is_sm121(); }
 
 __global__ void fp16_to_fp32_reference(const __half* source, float* destination, size_t count) {
     for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -664,20 +614,6 @@ __global__ void q4_g32_pair_rows_small_batch_cuda(const float* activation,
         if ((lane & 15) == 0 && column < columns)
             output[size_t(token) * ldc + column] = sum;
     }
-}
-
-template<int Batch>
-__global__ void q4_g32_small_batch_unequal_cuda(const float* activation,
-    const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
-    float* first_output, float* second_output, int tokens, int inner, int lda,
-    int first_columns, int first_ldc, int second_ldc) {
-    const bool first = blockIdx.x < first_columns;
-    // CTA-uniform selection shares the exact same per-row computation as the
-    // separate projections. The narrow output no longer needs its own launch.
-    q4_g32_small_batch_compute<Batch, true>(activation,
-        first ? first_weight : second_weight, first ? first_output : second_output,
-        tokens, inner, lda, first ? first_ldc : second_ldc,
-        first ? blockIdx.x : blockIdx.x - first_columns);
 }
 
 template<int Batch, class Block = Q4B8G32Block, int FixedTokens = 0, int PrefetchDistance = 0>
@@ -1682,7 +1618,7 @@ void launch_q4_g32_compact_gemv(const float* activation,
     if(columns==16480&&inner==2560&&
        reinterpret_cast<uintptr_t>(activation)%alignof(float4)==0&&
        reinterpret_cast<uintptr_t>(weight)%alignof(uint32_t)==0&&cuda_q4_full_scale_lookup_enabled()) {
-        if (reinterpret_cast<uintptr_t>(weight) % 16 == 0 && cuda_q4_async_weights_enabled()) {
+        if (reinterpret_cast<uintptr_t>(weight) % 16 == 0) {
             // Double-buffer four groups while preserving every original FP32
             // accumulator and reduction. No extra resident weight view.
             q4_g32_oct_rows_gemv_cuda<true,false,4,Q4CompactG32,0,true,false,false,false,false,false,4,false,false,true><<<
@@ -2301,33 +2237,6 @@ cudaError_t launch_q4_g32_single_barrier_gemv(const float* activation,
         return cudaErrorInvalidValue;
     q4_g32_row_parallel_gemv_cuda<256, false, 0, Q4B8G32Block, true><<<columns, 256, 0, stream>>>(
         activation, weight, output, inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_q4_g32_small_batch_unequal_projections(const float* activation,
-    const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
-    float* first_output, float* second_output, int tokens, int first_columns,
-    int second_columns, int inner, int lda, int first_ldc, int second_ldc,
-    cudaStream_t stream) {
-    if (!activation || !first_weight || !second_weight || !first_output || !second_output ||
-        tokens < 2 || tokens > 8 || first_columns <= 0 || first_columns > 4096 ||
-        second_columns <= 0 || second_columns > 4096 || inner < 2048 ||
-        inner > INT32_MAX - 2048 || inner % 32 || lda < inner ||
-        first_ldc < first_columns || second_ldc < second_columns ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float2)) return cudaErrorInvalidValue;
-    const int blocks = first_columns + second_columns;
-    if (tokens == 2)
-        q4_g32_small_batch_unequal_cuda<2><<<blocks,256,0,stream>>>(activation,first_weight,second_weight,
-            first_output,second_output,tokens,inner,lda,first_columns,first_ldc,second_ldc);
-    else if (tokens == 3)
-        q4_g32_small_batch_unequal_cuda<3><<<blocks,256,0,stream>>>(activation,first_weight,second_weight,
-            first_output,second_output,tokens,inner,lda,first_columns,first_ldc,second_ldc);
-    else if (tokens == 4)
-        q4_g32_small_batch_unequal_cuda<4><<<blocks,256,0,stream>>>(activation,first_weight,second_weight,
-            first_output,second_output,tokens,inner,lda,first_columns,first_ldc,second_ldc);
-    else
-        q4_g32_small_batch_unequal_cuda<8><<<blocks,256,0,stream>>>(activation,first_weight,second_weight,
-            first_output,second_output,tokens,inner,lda,first_columns,first_ldc,second_ldc);
     return cudaGetLastError();
 }
 

@@ -172,12 +172,6 @@ cudaError_t launch_q4_g32_shared_activation(const float* activation,
     const Q4B8G32Block* gate_weight, const Q4B8G32Block* up_weight,
     float* output, int columns, int inner, cudaStream_t stream = nullptr);
 // Diagnostic unequal projections sharing an input; independent canonical weights.
-// Exact small-batch form; both outputs use their own row stride.
-cudaError_t launch_q4_g32_small_batch_unequal_projections(const float* activation,
-    const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
-    float* first_output, float* second_output, int tokens, int first_columns,
-    int second_columns, int inner, int lda, int first_ldc, int second_ldc,
-    cudaStream_t stream = nullptr);
 cudaError_t launch_q4_g32_unequal_projections(const float* activation,
     const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
     float* first_output, float* second_output, int first_columns, int second_columns,

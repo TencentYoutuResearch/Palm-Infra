@@ -759,7 +759,6 @@ __global__ void gdn_128_cuda(
     }
 }
 
-template<bool StorePrefixes = false>
 bool configure_gdn_shared_state() {
     constexpr size_t state_cache_bytes =
         gdn_head_dim * gdn_head_dim * sizeof(float);
@@ -774,7 +773,7 @@ bool configure_gdn_shared_state() {
               device)
         : device_status;
     const cudaError_t function_status = limit_status == cudaSuccess
-        ? cudaFuncGetAttributes(&attributes, gdn_128_cuda<true,StorePrefixes>)
+        ? cudaFuncGetAttributes(&attributes, gdn_128_cuda<true>)
         : limit_status;
     if (function_status != cudaSuccess) {
         cudaGetLastError();
@@ -785,7 +784,7 @@ bool configure_gdn_shared_state() {
         return false;
 
     const cudaError_t configure_status = cudaFuncSetAttribute(
-        gdn_128_cuda<true,StorePrefixes>,
+        gdn_128_cuda<true>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(state_cache_bytes));
     if (configure_status != cudaSuccess)
@@ -1008,7 +1007,7 @@ bool launch_gdn(
     }
     constexpr size_t state_cache_bytes =
         gdn_head_dim * gdn_head_dim * sizeof(float);
-    static const bool shared_state_configured = configure_gdn_shared_state<>();
+    static const bool shared_state_configured = configure_gdn_shared_state();
     // Single-token decode keeps the 128-value state in registers.
     if (sequence_length == 1) {
         gdn_128_cuda<true,false,true><<<num_value_heads,gdn_head_dim>>>(
@@ -1044,25 +1043,14 @@ bool launch_gdn_prefixes(
         num_heads<=0||num_value_heads<=0||num_value_heads%num_heads||
         sequence_length<1||sequence_length>8||real_tokens<1||real_tokens>sequence_length)
         return false;
-    {
-        gdn_128_cuda<true,true,true><<<num_value_heads,128>>>(
-            qkv,a,b,z,a_log,dt_bias,norm_weight,state,output,num_heads,num_value_heads,
-            sequence_length,real_tokens,(flags&1)!=0,rms_epsilon,l2_epsilon,scale,
-            a_row_stride,b_row_stride,z_row_stride,(flags&2)!=0,prefixes);
-        return cudaGetLastError()==cudaSuccess;
-    }
-    static const bool cached=configure_gdn_shared_state<true>();
-    if(cached)
-        gdn_128_cuda<true,true><<<num_value_heads,128,128*128*sizeof(float)>>>(
-            qkv,a,b,z,a_log,dt_bias,norm_weight,state,output,num_heads,num_value_heads,
-            sequence_length,real_tokens,(flags&1)!=0,rms_epsilon,l2_epsilon,scale,
-            a_row_stride,b_row_stride,z_row_stride,(flags&2)!=0,prefixes);
-    else
-        gdn_128_cuda<false,true><<<num_value_heads,128>>>(
-            qkv,a,b,z,a_log,dt_bias,norm_weight,state,output,num_heads,num_value_heads,
-            sequence_length,real_tokens,(flags&1)!=0,rms_epsilon,l2_epsilon,scale,
-            a_row_stride,b_row_stride,z_row_stride,(flags&2)!=0,prefixes);
-    return cudaGetLastError()==cudaSuccess;
+    // Prefix snapshots keep each value column's state in registers; the
+    // verification widths (<= 8 tokens) never need the shared-state variant.
+    gdn_128_cuda<true, true, true><<<num_value_heads, gdn_head_dim>>>(
+        qkv, a, b, z, a_log, dt_bias, norm_weight, state, output, num_heads,
+        num_value_heads, sequence_length, real_tokens, (flags & 1) != 0,
+        rms_epsilon, l2_epsilon, scale, a_row_stride, b_row_stride,
+        z_row_stride, (flags & 2) != 0, prefixes);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 }  // namespace mollm_cuda

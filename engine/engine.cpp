@@ -285,11 +285,11 @@ bool LLMEngine::set_cache_lengths(
 // ---------------------------------------------------------------------------
 
 void LLMEngine::reset() {
+    // A failed workspace release must not leave KV lengths or recurrent state
+    // from the previous request behind; report it and reset the rest anyway.
     if (exec_ctx_prefill_.backend &&
-        !exec_ctx_prefill_.backend->release_verification_workspaces(graph_prefill_, exec_ctx_prefill_)) {
-        std::fprintf(stderr, "verification workspace release failed\n");
-        return;
-    }
+        !exec_ctx_prefill_.backend->release_verification_workspaces(graph_prefill_, exec_ctx_prefill_))
+        std::fprintf(stderr, "Engine: failed to release verification workspaces\n");
 
     release_graph_temporaries(graph_decode_, exec_ctx_decode_.backend);
     invalidate_workspace_key(exec_ctx_decode_);
@@ -1035,7 +1035,8 @@ void LLMEngine::prepare_accelerator_prefill_weights() {
 void LLMEngine::release_prefill_buffers() {
     if (exec_ctx_prefill_.backend &&
         !exec_ctx_prefill_.backend->release_verification_workspaces(graph_prefill_, exec_ctx_prefill_)) {
-        std::fprintf(stderr, "verification workspace release failed\n");
+        // Cached verification graphs may still reference these buffers.
+        std::fprintf(stderr, "Engine: failed to release verification workspaces; keeping prefill buffers\n");
         return;
     }
 

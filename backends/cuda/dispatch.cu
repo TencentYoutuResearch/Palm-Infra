@@ -534,9 +534,8 @@ void CudaBackend::dispatch(const GraphNode& node,
         if (node.op_type != OpType::MATMUL || inputs.size() != 2 ||
             inputs[0] != hc_pair->input || !inputs[1] || !output ||
             !fp32_contiguous(*inputs[0]) || !fp32_contiguous(*output) ||
-            inputs[0]->shape[0] != 10240 || inputs[0]->shape[1] < 1 ||
-            inputs[0]->shape[1] > Impl::hc_projection_cached_tokens ||
-            (inputs[0]->shape[1] > 1 && (!impl_->hc_small_batch_pair_enabled || impl_->segment_enabled)) ||
+            inputs[0]->shape[0] != 10240 ||
+            inputs[0]->shape[1] != Impl::hc_projection_cached_tokens ||
             inputs[0]->shape[2] != 1 || inputs[0]->shape[3] != 1 ||
             output->shape[0] != (first ? 320 : 4) || output->shape[1] != inputs[0]->shape[1] ||
             output->shape[2] != 1 || output->shape[3] != 1 ||
@@ -593,25 +592,17 @@ void CudaBackend::dispatch(const GraphNode& node,
         if (hc_tag == 2) {
             result = cudaMemcpyAsync(device_pointer<float>(*output), hc_pair->cache,
                 size_t(rows) * 4 * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        } else if (rows == 1) {
-            if(impl_->prefer_q4_hc_adjacent&&
-               reinterpret_cast<uintptr_t>(hc_pair->computed_input)%alignof(float4)==0) {
-                result=mollm_cuda::launch_q4_g32_hc_adjacent_projections(
-                    hc_pair->computed_input,static_cast<const Q4B8G32Block*>(hc_first_weight->data),
-                    static_cast<const Q4B8G32Block*>(hc_second_weight->data),
-                    device_pointer<float>(*output),hc_pair->cache,cudaStreamPerThread);
-            } else {
+        } else if (impl_->prefer_q4_hc_adjacent &&
+                   reinterpret_cast<uintptr_t>(hc_pair->computed_input) % alignof(float4) == 0) {
+            result = mollm_cuda::launch_q4_g32_hc_adjacent_projections(
+                hc_pair->computed_input, static_cast<const Q4B8G32Block*>(hc_first_weight->data),
+                static_cast<const Q4B8G32Block*>(hc_second_weight->data),
+                device_pointer<float>(*output), hc_pair->cache, cudaStreamPerThread);
+        } else {
             result = mollm_cuda::launch_q4_g32_unequal_projections(
                 hc_pair->computed_input, static_cast<const Q4B8G32Block*>(hc_first_weight->data),
                 static_cast<const Q4B8G32Block*>(hc_second_weight->data),
                 device_pointer<float>(*output), hc_pair->cache, 320, 4, 10240, cudaStreamPerThread);
-            }
-        } else {
-            result = mollm_cuda::launch_q4_g32_small_batch_unequal_projections(
-                hc_pair->computed_input, static_cast<const Q4B8G32Block*>(hc_first_weight->data),
-                static_cast<const Q4B8G32Block*>(hc_second_weight->data),
-                device_pointer<float>(*output), hc_pair->cache, rows, 320, 4, 10240, 10240, 320, 4,
-                cudaStreamPerThread);
         }
         if (!mollm_cuda::report_cuda(result, "HC paired projection")) impl_->failed = true;
         else if (hc_tag == 1) ++impl_->hc_projection_enqueues;

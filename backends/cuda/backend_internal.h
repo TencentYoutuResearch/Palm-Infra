@@ -356,10 +356,10 @@ struct CudaBackend::Impl {
     // Enabled for the qualified policy; disabled for differential reference
     // backends that execute every node separately.
     bool qualified_fusions = true;
-    // Qualified HC prefill/decode policy: pair the N320+N4 projections.
+    // Qualified HC decode policy: pair the N320+N4 projections.
     bool hc_projection_enabled = true;
-    static constexpr int hc_projection_cached_tokens = 8;
-    bool hc_small_batch_pair_enabled = false;
+    // Decode only: each pair caches the four-column N4 output for one token.
+    static constexpr int hc_projection_cached_tokens = 1;
     // Indexer top-k is sensitive to changes in GEMM accumulation order.
     std::unordered_map<const GraphNode*, const Graph*> qsa_projection_graphs;
     std::unordered_map<const Graph*, HcProjectionPlan> hc_projection_plans;
