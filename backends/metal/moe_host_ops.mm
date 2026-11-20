@@ -541,7 +541,7 @@ bool MetalMoeOps::dispatch_host(
     const float* selected = static_cast<const float*>(
         MetalBufferPool::contents(selected_handle));
     float* destination = output->ptr<float>();
-    kernel_moe_accumulate_selected(selected, shared_values, routes.data(),
+    kernel_moe_accumulate_selected(selected, shared_values.data(), routes.data(),
                                    top_k, hidden_size, destination);
     release_buffers();
     success = true;
