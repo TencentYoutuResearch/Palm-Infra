@@ -1,5 +1,7 @@
 #include "kernels/cuda/draft_compact_head.h"
 
+#include "cuda_test_support.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -9,117 +11,131 @@
 #include <vector>
 
 namespace {
+
 using namespace mollm_cuda;
-constexpr int rows = 248320, inner = 2560, candidates = 1024;
-void require(bool value, const char* message) {
-    if (!value) { std::fprintf(stderr, "draft energy screen: %s\n", message); std::exit(1); }
-}
-void check(cudaError_t status) {
-    if (status != cudaSuccess) {
-        std::fprintf(stderr, "draft energy screen CUDA: %s\n", cudaGetErrorString(status));
-        std::exit(1);
-    }
-}
+using mollm_test::check;
+using mollm_test::GuardedBuffer;
+using mollm_test::require;
+
+constexpr int rows = 248320;
+constexpr int inner = 2560;
+constexpr int candidates = 1024;
+
 uint32_t ordered_key(float value) {
-    uint32_t bits; std::memcpy(&bits, &value, sizeof(bits));
-    if (!(bits & 0x7fffffffU)) bits = 0; // Stable +0/-0 equivalence in CUB.
+    uint32_t bits = mollm_test::to_bits(value);
+    if (!(bits & 0x7fffffffU)) bits = 0;  // Stable +0/-0 equivalence in CUB.
     return bits & 0x80000000U ? ~bits : bits ^ 0x80000000U;
 }
-struct Buffer {
-    unsigned char *allocation = nullptr, *data = nullptr;
-    size_t bytes;
-    explicit Buffer(size_t size) : bytes(size) {
-        check(cudaMalloc(&allocation, size + 512)); data = allocation + 256;
-        check(cudaMemset(allocation, 0x39, size + 512));
-    }
-    ~Buffer() { cudaFree(allocation); }
-    template<class T> T* as() { return reinterpret_cast<T*>(data); }
-    void put(const void* source) { check(cudaMemcpy(data, source, bytes, cudaMemcpyHostToDevice)); }
-    template<class T> std::vector<T> get() {
-        std::vector<T> result(bytes / sizeof(T));
-        check(cudaMemcpy(result.data(), data, bytes, cudaMemcpyDeviceToHost)); return result;
-    }
-    void guards() {
-        unsigned char first[256], last[256];
-        check(cudaMemcpy(first, allocation, 256, cudaMemcpyDeviceToHost));
-        check(cudaMemcpy(last, data + bytes, 256, cudaMemcpyDeviceToHost));
-        for (int i = 0; i < 256; ++i) require(first[i] == 0x39 && last[i] == 0x39, "buffer guards");
-    }
-};
+
 void test_screen(int group_count) {
     std::vector<Q4CompactG32> weights(size_t(rows / 8) * (inner / 32));
-    for (size_t i = 0; i < weights.size(); ++i) for (int row = 0; row < 8; ++row) {
-        auto& block = weights[i];
-        block.scales[row] = uint16_t(0x3d00 + (i * 13 + row * 7) % 512);
-        uint32_t value = uint32_t(i * 1664525 + row * 1013904223u);
-        for (int j = 0; j < 16; ++j) { value = value * 1664525 + 1013904223; block.q[row][j] = uint8_t(value >> 24); }
+    for (size_t i = 0; i < weights.size(); ++i) {
+        for (int row = 0; row < 8; ++row) {
+            auto& block = weights[i];
+            block.scales[row] = uint16_t(0x3d00 + (i * 13 + row * 7) % 512);
+            uint32_t value = uint32_t(i * 1664525 + row * 1013904223u);
+            for (int j = 0; j < 16; ++j) {
+                value = value * 1664525 + 1013904223;
+                block.q[row][j] = uint8_t(value >> 24);
+            }
+        }
     }
-    Buffer weight(weights.size() * sizeof(weights[0])), input(inner * 4), output(rows * 4),
-        full(rows * 4), coarse(rows * 4), sorted(rows * 4), ids(rows * 4), selected(rows * 4), groups(32 * 4);
-    weight.put(weights.data());
+    GuardedBuffer weight(weights.size() * sizeof(weights[0]));
+    GuardedBuffer input(inner * sizeof(float));
+    GuardedBuffer output(rows * sizeof(float));
+    GuardedBuffer full(rows * sizeof(float));
+    GuardedBuffer coarse(rows * sizeof(float));
+    GuardedBuffer sorted(rows * sizeof(float));
+    GuardedBuffer ids(rows * sizeof(int));
+    GuardedBuffer selected(rows * sizeof(int));
+    GuardedBuffer groups(32 * sizeof(int));
+    weight.upload(weights.data());
     DraftHeadScreenScratch scratch{coarse.as<float>(), sorted.as<float>(), ids.as<int>(),
-        selected.as<int>(), groups.as<int>(), nullptr, 0};
+                                   selected.as<int>(), groups.as<int>(), nullptr, 0};
     size_t bytes = 0;
-    check(draft_head_screen_temp_bytes(scratch, bytes)); require(bytes > 0, "temporary query");
-    Buffer temporary(bytes); scratch.sort_temp = temporary.data; scratch.sort_bytes = bytes;
-    cudaStream_t stream; check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    check(initialize_draft_head_screen(scratch, stream)); check(cudaStreamSynchronize(stream));
-    auto original_ids = ids.get<int>();
+    check(draft_head_screen_temp_bytes(scratch, bytes));
+    require(bytes > 0, "temporary query");
+    GuardedBuffer temporary(bytes);
+    scratch.sort_temp = temporary.data();
+    scratch.sort_bytes = bytes;
+    cudaStream_t stream;
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    check(initialize_draft_head_screen(scratch, stream));
+    check(cudaStreamSynchronize(stream));
+    const auto original_ids = ids.download<int>();
     for (int i = 0; i < rows; ++i) require(original_ids[i] == i, "initialized stable IDs");
 
-    std::vector<float> values(inner, 0.f); input.put(values.data());
-    cudaGraph_t graph; cudaGraphExec_t executable;
+    const auto* w = weight.as<Q4CompactG32>();
+    std::vector<float> values(inner, 0.f);
+    input.upload(values.data());
+    cudaGraph_t graph;
+    cudaGraphExec_t executable;
     check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    check(launch_draft_head_screen(input.as<float>(), weight.as<Q4CompactG32>(), output.as<float>(),
-        rows, inner, scratch, stream, group_count));
+    check(launch_draft_head_screen(input.as<float>(), w, output.as<float>(), rows, inner, scratch,
+                                   stream, group_count));
     check(cudaStreamEndCapture(stream, &graph));
     check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
     for (int fixture = 0; fixture < 10; ++fixture) {
         for (int i = 0; i < inner; ++i) {
-            values[i] = fixture == 0 ? 0.f : fixture == 1 ? (i == 73 * 32 + 7 ? -2.f : 0.f) :
-                float((i * 29 + fixture * 7) % 251 - 125) * (fixture == 3 ? 1e-40f : .013f);
+            if (fixture == 0)
+                values[i] = 0.f;
+            else if (fixture == 1)
+                values[i] = i == 73 * 32 + 7 ? -2.f : 0.f;
+            else
+                values[i] = float((i * 29 + fixture * 7) % 251 - 125) * (fixture == 3 ? 1e-40f : .013f);
         }
         if (fixture == 9) std::fill(values.begin(), values.end(), 1.f);
-        if (fixture == 5) {
-            const uint32_t bits = 0xffc00001U; float negative_nan;
-            std::memcpy(&negative_nan, &bits, sizeof(bits));
-            std::fill(values.begin(), values.end(), negative_nan);
-        }
+        if (fixture == 5) std::fill(values.begin(), values.end(), mollm_test::from_bits(0xffc00001U));
         if (fixture == 6) values[73 * 32 + 7] = INFINITY;
         if (fixture == 7) values[17] = -INFINITY;
-        if (fixture == 8) std::fill(values.begin(), values.end(), 1e30f); // Energy overflows, logits need not.
+        // Energy overflows, logits need not.
+        if (fixture == 8) std::fill(values.begin(), values.end(), 1e30f);
         if (fixture == 4) {
             // Replay must observe changed weight contents without repacking.
-            weights[0].scales[0] = 0x3f00; weights[0].q[0][0] ^= 0x5a;
-            check(cudaMemcpy(weight.data, weights.data(), sizeof(weights[0]), cudaMemcpyHostToDevice));
+            weights[0].scales[0] = 0x3f00;
+            weights[0].q[0][0] ^= 0x5a;
+            check(cudaMemcpy(weight.data(), weights.data(), sizeof(weights[0]), cudaMemcpyHostToDevice));
         }
-        input.put(values.data());
-        launch_q4_g32_compact_gemv(input.as<float>(), weight.as<Q4CompactG32>(), full.as<float>(), rows, inner, stream);
-        check(cudaGetLastError()); check(cudaStreamSynchronize(stream));
-        const auto reference = full.get<float>();
-        check(launch_draft_head_screen(input.as<float>(), weight.as<Q4CompactG32>(), output.as<float>(),
-            rows, inner, scratch, stream, group_count));
+        input.upload(values.data());
+        launch_q4_g32_compact_gemv(input.as<float>(), w, full.as<float>(), rows, inner, stream);
+        check(cudaGetLastError());
         check(cudaStreamSynchronize(stream));
-        const auto eager = output.get<float>();
-        check(cudaGraphLaunch(executable, stream)); check(cudaStreamSynchronize(stream));
-        const auto actual = output.get<float>();
-        require(!std::memcmp(eager.data(), actual.data(), rows * 4), "mutable graph equals eager");
+        const auto reference = full.download<float>();
+        check(launch_draft_head_screen(input.as<float>(), w, output.as<float>(), rows, inner, scratch,
+                                       stream, group_count));
+        check(cudaStreamSynchronize(stream));
+        const auto eager = output.download<float>();
+        check(cudaGraphLaunch(executable, stream));
+        check(cudaStreamSynchronize(stream));
+        const auto actual = output.download<float>();
+        require(mollm_test::same_bits(eager, actual), "mutable graph equals eager");
 
-        float energies[80]; std::vector<int> expected_groups(80); std::iota(expected_groups.begin(), expected_groups.end(), 0);
+        float energies[80];
+        std::vector<int> expected_groups(80);
+        std::iota(expected_groups.begin(), expected_groups.end(), 0);
         for (int group = 0; group < 80; ++group) {
             float sum = 0;
-            for (int j = 0; j < 32; ++j) { volatile float product = values[group * 32 + j] * values[group * 32 + j]; sum += product; }
+            for (int j = 0; j < 32; ++j) {
+                volatile float product = values[group * 32 + j] * values[group * 32 + j];
+                sum += product;
+            }
             energies[group] = std::isnan(sum) ? INFINITY : sum;
         }
-        std::stable_sort(expected_groups.begin(), expected_groups.end(), [&](int a, int b) { return energies[a] > energies[b]; });
-        const auto actual_groups = groups.get<int>();
-        require(std::equal(actual_groups.begin(), actual_groups.end(), expected_groups.begin()), "CPU group selection");
-        const auto scores = coarse.get<float>(); const auto selected_ids = selected.get<int>();
-        std::vector<int> expected(rows); std::iota(expected.begin(), expected.end(), 0);
-        std::partial_sort(expected.begin(), expected.begin() + candidates, expected.end(), [&](int a, int b) {
-            const auto left = ordered_key(scores[a]), right = ordered_key(scores[b]);
-            return left > right || (left == right && a < b);
-        });
+        std::stable_sort(expected_groups.begin(), expected_groups.end(),
+                         [&](int a, int b) { return energies[a] > energies[b]; });
+        const auto actual_groups = groups.download<int>();
+        require(std::equal(actual_groups.begin(), actual_groups.end(), expected_groups.begin()),
+                "CPU group selection");
+        const auto scores = coarse.download<float>();
+        const auto selected_ids = selected.download<int>();
+        std::vector<int> expected(rows);
+        std::iota(expected.begin(), expected.end(), 0);
+        std::partial_sort(expected.begin(), expected.begin() + candidates, expected.end(),
+                          [&](int a, int b) {
+                              const auto left = ordered_key(scores[a]);
+                              const auto right = ordered_key(scores[b]);
+                              return left > right || (left == right && a < b);
+                          });
         std::vector<bool> included(rows, false);
         for (int j = 0; j < candidates; ++j) {
             require(expected[j] == selected_ids[j], "CPU vocabulary selection and ties");
@@ -127,58 +143,83 @@ void test_screen(int group_count) {
             require(row >= 0 && row < rows && !included[row], "candidate bounds and uniqueness");
             included[row] = true;
             require((std::isnan(actual[row]) && std::isnan(reference[row])) ||
-                !std::memcmp(&actual[row], &reference[row], 4), "selected full-K native bits / NaN semantics");
+                        mollm_test::to_bits(actual[row]) == mollm_test::to_bits(reference[row]),
+                    "selected full-K native bits / NaN semantics");
         }
-        for (int row = 0; row < rows; ++row) if (!included[row]) require(actual[row] == -INFINITY, "non-candidate sentinel");
+        for (int row = 0; row < rows; ++row) {
+            if (!included[row]) require(actual[row] == -INFINITY, "non-candidate sentinel");
+        }
         if (fixture == 9) {
             // Equal energies select ascending K groups. A full-K projection
             // with the unselected input groups zeroed independently checks
             // that the requested group budget is used by the coarse pass.
             auto masked = values;
             std::fill(masked.begin() + group_count * 32, masked.end(), 0.f);
-            input.put(masked.data());
-            launch_q4_g32_compact_gemv(input.as<float>(), weight.as<Q4CompactG32>(),
-                full.as<float>(), rows, inner, stream);
-            check(cudaGetLastError()); check(cudaStreamSynchronize(stream));
-            const auto coarse_reference = full.get<float>();
-            require(!std::memcmp(scores.data(), coarse_reference.data(), rows * 4),
-                "coarse group budget matches masked full projection");
-            input.put(values.data());
+            input.upload(masked.data());
+            launch_q4_g32_compact_gemv(input.as<float>(), w, full.as<float>(), rows, inner, stream);
+            check(cudaGetLastError());
+            check(cudaStreamSynchronize(stream));
+            const auto coarse_reference = full.download<float>();
+            require(mollm_test::same_bits(scores, coarse_reference),
+                    "coarse group budget matches masked full projection");
+            input.upload(values.data());
         }
-        require(ids.get<int>() == original_ids, "stable IDs immutable");
-        const auto copied_input = input.get<float>();
-        require(!std::memcmp(copied_input.data(), values.data(), input.bytes), "input immutable");
-        for (auto* buffer : {&weight, &input, &output, &full, &coarse, &sorted, &ids, &selected, &groups, &temporary}) buffer->guards();
+        require(ids.download<int>() == original_ids, "stable IDs immutable");
+        require(mollm_test::same_bits(input.download<float>(), values), "input immutable");
+        for (const auto* buffer :
+             {&weight, &input, &output, &full, &coarse, &sorted, &ids, &selected, &groups, &temporary})
+            buffer->check_guards();
     }
-    const auto copied = weight.get<Q4CompactG32>();
-    require(!std::memcmp(copied.data(), weights.data(), weight.bytes), "weights immutable");
-    check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph));
+    require(mollm_test::same_bits(weight.download<Q4CompactG32>(), weights), "weights immutable");
+    check(cudaGraphExecDestroy(executable));
+    check(cudaGraphDestroy(graph));
 
     // Rejected geometry, aliasing and capacity must not enqueue partial work.
+    const float* x = input.as<float>();
+    float* y = output.as<float>();
     check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    auto invalid = scratch; invalid.sort_bytes = bytes - 1;
-    require(launch_draft_head_screen(input.as<float>(), weight.as<Q4CompactG32>(), output.as<float>(), rows, inner, invalid, stream) == cudaErrorInvalidValue, "short temporary");
-    invalid = scratch; invalid.sorted = invalid.coarse;
+    auto invalid = scratch;
+    invalid.sort_bytes = bytes - 1;
+    require(launch_draft_head_screen(x, w, y, rows, inner, invalid, stream) == cudaErrorInvalidValue,
+            "short temporary");
+    invalid = scratch;
+    invalid.sorted = invalid.coarse;
     require(initialize_draft_head_screen(invalid, stream) == cudaErrorInvalidValue, "aliased scratch");
-    invalid = scratch; invalid.sort_temp = coarse.data;
-    require(launch_draft_head_screen(input.as<float>(), weight.as<Q4CompactG32>(), output.as<float>(), rows, inner, invalid, stream) == cudaErrorInvalidValue, "aliased temporary");
-    require(launch_draft_head_screen(input.as<float>(), weight.as<Q4CompactG32>(), coarse.as<float>(), rows, inner, scratch, stream) == cudaErrorInvalidValue, "aliased output");
-    require(launch_draft_head_screen(nullptr, weight.as<Q4CompactG32>(), output.as<float>(), rows, inner, scratch, stream) == cudaErrorInvalidValue, "null input");
-    require(launch_draft_head_screen(input.as<float>() + 1, weight.as<Q4CompactG32>(), output.as<float>(), rows, inner, scratch, stream) == cudaErrorInvalidValue, "unaligned input");
-    require(launch_draft_head_screen(input.as<float>(), weight.as<Q4CompactG32>(), output.as<float>(), rows - 1, inner, scratch, stream) == cudaErrorInvalidValue, "unsupported rows");
-    require(launch_draft_head_screen(input.as<float>(), weight.as<Q4CompactG32>(), output.as<float>(), rows, inner - 32, scratch, stream) == cudaErrorInvalidValue, "unsupported inner");
-    for (int unsupported : {0, 15, 17, 20, 25, 80})
-        require(launch_draft_head_screen(input.as<float>(), weight.as<Q4CompactG32>(),
-            output.as<float>(), rows, inner, scratch, stream, unsupported) == cudaErrorInvalidValue,
-            "unsupported group budget");
-    check(cudaStreamEndCapture(stream, &graph)); size_t nodes = 1;
-    check(cudaGraphGetNodes(graph, nullptr, &nodes)); require(nodes == 0, "invalid calls submit no kernels");
-    check(cudaGraphDestroy(graph)); check(cudaStreamDestroy(stream));
-    std::printf("draft energy screen groups=%d: native bits, CPU selections, mutable graphs, guards, immutable inputs and rejection PASS\n", group_count);
+    invalid = scratch;
+    invalid.sort_temp = coarse.data();
+    require(launch_draft_head_screen(x, w, y, rows, inner, invalid, stream) == cudaErrorInvalidValue,
+            "aliased temporary");
+    require(launch_draft_head_screen(x, w, coarse.as<float>(), rows, inner, scratch, stream) ==
+                cudaErrorInvalidValue,
+            "aliased output");
+    require(launch_draft_head_screen(nullptr, w, y, rows, inner, scratch, stream) == cudaErrorInvalidValue,
+            "null input");
+    require(launch_draft_head_screen(x + 1, w, y, rows, inner, scratch, stream) == cudaErrorInvalidValue,
+            "unaligned input");
+    require(launch_draft_head_screen(x, w, y, rows - 1, inner, scratch, stream) == cudaErrorInvalidValue,
+            "unsupported rows");
+    require(launch_draft_head_screen(x, w, y, rows, inner - 32, scratch, stream) == cudaErrorInvalidValue,
+            "unsupported inner");
+    for (int unsupported : {0, 15, 17, 20, 25, 80}) {
+        require(launch_draft_head_screen(x, w, y, rows, inner, scratch, stream, unsupported) ==
+                    cudaErrorInvalidValue,
+                "unsupported group budget");
+    }
+    check(cudaStreamEndCapture(stream, &graph));
+    size_t nodes = 1;
+    check(cudaGraphGetNodes(graph, nullptr, &nodes));
+    require(nodes == 0, "invalid calls submit no kernels");
+    check(cudaGraphDestroy(graph));
+    check(cudaStreamDestroy(stream));
+    std::printf("draft energy screen groups=%d: native bits, CPU selections, mutable graphs, guards, "
+                "immutable inputs and rejection PASS\n",
+                group_count);
 }
+
 }  // namespace
+
 int main() {
-    int devices = 0; if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
+    if (!mollm_test::cuda_device_available()) return mollm_test::skip_status;
     test_screen(32);
     test_screen(24);
     test_screen(16);

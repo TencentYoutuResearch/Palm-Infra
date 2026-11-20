@@ -1,401 +1,460 @@
+// Load-time gate views must decode exactly like the canonical payload.
+//
+// launch_repack_nvfp4_gate_codes turns canonical ROW/PAIR gate codes into the
+// K64-major code view and launch_repack_nvfp4_gate_scales turns row-major block
+// scales into the K-major scale view. Every consumer of those views must be
+// byte-exact with the canonical payload: plain and pipelined SIMT, the subgroup
+// gate entry and the MMA path (1/2/8 split-K parts, pre-quantized inputs).
+// Each run checks both views: the code view against the canonical layout, and
+// the scale view against row-major scales with both arms on the code view.
+// The shared gate launcher fixture lives in test_cuda_nvfp4_gate_projections.cpp.
+//
+// Usage: test_cuda_nvfp4_gate_code_decode [--routes N[,N...]] [--timing]
+//   N is 10..60 in steps of 10 (default 10). --timing also prints pipelined
+//   SIMT timings for the canonical and view arms (developer measurement).
+
 #include "kernels/cuda/moe.h"
-#include <cuda_runtime.h>
-#include <algorithm>
+
+#include "cuda_test_support.h"
+
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-#include <cstdint>
 
 namespace {
-void check(cudaError_t status) {
-    if (status != cudaSuccess) {
-        std::fprintf(stderr, "%s\n", cudaGetErrorString(status)); std::exit(1);
+
+using Job = mollm_cuda::Nvfp4Projection;
+using mollm_test::check;
+using mollm_test::require;
+using mollm_test::same_bits;
+
+constexpr int rows = 1280;
+constexpr int inner = 2560;
+// Two graphs over disjoint expert sets; each replay rotates the routed experts.
+constexpr int sets = 2;
+constexpr int variants = 8;
+constexpr int split_row = 640;
+constexpr size_t code_bytes = size_t(rows) * inner / 2;
+constexpr size_t scale_bytes = size_t(rows) * inner / 16;
+// One canonical expert payload: codes, row-major block scales, FP32 row scales.
+constexpr size_t expert_stride = code_bytes + scale_bytes + rows * sizeof(float);
+
+// Typed, stream-ordered view of a GuardedBuffer. The test stream is
+// non-blocking, so every copy and fill is issued on it explicitly.
+template<class T> class DeviceArray {
+public:
+    explicit DeviceArray(size_t count) : buffer_(count * sizeof(T)), count_(count) {}
+
+    T* data() { return buffer_.as<T>(); }
+    const T* data() const { return buffer_.as<T>(); }
+    size_t size() const { return count_; }
+
+    void upload(const std::vector<T>& host, cudaStream_t stream) {
+        require(host.size() == count_, "upload size mismatch");
+        check(cudaMemcpyAsync(data(), host.data(), count_ * sizeof(T), cudaMemcpyHostToDevice, stream),
+              "upload");
+        check(cudaStreamSynchronize(stream), "upload");
     }
-}
-template<class T> struct Buffer {
-    T* p = nullptr;
-    explicit Buffer(size_t n) { check(cudaMalloc(&p, n * sizeof(T))); }
-    ~Buffer() { cudaFree(p); }
+    std::vector<T> download(cudaStream_t stream) const {
+        std::vector<T> host(count_);
+        check(cudaMemcpyAsync(host.data(), data(), count_ * sizeof(T), cudaMemcpyDeviceToHost, stream),
+              "download");
+        check(cudaStreamSynchronize(stream), "download");
+        return host;
+    }
+    // Fills the payload with the guard pattern so unwritten outputs differ.
+    void poison(cudaStream_t stream) {
+        check(cudaMemsetAsync(data(), mollm_test::GuardedBuffer::guard_pattern, count_ * sizeof(T), stream),
+              "poison");
+    }
+    void check_guards() const { buffer_.check_guards(); }
+
+private:
+    mollm_test::GuardedBuffer buffer_;
+    size_t count_;
 };
-template<class T> void copy(T* ptr, const std::vector<T>& data) {
-    check(cudaMemcpy(ptr, data.data(), data.size() * sizeof(T), cudaMemcpyHostToDevice));
-}
-template<class T> std::vector<T> read(const T* ptr, size_t count) {
-    std::vector<T> result(count);
-    check(cudaMemcpy(result.data(), ptr, count * sizeof(T), cudaMemcpyDeviceToHost)); return result;
-}
-void equal(const std::vector<float>& a, const std::vector<float>& b) {
-    if (a.size() != b.size() || std::memcmp(a.data(), b.data(), a.size()*sizeof(float))) {
-        std::fprintf(stderr, "decode byte mismatch\n"); std::exit(2);
+
+enum class Mode { simt, pipelined, mma1, mma2, mma8, mma_prepared, subgroup };
+
+const Mode modes[] = {Mode::simt, Mode::pipelined, Mode::mma1, Mode::mma2,
+                      Mode::mma8, Mode::mma_prepared, Mode::subgroup};
+
+const char* mode_name(Mode mode) {
+    switch (mode) {
+    case Mode::simt: return "simt";
+    case Mode::pipelined: return "pipelined";
+    case Mode::mma1: return "mma1";
+    case Mode::mma2: return "mma2";
+    case Mode::mma8: return "mma8";
+    case Mode::mma_prepared: return "mma_prepared";
+    case Mode::subgroup: return "subgroup";
     }
-}
-// Keep the general 32-lane reduction as an independent reference for the
-// subgroup's alignment dispatch and peeled final packet loads.
-void check_subgroup_packets(int routes, cudaStream_t stream, bool paired = false) {
-    constexpr int rows = 1280, inner = 2560, experts = 3;
-    constexpr size_t code_bytes = size_t(rows) * inner / 2;
-    constexpr size_t scale_bytes = size_t(rows) * inner / 16;
-    constexpr size_t code_stride = code_bytes + 16, scale_stride = scale_bytes + 16;
-    const size_t output_count = size_t(routes) * rows + 32;
-    Buffer<uint8_t> codes(experts * code_stride), scales(experts * scale_stride);
-    Buffer<float> row_scales(experts * rows), input(size_t(routes) * inner + 4);
-    Buffer<float> reference(output_count), result(output_count);
-    Buffer<mollm_cuda::Nvfp4Projection> reference_jobs(routes), candidate_jobs(routes);
-    const auto from_bits = [](uint32_t bits) {
-        float value;
-        std::memcpy(&value, &bits, sizeof(value));
-        return value;
-    };
-    const auto bytes_equal = [](const auto& a, const auto& b) {
-        return a.size() == b.size() &&
-            !std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0]));
-    };
-    int cases = 0;
-    for (bool pair : {false, true}) for (bool scale_major : {false, true}) {
-        for (int alignment = 0; alignment < 4; ++alignment) {
-            // Deliberately support odd code addresses and float-aligned inputs
-            // that cannot be loaded as float4. Padding also acts as a sentinel.
-            const int code_shift = alignment & 1, input_shift = (alignment >> 1) & 1;
-            std::vector<uint8_t> host_codes(experts * code_stride, 0x5a);
-            std::vector<uint8_t> host_scales(experts * scale_stride, 0x5a);
-            std::vector<float> host_rows(experts * rows);
-            unsigned random = 181203;
-            const auto next = [&]() {
-                random ^= random << 13; random ^= random >> 17; random ^= random << 5;
-                return random;
-            };
-            for (int expert = 0; expert < experts; ++expert) {
-                for (int row = 0; row < rows; ++row) {
-                    host_rows[expert * rows + row] = float((row + expert) % 7 + 1) / 64.f;
-                    for (int group = 0; group < inner / 16; ++group) {
-                        const uint8_t values[] = {0,1,7,8,48,56,64,126,128,129,184,254};
-                        const size_t offset = scale_major
-                            ? size_t(group / 4) * rows * 4 + row * 4 + group % 4
-                            : size_t(row) * (inner / 16) + group;
-                        host_scales[expert * scale_stride + offset] =
-                            values[(group + row + expert) % 12];
-                    }
-                    for (int col = 0; col < inner; col += 2) {
-                        const size_t offset = size_t(col / 64) * rows * 32 + (pair
-                            ? size_t(row / 4) * 128 + (col % 64 / 16) * 32 +
-                                (row % 4) * 8 + (col % 16) / 2
-                            : size_t(row) * 32 + (col % 64) / 2);
-                        host_codes[expert * code_stride + code_shift + offset] = next();
-                    }
-                }
-            }
-            copy(codes.p, host_codes); copy(row_scales.p, host_rows);
-            std::vector<mollm_cuda::Nvfp4Projection> jobs(routes), refs(routes);
-            for (int route = 0; route < routes; ++route) {
-                const int expert = route % experts;
-                jobs[route] = {codes.p + expert * code_stride + code_shift,
-                    scales.p + expert * scale_stride, row_scales.p + expert * rows,
-                    input.p + size_t(route) * inner + input_shift,
-                    result.p + size_t(route) * rows, pair};
-                jobs[route].gate_scales_kmajor = scale_major;
-                refs[route] = jobs[route];
-                refs[route].output = reference.p + size_t(route) * rows;
-            }
-            copy(candidate_jobs.p, jobs); copy(reference_jobs.p, refs);
-            const auto launch = [&]() {
-                check(mollm_cuda::launch_nvfp4_gate_code_projections(
-                    reference_jobs.p, routes, rows, inner, false, stream));
-                check(paired
-                    ? mollm_cuda::launch_nvfp4_gate_paired_projections(
-                        candidate_jobs.p, routes, rows, inner, stream)
-                    : mollm_cuda::launch_nvfp4_gate_code_subgroup_projections(
-                        candidate_jobs.p, routes, rows, inner, stream));
-            };
-            cudaGraph_t graph;
-            cudaGraphExec_t executable;
-            check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-            launch();
-            check(cudaStreamEndCapture(stream, &graph));
-            check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-            for (int variant = 0; variant < 11; ++variant) {
-                std::vector<float> host_input(size_t(routes) * inner + 4);
-                for (size_t i = 0; i < host_input.size(); ++i) {
-                    float value = float(int(next() % 2001) - 1000) / 8192.f;
-                    if (variant == 1) value = -value;
-                    if (variant == 2) value = value * .5f + float(int(i % 13) - 6) * .00013f;
-                    if (variant == 3) value = 0.f;
-                    if (variant == 4) value = from_bits(0x80000000u);
-                    if (variant == 5) value = i % 4 ? 0.f : from_bits(2);
-                    host_input[i] = value;
-                }
-                if (variant == 6) host_input[13] = from_bits(0x7fc12345u);
-                if (variant == 7 || variant == 8) host_input[17] = from_bits(0x7f800000u);
-                if (variant == 8) host_input[23] = from_bits(0xff800000u);
-                auto changed_scales = host_scales;
-                if (variant >= 9) changed_scales[3] = variant == 9 ? 127 : 255;
-                if (paired) {
-                    // Graph replays must match the current descriptor contents,
-                    // including unequal layouts sharing the same code address.
-                    for (int route = 0; route < routes; ++route) {
-                        const int expert = variant & 1
-                            ? (route * (route + 3) + variant) % experts : route % experts;
-                        jobs[route].weight = codes.p + expert * code_stride + code_shift;
-                        jobs[route].block_scales = scales.p + expert * scale_stride;
-                        jobs[route].row_scales = row_scales.p + expert * rows;
-                        jobs[route].pair_layout = pair ^ (variant == 2 && route % 5 == 0);
-                        jobs[route].gate_scales_kmajor = scale_major ^ (variant == 1 && route % 7 == 0);
-                        refs[route] = jobs[route];
-                        refs[route].output = reference.p + size_t(route) * rows;
-                    }
-                    copy(candidate_jobs.p, jobs); copy(reference_jobs.p, refs);
-                }
-                copy(input.p, host_input); copy(scales.p, changed_scales);
-                for (bool captured : {false, true}) {
-                    check(cudaMemsetAsync(reference.p, 0x5a, output_count * sizeof(float), stream));
-                    check(cudaMemsetAsync(result.p, 0x5a, output_count * sizeof(float), stream));
-                    if (captured) check(cudaGraphLaunch(executable, stream));
-                    else launch();
-                    check(cudaStreamSynchronize(stream));
-                    const auto expected = read(reference.p, output_count);
-                    const auto actual = read(result.p, output_count);
-                    equal(expected, actual);
-                    const auto* tail = reinterpret_cast<const uint8_t*>(actual.data() + size_t(routes) * rows);
-                    for (size_t i = 0; i < 32 * sizeof(float); ++i) if (tail[i] != 0x5a) std::exit(6);
-                }
-                if (read(codes.p, host_codes.size()) != host_codes ||
-                    read(scales.p, changed_scales.size()) != changed_scales ||
-                    !bytes_equal(read(input.p, host_input.size()), host_input) ||
-                    !bytes_equal(read(row_scales.p, host_rows.size()), host_rows)) std::exit(7);
-                ++cases;
-            }
-            check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph));
-        }
-    }
-    std::printf("subgroup_packets cases=%d routes=%d aligned_unaligned=1 nonfinite=1 eager_graph=1 bitwise=1 guards=1 immutable=1 paired=%d\n", cases, routes, paired);
-}
+    return "unknown";
 }
 
-int main(int argc, char** argv) {
-    const bool timing = argc == 2 && !std::strcmp(argv[1], "--timing");
-    if (argc > 1 && !timing) return 64;
-    const bool scale_view=std::getenv("MOLLM_TEST_NVFP4_RESIDENT_GATE_SCALE_VIEW")&&
-        !std::strcmp(std::getenv("MOLLM_TEST_NVFP4_RESIDENT_GATE_SCALE_VIEW"),"1");
-    int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
-    cudaDeviceProp prop{};
-    check(cudaGetDeviceProperties(&prop,0));
-    if (prop.major != 12 || prop.minor > 1) return 77;
-    constexpr int rows = 1280, inner = 2560, sets = 2;
-    int routes=10;
-    if(const char* option=std::getenv("MOLLM_TEST_NVFP4_GATE_CODE_ROUTES")) {
-        char* end=nullptr;const long value=std::strtol(option,&end,10);
-        if(end==option || *end || value<10 || value>60 || value%10)return 64;
-        routes=int(value);
+bool is_mma(Mode mode) {
+    return mode == Mode::mma1 || mode == Mode::mma2 || mode == Mode::mma8 || mode == Mode::mma_prepared;
+}
+
+std::vector<uint8_t> make_payload(bool pair, int experts) {
+    const uint8_t scale_table[] = {0, 1, 7, 8, 48, 56, 64, 126};
+    std::vector<uint8_t> payload(size_t(experts) * expert_stride);
+    for (int expert = 0; expert < experts; ++expert) {
+        uint8_t* p = payload.data() + size_t(expert) * expert_stride;
+        for (int row = 0; row < rows; ++row) {
+            const float row_scale = float(1 + (row + expert) % 7) / 64.f;
+            std::memcpy(p + code_bytes + scale_bytes + size_t(row) * sizeof(float), &row_scale,
+                        sizeof(float));
+            for (int group = 0; group < inner / 16; ++group) {
+                p[code_bytes + size_t(row) * (inner / 16) + group] = scale_table[(row + group + expert) % 8];
+                for (int byte = 0; byte < 8; ++byte) {
+                    const size_t offset = pair
+                        ? size_t(row / 4) * (inner / 16) * 32 + group * 32 + (row % 4) * 8 + byte
+                        : size_t(row) * (inner / 2) + group * 8 + byte;
+                    p[offset] = uint8_t((row * 29 + group * 17 + byte * 13 + expert * 37) & 255);
+                }
+            }
+        }
     }
-    const char* subgroup_option=std::getenv("MOLLM_TEST_NVFP4_GATE_CODE_SUBGROUP");
-    const bool subgroup=subgroup_option && !std::strcmp(subgroup_option,"1");
-    constexpr size_t codes = size_t(rows)*inner/2, scales = size_t(rows)*inner/16;
-    constexpr size_t stride = codes + scales + rows*sizeof(float);
-    const size_t outputs = size_t(routes)*rows;
-    Buffer<uint8_t> weights(sets*routes*stride), view(sets*routes*codes+16);
-    Buffer<uint8_t> scale_major(sets*routes*scales+16);
-    Buffer<float> input(size_t(sets)*routes*inner), baseline(outputs+8), candidate(outputs+8);
-    Buffer<float> partial_base(outputs*8), partial_code(outputs*8);
-    Buffer<uint8_t> prepared(routes*2*inner/2), prepared_scales(routes*2*inner/16);
-    Buffer<mollm_cuda::Nvfp4Projection> base_jobs(sets*routes), code_jobs(sets*routes);
-    cudaStream_t stream;
-    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    const auto launch = [&](bool code, int mode, int set) {
-        if (mode >= 2) {
-            const int parts = mode == 3 ? 2 : mode == 4 ? 8 : 1;
+    return payload;
+}
+
+class ViewCheck {
+public:
+    ViewCheck(int routes, cudaStream_t stream)
+        : routes_(routes),
+          stream_(stream),
+          weights_(size_t(sets) * routes * expert_stride),
+          code_view_(size_t(sets) * routes * code_bytes),
+          kmajor_scales_(size_t(sets) * routes * scale_bytes),
+          input_(size_t(sets) * routes * inner),
+          baseline_(size_t(routes) * rows),
+          candidate_(size_t(routes) * rows),
+          partial_base_(size_t(routes) * rows * 8),
+          partial_code_(size_t(routes) * rows * 8),
+          prepared_(size_t(routes) * 2 * inner / 2),
+          prepared_scales_(size_t(routes) * 2 * inner / 16),
+          base_jobs_(size_t(sets) * routes),
+          code_jobs_(size_t(sets) * routes) {}
+
+    // Returns the number of checked graph replays.
+    int run(bool scale_view, bool timing) {
+        scale_view_enabled_ = scale_view;
+        int replays = 0;
+        for (bool pair : {false, true}) {
+            const std::vector<uint8_t> payload = make_payload(pair, sets * routes_);
+            weights_.upload(payload, stream_);
+            repack(pair);
+            const std::vector<uint8_t> code_view = code_view_.download(stream_);
+            const std::vector<uint8_t> kmajor_scale_bytes = kmajor_scales_.download(stream_);
+            for (Mode mode : modes) {
+                replays += run_mode(pair, mode);
+                if (timing && mode == Mode::pipelined) time_pipelined(pair);
+            }
+            fail_unless(same_bits(weights_.download(stream_), payload), pair, "canonical weights modified");
+            fail_unless(same_bits(code_view_.download(stream_), code_view), pair, "code view modified");
+            fail_unless(same_bits(kmajor_scales_.download(stream_), kmajor_scale_bytes), pair,
+                        "scale view modified");
+        }
+        return replays;
+    }
+
+private:
+    void fail_unless(bool ok, bool pair, const char* what, Mode mode = Mode::simt, int variant = -1,
+                     int set = -1) const {
+        if (ok) return;
+        char message[256];
+        std::snprintf(message, sizeof(message),
+                      "%s (routes=%d scale_view=%d pair=%d mode=%s variant=%d set=%d)", what, routes_,
+                      int(scale_view_enabled_), int(pair), mode_name(mode), variant, set);
+        mollm_test::fail(message);
+    }
+
+    void repack(bool pair) {
+        code_view_.poison(stream_);
+        kmajor_scales_.poison(stream_);
+        for (int expert = 0; expert < sets * routes_; ++expert) {
+            Job source{};
+            source.weight = weights_.data() + size_t(expert) * expert_stride;
+            source.pair_layout = pair;
+            check(mollm_cuda::launch_repack_nvfp4_gate_codes(
+                      source, code_view_.data() + size_t(expert) * code_bytes, rows, inner, stream_),
+                  "code repack");
+            if (scale_view_enabled_) {
+                source.block_scales = weights_.data() + size_t(expert) * expert_stride + code_bytes;
+                check(mollm_cuda::launch_repack_nvfp4_gate_scales(
+                          source, kmajor_scales_.data() + size_t(expert) * scale_bytes, rows, inner, stream_),
+                      "scale repack");
+            }
+        }
+        check(cudaStreamSynchronize(stream_), "repack");
+        code_view_.check_guards();
+        kmajor_scales_.check_guards();
+    }
+
+    // Baseline jobs read the canonical payload; candidate jobs read the views.
+    void describe(bool pair, int variant) {
+        std::vector<float> values(input_.size());
+        for (size_t i = 0; i < values.size(); ++i)
+            values[i] = float(int((i * 17 + size_t(variant) * 31) % 257) - 128) / 128.f;
+        input_.upload(values, stream_);
+        std::vector<Job> base(size_t(sets) * routes_);
+        std::vector<Job> code(size_t(sets) * routes_);
+        for (int set = 0; set < sets; ++set) {
+            for (int route = 0; route < routes_; ++route) {
+                const int index = set * routes_ + route;
+                const int expert = set * routes_ + (route * 3 + variant) % routes_;
+                const uint8_t* payload = weights_.data() + size_t(expert) * expert_stride;
+                const uint8_t* view = code_view_.data() + size_t(expert) * code_bytes;
+                Job job{};
+                job.weight = payload;
+                job.block_scales = payload + code_bytes;
+                job.row_scales = reinterpret_cast<const float*>(payload + code_bytes + scale_bytes);
+                job.input = input_.data() + size_t(index) * inner;
+                job.output = baseline_.data() + size_t(route) * rows;
+                job.pair_layout = pair;
+                job.input_global = float(1 + route % 3) / 16.f;
+                job.input_global_second = float(1 + route % 5) / 16.f;
+                job.output_scale = float(1 + route % 7) / 8.f;
+                // Isolate the scale-layout change: with the scale view both
+                // arms read the already-qualified code view.
+                if (scale_view_enabled_) job.weight = view;
+                base[index] = job;
+                job.weight = view;
+                if (scale_view_enabled_) {
+                    job.block_scales = kmajor_scales_.data() + size_t(expert) * scale_bytes;
+                    job.gate_scales_kmajor = true;
+                }
+                job.output = candidate_.data() + size_t(route) * rows;
+                code[index] = job;
+            }
+        }
+        base_jobs_.upload(base, stream_);
+        code_jobs_.upload(code, stream_);
+    }
+
+    void launch(bool code, Mode mode, int set) {
+        const Job* jobs = (code ? code_jobs_.data() : base_jobs_.data()) + set * routes_;
+        // Candidate jobs always read the code view; baseline jobs do with the scale view.
+        const bool view = code || scale_view_enabled_;
+        if (is_mma(mode)) {
+            const int parts = mode == Mode::mma2 ? 2 : mode == Mode::mma8 ? 8 : 1;
+            const bool prepare = mode == Mode::mma_prepared;
             check(mollm_cuda::launch_nvfp4_mma_projections(
-                (code?code_jobs.p:base_jobs.p)+set*routes,routes,rows,inner,640,stream,
-                code?partial_code.p:partial_base.p,parts,true,
-                mode==5?prepared.p:nullptr,mode==5?prepared_scales.p:nullptr,code||scale_view));
-        } else if (code||scale_view) {
-            if(subgroup && mode==0)check(mollm_cuda::launch_nvfp4_gate_code_subgroup_projections(
-                (code?code_jobs.p:base_jobs.p)+set*routes,routes,rows,inner,stream));
-            else check(mollm_cuda::launch_nvfp4_gate_code_projections(
-                (code?code_jobs.p:base_jobs.p)+set*routes,routes,rows,inner,mode==1,stream));
+                      jobs, routes_, rows, inner, split_row, stream_,
+                      code ? partial_code_.data() : partial_base_.data(), parts, true,
+                      prepare ? prepared_.data() : nullptr, prepare ? prepared_scales_.data() : nullptr,
+                      view),
+                  "MMA launch");
+        } else if (view && mode == Mode::subgroup) {
+            check(mollm_cuda::launch_nvfp4_gate_code_subgroup_projections(jobs, routes_, rows, inner,
+                                                                          stream_),
+                  "subgroup launch");
+        } else if (view) {
+            check(mollm_cuda::launch_nvfp4_gate_code_projections(jobs, routes_, rows, inner,
+                                                                 mode == Mode::pipelined, stream_),
+                  "gate code launch");
+        } else if (mode == Mode::pipelined) {
+            check(mollm_cuda::launch_nvfp4_pipelined_projections(jobs, routes_, rows, inner, true, stream_),
+                  "pipelined launch");
+        } else {
+            mollm_cuda::launch_nvfp4_projections(jobs, routes_, rows, inner, stream_);
+            check(cudaGetLastError(), "SIMT launch");
         }
-        else if (mode==1) check(mollm_cuda::launch_nvfp4_pipelined_projections(
-            base_jobs.p+set*routes, routes, rows, inner, true, stream));
-        else {
-            mollm_cuda::launch_nvfp4_projections(base_jobs.p+set*routes, routes, rows, inner, stream);
-            check(cudaGetLastError());
+    }
+
+    int run_mode(bool pair, Mode mode) {
+        describe(pair, 0);
+        cudaGraph_t graphs[sets];
+        cudaGraphExec_t executables[sets];
+        for (int set = 0; set < sets; ++set) {
+            check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin capture");
+            launch(false, mode, set);
+            launch(true, mode, set);
+            check(cudaStreamEndCapture(stream_, &graphs[set]), "end capture");
+            check(cudaGraphInstantiate(&executables[set], graphs[set], nullptr, nullptr, 0),
+                  "graph instantiate");
         }
+        int replays = 0;
+        for (int variant = 0; variant < variants; ++variant) {
+            describe(pair, variant);
+            for (int set = 0; set < sets; ++set) {
+                baseline_.poison(stream_);
+                candidate_.poison(stream_);
+                check(cudaGraphLaunch(executables[set], stream_), "graph launch");
+                const std::vector<float> expected = baseline_.download(stream_);
+                fail_unless(same_bits(candidate_.download(stream_), expected), pair,
+                            "view output differs from the canonical output", mode, variant, set);
+                baseline_.check_guards();
+                candidate_.check_guards();
+                ++replays;
+            }
+        }
+        for (int set = 0; set < sets; ++set) {
+            check(cudaGraphExecDestroy(executables[set]), "graph exec destroy");
+            check(cudaGraphDestroy(graphs[set]), "graph destroy");
+        }
+        return replays;
+    }
+
+    void time_pipelined(bool pair) {
+        constexpr int graph_repeats = 16;
+        constexpr int batches = 16;
+        cudaGraph_t graphs[2];
+        cudaGraphExec_t executables[2];
+        for (int code = 0; code < 2; ++code) {
+            check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin capture");
+            for (int repeat = 0; repeat < graph_repeats; ++repeat) {
+                for (int set = 0; set < sets; ++set) launch(code == 1, Mode::pipelined, set);
+            }
+            check(cudaStreamEndCapture(stream_, &graphs[code]), "end capture");
+            check(cudaGraphInstantiate(&executables[code], graphs[code], nullptr, nullptr, 0),
+                  "graph instantiate");
+        }
+        cudaEvent_t start;
+        cudaEvent_t end;
+        check(cudaEventCreate(&start), "event create");
+        check(cudaEventCreate(&end), "event create");
+        for (int repeat = 0; repeat < 4; ++repeat) {
+            for (int code = 0; code < 2; ++code) check(cudaGraphLaunch(executables[code], stream_), "warmup");
+        }
+        check(cudaStreamSynchronize(stream_), "warmup");
+        for (int repeat = 0; repeat < 7; ++repeat) {
+            float us[2];
+            for (int slot = 0; slot < 2; ++slot) {
+                const int code = (repeat + slot) & 1;
+                check(cudaEventRecord(start, stream_), "event record");
+                for (int batch = 0; batch < batches; ++batch)
+                    check(cudaGraphLaunch(executables[code], stream_), "graph launch");
+                check(cudaEventRecord(end, stream_), "event record");
+                check(cudaEventSynchronize(end), "event synchronize");
+                float ms = 0.f;
+                check(cudaEventElapsedTime(&ms, start, end), "event elapsed");
+                us[code] = ms * 1000.f / float(batches * graph_repeats * sets);
+            }
+            std::printf("gate_code_decode_timing routes=%d scale_view=%d pair=%d repeat=%d baseline_us=%.6f "
+                        "kmajor_us=%.6f scope=two_rotating_synthetic_sets_gate_only_not_model\n",
+                        routes_, int(scale_view_enabled_), int(pair), repeat, us[0], us[1]);
+        }
+        check(cudaEventDestroy(start), "event destroy");
+        check(cudaEventDestroy(end), "event destroy");
+        for (int code = 0; code < 2; ++code) {
+            check(cudaGraphExecDestroy(executables[code]), "graph exec destroy");
+            check(cudaGraphDestroy(graphs[code]), "graph destroy");
+        }
+    }
+
+    int routes_;
+    cudaStream_t stream_;
+    bool scale_view_enabled_ = false;
+    DeviceArray<uint8_t> weights_;
+    DeviceArray<uint8_t> code_view_;
+    DeviceArray<uint8_t> kmajor_scales_;
+    DeviceArray<float> input_;
+    DeviceArray<float> baseline_;
+    DeviceArray<float> candidate_;
+    DeviceArray<float> partial_base_;
+    DeviceArray<float> partial_code_;
+    DeviceArray<uint8_t> prepared_;
+    DeviceArray<uint8_t> prepared_scales_;
+    DeviceArray<Job> base_jobs_;
+    DeviceArray<Job> code_jobs_;
+};
+
+// The K64-major MMA entry rejects invalid arguments before enqueue: the
+// rejected calls run inside a stream capture that has to stay empty.
+void check_mma_admission(cudaStream_t stream) {
+    constexpr int routes = 10;
+    DeviceArray<Job> jobs(routes);
+    struct Case {
+        const char* name;
+        const Job* jobs;
+        int rows;
+        int inner;
+        bool canonical;
     };
-    check(cudaMemset(candidate.p, 0x5a, (outputs+8)*sizeof(float)));
-    check(cudaDeviceSynchronize());
-    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    int rejects = 0;
-    for (int id = 0; id < 7; ++id) {
-        const auto* jobs = code_jobs.p;
-        int n = routes, r = rows, k = inner;
-        switch (id) {
-            case 0: jobs = nullptr; break;
-            case 1: n = 0; break;
-            case 2: n = -1; break;
-            case 3: n = 65536; break;
-            case 4: r = 640; break;
-            case 5: k = 640; break;
-            case 6: jobs = reinterpret_cast<const mollm_cuda::Nvfp4Projection*>(
-                reinterpret_cast<const uint8_t*>(jobs)+1); break;
+    const Case cases[] = {
+        {"null descriptors", nullptr, rows, inner, true},
+        {"N 1024", jobs.data(), 1024, inner, true},
+        {"K 1280", jobs.data(), rows, 1280, true},
+        {"native weights", jobs.data(), rows, inner, false},
+    };
+    cudaGraph_t graph;
+    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+    for (const Case& c : cases) {
+        const cudaError_t status = mollm_cuda::launch_nvfp4_mma_projections(
+            c.jobs, routes, c.rows, c.inner, split_row, stream, nullptr, 1, c.canonical, nullptr, nullptr,
+            true);
+        if (status != cudaErrorInvalidValue) {
+            char message[128];
+            std::snprintf(message, sizeof(message), "K64-major MMA: %s admitted", c.name);
+            mollm_test::fail(message);
         }
-        if (mollm_cuda::launch_nvfp4_gate_code_projections(jobs,n,r,k,true,stream)
-            != cudaErrorInvalidValue) return 3;
-        ++rejects;
-        if(mollm_cuda::launch_nvfp4_gate_code_subgroup_projections(jobs,n,r,k,stream)
-            !=cudaErrorInvalidValue)return 3;
-        ++rejects;
-        if(mollm_cuda::launch_nvfp4_gate_paired_projections(jobs,n,r,k,stream)
-            !=cudaErrorInvalidValue)return 3;
-        ++rejects;
     }
-    if(mollm_cuda::launch_nvfp4_gate_paired_projections(code_jobs.p,51,rows,inner,stream)
-        !=cudaErrorInvalidValue)return 3;
-    ++rejects;
-    for (int id = 0; id < 4; ++id) {
-        const auto* jobs = code_jobs.p;
-        int r = rows, k = inner;
-        bool canonical = true;
-        switch (id) {
-            case 0: jobs = nullptr; break;
-            case 1: r = 1024; break;
-            case 2: k = 1280; break;
-            case 3: canonical = false; break;
-        }
-        if (mollm_cuda::launch_nvfp4_mma_projections(jobs,routes,r,k,640,stream,
-            nullptr,1,canonical,nullptr,nullptr,true) != cudaErrorInvalidValue) return 3;
-        ++rejects;
-    }
-    cudaGraph_t empty;
-    check(cudaStreamEndCapture(stream, &empty));
+    check(cudaStreamEndCapture(stream, &graph), "end capture");
     size_t nodes = 0;
-    check(cudaGraphGetNodes(empty, nullptr, &nodes));
-    if (nodes) return 4;
-    check(cudaGraphDestroy(empty));
-    const auto sentinel = read(reinterpret_cast<const uint8_t*>(candidate.p), (outputs+8)*sizeof(float));
-    for (uint8_t b : sentinel) if (b != 0x5a) return 5;
-    int changed = 0;
-    for (bool pair : {false, true}) {
-        std::vector<uint8_t> payload(sets*routes*stride);
-        for (int expert = 0; expert < sets*routes; ++expert) {
-            auto* p = payload.data()+size_t(expert)*stride;
-            for (int row = 0; row < rows; ++row) {
-                const float global = (1+(row+expert)%7)/64.f;
-                std::memcpy(p+codes+scales+row*sizeof(float), &global, sizeof(float));
-                for (int group = 0; group < inner/16; ++group) {
-                    const uint8_t sf[] = {0,1,7,8,48,56,64,126};
-                    p[codes+size_t(row)*(inner/16)+group] = sf[(row+group+expert)%8];
-                    for (int byte = 0; byte < 8; ++byte) {
-                        const size_t offset = pair ? size_t(row/4)*(inner/16)*32+group*32+(row%4)*8+byte
-                            : size_t(row)*(inner/2)+group*8+byte;
-                        p[offset] = (row*29+group*17+byte*13+expert*37)&255;
-                    }
-                }
-            }
-        }
-        copy(weights.p, payload);
-        check(cudaMemset(view.p, 0x5a, sets*routes*codes+16));
-        for (int expert = 0; expert < sets*routes; ++expert) {
-            mollm_cuda::Nvfp4Projection source{};
-            source.weight = weights.p+size_t(expert)*stride; source.pair_layout = pair;
-            check(mollm_cuda::launch_repack_nvfp4_gate_codes(source, view.p+size_t(expert)*codes,
-                rows,inner,stream));
-            if(scale_view) {
-                source.block_scales=weights.p+size_t(expert)*stride+codes;
-                check(mollm_cuda::launch_repack_nvfp4_gate_scales(source,
-                    scale_major.p+size_t(expert)*scales,rows,inner,stream));
-            }
-        }
-        check(cudaStreamSynchronize(stream));
-        const auto original_view = read(view.p, sets*routes*codes+16);
-        for (int mode = 0; mode < 6; ++mode) {
-            std::vector<mollm_cuda::Nvfp4Projection> a(sets*routes), b(sets*routes);
-            const auto update = [&](int variant) {
-                std::vector<float> values(size_t(sets)*routes*inner);
-                for (size_t i = 0; i < values.size(); ++i)
-                    values[i] = (int((i*17+variant*31)%257)-128)/128.f;
-                copy(input.p, values);
-                for (int set = 0; set < sets; ++set) for (int route = 0; route < routes; ++route) {
-                    const int expert = set*routes+(route*3+variant)%routes;
-                    const auto* ptr = weights.p+size_t(expert)*stride;
-                    a[set*routes+route] = {ptr,ptr+codes,reinterpret_cast<const float*>(ptr+codes+scales),
-                        input.p+size_t(set*routes+route)*inner,baseline.p+size_t(route)*rows,pair};
-                    a[set*routes+route].input_global = (1+route%3)/16.f;
-                    a[set*routes+route].input_global_second = (1+route%5)/16.f;
-                    a[set*routes+route].output_scale = (1+route%7)/8.f;
-                    // Isolate the scale-layout change: both arms use the
-                    // already-qualified K-major code payload in this mode.
-                    if(scale_view)a[set*routes+route].weight=view.p+size_t(expert)*codes;
-                    b[set*routes+route] = a[set*routes+route];
-                    b[set*routes+route].weight = view.p+size_t(expert)*codes;
-                    if(scale_view) {
-                        b[set*routes+route].block_scales=scale_major.p+size_t(expert)*scales;
-                        b[set*routes+route].gate_scales_kmajor=true;
-                    }
-                    b[set*routes+route].output = candidate.p+size_t(route)*rows;
-                }
-                copy(base_jobs.p,a); copy(code_jobs.p,b);
-            };
-            update(0);
-            cudaGraph_t graphs[sets]; cudaGraphExec_t execs[sets];
-            for (int set = 0; set < sets; ++set) {
-                check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-                launch(false,mode,set); launch(true,mode,set);
-                check(cudaStreamEndCapture(stream,&graphs[set]));
-                check(cudaGraphInstantiate(&execs[set],graphs[set],nullptr,nullptr,0));
-            }
-            for (int variant = 0; variant < 8; ++variant) {
-                update(variant);
-                for (int set = 0; set < sets; ++set) {
-                    check(cudaMemsetAsync(baseline.p,0x5a,(outputs+8)*sizeof(float),stream));
-                    check(cudaMemsetAsync(candidate.p,0x5a,(outputs+8)*sizeof(float),stream));
-                    check(cudaGraphLaunch(execs[set],stream)); check(cudaStreamSynchronize(stream));
-                    const auto ref = read(baseline.p,outputs+8), result = read(candidate.p,outputs+8);
-                    equal(ref,result);
-                    const auto* tail = reinterpret_cast<const uint8_t*>(result.data()+outputs);
-                    for (int i = 0; i < 8*sizeof(float); ++i) if (tail[i] != 0x5a) return 6;
-                    ++changed;
-                }
-            }
-            for (int set = 0; set < sets; ++set) {
-                check(cudaGraphExecDestroy(execs[set])); check(cudaGraphDestroy(graphs[set]));
-            }
-            if (timing && mode==1) {
-                cudaGraph_t graph[2]; cudaGraphExec_t exec[2];
-                for (int code = 0; code < 2; ++code) {
-                    check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-                    for (int repeat = 0; repeat < 16; ++repeat)
-                        for (int set = 0; set < sets; ++set) launch(code,mode,set);
-                    check(cudaStreamEndCapture(stream,&graph[code]));
-                    check(cudaGraphInstantiate(&exec[code],graph[code],nullptr,nullptr,0));
-                }
-                cudaEvent_t start,end; check(cudaEventCreate(&start)); check(cudaEventCreate(&end));
-                for (int repeat = 0; repeat < 4; ++repeat)
-                    for (int code = 0; code < 2; ++code) check(cudaGraphLaunch(exec[code],stream));
-                check(cudaStreamSynchronize(stream));
-                for (int repeat = 0; repeat < 7; ++repeat) {
-                    float us[2];
-                    for (int slot = 0; slot < 2; ++slot) {
-                        const int code = (repeat+slot)&1;
-                        check(cudaEventRecord(start,stream));
-                        for (int batch = 0; batch < 16; ++batch) check(cudaGraphLaunch(exec[code],stream));
-                        check(cudaEventRecord(end,stream)); check(cudaEventSynchronize(end));
-                        float ms; check(cudaEventElapsedTime(&ms,start,end)); us[code]=ms*1000/(16*32);
-                    }
-                    std::printf("gate_code_decode_timing pair=%d repeat=%d baseline_us=%.6f kmajor_us=%.6f scale_view=%d scope=ten_routes_two_rotating_synthetic_sets_gate_only_not_model\n",
-                        pair,repeat,us[0],us[1],scale_view);
-                }
-                check(cudaEventDestroy(start)); check(cudaEventDestroy(end));
-                for (int code = 0; code < 2; ++code) {
-                    check(cudaGraphExecDestroy(exec[code])); check(cudaGraphDestroy(graph[code]));
-                }
-            }
-        }
-        if (read(view.p,original_view.size()) != original_view || read(weights.p,payload.size()) != payload) return 7;
+    check(cudaGraphGetNodes(graph, nullptr, &nodes), "graph nodes");
+    check(cudaGraphDestroy(graph), "graph destroy");
+    require(nodes == 0, "rejected launches enqueued work");
+}
+
+bool parse_routes(const char* text, std::vector<int>& routes) {
+    const char* cursor = text;
+    while (true) {
+        char* end = nullptr;
+        const long value = std::strtol(cursor, &end, 10);
+        if (end == cursor || value < 10 || value > 60 || value % 10) return false;
+        routes.push_back(int(value));
+        if (*end == '\0') return true;
+        if (*end != ',') return false;
+        cursor = end + 1;
     }
-    if (subgroup) {
-        check_subgroup_packets(routes, stream);
-        if (routes <= 50) check_subgroup_packets(routes, stream, true);
+}
+
+bool parse_options(int argc, char** argv, std::vector<int>& routes, bool& timing) {
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--timing")) {
+            timing = true;
+        } else if (!std::strcmp(argv[i], "--routes") && i + 1 < argc) {
+            if (!parse_routes(argv[++i], routes)) return false;
+        } else {
+            return false;
+        }
     }
-    check(cudaStreamDestroy(stream));
-    std::printf("gate_code_decode rejected=%d changed_replays=%d rows=1280 inner=2560 routes=%d sets=2 layouts=ROW,PAIR simt_pipeline=0,1 mma_parts=1,2,8 mma_prequantized=1 split_row=640 byte_exact=1 weights_immutable=1 guards=1\n",rejects,changed,routes);
+    if (routes.empty()) routes.push_back(10);
+    return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::vector<int> routes;
+    bool timing = false;
+    if (!parse_options(argc, argv, routes, timing)) {
+        std::fprintf(stderr, "usage: %s [--routes N[,N...]] [--timing]   (N: 10..60, multiple of 10)\n",
+                     argv[0]);
+        return 2;
+    }
+    if (!mollm_test::cuda_device_available()) return mollm_test::skip_status;
+    cudaDeviceProp prop{};
+    check(cudaGetDeviceProperties(&prop, 0), "device properties");
+    // The MMA consumers need the SM 12.0/12.1 FP4 tensor-core path.
+    if (prop.major != 12 || prop.minor > 1) return mollm_test::skip_status;
+    cudaStream_t stream;
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream create");
+    check_mma_admission(stream);
+    for (int count : routes) {
+        ViewCheck view_check(count, stream);
+        for (bool scale_view : {false, true}) {
+            const int replays = view_check.run(scale_view, timing);
+            std::printf("PASS gate_code_decode routes=%d scale_view=%d replays=%d layouts=ROW,PAIR "
+                        "modes=simt,pipelined,mma1,mma2,mma8,mma_prepared,subgroup split_row=640 "
+                        "bitwise=1 guards=1 immutable=1\n",
+                        count, int(scale_view), replays);
+        }
+    }
+    check(cudaStreamDestroy(stream), "stream destroy");
+    return 0;
 }

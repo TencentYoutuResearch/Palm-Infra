@@ -1,82 +1,196 @@
 #include "kernels/cuda/matmul.h"
+
+#include "cuda_test_support.h"
+
 #include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <stdexcept>
 #include <vector>
 
 namespace {
-void check(cudaError_t status) { if(status!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(status)); }
-void require(bool ok,const char* message) { if(!ok)throw std::runtime_error(message); }
-template<class T> struct Buffer {
-    T* data=nullptr;size_t count;
-    explicit Buffer(size_t n):count(n) { check(cudaMalloc(&data,n*sizeof(T))); }
-    ~Buffer() { if(data)cudaFree(data); }
-    std::vector<T> read(cudaStream_t stream) const {
-        std::vector<T> result(count);check(cudaMemcpyAsync(result.data(),data,count*sizeof(T),cudaMemcpyDeviceToHost,stream));check(cudaStreamSynchronize(stream));return result;
+
+using mollm_test::check;
+using mollm_test::from_bits;
+using mollm_test::GuardedBuffer;
+using mollm_test::require;
+using mollm_test::same_bits;
+using mollm_test::to_bits;
+
+constexpr int inner = 10240;
+constexpr int down_rows = 320;
+constexpr int inject_rows = 4;
+// Extra output elements after the rows; they must keep the 0x5a fill.
+constexpr int tail = 32;
+constexpr int input_changes = 9;
+
+template<class T> T* misaligned(T* pointer) {
+    return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(pointer) + 1);
+}
+
+// Change 0 is the original input; 1..2 perturb it; 3..8 cover zeros, signed
+// zeros, subnormals, a NaN payload and infinities.
+std::vector<float> changed_input(const std::vector<float>& original, int change) {
+    std::vector<float> values = original;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (change == 1)
+            values[i] = -values[i];
+        else if (change == 2)
+            values[i] = values[i] * 0.5f + float(int(i % 13) - 6) * 0.00017f;
+        else if (change == 3)
+            values[i] = 0.f;
+        else if (change == 4)
+            values[i] = from_bits(0x80000000u);
+        else if (change == 5)
+            values[i] = (i % 4 == 0) ? from_bits(2) : 0.f;
     }
-};
-float float_bits(uint32_t bits) { float value;std::memcpy(&value,&bits,sizeof(value));return value; }
+    if (change == 6) values[13] = from_bits(0x7fc12345u);
+    if (change == 7) values[17] = from_bits(0x7f800000u);
+    if (change == 8) {
+        values[17] = from_bits(0x7f800000u);
+        values[23] = from_bits(0xff800000u);
+    }
+    return values;
+}
+
+void require_tail(const std::vector<float>& output, size_t rows, const char* message) {
+    for (size_t i = rows; i < output.size(); ++i)
+        require(to_bits(output[i]) == 0x5a5a5a5au, message);
+}
+
 void run() {
-    constexpr int inner=10240,down_rows=320,inject_rows=4,guard=32;
-    check(mollm_cuda::configure_q4_g32_hc_adjacent_cache());
-    cudaStream_t stream;check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
-    std::vector<Q4B8G32Block> down(size_t(down_rows/8)*(inner/32)),inject(inner/32);
-    uint32_t state=813171;const auto random=[&]() mutable {state^=state<<13;state^=state>>17;state^=state<<5;return state;};
-    // Every nibble pattern is valid for the existing biased CUDA BG32 layout.
-    auto rng=random;
-    for(auto* weights:{&down,&inject})for(auto& block:*weights)for(int row=0;row<8;++row) {
-        block.scales[row]=float((rng()%1024)+1)*0.000013f;
-        for(auto& code:block.q[row])code=static_cast<uint8_t>(rng());
-    }
-    Buffer<Q4B8G32Block> wd(down.size()),wi(inject.size());Buffer<float> x(inner+4),expected_down(down_rows+guard),expected_inject(inject_rows+guard),actual_down(down_rows+guard),actual_inject(inject_rows+guard);
-    check(cudaMemcpyAsync(wd.data,down.data(),down.size()*sizeof(down[0]),cudaMemcpyHostToDevice,stream));check(cudaMemcpyAsync(wi.data,inject.data(),inject.size()*sizeof(inject[0]),cudaMemcpyHostToDevice,stream));check(cudaStreamSynchronize(stream));
-    const auto launch=[&](const float* input,const Q4B8G32Block* a,const Q4B8G32Block* b,float* y,float* z) {return mollm_cuda::launch_q4_g32_hc_adjacent_projections(input,a,b,y,z,stream);};
-    cudaGraph_t empty;check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-    require(launch(nullptr,wd.data,wi.data,actual_down.data,actual_inject.data)==cudaErrorInvalidValue,"null input accepted");
-    require(launch(x.data,nullptr,wi.data,actual_down.data,actual_inject.data)==cudaErrorInvalidValue,"null down weight accepted");
-    require(launch(x.data,wd.data,nullptr,actual_down.data,actual_inject.data)==cudaErrorInvalidValue,"null inject weight accepted");
-    require(launch(x.data,wd.data,wi.data,nullptr,actual_inject.data)==cudaErrorInvalidValue,"null down output accepted");
-    require(launch(x.data,wd.data,wi.data,actual_down.data,nullptr)==cudaErrorInvalidValue,"null inject output accepted");
-    require(launch(x.data+2,wd.data,wi.data,actual_down.data,actual_inject.data)==cudaErrorInvalidValue,"8-byte input accepted");
-    require(launch(x.data,reinterpret_cast<const Q4B8G32Block*>(reinterpret_cast<const char*>(wd.data)+1),wi.data,actual_down.data,actual_inject.data)==cudaErrorInvalidValue,"unaligned weight accepted");
-    require(launch(x.data,wd.data,wi.data,reinterpret_cast<float*>(reinterpret_cast<char*>(actual_down.data)+1),actual_inject.data)==cudaErrorInvalidValue,"unaligned output accepted");
-    check(cudaStreamEndCapture(stream,&empty));size_t nodes=0;check(cudaGraphGetNodes(empty,nullptr,&nodes));require(nodes==0,"invalid calls enqueued work");check(cudaGraphDestroy(empty));
-    cudaGraph_t graph;cudaGraphExec_t exec;check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));check(launch(x.data,wd.data,wi.data,actual_down.data,actual_inject.data));check(cudaStreamEndCapture(stream,&graph));check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
-    std::vector<float> original(inner);for(float& value:original)value=float(int(rng()%2001)-1000)*0.00073f;
-    for(int change=0;change<9;++change) {
-        auto values=original;
-        for(size_t i=0;i<values.size();++i) {
-            if(change==1)values[i]=-values[i];
-            else if(change==2)values[i]=values[i]*0.5f+float(int(i%13)-6)*0.00017f;
-            else if(change==3)values[i]=0.f;
-            else if(change==4)values[i]=float_bits(0x80000000u);
-            else if(change==5)values[i]=(i%4==0)?float_bits(2):0.f;
+    check(mollm_cuda::configure_q4_g32_hc_adjacent_cache(), "configure HC adjacent cache");
+    cudaStream_t stream;
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream create");
+
+    std::vector<Q4B8G32Block> down(size_t(down_rows / 8) * (inner / 32));
+    std::vector<Q4B8G32Block> inject(inner / 32);
+    uint32_t state = 813171;
+    const auto random = [&state] {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    };
+    // Every nibble pattern is valid for the biased CUDA BG32 layout.
+    for (auto* weights : {&down, &inject}) {
+        for (auto& block : *weights) {
+            for (int row = 0; row < 8; ++row) {
+                block.scales[row] = float((random() % 1024) + 1) * 0.000013f;
+                for (auto& code : block.q[row])
+                    code = static_cast<uint8_t>(random());
+            }
         }
-        if(change==6)values[13]=float_bits(0x7fc12345u);
-        if(change==7)values[17]=float_bits(0x7f800000u);
-        if(change==8){values[17]=float_bits(0x7f800000u);values[23]=float_bits(0xff800000u);}
-        check(cudaMemcpyAsync(x.data,values.data(),inner*sizeof(float),cudaMemcpyHostToDevice,stream));
-        for(auto* buffer:{&expected_down,&expected_inject,&actual_down,&actual_inject})check(cudaMemsetAsync(buffer->data,0x5a,buffer->count*sizeof(float),stream));
-        // Independent existing 256-thread kernels supply the exact native reference.
-        check(mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(x.data,wd.data,expected_down.data,down_rows,inner,1,true,stream));
-        check(mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(x.data,wi.data,expected_inject.data,inject_rows,inner,1,true,stream));
-        check(launch(x.data,wd.data,wi.data,actual_down.data,actual_inject.data));
-        const auto reference_down=expected_down.read(stream),reference_inject=expected_inject.read(stream);
-        auto result_down=actual_down.read(stream),result_inject=actual_inject.read(stream);
-        require(!std::memcmp(reference_down.data(),result_down.data(),reference_down.size()*sizeof(float))&&!std::memcmp(reference_inject.data(),result_inject.data(),reference_inject.size()*sizeof(float)),"eager FP32/tree mismatch");
-        check(cudaMemsetAsync(actual_down.data,0x5a,actual_down.count*sizeof(float),stream));check(cudaMemsetAsync(actual_inject.data,0x5a,actual_inject.count*sizeof(float),stream));check(cudaGraphLaunch(exec,stream));result_down=actual_down.read(stream);result_inject=actual_inject.read(stream);
-        require(!std::memcmp(reference_down.data(),result_down.data(),reference_down.size()*sizeof(float))&&!std::memcmp(reference_inject.data(),result_inject.data(),reference_inject.size()*sizeof(float)),"changed-input graph/guard mismatch");
-        for(size_t i=down_rows;i<result_down.size();++i){uint32_t bits;std::memcpy(&bits,&result_down[i],4);require(bits==0x5a5a5a5au,"down guard changed");}
-        for(size_t i=inject_rows;i<result_inject.size();++i){uint32_t bits;std::memcpy(&bits,&result_inject[i],4);require(bits==0x5a5a5a5au,"inject guard changed");}
     }
-    const auto final_down=wd.read(stream),final_inject=wi.read(stream);require(!std::memcmp(final_down.data(),down.data(),down.size()*sizeof(down[0]))&&!std::memcmp(final_inject.data(),inject.data(),inject.size()*sizeof(inject[0])),"weights changed");
-    check(cudaGraphExecDestroy(exec));check(cudaGraphDestroy(graph));check(cudaStreamDestroy(stream));
+
+    GuardedBuffer down_weight_buffer(down.size() * sizeof(Q4B8G32Block));
+    GuardedBuffer inject_weight_buffer(inject.size() * sizeof(Q4B8G32Block));
+    GuardedBuffer input_buffer((inner + 4) * sizeof(float));
+    GuardedBuffer expected_down_buffer((down_rows + tail) * sizeof(float));
+    GuardedBuffer expected_inject_buffer((inject_rows + tail) * sizeof(float));
+    GuardedBuffer actual_down_buffer((down_rows + tail) * sizeof(float));
+    GuardedBuffer actual_inject_buffer((inject_rows + tail) * sizeof(float));
+    auto* down_weight = down_weight_buffer.as<Q4B8G32Block>();
+    auto* inject_weight = inject_weight_buffer.as<Q4B8G32Block>();
+    float* x = input_buffer.as<float>();
+    float* expected_down = expected_down_buffer.as<float>();
+    float* expected_inject = expected_inject_buffer.as<float>();
+    float* actual_down = actual_down_buffer.as<float>();
+    float* actual_inject = actual_inject_buffer.as<float>();
+    down_weight_buffer.upload(down.data());
+    inject_weight_buffer.upload(inject.data());
+    // The work below runs on a non-blocking stream; finish the uploads first.
+    check(cudaDeviceSynchronize(), "weight upload");
+
+    const auto launch = [&](const float* input, const Q4B8G32Block* a, const Q4B8G32Block* b, float* y,
+                            float* z) {
+        return mollm_cuda::launch_q4_g32_hc_adjacent_projections(input, a, b, y, z, stream);
+    };
+    const auto rejected = [&](const float* input, const Q4B8G32Block* a, const Q4B8G32Block* b, float* y,
+                              float* z) {
+        return launch(input, a, b, y, z) == cudaErrorInvalidValue;
+    };
+
+    // Rejected calls must not enqueue work into a capturing stream.
+    cudaGraph_t empty;
+    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+    require(rejected(nullptr, down_weight, inject_weight, actual_down, actual_inject), "null input accepted");
+    require(rejected(x, nullptr, inject_weight, actual_down, actual_inject), "null down weight accepted");
+    require(rejected(x, down_weight, nullptr, actual_down, actual_inject), "null inject weight accepted");
+    require(rejected(x, down_weight, inject_weight, nullptr, actual_inject), "null down output accepted");
+    require(rejected(x, down_weight, inject_weight, actual_down, nullptr), "null inject output accepted");
+    require(rejected(x + 2, down_weight, inject_weight, actual_down, actual_inject), "8-byte input accepted");
+    require(rejected(x, misaligned(down_weight), inject_weight, actual_down, actual_inject),
+            "unaligned weight accepted");
+    require(rejected(x, down_weight, inject_weight, misaligned(actual_down), actual_inject),
+            "unaligned output accepted");
+    check(cudaStreamEndCapture(stream, &empty), "end capture");
+    size_t nodes = 0;
+    check(cudaGraphGetNodes(empty, nullptr, &nodes), "graph nodes");
+    require(nodes == 0, "invalid calls enqueued work");
+    check(cudaGraphDestroy(empty), "graph destroy");
+
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+    check(launch(x, down_weight, inject_weight, actual_down, actual_inject), "HC adjacent launch");
+    check(cudaStreamEndCapture(stream, &graph), "end capture");
+    check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "graph instantiate");
+
+    std::vector<float> original(inner);
+    for (float& value : original)
+        value = float(int(random() % 2001) - 1000) * 0.00073f;
+    for (int change = 0; change < input_changes; ++change) {
+        const std::vector<float> values = changed_input(original, change);
+        check(cudaMemcpyAsync(x, values.data(), inner * sizeof(float), cudaMemcpyHostToDevice, stream),
+              "input upload");
+        for (GuardedBuffer* buffer :
+             {&expected_down_buffer, &expected_inject_buffer, &actual_down_buffer, &actual_inject_buffer})
+            check(cudaMemsetAsync(buffer->data(), 0x5a, buffer->bytes(), stream), "output fill");
+        // Independent existing 256-thread kernels supply the exact native reference.
+        check(mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(x, down_weight, expected_down, down_rows, inner,
+                                                              1, true, stream),
+              "down reference launch");
+        check(mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(x, inject_weight, expected_inject, inject_rows,
+                                                              inner, 1, true, stream),
+              "inject reference launch");
+        check(launch(x, down_weight, inject_weight, actual_down, actual_inject), "HC adjacent launch");
+        check(cudaStreamSynchronize(stream), "eager");
+        const auto reference_down = expected_down_buffer.download<float>();
+        const auto reference_inject = expected_inject_buffer.download<float>();
+        require(same_bits(reference_down, actual_down_buffer.download<float>()) &&
+                    same_bits(reference_inject, actual_inject_buffer.download<float>()),
+                "eager FP32/tree mismatch");
+
+        check(cudaMemsetAsync(actual_down, 0x5a, actual_down_buffer.bytes(), stream), "output fill");
+        check(cudaMemsetAsync(actual_inject, 0x5a, actual_inject_buffer.bytes(), stream), "output fill");
+        check(cudaGraphLaunch(exec, stream), "graph launch");
+        check(cudaStreamSynchronize(stream), "graph");
+        const auto result_down = actual_down_buffer.download<float>();
+        const auto result_inject = actual_inject_buffer.download<float>();
+        require(same_bits(reference_down, result_down) && same_bits(reference_inject, result_inject),
+                "changed-input graph/guard mismatch");
+        require_tail(result_down, down_rows, "down guard changed");
+        require_tail(result_inject, inject_rows, "inject guard changed");
+    }
+    require(same_bits(down_weight_buffer.download<Q4B8G32Block>(), down) &&
+                same_bits(inject_weight_buffer.download<Q4B8G32Block>(), inject),
+            "weights changed");
+    for (const GuardedBuffer* buffer :
+         {&down_weight_buffer, &inject_weight_buffer, &input_buffer, &expected_down_buffer,
+          &expected_inject_buffer, &actual_down_buffer, &actual_inject_buffer})
+        buffer->check_guards();
+    check(cudaGraphExecDestroy(exec), "graph exec destroy");
+    check(cudaGraphDestroy(graph), "graph destroy");
+    check(cudaStreamDestroy(stream), "stream destroy");
 }
-}
+
+}  // namespace
+
 int main() {
-    int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;
-    try {run();std::puts("HC adjacent: native FP32/NaN/Inf/signed-zero/subnormal, changed graph, guards, immutable weights and empty invalid capture PASS");return 0;}
-    catch(const std::exception& error){std::fprintf(stderr,"HC adjacent: %s\n",error.what());return 1;}
+    if (!mollm_test::cuda_device_available()) return mollm_test::skip_status;
+    run();
+    std::puts("HC adjacent: native FP32/NaN/Inf/signed-zero/subnormal, changed graph, guards, "
+              "immutable weights and empty invalid capture PASS");
+    return 0;
 }

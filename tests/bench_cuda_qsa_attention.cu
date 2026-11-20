@@ -37,7 +37,7 @@ void bench(int rows,int keys) {
         static_cast<int32_t*>(di.data),static_cast<float*>(out.data),p));};
     cudaEvent_t begin,end;check(cudaEventCreate(&begin));check(cudaEventCreate(&end));
     for(int mode:{0,1,2,2,1,0}) {
-        p.reuse_gqa=mode==1;p.partitions=mode>=2?16:1;
+        p.reuse_gqa=mode==1;p.partitions=mode==2?16:1;
         p.selected_scores=static_cast<float*>(scores.data);
         for(int i=0;i<5;++i)launch();
         check(cudaDeviceSynchronize());

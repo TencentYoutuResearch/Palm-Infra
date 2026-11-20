@@ -2043,13 +2043,16 @@ bool test_nvfp4_moe_provider() {
             if(cudaStreamIsCapturing(cudaStreamPerThread,&status)!=cudaSuccess)return false;
             const bool closed=status==cudaStreamCaptureStatusNone;
             if(!closed) {
-                // Keep the intentionally failing pre-fix test well behaved.
-                cudaGraph_t discarded=nullptr;cudaStreamEndCapture(cudaStreamPerThread,&discarded);
-                if(discarded)cudaGraphDestroy(discarded);cudaGetLastError();
-            }
-            if(!closed) {
+                // End the leaked capture so the failure does not cascade into
+                // later tests, then report it.
+                cudaGraph_t discarded=nullptr;
+                cudaStreamEndCapture(cudaStreamPerThread,&discarded);
+                if(discarded)cudaGraphDestroy(discarded);
+                cudaGetLastError();
                 std::fprintf(stderr,"verify allocation failure left stream capture open\n");
-                graph_backend.clear_dispatch_error();leave_verify();return false;
+                graph_backend.clear_dispatch_error();
+                leave_verify();
+                return false;
             }
             if(!phase_restored||!owner_restored||graph_backend.logical_prefill_batch_enabled()||
                graph_backend.restore_state_prefix(1))return false;
