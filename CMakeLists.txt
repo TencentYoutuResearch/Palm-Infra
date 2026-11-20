@@ -63,7 +63,7 @@ endif()
 set(SOURCES
     # Metal-specific weight conversion is written in portable C++ so it can
     # also be validated by the CPU-only test target.
-    backends/metal/weight_layout.cpp
+    kernels/metal/weight_layout.cpp
     # runtime
     runtime/host_buffer_pool.cpp
     runtime/threading.cpp
@@ -102,6 +102,7 @@ set(SOURCES
     kernels/cpu/matmul/matmul_nvfp4.cpp
     ${MOLLM_CPU_PLATFORM_SOURCE}
     kernels/cpu/elementwise.cpp
+    kernels/cpu/reduction.cpp
     kernels/cpu/layout.cpp
     kernels/cpu/norm.cpp
     kernels/cpu/rope.cpp

@@ -942,6 +942,64 @@ static void matmul_int4_scalar_range(const float* A, const uint8_t* B,
     }
 }
 
+namespace mollm::cpu {
+
+void matmul_int4_packed_scalar_range(const Tensor& A, const Tensor& B,
+                                     Tensor& C, int lda, int ldc,
+                                     int m_begin, int m_end,
+                                     int n_begin, int n_end) {
+    const int K = static_cast<int>(A.shape[0]);
+    const int groups = static_cast<int>(B.groups_per_row);
+    const auto* q4dot = static_cast<const uint8_t*>(B.q4_repack_data);
+    const auto* bg32 = static_cast<const Q4B8G32Block*>(B.q4_g32_data);
+    const auto* bg128 = static_cast<const Q4B8G128Block*>(B.q4_g128_data);
+    const bool is_bg32 = B.is_q4_g32_packed && bg32 && B.group_size == 32;
+    const bool is_bg128 = B.is_q4_g128_packed && bg128 && B.group_size == 128;
+    for (int m = m_begin; m < m_end; ++m) {
+        float* out = C.ptr<float>() + static_cast<size_t>(m) * ldc;
+        for (int n = n_begin; n < n_end; ++n) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                int8_t value = 0;
+                float scale = 0.0f;
+                if (is_bg128) {
+                    const int group = k / 128;
+                    const auto& block = bg128[
+                        static_cast<size_t>(n / 8) * groups + group];
+                    const int local = k & 127;
+                    const uint8_t byte = block.q[local / 32][n & 7]
+                                                   [(local & 31) >> 1];
+                    value = unpack_int4_signed(byte, (local & 1) != 0);
+                    scale = block.scales[n & 7];
+                } else if (is_bg32) {
+                    const int group = k / 32;
+                    const auto& block = bg32[
+                        static_cast<size_t>(n / 8) * groups + group];
+                    const int local = k & 31;
+                    const uint8_t byte = block.q[n & 7][local >> 1];
+                    value = unpack_int4_signed(byte, (local & 1) != 0);
+                    scale = block.scales[n & 7];
+                } else {
+                    const int block_k = k / 32;
+                    const size_t byte_index =
+                        ((static_cast<size_t>(n / 8) * ((K + 31) / 32) +
+                          block_k) * 8 + (n & 7)) * 16 +
+                        ((k & 31) >> 1);
+                    value = unpack_int4_signed(q4dot[byte_index],
+                                                (k & 1) != 0);
+                    scale = B.scales[static_cast<size_t>(n) * groups +
+                                     k / static_cast<int>(B.group_size)];
+                }
+                sum += A.ptr<float>()[static_cast<size_t>(m) * lda + k] *
+                       static_cast<float>(value) * scale;
+            }
+            out[n] = sum;
+        }
+    }
+}
+
+}  // namespace mollm::cpu
+
 void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
                           ThreadPool* thread_pool, Activation act,
                           int act_n_begin, int act_n_len, MatmulTimer& timer) {

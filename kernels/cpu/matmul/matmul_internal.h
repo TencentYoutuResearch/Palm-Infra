@@ -11,6 +11,13 @@
 
 class ThreadPool;
 
+namespace mollm::cpu {
+void matmul_int4_packed_scalar_range(const Tensor& A, const Tensor& B,
+                                     Tensor& C, int lda, int ldc,
+                                     int m_begin, int m_end,
+                                     int n_begin, int n_end);
+}
+
 constexpr int MATMUL_Q8_BLOCK = 32;
 
 enum class W8ScaleMode {

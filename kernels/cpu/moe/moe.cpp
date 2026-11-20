@@ -1234,3 +1234,24 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     }
     return true;
 }
+
+void kernel_moe_accumulate_selected(const float* selected,
+                                    const float* shared,
+                                    const int* routes, int top_k,
+                                    int hidden_size, float* output) {
+    std::fill(output, output + hidden_size, 0.0f);
+    std::vector<int> order(static_cast<size_t>(top_k));
+    for (int selection = 0; selection < top_k; ++selection)
+        order[selection] = selection;
+    std::stable_sort(
+        order.begin(), order.end(),
+        [&](int left, int right) { return routes[left] < routes[right]; });
+    for (int selection : order) {
+        const float* source =
+            selected + static_cast<size_t>(selection) * hidden_size;
+        for (int dim = 0; dim < hidden_size; ++dim)
+            output[dim] += source[dim];
+    }
+    for (int dim = 0; dim < hidden_size; ++dim)
+        output[dim] += shared[dim];
+}

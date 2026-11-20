@@ -722,4 +722,24 @@ __fp16* pack_b_interleaved_full(const __fp16* B_original, int N, int K,
 // Enables vld1q_f16 contiguous load of A + vfmlalq_laneq_f16 lane-broadcast.
 // FP32→FP16 conversion happens during pack (one-time precision loss).
 // ---------------------------------------------------------------------------
+#else
+__fp16* pack_b_interleaved_full(const __fp16* source, int rows, int cols,
+                                int source_stride) {
+    if (!source || rows < 0 || cols < 0 || source_stride < cols)
+        return nullptr;
+    const int padded_rows = ((rows + 7) / 8) * 8;
+    auto* packed = new __fp16[static_cast<size_t>(padded_rows) * cols];
+    for (int row_tile = 0; row_tile < padded_rows; row_tile += 8) {
+        const int valid_rows = std::max(0, std::min(8, rows - row_tile));
+        for (int col = 0; col < cols; ++col) {
+            for (int lane = 0; lane < valid_rows; ++lane) {
+                packed[row_tile * cols + col * 8 + lane] =
+                    source[(row_tile + lane) * source_stride + col];
+            }
+            for (int lane = valid_rows; lane < 8; ++lane)
+                packed[row_tile * cols + col * 8 + lane] = (__fp16)0.0f;
+        }
+    }
+    return packed;
+}
 #endif

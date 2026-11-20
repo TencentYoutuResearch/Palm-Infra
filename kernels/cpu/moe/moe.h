@@ -63,3 +63,9 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
 extern "C" int mollm_moe_profile_enabled();
 extern "C" void mollm_reset_moe_profile();
 extern "C" void mollm_print_moe_profile(const char* title);
+
+// Accumulate already weighted selected-expert outputs in stable route order.
+void kernel_moe_accumulate_selected(const float* selected,
+                                    const float* shared,
+                                    const int* routes, int top_k,
+                                    int hidden_size, float* output);

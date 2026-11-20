@@ -107,11 +107,6 @@ const X86Dispatch& dispatch() {
     return value;
 }
 
-int8_t unpack_int4_signed(uint8_t byte, bool high_nibble) {
-    int value = high_nibble ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
-    return static_cast<int8_t>(value >= 8 ? value - 16 : value);
-}
-
 }  // namespace
 
 const Capabilities& capabilities() {
@@ -206,56 +201,8 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
             int4_kernel(A, B, C, lda, ldc, m_begin, m_end, n_begin, n_end);
             return;
         }
-        for (int m = m_begin; m < m_end; ++m) {
-            float* out = C.ptr<float>() + static_cast<size_t>(m) * ldc;
-            for (int n = n_begin; n < n_end; ++n) {
-                float sum = 0.0f;
-                for (int k = 0; k < K; ++k) {
-                    int8_t value = 0;
-                    float scale = 0.0f;
-                    if (is_bg128) {
-                        const int group = k / 128;
-                        const auto& block = bg128[
-                            static_cast<size_t>(n / 8) * groups + group];
-                        const int local = k & 127;
-                        const uint8_t byte =
-                            block.q[local / 32][n & 7][(local & 31) >> 1];
-                        value =
-                            unpack_int4_signed(byte, (local & 1) != 0);
-                        scale = block.scales[n & 7];
-                    } else if (is_bg32) {
-                        const int group = k / 32;
-                        const auto& block = bg32[
-                            static_cast<size_t>(n / 8) * groups + group];
-                        const int local = k & 31;
-                        const uint8_t byte =
-                            block.q[n & 7][local >> 1];
-                        value =
-                            unpack_int4_signed(byte, (local & 1) != 0);
-                        scale = block.scales[n & 7];
-                    } else {
-                        const int block_k = k / 32;
-                        const size_t byte_index =
-                            ((static_cast<size_t>(n / 8) *
-                                  ((K + 31) / 32) +
-                              block_k) *
-                                 8 +
-                             (n & 7)) *
-                                16 +
-                            ((k & 31) >> 1);
-                        value = unpack_int4_signed(
-                            q4dot[byte_index], (k & 1) != 0);
-                        scale =
-                            B.scales[static_cast<size_t>(n) * groups +
-                                     k / static_cast<int>(B.group_size)];
-                    }
-                    sum +=
-                        A.ptr<float>()[static_cast<size_t>(m) * lda + k] *
-                        static_cast<float>(value) * scale;
-                }
-                out[n] = sum;
-            }
-        }
+        matmul_int4_packed_scalar_range(A, B, C, lda, ldc, m_begin, m_end,
+                                        n_begin, n_end);
     };
 
     const int n_threads = thread_pool ? thread_pool->num_threads() : 1;
@@ -310,25 +257,3 @@ bool matmul_int8_range(const float* A, const int8_t* B, const float* scales,
 }
 
 }  // namespace mollm::cpu
-
-// x86 keeps dense FP16 weights row-major, but direct packing tests still use
-// this architecture-independent layout helper.
-__fp16* pack_b_interleaved_full(const __fp16* source, int rows, int cols,
-                                int source_stride) {
-    if (!source || rows < 0 || cols < 0 || source_stride < cols)
-        return nullptr;
-    const int padded_rows = ((rows + 7) / 8) * 8;
-    auto* packed = new __fp16[static_cast<size_t>(padded_rows) * cols];
-    for (int row_tile = 0; row_tile < padded_rows; row_tile += 8) {
-        const int valid_rows = std::max(0, std::min(8, rows - row_tile));
-        for (int col = 0; col < cols; ++col) {
-            for (int lane = 0; lane < valid_rows; ++lane) {
-                packed[row_tile * cols + col * 8 + lane] =
-                    source[(row_tile + lane) * source_stride + col];
-            }
-            for (int lane = valid_rows; lane < 8; ++lane)
-                packed[row_tile * cols + col * 8 + lane] = (__fp16)0.0f;
-        }
-    }
-    return packed;
-}

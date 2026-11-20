@@ -541,21 +541,8 @@ bool MetalMoeOps::dispatch_host(
     const float* selected = static_cast<const float*>(
         MetalBufferPool::contents(selected_handle));
     float* destination = output->ptr<float>();
-    std::fill(destination, destination + hidden_size, 0.0f);
-    std::vector<int> order(static_cast<size_t>(top_k));
-    for (int selection = 0; selection < top_k; ++selection)
-        order[selection] = selection;
-    std::stable_sort(
-        order.begin(), order.end(),
-        [&](int left, int right) { return routes[left] < routes[right]; });
-    for (int selection : order) {
-        const float* source =
-            selected + static_cast<size_t>(selection) * hidden_size;
-        for (int dim = 0; dim < hidden_size; ++dim)
-            destination[dim] += source[dim];
-    }
-    for (int dim = 0; dim < hidden_size; ++dim)
-        destination[dim] += shared_values[dim];
+    kernel_moe_accumulate_selected(selected, shared_values, routes.data(),
+                                   top_k, hidden_size, destination);
     release_buffers();
     success = true;
     return true;

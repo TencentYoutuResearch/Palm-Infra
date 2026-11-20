@@ -1,4 +1,4 @@
-#include "backends/metal/weight_layout.h"
+#include "kernels/metal/weight_layout.h"
 #include "core/quant_layouts.h"
 
 #include <cstdio>
