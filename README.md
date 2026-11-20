@@ -433,30 +433,31 @@ The companion must match the selected checkpoint. The launcher checks for an
 idle GPU and sufficient host memory at startup; admission checks are not
 memory reservations.
 
-For optional QSA + MTP, export the separate draft once and start its preset:
+For optional QSA + MTP speculative decoding, export the separate draft once
+and start the preset with `--mtp`:
 
 ```bash
 python3 tools/export_qwen4_mtp_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
   ../qwen38_mtp_qsa_bundle --qsa --n-ctx 32768
-./chat-qwen38-cuda-mtp.sh
+./chat-qwen38-cuda.sh --mtp
 ```
 
-This uses a 32K context and two draft tokens; `--n-ctx` and
-`--mtp-draft-tokens` override those defaults. QSA draft caches follow the
-runtime context without re-exporting weights. Speedup depends on acceptance
-and generation length.
+`--mtp` uses greedy decoding, a 32K context and two draft tokens; `--n-ctx`
+and `--mtp-draft-tokens` override those defaults. QSA draft caches follow the
+runtime context without re-exporting weights. Speedup depends on draft
+acceptance and generation length.
 
-Both presets enable the measured greedy optimizations by default: exact Q8
-argmax screening, the stable narrow-row cache, and architecture/shape-guarded
-small-batch kernels. MTP additionally uses compact draft heads, lossless FP16
-expert palettes, and cached verification. Draft approximations never replace
-target verification with the original weights. Production backends select the
-same guarded policies by capability and shape; unsupported configurations keep
-their generic paths.
-
-With `-DMOLLM_CUDA_DECODE_SEGMENTS=ON`, eligible greedy verification also uses
-cached workspaces and proven recurrent prefixes. Other configurations retain
-the previous policy. See
+On SM121 (GB10), the CUDA backend selects its measured decode kernels
+automatically: an argmax screen of the Q8 output head that rescoring keeps
+exact, cached narrow-row projection views, and small-batch kernels for the
+qualified shapes. With MTP it additionally uses compact draft heads,
+FP16 expert palettes that reproduce the original weights exactly, and
+verification batches that reproduce token-by-token decode arithmetic, with
+device-side checkpoints and per-token recurrent state snapshots for rollback.
+Draft approximations only propose tokens; the target model verifies every
+token with its original weights. Other GPUs, shapes and packages keep the
+generic paths. With `-DMOLLM_CUDA_DECODE_SEGMENTS=ON`, verification batches
+also reuse cached workspaces. See
 [measured results and limitations](docs/performance.md).
 
 For models other than Qwen3.8-Flash-Next, CUDA is a mixed native/fallback

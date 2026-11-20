@@ -1881,8 +1881,8 @@ bool test_nvfp4_moe_provider() {
             }
         }
         if(graph_backend.verification_workspace_max_rows() > 0 &&
+           graph_backend.qualified_verification_enabled() &&
            !std::getenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS")) {
-            setenv("MOLLM_CUDA_MTP_STATE_PREFIXES", "1", 1);
             const char* width_env=std::getenv("MOLLM_TEST_CUDA_VERIFY_WIDTH");
             const int width=width_env?std::atoi(width_env):3;
             if((width<3 || width>8)||!test_prefix_plan_backend_contract(width))return false;
@@ -2111,8 +2111,7 @@ bool test_ple_device_ops(CudaBackend& backend) {
             Tensor hx = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, channels, rows, 1, 1, x.data());
             Tensor hy = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, channels, rows, 1, 1, expected.data());
             GraphNode node; node.op_type = OpType::PLE_DILATED_CONV; node.params.i32 = {kernel, dilation, real};
-            const char* prefix_flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
-            const bool prefix_test=prefix_flag && !std::strcmp(prefix_flag,"1") && rows==3 && real==-1;
+            const bool prefix_test=backend.qualified_verification_enabled() && rows==3 && real==-1;
             const auto initial_history=history;
             if(prefix_test && !backend.begin_state_prefixes({&ds},rows))return false;
             CPUBackend cpu; cpu.dispatch(node, {&hx, &hw, &hs}, &hy, nullptr);
@@ -3052,9 +3051,8 @@ bool test_lm_head_argmax(CudaBackend& backend) {
 }
 
 bool test_ple_history_prefix(CudaBackend&) {
-    const char* flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
-    if(!flag||std::strcmp(flag,"1"))return true;
     CudaBackend backend;
+    if(!backend.qualified_verification_enabled())return true;
     int32_t ids_data[4]={4,0,5,6},sizes_data[2]={7,11},offset_data[2]={0,7};
     uint8_t table_data[36]={};float scale_data=1.f;
     Tensor ids=Tensor::create(Precision::INT32,MemoryType::EXTERNAL,4,1,1,1,ids_data);
@@ -3095,8 +3093,7 @@ bool test_state_prefix_coverage(CudaBackend&) {
     std::vector<float> x(21),w(28,.25f),initial(21,.5f),dummy(4,9.f);
     for(int i=0;i<21;++i)x[i]=float(i-10)/17.f;
     if(!upload(backend,input,x)||!upload(backend,weight,w)||!upload(backend,state,initial)||!upload(backend,unused,dummy))return false;
-    const char* flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
-    if(!flag||std::strcmp(flag,"1"))return !backend.begin_state_prefixes({&state},3);
+    if(!backend.qualified_verification_enabled())return !backend.begin_state_prefixes({&state},3);
     GraphNode node;node.op_type=OpType::SHORTCONV;node.params.i32={4,3};
     for(bool incomplete:{true,false}) {
         if(!upload(backend,state,initial))return false;
@@ -3136,8 +3133,7 @@ bool test_q8_batch_head(CudaBackend&) {
     Tensor weight=Tensor::create(Precision::INT8,MemoryType::EXTERNAL,n,k,1,1,weights.data());
     weight.rowmajor_data=weights.data();weight.scales=scales.data();
     weight.group_size=k;weight.groups_per_row=1;backend.wrap_weight(weight);
-    const char* flag=std::getenv("MOLLM_CUDA_MTP_VERIFY_Q8_BATCH");
-    if(!flag||std::strcmp(flag,"1"))return !backend.supports_lm_head_small_batch(weight);
+    if(!backend.qualified_verification_enabled())return !backend.supports_lm_head_small_batch(weight);
     if(!backend.supports_lm_head_small_batch(weight)) {std::fprintf(stderr,"q8 batch unsupported\n");return false;}
     {
         Tensor activation=device_tensor(backend,k,2);
@@ -3833,8 +3829,7 @@ bool test_nvfp4_sort_stream() {
 bool test_conservative_shortconv_graph(CudaBackend& backend, bool ple_conv = false,
                                       bool returned_view = false, bool owned_state = false) {
     std::vector<std::vector<float>> outputs, states, view_outputs, prefix_states;
-    const char* prefix_flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
-    const bool prefixes=!ple_conv && !owned_state && prefix_flag && !std::strcmp(prefix_flag,"1");
+    const bool prefixes=!ple_conv && !owned_state && backend.qualified_verification_enabled();
     for (int mode : {0,1,2}) {
         const bool planned=mode!=0,contract=mode==2;
         backend.clear_dispatch_error();

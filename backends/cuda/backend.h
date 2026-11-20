@@ -86,6 +86,9 @@ public:
     size_t strided_reshape_view_calls() const;
     // Includes live checkpoints and dormant prefix banks owned by this backend.
     size_t state_snapshot_pool_reserved_bytes() const;
+    // True on qualified devices unless MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION
+    // was set when the backend was created.
+    bool qualified_verification_enabled() const;
     size_t prefill_shared_cache_bytes() const;
     size_t prefill_shared_cache_hits() const;
     bool supports_state_snapshot(const std::vector<Tensor*>& states) const override;

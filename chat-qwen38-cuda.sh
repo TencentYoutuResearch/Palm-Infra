@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Recorded GB10 Qwen3.8 resident+PLE+QSA preset. No benchmark-script dependency.
-# Arguments are forwarded to mollm_chat; later CLI arguments override defaults.
+# --mtp adds the QSA MTP draft bundle with greedy speculative decoding.
+# Other arguments are forwarded to mollm_chat; later CLI arguments override
+# the preset defaults.
 set -euo pipefail
 preset_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd -- "$preset_root"
@@ -11,15 +13,17 @@ fi
 preset_help=0
 preset_qsa=0
 preset_dense=0
+preset_mtp=0
 preset_package=../qwen38_flash_next_nvfp4_calibrated.mollm
 preset_default_package=$preset_package
 preset_companion_args=()
 preset_forward_args=()
-preset_context=16384
+preset_context=
 preset_args=("$@")
 for ((preset_i=0;preset_i<${#preset_args[@]};++preset_i)); do
   preset_arg=${preset_args[preset_i]}
   if [[ $preset_arg == --dense-bringup ]]; then preset_dense=1; continue; fi
+  if [[ $preset_arg == --mtp ]]; then preset_mtp=1; continue; fi
   preset_forward_args+=("$preset_arg")
   case "$preset_arg" in
     --help|-h) preset_help=1 ;;
@@ -43,6 +47,12 @@ done
 if (( preset_dense && preset_qsa )); then
   echo '--dense-bringup conflicts with --qsa-companion.' >&2; exit 1
 fi
+if (( preset_dense && preset_mtp )); then
+  echo '--mtp requires QSA and conflicts with --dense-bringup.' >&2; exit 1
+fi
+preset_default_context=16384
+if (( preset_mtp )); then preset_default_context=32768; fi
+preset_context=${preset_context:-$preset_default_context}
 # Existing files can be compared by identity (including symlinks). For help
 # before downloading weights, compare the basename and physical parent path.
 # Failed directory resolution must never identify a custom package as default.
@@ -57,6 +67,10 @@ preset_is_default_package() {
 }
 preset_default=0
 if preset_is_default_package; then preset_default=1; fi
+if (( preset_mtp && !preset_default )); then
+  echo '--mtp uses the draft bundle for the default package; pass --mtp-companion yourself for other packages.' >&2
+  exit 1
+fi
 if (( !preset_dense && !preset_qsa && preset_default )); then
   preset_qsa=1
   preset_companion_args=(--qsa-companion ../qwen38_qsa_bundle)
@@ -65,24 +79,41 @@ if (( !preset_dense && !preset_qsa && preset_default )); then
     exit 1
   fi
 fi
+preset_mtp_args=()
+if (( preset_mtp )); then
+  preset_mtp_args=(--mtp-companion ../qwen38_mtp_qsa_bundle --mtp-draft-tokens 2 --temperature 0)
+  if (( !preset_help )) && [[ ! -f ../qwen38_mtp_qsa_bundle/manifest.json ]]; then
+    echo 'Missing MTP bundle: ../qwen38_mtp_qsa_bundle.' >&2
+    exit 1
+  fi
+fi
 preset_chunk=2048
 preset_fp16_cache=8192
+# Cached MTP verification workspaces require an output pool of at most 3 GiB.
+preset_output_pool=4096
 if (( preset_qsa && preset_context>65536 )); then
   preset_chunk=512
   preset_fp16_cache=4096
+fi
+if (( preset_mtp )); then
+  preset_fp16_cache=2048
+  preset_output_pool=3072
 fi
 # Preserve explicit cache overrides; final CLI arguments likewise override the
 # chosen chunk. This is a conservative preset, not a memory reservation.
 preset_fp16_cache=${MOLLM_CUDA_PREFILL_FP16_CACHE_MB:-$preset_fp16_cache}
 if (( preset_help )); then
-  echo 'Launcher: QSA is default for its Qwen3.8 package; --dense-bringup skips automatic QSA for diagnostics. Other options are forwarded.' >&2
+  echo 'Launcher: QSA is default for its Qwen3.8 package; --mtp adds greedy speculative decoding (default context 32768, draft depth 2); --dense-bringup skips automatic QSA for diagnostics. Other options are forwarded.' >&2
 fi
 if (( ! preset_help )); then
   if (( preset_qsa )); then
     echo 'QSA enabled: CUDA text, contiguous causal history, context<=262144 (memory-dependent); package uses dense W4/LM W8, not original BF16 precision.' >&2
+    if (( preset_mtp )); then
+      echo 'MTP enabled: greedy decoding, draft depth 2 (--mtp-draft-tokens N to change). Speed depends on draft acceptance.' >&2
+    fi
   else
     if (( preset_default )); then
-      echo 'WARNING: dense bring-up omits QSA; beyond2048 tokens this is a diagnostic model, not original long-context attention.' >&2
+      echo 'WARNING: dense bring-up omits QSA; beyond 2048 tokens this is a diagnostic model, not original long-context attention.' >&2
     else
       echo 'Explicit package override: no automatic QSA companion attached; verify the package attention/precision yourself.' >&2
     fi
@@ -92,13 +123,14 @@ if (( ! preset_help )); then
     exit 1
   fi
   if ! awk '/MemAvailable:/{seen=1; if($2<104857600)exit 1} END{if(!seen)exit 1}' /proc/meminfo; then
-    echo 'This preset requires at least100 GiB MemAvailable at startup; this is not a memory reservation.' >&2
+    echo 'This preset requires at least 100 GiB MemAvailable at startup; this is not a memory reservation.' >&2
     exit 1
   fi
 fi
-# Qualified Qwen3.8 QSA contexts can replay decode segments between logical
-# prefill phases. Respect the caller's presence-based disable switch. Keep
-# custom packages, dense diagnostics and larger contexts on the prior policy.
+# Default-package QSA contexts up to 32768 replay captured decode segments
+# between logical prefill phases. Setting MOLLM_CUDA_DISABLE_DECODE_SEGMENTS
+# (to any value) still disables them. Custom packages, dense diagnostics and
+# larger contexts run without decode segments.
 preset_segment_env=(MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1)
 if (( preset_default && preset_qsa && preset_context>0 && preset_context<=32768 )); then
   preset_segment_env=()
@@ -109,11 +141,12 @@ exec env \
   MOLLM_RESIDENT_EXPERT_ARENA=cuda-device \
   MOLLM_CUDA_PREFILL_FP16_CACHE_MB="$preset_fp16_cache" \
   MOLLM_CUDA_HOST_HEADROOM_MB=24576 \
-  MOLLM_CUDA_OUTPUT_POOL_MB=4096 \
+  MOLLM_CUDA_OUTPUT_POOL_MB="$preset_output_pool" \
   ${preset_segment_env[@]+"${preset_segment_env[@]}"} \
   build_cuda/mollm_chat \
   --package ../qwen38_flash_next_nvfp4_calibrated.mollm \
   ${preset_companion_args[@]+"${preset_companion_args[@]}"} \
   --device cuda --offload-ple --cuda-prefill-reclaim --cuda-prefill-logical-batch \
-  --n-ctx 16384 --prefill-chunk-size "$preset_chunk" --threads 8 \
-  --max-new-tokens 512 --temperature 0.6 ${preset_forward_args[@]+"${preset_forward_args[@]}"}
+  --n-ctx "$preset_default_context" --prefill-chunk-size "$preset_chunk" --threads 8 \
+  --max-new-tokens 512 --temperature 0.6 ${preset_mtp_args[@]+"${preset_mtp_args[@]}"} \
+  ${preset_forward_args[@]+"${preset_forward_args[@]}"}

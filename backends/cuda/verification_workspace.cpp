@@ -160,11 +160,12 @@ bool CudaBackend::select_verification_workspace(Graph& graph, ExecContext& ctx, 
     if (ctx.graph != &graph || ctx.backend != this || !available() || dispatch_failed() ||
         !impl_->state_prefixes.empty()) return false;
     // Unsupported execution modes retain their existing workspace policy.
-    const char* prefix_policy = std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
+    // The cache is sized for output pools of at most 3 GiB.
+    constexpr size_t max_output_pool_bytes = size_t(3) << 30;
     if (ctx.static_padded || ctx.profile_enabled ||
         (ctx.runtime_batch != -1 && ctx.runtime_batch != 1) ||
-        !impl_->segment_requested || !prefix_policy || std::strcmp(prefix_policy, "1") ||
-        !impl_->output_pool_limit_bytes || impl_->output_pool_limit_bytes > (size_t(3) << 30))
+        !impl_->segment_requested || !impl_->qualified_verification ||
+        !impl_->output_pool_limit_bytes || impl_->output_pool_limit_bytes > max_output_pool_bytes)
         return clear_verification_workspaces(&graph, &ctx);
     if (graph.nodes.empty() || graph.runtime.tensors.size() != graph.nodes.size()) return false;
     for (size_t i = 0; i < graph.nodes.size(); ++i)

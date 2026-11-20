@@ -190,10 +190,6 @@ int main(int argc,char** argv) {
     const bool compact=argc==2&&!std::strcmp(argv[1],"--compact");
     const bool small_batch=argc==2&&!std::strcmp(argv[1],"--small-batch");
     if(argc!=1&&!compact&&!small_batch)return 2;
-    if(small_batch){
-        setenv("MOLLM_CUDA_Q4_SMALL_BATCH_EXACT","1",1);
-        setenv("MOLLM_CUDA_Q4_SMALL_BATCH_EXACT_REUSE","1",1);
-    }
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
     // Deferred RMS is deliberately not a graph output. Its intermediate

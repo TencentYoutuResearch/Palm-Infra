@@ -98,9 +98,8 @@ int main() {
               cuda.copy_from_host(original.data(), device_tensor, 16),
               "CUDA checkpoint initial state upload");
         check(snapshot.capture(cuda, {&device_tensor}), "CUDA checkpoint capture");
-        const char* device_option = std::getenv("MOLLM_CUDA_MTP_DEVICE_CHECKPOINT");
-        check(snapshot.device_resident() == (device_option && !std::strcmp(device_option,"1")),
-              "CUDA checkpoint option selects device storage");
+        check(snapshot.device_resident() == cuda.qualified_verification_enabled(),
+              "qualified CUDA verification selects device checkpoint storage");
         check(cuda.zero_tensor(device_tensor, 16) && snapshot.restore(cuda),
               "CUDA checkpoint restores overwritten device state");
         std::vector<float> restored(4);

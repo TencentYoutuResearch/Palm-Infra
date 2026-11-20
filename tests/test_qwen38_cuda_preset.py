@@ -40,45 +40,43 @@ class PresetTests(unittest.TestCase):
     def chunk(self, result):
         return [result["args"][i+1] for i, arg in enumerate(result["args"][:-1]) if arg == "--prefill-chunk-size"]
 
-    def run_mtp_case(self, *args, overrides=None):
-        script = self.root / "chat-qwen38-cuda-mtp.sh"
-        shutil.copyfile(SCRIPT.with_name(script.name), script)
-        mock_bin = self.root / "mock-tools"
-        mock_bin.mkdir(exist_ok=True)
-        for name in ("nvidia-smi", "awk"):
-            tool = mock_bin / name
-            tool.write_text("#!/bin/sh\nexit 0\n")
-            tool.chmod(0o755)
-        env = {k: v for k, v in os.environ.items() if not k.startswith("MOLLM_")}
-        env["PATH"] = str(mock_bin) + os.pathsep + env["PATH"]
-        env.update(overrides or {})
-        result = subprocess.run(["bash", str(script), *args], env=env,
-                                text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        data = json.loads(result.stdout)
-        self.assertEqual(data["args"][-len(args):] if args else [], list(args))
-        self.assertEqual(data["cache"], "2048")
-        return data
+    def run_mtp_case(self, *args):
+        result = self.run_case("--mtp", *args)
+        self.assertNotIn("--mtp", result["args"])
+        self.assertEqual(result["cache"], "2048")
+        return result
 
-    def test_no_experiment_environment(self):
-        removed = (
-            "MOLLM_CUDA_FP16_EXPERT_PALETTE", "MOLLM_CUDA_GDN_REGISTER_PREFIXES",
-            "MOLLM_CUDA_HC_SMALL_BATCH_PAIR", "MOLLM_CUDA_MTP_CONFIDENCE_PRODUCT",
-            "MOLLM_CUDA_MTP_CONTINUE_PRODUCT", "MOLLM_CUDA_MTP_DRAFT_COMPACT_Q2",
-            "MOLLM_CUDA_MTP_DRAFT_COMPACT_Q4", "MOLLM_CUDA_MTP_DRAFT_ENERGY_GROUPS",
-            "MOLLM_CUDA_MTP_DRAFT_ENERGY_SCREEN", "MOLLM_CUDA_MTP_DRAFT_FITTED_Q4",
-            "MOLLM_CUDA_MTP_PREFIX_ONLY", "MOLLM_CUDA_MTP_VERIFY_SEGMENTS",
-            "MOLLM_CUDA_MTP_WIDTH_CACHE", "MOLLM_CUDA_NVFP4_MMA_MIN_ROWS",
-            "MOLLM_CUDA_Q4_BATCH_VECTOR_LOADS", "MOLLM_CUDA_Q4_GROUPED_NARROW",
-            "MOLLM_CUDA_Q4_NARROW_PREFETCH", "MOLLM_CUDA_Q4_NARROW_ROW_CACHE",
-            "MOLLM_CUDA_Q4_PREFETCH", "MOLLM_CUDA_Q8_HEAD_SCREEN",
-            "MOLLM_CUDA_Q8_HEAD_SCREEN_BITS", "MOLLM_CUDA_QSA_SPLIT_VALUES",
-            "MOLLM_CUDA_SDPA_SMALL_BATCH_EXACT",
-        )
+    def value(self, result, flag):
+        args = result["args"]
+        return [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == flag][-1]
+
+    def test_environment_is_limited_to_resource_settings(self):
+        allowed = {"MOLLM_RESIDENT_EXPERT_ARENA", "MOLLM_CUDA_PREFILL_FP16_CACHE_MB",
+                   "MOLLM_CUDA_HOST_HEADROOM_MB", "MOLLM_CUDA_OUTPUT_POOL_MB",
+                   "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS"}
         for data in (self.run_case(), self.run_mtp_case()):
-            for name in removed:
-                self.assertNotIn(name, data["policy"])
-        self.assertEqual(self.run_mtp_case()["policy"]["MOLLM_CUDA_MTP_STATE_PREFIXES"], "1")
+            self.assertLessEqual(set(data["policy"]), allowed)
+
+    def test_mtp_preset(self):
+        result = self.run_mtp_case()
+        self.assertEqual(self.value(result, "--mtp-companion"), "../qwen38_mtp_qsa_bundle")
+        self.assertEqual(self.value(result, "--mtp-draft-tokens"), "2")
+        self.assertEqual(self.value(result, "--temperature"), "0")
+        self.assertEqual(self.value(result, "--n-ctx"), "32768")
+        # Cached verification workspaces need an output pool of at most 3 GiB.
+        self.assertEqual(result["policy"]["MOLLM_CUDA_OUTPUT_POOL_MB"], "3072")
+        self.assertIsNone(result["segments_disabled"])
+        overridden = self.run_mtp_case("--mtp-draft-tokens", "3")
+        self.assertEqual(self.value(overridden, "--mtp-draft-tokens"), "3")
+        self.assertEqual(self.run_case()["policy"]["MOLLM_CUDA_OUTPUT_POOL_MB"], "4096")
+
+    def test_mtp_rejects_dense_and_custom_packages(self):
+        for args in (("--mtp", "--dense-bringup"), ("--mtp", "--package", "custom.mollm")):
+            result = subprocess.run(["bash", str(self.root / SCRIPT.name), "--help", *args],
+                                    env={k: v for k, v in os.environ.items()
+                                         if not k.startswith("MOLLM_")},
+                                    text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
 
     def test_qualified_decode_segment_policy(self):
         for context in ("2048", "16384", "32768"):

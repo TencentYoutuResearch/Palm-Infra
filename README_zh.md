@@ -411,20 +411,27 @@ static padding、vision 或非规范 mask。不支持的配置会直接拒绝，
 静默使用 dense attention。companion 必须与所选 checkpoint 匹配。Launcher
 会在启动时检查 GPU 空闲与 host 内存；admission check 不是内存预留。
 
-可选的 QSA + MTP 需要先导出独立 draft，再使用对应预设：
+可选的 QSA + MTP 投机解码需要先导出独立 draft，再用 `--mtp` 启动预设：
 
 ```bash
 python3 tools/export_qwen4_mtp_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
   ../qwen38_mtp_qsa_bundle --qsa --n-ctx 32768
-./chat-qwen38-cuda-mtp.sh
+./chat-qwen38-cuda.sh --mtp
 ```
 
-默认使用 32K context 和两个 draft tokens，可由 `--n-ctx` 与
-`--mtp-draft-tokens` 覆盖。两个 launcher 默认启用已测量的 greedy 优化；
-MTP 还使用紧凑 draft head、无损 FP16 expert palette 与验证缓存。draft 的
-近似计算不会替代原始权重的 target verification。生产后端按设备能力和
-shape 选择相应策略，不支持的配置保留通用路径。测量结果与限制见
-[性能说明](docs/performance.md)。
+`--mtp` 使用 greedy 解码、32K context 和两个 draft tokens，可由 `--n-ctx` 与
+`--mtp-draft-tokens` 覆盖。QSA draft cache 随运行时 context 调整，无需重新
+导出权重。加速效果取决于 draft 接受率和生成长度。
+
+在 SM121（GB10）上，CUDA 后端会自动选择已测量的 decode kernel：对 Q8 输出
+head 做 argmax 筛选（候选行用原始权重重新计算，结果保持精确）、缓存的
+narrow-row 投影视图，以及针对已验证 shape 的 small-batch kernel。启用 MTP
+时还会使用紧凑 draft head、与原始权重逐位一致的 FP16 expert palette，以及与
+逐 token decode 算术一致的验证批次，并用设备端 checkpoint 和逐 token 的
+recurrent state 快照完成回滚。draft 的近似计算只用于提出候选 token，每个
+token 都由 target 模型用原始权重验证。其他 GPU、shape 和 package 保留通用
+路径。使用 `-DMOLLM_CUDA_DECODE_SEGMENTS=ON` 构建时，验证批次还会复用缓存的
+workspace。测量结果与限制见[性能说明](docs/performance.md)。
 
 对于 Qwen3.8-Flash-Next 之外的模型，CUDA 是 native/fallback 混合实现：图输出、
 持久状态、dense elementwise、norm、RoPE、SDPA 与 decode `lm_head` 在 CUDA

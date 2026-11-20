@@ -34,29 +34,33 @@ select local architectures automatically and retains generic fallbacks.
 
 ## Public presets
 
-The launchers enable the measured stable policy without requiring users to
-assemble environment variables:
+The launcher sets only resource limits; the CUDA backend selects the measured
+kernels by device and shape:
 
 ```bash
 ./chat-qwen38-cuda.sh --temperature 0
-./chat-qwen38-cuda-mtp.sh
+./chat-qwen38-cuda.sh --mtp
 ```
 
-The base preset uses exact Q8 argmax screening and the stable narrow-row cache.
-The MTP preset additionally enables compact draft heads, lossless FP16 expert
-palettes, verification width caching, and confidence-based draft scheduling.
-Approximations are limited to draft proposals; target verification uses the
-original weights. Ineligible models and shapes retain their generic paths.
+On SM121 the base configuration uses an exact Q8 argmax screen and cached
+narrow-row projection views. With MTP the backend additionally uses compact
+draft heads, FP16 expert palettes that reproduce the original weights,
+confidence-based draft scheduling, and verification batches that reproduce
+token-by-token decode arithmetic, with cached workspaces, device checkpoints
+and per-token recurrent state snapshots. Approximations are limited to draft
+proposals; target verification uses the original weights. Other devices,
+models and shapes retain their generic paths. Setting
+`MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION` selects the generic verification
+paths for reference comparisons.
 
-The MTP preset defaults to two draft tokens. The measured configuration below
-uses three. Production optimizations are selected by device and shape guards;
-no experimental environment settings are required.
+`--mtp` defaults to two draft tokens. The measured configuration below uses
+three.
 
 ## Current measurements
 
 ### Base decode
 
-Two model loads used the stable narrow-row cache. Both generated the exact
+Two model loads used the narrow-row cache. Both generated the exact
 independent 512-token reference:
 
 | Measurement | Run 1 | Run 2 |
@@ -66,7 +70,7 @@ independent 512-token reference:
 
 ### QSA + MTP
 
-The MTP run used three draft tokens and the stable mode1 narrow-row cache:
+The MTP run used three draft tokens and the narrow-row cache:
 
 | Measurement | Run 1 | Run 2 |
 | --- | ---: | ---: |
@@ -90,7 +94,7 @@ Use `mollm_bench` with the same package, companions, prompt, and policy as the
 presets. A benchmark prompt used for the table must contain exactly 1759 tokens
 after chat templating if exact numerical comparison is required.
 
-Base mode1:
+Base configuration:
 
 ```bash
 env \
@@ -108,24 +112,14 @@ env \
   --print-token-ids
 ```
 
-For the MTP measurement, add the following environment settings and arguments:
-
-```bash
-  MOLLM_CUDA_Q4_SMALL_BATCH_EXACT=1 \
-  MOLLM_CUDA_Q4_SMALL_BATCH_EXACT_REUSE=1 \
-  MOLLM_CUDA_Q4_COMPACT_BATCH_REUSE=1 \
-  MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1 \
-  MOLLM_CUDA_MTP_DEVICE_ARGMAX=1 \
-  MOLLM_CUDA_MTP_DEVICE_CHECKPOINT=1 \
-  MOLLM_CUDA_MTP_STATE_PREFIXES=1 \
-  MOLLM_CUDA_MTP_VERIFY_Q8_BATCH=1 \
-```
+For the MTP measurement, add:
 
 ```text
   --mtp-companion ../qwen38_mtp_qsa_bundle --mtp-draft-tokens 3
 ```
 
-Keep the base resource settings from the first command. Compare complete
+Keep the resource settings from the first command; the 3072 MiB output pool
+is the largest that admits cached verification workspaces. Compare complete
 generated token IDs, not only throughput. Serialize GPU jobs and avoid
 concurrent compilation during timing.
 
@@ -135,7 +129,7 @@ concurrent compilation during timing.
 python3 tests/test_prefill_contract_selector.py build_cuda/mollm_bench
 python3 tests/test_qwen38_cuda_preset.py
 ctest --test-dir build_cuda --output-on-failure -j 1 -R \
-  '^(test_cuda_qsa_.*|test_qsa_engine_e2e$|test_cuda_verification_workspace.*|test_cuda_verify_.*|test_cuda_q4_narrow.*|test_cuda_q8_.*|test_cuda_draft_.*|test_cuda_fp16_expert_palette$|test_recurrent_mtp_prefix_e2e$)$'
+  '^(test_cuda_qsa_.*|test_qsa_engine_e2e$|test_cuda_verification_workspace.*|test_cuda_verify_.*|test_cuda_q4_narrow.*|test_cuda_q8_.*|test_cuda_draft_.*|test_cuda_fp16_expert_palette$|test_recurrent_mtp_.*e2e$)$'
 ```
 
 Run the complete CTest suite for a release candidate. The focused list above

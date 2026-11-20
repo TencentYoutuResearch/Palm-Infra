@@ -814,9 +814,9 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_mtp_draft_policy tests/test_mtp_draft_policy.cpp)
     add_mollm_test(test_recurrent_checkpoint tests/test_recurrent_checkpoint.cpp)
     if(MOLLM_CUDA)
-        add_test(NAME test_recurrent_checkpoint_device COMMAND test_recurrent_checkpoint)
-        set_tests_properties(test_recurrent_checkpoint_device PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_MTP_DEVICE_CHECKPOINT=1" LABELS "cuda")
+        add_test(NAME test_recurrent_checkpoint_unqualified COMMAND test_recurrent_checkpoint)
+        set_tests_properties(test_recurrent_checkpoint_unqualified PROPERTIES
+            ENVIRONMENT "MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION=1" LABELS "cuda")
     endif()
     add_mollm_test(test_tokenizer     tests/test_tokenizer.cpp)
     add_mollm_test(test_e2e           tests/test_e2e.cpp)
@@ -1208,28 +1208,24 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             add_test(NAME test_cuda_verify_workspace_pool COMMAND test_cuda_backend --verify-workspace-only)
             set_tests_properties(test_cuda_verify_workspace_pool PROPERTIES
-                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_CUDA_OUTPUT_POOL_MB=3072;MOLLM_CUDA_MTP_DEVICE_CHECKPOINT=1"
+                ENVIRONMENT "MOLLM_CUDA_OUTPUT_POOL_MB=3072"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             add_test(NAME test_cuda_verify_workspace_unbounded COMMAND test_cuda_backend --verify-workspace-only)
             set_tests_properties(test_cuda_verify_workspace_unbounded PROPERTIES
-                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_CUDA_OUTPUT_POOL_MB=0"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_verify_segment_prefixes COMMAND test_cuda_backend --moe-provider-only)
-            set_tests_properties(test_cuda_verify_segment_prefixes PROPERTIES
-                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1"
+                ENVIRONMENT "MOLLM_CUDA_OUTPUT_POOL_MB=0"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             add_test(NAME test_cuda_verify_segment_prefixes_wide COMMAND test_cuda_backend --moe-provider-only)
             set_tests_properties(test_cuda_verify_segment_prefixes_wide PROPERTIES
-                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_TEST_CUDA_VERIFY_WIDTH=5;MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1"
+                ENVIRONMENT "MOLLM_TEST_CUDA_VERIFY_WIDTH=5"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             add_test(NAME test_cuda_verify_segment_prefixes_width4 COMMAND test_cuda_backend --moe-provider-only)
             set_tests_properties(test_cuda_verify_segment_prefixes_width4 PROPERTIES
-                ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_TEST_CUDA_VERIFY_WIDTH=4;MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1"
+                ENVIRONMENT "MOLLM_TEST_CUDA_VERIFY_WIDTH=4"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             foreach(width IN ITEMS 6 7 8)
                 add_test(NAME test_cuda_verify_segment_prefixes_width${width} COMMAND test_cuda_backend --moe-provider-only)
                 set_tests_properties(test_cuda_verify_segment_prefixes_width${width} PROPERTIES
-                    ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_TEST_CUDA_VERIFY_WIDTH=${width};MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1"
+                    ENVIRONMENT "MOLLM_TEST_CUDA_VERIFY_WIDTH=${width}"
                     SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             endforeach()
         endif()
@@ -1377,7 +1373,7 @@ if(MOLLM_BUILD_TESTS)
         set_tests_properties(test_cuda_stateful_contracts test_cuda_stateful_contract_prefixes PROPERTIES
             LABELS "cuda" SKIP_RETURN_CODE 77)
         set_tests_properties(test_cuda_stateful_contract_prefixes PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1")
+            ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1")
         set_tests_properties(test_cuda_stateful_contracts PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1")
         add_test(NAME test_cuda_backend_gdn_quad_values COMMAND test_cuda_backend)
@@ -1514,15 +1510,10 @@ if(MOLLM_BUILD_TESTS)
         set_tests_properties(test_cuda_backend_prefill_fp16_cache_hc_down_limited PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=1;MOLLM_TEST_CUDA_HC_DOWN_CACHE=1"
             LABELS "cuda" SKIP_RETURN_CODE 77)
-        add_test(NAME test_cuda_backend_exact_batch COMMAND test_cuda_backend)
-        add_test(NAME test_cuda_backend_exact_reuse COMMAND test_cuda_backend)
-        add_test(NAME test_cuda_backend_q8_verify_batch COMMAND test_cuda_backend)
-        add_test(NAME test_cuda_backend_state_prefixes COMMAND test_cuda_backend)
-        set_tests_properties(test_cuda_backend_state_prefixes PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_MTP_STATE_PREFIXES=1"
-            LABELS "cuda" SKIP_RETURN_CODE 77)
-        set_tests_properties(test_cuda_backend_q8_verify_batch PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_MTP_VERIFY_Q8_BATCH=1"
+        # Reference run with the generic verification paths.
+        add_test(NAME test_cuda_backend_unqualified_verification COMMAND test_cuda_backend)
+        set_tests_properties(test_cuda_backend_unqualified_verification PROPERTIES
+            ENVIRONMENT "MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION=1"
             LABELS "cuda" SKIP_RETURN_CODE 77)
         add_test(NAME test_cuda_backend_narrow_pipeline COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_gdn_register_state COMMAND test_cuda_backend)
@@ -1555,10 +1546,6 @@ if(MOLLM_BUILD_TESTS)
         set_tests_properties(test_cuda_backend_shared_overlap_direct PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_DISABLE_MOE_GRAPHS=1;MOLLM_CUDA_DISABLE_DECODE_SEGMENTS=1"
             SKIP_RETURN_CODE 77 LABELS "cuda")
-        set_tests_properties(test_cuda_backend_exact_reuse PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_Q4_SMALL_BATCH_EXACT=1;MOLLM_CUDA_Q4_SMALL_BATCH_EXACT_REUSE=1"
-            SKIP_RETURN_CODE 77 LABELS "cuda")
-        add_test(NAME test_cuda_backend_exact_attention COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_validated_prefix COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_sdpa_full_batch COMMAND test_cuda_backend --sdpa-full-batch-only)
         set_tests_properties(test_cuda_backend_sdpa_full_batch PROPERTIES
@@ -1614,12 +1601,6 @@ if(MOLLM_BUILD_TESTS)
         set_tests_properties(test_cuda_backend_validated_prefix PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX=1"
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        set_tests_properties(test_cuda_backend_exact_attention PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL=1"
-            SKIP_RETURN_CODE 77 LABELS "cuda")
-        set_tests_properties(test_cuda_backend_exact_batch PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_Q4_SMALL_BATCH_EXACT=1"
-            SKIP_RETURN_CODE 77 LABELS "cuda")
         add_test(NAME test_cuda_backend_row_major COMMAND test_cuda_backend)
         add_test(NAME test_cuda_backend_row_major_extended COMMAND test_cuda_backend)
         set_tests_properties(test_cuda_backend_row_major_extended PROPERTIES
@@ -1744,19 +1725,12 @@ if(MOLLM_BUILD_TESTS)
                          $<TARGET_FILE:test_recurrent_mtp>)
         set_tests_properties(test_recurrent_mtp_e2e PROPERTIES SKIP_RETURN_CODE 77)
         if(MOLLM_CUDA)
-            add_test(NAME test_recurrent_mtp_device_e2e
+            add_test(NAME test_recurrent_mtp_unqualified_e2e
                      COMMAND ${Python3_EXECUTABLE}
                              ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_recurrent_mtp_e2e.py
                              $<TARGET_FILE:test_recurrent_mtp>)
-            set_tests_properties(test_recurrent_mtp_device_e2e PROPERTIES
-                ENVIRONMENT "MOLLM_CUDA_MTP_DEVICE_CHECKPOINT=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda")
-            add_test(NAME test_recurrent_mtp_prefix_e2e
-                     COMMAND ${Python3_EXECUTABLE}
-                             ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_recurrent_mtp_e2e.py
-                             $<TARGET_FILE:test_recurrent_mtp>)
-            set_tests_properties(test_recurrent_mtp_prefix_e2e PROPERTIES
-                ENVIRONMENT "MOLLM_CUDA_MTP_DEVICE_CHECKPOINT=1;MOLLM_CUDA_MTP_STATE_PREFIXES=1"
+            set_tests_properties(test_recurrent_mtp_unqualified_e2e PROPERTIES
+                ENVIRONMENT "MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda")
         endif()
         target_link_libraries(test_tiny_cpu_inference PRIVATE mollm_lib)

@@ -934,14 +934,10 @@ bool launch_gdn(
     const size_t required_scratch = gdn_prefill_scratch_bytes(
         num_heads, num_value_heads, key_dimension, value_dimension,
         sequence_length);
-    // Diagnostic: keep short verification batches on decode arithmetic.
-    // Leave longer prompt prefill and the default dispatch unchanged.
-    static const bool serial_small_batch = [] {
-        const char* value = std::getenv("MOLLM_CUDA_GDN_SMALL_BATCH_SERIAL");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    const bool use_serial_small_batch =
-        serial_small_batch && sequence_length > 1 && sequence_length <= 8;
+    // Short verification batches can request decode arithmetic; longer
+    // prompt prefill keeps the chunked path.
+    const bool use_serial_small_batch = (flags & gdn_flag_decode_arithmetic) &&
+        sequence_length > 1 && sequence_length <= 8;
     // Diagnostic reference: run arbitrary prefill lengths through the original
     // sequential shared-state arithmetic. Default and small-batch policy stay
     // unchanged; this is not a performance selector.

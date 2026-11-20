@@ -139,10 +139,6 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--fixed") == 0) fixed = true;
         else { std::fprintf(stderr, "Usage: %s [--fixed] [--backend]\n", argv[0]); return 2; }
     }
-    if (backend_check) {
-        setenv("MOLLM_CUDA_Q4_SMALL_BATCH_EXACT", "1", 1);
-        setenv("MOLLM_CUDA_Q4_SMALL_BATCH_EXACT_REUSE", "1", 1);
-    }
     try {
         if (fixed) { run(2560, 6144, backend_check, true); run(512, 2560, backend_check, true); }
         else { run(320, 10240, backend_check, false); run(640, 2560, backend_check, false); }

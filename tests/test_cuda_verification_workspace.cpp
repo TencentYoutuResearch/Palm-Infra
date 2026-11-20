@@ -80,10 +80,12 @@ struct CaptureScope {
 
 int run() {
     unsetenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS");
-    setenv("MOLLM_CUDA_MTP_STATE_PREFIXES", "1", 1);
+    unsetenv("MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION");
     setenv("MOLLM_CUDA_OUTPUT_POOL_MB", "64", 1);
     CudaBackend backend;
     if (!backend.available()) return 77;
+    // Width caching is part of the qualified verification policy.
+    if (!backend.qualified_verification_enabled()) return 77;
     backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
     CudaBackend reference;
     reference.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE);
@@ -243,10 +245,10 @@ int run() {
         CudaBackend disabled_segments;
         unsetenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS");
         check_unsupported(disabled_segments);
-        unsetenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
+        setenv("MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION", "1", 1);
         CudaBackend disabled_prefixes;
+        unsetenv("MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION");
         check_unsupported(disabled_prefixes);
-        setenv("MOLLM_CUDA_MTP_STATE_PREFIXES", "1", 1);
         CudaBackend multiple_batches;
         check_unsupported(multiple_batches, 2);
     }

@@ -129,6 +129,9 @@ struct CudaBackend::Impl {
     bool coherent_host_weights = false;
     bool supports_native_nvfp4_mma = false;
     bool prefer_screened_heads = false; // Q4 screen and compact draft heads.
+    // MTP verification policy: decode-equivalent 2..8-row Q4/GDN arithmetic,
+    // Q8 batch argmax, device checkpoints and recurrent state prefixes.
+    bool qualified_verification = false;
     bool prefer_q4_narrow_row_cache = false; // Exact narrow projection views on qualified devices.
     bool prefer_q4_m3_specializations = false; // Qualified SM121 M3 projection policy.
     bool prefer_q4_fixed_m5 = false; // Qualified SM121 compact-wide M5 policy.
@@ -1097,26 +1100,15 @@ struct CudaBackend::Impl {
             const char* value = std::getenv("MOLLM_CUDA_Q4_SMALL_BATCH");
             return value && std::strcmp(value, "1") == 0;
         }();
-        static const bool exact_batch = [] {
-            const char* value = std::getenv("MOLLM_CUDA_Q4_SMALL_BATCH_EXACT");
-            return value && std::strcmp(value, "1") == 0;
-        }();
-        if (exact_batch && valid_q4_g32 && m >= 2 && m <= 8) {
-            static const bool exact_reuse = [] {
-                const char* value = std::getenv("MOLLM_CUDA_Q4_SMALL_BATCH_EXACT_REUSE");
-                return value && std::strcmp(value, "1") == 0;
-            }();
-            static const bool compact_reuse = [] {
-                const char* value = std::getenv("MOLLM_CUDA_Q4_COMPACT_BATCH_REUSE");
-                return value && std::strcmp(value, "1") == 0;
-            }();
-            if (exact_reuse && compact_reuse && compact_q4_g32) {
+        // Verification batches reproduce per-token decode arithmetic exactly.
+        if (qualified_verification && valid_q4_g32 && m >= 2 && m <= 8) {
+            if (compact_q4_g32) {
                 if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_compact_small_batch_exact(
                         device_a, static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data),
                         device_c, m, n, k, lda, ldc, integer_compact, stream,
                         prefer_q4_fixed_m5), "q4_compact_batch_reuse"))
                     return false;
-            } else if (exact_reuse && !compact_q4_g32 && !prepared->row_g32) {
+            } else if (!prepared->row_g32) {
                 const bool specialized = prefer_q4_m3_specializations && m == 3 && lda == k &&
                     reinterpret_cast<uintptr_t>(device_a) % alignof(float4) == 0;
                 cudaError_t status;
@@ -1136,8 +1128,8 @@ struct CudaBackend::Impl {
                 }
                 if (!mollm_cuda::report_cuda(status, "q4_small_batch_exact_reuse")) return false;
             } else {
-                // Diagnostic: run each token through the exact decode projection,
-                // including small router/shared weights, without FP16 expansion.
+                // Row-major sidecar weights: run each token through the exact
+                // decode projection, without FP16 expansion.
                 for (int token = 0; token < m; ++token) {
                     const float* a = device_a + static_cast<size_t>(token) * lda;
                     float* c = device_c + static_cast<size_t>(token) * ldc;

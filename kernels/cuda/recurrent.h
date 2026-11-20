@@ -27,6 +27,11 @@ bool launch_gdn_recurrence_probe(
     int heads, int value_heads, int sequence, int real_tokens, float scale,
     bool prefetch_qk, int value_warps = 2, bool butterfly_key = false,
     bool broadcast_gates = false, bool paired_values = false, bool quad_values = false);
+// launch_gdn/launch_gdn_prefixes flags: bit 0 normalizes Q/K, bit 1 applies
+// the sigmoid output gate. gdn_flag_decode_arithmetic keeps 2..8-token
+// batches on the sequential decode arithmetic, so a verification batch
+// reproduces token-by-token decode exactly.
+constexpr int gdn_flag_decode_arithmetic = 4;
 bool launch_gdn(
     const float* qkv, const float* a, const float* b, const float* z,
     const float* a_log, const float* dt_bias, const float* norm_weight,

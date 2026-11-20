@@ -25,12 +25,8 @@ bool CudaBackend::supports_lm_head_argmax(const Tensor& weight) const {
 }
 
 bool CudaBackend::supports_lm_head_small_batch(const Tensor& weight) const {
-    static const bool enabled=[] {
-        const char* value=std::getenv("MOLLM_CUDA_MTP_VERIFY_Q8_BATCH");
-        return value && std::strcmp(value,"1")==0;
-    }();
     const auto* prepared=impl_->find_weight(weight);
-    return enabled && prepared &&
+    return impl_->qualified_verification && prepared &&
         prepared->layout==Impl::WeightLayout::Q8RowMajor && prepared->scales &&
         prepared->groups_per_row==1 && prepared->group_size>=weight.shape[1] &&
         weight.shape[0]>0 && weight.shape[0]<=INT32_MAX-7 &&

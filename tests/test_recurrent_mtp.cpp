@@ -9,6 +9,17 @@
 #include <cstdlib>
 #include <vector>
 
+// Whether a CUDA backend created now selects the qualified verification
+// policy (device checkpoints and recurrent state prefixes).
+static bool cuda_qualified_verification() {
+#ifdef MOLLM_CUDA
+    CudaBackend probe;
+    return probe.qualified_verification_enabled();
+#else
+    return false;
+#endif
+}
+
 static bool run(const char* path, Device device, const char* companion = nullptr) {
     EngineConfig config;
     config.package_path = path;
@@ -59,15 +70,12 @@ static bool run(const char* path, Device device, const char* companion = nullptr
             if (reference.past_len() != speculative.past_len()) return false;
         }
         const auto stats = speculative.mtp_stats();
-        const char* snapshot_option=std::getenv("MOLLM_CUDA_MTP_DEVICE_CHECKPOINT");
-        if (device==Device::CUDA && snapshot_option && !std::strcmp(snapshot_option,"1") &&
-            stats.recurrent_device_checkpoint_bytes!=stats.recurrent_checkpoint_bytes) {
+        const bool qualified = device == Device::CUDA && cuda_qualified_verification();
+        if (qualified && stats.recurrent_device_checkpoint_bytes != stats.recurrent_checkpoint_bytes) {
             std::fprintf(stderr,"CUDA MTP did not use device checkpoints for every state\n");
             return false;
         }
-        const char* prefix_option=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
-        const bool expect_prefix=device==Device::CUDA && prefix_option &&
-            !std::strcmp(prefix_option,"1");
+        const bool expect_prefix = qualified;
         if (!stats.recurrent_rollbacks || !stats.recurrent_checkpoint_bytes ||
             (expect_prefix ? stats.recurrent_replay_tokens!=0 : stats.recurrent_replay_tokens==0)) {
             std::fprintf(stderr,"MTP rollback path mismatch: prefix=%d replay=%llu\n",

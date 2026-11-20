@@ -145,14 +145,17 @@ bool CudaBackend::retire_verify_prefix_bank() {
     return true;
 }
 
+bool CudaBackend::qualified_verification_enabled() const {
+    return available() && impl_->qualified_verification;
+}
+
 int CudaBackend::verification_workspace_max_rows() const {
     return available() ? impl_->verification_rows_limit : 0;
 }
 
 bool CudaBackend::begin_state_prefixes(const std::vector<Tensor*>& states,int tokens) {
     end_state_prefixes();
-    const char* flag=std::getenv("MOLLM_CUDA_MTP_STATE_PREFIXES");
-    if(!flag||std::strcmp(flag,"1")||tokens<2||tokens>8||states.empty())return false;
+    if(!impl_->qualified_verification||tokens<2||tokens>8||states.empty())return false;
     finish_decode_segment();
     std::vector<Impl::StatePrefix> bindings;
     bindings.reserve(states.size());
@@ -304,11 +307,7 @@ bool CudaBackend::restore_state_prefix(int kept) {
 }
 
 bool CudaBackend::supports_state_snapshot(const std::vector<Tensor*>& states) const {
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOLLM_CUDA_MTP_DEVICE_CHECKPOINT");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    if (!enabled || !available()) return false;
+    if (!impl_->qualified_verification || !available()) return false;
     for (const Tensor* state : states) {
         if (!state || !state->view_span_bytes()) continue;
         // Host-authoritative/mirrored metadata requires the existing transfer
@@ -394,6 +393,9 @@ CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) 
         impl_->verification_rows_limit = sm121 ? 8 : 5;
         impl_->supports_native_nvfp4_mma = properties.major == 12 && properties.minor <= 1;
         impl_->prefer_screened_heads = sm121;
+        // Reference runs can opt out to compare against the generic batch paths.
+        impl_->qualified_verification = sm121 &&
+            std::getenv("MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION") == nullptr;
         impl_->prefer_nvfp4_gate_m1_proven = sm121;
         impl_->prefer_nvfp4_gate_subgroup = sm121;
         impl_->prefer_nvfp4_mtp_gate_pairs = sm121;

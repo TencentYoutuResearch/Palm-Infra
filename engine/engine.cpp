@@ -884,14 +884,11 @@ bool LLMEngine::execute_mtp_tokens(
     Tensor mask = build_causal_mask(n, position);
     set_cache_length(mtp_caches_, position);
 
-    static const bool cuda_mtp_device_argmax = [] {
-        const char* value = std::getenv("MOLLM_CUDA_MTP_DEVICE_ARGMAX");
-        return value && std::strcmp(value, "1") == 0;
-    }();
+    // Draft heads only propose tokens; target verification stays exact, so
+    // accelerators may pick the draft token on device.
     const bool fuse_accelerator_lm_head =
         !cache_only && draft_token &&
-        (cfg_.device == Device::METAL ||
-         (cfg_.device == Device::CUDA && cuda_mtp_device_argmax)) && accelerator_backend_ &&
+        (cfg_.device == Device::METAL || cfg_.device == Device::CUDA) && accelerator_backend_ &&
         exec_ctx_mtp_.backend == accelerator_backend_.get() &&
         lm_head_weight_ &&
         accelerator_backend_->supports_lm_head_argmax(*lm_head_weight_);
@@ -1686,9 +1683,12 @@ bool LLMEngine::speculative_decode(int token_id,
     const int hidden = static_cast<int>(mtp_pending_hidden_.size());
     const int vocab = static_cast<int>(lm_head_weight_->shape[0]);
     const bool plain_argmax = sampler_.uses_plain_argmax();
+    // Confidence scheduling needs per-draft probabilities, which only the
+    // CUDA draft head reports; elsewhere the policy keeps the fixed depth.
+    const bool confidence_drafts = plain_argmax && cfg_.device == Device::CUDA;
     mollm::detail::MtpDraftPolicy draft_policy(
-        plain_argmax && cfg_.device == Device::CUDA ? 0.4 : 0.0,
-        plain_argmax && cfg_.device == Device::CUDA ? 0.5 : 0.0);
+        confidence_drafts ? mollm::detail::mtp_draft_confidence_floor : 0.0,
+        confidence_drafts ? mollm::detail::mtp_draft_continuation_floor : 0.0);
     Tensor state_tensor = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, hidden, 1, 1, 1,
         mtp_pending_hidden_.data());

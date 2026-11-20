@@ -95,7 +95,6 @@ static int screen_cache_lifecycle() {
 }
 
 int main(int argc,char** argv){
-    setenv("MOLLM_CUDA_MTP_VERIFY_Q8_BATCH","1",1);
     if(argc==2&&!std::strcmp(argv[1],"--screen-shape"))return screen_shape();
     if(argc==2&&!std::strcmp(argv[1],"--screen-cache-lifecycle"))return screen_cache_lifecycle();
     require(argc==1,"unexpected arguments");
