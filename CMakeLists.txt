@@ -1322,16 +1322,12 @@ if(MOLLM_BUILD_TESTS)
             target_compile_definitions(test_cuda_backend PRIVATE MOLLM_CUDA_DECODE_SEGMENTS=1)
         endif()
         add_test(NAME test_cuda_stateful_contracts COMMAND test_cuda_backend --stateful-contract-only)
-        foreach(shared_cache_mode disabled enabled invalid limited partial zero compact)
+        foreach(shared_cache_mode enabled limited partial zero)
             add_test(NAME test_cuda_shared_fp16_cache_${shared_cache_mode} COMMAND test_cuda_backend --shared-cache-only)
             set_tests_properties(test_cuda_shared_fp16_cache_${shared_cache_mode} PROPERTIES
                 LABELS "cuda" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
         endforeach()
-        set_tests_properties(test_cuda_shared_fp16_cache_disabled PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
         set_tests_properties(test_cuda_shared_fp16_cache_enabled PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
-        set_tests_properties(test_cuda_shared_fp16_cache_invalid PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
         set_tests_properties(test_cuda_shared_fp16_cache_limited PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=1")
@@ -1339,8 +1335,6 @@ if(MOLLM_BUILD_TESTS)
             ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=5")
         set_tests_properties(test_cuda_shared_fp16_cache_zero PROPERTIES
             ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=0")
-        set_tests_properties(test_cuda_shared_fp16_cache_compact PROPERTIES
-            ENVIRONMENT "MOLLM_CUDA_PREFILL_FP16_CACHE_MB=128")
         foreach(reshape_mode disabled enabled invalid capture)
             add_test(NAME test_cuda_strided_reshape_${reshape_mode} COMMAND test_cuda_backend --strided-reshape-only)
             set_tests_properties(test_cuda_strided_reshape_${reshape_mode} PROPERTIES

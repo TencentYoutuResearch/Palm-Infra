@@ -4248,10 +4248,11 @@ bool test_shared_fp16_cache(CudaBackend& backend) {
     };
     stage("begin");
     if (!backend.set_operator_fallback_policy(OperatorFallbackPolicy::REQUIRE_NATIVE)) return false;
-    const char* flag = std::getenv("MOLLM_CUDA_PREFILL_FP16_CACHE_SHARED");
+    // The shared-shape cache has no switch of its own: any non-zero
+    // MOLLM_CUDA_PREFILL_FP16_CACHE_MB budget enables it.
     const char* budget = std::getenv("MOLLM_CUDA_PREFILL_FP16_CACHE_MB");
-    const bool enabled = flag && !std::strcmp(flag, "1");
     const size_t limit = budget ? size_t(std::strtoull(budget, nullptr, 10)) * 1024 * 1024 : 0;
+    const bool enabled = limit != 0;
     const bool small = std::getenv("MOLLM_TEST_CUDA_SHARED_CACHE_SMALL") != nullptr;
     const std::vector<int> row_cases = small ? std::vector<int>{17} : std::vector<int>{17,719,1743};
     std::vector<std::vector<Q4B8G32Block>> sources;
