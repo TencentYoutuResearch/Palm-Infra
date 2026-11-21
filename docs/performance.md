@@ -44,14 +44,21 @@ kernels by device and shape:
 
 On SM121 the base configuration uses an exact Q8 argmax screen and cached
 narrow-row projection views. With MTP the backend additionally uses compact
-draft heads, FP16 expert palettes that reproduce the original weights,
-confidence-based draft scheduling, and verification batches that reproduce
-token-by-token decode arithmetic, with cached workspaces, device checkpoints
-and per-token recurrent state snapshots. Approximations are limited to draft
-proposals; target verification uses the original weights. Other devices,
-models and shapes retain their generic paths. Setting
+draft heads and FP16 expert palettes that reproduce the original weights.
+Other devices, models and shapes retain their generic decode kernels.
+
+On every device with compute capability 8.0 or newer, MTP uses
+confidence-based draft scheduling and verification batches that reproduce the
+device's token-by-token decode arithmetic, with cached workspaces, device
+checkpoints and per-token recurrent state snapshots. Greedy MTP output therefore
+matches greedy decoding. Approximations are limited to draft proposals; target
+verification uses the original weights. Setting
 `MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION` selects the generic verification
 paths for reference comparisons.
+
+Outside SM121 the verification exactness tests also pass on SM89
+(RTX 4060 Ti). End-to-end throughput was measured only on GB10; the resident
+expert arena (about 68 GB) does not fit in the memory of that GPU.
 
 `--mtp` defaults to two draft tokens. The measured configuration below uses
 three.
@@ -158,7 +165,8 @@ cover the public configuration contract.
 - QSA and dense draft bundles must match the target model and each other.
 - Screening is used only where exact argmax semantics are preserved. Sparse
   screened logits must not be consumed as full sampling logits.
-- Qualified SM121 specializations must not bypass the generic
-  fallback for unsupported devices, layouts, shapes, or model files.
+- SM121 decode specializations must not bypass the generic fallback for
+  unsupported devices, layouts, shapes, or model files. Verification batches
+  must reproduce the decode arithmetic of the device they run on.
 - Raw traces, generated corpora, sanitizer logs, and historical round reports
   belong in external benchmark storage, not in this document or the repository.

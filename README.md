@@ -450,14 +450,16 @@ acceptance and generation length.
 On SM121 (GB10), the CUDA backend selects its measured decode kernels
 automatically: an argmax screen of the Q8 output head that rescoring keeps
 exact, cached narrow-row projection views, and small-batch kernels for the
-qualified shapes. With MTP it additionally uses compact draft heads,
-FP16 expert palettes that reproduce the original weights exactly, and
-verification batches that reproduce token-by-token decode arithmetic, with
-device-side checkpoints and per-token recurrent state snapshots for rollback.
-Draft approximations only propose tokens; the target model verifies every
-token with its original weights. Other GPUs, shapes and packages keep the
-generic paths. With `-DMOLLM_CUDA_DECODE_SEGMENTS=ON`, verification batches
-also reuse cached workspaces. See
+qualified shapes. With MTP it additionally uses compact draft heads and
+FP16 expert palettes that reproduce the original weights exactly. Other GPUs,
+shapes and packages keep the generic decode kernels. On every GPU with compute
+capability 8.0 or newer, MTP verifies drafts with batches that reproduce the
+device's token-by-token decode arithmetic, with device-side checkpoints and
+per-token recurrent state snapshots for rollback, so greedy MTP output matches
+greedy decoding. Draft approximations only propose tokens; the target model
+verifies every token with its original weights. With
+`-DMOLLM_CUDA_DECODE_SEGMENTS=ON`, verification batches also reuse cached
+workspaces. See
 [measured results and limitations](docs/performance.md).
 
 For models other than Qwen3.8-Flash-Next, CUDA is a mixed native/fallback

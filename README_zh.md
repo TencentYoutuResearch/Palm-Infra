@@ -426,11 +426,12 @@ python3 tools/export_qwen4_mtp_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
 在 SM121（GB10）上，CUDA 后端会自动选择已测量的 decode kernel：对 Q8 输出
 head 做 argmax 筛选（候选行用原始权重重新计算，结果保持精确）、缓存的
 narrow-row 投影视图，以及针对已验证 shape 的 small-batch kernel。启用 MTP
-时还会使用紧凑 draft head、与原始权重逐位一致的 FP16 expert palette，以及与
-逐 token decode 算术一致的验证批次，并用设备端 checkpoint 和逐 token 的
-recurrent state 快照完成回滚。draft 的近似计算只用于提出候选 token，每个
-token 都由 target 模型用原始权重验证。其他 GPU、shape 和 package 保留通用
-路径。使用 `-DMOLLM_CUDA_DECODE_SEGMENTS=ON` 构建时，验证批次还会复用缓存的
+时还会使用紧凑 draft head 和与原始权重逐位一致的 FP16 expert palette。其他
+GPU、shape 和 package 保留通用 decode kernel。在所有 compute capability 8.0
+及以上的 GPU 上，MTP 都用与该设备逐 token decode 算术一致的验证批次检查
+draft，并用设备端 checkpoint 和逐 token 的 recurrent state 快照完成回滚，因此
+贪心 MTP 的输出与贪心解码一致。draft 的近似计算只用于提出候选 token，每个
+token 都由 target 模型用原始权重验证。使用 `-DMOLLM_CUDA_DECODE_SEGMENTS=ON` 构建时，验证批次还会复用缓存的
 workspace。测量结果与限制见[性能说明](docs/performance.md)。
 
 对于 Qwen3.8-Flash-Next 之外的模型，CUDA 是 native/fallback 混合实现：图输出、

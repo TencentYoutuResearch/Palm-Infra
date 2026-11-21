@@ -418,8 +418,11 @@ CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) 
         impl_->verification_rows_limit = sm121 ? 8 : 5;
         impl_->supports_native_nvfp4_mma = properties.major == 12 && properties.minor <= 1;
         impl_->prefer_screened_heads = sm121;
-        // Reference runs can opt out to compare against the generic batch paths.
-        impl_->qualified_verification = sm121 &&
+        // Verification batches that reproduce the M=1 decode arithmetic pair
+        // with whichever decode kernels the device selects, so they are not
+        // tied to the SM121 specializations. Reference runs can opt out to
+        // compare against the generic batch paths.
+        impl_->qualified_verification = properties.major >= 8 &&
             std::getenv("MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION") == nullptr;
         impl_->prefer_nvfp4_gate_m1_proven = sm121;
         impl_->prefer_nvfp4_gate_subgroup = sm121;
