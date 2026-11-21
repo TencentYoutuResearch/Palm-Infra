@@ -81,7 +81,6 @@ class DecodeProfileTest(unittest.TestCase):
             "fp16_palette_projections_cuda": "fp16_expert_projection",
             "void nvfp4_exact_subwarp_cuda<(int)8, (bool)0>": "nvfp4_projection",
             "void nvfp4_exact_subwarp_cuda<(int)16, (bool)1>": "nvfp4_projection",
-            "q2_draft_head_gemv_cuda": "draft_head",
             "q4_g32_small_batch_wide_cuda<3>": "q4_projection",
             "q4_g32_hc_adjacent_projections_cuda": "q4_projection",
             "q4_g32_m3_adjacent_cuda": "q4_projection",

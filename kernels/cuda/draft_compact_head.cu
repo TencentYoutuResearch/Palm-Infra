@@ -115,99 +115,6 @@ __global__ void pack_q8_draft_head_compact_fitted_cuda(
     }
 }
 
-// Fit symmetric levels {-3,-1,1,3} to each K32 group once at load.
-// Integer dot products keep the scale fit independent of reduction ordering.
-__global__ void pack_q8_draft_head_q2_cuda(
-    const int8_t* weights, const float* scales, mollm_cuda::Q2DraftG32* output,
-    int rows, int inner) {
-    const int groups = inner / 32;
-    const int group = blockIdx.x % groups;
-    const int row = (blockIdx.x / groups) * 4 + threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
-    if (row >= rows) return;
-
-    const int value = weights[size_t(row) * inner + group * 32 + lane];
-    int maximum = abs(value);
-    for (int distance = 16; distance; distance /= 2)
-        maximum = max(maximum, __shfl_down_sync(0xffffffffu, maximum, distance));
-    maximum = __shfl_sync(0xffffffffu, maximum, 0);
-    float step = __fdiv_rn(float(maximum), 3.f);
-    for (int iteration = 0; iteration < 4; ++iteration) {
-        const int magnitude = float(abs(value)) > 2.f * step ? 3 : 1;
-        const int quantized = value < 0 ? -magnitude : magnitude;
-        int numerator = value * quantized, denominator = quantized * quantized;
-        for (int distance = 16; distance; distance /= 2) {
-            numerator += __shfl_down_sync(0xffffffffu, numerator, distance);
-            denominator += __shfl_down_sync(0xffffffffu, denominator, distance);
-        }
-        step = __shfl_sync(0xffffffffu,
-            __fdiv_rn(float(numerator), float(denominator)), 0);
-    }
-    const int magnitude = float(abs(value)) > 2.f * step ? 3 : 1;
-    const int quantized = value < 0 ? -magnitude : magnitude;
-    const unsigned code = (quantized + 3) / 2;
-    int numerator = value * quantized, denominator = quantized * quantized;
-    for (int distance = 16; distance; distance /= 2) {
-        numerator += __shfl_down_sync(0xffffffffu, numerator, distance);
-        denominator += __shfl_down_sync(0xffffffffu, denominator, distance);
-    }
-    const float fitted_maximum = __fmul_rn(3.f,
-        __fdiv_rn(float(numerator), float(denominator)));
-
-    auto& block = output[size_t(row / 8) * groups + group];
-    // Each four-lane row owns two independent four-value FMA chains.
-    for (int packet = 0; packet < 4; ++packet) {
-        unsigned word = 0;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int source = packet * 4 + (j < 4 ? j : j + 12);
-            word |= __shfl_sync(0xffffffffu, code, source) << (2 * j);
-        }
-        if (lane == packet) block.codes[row % 8][packet] = uint16_t(word);
-    }
-    if (!lane) {
-        const unsigned bits = __float_as_uint(__fmul_rn(fitted_maximum, scales[row]));
-        block.scales[row % 8] = bf16_bits_round_nearest_even(bits);
-    }
-}
-
-__global__ void q2_draft_head_gemv_cuda(
-    const float* __restrict__ activation,
-    const mollm_cuda::Q2DraftG32* __restrict__ weights,
-    float* __restrict__ output, int rows, int inner) {
-    extern __shared__ __align__(16) float input[];
-    for (int i = threadIdx.x; i < inner; i += blockDim.x)
-        input[i] = activation[i];
-    __syncthreads();
-    const int row = blockIdx.x * 32 + threadIdx.x / 4;
-    const int pair = threadIdx.x % 4;
-    if (row >= rows) return;
-    const int groups = inner / 32;
-    float sum = 0.f, second = 0.f;
-    for (int group = 0; group < groups; ++group) {
-        const auto& block = weights[size_t(row / 8) * groups + group];
-        const unsigned packed = block.codes[row % 8][pair];
-        const float scale = __fdiv_rn(
-            __uint_as_float(unsigned(block.scales[row % 8]) << 16), 3.f);
-        const auto* values = reinterpret_cast<const float4*>(input + group * 32);
-        const float4 a = values[pair], b = values[pair + 4];
-        float dot = fmaf(a.x, float(int((packed >> 0) & 3) * 2 - 3),
-                        a.y * float(int((packed >> 2) & 3) * 2 - 3));
-        dot = fmaf(a.z, float(int((packed >> 4) & 3) * 2 - 3), dot);
-        dot = fmaf(a.w, float(int((packed >> 6) & 3) * 2 - 3), dot);
-        sum = fmaf(dot, scale, sum);
-        dot = fmaf(b.x, float(int((packed >> 8) & 3) * 2 - 3),
-                   b.y * float(int((packed >> 10) & 3) * 2 - 3));
-        dot = fmaf(b.z, float(int((packed >> 12) & 3) * 2 - 3), dot);
-        dot = fmaf(b.w, float(int((packed >> 14) & 3) * 2 - 3), dot);
-        second = fmaf(dot, scale, second);
-    }
-    sum += second;
-    sum += __shfl_down_sync(0xffffffffu, sum, 2, 4);
-    sum += __shfl_down_sync(0xffffffffu, sum, 1, 4);
-    if (!pair) output[row] = sum;
-}
-
 constexpr int screen_rows = 248320;
 constexpr int screen_inner = 2560;
 constexpr int screen_candidates = 1024;
@@ -335,32 +242,6 @@ cudaError_t mollm_cuda::pack_q8_draft_head_compact_fitted(
     if (status != cudaSuccess) return status;
     pack_q8_draft_head_compact_fitted_cuda<<<unsigned(blocks), 128, 0, stream>>>(
         weights, scales, output, rows, inner);
-    return cudaGetLastError();
-}
-
-cudaError_t mollm_cuda::pack_q8_draft_head_q2(
-    const int8_t* weights, const float* scales, Q2DraftG32* output,
-    int rows, int inner, cudaStream_t stream) {
-    if (!weights || !scales || !output || rows <= 0 || rows > INT_MAX - 31 ||
-        rows % 8 || inner <= 0 || inner > 2560 || inner % 32 ||
-        uintptr_t(scales) % alignof(float) || uintptr_t(output) % alignof(Q2DraftG32))
-        return cudaErrorInvalidValue;
-    const size_t blocks = size_t(rows / 4) * (inner / 32);
-    if (blocks > INT_MAX) return cudaErrorInvalidValue;
-    pack_q8_draft_head_q2_cuda<<<unsigned(blocks), 128, 0, stream>>>(
-        weights, scales, output, rows, inner);
-    return cudaGetLastError();
-}
-
-cudaError_t mollm_cuda::launch_q2_draft_head_gemv(
-    const float* input, const Q2DraftG32* weights, float* output,
-    int rows, int inner, cudaStream_t stream) {
-    if (!input || !weights || !output || rows <= 0 || rows > INT_MAX - 31 ||
-        rows % 8 || inner <= 0 || inner > 2560 || inner % 32 ||
-        uintptr_t(input) % 16 || uintptr_t(weights) % alignof(Q2DraftG32) ||
-        uintptr_t(output) % alignof(float)) return cudaErrorInvalidValue;
-    q2_draft_head_gemv_cuda<<<(rows + 31) / 32, 128, size_t(inner) * sizeof(float), stream>>>(
-        input, weights, output, rows, inner);
     return cudaGetLastError();
 }
 

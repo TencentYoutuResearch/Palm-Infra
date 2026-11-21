@@ -7,18 +7,6 @@
 #include <cstddef>
 
 namespace mollm_cuda {
-// Transient CUDA draft cache only; this is not a serialized weight format.
-struct Q2DraftG32 {
-    uint16_t scales[8];
-    uint16_t codes[8][4];
-};
-static_assert(sizeof(Q2DraftG32) == 80);
-// Multiple-of-eight rows, K32 groups, inner<=2560; FP32 input aligned to16.
-cudaError_t pack_q8_draft_head_q2(const int8_t* weights, const float* scales,
-    Q2DraftG32* output, int rows, int inner, cudaStream_t stream);
-cudaError_t launch_q2_draft_head_gemv(const float* input,
-    const Q2DraftG32* weights, float* output, int rows, int inner,
-    cudaStream_t stream);
 // Private approximate draft-head cache; original Q8 remains the target head.
 cudaError_t pack_q8_draft_head_compact(
     const int8_t* weights, const float* scales, Q4CompactG32* output,

@@ -70,7 +70,7 @@ def kernel_family(name):
         return "fp16_expert_projection"
     # Generic projection kernels can serve several model roles. Do not call
     # every Q8 GEMV an LM head without validating its source/window contract.
-    if "q2_draft_head_gemv_cuda" in name or "q4_draft_screen_" in name:
+    if "q4_draft_screen_" in name:
         return "draft_head"
     if "q4_g32_" in name or "q4_g128_" in name:
         return "q4_projection" if "prepare_q4" not in name else "dense_prepare"

@@ -211,24 +211,19 @@ int CudaBackend::lm_head_argmax_device_and_end_graph(
         k>0&&k%32==0&&n<=INT32_MAX-7&&uintptr_t(source)%16==0&&activation_kind==0;
     bool computed=false;
     if(draft_q4) {
-        // Confidence requests need Q4 logits/probabilities; plain greedy drafts
-        // on the qualified shape use the smaller Q2 head.
+        // Confidence requests on the qualified shape use the fitted Q4 head
+        // with energy screening where screened heads are preferred.
         const bool qualified_shape=n==qualified_head_rows&&k==qualified_head_inner;
-        const int bits=!impl_->draft_probability_output&&qualified_shape ? 2 : 4;
-        const bool fitted_q4=bits==4&&impl_->draft_probability_output&&qualified_shape&&
+        const bool fitted_q4=impl_->draft_probability_output&&qualified_shape&&
             impl_->prefer_screened_heads;
-        const auto kind = bits == 2 ? Impl::DraftCompactHeadKind::Q2 :
-            fitted_q4 ? Impl::DraftCompactHeadKind::FittedQ4 : Impl::DraftCompactHeadKind::Q4;
-        const size_t block_bytes=bits==2 ? sizeof(mollm_cuda::Q2DraftG32) : sizeof(mollm_cuda::Q4CompactG32);
-        const size_t bytes=size_t((n+7)/8)*(k/32)*block_bytes;
+        const auto kind = fitted_q4 ? Impl::DraftCompactHeadKind::FittedQ4 :
+            Impl::DraftCompactHeadKind::Q4;
+        const size_t bytes=size_t((n+7)/8)*(k/32)*sizeof(mollm_cuda::Q4CompactG32);
         if(!impl_->reserve(impl_->draft_q4_head,impl_->draft_q4_head_bytes,bytes,true)) {impl_->failed=true;return -1;}
         if(impl_->draft_q4_head_source!=prepared->data||impl_->draft_q4_rows!=n||
            impl_->draft_q4_inner!=k||impl_->draft_compact_head_kind!=kind) {
             cudaError_t status;
-            if (bits == 2) status = mollm_cuda::pack_q8_draft_head_q2(
-                static_cast<const int8_t*>(prepared->data), prepared->scales,
-                static_cast<mollm_cuda::Q2DraftG32*>(impl_->draft_q4_head), n, k, cudaStreamPerThread);
-            else if (fitted_q4) status = mollm_cuda::pack_q8_draft_head_compact_fitted(
+            if (fitted_q4) status = mollm_cuda::pack_q8_draft_head_compact_fitted(
                 static_cast<const int8_t*>(prepared->data), prepared->scales,
                 static_cast<mollm_cuda::Q4CompactG32*>(impl_->draft_q4_head), n, k, cudaStreamPerThread);
             else status = mollm_cuda::pack_q8_draft_head_compact(
@@ -238,49 +233,44 @@ int CudaBackend::lm_head_argmax_device_and_end_graph(
             impl_->draft_q4_head_source=prepared->data;impl_->draft_q4_rows=n;impl_->draft_q4_inner=k;
             impl_->draft_compact_head_kind=kind;
         }
-        if(bits==2) computed=mollm_cuda::report_cuda(mollm_cuda::launch_q2_draft_head_gemv(
-            source,static_cast<const mollm_cuda::Q2DraftG32*>(impl_->draft_q4_head),
-            static_cast<float*>(impl_->output),n,k,cudaStreamPerThread),"Q2 draft head");
-        else {
-            if (fitted_q4) {
-                // Fitted Q4 implies a probability request on the qualified
-                // shape. Scratch persists across eager draft calls.
-                constexpr size_t array_bytes = size_t(qualified_head_rows) * sizeof(float);
-                constexpr size_t bytes = array_bytes * 4 + 32 * sizeof(int);
-                if (!impl_->reserve(impl_->draft_screen_scratch,
-                        impl_->draft_screen_scratch_bytes, bytes, true)) {impl_->failed=true;return -1;}
-                auto* base = static_cast<char*>(impl_->draft_screen_scratch);
-                mollm_cuda::DraftHeadScreenScratch scratch{
-                    reinterpret_cast<float*>(base), reinterpret_cast<float*>(base + array_bytes),
-                    reinterpret_cast<int*>(base + array_bytes * 2),
-                    reinterpret_cast<int*>(base + array_bytes * 3),
-                    reinterpret_cast<int*>(base + array_bytes * 4),
-                    impl_->draft_screen_sort, impl_->draft_screen_sort_bytes};
-                if (!impl_->draft_screen_initialized) {
-                    size_t required = 0;
-                    if (!mollm_cuda::report_cuda(
-                            mollm_cuda::draft_head_screen_temp_bytes(scratch, required),
-                            "draft energy screen scratch query") ||
-                        !impl_->reserve(impl_->draft_screen_sort,
-                            impl_->draft_screen_sort_bytes, required, true)) {impl_->failed=true;return -1;}
-                    scratch.sort_temp = impl_->draft_screen_sort;
-                    scratch.sort_bytes = impl_->draft_screen_sort_bytes;
-                    if (!mollm_cuda::report_cuda(
-                            mollm_cuda::initialize_draft_head_screen(scratch, cudaStreamPerThread),
-                            "draft energy screen initialize")) {impl_->failed=true;return -1;}
-                    impl_->draft_screen_initialized = true;
-                }
-                computed = mollm_cuda::report_cuda(mollm_cuda::launch_draft_head_screen(
-                    source, static_cast<const mollm_cuda::Q4CompactG32*>(impl_->draft_q4_head),
-                    static_cast<float*>(impl_->output), n, k, scratch, cudaStreamPerThread,
-                    draft_energy_screen_groups),
-                    "draft energy screen");
-                if (computed) ++impl_->draft_screen_calls;
-            } else {
-                mollm_cuda::launch_q4_g32_compact_gemv(source,static_cast<const mollm_cuda::Q4CompactG32*>(impl_->draft_q4_head),
-                    static_cast<float*>(impl_->output),n,k,cudaStreamPerThread);
-                computed=mollm_cuda::report_cuda(cudaGetLastError(),"Q4 draft head");
+        if (fitted_q4) {
+            // Fitted Q4 implies a probability request on the qualified
+            // shape. Scratch persists across eager draft calls.
+            constexpr size_t array_bytes = size_t(qualified_head_rows) * sizeof(float);
+            constexpr size_t bytes = array_bytes * 4 + 32 * sizeof(int);
+            if (!impl_->reserve(impl_->draft_screen_scratch,
+                    impl_->draft_screen_scratch_bytes, bytes, true)) {impl_->failed=true;return -1;}
+            auto* base = static_cast<char*>(impl_->draft_screen_scratch);
+            mollm_cuda::DraftHeadScreenScratch scratch{
+                reinterpret_cast<float*>(base), reinterpret_cast<float*>(base + array_bytes),
+                reinterpret_cast<int*>(base + array_bytes * 2),
+                reinterpret_cast<int*>(base + array_bytes * 3),
+                reinterpret_cast<int*>(base + array_bytes * 4),
+                impl_->draft_screen_sort, impl_->draft_screen_sort_bytes};
+            if (!impl_->draft_screen_initialized) {
+                size_t required = 0;
+                if (!mollm_cuda::report_cuda(
+                        mollm_cuda::draft_head_screen_temp_bytes(scratch, required),
+                        "draft energy screen scratch query") ||
+                    !impl_->reserve(impl_->draft_screen_sort,
+                        impl_->draft_screen_sort_bytes, required, true)) {impl_->failed=true;return -1;}
+                scratch.sort_temp = impl_->draft_screen_sort;
+                scratch.sort_bytes = impl_->draft_screen_sort_bytes;
+                if (!mollm_cuda::report_cuda(
+                        mollm_cuda::initialize_draft_head_screen(scratch, cudaStreamPerThread),
+                        "draft energy screen initialize")) {impl_->failed=true;return -1;}
+                impl_->draft_screen_initialized = true;
             }
+            computed = mollm_cuda::report_cuda(mollm_cuda::launch_draft_head_screen(
+                source, static_cast<const mollm_cuda::Q4CompactG32*>(impl_->draft_q4_head),
+                static_cast<float*>(impl_->output), n, k, scratch, cudaStreamPerThread,
+                draft_energy_screen_groups),
+                "draft energy screen");
+            if (computed) ++impl_->draft_screen_calls;
+        } else {
+            mollm_cuda::launch_q4_g32_compact_gemv(source,static_cast<const mollm_cuda::Q4CompactG32*>(impl_->draft_q4_head),
+                static_cast<float*>(impl_->output),n,k,cudaStreamPerThread);
+            computed=mollm_cuda::report_cuda(cudaGetLastError(),"Q4 draft head");
         }
     } else if(screen) {
         // The qualified shape uses the smaller Q4 screen; others keep Q6.

@@ -40,7 +40,6 @@ struct CudaBackend::Impl {
 
     enum class DraftCompactHeadKind : int {
         None = 0,
-        Q2 = 2,
         Q4 = 4,
         FittedQ4 = 0x104,
     };

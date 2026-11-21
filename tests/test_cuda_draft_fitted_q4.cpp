@@ -195,8 +195,10 @@ void test_backend() {
             "original target starts exact");
     const int active_rows = screened ? 1024 : rows;
     for (int repeat = 0; repeat < 2; ++repeat) {
-        require(backend.lm_head_draft_argmax_device_and_end_graph(input, 0, weight, rows, inner) == 1,
-                "no-probability Q2 cache restored");
+        // Without a probability request every device drafts with legacy Q4,
+        // which ties the fixture rows and keeps the first.
+        require(backend.lm_head_draft_argmax_device_and_end_graph(input, 0, weight, rows, inner) == 0,
+                "no-probability legacy Q4 cache restored");
         float probability = -99.f;
         require(backend.lm_head_draft_argmax_device_and_end_graph(
                     input, 0, weight, rows, inner, 0, nullptr, &probability) == expected,
