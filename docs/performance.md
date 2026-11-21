@@ -88,6 +88,21 @@ This reproduces the earlier approximately 59.5 tok/s result within ordinary
 run-to-run variation. It does not establish a speedup for every prompt, draft
 depth, or acceptance distribution.
 
+MTP decode throughput follows the draft acceptance rate of the prompt; base
+decode does not draft. The 1759-token prompt above accepts 88% of
+drafted tokens. The repository prompt
+`tests/data/qwen38_cuda_prefill_engineering_long.txt` (1743 tokens) accepts
+71.9% on 2026-11-21 with the same settings:
+
+| Measurement | Base | QSA + MTP |
+| --- | ---: | ---: |
+| Decode tok/s | 40.7 | 50.0 |
+| MTP steps for 512 tokens | – | 184 |
+
+Each value is the mean of three model loads. An MTP step costs 55–58 ms
+with either prompt; the MTP gap comes from fewer accepted tokens per step.
+Use this prompt when the original one is unavailable.
+
 ## Reproducing a benchmark
 
 Use `mollm_bench` with the same package, companions, prompt, and policy as the
