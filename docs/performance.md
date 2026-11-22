@@ -118,14 +118,15 @@ tok/s is `1000 / tpot_ms` from one model load:
 
 | Draft tokens | Accepted | GB10 (SM121) | RTX 4060 Ti (SM89) |
 | --- | ---: | ---: | ---: |
-| Base | – | 53.2 | 90.2 |
-| 1 | 65.6% | 63.6 | 99.9 |
-| 2 | 55.4% | 66.1 | 92.6 |
-| 3 | 41.5% | 58.4 | 75.8 |
+| Base | – | 55.1 | 98.9 |
+| 1 | 65.6% | 67.2 | 112.7 |
+| 2 | 55.4% | 70.4 | 105.3 |
+| 3 | 41.5% | 63.3 | 86.8 |
 
-Every run on both devices generated the same 256 tokens. Verification
-batches cost more than one decode step, so deeper drafts pay off only with
-higher acceptance; one draft token is the better setting on the 4060 Ti.
+Every run on both devices generated the same 256 tokens. A verification
+batch costs slightly more than one decode step and each draft token adds a
+draft-layer pass, so deeper drafts pay off only with higher acceptance; one
+draft token is the better setting on the 4060 Ti.
 
 ## Reproducing a benchmark
 
