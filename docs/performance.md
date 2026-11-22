@@ -128,6 +128,21 @@ batch costs slightly more than one decode step and each draft token adds a
 draft-layer pass, so deeper drafts pay off only with higher acceptance; one
 draft token is the better setting on the 4060 Ti.
 
+### Qwen3.5-35B-A3B MoE MTP
+
+The same settings with a `w4g128` package on GB10, whose experts are read
+in place from the package mapping:
+
+| Draft tokens | Accepted | Decode tok/s |
+| --- | ---: | ---: |
+| Base | – | 68.4 |
+| 1 | 86.1% | 81.0 |
+| 2 | 74.1% | 83.3 |
+| 3 | 68.4% | 82.5 |
+
+Every run generated the same 256 tokens. The package needs about 19 GB of
+memory, more than the RTX 4060 Ti has.
+
 ## Reproducing a benchmark
 
 Use `mollm_bench` with the same package, companions, prompt, and policy as the

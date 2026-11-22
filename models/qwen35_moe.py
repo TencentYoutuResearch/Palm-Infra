@@ -26,8 +26,12 @@ from transpile import (
 )
 from model_metadata import infer_hf_model_name
 from qwen35 import (
-    _build_full_attn_layer, _build_linear_attn_layer,
-    _query_then_gate_rows, _w4mix_promote_to_w8,
+    _MTP_LAYER_OUTPUT, _build_full_attn_layer, _build_linear_attn_layer,
+    _build_mtp_inputs, _mtp_shared_streamed_weights, _mtp_text_config,
+    _query_then_gate_rows, _rename_mtp_layer_weights, _w4mix_promote_to_w8,
+)
+from safetensors_stream import (
+    SafeTensorIndex, aggregate_fp16_experts, dense_streamed_weight,
 )
 
 
@@ -538,6 +542,59 @@ def _build_layer(g, x, layer_idx, weights_dir, tc,
                     intermediate_size=moe_intermediate,
                     shared_intermediate_size=shared_intermediate)
     return g.add(x, mlp_out)
+
+
+def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 8,
+                    n_ctx: int = 4096) -> GraphBuilder:
+    """Build the single-layer Qwen3.5-MoE draft; weights live in a bundle.
+
+    The draft layer is a full-attention MoE layer with its own router, routed
+    experts and shared expert. Its ``mtp.norm`` output feeds both the shared
+    lm_head and the next recursive draft step.
+    """
+    tc = _mtp_text_config(cfg)
+    hidden_size = tc["hidden_size"]
+    eps = tc.get("rms_norm_eps", 1e-6)
+    g = GraphBuilder()
+    inputs = _build_mtp_inputs(g, weights_dir, tc, seq_len, n_ctx, "qwen3_5_moe")
+    x = _build_layer(g, inputs["x"], 0, weights_dir, tc,
+                     inputs["cos"], inputs["sin"], inputs["mask"],
+                     inputs["cache_k"], inputs["cache_v"], None, None,
+                     eps, seq_len, inputs["rope_dim"],
+                     tc["num_attention_heads"], tc["num_key_value_heads"], tc["head_dim"],
+                     0, 0, 0, 0, 0, hidden_size, "full_attention",
+                     tc["moe_intermediate_size"], tc["shared_expert_intermediate_size"],
+                     tc["num_experts"], tc["num_experts_per_tok"], is_prefill=True)
+    norm = g.weight(os.path.join(weights_dir, "mtp_norm_weight.weights"),
+                    (hidden_size,), Precision.FP32)
+    g.rms_norm(x, norm, eps=eps)
+    return _rename_mtp_layer_weights(g)
+
+
+def build_mtp_streamed_weights(model_dir: str | Path, cfg: dict) -> dict:
+    """MoE MTP-only FP16/FP32 weights, excluding the shared embedding and head.
+
+    The checkpoint stores draft experts one tensor per projection; aggregate
+    them into the expert-major layout the target layers use.
+    """
+    tc = _mtp_text_config(cfg)
+    index = SafeTensorIndex(model_dir)
+    base = "mtp.layers.0.mlp"
+    out = f"./{_MTP_LAYER_OUTPUT}mlp"
+    experts = range(tc["num_experts"])
+    weights = _mtp_shared_streamed_weights(index, tc)
+    weights[f"{out}_gate_weight.weights"] = dense_streamed_weight(index, f"{base}.gate.weight")
+    weights[f"{out}_experts_gate_up_proj.weights"] = aggregate_fp16_experts(index, [
+        [f"{base}.experts.{e}.gate_proj.weight", f"{base}.experts.{e}.up_proj.weight"]
+        for e in experts])
+    weights[f"{out}_experts_down_proj.weights"] = aggregate_fp16_experts(
+        index, [[f"{base}.experts.{e}.down_proj.weight"] for e in experts])
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        weights[f"{out}_shared_expert_{name}_weight.weights"] = dense_streamed_weight(
+            index, f"{base}.shared_expert.{name}.weight")
+    weights[f"{out}_shared_expert_gate_weight.weights"] = dense_streamed_weight(
+        index, f"{base}.shared_expert_gate.weight")
+    return weights
 
 
 def convert_qwen35_moe(model_dir: str, output_path: str, num_layers: int | None = None,

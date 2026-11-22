@@ -462,8 +462,10 @@ verifies every token with its original weights. With
 workspaces. See
 [measured results and limitations](docs/performance.md).
 
-**Qwen3.5 dense** packages (tested with Qwen3.5-4B W4G128) run natively on
-CUDA and can draft with the checkpoint's MTP layer. Export the companion from
+**Qwen3.5** dense and MoE packages (tested with Qwen3.5-4B and
+Qwen3.5-35B-A3B W4G128) run natively on CUDA and can draft with the
+checkpoint's MTP layer. GB10 reads W4G128 experts in place; other GPUs copy
+them when they fit and otherwise keep the CPU MoE. Export the companion from
 the same checkpoint as the package; its `--n-ctx` must cover the runtime
 context:
 

@@ -434,9 +434,11 @@ draft，并用设备端 checkpoint 和逐 token 的 recurrent state 快照完成
 token 都由 target 模型用原始权重验证。使用 `-DMOLLM_CUDA_DECODE_SEGMENTS=ON` 构建时，验证批次还会复用缓存的
 workspace。测量结果与限制见[性能说明](docs/performance.md)。
 
-**Qwen3.5 dense** package（已用 Qwen3.5-4B W4G128 测试）在 CUDA 上全部 native
-执行，并可用 checkpoint 自带的 MTP 层做 draft。companion 需从与 package 相同的
-checkpoint 导出，其 `--n-ctx` 必须覆盖运行时 context：
+**Qwen3.5** 的 dense 与 MoE package（已用 Qwen3.5-4B 与 Qwen3.5-35B-A3B W4G128
+测试）在 CUDA 上全部 native 执行，并可用 checkpoint 自带的 MTP 层做 draft。GB10
+直接读取原位的 W4G128 expert；其他 GPU 在显存放得下时复制 expert，否则保留 CPU
+MoE。companion 需从与 package 相同的 checkpoint 导出，其 `--n-ctx` 必须覆盖运行时
+context：
 
 ```bash
 python3 models/converter.py /path/to/Qwen3.5-4B ../qwen35_4b_w4g128.mollm w4g128

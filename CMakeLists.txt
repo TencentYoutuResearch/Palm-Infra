@@ -1642,6 +1642,7 @@ if(MOLLM_BUILD_TESTS)
                               test_qwen3_moe_graph.py)
         add_mollm_python_test(test_qwen35_graph
                               test_qwen35_graph.py)
+        add_mollm_python_test(test_qwen35_mtp test_qwen35_mtp.py)
         add_mollm_python_test(test_qwen4_exp_graph
                               test_qwen4_exp_graph.py)
         add_mollm_python_test(test_hy4_graph

@@ -538,30 +538,24 @@ def _mtp_text_config(cfg: dict) -> dict:
     return tc
 
 
-def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 8,
-                    n_ctx: int = 4096) -> GraphBuilder:
-    """Build the single-layer Qwen3.5 draft; weights live in a companion bundle.
+def _build_mtp_inputs(g: GraphBuilder, weights_dir: str, tc: dict,
+                      seq_len: int, n_ctx: int, model_type: str) -> dict:
+    """Declare the draft inputs shared by dense and MoE Qwen3.5 drafts.
 
     The draft normalizes the token embedding and the target's final hidden
-    state, projects each half of the checkpoint's fused ``mtp.fc``, runs one
-    full-attention layer, and emits the ``mtp.norm`` state that feeds both the
-    shared lm_head and the next recursive draft step.
+    state and projects each half of the checkpoint's fused ``mtp.fc``. The
+    returned ``x`` is the residual stream entering the single draft layer.
     """
-    tc = _mtp_text_config(cfg)
     if seq_len < 1 or n_ctx < 1:
         raise ValueError("Qwen3.5 MTP needs positive sequence and context lengths")
     hidden_size = tc['hidden_size']
     eps = tc.get('rms_norm_eps', 1e-6)
-    rope_theta = tc['rope_parameters']['rope_theta']
     head_dim = tc['head_dim']
     rope_dim = int(head_dim * tc['rope_parameters']['partial_rotary_factor'])
-    num_heads = tc['num_attention_heads']
-    num_kv_heads = tc['num_key_value_heads']
-
-    g = GraphBuilder()
     g.set_model_config(
-        rope_dim=rope_dim, rope_theta=rope_theta, hidden_size=hidden_size,
-        num_layers=1, vocab_size=tc['vocab_size'], model_type='qwen3_5')
+        rope_dim=rope_dim, rope_theta=tc['rope_parameters']['rope_theta'],
+        hidden_size=hidden_size, num_layers=1, vocab_size=tc['vocab_size'],
+        model_type=model_type)
     embed_shape = (tc['vocab_size'], hidden_size)
     g.weight(os.path.join(weights_dir, "embed_tokens.weights"), embed_shape, Precision.FP16)
     g.weight(os.path.join(weights_dir, "lm_head.weights"), embed_shape, Precision.FP16)
@@ -571,34 +565,32 @@ def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 8,
 
     const, seq = DimExpr.const(), DimExpr.seq()
     dynamic = (const, seq, const, const)
-    hidden = g.input('hidden', (hidden_size, seq_len), dynamic=dynamic)
-    mask = g.input('mask', (1, seq_len), dynamic=dynamic)
-    cos = g.input('cos', (rope_dim // 2, seq_len), dynamic=dynamic)
-    sin = g.input('sin', (rope_dim // 2, seq_len), dynamic=dynamic)
-    cache_k = g.input('cache_k0', (head_dim, n_ctx, num_kv_heads), prec=Precision.FP16)
-    cache_v = g.input('cache_v0', (head_dim, n_ctx, num_kv_heads), prec=Precision.FP16)
+    inputs = {
+        'hidden': g.input('hidden', (hidden_size, seq_len), dynamic=dynamic),
+        'mask': g.input('mask', (1, seq_len), dynamic=dynamic),
+        'cos': g.input('cos', (rope_dim // 2, seq_len), dynamic=dynamic),
+        'sin': g.input('sin', (rope_dim // 2, seq_len), dynamic=dynamic),
+        'cache_k': g.input('cache_k0', (head_dim, n_ctx, tc['num_key_value_heads']),
+                           prec=Precision.FP16),
+        'cache_v': g.input('cache_v0', (head_dim, n_ctx, tc['num_key_value_heads']),
+                           prec=Precision.FP16),
+    }
     target_hidden = g.input('target_hidden', (hidden_size, seq_len), dynamic=dynamic)
-
     embedding = g.matmul(
-        g.rms_norm(hidden, weight("mtp_pre_fc_norm_embedding_weight",
-                                  (hidden_size,), Precision.FP32), eps=eps),
+        g.rms_norm(inputs['hidden'], weight("mtp_pre_fc_norm_embedding_weight",
+                                            (hidden_size,), Precision.FP32), eps=eps),
         weight("mtp_fc_embedding_weight", (hidden_size, hidden_size)))
     projected = g.matmul(
         g.rms_norm(target_hidden, weight("mtp_pre_fc_norm_hidden_weight",
                                          (hidden_size,), Precision.FP32), eps=eps),
         weight("mtp_fc_hidden_weight", (hidden_size, hidden_size)))
-    x = g.add(embedding, projected)
-    x_normed = g.rms_norm(x, weight(f"{_MTP_LAYER_PREFIX}input_layernorm_weight",
-                                    (hidden_size,), Precision.FP32), eps=eps)
-    _build_layer(
-        g, x, x_normed,
-        weight(f"{_MTP_LAYER_PREFIX}post_attention_layernorm_weight",
-               (hidden_size,), Precision.FP32),
-        weight("mtp_norm_weight", (hidden_size,), Precision.FP32),
-        0, weights_dir, cos, sin, mask, cache_k, cache_v, None, None,
-        eps, seq_len, rope_dim, rope_theta, num_heads, num_kv_heads, head_dim,
-        0, 0, 0, 0, 0, tc['intermediate_size'], hidden_size, 'full_attention',
-        is_prefill=True)
+    inputs['x'] = g.add(embedding, projected)
+    inputs['rope_dim'] = rope_dim
+    return inputs
+
+
+def _rename_mtp_layer_weights(g: GraphBuilder) -> GraphBuilder:
+    """Point the reused layer-0 builders at the bundle's draft-layer weights."""
     for node in g._nodes:
         if node.weight_path:
             node.weight_path = node.weight_path.replace(_MTP_LAYER_PREFIX, _MTP_LAYER_OUTPUT)
@@ -607,15 +599,43 @@ def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 8,
     return g
 
 
-def build_mtp_streamed_weights(model_dir: str | Path, cfg: dict) -> dict:
-    """MTP-only FP16/FP32 weights, excluding the shared embedding and head."""
+def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 8,
+                    n_ctx: int = 4096) -> GraphBuilder:
+    """Build the single-layer dense Qwen3.5 draft; weights live in a bundle.
+
+    One full-attention layer follows the fused inputs and emits the
+    ``mtp.norm`` state that feeds both the shared lm_head and the next
+    recursive draft step.
+    """
     tc = _mtp_text_config(cfg)
+    hidden_size = tc['hidden_size']
+    eps = tc.get('rms_norm_eps', 1e-6)
+    g = GraphBuilder()
+    inputs = _build_mtp_inputs(g, weights_dir, tc, seq_len, n_ctx, 'qwen3_5')
+
+    def weight(name: str) -> int:
+        return g.weight(os.path.join(weights_dir, f"{name}.weights"),
+                        (hidden_size,), Precision.FP32)
+
+    x = inputs['x']
+    x_normed = g.rms_norm(x, weight(f"{_MTP_LAYER_PREFIX}input_layernorm_weight"), eps=eps)
+    _build_layer(
+        g, x, x_normed, weight(f"{_MTP_LAYER_PREFIX}post_attention_layernorm_weight"),
+        weight("mtp_norm_weight"), 0, weights_dir,
+        inputs['cos'], inputs['sin'], inputs['mask'], inputs['cache_k'], inputs['cache_v'],
+        None, None, eps, seq_len, inputs['rope_dim'], tc['rope_parameters']['rope_theta'],
+        tc['num_attention_heads'], tc['num_key_value_heads'], tc['head_dim'],
+        0, 0, 0, 0, 0, tc['intermediate_size'], hidden_size, 'full_attention',
+        is_prefill=True)
+    return _rename_mtp_layer_weights(g)
+
+
+def _mtp_shared_streamed_weights(index: SafeTensorIndex, tc: dict) -> dict:
+    """Draft weights common to dense and MoE checkpoints: norms, attention, fc."""
     hidden_size = tc['hidden_size']
     num_heads = tc['num_attention_heads']
     head_dim = tc['head_dim']
     kv_dim = tc['num_key_value_heads'] * head_dim
-    intermediate = tc['intermediate_size']
-    index = SafeTensorIndex(model_dir)
     base = "mtp.layers.0"
     weights = {}
 
@@ -638,15 +658,25 @@ def build_mtp_streamed_weights(model_dir: str | Path, cfg: dict) -> dict:
         index, rows, (2 * num_heads * head_dim + 2 * kv_dim, hidden_size)))
     put(f"{_MTP_LAYER_OUTPUT}self_attn_o_proj_weight",
         dense_streamed_weight(index, f"{base}.self_attn.o_proj.weight"))
-    put(f"{_MTP_LAYER_OUTPUT}mlp_gate_up_proj_weight", concatenate_fp16_streamed_weights(
-        index, [f"{base}.mlp.gate_proj.weight", f"{base}.mlp.up_proj.weight"],
-        (2 * intermediate, hidden_size)))
-    put(f"{_MTP_LAYER_OUTPUT}mlp_down_proj_weight",
-        dense_streamed_weight(index, f"{base}.mlp.down_proj.weight"))
     # mtp.fc consumes cat(embedding, target hidden); split its input columns.
     for part, column in (("embedding", 0), ("hidden", hidden_size)):
         put(f"mtp_fc_{part}_weight", fp16_column_slice_streamed_weight(
             index, "mtp.fc.weight", column, hidden_size))
+    return weights
+
+
+def build_mtp_streamed_weights(model_dir: str | Path, cfg: dict) -> dict:
+    """Dense MTP-only FP16/FP32 weights, excluding the shared embedding and head."""
+    tc = _mtp_text_config(cfg)
+    index = SafeTensorIndex(model_dir)
+    base = "mtp.layers.0.mlp"
+    weights = _mtp_shared_streamed_weights(index, tc)
+    weights[f"./{_MTP_LAYER_OUTPUT}mlp_gate_up_proj_weight.weights"] = (
+        concatenate_fp16_streamed_weights(
+            index, [f"{base}.gate_proj.weight", f"{base}.up_proj.weight"],
+            (2 * tc['intermediate_size'], tc['hidden_size'])))
+    weights[f"./{_MTP_LAYER_OUTPUT}mlp_down_proj_weight.weights"] = (
+        dense_streamed_weight(index, f"{base}.down_proj.weight"))
     return weights
 
 

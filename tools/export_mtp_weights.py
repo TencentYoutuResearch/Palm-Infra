@@ -20,12 +20,14 @@ def mtp_builders(cfg: dict, enable_qsa: bool):
                     ".", cfg, seq_len, n_ctx, enable_qsa=enable_qsa),
                 lambda model_dir: qwen4_exp.build_mtp_streamed_weights(
                     model_dir, cfg, enable_qsa=enable_qsa))
-    if model_type == "qwen3_5":
+    if model_type in ("qwen3_5", "qwen3_5_moe"):
         if enable_qsa:
             raise ValueError("Qwen3.5 has no QSA indexer")
         import qwen35
-        return (lambda seq_len, n_ctx: qwen35.build_mtp_graph(".", cfg, seq_len, n_ctx),
-                lambda model_dir: qwen35.build_mtp_streamed_weights(model_dir, cfg))
+        import qwen35_moe
+        module = qwen35 if model_type == "qwen3_5" else qwen35_moe
+        return (lambda seq_len, n_ctx: module.build_mtp_graph(".", cfg, seq_len, n_ctx),
+                lambda model_dir: module.build_mtp_streamed_weights(model_dir, cfg))
     raise ValueError(f"no MTP exporter for model_type={model_type!r}")
 
 

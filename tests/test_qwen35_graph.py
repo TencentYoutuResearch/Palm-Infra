@@ -1,22 +1,12 @@
 #!/usr/bin/env python3
 """Structural tests for the Qwen3.5 graph builder."""
 
-import io
-import json
 import os
-import struct
 import sys
-import tempfile
-from pathlib import Path
-
-import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "models"))
 
-from qwen35 import (
-    _query_then_gate_rows, build_graph, build_mtp_graph,
-    build_mtp_streamed_weights,
-)
+from qwen35 import build_graph
 from transpile import OpType
 
 
@@ -51,106 +41,7 @@ def tiny_cfg(layer_type="linear_attention"):
     }
 
 
-def mtp_cfg():
-    cfg = tiny_cfg("full_attention")
-    cfg["text_config"]["mtp_num_hidden_layers"] = 1
-    return cfg
-
-
-def write_safetensors(path: Path, tensors: dict[str, np.ndarray]) -> None:
-    header = {}
-    payload = b""
-    for name, array in tensors.items():
-        data = np.ascontiguousarray(array, dtype=np.float16).tobytes()
-        header[name] = {"dtype": "F16", "shape": list(array.shape),
-                        "data_offsets": [len(payload), len(payload) + len(data)]}
-        payload += data
-    encoded = json.dumps(header).encode()
-    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
-
-
-def streamed_array(weight, dtype) -> np.ndarray:
-    output = io.BytesIO()
-    weight.write_to(output)
-    return np.frombuffer(output.getvalue()[88:], dtype=dtype).reshape(weight.logical_shape)
-
-
-def check_mtp_graph():
-    graph = build_mtp_graph(".", mtp_cfg(), seq_len=8, n_ctx=64)
-    inputs = [node.params_str[0] for node in graph._nodes if node.op_type == OpType.INPUT]
-    check(inputs == ["hidden", "mask", "cos", "sin", "cache_k0", "cache_v0", "target_hidden"],
-          "Qwen3.5 MTP graph exposes the engine's draft inputs")
-    references = {node.weight_path for node in graph._nodes if node.weight_path}
-    check(not any("model_language_model" in name for name in references),
-          "MTP weights never alias target layer weights")
-    check({"./embed_tokens.weights", "./lm_head.weights"} <= references,
-          "MTP graph shares the target embedding and head")
-    consumed = {i for node in graph._nodes for i in node.inputs}
-    outputs = [node for node in graph._nodes
-               if node.id not in consumed and node.op_type not in (OpType.INPUT, OpType.CONSTANT)]
-    check(outputs[-1].op_type == OpType.ADD_RMS_NORM and outputs[-1].out_shape[0] == 16,
-          "MTP graph ends with the mtp.norm state")
-    try:
-        build_mtp_graph(".", tiny_cfg("full_attention"))
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("Qwen3.5 MTP export requires a declared draft layer")
-
-
-def check_mtp_weights():
-    cfg = mtp_cfg()
-    tc = cfg["text_config"]
-    hidden, heads, head_dim = tc["hidden_size"], tc["num_attention_heads"], tc["head_dim"]
-    kv = tc["num_key_value_heads"] * head_dim
-    rng = np.random.default_rng(7)
-    def tensor(*shape):
-        return rng.standard_normal(shape).astype(np.float16)
-    base = "mtp.layers.0"
-    tensors = {
-        "mtp.fc.weight": tensor(hidden, 2 * hidden),
-        f"{base}.self_attn.q_proj.weight": tensor(2 * heads * head_dim, hidden),
-        f"{base}.self_attn.k_proj.weight": tensor(kv, hidden),
-        f"{base}.self_attn.v_proj.weight": tensor(kv, hidden),
-        f"{base}.self_attn.o_proj.weight": tensor(hidden, heads * head_dim),
-        f"{base}.self_attn.q_norm.weight": tensor(head_dim),
-        f"{base}.self_attn.k_norm.weight": tensor(head_dim),
-        f"{base}.mlp.gate_proj.weight": tensor(tc["intermediate_size"], hidden),
-        f"{base}.mlp.up_proj.weight": tensor(tc["intermediate_size"], hidden),
-        f"{base}.mlp.down_proj.weight": tensor(hidden, tc["intermediate_size"]),
-    }
-    for name in ("mtp.pre_fc_norm_embedding", "mtp.pre_fc_norm_hidden", "mtp.norm",
-                 f"{base}.input_layernorm", f"{base}.post_attention_layernorm"):
-        tensors[f"{name}.weight"] = tensor(hidden)
-    with tempfile.TemporaryDirectory() as directory:
-        write_safetensors(Path(directory) / "model.safetensors", tensors)
-        weights = build_mtp_streamed_weights(directory, cfg)
-        graph = build_mtp_graph(".", cfg)
-        dedicated = {node.weight_path for node in graph._nodes if node.weight_path} - {
-            "./embed_tokens.weights", "./lm_head.weights"}
-        check(set(weights) == dedicated, "MTP weights match the graph references exactly")
-        def get(name, dtype=np.float16):
-            return streamed_array(weights[f"./{name}.weights"], dtype)
-        qkv = np.concatenate([
-            _query_then_gate_rows(tensors[f"{base}.self_attn.q_proj.weight"], heads, head_dim),
-            tensors[f"{base}.self_attn.k_proj.weight"], tensors[f"{base}.self_attn.v_proj.weight"]])
-        check(np.array_equal(get("mtp_layers_0_self_attn_qkv_proj_weight"), qkv),
-              "MTP Q/K/V rows follow the target query-then-gate layout")
-        fc = tensors["mtp.fc.weight"]
-        check(np.array_equal(get("mtp_fc_embedding_weight"), fc[:, :hidden]) and
-              np.array_equal(get("mtp_fc_hidden_weight"), fc[:, hidden:]),
-              "mtp.fc splits into its embedding and hidden input columns")
-        check(np.array_equal(get("mtp_layers_0_mlp_gate_up_proj_weight"), np.concatenate([
-                  tensors[f"{base}.mlp.gate_proj.weight"], tensors[f"{base}.mlp.up_proj.weight"]])),
-              "MTP MLP stores gate rows before up rows")
-        check(np.array_equal(get("mtp_norm_weight", np.float32),
-                             tensors["mtp.norm.weight"].astype(np.float32) + 1.0),
-              "MTP norms store the effective 1 + gamma scale")
-
-
 def main():
-    check_mtp_graph()
-    check_mtp_weights()
     graph = build_graph(
         ".", tiny_cfg(), seq_len=8, n_ctx=64, is_prefill=True
     )
