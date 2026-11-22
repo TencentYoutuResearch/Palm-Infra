@@ -1,4 +1,5 @@
 #include "kernels/cuda/moe.h"
+#include "core/quant_layouts.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -70,6 +71,39 @@ __global__ void fp16_expert_projections_cuda(
     float sum = 0;
     for (int k = lane; k < inner; k += 32)
         sum = fmaf(__half2float(weight[k]), job.input[k], sum);
+    for (int distance = 16; distance; distance >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, distance);
+    if (lane == 0) job.output[row] = sum;
+}
+
+__device__ __forceinline__ int q4_signed_nibble(uint8_t value) {
+    const int nibble = value & 0x0f;
+    return nibble >= 8 ? nibble - 16 : nibble;
+}
+
+// W4G128 expert-major rows. Each route is computed on its own with the dense
+// decode GEMV's lane assignment and reduction, so a route's result does not
+// depend on how many tokens share the launch.
+__global__ void q4_g128_expert_projections_cuda(
+    const mollm_cuda::Nvfp4Projection* jobs, int rows, int inner) {
+    const auto job = jobs[blockIdx.y];
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= rows) return;
+    const auto* weight = reinterpret_cast<const Q4B8G128Block*>(job.weight);
+    const int groups = inner / 128;
+    const int row_lane = row & 7;
+    float sum = 0.0f;
+    for (int group = 0; group < groups; ++group) {
+        const auto& block = weight[static_cast<size_t>(row / 8) * groups + group];
+        const float scale = block.scales[row_lane];
+        for (int subgroup = 0; subgroup < 4; ++subgroup) {
+            const uint8_t packed = block.q[subgroup][row_lane][lane / 2];
+            const int k = group * 128 + subgroup * 32 + lane;
+            sum += job.input[k] *
+                q4_signed_nibble(lane & 1 ? packed >> 4 : packed) * scale;
+        }
+    }
     for (int distance = 16; distance; distance >>= 1)
         sum += __shfl_down_sync(0xffffffffu, sum, distance);
     if (lane == 0) job.output[row] = sum;
@@ -2313,6 +2347,15 @@ cudaError_t launch_fp16_expert_projections(const Nvfp4Projection* jobs,
         (count && !jobs)) return cudaErrorInvalidValue;
     if (!count) return cudaSuccess;
     fp16_expert_projections_cuda<<<dim3((rows + 7) / 8, count), 256, 0, stream>>>(
+        jobs, rows, inner);
+    return cudaGetLastError();
+}
+cudaError_t launch_q4_g128_expert_projections(const Nvfp4Projection* jobs,
+    int count, int rows, int inner, cudaStream_t stream) {
+    if (count < 0 || rows <= 0 || rows > INT32_MAX - 7 || rows % 8 || inner <= 0 ||
+        inner % 128 || count > 65535 || (count && !jobs)) return cudaErrorInvalidValue;
+    if (!count) return cudaSuccess;
+    q4_g128_expert_projections_cuda<<<dim3((rows + 7) / 8, count), 256, 0, stream>>>(
         jobs, rows, inner);
     return cudaGetLastError();
 }

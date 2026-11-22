@@ -2146,7 +2146,7 @@ void CudaBackend::dispatch(const GraphNode& node,
     }
 
     if (node.op_type == OpType::MOE &&
-        (try_fp16_moe(node, inputs, output) || try_nvfp4_moe(node, inputs, output))) {
+        (try_dense_moe(node, inputs, output) || try_nvfp4_moe(node, inputs, output))) {
         if (!impl_->failed) record_native();
         return;
     }

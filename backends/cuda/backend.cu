@@ -51,6 +51,17 @@ size_t CudaBackend::prefill_shared_cache_bytes() const { return impl_->prefill_s
 size_t CudaBackend::prefill_shared_cache_hits() const { return impl_->prefill_shared_cache_hits; }
 
 namespace {
+// Device copies of routed experts must leave room for activations, caches and
+// the graph's other weights; keep at least an eighth of device memory free.
+bool expert_copy_fits(size_t bytes) {
+    size_t free = 0, total = 0;
+    if (cudaMemGetInfo(&free, &total) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return bytes <= free && free - bytes >= total / 8;
+}
+
 class CudaStateSnapshot final : public BackendStateSnapshot {
 public:
     explicit CudaStateSnapshot(std::shared_ptr<mollm_cuda::DeviceBufferPool> pool)
@@ -866,11 +877,24 @@ void CudaBackend::wrap_weight(Tensor& tensor) {
 
 void CudaBackend::wrap_weight_int4(Tensor& tensor,
                                    bool keep_native_experts) {
-    if (!available() || keep_native_experts || tensor.prec != Precision::INT4 ||
+    if (!available() || tensor.prec != Precision::INT4 ||
         tensor.shape[0] <= 0 || tensor.shape[1] <= 0)
         return;
     const int n = static_cast<int>(tensor.shape[0]);
     const int k = static_cast<int>(tensor.shape[1]);
+    // Routed expert aggregates stay with the CPU MoE unless they are W4G128,
+    // which the CUDA MoE runs natively. Coherent devices read them in place;
+    // others copy them when the copy fits in device memory.
+    if (keep_native_experts) {
+        if (!tensor.is_q4_g128_packed || !tensor.q4_g128_data || k % 128 ||
+            tensor.group_size != 128 || tensor.groups_per_row != static_cast<uint32_t>(k / 128))
+            return;
+        const size_t bytes = static_cast<size_t>((n + 7) / 8) * (k / 128) * sizeof(Q4B8G128Block);
+        if (impl_->register_host_weight(tensor, tensor.q4_g128_data, bytes,
+                CUDA_R_8I, n, k, Impl::WeightLayout::Q4Bg128) ||
+            !expert_copy_fits(bytes))
+            return;
+    }
 
     if (tensor.is_q4_g32_packed && tensor.q4_g32_data && k % 32 == 0 &&
         tensor.group_size == 32 &&

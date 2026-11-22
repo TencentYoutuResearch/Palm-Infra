@@ -18,11 +18,14 @@ using mollm::cuda_backend_detail::device_pointer_const;
 using mollm::cuda_backend_detail::fp32_contiguous;
 using mollm::cuda_backend_detail::same_shape;
 
-bool CudaBackend::try_fp16_moe(const GraphNode& node,
+// Routed experts stored as FP16 or W4G128 expert-major matrices.
+bool CudaBackend::try_dense_moe(const GraphNode& node,
     const std::vector<const Tensor*>& inputs, Tensor* output) {
     if (inputs.size() != 8 || !output ||
-        !std::all_of(inputs.begin(), inputs.end(), [](const Tensor* t) { return t; }) ||
-        inputs[2]->prec != Precision::FP16 || inputs[3]->prec != Precision::FP16)
+        !std::all_of(inputs.begin(), inputs.end(), [](const Tensor* t) { return t; }))
+        return false;
+    const bool q4 = inputs[2]->prec == Precision::INT4 && inputs[3]->prec == Precision::INT4;
+    if (!q4 && (inputs[2]->prec != Precision::FP16 || inputs[3]->prec != Precision::FP16))
         return false;
     const auto& p = node.params;
     const int hidden = graph_params::get_i32(p, 0, 0);
@@ -46,10 +49,14 @@ bool CudaBackend::try_fp16_moe(const GraphNode& node,
         return false;
     const auto* gate_weight = impl_->find_weight(*inputs[2]);
     const auto* down_weight = impl_->find_weight(*inputs[3]);
-    const auto* gate_palette = impl_->find_fp16_expert_palette(*inputs[2]);
-    const auto* down_palette = impl_->find_fp16_expert_palette(*inputs[3]);
+    const auto* gate_palette = q4 ? nullptr : impl_->find_fp16_expert_palette(*inputs[2]);
+    const auto* down_palette = q4 ? nullptr : impl_->find_fp16_expert_palette(*inputs[3]);
     const auto valid = [&](const auto* palette, const Impl::DeviceWeight* weight,
                            int expert_rows, int inner) {
+        if (q4)
+            return weight && weight->layout == Impl::WeightLayout::Q4Bg128 &&
+                expert_rows % 8 == 0 && inner % 128 == 0 &&
+                weight->n == experts * expert_rows && weight->k == inner;
         return palette ? (expert_rows % 128 == 0 && inner % 128 == 0 &&
                           palette->rows == experts * expert_rows && palette->inner == inner)
                        : (weight && weight->type == CUDA_R_16F && weight->layout == Impl::WeightLayout::Dense &&
@@ -78,18 +85,24 @@ bool CudaBackend::try_fp16_moe(const GraphNode& node,
     if (!impl_->reserve(impl_->moe_scratch, impl_->moe_scratch_bytes, count * sizeof(float)) ||
         !impl_->reserve(impl_->moe_jobs, impl_->moe_jobs_bytes,
                         static_cast<size_t>(routes) * 2 * sizeof(mollm_cuda::Nvfp4Projection))) return fail();
-    auto found = std::find_if(impl_->fp16_moe_tables.begin(), impl_->fp16_moe_tables.end(),
+    auto found = std::find_if(impl_->dense_moe_tables.begin(), impl_->dense_moe_tables.end(),
         [&](const auto& t) { return t.gate == gate_data && t.down == down_data &&
             t.experts == experts && t.hidden == hidden && t.inter == inter; });
-    if (found == impl_->fp16_moe_tables.end()) {
+    if (found == impl_->dense_moe_tables.end()) {
+        // One expert's matrix: two bytes per FP16 element, one per palette
+        // code, or one W4G128 block per 8 rows x 128 columns.
+        const auto expert_bytes = [&](size_t elements, bool palette) {
+            return q4 ? elements / 1024 * sizeof(Q4B8G128Block)
+                      : elements * (palette ? 1 : sizeof(__half));
+        };
         std::vector<mollm_cuda::Nvfp4Projection> tables(2 * experts);
         for (int e = 0; e < experts; ++e) {
             tables[e].weight = static_cast<const uint8_t*>(gate_data) +
-                static_cast<size_t>(e) * 2 * inter * hidden * (gate_palette ? 1 : sizeof(__half));
+                static_cast<size_t>(e) * expert_bytes(size_t(2) * inter * hidden, gate_palette);
             if (gate_palette) tables[e].block_scales = reinterpret_cast<const uint8_t*>(
                 gate_palette->palette + size_t(e) * 2 * inter * hidden / 16384 * 256);
             tables[experts + e].weight = static_cast<const uint8_t*>(down_data) +
-                static_cast<size_t>(e) * hidden * inter * (down_palette ? 1 : sizeof(__half));
+                static_cast<size_t>(e) * expert_bytes(size_t(hidden) * inter, down_palette);
             if (down_palette) tables[experts + e].block_scales = reinterpret_cast<const uint8_t*>(
                 down_palette->palette + size_t(e) * hidden * inter / 16384 * 256);
         }
@@ -98,9 +111,9 @@ bool CudaBackend::try_fp16_moe(const GraphNode& node,
         impl_->device_allocations.push_back(device_tables);
         if (!mollm_cuda::copy_memory(device_tables, tables.data(), tables.size() * sizeof(tables[0]),
                                     cudaMemcpyHostToDevice, "FP16 expert tables")) return fail();
-        impl_->fp16_moe_tables.push_back({gate_data, down_data, experts, hidden, inter,
+        impl_->dense_moe_tables.push_back({gate_data, down_data, experts, hidden, inter,
                                         static_cast<mollm_cuda::Nvfp4Projection*>(device_tables)});
-        found = impl_->fp16_moe_tables.end() - 1;
+        found = impl_->dense_moe_tables.end() - 1;
     }
     float* logits = static_cast<float*>(impl_->moe_scratch);
     float* gate_up = logits + static_cast<size_t>(rows) * experts;
@@ -117,20 +130,34 @@ bool CudaBackend::try_fp16_moe(const GraphNode& node,
         return impl_->run_matmul_device(input, k, *inputs[index], out, n, rows, n, k,
                                        Activation::NONE, 0, -1);
     };
-    if (!matmul(x, 1, logits, experts, hidden)) return fail();
+    // FP16 router and shared-expert gate projections run through cuBLAS,
+    // whose kernel choice depends on the batch. Verification batches repeat
+    // the one-token call so routing and gating match decode.
+    auto token_matmul = [&](const float* input, int index, float* out, int n, int k) {
+        if (!impl_->qualified_verification || rows < 2 || rows > 8)
+            return matmul(input, index, out, n, k);
+        for (int token = 0; token < rows; ++token)
+            if (!impl_->run_matmul_device(input + size_t(token) * k, k, *inputs[index],
+                    out + size_t(token) * n, n, 1, n, k, Activation::NONE, 0, -1))
+                return false;
+        return true;
+    };
+    if (!token_matmul(x, 1, logits, experts, hidden)) return fail();
     mollm_cuda::launch_moe_resident_routes(logits, rows, experts, top_k, score_func,
         graph_params::get_i32(p, 6, 1) != 0, graph_params::get_f32(p, 0, 1),
         found->tables, x, gate_up, activated, down, hidden, inter,
         jobs, jobs + routes, route_weights);
-    if (!mollm_cuda::report_cuda((gate_palette ? mollm_cuda::launch_fp16_palette_projections : mollm_cuda::launch_fp16_expert_projections)(jobs, routes, 2 * inter, hidden, nullptr), "FP16 expert gate/up")) return fail();
+    const auto projections = q4 ? mollm_cuda::launch_q4_g128_expert_projections :
+        mollm_cuda::launch_fp16_expert_projections;
+    if (!mollm_cuda::report_cuda((gate_palette ? mollm_cuda::launch_fp16_palette_projections : projections)(jobs, routes, 2 * inter, hidden, nullptr), "expert gate/up")) return fail();
     mollm_cuda::launch_moe_activation(gate_up, gate_up + inter, route_weights,
                                      activated, routes, inter, 2 * inter);
-    if (!mollm_cuda::report_cuda((down_palette ? mollm_cuda::launch_fp16_palette_projections : mollm_cuda::launch_fp16_expert_projections)(jobs + routes, routes, hidden, inter, nullptr), "FP16 expert down")) return fail();
+    if (!mollm_cuda::report_cuda((down_palette ? mollm_cuda::launch_fp16_palette_projections : projections)(jobs + routes, routes, hidden, inter, nullptr), "expert down")) return fail();
     if (!matmul(x, 4, shared_g, shared_inter, hidden) || !matmul(x, 5, shared_u, shared_inter, hidden)) return fail();
     mollm_cuda::launch_moe_activation(shared_g, shared_u, nullptr, shared_a, rows, shared_inter, shared_inter);
-    if (!matmul(shared_a, 6, shared_d, hidden, shared_inter) || !matmul(x, 7, shared_scale, 1, hidden)) return fail();
+    if (!matmul(shared_a, 6, shared_d, hidden, shared_inter) || !token_matmul(x, 7, shared_scale, 1, hidden)) return fail();
     mollm_cuda::launch_moe_combine(down, shared_d, shared_scale, destination, rows, hidden, top_k);
-    if (!mollm_cuda::report_cuda(cudaGetLastError(), "FP16 MoE combine")) return fail();
+    if (!mollm_cuda::report_cuda(cudaGetLastError(), "MoE combine")) return fail();
     return true;
 }
 

@@ -251,13 +251,13 @@ struct CudaBackend::Impl {
     size_t recurrent_scratch_bytes = 0;
     void* moe_scratch = nullptr;
     size_t moe_scratch_bytes = 0;
-    struct Fp16MoeTables {
+    struct DenseMoeTables {
         const void* gate;
         const void* down;
         int experts, hidden, inter;
         mollm_cuda::Nvfp4Projection* tables;
     };
-    std::vector<Fp16MoeTables> fp16_moe_tables;
+    std::vector<DenseMoeTables> dense_moe_tables;
     struct ResidentExperts {
         bool uniform_gate_input_global = false;
         float gate_input_global = 1.f;
@@ -907,6 +907,23 @@ struct CudaBackend::Impl {
             return nullptr;
         const auto found = weights_by_device.find(tensor.device.buffer);
         return found == weights_by_device.end() ? nullptr : found->second;
+    }
+
+    // Coherent devices read host weights in place; the package mapping owns
+    // the memory, so the entry is never freed by the backend.
+    bool register_host_weight(Tensor& tensor, const void* source, size_t bytes,
+                              cudaDataType type, int n, int k, WeightLayout layout) {
+        if (!coherent_host_weights || !source || bytes == 0)
+            return false;
+        auto [found, inserted] = weights.try_emplace(source,
+            DeviceWeight{const_cast<void*>(source), nullptr, type, n, k, 0, 0, layout});
+        if (inserted) {
+            found->second.data_bytes = bytes;
+            weights_by_device.emplace(found->second.data, &found->second);
+        }
+        tensor.device.buffer = found->second.data;
+        tensor.device.offset = 0;
+        return true;
     }
 
     bool upload_weight(Tensor& tensor, const void* cache_key,

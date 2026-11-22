@@ -172,7 +172,7 @@ private:
     void abandon_decode_segment();
     bool try_nvfp4_moe(const GraphNode& node,
                        const std::vector<const Tensor*>& inputs, Tensor* output);
-    bool try_fp16_moe(const GraphNode& node,
+    bool try_dense_moe(const GraphNode& node,
                      const std::vector<const Tensor*>& inputs, Tensor* output);
     struct Impl;
     std::unique_ptr<Impl> impl_;

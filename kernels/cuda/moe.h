@@ -152,6 +152,10 @@ cudaError_t launch_nvfp4_paired_projections(const Nvfp4Projection* jobs, int cou
 // weight/input/output fields are read; route weights are applied by activation.
 cudaError_t launch_fp16_expert_projections(const Nvfp4Projection* jobs,
     int count, int rows, int inner, cudaStream_t stream = nullptr);
+// Same descriptor ABI for W4G128 expert-major matrices (Q4B8G128Block rows,
+// rows % 8 == 0, inner % 128 == 0). Each route uses decode GEMV arithmetic.
+cudaError_t launch_q4_g128_expert_projections(const Nvfp4Projection* jobs,
+    int count, int rows, int inner, cudaStream_t stream = nullptr);
 // Experimental fixed-checkpoint activation quantization. Native packed
 // descriptors require positive input globals; a split selects the second
 // global for up rows. canonical_weights reads row/pair weights and row-major
