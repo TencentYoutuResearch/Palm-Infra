@@ -234,6 +234,11 @@ cudaError_t launch_q4_g32_prefetch_scale_gemv(const float* activation,
 void launch_q4_g128_dense_gemv(
     const float* activation, const Q4B8G128Block* weight, float* output,
     int columns, int inner);
+// Small verification batch with the exact per-token decode arithmetic.
+// rows_per_warp (1, 2 or 4) trades activation reuse for warp parallelism.
+cudaError_t launch_q4_g128_small_batch_exact(
+    const float* activation, const Q4B8G128Block* weight, float* output,
+    int tokens, int columns, int inner, int lda, int ldc, int rows_per_warp);
 bool run_dense_matmul(
     cublasHandle_t cublas, const void* weight, cudaDataType weight_type,
     const void* activation, cudaDataType activation_type, float* output,

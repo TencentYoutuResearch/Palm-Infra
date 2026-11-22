@@ -135,6 +135,7 @@ struct CudaBackend::Impl {
     bool prefer_q4_m3_specializations = false; // Qualified SM121 M3 projection policy.
     bool prefer_q4_fixed_m5 = false; // Qualified SM121 compact-wide M5 policy.
     bool prefer_q4_hc_adjacent = false; // Qualified SM121 paired-HC policy.
+    bool prefer_q4_g128_column_batches = false; // Measured SM121 W4G128 M2-M4 policy.
     bool prefer_nvfp4_gate_m1_proven = false; // Qualified SM121 resident M1 policy.
     bool prefer_nvfp4_gate_subgroup = false; // Qualified SM121 tiny-batch policy.
     bool prefer_nvfp4_mtp_gate_pairs = false; // Exact small-batch gate expert reuse.
@@ -1069,6 +1070,12 @@ struct CudaBackend::Impl {
         return true;
     }
 
+    // Rows of a W4G128 tile per warp for an exact verification batch.
+    int q4_g128_batch_rows(int tokens) const {
+        if (prefer_q4_g128_column_batches && tokens <= 4) return 1;
+        return tokens <= 3 ? 2 : 4;
+    }
+
     bool run_matmul_device(const float* device_a, int lda,
                            const Tensor& weight, float* device_c, int ldc,
                            int m, int n, int k,
@@ -1151,6 +1158,12 @@ struct CudaBackend::Impl {
                 }
                 if (!mollm_cuda::report_cuda(cudaGetLastError(), "q4_small_batch_exact_decode")) return false;
             }
+        } else if (qualified_verification && valid_q4_g128 && m >= 2 && m <= 8) {
+            if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_g128_small_batch_exact(
+                    device_a, static_cast<const Q4B8G128Block*>(prepared->data),
+                    device_c, m, n, k, lda, ldc, q4_g128_batch_rows(m)),
+                    "q4_g128_small_batch_exact"))
+                return false;
         } else if (small_batch && valid_q4_g32 && !compact_q4_g32 && m >= 2 && m <= 8 &&
             k >= 2048 && static_cast<int64_t>(n) * k >= 4 * 1024 * 1024) {
             if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_g32_small_batch(

@@ -433,6 +433,7 @@ CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) 
         impl_->prefer_q4_narrow_row_cache = sm121;
         impl_->prefer_q4_m3_specializations = sm121;
         impl_->prefer_q4_fixed_m5 = sm121;
+        impl_->prefer_q4_g128_column_batches = sm121;
         if (sm121) {
             const auto status = mollm_cuda::configure_q4_g32_hc_adjacent_cache();
             impl_->prefer_q4_hc_adjacent = status == cudaSuccess;

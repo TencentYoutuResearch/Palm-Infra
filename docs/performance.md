@@ -110,6 +110,23 @@ Each value is the mean of three model loads. An MTP step costs 55–58 ms
 with either prompt; the MTP gap comes from fewer accepted tokens per step.
 Use this prompt when the original one is unavailable.
 
+### Qwen3.5-4B dense MTP
+
+A `w4g128` package with its exported MTP companion, the repository prompt,
+`--n-ctx 8192`, greedy decoding and 256 generated tokens (2026-11-22). Decode
+tok/s is `1000 / tpot_ms` from one model load:
+
+| Draft tokens | Accepted | GB10 (SM121) | RTX 4060 Ti (SM89) |
+| --- | ---: | ---: | ---: |
+| Base | – | 53.2 | 90.2 |
+| 1 | 65.6% | 63.6 | 99.9 |
+| 2 | 55.4% | 66.1 | 92.6 |
+| 3 | 41.5% | 58.4 | 75.8 |
+
+Every run on both devices generated the same 256 tokens. Verification
+batches cost more than one decode step, so deeper drafts pay off only with
+higher acceptance; one draft token is the better setting on the 4060 Ti.
+
 ## Reproducing a benchmark
 
 Use `mollm_bench` with the same package, companions, prompt, and policy as the

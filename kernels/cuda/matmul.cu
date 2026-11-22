@@ -1591,10 +1591,14 @@ __global__ void q4_g32_oct_rows_gemv_cuda(
         output[column] = sum;
 }
 
+// Tokens > 1 reads each weight block once for a small verification batch.
+// Every token keeps the M=1 lane assignment, accumulation order and warp
+// reduction, so batched outputs are bit-identical to per-token decode.
+template <int Tokens>
 __global__ void q4_g128_dense_gemv_cuda(
-    const float* __restrict__ activation,
+    const float* __restrict__ activation, int activation_stride,
     const Q4B8G128Block* __restrict__ weight,
-    float* __restrict__ output, int columns, int inner) {
+    float* __restrict__ output, int output_stride, int columns, int inner) {
     constexpr int warps_per_block = 4;
     const int warp = static_cast<int>(threadIdx.x) / warpSize;
     const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
@@ -1603,7 +1607,7 @@ __global__ void q4_g128_dense_gemv_cuda(
         return;
     const int groups = inner / 128;
     const int row_lane = column & 7;
-    float sum = 0.0f;
+    float sum[Tokens] = {};
     for (int group = 0; group < groups; ++group) {
         const auto& block =
             weight[static_cast<size_t>(column / 8) * groups + group];
@@ -1613,15 +1617,74 @@ __global__ void q4_g128_dense_gemv_cuda(
         for (int subgroup = 0; subgroup < 4; ++subgroup) {
             const uint8_t packed =
                 block.q[subgroup][row_lane][lane / 2];
+            const int value = signed_nibble(lane & 1 ? packed >> 4 : packed);
             const int k = group * 128 + subgroup * 32 + lane;
-            sum += activation[k] *
-                signed_nibble(lane & 1 ? packed >> 4 : packed) * scale;
+#pragma unroll
+            for (int token = 0; token < Tokens; ++token)
+                sum[token] += activation[token * activation_stride + k] * value * scale;
         }
     }
-    for (int offset = warpSize / 2; offset != 0; offset /= 2)
-        sum += __shfl_down_sync(0xffffffffu, sum, offset);
-    if (lane == 0)
-        output[column] = sum;
+#pragma unroll
+    for (int token = 0; token < Tokens; ++token) {
+        for (int offset = warpSize / 2; offset != 0; offset /= 2)
+            sum[token] += __shfl_down_sync(0xffffffffu, sum[token], offset);
+        if (lane == 0)
+            output[token * output_stride + column] = sum[token];
+    }
+}
+
+// One warp computes Rows adjacent rows of an 8-row tile and reuses each
+// token's activation across them. Every (row, lane) pair keeps the decode
+// kernel's element assignment, accumulation order and warp reduction.
+template <int Tokens, int Rows>
+__global__ void q4_g128_rows_batch_cuda(
+    const float* __restrict__ activation, int activation_stride,
+    const Q4B8G128Block* __restrict__ weight,
+    float* __restrict__ output, int output_stride, int columns, int inner) {
+    static_assert(8 % Rows == 0, "rows must tile an 8-row block");
+    constexpr int warps_per_block = 4;
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int first = (static_cast<int>(blockIdx.x) * warps_per_block + warp) * Rows;
+    if (first >= columns)
+        return;
+    const int groups = inner / 128;
+    const int row_lane = first & 7;
+    const Q4B8G128Block* tile = weight + static_cast<size_t>(first / 8) * groups;
+    float sum[Rows][Tokens] = {};
+    for (int group = 0; group < groups; ++group) {
+        const auto& block = tile[group];
+        float scale[Rows];
+#pragma unroll
+        for (int row = 0; row < Rows; ++row)
+            scale[row] = block.scales[row_lane + row];
+        for (int subgroup = 0; subgroup < 4; ++subgroup) {
+            const int k = group * 128 + subgroup * 32 + lane;
+            float token_input[Tokens];
+#pragma unroll
+            for (int token = 0; token < Tokens; ++token)
+                token_input[token] = activation[token * activation_stride + k];
+#pragma unroll
+            for (int row = 0; row < Rows; ++row) {
+                const uint8_t packed = block.q[subgroup][row_lane + row][lane / 2];
+                const int value = signed_nibble(lane & 1 ? packed >> 4 : packed);
+#pragma unroll
+                for (int token = 0; token < Tokens; ++token)
+                    sum[row][token] += token_input[token] * value * scale[row];
+            }
+        }
+    }
+#pragma unroll
+    for (int row = 0; row < Rows; ++row) {
+#pragma unroll
+        for (int token = 0; token < Tokens; ++token) {
+            float total = sum[row][token];
+            for (int offset = warpSize / 2; offset != 0; offset /= 2)
+                total += __shfl_down_sync(0xffffffffu, total, offset);
+            if (lane == 0 && first + row < columns)
+                output[token * output_stride + first + row] = total;
+        }
+    }
 }
 
 }  // namespace
@@ -2617,12 +2680,41 @@ cudaError_t launch_q4_g32_prefetch_scale_gemv(const float* activation,
 void launch_q4_g128_dense_gemv(
     const float* activation, const Q4B8G128Block* weight, float* output,
     int columns, int inner) {
+    launch_q4_g128_small_batch_exact(
+        activation, weight, output, 1, columns, inner, inner, columns, 1);
+}
+
+cudaError_t launch_q4_g128_small_batch_exact(
+    const float* activation, const Q4B8G128Block* weight, float* output,
+    int tokens, int columns, int inner, int lda, int ldc, int rows_per_warp) {
     constexpr int warps_per_block = 4;
     constexpr int threads = warps_per_block * 32;
+    if (tokens < 1 || tokens > 8 || columns <= 0 || inner <= 0 ||
+        inner % 128 || lda < inner || ldc < columns ||
+        (rows_per_warp != 1 && rows_per_warp != 2 && rows_per_warp != 4))
+        return cudaErrorInvalidValue;
+    const int warps = (columns + rows_per_warp - 1) / rows_per_warp;
     const unsigned blocks = static_cast<unsigned>(
-        (columns + warps_per_block - 1) / warps_per_block);
-    q4_g128_dense_gemv_cuda<<<blocks, threads>>>(
-        activation, weight, output, columns, inner);
+        (warps + warps_per_block - 1) / warps_per_block);
+#define MOLLM_Q4_G128_LAUNCH(count)                                            \
+    case count:                                                                \
+        if (rows_per_warp == 1)                                                \
+            q4_g128_dense_gemv_cuda<count><<<blocks, threads>>>(               \
+                activation, lda, weight, output, ldc, columns, inner);         \
+        else if (rows_per_warp == 2)                                           \
+            q4_g128_rows_batch_cuda<count, 2><<<blocks, threads>>>(            \
+                activation, lda, weight, output, ldc, columns, inner);         \
+        else                                                                   \
+            q4_g128_rows_batch_cuda<count, 4><<<blocks, threads>>>(            \
+                activation, lda, weight, output, ldc, columns, inner);         \
+        break;
+    switch (tokens) {
+    MOLLM_Q4_G128_LAUNCH(1) MOLLM_Q4_G128_LAUNCH(2) MOLLM_Q4_G128_LAUNCH(3)
+    MOLLM_Q4_G128_LAUNCH(4) MOLLM_Q4_G128_LAUNCH(5) MOLLM_Q4_G128_LAUNCH(6)
+    MOLLM_Q4_G128_LAUNCH(7) MOLLM_Q4_G128_LAUNCH(8)
+    }
+#undef MOLLM_Q4_G128_LAUNCH
+    return cudaGetLastError();
 }
 
 void launch_fp16_to_fp32(const __half* source, float* destination, size_t count) {

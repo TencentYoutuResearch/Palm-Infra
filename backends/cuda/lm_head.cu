@@ -26,11 +26,13 @@ bool CudaBackend::supports_lm_head_argmax(const Tensor& weight) const {
 
 bool CudaBackend::supports_lm_head_small_batch(const Tensor& weight) const {
     const auto* prepared=impl_->find_weight(weight);
-    return impl_->qualified_verification && prepared &&
-        prepared->layout==Impl::WeightLayout::Q8RowMajor && prepared->scales &&
+    if(!impl_->qualified_verification || !prepared ||
+       weight.shape[0]<=0 || weight.shape[0]>INT32_MAX-7 ||
+       weight.shape[1]<=0 || weight.shape[1]>INT32_MAX) return false;
+    if(prepared->layout==Impl::WeightLayout::Q4Bg128) return weight.shape[1]%128==0;
+    return prepared->layout==Impl::WeightLayout::Q8RowMajor && prepared->scales &&
         prepared->groups_per_row==1 && prepared->group_size>=weight.shape[1] &&
-        weight.shape[0]>0 && weight.shape[0]<=INT32_MAX-7 &&
-        weight.shape[1]>0 && weight.shape[1]<=INT32_MAX && weight.shape[1]%4==0;
+        weight.shape[1]%4==0;
 }
 
 bool CudaBackend::lm_head_small_batch_argmax_device_and_end_graph(
@@ -56,7 +58,8 @@ bool CudaBackend::lm_head_small_batch_argmax_device_and_end_graph(
     // Scalar and batch screening share one auxiliary weight copy. Admit this
     // measured target-head shape only with compact-Q4 drafting: otherwise a
     // screened scalar draft could evict the target copy on every MTP round.
-    const bool screen_candidate=!impl_->draft_head_request&&tokens>=3&&
+    const bool q4_g128=prepared->layout==Impl::WeightLayout::Q4Bg128;
+    const bool screen_candidate=!q4_g128&&!impl_->draft_head_request&&tokens>=3&&
         tokens<=verification_workspace_max_rows()&&columns==qualified_head_rows&&
         inner==qualified_head_inner&&uintptr_t(source)%16==0;
     const bool wide_screen=impl_->prefer_screened_heads;
@@ -100,6 +103,12 @@ bool CudaBackend::lm_head_small_batch_argmax_device_and_end_graph(
         }
         if(!mollm_cuda::report_cuda(status,
             "Q8 batch head screen")) {impl_->failed=true;return false;}
+    } else if(q4_g128) {
+        if(!mollm_cuda::report_cuda(mollm_cuda::launch_q4_g128_small_batch_exact(source,
+            static_cast<const Q4B8G128Block*>(prepared->data),static_cast<float*>(impl_->output),
+            tokens,columns,inner,inner,columns,impl_->q4_g128_batch_rows(tokens)),"q4_g128_verify_batch")) {
+            impl_->failed=true;return false;
+        }
     } else if(!mollm_cuda::report_cuda(mollm_cuda::launch_q8_small_batch_exact(source,
         static_cast<const int8_t*>(prepared->data),prepared->scales,
         static_cast<float*>(impl_->output),tokens,columns,inner,inner,columns),"q8_verify_batch")) {
