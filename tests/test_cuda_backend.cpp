@@ -3537,7 +3537,10 @@ bool test_q4_wide_pipeline_stream(int pair_mode = 0) {
             cudaMalloc(&input, inner * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&output, (rows + 8) * sizeof(float)) != cudaSuccess ||
             cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaMemcpy(weight, host.data(), host.size() * sizeof(host[0]), cudaMemcpyHostToDevice) != cudaSuccess) {
+            // A blocking copy from pageable memory may still be in flight on
+            // the default stream when it returns, and a non-blocking stream
+            // does not wait for it: upload on the stream the kernels use.
+            cudaMemcpyAsync(weight, host.data(), host.size() * sizeof(host[0]), cudaMemcpyHostToDevice, stream) != cudaSuccess) {
             cleanup(); return false;
         }
         if (pair_mode >= 3 && mollm_cuda::launch_q4_g32_l1_prefetch_wide_gemv(
