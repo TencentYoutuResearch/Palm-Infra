@@ -8,8 +8,25 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "models"))
-from qwen4_exp import build_mtp_graph, build_mtp_streamed_weights
 from transpile import _read_weight_header
+
+
+def mtp_builders(cfg: dict, enable_qsa: bool):
+    """Return (graph builder, weight builder) for the checkpoint family."""
+    model_type = cfg.get("model_type")
+    if model_type == "qwen4_exp":
+        import qwen4_exp
+        return (lambda seq_len, n_ctx: qwen4_exp.build_mtp_graph(
+                    ".", cfg, seq_len, n_ctx, enable_qsa=enable_qsa),
+                lambda model_dir: qwen4_exp.build_mtp_streamed_weights(
+                    model_dir, cfg, enable_qsa=enable_qsa))
+    if model_type == "qwen3_5":
+        if enable_qsa:
+            raise ValueError("Qwen3.5 has no QSA indexer")
+        import qwen35
+        return (lambda seq_len, n_ctx: qwen35.build_mtp_graph(".", cfg, seq_len, n_ctx),
+                lambda model_dir: qwen35.build_mtp_streamed_weights(model_dir, cfg))
+    raise ValueError(f"no MTP exporter for model_type={model_type!r}")
 
 
 def main():
@@ -25,7 +42,8 @@ def main():
     if not args.refresh_graph and args.output_dir.exists() and (not args.output_dir.is_dir() or any(args.output_dir.iterdir())):
         parser.error("output directory must be new or empty; existing files are never overwritten")
     cfg = json.loads((args.model_dir / "config.json").read_text())
-    graph = build_mtp_graph(".", cfg, args.seq_len, args.n_ctx, enable_qsa=args.qsa)
+    build_graph, build_weights = mtp_builders(cfg, args.qsa)
+    graph = build_graph(args.seq_len, args.n_ctx)
     if args.refresh_graph:
         manifest = json.loads((args.output_dir / "manifest.json").read_text())
         if (manifest["format"] != "mollm-mtp-weight-bundle-v1" or
@@ -53,7 +71,7 @@ def main():
         graph.save(str(args.output_dir / "model_mtp"))
         print("Refreshed graph/inline constants only; all streamed model weight files unchanged.")
         return
-    weights = build_mtp_streamed_weights(args.model_dir, cfg, enable_qsa=args.qsa)
+    weights = build_weights(args.model_dir)
     shared = {"./embed_tokens.weights", "./lm_head.weights"}
     refs = {node.weight_path for node in graph._nodes if node.weight_path}
     if refs - shared != set(weights):

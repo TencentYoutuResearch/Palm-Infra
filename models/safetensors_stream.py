@@ -689,6 +689,32 @@ def concatenate_fp16_row_slices(
         data_ranges=ranges)
 
 
+def fp16_column_slice_streamed_weight(
+        index: SafeTensorIndex, name: str,
+        column_begin: int, column_count: int) -> StreamedWeight:
+    """Stream one contiguous column range of a rank-2 BF16/F16 matrix."""
+    tensor = index.tensor(name)
+    if tensor.dtype not in ("BF16", "F16") or len(tensor.shape) != 2:
+        raise ValueError(f"column slice is not a BF16/F16 matrix: {name}")
+    rows, cols = tensor.shape
+    if column_begin < 0 or column_count <= 0 or column_begin + column_count > cols:
+        raise ValueError(
+            f"invalid column slice [{column_begin}, {column_begin + column_count}) "
+            f"for {name} with {cols} columns")
+    transform = _bf16_to_fp16 if tensor.dtype == "BF16" else None
+    ranges = [
+        WeightByteRange(
+            tensor.source.path,
+            tensor.source.offset + (row * cols + column_begin) * 2,
+            column_count * 2, transform)
+        for row in range(rows)
+    ]
+    return StreamedWeight(
+        precision=Precision.FP16,
+        logical_shape=(int(rows), int(column_count)),
+        data_ranges=ranges)
+
+
 def raw_u8_streamed_weight(
         index: SafeTensorIndex, names: Iterable[str],
         logical_shape: tuple[int, ...], *,

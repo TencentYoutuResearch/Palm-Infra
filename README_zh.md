@@ -414,7 +414,7 @@ static padding、vision 或非规范 mask。不支持的配置会直接拒绝，
 可选的 QSA + MTP 投机解码需要先导出独立 draft，再用 `--mtp` 启动预设：
 
 ```bash
-python3 tools/export_qwen4_mtp_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
+python3 tools/export_mtp_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
   ../qwen38_mtp_qsa_bundle --qsa --n-ctx 32768
 ./chat-qwen38-cuda.sh --mtp
 ```
@@ -434,7 +434,18 @@ draft，并用设备端 checkpoint 和逐 token 的 recurrent state 快照完成
 token 都由 target 模型用原始权重验证。使用 `-DMOLLM_CUDA_DECODE_SEGMENTS=ON` 构建时，验证批次还会复用缓存的
 workspace。测量结果与限制见[性能说明](docs/performance.md)。
 
-对于 Qwen3.8-Flash-Next 之外的模型，CUDA 是 native/fallback 混合实现：图输出、
+**Qwen3.5 dense** package（已用 Qwen3.5-4B W4G128 测试）在 CUDA 上全部 native
+执行，并可用 checkpoint 自带的 MTP 层做 draft。companion 需从与 package 相同的
+checkpoint 导出，其 `--n-ctx` 必须覆盖运行时 context：
+
+```bash
+python3 models/converter.py /path/to/Qwen3.5-4B ../qwen35_4b_w4g128.mollm w4g128
+python3 tools/export_mtp_weights.py /path/to/Qwen3.5-4B ../qwen35_4b_mtp_bundle --n-ctx 32768
+./build_cuda/mollm_chat --device cuda --package ../qwen35_4b_w4g128.mollm \
+  --mtp-companion ../qwen35_4b_mtp_bundle --mtp-draft-tokens 2 --temperature 0
+```
+
+对于其他模型，CUDA 是 native/fallback 混合实现：图输出、
 持久状态、dense elementwise、norm、RoPE、SDPA 与 decode `lm_head` 在 CUDA
 上执行，而 recurrent GDN / short-convolution 及部分专用模型系列可能使用 CPU
 reference dispatcher。范围与证据见

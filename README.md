@@ -437,7 +437,7 @@ For optional QSA + MTP speculative decoding, export the separate draft once
 and start the preset with `--mtp`:
 
 ```bash
-python3 tools/export_qwen4_mtp_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
+python3 tools/export_mtp_weights.py /path/to/Qwen3.8-Flash-Next-NVFP4 \
   ../qwen38_mtp_qsa_bundle --qsa --n-ctx 32768
 ./chat-qwen38-cuda.sh --mtp
 ```
@@ -462,7 +462,19 @@ verifies every token with its original weights. With
 workspaces. See
 [measured results and limitations](docs/performance.md).
 
-For models other than Qwen3.8-Flash-Next, CUDA is a mixed native/fallback
+**Qwen3.5 dense** packages (tested with Qwen3.5-4B W4G128) run natively on
+CUDA and can draft with the checkpoint's MTP layer. Export the companion from
+the same checkpoint as the package; its `--n-ctx` must cover the runtime
+context:
+
+```bash
+python3 models/converter.py /path/to/Qwen3.5-4B ../qwen35_4b_w4g128.mollm w4g128
+python3 tools/export_mtp_weights.py /path/to/Qwen3.5-4B ../qwen35_4b_mtp_bundle --n-ctx 32768
+./build_cuda/mollm_chat --device cuda --package ../qwen35_4b_w4g128.mollm \
+  --mtp-companion ../qwen35_4b_mtp_bundle --mtp-draft-tokens 2 --temperature 0
+```
+
+For other models, CUDA is a mixed native/fallback
 implementation: graph outputs, persistent state, dense elementwise ops, norms,
 RoPE, SDPA, and the decode `lm_head` stay on CUDA, while recurrent GDN /
 short-convolution and several specialized model families may use the CPU
