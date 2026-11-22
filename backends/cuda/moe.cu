@@ -134,7 +134,7 @@ bool CudaBackend::try_dense_moe(const GraphNode& node,
     // whose kernel choice depends on the batch. Verification batches repeat
     // the one-token call so routing and gating match decode.
     auto token_matmul = [&](const float* input, int index, float* out, int n, int k) {
-        if (!impl_->qualified_verification || rows < 2 || rows > 8)
+        if (!impl_->policy.qualified_verification || rows < 2 || rows > 8)
             return matmul(input, index, out, n, k);
         for (int token = 0; token < rows; ++token)
             if (!impl_->run_matmul_device(input + size_t(token) * k, k, *inputs[index],
@@ -296,7 +296,7 @@ bool CudaBackend::try_nvfp4_moe(
         return 1;
     }();
     if (native_mma &&
-        (!impl_->supports_native_nvfp4_mma ||
+        (!impl_->policy.supports_native_nvfp4_mma ||
          gate_source->resident_nvfp4_mma_layout != down_source->resident_nvfp4_mma_layout ||
          hidden > 2560 || inter > 2560 || hidden % 64 || inter % 64 ||
          gate_source->nvfp4_input_scales_per_expert != 2 ||
@@ -897,13 +897,13 @@ bool CudaBackend::try_nvfp4_moe(
                 } else if (gate_codes_kmajor) {
                     const bool pipeline=(simt_pipeline&&rows==1)||
                         (batch_pipeline&&rows>=2&&rows<=8);
-                    const bool paired=impl_->prefer_nvfp4_mtp_gate_pairs &&
+                    const bool paired=impl_->policy.prefer_nvfp4_mtp_gate_pairs &&
                         rows>=2 && rows<=verification_workspace_max_rows() && top_k==10 && hidden==2560 && inter==640 && !pipeline;
-                    const bool subgroup=impl_->prefer_nvfp4_gate_subgroup &&
+                    const bool subgroup=impl_->policy.prefer_nvfp4_gate_subgroup &&
                         rows>=2 && rows<=verification_workspace_max_rows() && top_k==10 && !pipeline;
-                    const bool paired_eight=paired&&impl_->prefer_nvfp4_mtp_gate_eight&&
+                    const bool paired_eight=paired&&impl_->policy.prefer_nvfp4_mtp_gate_eight&&
                         gate_scales_kmajor&&found->second.gate_pair_layout;
-                    const bool proven_m1=impl_->prefer_nvfp4_gate_m1_proven&&
+                    const bool proven_m1=impl_->policy.prefer_nvfp4_gate_m1_proven&&
                         rows==1&&routes==10&&pipeline&&hidden==2560&&inter==640&&
                         found->second.gate_m1_layout_proven&&!(reinterpret_cast<uintptr_t>(x)&15);
                     const auto status=proven_m1
@@ -964,7 +964,7 @@ bool CudaBackend::try_nvfp4_moe(
                     }();
                     const int load_hint = prefetch_down_row_scale && rows == 1 &&
                         hidden == 2560 && inter == 640 ? 7 : 0;
-                    const bool exact_m1_down = impl_->prefer_nvfp4_m1_down_subwarp &&
+                    const bool exact_m1_down = impl_->policy.prefer_nvfp4_m1_down_subwarp &&
                         rows == 1 && top_k == 10 && hidden == 2560 && inter == 640 &&
                         found->second.down_pair_layout && load_hint == 0;
                     const auto down_status = exact_m1_down
@@ -975,7 +975,7 @@ bool CudaBackend::try_nvfp4_moe(
                             false, load_hint);
                     if (!mollm_cuda::report_cuda(down_status,
                             exact_m1_down ? "NVFP4 exact M1 down" : "NVFP4 pipelined down")) return fail();
-                } else if (impl_->prefer_nvfp4_mtp_down_subwarp && rows >= 2 && rows <= verification_workspace_max_rows() &&
+                } else if (impl_->policy.prefer_nvfp4_mtp_down_subwarp && rows >= 2 && rows <= verification_workspace_max_rows() &&
                            top_k == 10 && hidden == 2560 && inter == 640 &&
                            found->second.down_pair_layout &&
                            !down_source->resident_nvfp4_mma_layout) {

@@ -26,7 +26,7 @@ bool CudaBackend::supports_lm_head_argmax(const Tensor& weight) const {
 
 bool CudaBackend::supports_lm_head_small_batch(const Tensor& weight) const {
     const auto* prepared=impl_->find_weight(weight);
-    if(!impl_->qualified_verification || !prepared ||
+    if(!impl_->policy.qualified_verification || !prepared ||
        weight.shape[0]<=0 || weight.shape[0]>INT32_MAX-7 ||
        weight.shape[1]<=0 || weight.shape[1]>INT32_MAX) return false;
     if(prepared->layout==Impl::WeightLayout::Q4Bg128) return weight.shape[1]%128==0;
@@ -62,7 +62,7 @@ bool CudaBackend::lm_head_small_batch_argmax_device_and_end_graph(
     const bool screen_candidate=!q4_g128&&!impl_->draft_head_request&&tokens>=3&&
         tokens<=verification_workspace_max_rows()&&columns==qualified_head_rows&&
         inner==qualified_head_inner&&uintptr_t(source)%16==0;
-    const bool wide_screen=impl_->prefer_screened_heads;
+    const bool wide_screen=impl_->policy.prefer_screened_heads;
     const bool screen=screen_candidate&&(tokens==3||wide_screen);
     if(screen) {
         // Reserve the maximum admitted width on the first screened batch;
@@ -106,7 +106,7 @@ bool CudaBackend::lm_head_small_batch_argmax_device_and_end_graph(
     } else if(q4_g128) {
         if(!mollm_cuda::report_cuda(mollm_cuda::launch_q4_g128_small_batch_exact(source,
             static_cast<const Q4B8G128Block*>(prepared->data),static_cast<float*>(impl_->output),
-            tokens,columns,inner,inner,columns,impl_->q4_g128_batch_rows(tokens)),"q4_g128_verify_batch")) {
+            tokens,columns,inner,inner,columns,mollm_cuda::q4_g128_batch_rows(impl_->policy, tokens)),"q4_g128_verify_batch")) {
             impl_->failed=true;return false;
         }
     } else if(!mollm_cuda::report_cuda(mollm_cuda::launch_q8_small_batch_exact(source,
@@ -224,7 +224,7 @@ int CudaBackend::lm_head_argmax_device_and_end_graph(
         // with energy screening where screened heads are preferred.
         const bool qualified_shape=n==qualified_head_rows&&k==qualified_head_inner;
         const bool fitted_q4=impl_->draft_probability_output&&qualified_shape&&
-            impl_->prefer_screened_heads;
+            impl_->policy.prefer_screened_heads;
         const auto kind = fitted_q4 ? Impl::DraftCompactHeadKind::FittedQ4 :
             Impl::DraftCompactHeadKind::Q4;
         const size_t bytes=size_t((n+7)/8)*(k/32)*sizeof(mollm_cuda::Q4CompactG32);
@@ -283,7 +283,7 @@ int CudaBackend::lm_head_argmax_device_and_end_graph(
         }
     } else if(screen) {
         // The qualified shape uses the smaller Q4 screen; others keep Q6.
-        const bool scalar_alternative=impl_->prefer_screened_heads&&
+        const bool scalar_alternative=impl_->policy.prefer_screened_heads&&
             n==qualified_head_rows&&prepared->n==n&&prepared->k==k;
         const int bits=scalar_alternative ? 4 : 6;
         // Allocate only the scalar format in use. MTP can additionally create

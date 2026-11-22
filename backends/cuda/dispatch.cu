@@ -591,7 +591,7 @@ void CudaBackend::dispatch(const GraphNode& node,
         if (hc_tag == 2) {
             result = cudaMemcpyAsync(device_pointer<float>(*output), hc_pair->cache,
                 size_t(rows) * 4 * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        } else if (impl_->prefer_q4_hc_adjacent &&
+        } else if (impl_->policy.prefer_q4_hc_adjacent &&
                    reinterpret_cast<uintptr_t>(hc_pair->computed_input) % alignof(float4) == 0) {
             result = mollm_cuda::launch_q4_g32_hc_adjacent_projections(
                 hc_pair->computed_input, static_cast<const Q4B8G32Block*>(hc_first_weight->data),
@@ -1804,7 +1804,7 @@ void CudaBackend::dispatch(const GraphNode& node,
                 destination, num_heads, num_value_heads, key_dimension,
                 value_dimension, sequence_length, real_tokens,
                 graph_params::get_i32(node.params, 4, 1) |
-                    (impl_->qualified_verification ? mollm_cuda::gdn_flag_decode_arithmetic : 0),
+                    (impl_->policy.qualified_verification ? mollm_cuda::gdn_flag_decode_arithmetic : 0),
                 graph_params::get_f32(node.params, 0, 1e-6f),
                 graph_params::get_f32(node.params, 1, 1e-6f), scale,
                 inputs[1]->stride[1] / sizeof(float),

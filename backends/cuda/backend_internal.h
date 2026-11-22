@@ -7,6 +7,7 @@
 #include "backends/cpu/backend.h"
 #include "backends/cuda/backend.h"
 #include "backends/cuda/device_runtime.h"
+#include "backends/cuda/kernel_policy.h"
 #include "backends/cuda/fp16_expert_palette_cache.h"
 #include "backends/cuda/dense_lt_gemm.h"
 #include "runtime/cuda_host_memory_budget.h"
@@ -26,6 +27,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct CudaBackend::Impl {
@@ -119,29 +121,15 @@ struct CudaBackend::Impl {
 
     bool ok = false;
     bool failed = false;
-    bool prefer_fp16_expert_palette = false;
+    // Device specializations in effect; see kernel_policy.h.
+    mollm_cuda::DevicePolicy policy;
+    std::unordered_set<std::string> traced_kernels;
     // Member destruction follows Impl's synchronization/graph teardown.
     mollm::cuda_backend_detail::Fp16ExpertPaletteCache fp16_expert_palettes;
     bool strided_reshape_views = false;
     size_t strided_reshape_calls = 0;
     std::unordered_map<const Tensor*, const Graph*> strided_reshape_targets;
     bool coherent_host_weights = false;
-    bool supports_native_nvfp4_mma = false;
-    bool prefer_screened_heads = false; // Q4 screen and compact draft heads.
-    // MTP verification policy: decode-equivalent 2..8-row Q4/GDN arithmetic,
-    // Q8 batch argmax, device checkpoints and recurrent state prefixes.
-    bool qualified_verification = false;
-    bool prefer_q4_narrow_row_cache = false; // Exact narrow projection views on qualified devices.
-    bool prefer_q4_m3_specializations = false; // Qualified SM121 M3 projection policy.
-    bool prefer_q4_fixed_m5 = false; // Qualified SM121 compact-wide M5 policy.
-    bool prefer_q4_hc_adjacent = false; // Qualified SM121 paired-HC policy.
-    bool prefer_q4_g128_column_batches = false; // Measured SM121 W4G128 M2-M4 policy.
-    bool prefer_nvfp4_gate_m1_proven = false; // Qualified SM121 resident M1 policy.
-    bool prefer_nvfp4_gate_subgroup = false; // Qualified SM121 tiny-batch policy.
-    bool prefer_nvfp4_mtp_gate_pairs = false; // Exact small-batch gate expert reuse.
-    bool prefer_nvfp4_mtp_gate_eight = false; // Qualified SM121 PAIR gate coalescing.
-    bool prefer_nvfp4_m1_down_subwarp = false; // Exact eight-lane resident M1 down policy.
-    bool prefer_nvfp4_mtp_down_subwarp = false; // Exact eight-lane small-batch down policy.
     bool supports_sdpa_head_lane_pair = false;
     bool supports_extended_nvfp4_prefill_sort = false;
     cublasHandle_t cublas = nullptr;
@@ -540,7 +528,6 @@ struct CudaBackend::Impl {
         size_t peak_output_bytes = 0;
     };
     std::unique_ptr<VerificationWorkspaces> verification_workspaces;
-    int verification_rows_limit = 5; // Wider admission is qualified on SM121.
     bool verification_cache_suspended = false;
     DecodeSegment* active_segment = nullptr;
     enum class SegmentMode { NONE, CAPTURE, REPLAY };
@@ -983,7 +970,7 @@ struct CudaBackend::Impl {
             // Preserve legacy layout metadata: HC fusion and exact batch reuse
             // make independent decisions from row_g32. This cache only supplies
             // the qualified M1 and M4..6 kernels, retaining the original payload.
-            if (prefer_q4_narrow_row_cache && !row_g32 &&
+            if (policy.prefer_q4_narrow_row_cache && !row_g32 &&
                 layout == WeightLayout::Q4Bg32Biased && n == 2560 && k == 6144) {
                 const size_t row_bytes = static_cast<size_t>(n) * (k / 32) * sizeof(mollm_cuda::Q4RowG32);
                 if (!mollm_cuda::malloc_device(reinterpret_cast<void**>(&narrow_row_g32), row_bytes,
@@ -1087,10 +1074,68 @@ struct CudaBackend::Impl {
         return true;
     }
 
-    // Rows of a W4G128 tile per warp for an exact verification batch.
-    int q4_g128_batch_rows(int tokens) const {
-        if (prefer_q4_g128_column_batches && tokens <= 4) return 1;
-        return tokens <= 3 ? 2 : 4;
+    // Prints each distinct kernel selection once when MOLLM_CUDA_TRACE_KERNELS
+    // is set, so a run shows which kernels its shapes actually reach.
+    void trace_kernel(const char* kernel, mollm_cuda::MatmulWeight weight, int m, int n, int k) {
+        static const bool enabled = std::getenv("MOLLM_CUDA_TRACE_KERNELS") != nullptr;
+        if (!enabled) return;
+        const char* layout = mollm_cuda::weight_name(weight);
+        const std::string key = std::string(kernel) + ' ' + layout + ' ' + std::to_string(m) + ' ' +
+            std::to_string(n) + ' ' + std::to_string(k);
+        if (!traced_kernels.insert(key).second) return;
+        std::fprintf(stderr, "mollm cuda kernel: matmul %s weight=%s m=%d n=%d k=%d\n",
+                     kernel, layout, m, n, k);
+    }
+
+    // One token through the quantized projection select_decode names.
+    bool launch_decode_gemv(const DeviceWeight& prepared, mollm_cuda::MatmulWeight kind,
+                            const float* a, float* c, int n, int k, int lda, int ldc,
+                            cudaStream_t stream) {
+        mollm_cuda::DecodeRequest request;
+        request.weight = kind;
+        if (kind == mollm_cuda::MatmulWeight::Q4G32) {
+            request.narrow_row_eligible = prepared.narrow_row_g32 &&
+                mollm_cuda::q4_narrow_row_eligible(a, 1, n, k, lda, ldc);
+            request.row_major_aligned = prepared.row_g32 &&
+                reinterpret_cast<uintptr_t>(a) % alignof(float2) == 0;
+        }
+        const auto kernel = mollm_cuda::select_decode(request);
+        const char* name = mollm_cuda::kernel_name(kernel);
+        trace_kernel(name, kind, 1, n, k);
+        cudaError_t status = cudaSuccess;
+        bool returns_status = false;
+        switch (kernel) {
+        case mollm_cuda::DecodeKernel::Q8:
+            mollm_cuda::launch_q8_dense_gemv(a, static_cast<const int8_t*>(prepared.data),
+                prepared.scales, prepared.group_size, prepared.groups_per_row, c, n, k);
+            break;
+        case mollm_cuda::DecodeKernel::Q4CompactInteger:
+            status = mollm_cuda::launch_q4_compact_integer_gemv(a,
+                static_cast<const mollm_cuda::Q4CompactG32*>(prepared.data), c, n, k, stream);
+            returns_status = true;
+            break;
+        case mollm_cuda::DecodeKernel::Q4Compact:
+            mollm_cuda::launch_q4_g32_compact_gemv(a,
+                static_cast<const mollm_cuda::Q4CompactG32*>(prepared.data), c, n, k, stream);
+            break;
+        case mollm_cuda::DecodeKernel::Q4NarrowRow:
+            status = mollm_cuda::launch_q4_narrow_row(a, prepared.narrow_row_g32, c, 1, n, k,
+                lda, ldc, stream);
+            returns_status = true;
+            break;
+        case mollm_cuda::DecodeKernel::Q4RowMajor:
+            mollm_cuda::launch_q4_row_g32_gemv(a, prepared.row_g32, c, n, k, stream);
+            break;
+        case mollm_cuda::DecodeKernel::Q4G32:
+            mollm_cuda::launch_q4_g32_dense_gemv(a,
+                static_cast<const Q4B8G32Block*>(prepared.data), c, n, k, stream);
+            break;
+        case mollm_cuda::DecodeKernel::Q4G128:
+            mollm_cuda::launch_q4_g128_dense_gemv(a,
+                static_cast<const Q4B8G128Block*>(prepared.data), c, n, k);
+            break;
+        }
+        return mollm_cuda::report_cuda(returns_status ? status : cudaGetLastError(), name);
     }
 
     bool run_matmul_device(const float* device_a, int lda,
@@ -1104,128 +1149,101 @@ struct CudaBackend::Impl {
             !device_c || ldc != n)
             return false;
 
-        const bool valid_q8 =
-            prepared->layout == WeightLayout::Q8RowMajor &&
-            prepared->scales && prepared->group_size > 0 &&
-            prepared->groups_per_row ==
-                (k + prepared->group_size - 1) / prepared->group_size;
-        const bool integer_compact = prepared->layout == WeightLayout::Q4Bg32CompactInteger;
-        const bool compact_q4_g32 = prepared->layout == WeightLayout::Q4Bg32Compact || integer_compact;
-        const bool valid_q4_g32 =
-            (prepared->layout == WeightLayout::Q4Bg32Biased || compact_q4_g32) && k % 32 == 0;
-        const bool valid_q4_g128 =
-            prepared->layout == WeightLayout::Q4Bg128 && k % 128 == 0;
-        const bool valid_quantized =
-            valid_q8 || valid_q4_g32 || valid_q4_g128;
+        using mollm_cuda::MatmulPath;
+        using mollm_cuda::MatmulWeight;
+        MatmulWeight kind = MatmulWeight::Other;
+        if (prepared->layout == WeightLayout::Q8RowMajor) {
+            if (prepared->scales && prepared->group_size > 0 &&
+                prepared->groups_per_row == (k + prepared->group_size - 1) / prepared->group_size)
+                kind = MatmulWeight::Q8;
+        } else if (k % 32 == 0 && prepared->layout == WeightLayout::Q4Bg32Biased) {
+            kind = MatmulWeight::Q4G32;
+        } else if (k % 32 == 0 && prepared->layout == WeightLayout::Q4Bg32Compact) {
+            kind = MatmulWeight::Q4G32Compact;
+        } else if (k % 32 == 0 && prepared->layout == WeightLayout::Q4Bg32CompactInteger) {
+            kind = MatmulWeight::Q4G32CompactInteger;
+        } else if (k % 128 == 0 && prepared->layout == WeightLayout::Q4Bg128) {
+            kind = MatmulWeight::Q4G128;
+        }
+        const bool valid_q8 = kind == MatmulWeight::Q8;
+        const bool valid_q4_g32 = mollm_cuda::is_q4_g32(kind);
+        const bool compact_q4_g32 = mollm_cuda::is_compact_q4_g32(kind);
+        const bool valid_quantized = kind != MatmulWeight::Other;
         // Non-default streams are used only by resident Q4 MoE graph capture.
         if (stream && !(valid_q4_g32 && m == 1 && activation_kind == Activation::NONE)) return false;
         static const bool small_batch = [] {
             const char* value = std::getenv("MOLLM_CUDA_Q4_SMALL_BATCH");
             return value && std::strcmp(value, "1") == 0;
         }();
+        mollm_cuda::MatmulRequest request;
+        request.weight = kind;
+        request.tokens = m;
+        request.columns = n;
+        request.inner = k;
+        request.row_major_sidecar = prepared->row_g32 != nullptr;
+        request.legacy_small_batch = small_batch;
+        const MatmulPath path = mollm_cuda::select_matmul_path(policy, request);
+        if (path != MatmulPath::Decode && path != MatmulPath::VerifyQ4PerToken &&
+            path != MatmulPath::VerifyQ4G32)
+            trace_kernel(mollm_cuda::kernel_name(path), kind, m, n, k);
         // Verification batches reproduce per-token decode arithmetic exactly.
-        if (qualified_verification && valid_q4_g32 && m >= 2 && m <= 8) {
-            if (compact_q4_g32) {
-                if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_compact_small_batch_exact(
-                        device_a, static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data),
-                        device_c, m, n, k, lda, ldc, integer_compact, stream,
-                        prefer_q4_fixed_m5), "q4_compact_batch_reuse"))
-                    return false;
-            } else if (!prepared->row_g32) {
-                const bool specialized = prefer_q4_m3_specializations && m == 3 && lda == k &&
-                    reinterpret_cast<uintptr_t>(device_a) % alignof(float4) == 0;
-                cudaError_t status;
-                if (prepared->narrow_row_g32 &&
-                    mollm_cuda::q4_narrow_row_eligible(device_a, m, n, k, lda, ldc)) {
-                    status = mollm_cuda::launch_q4_narrow_row(device_a,
-                        prepared->narrow_row_g32, device_c, m, n, k, lda, ldc, stream);
-                } else if (specialized && ((n == 320 && k == 10240) || (n == 640 && k == 2560))) {
-                    status = mollm_cuda::launch_q4_g32_m3_adjacent(device_a,
-                        static_cast<const Q4B8G32Block*>(prepared->data), device_c, n, k, stream);
-                } else if (specialized && ((n == 2560 && k == 6144) || (n == 512 && k == 2560))) {
-                    status = mollm_cuda::launch_q4_g32_m3_fixed(device_a,
-                        static_cast<const Q4B8G32Block*>(prepared->data), device_c, n, k, stream);
-                } else {
-                    status = mollm_cuda::launch_q4_g32_small_batch_exact(device_a,
-                        static_cast<const Q4B8G32Block*>(prepared->data), device_c, m, n, k, lda, ldc, stream);
-                }
-                if (!mollm_cuda::report_cuda(status, "q4_small_batch_exact_reuse")) return false;
-            } else {
-                // Row-major sidecar weights: run each token through the exact
-                // decode projection, without FP16 expansion.
-                for (int token = 0; token < m; ++token) {
-                    const float* a = device_a + static_cast<size_t>(token) * lda;
-                    float* c = device_c + static_cast<size_t>(token) * ldc;
-                    if (integer_compact) {
-                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_compact_integer_gemv(a,
-                            static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data), c, n, k, stream),
-                            "compact_integer_gemv")) return false;
-                    } else if (compact_q4_g32)
-                        mollm_cuda::launch_q4_g32_compact_gemv(a,
-                            static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data), c, n, k, stream);
-                    else if (prepared->narrow_row_g32 &&
-                        mollm_cuda::q4_narrow_row_eligible(a, 1, n, k, lda, ldc)) {
-                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_narrow_row(a,
-                            prepared->narrow_row_g32, c, 1, n, k, lda, ldc, stream), "q4_narrow_row")) return false;
-                    } else if (prepared->row_g32 && reinterpret_cast<uintptr_t>(a) % alignof(float2) == 0)
-                        mollm_cuda::launch_q4_row_g32_gemv(a, prepared->row_g32, c, n, k, stream);
-                    else
-                        mollm_cuda::launch_q4_g32_dense_gemv(a,
-                            static_cast<const Q4B8G32Block*>(prepared->data), c, n, k, stream);
-                }
-                if (!mollm_cuda::report_cuda(cudaGetLastError(), "q4_small_batch_exact_decode")) return false;
+        if (path == MatmulPath::VerifyQ4Compact) {
+            if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_compact_small_batch_exact(
+                    device_a, static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data),
+                    device_c, m, n, k, lda, ldc, kind == MatmulWeight::Q4G32CompactInteger, stream,
+                    policy.prefer_q4_fixed_m5), "q4_compact_batch_reuse"))
+                return false;
+        } else if (path == MatmulPath::VerifyQ4G32) {
+            mollm_cuda::Q4G32BatchRequest batch;
+            batch.tokens = m;
+            batch.columns = n;
+            batch.inner = k;
+            batch.narrow_row_eligible = prepared->narrow_row_g32 &&
+                mollm_cuda::q4_narrow_row_eligible(device_a, m, n, k, lda, ldc);
+            batch.packed_aligned = lda == k &&
+                reinterpret_cast<uintptr_t>(device_a) % alignof(float4) == 0;
+            const auto kernel = mollm_cuda::select_q4_g32_batch(policy, batch);
+            trace_kernel(mollm_cuda::kernel_name(kernel), kind, m, n, k);
+            const auto* tiles = static_cast<const Q4B8G32Block*>(prepared->data);
+            cudaError_t status;
+            switch (kernel) {
+            case mollm_cuda::Q4G32BatchKernel::NarrowRow:
+                status = mollm_cuda::launch_q4_narrow_row(device_a,
+                    prepared->narrow_row_g32, device_c, m, n, k, lda, ldc, stream);
+                break;
+            case mollm_cuda::Q4G32BatchKernel::M3Adjacent:
+                status = mollm_cuda::launch_q4_g32_m3_adjacent(device_a, tiles, device_c, n, k, stream);
+                break;
+            case mollm_cuda::Q4G32BatchKernel::M3Fixed:
+                status = mollm_cuda::launch_q4_g32_m3_fixed(device_a, tiles, device_c, n, k, stream);
+                break;
+            default:
+                status = mollm_cuda::launch_q4_g32_small_batch_exact(device_a, tiles, device_c,
+                    m, n, k, lda, ldc, stream);
+                break;
             }
-        } else if (qualified_verification && valid_q4_g128 && m >= 2 && m <= 8) {
+            if (!mollm_cuda::report_cuda(status, "q4_small_batch_exact_reuse")) return false;
+        } else if (path == MatmulPath::VerifyQ4PerToken) {
+            // Run each token through the exact decode projection, without
+            // FP16 expansion.
+            for (int token = 0; token < m; ++token)
+                if (!launch_decode_gemv(*prepared, kind,
+                        device_a + static_cast<size_t>(token) * lda,
+                        device_c + static_cast<size_t>(token) * ldc, n, k, lda, ldc, stream))
+                    return false;
+        } else if (path == MatmulPath::VerifyQ4G128) {
             if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_g128_small_batch_exact(
                     device_a, static_cast<const Q4B8G128Block*>(prepared->data),
-                    device_c, m, n, k, lda, ldc, q4_g128_batch_rows(m)),
+                    device_c, m, n, k, lda, ldc, mollm_cuda::q4_g128_batch_rows(policy, m)),
                     "q4_g128_small_batch_exact"))
                 return false;
-        } else if (small_batch && valid_q4_g32 && !compact_q4_g32 && m >= 2 && m <= 8 &&
-            k >= 2048 && static_cast<int64_t>(n) * k >= 4 * 1024 * 1024) {
+        } else if (path == MatmulPath::LegacyQ4G32Batch) {
             if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_g32_small_batch(
                     device_a, static_cast<const Q4B8G32Block*>(prepared->data),
                     device_c, m, n, k, lda, ldc, stream), "q4_g32_small_batch_cuda"))
                 return false;
-        } else if (valid_quantized && m == 1) {
-            const char* label = nullptr;
-            if (valid_q8) {
-                mollm_cuda::launch_q8_dense_gemv(
-                    device_a, static_cast<const int8_t*>(prepared->data),
-                    prepared->scales, prepared->group_size,
-                    prepared->groups_per_row, device_c, n, k);
-                label = "q8_dense_gemv_cuda";
-            } else if (valid_q4_g32) {
-                if (integer_compact) {
-                    if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_compact_integer_gemv(device_a,
-                        static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data), device_c, n, k, stream),
-                        "compact_integer_gemv")) return false;
-                } else if (compact_q4_g32)
-                    mollm_cuda::launch_q4_g32_compact_gemv(device_a,
-                        static_cast<const mollm_cuda::Q4CompactG32*>(prepared->data),
-                        device_c, n, k, stream);
-                else if (prepared->narrow_row_g32 &&
-                    mollm_cuda::q4_narrow_row_eligible(device_a, 1, n, k, lda, ldc)) {
-                    if (!mollm_cuda::report_cuda(mollm_cuda::launch_q4_narrow_row(device_a,
-                        prepared->narrow_row_g32, device_c, 1, n, k, lda, ldc, stream), "q4_narrow_row")) return false;
-                } else if (prepared->row_g32 && reinterpret_cast<uintptr_t>(device_a) % alignof(float2) == 0)
-                    mollm_cuda::launch_q4_row_g32_gemv(device_a, prepared->row_g32,
-                        device_c, n, k, stream);
-                else
-                    mollm_cuda::launch_q4_g32_dense_gemv(
-                        device_a,
-                        static_cast<const Q4B8G32Block*>(prepared->data),
-                        device_c, n, k, stream);
-                label = "q4_g32_dense_gemv_cuda";
-            } else {
-                mollm_cuda::launch_q4_g128_dense_gemv(
-                    device_a,
-                    static_cast<const Q4B8G128Block*>(prepared->data),
-                    device_c, n, k);
-                label = "q4_g128_dense_gemv_cuda";
-            }
-            if (!mollm_cuda::report_cuda(
-                    cudaGetLastError(), label))
+        } else if (path == MatmulPath::Decode) {
+            if (!launch_decode_gemv(*prepared, kind, device_a, device_c, n, k, lda, ldc, stream))
                 return false;
         } else {
             const void* linear_weight = prepared->data;

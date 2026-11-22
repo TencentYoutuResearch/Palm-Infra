@@ -161,16 +161,16 @@ bool CudaBackend::retire_verify_prefix_bank() {
 }
 
 bool CudaBackend::qualified_verification_enabled() const {
-    return available() && impl_->qualified_verification;
+    return available() && impl_->policy.qualified_verification;
 }
 
 int CudaBackend::verification_workspace_max_rows() const {
-    return available() ? impl_->verification_rows_limit : 0;
+    return available() ? impl_->policy.verification_rows_limit : 0;
 }
 
 bool CudaBackend::begin_state_prefixes(const std::vector<Tensor*>& states, int tokens) {
     end_state_prefixes();
-    if (!impl_->qualified_verification || tokens < 2 || tokens > 8 || states.empty()) return false;
+    if (!impl_->policy.qualified_verification || tokens < 2 || tokens > 8 || states.empty()) return false;
     finish_decode_segment();
     std::vector<Impl::StatePrefix> bindings;
     bindings.reserve(states.size());
@@ -343,7 +343,7 @@ bool CudaBackend::restore_state_prefix(int kept) {
 }
 
 bool CudaBackend::supports_state_snapshot(const std::vector<Tensor*>& states) const {
-    if (!impl_->qualified_verification || !available()) return false;
+    if (!impl_->policy.qualified_verification || !available()) return false;
     for (const Tensor* state : states) {
         if (!state || !state->view_span_bytes()) continue;
         // Host-authoritative/mirrored metadata requires the existing transfer
@@ -422,33 +422,16 @@ CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) 
         impl_->coherent_host_weights = pageable && host_tables;
     cudaDeviceProp properties{};
     if (cudaGetDeviceProperties(&properties, 0) == cudaSuccess) {
-        // Decode specializations below were qualified on SM121 only; every
-        // other device keeps the generic paths.
         const bool sm121 = properties.major == 12 && properties.minor == 1;
-        impl_->prefer_fp16_expert_palette = sm121;
-        impl_->verification_rows_limit = sm121 ? 8 : 5;
-        impl_->supports_native_nvfp4_mma = properties.major == 12 && properties.minor <= 1;
-        impl_->prefer_screened_heads = sm121;
-        // Verification batches that reproduce the M=1 decode arithmetic pair
-        // with whichever decode kernels the device selects, so they are not
-        // tied to the SM121 specializations. Reference runs can opt out to
+        impl_->policy = mollm_cuda::make_device_policy(properties.major, properties.minor);
+        // Reference runs can opt out of decode-equivalent verification to
         // compare against the generic batch paths.
-        impl_->qualified_verification = properties.major >= 8 &&
-            std::getenv("MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION") == nullptr;
-        impl_->prefer_nvfp4_gate_m1_proven = sm121;
-        impl_->prefer_nvfp4_gate_subgroup = sm121;
-        impl_->prefer_nvfp4_mtp_gate_pairs = sm121;
-        impl_->prefer_nvfp4_mtp_gate_eight = sm121;
-        impl_->prefer_nvfp4_m1_down_subwarp = sm121;
-        impl_->prefer_nvfp4_mtp_down_subwarp = sm121;
-        impl_->prefer_q4_narrow_row_cache = sm121;
-        impl_->prefer_q4_m3_specializations = sm121;
-        impl_->prefer_q4_fixed_m5 = sm121;
-        impl_->prefer_q4_g128_column_batches = sm121;
-        if (sm121) {
-            const auto status = mollm_cuda::configure_q4_g32_hc_adjacent_cache();
-            impl_->prefer_q4_hc_adjacent = status == cudaSuccess;
-            if (status != cudaSuccess) cudaGetLastError(); // Keep the generic path available.
+        if (std::getenv("MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION"))
+            impl_->policy.qualified_verification = false;
+        if (impl_->policy.prefer_q4_hc_adjacent &&
+            mollm_cuda::configure_q4_g32_hc_adjacent_cache() != cudaSuccess) {
+            impl_->policy.prefer_q4_hc_adjacent = false;
+            cudaGetLastError(); // Keep the generic path available.
         }
 
         impl_->supports_extended_nvfp4_prefill_sort = sm121;
@@ -825,7 +808,7 @@ bool CudaBackend::set_operator_fallback_policy(
 bool CudaBackend::register_weight_region(void*, size_t) { return true; }
 
 void CudaBackend::wrap_routed_expert_weight(Tensor& tensor, int rows_per_expert) {
-    if (available() && impl_->prefer_fp16_expert_palette && tensor.data &&
+    if (available() && impl_->policy.prefer_fp16_expert_palette && tensor.data &&
         tensor.prec == Precision::FP16 && !tensor.device.buffer && !tensor.device.offset &&
         tensor.is_contiguous() && tensor.shape[2] == 1 && tensor.shape[3] == 1 &&
         rows_per_expert > 0 && rows_per_expert % 128 == 0 &&

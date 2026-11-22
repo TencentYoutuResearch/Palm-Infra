@@ -805,6 +805,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_cuda_prefill_batch_policy tests/test_cuda_prefill_batch_policy.cpp)
     # CUDA prefix planning inspects metadata only; run it without a toolkit/GPU too.
     add_mollm_test(test_cuda_prefix_plan tests/test_cuda_prefix_plan.cpp)
+    add_mollm_test(test_cuda_kernel_policy tests/test_cuda_kernel_policy.cpp)
     add_mollm_test(test_cuda_host_memory_watchdog tests/test_cuda_host_memory_watchdog.cpp)
     add_mollm_test(test_engine        tests/test_engine.cpp)
     add_mollm_test(test_routed_expert_weight tests/test_routed_expert_weight.cpp)
