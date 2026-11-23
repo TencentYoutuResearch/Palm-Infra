@@ -409,6 +409,75 @@ bool CudaBackend::try_nvfp4_moe(
         if (!shared_branch()) return fail();
         return combine(synchronous);
     };
+    // Demand-cached experts: route on the host, since the provider has to be
+    // told which experts to fetch, then hold a lease on each distinct one.
+    // The leases keep the weights in place until the GPU work has finished.
+    ExpertProvider* const provider = gate_source->provider;
+    const bool wait_for_experts = !impl_->options.disable_moe_demand_wait;
+    std::vector<int> indices, wanted;
+    std::vector<float> weights;
+    std::vector<ExpertLease> leases;
+    // This function returns true once it has handled the operator, also when
+    // it failed; false leaves the operator to the CPU bridge. Acquisition
+    // reports which of the two a refusal is.
+    bool acquisition_failed = false;
+    const auto lease_of = [&](int expert) -> const ExpertLease& {
+        return leases[static_cast<size_t>(
+            std::lower_bound(wanted.begin(), wanted.end(), expert) - wanted.begin())];
+    };
+    const auto acquire_routed_experts = [&]() {
+        if (!matmul(x, 1, logits, experts, hidden)) { fail(); acquisition_failed = true; return false; }
+        std::vector<float> host_logits(static_cast<size_t>(rows) * experts);
+        if (!mollm_cuda::copy_memory(host_logits.data(), logits,
+                host_logits.size() * sizeof(float), cudaMemcpyDeviceToHost, "MoE routing logits"))
+            { fail(); acquisition_failed = true; return false; }
+        mollm::detail::MoeRoutingParams routing;
+        routing.num_experts = experts;
+        routing.top_k = top_k;
+        routing.score_func = graph_params::get_i32(p, 5, 0);
+        routing.normalize_topk = graph_params::get_i32(p, 6, 1) != 0;
+        routing.num_groups = graph_params::get_i32(p, 8, 1);
+        routing.topk_groups = graph_params::get_i32(p, 9, 1);
+        routing.scaling_factor = graph_params::get_f32(p, 0, 1.0f);
+        if (!mollm::detail::select_moe_routes(host_logits.data(), rows, nullptr,
+                                             routing, indices, weights)) { fail(); acquisition_failed = true; return false; }
+        // As in the CPU kernel: a decode token tells the cache which experts to
+        // keep for the next one, in router rank order.
+        if (wait_for_experts && rows == 1)
+            provider->retain_for_next_forward(gate_source, down_source,
+                std::vector<int>(indices.begin(), indices.begin() + top_k), true);
+        // Accumulate experts in the same ascending-ID order as the CPU provider.
+        for (int row = 0; row < rows; ++row) {
+            for (int i = 1; i < top_k; ++i) {
+                for (int j = i; j > 0 && indices[row * top_k + j] < indices[row * top_k + j - 1]; --j) {
+                    std::swap(indices[row * top_k + j], indices[row * top_k + j - 1]);
+                    std::swap(weights[row * top_k + j], weights[row * top_k + j - 1]);
+                }
+            }
+        }
+        wanted.assign(indices.begin(), indices.begin() + routes);
+        std::sort(wanted.begin(), wanted.end());
+        wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+        if (wait_for_experts) {
+            // Queue every miss at once so the reads overlap, then wait for each
+            // expert below. The cache must be able to hold all of this call's
+            // experts together, because each stays pinned until the projections
+            // have run; when it cannot, the CPU kernel streams them in a window.
+            if (!provider->request_many(gate_source, down_source, wanted) ||
+                provider->resident_count(gate_source, down_source, wanted) < wanted.size())
+                return false;
+        }
+        // One lease per distinct expert. Without waiting, a miss or an
+        // unsupported provider leaves the whole operator to the CPU bridge.
+        leases = std::vector<ExpertLease>(wanted.size());
+        for (size_t i = 0; i < wanted.size(); ++i) {
+            if (!provider->borrow(gate_source, down_source, wanted[i], leases[i], wait_for_experts))
+                return false;
+            if (!valid(leases[i].gate_up, 2 * inter, hidden) ||
+                !valid(leases[i].down, hidden, inter)) return false;
+        }
+        return true;
+    };
     const bool host_routing = impl_->options.disable_resident_routes;
     const int score_func = graph_params::get_i32(p, 5, 0);
     if (!host_routing && experts <= 1024 && top_k <= 32 &&
@@ -473,9 +542,37 @@ bool CudaBackend::try_nvfp4_moe(
                 found = impl_->resident_experts.emplace(gate_source, std::move(resident)).first;
             }
         }
+        Impl::ResidentExperts* layer = nullptr;
         if (found != impl_->resident_experts.end() && found->second.down_source == down_source &&
             found->second.hidden == hidden && found->second.inter == inter &&
-            found->second.leases.size() == static_cast<size_t>(experts)) {
+            found->second.leases.size() == static_cast<size_t>(experts))
+            layer = &found->second;
+        // Without a resident layer the same execution runs on this call's
+        // leases. Their buffers are ordinary host memory, so the layouts that
+        // exist only in a resident arena are off, as for a host arena.
+        Impl::ResidentExperts demand_layer;
+        const bool demand = !layer && wait_for_experts;
+        if (demand) {
+            if (!acquire_routed_experts()) return acquisition_failed;
+            demand_layer.down_source = down_source;
+            demand_layer.hidden = hidden;
+            demand_layer.inter = inter;
+            demand_layer.gate_pair_layout = std::all_of(leases.begin(), leases.end(),
+                [](const ExpertLease& lease) { return lease.gate_up.nvfp4_q8_pair_data != nullptr; });
+            demand_layer.down_pair_layout = std::all_of(leases.begin(), leases.end(),
+                [](const ExpertLease& lease) { return lease.down.nvfp4_q8_pair_data != nullptr; });
+            if (native_mma) {
+                demand_layer.gate_input_global = gate_source->nvfp4_input_scales[wanted.front() * 2];
+                demand_layer.uniform_gate_input_global = std::isfinite(demand_layer.gate_input_global) &&
+                    demand_layer.gate_input_global > 0.f &&
+                    std::all_of(wanted.begin(), wanted.end(), [&](int expert) {
+                        return gate_source->nvfp4_input_scales[expert * 2] == demand_layer.gate_input_global &&
+                            gate_source->nvfp4_input_scales[expert * 2 + 1] == demand_layer.gate_input_global;
+                    });
+            }
+            layer = &demand_layer;
+        }
+        if (layer) {
             const bool no_grouping = impl_->options.disable_nvfp4_grouping;
             // Qualified grouped batched prefill; per-shape guards below.
             constexpr bool batch_prefill=true;
@@ -525,7 +622,7 @@ bool CudaBackend::try_nvfp4_moe(
             const bool async_gate = async_gate_requested && async_gate_four_warps &&
                 rows>=16 && hidden==2560 && inter==640 && canonical_mma &&
                 gate_batch_routes==32 && !compact_gate_dispatch && !specialized_prepared &&
-                found->second.gate_async_aligned;
+                layer->gate_async_aligned;
             // Qualified fused prepare: packed-only mode 2.
             constexpr int activation_prepare_fusion=2;
             // Qualified BF16 gate/up epilogue boundary.
@@ -536,7 +633,7 @@ bool CudaBackend::try_nvfp4_moe(
             // Qualified early input-fragment loads before the weight wait.
             constexpr bool early_inputs_requested=true;
             const bool gate_early_inputs=early_inputs_requested && gate_output_bf16 &&
-                found->second.gate_pair_layout;
+                layer->gate_pair_layout;
             // Qualified vectorized gate input quantization.
             constexpr bool vector_quantize_requested=true;
             const bool gate_vector_quantize=vector_quantize_requested && gate_output_bf16;
@@ -576,17 +673,17 @@ bool CudaBackend::try_nvfp4_moe(
             if(gate_codes_kmajor&&!(requested(input_scale_kmajor_override)&&
                 batch_policy.kmajor_rows(rows)&&requested(compact_logits_override)&&
                 rows<=2048&&hidden==2560&&inter==640&&
-                requested(token_quantization_override)&&found->second.uniform_gate_input_global&&
+                requested(token_quantization_override)&&layer->uniform_gate_input_global&&
                 !(reinterpret_cast<uintptr_t>(x)&15)&&requested(token_pair_words_override)&&
-                found->second.gate_pair_layout))mma_activation_fused=false;
+                layer->gate_pair_layout))mma_activation_fused=false;
             // Explicit total budget; native descriptors remain immutable for
             // decode and every unfused fallback. Never allocate during capture.
             const size_t scale_cache_limit=impl_->options.prefill_gate_scale_cache_bytes;
-            auto& resident=found->second;
+            auto& resident=*layer;
             const size_t scale_view_bytes=size_t(experts)*204800;
             const size_t scale_table_bytes=size_t(experts)*2*sizeof(mollm_cuda::Nvfp4Projection);
             const size_t scale_cache_bytes=scale_view_bytes+scale_table_bytes;
-            if(mma_activation_fused&&rows>1&&hidden==2560&&inter==640&&
+            if(!demand&&mma_activation_fused&&rows>1&&hidden==2560&&inter==640&&
                 resident.gate_async_aligned&&!gate_scales_kmajor&&!resident.prefill_scale_tables&&
                 impl_->prefill_gate_scale_cache_bytes<=scale_cache_limit&&
                 scale_cache_bytes<=scale_cache_limit-impl_->prefill_gate_scale_cache_bytes) {
@@ -677,7 +774,8 @@ bool CudaBackend::try_nvfp4_moe(
             if (native_mma && native_gate_parts > 1 && !impl_->reserve(impl_->moe_mma_partial, impl_->moe_mma_partial_bytes,
                     static_cast<size_t>(routes) * 2 * inter * native_gate_parts * sizeof(float))) return fail();
             const auto enqueue = [&]() {
-                if (!matmul(x, 1, logits, experts, hidden)) return fail();
+                // Demand routing already computed the logits to choose leases.
+                if (!demand && !matmul(x, 1, logits, experts, hidden)) return fail();
                 // Only canonical single-token Q4 projections are scratch-free
                 // on a non-default stream. Batched/FP16/other layouts stay serial.
                 bool parallel_shared = impl_->moe_shared_stream && rows == 1;
@@ -695,14 +793,45 @@ bool CudaBackend::try_nvfp4_moe(
                     if (!shared_ok || !mollm_cuda::report_cuda(recorded, "shared expert completion")) return fail();
                     ++impl_->moe_shared_overlap_enqueues;
                 }
-                mollm_cuda::launch_moe_resident_routes(logits, rows, experts, top_k,
-                    score_func, graph_params::get_i32(p, 6, 1) != 0,
-                    graph_params::get_f32(p, 0, 1.0f), gate_scale_tables, x,
-                    gate_up, activated, down, hidden, inter, gate_jobs, down_jobs,
-                    device_route_weights, execution_stream, -1, down_output_bf16,gate_output_bf16);
+                if (demand) {
+                    // The descriptors the routing kernel would write, built
+                    // from the leases in the same ascending-expert order.
+                    std::vector<mollm_cuda::Nvfp4Projection> host_gate(routes), host_down(routes);
+                    for (size_t i = 0; i < routes; ++i) {
+                        const int expert = indices[i];
+                        const ExpertLease& lease = lease_of(expert);
+                        float* gate_output = gate_output_bf16
+                            ? reinterpret_cast<float*>(reinterpret_cast<uint16_t*>(gate_up) + i * 2 * inter)
+                            : gate_up + i * 2 * inter;
+                        float* down_output = down_output_bf16
+                            ? reinterpret_cast<float*>(reinterpret_cast<uint16_t*>(down) + i * hidden)
+                            : down + i * hidden;
+                        host_gate[i] = projection(lease.gate_up, x + (i / top_k) * hidden, gate_output);
+                        host_down[i] = projection(lease.down, activated + i * inter, down_output);
+                        host_down[i].output_scale = weights[i];
+                        if (native_mma) {
+                            host_gate[i].input_global = gate_source->nvfp4_input_scales[expert * 2];
+                            host_gate[i].input_global_second = gate_source->nvfp4_input_scales[expert * 2 + 1];
+                            host_down[i].input_global = down_source->nvfp4_input_scales[expert];
+                        }
+                    }
+                    const size_t job_bytes = routes * sizeof(mollm_cuda::Nvfp4Projection);
+                    if (!mollm_cuda::report_cuda(cudaMemcpyAsync(gate_jobs, host_gate.data(), job_bytes,
+                            cudaMemcpyHostToDevice, execution_stream), "demand MoE gate descriptors") ||
+                        !mollm_cuda::report_cuda(cudaMemcpyAsync(down_jobs, host_down.data(), job_bytes,
+                            cudaMemcpyHostToDevice, execution_stream), "demand MoE down descriptors") ||
+                        !mollm_cuda::report_cuda(cudaMemcpyAsync(device_route_weights, weights.data(),
+                            routes * sizeof(float), cudaMemcpyHostToDevice, execution_stream),
+                            "demand MoE route weights")) return fail();
+                } else
+                    mollm_cuda::launch_moe_resident_routes(logits, rows, experts, top_k,
+                        score_func, graph_params::get_i32(p, 6, 1) != 0,
+                        graph_params::get_f32(p, 0, 1.0f), gate_scale_tables, x,
+                        gate_up, activated, down, hidden, inter, gate_jobs, down_jobs,
+                        device_route_weights, execution_stream, -1, down_output_bf16,gate_output_bf16);
                 const bool trace_first_routes=impl_->options.nvfp4_trace_first_routes;
                 const bool trace_batch_occupancy=impl_->options.nvfp4_trace_batch_occupancy;
-                if ((trace_first_routes || trace_batch_occupancy) && rows > 1) {
+                if (!demand && (trace_first_routes || trace_batch_occupancy) && rows > 1) {
                     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
                     if (!mollm_cuda::report_cuda(cudaStreamIsCapturing(execution_stream, &capture), "first-route capture check")) return fail();
                     if (capture == cudaStreamCaptureStatusNone) {
@@ -886,8 +1015,8 @@ bool CudaBackend::try_nvfp4_moe(
                     request.scales_kmajor = gate_scales_kmajor;
                     request.pipeline = small_pipeline;
                     request.resident_mma_layout = gate_source->resident_nvfp4_mma_layout;
-                    request.pair_layout = found->second.gate_pair_layout;
-                    request.m1_layout_proven = found->second.gate_m1_layout_proven;
+                    request.pair_layout = layer->gate_pair_layout;
+                    request.m1_layout_proven = layer->gate_m1_layout_proven;
                     request.activation_aligned = !(reinterpret_cast<uintptr_t>(x) & 15);
                     const auto kernel = mollm_cuda::select_nvfp4_gate(impl_->policy, request);
                     impl_->trace_expert_kernel("gate", mollm_cuda::kernel_name(kernel), rows, routes, hidden, inter);
@@ -975,7 +1104,7 @@ bool CudaBackend::try_nvfp4_moe(
                     request.verification_rows = verification_workspace_max_rows();
                     request.pipeline = small_pipeline;
                     request.resident_mma_layout = down_source->resident_nvfp4_mma_layout;
-                    request.pair_layout = found->second.down_pair_layout;
+                    request.pair_layout = layer->down_pair_layout;
                     request.row_scale_prefetch = prefetch_row_scale;
                     const auto kernel = mollm_cuda::select_nvfp4_down(impl_->policy, request);
                     impl_->trace_expert_kernel("down", mollm_cuda::kernel_name(kernel), rows, routes, hidden, inter);
@@ -1012,6 +1141,18 @@ bool CudaBackend::try_nvfp4_moe(
             // A segment capture records the constituent kernels directly;
             // launching an already instantiated graph into capture is rejected
             // by CUDA. Resident leases still keep every descriptor alive.
+            if (demand) {
+                // Lease addresses change from call to call, so nothing here
+                // may be recorded for replay, and the weights must stay
+                // leased until every kernel that reads them has run.
+                if (impl_->segment_mode == Impl::SegmentMode::CAPTURE) return false;
+                enqueue();
+                if (impl_->failed) return true;  // fail() has already drained the device.
+                if (!mollm_cuda::report_cuda(cudaDeviceSynchronize(), "demand MoE lease completion"))
+                    return fail();
+                ++impl_->moe_demand_gpu_calls;
+                return true;
+            }
             if (impl_->segment_mode == Impl::SegmentMode::CAPTURE) return enqueue();
             const bool no_graphs = impl_->options.disable_moe_graphs;
             std::array<const void*, 5> graph_weights{};
@@ -1057,65 +1198,11 @@ bool CudaBackend::try_nvfp4_moe(
             return true;
         }
     }
-    if (!matmul(x, 1, logits, experts, hidden)) return fail();
-    std::vector<float> host_logits(static_cast<size_t>(rows) * experts);
-    if (!mollm_cuda::copy_memory(host_logits.data(), logits,
-            host_logits.size() * sizeof(float), cudaMemcpyDeviceToHost, "MoE routing logits"))
-        return fail();
-    mollm::detail::MoeRoutingParams routing;
-    routing.num_experts = experts;
-    routing.top_k = top_k;
-    routing.score_func = graph_params::get_i32(p, 5, 0);
-    routing.normalize_topk = graph_params::get_i32(p, 6, 1) != 0;
-    routing.num_groups = graph_params::get_i32(p, 8, 1);
-    routing.topk_groups = graph_params::get_i32(p, 9, 1);
-    routing.scaling_factor = graph_params::get_f32(p, 0, 1.0f);
-    std::vector<int> indices;
-    std::vector<float> weights;
-    if (!mollm::detail::select_moe_routes(host_logits.data(), rows, nullptr,
-                                         routing, indices, weights)) return fail();
-    ExpertProvider* const provider = gate_source->provider;
-    const bool wait_for_experts = !impl_->options.disable_moe_demand_wait;
-    // As in the CPU kernel: a decode token tells the cache which experts to
-    // keep for the next one, in router rank order.
-    if (wait_for_experts && rows == 1)
-        provider->retain_for_next_forward(gate_source, down_source,
-            std::vector<int>(indices.begin(), indices.begin() + top_k), true);
-    // Accumulate experts in the same ascending-ID order as the CPU provider.
-    for (int row = 0; row < rows; ++row) {
-        for (int i = 1; i < top_k; ++i) {
-            for (int j = i; j > 0 && indices[row * top_k + j] < indices[row * top_k + j - 1]; --j) {
-                std::swap(indices[row * top_k + j], indices[row * top_k + j - 1]);
-                std::swap(weights[row * top_k + j], weights[row * top_k + j - 1]);
-            }
-        }
-    }
-    std::vector<int> wanted(indices.begin(), indices.begin() + routes);
-    std::sort(wanted.begin(), wanted.end());
-    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
-    if (wait_for_experts) {
-        // Queue every miss at once so the reads overlap, then wait for each
-        // expert below. The cache must be able to hold all of this call's
-        // experts together, because each stays pinned until the projections
-        // have run; when it cannot, the CPU kernel streams them in a window.
-        if (!provider->request_many(gate_source, down_source, wanted) ||
-            provider->resident_count(gate_source, down_source, wanted) < wanted.size())
-            return false;
-    }
-    // One lease per distinct expert. Without waiting, a miss or an
-    // unsupported provider leaves the whole operator to the CPU bridge.
-    std::vector<ExpertLease> leases(wanted.size());
-    for (size_t i = 0; i < wanted.size(); ++i) {
-        if (!provider->borrow(gate_source, down_source, wanted[i], leases[i], wait_for_experts))
-            return false;
-        if (!valid(leases[i].gate_up, 2 * inter, hidden) ||
-            !valid(leases[i].down, hidden, inter)) return false;
-    }
+    if (!acquire_routed_experts()) return acquisition_failed;
     if (wait_for_experts) ++impl_->moe_demand_gpu_calls;
     std::vector<mollm_cuda::Nvfp4Projection> gate_jobs(routes), down_jobs(routes);
     for (size_t i = 0; i < routes; ++i) {
-        const ExpertLease& lease = leases[static_cast<size_t>(
-            std::lower_bound(wanted.begin(), wanted.end(), indices[i]) - wanted.begin())];
+        const ExpertLease& lease = lease_of(indices[i]);
         gate_jobs[i] = projection(lease.gate_up, x + (i / top_k) * hidden,
                                   gate_up + i * 2 * inter);
         down_jobs[i] = projection(lease.down, activated + i * inter, down + i * hidden);
