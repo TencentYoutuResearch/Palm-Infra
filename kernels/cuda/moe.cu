@@ -649,19 +649,19 @@ __device__ bool same_nvfp4_expert(const mollm_cuda::Nvfp4Projection& a,
 }
 
 // Diagnostic prefill MMA + activation/quantization dataflow fusion.
-template<bool SkewWeights = false,bool TransposedScales = false,bool KmajorCodes = false>
+template<bool TransposedScales = false,bool KmajorCodes = false>
 __device__ __forceinline__ void nvfp4_stage_fused_gate_weights(
     const mollm_cuda::Nvfp4Projection& job, uint8_t* stage, int cta_row, int k) {
     const int t=threadIdx.x%128;
     cta_row+=(threadIdx.x/128)*640;
-    constexpr int weight_bytes=SkewWeights?3328:2304;
-    constexpr int scale_offset=SkewWeights?3072:2048;
+    constexpr int weight_bytes=2304;
+    constexpr int scale_offset=2048;
     stage+=(threadIdx.x/128)*weight_bytes;
     const size_t source = KmajorCodes ? size_t(k/64)*1280*32+
         (job.pair_layout?size_t(cta_row/4+t/8)*128+(t%8)*16:size_t(cta_row+t/2)*32+(t%2)*16) : job.pair_layout
         ? size_t(cta_row/4+t/8)*5120 + size_t(k)*2 + (t%8)*16
         : size_t(cta_row+t/2)*1280 + k/2 + (t%2)*16;
-    const int destination_offset=SkewWeights&&job.pair_layout?(t/8)*192+(t%8)*16:t*16;
+    const int destination_offset=t*16;
     const unsigned destination=static_cast<unsigned>(__cvta_generic_to_shared(stage+destination_offset));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::
         "r"(destination),"l"(job.weight+source):"memory");
@@ -671,33 +671,6 @@ __device__ __forceinline__ void nvfp4_stage_fused_gate_weights(
             (size_t(k/64)*1280+cta_row+t)*4:size_t(cta_row+t)*160+k/16;
         asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::
             "r"(scales),"l"(job.block_scales+sf_source):"memory");
-    }
-    asm volatile("cp.async.commit_group;" ::: "memory");
-}
-
-// Cooperatively copy one input tile per gate/up half instead of requesting it
-// independently from each of the four output-row warps. Ragged columns use a
-// valid source; their MMA registers are still explicitly zeroed below.
-template<int InputPitch,bool KmajorInputScales = false>
-__device__ __forceinline__ void nvfp4_stage_fused_gate_inputs(
-    uint8_t* stage,const uint8_t* packed,const uint8_t* scales,
-    int first,int batch_size,int count,int k) {
-    const int t=threadIdx.x%128,half=threadIdx.x/128;
-    constexpr int input_bytes=32*InputPitch+128;
-    stage+=half*input_bytes;
-    if(t<64) {
-        const int column=t/2,source=first+min(column,batch_size-1)+half*count;
-        const unsigned destination=static_cast<unsigned>(__cvta_generic_to_shared(stage+column*InputPitch+(t%2)*16));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::
-            "r"(destination),"l"(packed+size_t(source)*1280+k/2+(t%2)*16):"memory");
-    }
-    if(t<32) {
-        const int source=first+min(t,batch_size-1)+half*count;
-        const unsigned destination=static_cast<unsigned>(__cvta_generic_to_shared(stage+32*InputPitch+t*4));
-        const size_t scale_source=KmajorInputScales?
-            (size_t(k/64)*count*2+source)*4:size_t(source)*160+k/16;
-        asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::
-            "r"(destination),"l"(scales+scale_source):"memory");
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
@@ -714,7 +687,8 @@ __global__ void nvfp4_token_input_map_cuda(const mollm_cuda::Nvfp4Projection* jo
     const int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i<count)indices[i]=static_cast<int>((jobs[i].input-token_input)/2560);
 }
-template<bool PublishActivated = true,bool StageInputs = false,int InputPitch = 32,bool PadLogits = false,bool SkewWeights = false,bool TransposedScales = false,bool KmajorInputScales = false,bool CompactLogits = false,bool TokenInputs = false,bool PairWords = false,bool KmajorCodes = false,bool KmajorTokenCodes = false,bool HoistTokenSources = false>
+template<bool PublishActivated,bool TransposedScales,bool KmajorInputScales,bool CompactLogits,
+         bool TokenInputs,bool PairWords,bool KmajorCodes,bool KmajorTokenCodes>
 __global__ void nvfp4_n32_fused_activation_cuda(const mollm_cuda::Nvfp4Projection* jobs,
     const mollm_cuda::Nvfp4Projection* down_jobs,
     const mollm_cuda::Nvfp4MmaBatch* batches, const uint8_t* packed,
@@ -729,79 +703,52 @@ __global__ void nvfp4_n32_fused_activation_cuda(const mollm_cuda::Nvfp4Projectio
     const int half=warp/4;
     const int cta_row=blockIdx.x*64, local_row=(warp%4)*16+lane/4,thread=lane%4;
     const int row=cta_row+local_row+half*640;
-    constexpr int input_bytes=32*InputPitch+128;
-    constexpr int weight_bytes=SkewWeights?3328:2304;
-    constexpr int scale_offset=SkewWeights?3072:2048;
-    __shared__ __align__(16) uint8_t staging[2][2*weight_bytes+(StageInputs?2*input_bytes:0)];
+    constexpr int weight_bytes=2304;
+    constexpr int scale_offset=2048;
+    __shared__ __align__(16) uint8_t staging[2][2*weight_bytes];
     using Logit=std::conditional_t<CompactLogits,uint16_t,float>;
-    __shared__ Logit logits[2][64][PadLogits?33:32];
-    nvfp4_stage_fused_gate_weights<SkewWeights,TransposedScales,KmajorCodes>(job,staging[0],cta_row,0);
-    if constexpr(StageInputs)nvfp4_stage_fused_gate_inputs<InputPitch,KmajorInputScales>(staging[0]+2*weight_bytes,packed,scales,first_job,batch_size,count,0);
+    __shared__ Logit logits[2][64][32];
+    nvfp4_stage_fused_gate_weights<TransposedScales,KmajorCodes>(job,staging[0],cta_row,0);
     float accum[4][4]={};
-    int source_indices[4];
-    if constexpr(HoistTokenSources) {
-        static_assert(TokenInputs&&!StageInputs);
-#pragma unroll
-        for(int group=0;group<4;++group) {
-            const int column=group*8+lane/4;
-            source_indices[group]=group*8<batch_size?token_indices[first_job+min(column,batch_size-1)]:0;
-        }
-    }
     for(int k=0;k<2560;k+=64) {
         uint32_t early_b0[4],early_b1[4],early_sb[4];
-        if constexpr(!StageInputs) {
 #pragma unroll
-            for(int group=0;group<4;++group) {
-                if(group*8>=batch_size)continue;
-                const int column=group*8+lane/4;
-                const int source=HoistTokenSources?source_indices[group]:TokenInputs?token_indices[first_job+min(column,batch_size-1)]:
-                    first_job+min(column,batch_size-1)+(half ? count : 0);
-                const auto* p=packed+size_t(source)*1280;
-                const auto* s=scales+size_t(source)*160;
-                if constexpr(PairWords) {
-                    const uint2 b=column>=batch_size?make_uint2(0,0):
-                        *reinterpret_cast<const uint2*>(KmajorTokenCodes?
-                            packed+(size_t(k/64)*token_count+source)*32+thread*8:p+k/2+thread*8);
-                    early_b0[group]=b.x;early_b1[group]=b.y;
-                } else {
-                    early_b0[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(p+k/2+thread*4);
-                    early_b1[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(p+k/2+thread*4+16);
-                }
-                if constexpr(KmajorInputScales) {
-                    if constexpr(TokenInputs)early_sb[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(
-                        scales+(size_t(k/64)*token_count+source)*4);
-                    else early_sb[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(
-                        scales+(size_t(k/64)*count*2+source)*4);
-                }
-                else early_sb[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(s+k/16);
+        for(int group=0;group<4;++group) {
+            if(group*8>=batch_size)continue;
+            const int column=group*8+lane/4;
+            const int source=TokenInputs?token_indices[first_job+min(column,batch_size-1)]:
+                first_job+min(column,batch_size-1)+(half ? count : 0);
+            const auto* p=packed+size_t(source)*1280;
+            const auto* s=scales+size_t(source)*160;
+            if constexpr(PairWords) {
+                const uint2 b=column>=batch_size?make_uint2(0,0):
+                    *reinterpret_cast<const uint2*>(KmajorTokenCodes?
+                        packed+(size_t(k/64)*token_count+source)*32+thread*8:p+k/2+thread*8);
+                early_b0[group]=b.x;early_b1[group]=b.y;
+            } else {
+                early_b0[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(p+k/2+thread*4);
+                early_b1[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(p+k/2+thread*4+16);
             }
+            if constexpr(KmajorInputScales) {
+                if constexpr(TokenInputs)early_sb[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(
+                    scales+(size_t(k/64)*token_count+source)*4);
+                else early_sb[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(
+                    scales+(size_t(k/64)*count*2+source)*4);
+            }
+            else early_sb[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(s+k/16);
         }
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
         const int current=(k/64)&1;
         if(k+64<2560) {
-            nvfp4_stage_fused_gate_weights<SkewWeights,TransposedScales,KmajorCodes>(job,staging[current^1],cta_row,k+64);
-            if constexpr(StageInputs)nvfp4_stage_fused_gate_inputs<InputPitch,KmajorInputScales>(staging[current^1]+2*weight_bytes,
-                packed,scales,first_job,batch_size,count,k+64);
-        }
-        if constexpr(StageInputs) {
-#pragma unroll
-            for(int group=0;group<4;++group) {
-                if(group*8>=batch_size)continue;
-                const int column=group*8+lane/4;
-                const auto* p=staging[current]+2*weight_bytes+half*input_bytes+column*InputPitch;
-                const auto* s=staging[current]+2*weight_bytes+half*input_bytes+32*InputPitch+column*4;
-                early_b0[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(p+thread*4);
-                early_b1[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(p+thread*4+16);
-                early_sb[group]=column>=batch_size?0:*reinterpret_cast<const uint32_t*>(s);
-            }
+            nvfp4_stage_fused_gate_weights<TransposedScales,KmajorCodes>(job,staging[current^1],cta_row,k+64);
         }
         const int offset=job.pair_layout
-            ? (local_row/4)*(SkewWeights?192:128)+(local_row%4)*8+(thread/2)*32+(thread%2)*4
+            ? (local_row/4)*128+(local_row%4)*8+(thread/2)*32+(thread%2)*4
             : local_row*32+thread*4;
         const auto* words=reinterpret_cast<const uint32_t*>(staging[current]+half*weight_bytes+offset);
         const int half_step=job.pair_layout?16:4;
-        const int row_step=SkewWeights&&job.pair_layout?96:64;
+        constexpr int row_step=64;
         const uint32_t a0=words[0],a1=words[row_step],a2=words[half_step],a3=words[row_step+half_step];
         const uint32_t sa=*reinterpret_cast<const uint32_t*>(staging[current]+half*weight_bytes+scale_offset+
             (local_row+(thread&1)*8)*4);
@@ -1981,12 +1928,17 @@ cudaError_t launch_nvfp4_batch_plan_diagnostic(const Nvfp4Projection* jobs,int c
     return cudaGetLastError();
 }
 
-cudaError_t launch_nvfp4_mma_activation_diagnostic(const Nvfp4Projection* jobs,
+cudaError_t launch_nvfp4_mma_fused_activation(const Nvfp4Projection* jobs,
     const Nvfp4Projection* down_jobs,int count,Nvfp4MmaBatch* batches,
     uint8_t* packed_inputs,uint8_t* input_scales,float* activated,
-    uint8_t* down_packed,uint8_t* down_scales,bool publish_activated,cudaStream_t stream,bool stage_inputs,int input_pitch,bool pad_logits,bool skew_weights,
-    const Nvfp4MmaBatch* gate_plan,int gate_batches,bool transposed_scales,bool kmajor_input_scales,bool compact_logits,
-    const float* token_input,int token_count,float token_global,int* token_indices,bool pair_words,bool weight_codes_kmajor,bool token_codes_kmajor,bool hoist_token_sources) {
+    uint8_t* down_packed,uint8_t* down_scales,const Nvfp4FusedActivationOptions& options,cudaStream_t stream) {
+    const bool transposed_scales=options.transposed_scales,kmajor_input_scales=options.kmajor_input_scales;
+    const bool compact_logits=options.compact_logits,pair_words=options.pair_words;
+    const bool weight_codes_kmajor=options.weight_codes_kmajor,token_codes_kmajor=options.token_codes_kmajor;
+    const float* token_input=options.token_input;
+    const int token_count=options.token_count;
+    const float token_global=options.token_global;
+    int* token_indices=options.token_indices;
     const bool token_inputs=token_input!=nullptr;
     if(!jobs||!down_jobs||!batches||!packed_inputs||!input_scales||!activated||
         !down_packed||!down_scales||count<=0||count>65535||
@@ -1994,16 +1946,8 @@ cudaError_t launch_nvfp4_mma_activation_diagnostic(const Nvfp4Projection* jobs,
         (!token_inputs&&(token_count||token_indices||pair_words))||
         (weight_codes_kmajor&&!pair_words)||
         (token_codes_kmajor&&(!pair_words||!weight_codes_kmajor))||
-        (hoist_token_sources&&!token_codes_kmajor)||
         (pair_words&&(reinterpret_cast<uintptr_t>(packed_inputs)&7))||
-        (compact_logits&&(stage_inputs||pad_logits||skew_weights||gate_plan||!transposed_scales||!kmajor_input_scales))||
-        (stage_inputs&&input_pitch!=32&&input_pitch!=48)||(pad_logits&&stage_inputs)||
-        (skew_weights&&(pad_logits||stage_inputs))||gate_batches<0||gate_batches>count||
-        ((gate_plan!=nullptr)!=(gate_batches>0))||
-        (gate_plan&&(stage_inputs||pad_logits||skew_weights))||
-        ((transposed_scales||kmajor_input_scales)&&(gate_plan||pad_logits||skew_weights))||
-        (stage_inputs&&(transposed_scales||kmajor_input_scales)&&
-            !(transposed_scales&&kmajor_input_scales&&input_pitch==32)))return cudaErrorInvalidValue;
+        (compact_logits&&(!transposed_scales||!kmajor_input_scales)))return cudaErrorInvalidValue;
     struct Span { uintptr_t begin,end;bool writable; } spans[10];
     const void* pointers[]={jobs,down_jobs,batches,packed_inputs,input_scales,
         activated,down_packed,down_scales,token_input,token_indices};
@@ -2021,13 +1965,6 @@ cudaError_t launch_nvfp4_mma_activation_diagnostic(const Nvfp4Projection* jobs,
         for(int j=0;j<i;++j)
             if(lengths[i]&&lengths[j]&&(spans[i].writable||spans[j].writable)&&begin<spans[j].end&&
                 spans[j].begin<spans[i].end)return cudaErrorInvalidValue;
-    }
-    if(gate_plan) {
-        const uintptr_t begin=reinterpret_cast<uintptr_t>(gate_plan);
-        const size_t bytes=size_t(gate_batches)*sizeof(*gate_plan);
-        if(begin%alignof(Nvfp4MmaBatch)||bytes>UINTPTR_MAX-begin)return cudaErrorInvalidValue;
-        for(const auto& span:spans)if(span.writable&&begin<span.end&&span.begin<begin+bytes)
-            return cudaErrorInvalidValue;
     }
     auto status=cudaMemsetAsync(batches,0xff,count*sizeof(*batches),stream);
     if(status!=cudaSuccess)return status;
@@ -2047,70 +1984,30 @@ cudaError_t launch_nvfp4_mma_activation_diagnostic(const Nvfp4Projection* jobs,
     else quantize_nvfp4_jobs_vector_cuda<><<<(count*2*160+127)/128,128,0,stream>>>(
         jobs,count,2560,2,packed_inputs,input_scales,batches,1);
     status=cudaGetLastError();if(status!=cudaSuccess)return status;
-    if(hoist_token_sources&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,false,true,true,true,true,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(hoist_token_sources)nvfp4_n32_fused_activation_cuda<false,false,32,false,false,true,true,true,true,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(token_codes_kmajor&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,false,true,true,true,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(token_codes_kmajor)nvfp4_n32_fused_activation_cuda<false,false,32,false,false,true,true,true,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(weight_codes_kmajor&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,false,true,true,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(weight_codes_kmajor)nvfp4_n32_fused_activation_cuda<false,false,32,false,false,true,true,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(pair_words&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,false,true,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(pair_words)nvfp4_n32_fused_activation_cuda<false,false,32,false,false,true,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(token_inputs&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,false,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(token_inputs)nvfp4_n32_fused_activation_cuda<false,false,32,false,false,true,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count);
-    else if(compact_logits&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,false,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(compact_logits)nvfp4_n32_fused_activation_cuda<false,false,32,false,false,true,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(stage_inputs&&kmajor_input_scales&&transposed_scales&&publish_activated)nvfp4_n32_fused_activation_cuda<true,true,32,false,false,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(stage_inputs&&kmajor_input_scales&&transposed_scales)nvfp4_n32_fused_activation_cuda<false,true,32,false,false,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(kmajor_input_scales&&transposed_scales&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,false,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(kmajor_input_scales&&transposed_scales)nvfp4_n32_fused_activation_cuda<false,false,32,false,false,true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(kmajor_input_scales&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,false,false,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(kmajor_input_scales)nvfp4_n32_fused_activation_cuda<false,false,32,false,false,false,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(transposed_scales&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,false,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(transposed_scales)nvfp4_n32_fused_activation_cuda<false,false,32,false,false,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(gate_plan&&publish_activated)nvfp4_n32_fused_activation_cuda<true><<<dim3(10,gate_batches),256,0,stream>>>(
-        jobs,down_jobs,gate_plan,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(gate_plan)nvfp4_n32_fused_activation_cuda<false><<<dim3(10,gate_batches),256,0,stream>>>(
-        jobs,down_jobs,gate_plan,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(skew_weights&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,false,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(skew_weights)nvfp4_n32_fused_activation_cuda<false,false,32,false,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(pad_logits&&publish_activated)nvfp4_n32_fused_activation_cuda<true,false,32,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(pad_logits)nvfp4_n32_fused_activation_cuda<false,false,32,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(stage_inputs&&input_pitch==48&&publish_activated)nvfp4_n32_fused_activation_cuda<true,true,48><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(stage_inputs&&input_pitch==48)nvfp4_n32_fused_activation_cuda<false,true,48><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(stage_inputs&&publish_activated)nvfp4_n32_fused_activation_cuda<true,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(stage_inputs)nvfp4_n32_fused_activation_cuda<false,true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else if(publish_activated)nvfp4_n32_fused_activation_cuda<true><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
-    else nvfp4_n32_fused_activation_cuda<false><<<dim3(10,count),256,0,stream>>>(
-        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales);
+    // Each later layout builds on the earlier ones, so one level names the kernel.
+    const int level=token_codes_kmajor?8:weight_codes_kmajor?7:pair_words?6:token_inputs?5:compact_logits?4:
+        kmajor_input_scales&&transposed_scales?3:kmajor_input_scales?2:transposed_scales?1:0;
+    const dim3 grid(10,count);
+    const auto launch=[&](auto publish) {
+        constexpr bool P=decltype(publish)::value;
+#define MOLLM_FUSED_ACTIVATION(...) nvfp4_n32_fused_activation_cuda<P,__VA_ARGS__><<<grid,256,0,stream>>>( \
+        jobs,down_jobs,batches,packed_inputs,input_scales,count,activated,down_packed,down_scales,token_indices,token_count)
+        //                              transposed kmajor compact token pair  codes  token-codes
+        switch(level) {
+        case 8: MOLLM_FUSED_ACTIVATION(true, true, true, true, true, true, true); break;
+        case 7: MOLLM_FUSED_ACTIVATION(true, true, true, true, true, true, false); break;
+        case 6: MOLLM_FUSED_ACTIVATION(true, true, true, true, true, false,false); break;
+        case 5: MOLLM_FUSED_ACTIVATION(true, true, true, true, false,false,false); break;
+        case 4: MOLLM_FUSED_ACTIVATION(true, true, true, false,false,false,false); break;
+        case 3: MOLLM_FUSED_ACTIVATION(true, true, false,false,false,false,false); break;
+        case 2: MOLLM_FUSED_ACTIVATION(false,true, false,false,false,false,false); break;
+        case 1: MOLLM_FUSED_ACTIVATION(true, false,false,false,false,false,false); break;
+        default: MOLLM_FUSED_ACTIVATION(false,false,false,false,false,false,false); break;
+        }
+#undef MOLLM_FUSED_ACTIVATION
+    };
+    if(options.publish_activated)launch(std::true_type{});
+    else launch(std::false_type{});
     return cudaGetLastError();
 }
 

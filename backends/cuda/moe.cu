@@ -815,14 +815,24 @@ bool CudaBackend::try_nvfp4_moe(
                     (batch_pipeline && rows >= 2 && rows <= 8);
                 if(mma_activation_fused){
                     auto* scratch=static_cast<uint8_t*>(impl_->moe_mma_group_scratch);
-                    if(!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
+                    mollm_cuda::Nvfp4FusedActivationOptions fused;
+                    fused.transposed_scales=use_scale_view;
+                    fused.kmajor_input_scales=input_scale_kmajor;
+                    fused.compact_logits=compact_logits;
+                    if(token_quantization) {
+                        fused.token_input=x;
+                        fused.token_count=rows;
+                        fused.token_indices=reinterpret_cast<int*>(scratch+token_indices_offset);
+                    }
+                    fused.token_global=resident.gate_input_global;
+                    fused.pair_words=token_pair_words;
+                    fused.weight_codes_kmajor=gate_codes_kmajor;
+                    fused.token_codes_kmajor=token_codes_kmajor;
+                    if(!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_mma_fused_activation(
                         gate_jobs,down_jobs,routes,reinterpret_cast<mollm_cuda::Nvfp4MmaBatch*>(scratch),
                         scratch+batch_bytes,scratch+batch_bytes+packed_bytes,activated,
                         scratch+fused_down_offset,scratch+fused_down_offset+routes*size_t(inter)/2,
-                        false,execution_stream,false,32,false,false,nullptr,0,use_scale_view,input_scale_kmajor,compact_logits,
-                        token_quantization?x:nullptr,token_quantization?rows:0,resident.gate_input_global,
-                        token_quantization?reinterpret_cast<int*>(scratch+token_indices_offset):nullptr,
-                        token_pair_words,gate_codes_kmajor,token_codes_kmajor),"NVFP4 MMA activation fusion"))return fail();
+                        fused,execution_stream),"NVFP4 MMA activation fusion"))return fail();
                     if(use_scale_view)++impl_->prefill_gate_scale_view_calls;
                     if(input_scale_kmajor)++impl_->prefill_input_scale_kmajor_calls;
                     if(compact_logits)++impl_->prefill_compact_gate_logit_calls;

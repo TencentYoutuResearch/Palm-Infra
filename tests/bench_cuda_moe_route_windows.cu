@@ -85,8 +85,10 @@ static void run(const std::vector<int>& ca,const std::vector<int>& cb,bool pair,
     auto launch=[&](int mode,int set,bool publish){
         auto* a=mode?act1.p:act0.p;auto* p=mode?pack1.p:pack0.p;auto* s=mode?scale1.p:scale0.p;
         const auto* g=(mode?gate1.p:gate0.p)+size_t(set)*count;const auto* d=mode?down1.p:down0.p;
-        auto call=[&](int first,int n){check(mollm_cuda::launch_nvfp4_mma_activation_diagnostic(g+first,d+first,n,plan.p,
-            packed.p,scales.p,a+size_t(first)*inner,p+size_t(first)*inner/2,s+size_t(first)*inner/16,publish,cudaStreamPerThread));};
+        mollm_cuda::Nvfp4FusedActivationOptions options;
+        options.publish_activated=publish;
+        auto call=[&](int first,int n){check(mollm_cuda::launch_nvfp4_mma_fused_activation(g+first,d+first,n,plan.p,
+            packed.p,scales.p,a+size_t(first)*inner,p+size_t(first)*inner/2,s+size_t(first)*inner/16,options,cudaStreamPerThread));};
         if(mode)call(0,count);else{call(0,na);call(na,nb);}
     };
     auto reset=[&](){for(auto p:{act0.p,act1.p})check(cudaMemset(p,0x5a,(av+8)*4));

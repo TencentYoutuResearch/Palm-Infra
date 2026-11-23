@@ -919,13 +919,6 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             add_test(NAME test_cuda_nvfp4_bf16_gate COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
             add_test(NAME test_cuda_nvfp4_mma_activation_fused COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_staged COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            set_tests_properties(test_cuda_nvfp4_mma_activation_staged PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_STAGE_INPUTS=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_nvfp4_mma_activation_staged48 COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_logits_pad COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_preplanned COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
             add_test(NAME test_cuda_nvfp4_mma_activation_weight_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
             add_test(NAME test_cuda_nvfp4_mma_activation_input_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
             add_test(NAME test_cuda_nvfp4_mma_activation_both_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
@@ -962,19 +955,11 @@ if(MOLLM_BUILD_TESTS)
             set_tests_properties(test_cuda_nvfp4_gate_token_code_kmajor PROPERTIES
                 ENVIRONMENT "${gate_code_test_env};MOLLM_TEST_NVFP4_GATE_TOKEN_CODE_KMAJOR=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_nvfp4_gate_token_hoist COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            set_tests_properties(test_cuda_nvfp4_gate_token_hoist PROPERTIES
-                ENVIRONMENT "${gate_code_test_env};MOLLM_TEST_NVFP4_GATE_TOKEN_CODE_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_TOKEN_HOIST=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_nvfp4_mma_activation_token_quantization PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_INPUT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_WEIGHT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_COMPACT_LOGITS=1;MOLLM_TEST_NVFP4_GATE_TOKEN_QUANTIZE=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_nvfp4_mma_activation_compact_logits PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_INPUT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_WEIGHT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_COMPACT_LOGITS=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_nvfp4_mma_activation_staged_both_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            set_tests_properties(test_cuda_nvfp4_mma_activation_staged_both_sf PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_STAGE_INPUTS=1;MOLLM_TEST_NVFP4_GATE_INPUT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_WEIGHT_SF_KMAJOR=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_nvfp4_mma_activation_input_sf PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_INPUT_SF_KMAJOR=1"
@@ -984,19 +969,6 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_nvfp4_mma_activation_weight_sf PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_WEIGHT_SF_KMAJOR=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            set_tests_properties(test_cuda_nvfp4_mma_activation_preplanned PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_PREPLANNED=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_nvfp4_mma_activation_weights_skew COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            set_tests_properties(test_cuda_nvfp4_mma_activation_weights_skew PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_SKEW_WEIGHTS=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            set_tests_properties(test_cuda_nvfp4_mma_activation_logits_pad PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_PAD_LOGITS=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            set_tests_properties(test_cuda_nvfp4_mma_activation_staged48 PROPERTIES
-                ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_STAGE_INPUTS=1;MOLLM_TEST_NVFP4_GATE_STAGE_INPUT_PITCH=48"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             add_test(NAME test_cuda_moe_route_windows COMMAND bench_cuda_moe_route_windows --check-only)
             set_tests_properties(test_cuda_moe_route_windows PROPERTIES

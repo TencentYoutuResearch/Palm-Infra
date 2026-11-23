@@ -80,8 +80,12 @@ int main(int argc,char** argv){
         if(gate)project_m32<false,2,true,false,true,true><<<grid,128,0,cudaStreamPerThread>>>(fjobs,compact,bx,rows,inner,selected);
         else project_m32<false,0,true,false,true,true><<<grid,128,0,cudaStreamPerThread>>>(fjobs,compact,bx,rows,inner,selected);ck(cudaGetLastError());};
     auto native=[&](bool prepared=false,bool publish=false){
-        if(gate)ck(mollm_cuda::launch_nvfp4_mma_activation_diagnostic(jobs,down_jobs,count,native_plan,packed,scales,activated,down_packed,down_scales,publish,
-            cudaStreamPerThread,false,32,false,false,nullptr,0,true,true));
+        mollm_cuda::Nvfp4FusedActivationOptions options;
+        options.publish_activated=publish;
+        options.transposed_scales=true;
+        options.kmajor_input_scales=true;
+        if(gate)ck(mollm_cuda::launch_nvfp4_mma_fused_activation(jobs,down_jobs,count,native_plan,packed,scales,activated,down_packed,down_scales,options,
+            cudaStreamPerThread));
         else ck(mollm_cuda::launch_nvfp4_mma_grouped(jobs,count,native_plan,rows,inner,0,cudaStreamPerThread,
             packed,scales,1,true,false,nullptr,0,8,false,prepared,false,true,false,true,false));};
     cudaGraph_t g;cudaGraphExec_t ex;ck(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));candidate();ck(cudaStreamEndCapture(cudaStreamPerThread,&g));ck(cudaGraphInstantiateWithFlags(&ex,g,0));

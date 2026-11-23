@@ -15,7 +15,6 @@ static bool scattered_token_inputs=false;
 static bool paired_token_words=false;
 static bool weight_codes_kmajor=false;
 static bool token_codes_kmajor=false;
-static bool hoist_token_sources=false;
 static bool weight_locality=false;
 static int locality_mask=0; // bit1: FP4 codes; bit2: K-major block scales.
 static int token_row(int job,int tokens,int variant=0) {
@@ -132,7 +131,7 @@ static void consumer_edges(){
     std::printf("bf16_gate_consumer edge_cases=%d rejected=%d full_activation_packed_scales_bytes=true packed_only_untouched=true\n",checked,rejected);
 }
 
-static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bool vector,bool fused,bool shared_inputs,bool stage_inputs,int input_pitch,bool pad_logits,bool skew_weights,bool preplanned,bool weight_sf,bool input_sf){
+static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bool vector,bool fused,bool shared_inputs,bool weight_sf,bool input_sf){
     constexpr int h=1280,k=2560,inner=640,sets=2;
     const int experts=runs.size(),count=std::accumulate(runs.begin(),runs.end(),0);
     const int token_count=token_quantization?(count+9)/10:0;
@@ -152,17 +151,6 @@ static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bo
     std::vector<uint8_t> code_host;
     Buffer<mollm_cuda::Nvfp4Projection> locality_jobs(weight_locality?size_t(sets)*count:1);
     Buffer<mollm_cuda::Nvfp4MmaBatch> plan(count+1);
-    std::vector<mollm_cuda::Nvfp4MmaBatch> compact_host;
-    int route_start=0;
-    for(int n:runs) {
-        for(int offset=0;offset<n;offset+=32)compact_host.push_back({route_start+offset,std::min(32,n-offset)});
-        route_start+=n;
-    }
-    if(route_start!=count||compact_host.empty())std::exit(4);
-    const int compact_count=compact_host.size();
-    compact_host.push_back({0x5a5a5a5a,0x5a5a5a5a});
-    Buffer<mollm_cuda::Nvfp4MmaBatch> compact(compact_host.size());
-    copy(compact.p,compact_host);
     std::vector<uint8_t> payload(size_t(sets)*experts*stride);
     for(int expert=0;expert<sets*experts;++expert){auto* p=payload.data()+size_t(expert)*stride;
         for(int row=0;row<h;++row){const float global=(1+(row+expert)%7)/64.f;std::memcpy(p+wbytes+sbytes+row*4,&global,4);
@@ -274,120 +262,102 @@ static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bo
         }
     }
     if(fused)for(int id=0;id<11;++id){
-        const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
+        mollm_cuda::Nvfp4FusedActivationOptions options;
+        options.publish_activated=true;
+        options.transposed_scales=weight_sf;
+        options.kmajor_input_scales=input_sf;
+        const auto status=mollm_cuda::launch_nvfp4_mma_fused_activation(
             id==0?nullptr:jobs.p+sets*count,id==1?nullptr:down.p+count,
             id==8?0:id==9?-1:id==10?65536:count,id==2?nullptr:plan.p,
             id==3?nullptr:packed.p,id==4?nullptr:scales.p,id==5?nullptr:b.p,
-            id==6?nullptr:pb.p,id==7?nullptr:sb.p,true,cudaStreamPerThread,stage_inputs,input_pitch,pad_logits,skew_weights,nullptr,0,weight_sf,input_sf);
+            id==6?nullptr:pb.p,id==7?nullptr:sb.p,options,cudaStreamPerThread);
         if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
     }
     if(fused){
         cudaGraph_t empty;
         check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
         if(weight_codes_kmajor) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
+            mollm_cuda::Nvfp4FusedActivationOptions options;
+            options.transposed_scales=true;
+            options.kmajor_input_scales=true;
+            options.compact_logits=true;
+            options.token_input=input.p;
+            options.token_count=token_count;
+            options.token_global=.75f;
+            options.token_indices=token_indices.p;
+            options.weight_codes_kmajor=true;
+            const auto status=mollm_cuda::launch_nvfp4_mma_fused_activation(
                 sf_jobs.p,down.p+count,count,plan.p,packed.p,scales.p,b.p,pb.p,sb.p,
-                false,cudaStreamPerThread,false,32,false,false,nullptr,0,true,true,true,
-                input.p,token_count,.75f,token_indices.p,false,true);
+                options,cudaStreamPerThread);
             if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
         }
         if(token_codes_kmajor)for(int invalid=0;invalid<2;++invalid) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
+            mollm_cuda::Nvfp4FusedActivationOptions options;
+            options.transposed_scales=true;
+            options.kmajor_input_scales=true;
+            options.compact_logits=true;
+            options.token_input=input.p;
+            options.token_count=token_count;
+            options.token_global=.75f;
+            options.token_indices=token_indices.p;
+            options.pair_words=invalid==0;
+            options.weight_codes_kmajor=invalid!=0;
+            options.token_codes_kmajor=true;
+            const auto status=mollm_cuda::launch_nvfp4_mma_fused_activation(
                 sf_jobs.p,down.p+count,count,plan.p,packed.p,scales.p,b.p,pb.p,sb.p,
-                false,cudaStreamPerThread,false,32,false,false,nullptr,0,true,true,true,
-                input.p,token_count,.75f,token_indices.p,invalid==0,invalid!=0,true);
-            if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
-        }
-        if(hoist_token_sources) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
-                sf_jobs.p,down.p+count,count,plan.p,packed.p,scales.p,b.p,pb.p,sb.p,
-                false,cudaStreamPerThread,false,32,false,false,nullptr,0,true,true,true,
-                input.p,token_count,.75f,token_indices.p,true,true,false,true);
+                options,cudaStreamPerThread);
             if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
         }
         if(token_quantization)for(int invalid=0;invalid<10;++invalid) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
+            mollm_cuda::Nvfp4FusedActivationOptions options;
+            options.transposed_scales=true;
+            options.kmajor_input_scales=true;
+            options.compact_logits=invalid!=0;
+            options.token_input=invalid==1?nullptr:invalid==2?input.p+1:invalid==3?b.p:input.p;
+            options.token_count=invalid==4?0:invalid==5?2049:token_count;
+            options.token_global=invalid==6?0.f:invalid==7?from_bits(0x7fc00000):.75f;
+            options.token_indices=invalid==8?nullptr:invalid==9?reinterpret_cast<int*>(packed.p):token_indices.p;
+            const auto status=mollm_cuda::launch_nvfp4_mma_fused_activation(
                 sf_jobs.p,down.p+count,count,plan.p,packed.p,scales.p,b.p,pb.p,sb.p,
-                false,cudaStreamPerThread,false,32,false,false,nullptr,0,true,true,invalid!=0,
-                invalid==1?nullptr:invalid==2?input.p+1:invalid==3?b.p:input.p,
-                invalid==4?0:invalid==5?2049:token_count,invalid==6?0.f:invalid==7?from_bits(0x7fc00000):.75f,
-                invalid==8?nullptr:invalid==9?reinterpret_cast<int*>(packed.p):token_indices.p);
+                options,cudaStreamPerThread);
             if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
         }
         if(paired_token_words)for(int invalid=0;invalid<2;++invalid) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
+            mollm_cuda::Nvfp4FusedActivationOptions options;
+            options.transposed_scales=true;
+            options.kmajor_input_scales=true;
+            options.compact_logits=true;
+            options.token_input=invalid?input.p:nullptr;
+            options.token_count=invalid?token_count:0;
+            options.token_global=.75f;
+            options.token_indices=invalid?token_indices.p:nullptr;
+            options.pair_words=true;
+            const auto status=mollm_cuda::launch_nvfp4_mma_fused_activation(
                 sf_jobs.p,down.p+count,count,plan.p,invalid?packed.p+4:packed.p,scales.p,b.p,pb.p,sb.p,
-                false,cudaStreamPerThread,false,32,false,false,nullptr,0,true,true,true,
-                invalid?input.p:nullptr,invalid?token_count:0,.75f,invalid?token_indices.p:nullptr,true);
+                options,cudaStreamPerThread);
             if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
         }
-        if(compact_logits)for(int invalid=0;invalid<6;++invalid) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
+        if(compact_logits)for(int invalid=4;invalid<6;++invalid) {
+            mollm_cuda::Nvfp4FusedActivationOptions options;
+            options.transposed_scales=invalid!=4;
+            options.kmajor_input_scales=invalid!=5;
+            options.compact_logits=true;
+            const auto status=mollm_cuda::launch_nvfp4_mma_fused_activation(
                 sf_jobs.p,down.p+count,count,plan.p,packed.p,scales.p,b.p,pb.p,sb.p,
-                false,cudaStreamPerThread,invalid==0,32,invalid==1,invalid==2,
-                invalid==3?compact.p:nullptr,invalid==3?compact_count:0,
-                invalid!=4,invalid!=5,true);
-            if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
-        }
-        if(weight_sf&&input_sf) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
-                sf_jobs.p,down.p+count,count,plan.p,packed.p,scales.p,
-                b.p,pb.p,sb.p,false,cudaStreamPerThread,true,48,
-                false,false,nullptr,0,true,true);
-            if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
-        }
-        if(input_sf)for(int combination=0;combination<4;++combination) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
-                jobs.p+sets*count,down.p+count,count,plan.p,packed.p,scales.p,
-                b.p,pb.p,sb.p,false,cudaStreamPerThread,combination==0,32,
-                combination==1,combination==2,combination==3?compact.p:nullptr,
-                combination==3?compact_count:0,false,true);
-            if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
-        }
-        if(weight_sf)for(int combination=0;combination<4;++combination) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
-                sf_jobs.p,count?down.p+count:nullptr,count,plan.p,packed.p,scales.p,
-                b.p,pb.p,sb.p,false,cudaStreamPerThread,combination==0,32,
-                combination==1,combination==2,combination==3?compact.p:nullptr,
-                combination==3?compact_count:0,true);
-            if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
-        }
-        if(preplanned)for(int id=0;id<7;++id) {
-            const auto* table=id==0?nullptr:id==4?plan.p:id==5?
-                reinterpret_cast<const mollm_cuda::Nvfp4MmaBatch*>(packed.p+1):id==6?
-                reinterpret_cast<const mollm_cuda::Nvfp4MmaBatch*>(UINTPTR_MAX-3):compact.p;
-            const int n=id==0?1:id==1?0:id==2?-1:id==3?count+1:compact_count;
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
-                jobs.p+sets*count,down.p+count,count,plan.p,packed.p,scales.p,
-                b.p,pb.p,sb.p,false,cudaStreamPerThread,false,32,false,false,table,n);
-            if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
-        }
-        if(skew_weights)for(int combination:{0,1}) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
-                jobs.p+sets*count,down.p+count,count,plan.p,packed.p,scales.p,
-                b.p,pb.p,sb.p,false,cudaStreamPerThread,combination==0,32,combination==1,true);
-            if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
-        }
-        if(pad_logits) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
-                jobs.p+sets*count,down.p+count,count,plan.p,packed.p,scales.p,
-                b.p,pb.p,sb.p,false,cudaStreamPerThread,true,32,true);
-            if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
-        }
-        if(stage_inputs)for(int invalid_pitch:{0,16,64}) {
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
-                jobs.p+sets*count,down.p+count,count,plan.p,packed.p,scales.p,
-                b.p,pb.p,sb.p,false,cudaStreamPerThread,true,invalid_pitch);
+                options,cudaStreamPerThread);
             if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
         }
         for(int id=0;id<8;++id){
-            const auto status=mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
+            mollm_cuda::Nvfp4FusedActivationOptions options;
+            options.transposed_scales=weight_sf;
+            options.kmajor_input_scales=input_sf;
+            const auto status=mollm_cuda::launch_nvfp4_mma_fused_activation(
                 jobs.p+sets*count,down.p+count,count,plan.p,
                 id==4?packed.p+1:packed.p,id==5?scales.p+1:scales.p,
                 id==3?reinterpret_cast<float*>(plan.p):b.p,
                 id==0?packed.p:id==1?packed.p+8:id==6?reinterpret_cast<uint8_t*>(UINTPTR_MAX-15):pb.p,
                 id==2?scales.p:id==7?reinterpret_cast<uint8_t*>(jobs.p+sets*count):sb.p,
-                false,cudaStreamPerThread,stage_inputs,input_pitch,pad_logits,skew_weights,nullptr,0,weight_sf,input_sf);
+                options,cudaStreamPerThread);
             if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
         }
         check(cudaStreamEndCapture(cudaStreamPerThread,&empty));size_t nodes=0;
@@ -397,17 +367,23 @@ static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bo
     for(auto v:read(bf.p,values+8))if(v!=0x5a5a)std::exit(4);
     for(auto v:read(reinterpret_cast<uint8_t*>(plan.p),(count+1)*sizeof(*plan.p)))if(v!=0x5a)std::exit(4);
     auto chain=[&](bool compressed,int set,int mode,bool ahead=false,bool allow_fused=true,bool staged=true,bool alias_weights=false){
-        const bool staged_sf=(stage_inputs&&weight_sf&&input_sf)||compact_logits;
+        const bool staged_sf=compact_logits;
         if(compressed&&fused&&allow_fused){
-            check(mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
+            mollm_cuda::Nvfp4FusedActivationOptions options;
+            options.publish_activated=mode==2;
+            options.transposed_scales=weight_sf&&(staged||input_sf||staged_sf);
+            options.kmajor_input_scales=input_sf&&(staged||staged_sf);
+            options.compact_logits=compact_logits&&(staged||token_quantization);
+            options.token_input=token_quantization&&(staged||paired_token_words)?input.p:nullptr;
+            options.token_count=token_quantization&&(staged||paired_token_words)?token_count:0;
+            options.token_global=.75f;
+            options.token_indices=token_quantization&&(staged||paired_token_words)?token_indices.p:nullptr;
+            options.pair_words=paired_token_words&&(staged||weight_codes_kmajor);
+            options.weight_codes_kmajor=weight_codes_kmajor&&(staged||token_codes_kmajor);
+            options.token_codes_kmajor=token_codes_kmajor&&staged;
+            check(mollm_cuda::launch_nvfp4_mma_fused_activation(
                 weight_codes_kmajor&&(staged||token_codes_kmajor)?code_jobs.p+size_t(set)*count:alias_weights?locality_jobs.p+size_t(set)*count:weight_sf&&(staged||input_sf||staged_sf)?sf_jobs.p+size_t(set)*count:jobs.p+(sets+set)*count,down.p+count,count,plan.p,packed.p,scales.p,
-                b.p,pb.p,sb.p,mode==2,cudaStreamPerThread,stage_inputs&&staged,input_pitch,pad_logits&&staged,skew_weights&&staged,
-                preplanned&&staged?compact.p:nullptr,preplanned&&staged?compact_count:0,
-                weight_sf&&(staged||input_sf||staged_sf),input_sf&&(staged||staged_sf),compact_logits&&(staged||token_quantization),
-                token_quantization&&(staged||paired_token_words)?input.p:nullptr,
-                token_quantization&&(staged||paired_token_words)?token_count:0,.75f,
-                token_quantization&&(staged||paired_token_words)?token_indices.p:nullptr,
-                paired_token_words&&(staged||weight_codes_kmajor),weight_codes_kmajor&&(staged||token_codes_kmajor),token_codes_kmajor&&(staged||hoist_token_sources),hoist_token_sources&&staged));return;
+                b.p,pb.p,sb.p,options,cudaStreamPerThread));return;
         }
         check(producer(compressed,set,ahead));
         check(mollm_cuda::launch_nvfp4_activation_prepare(down.p+(compressed?count:0),count,inner,
@@ -494,21 +470,10 @@ static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bo
             if(mode==3){const auto* bytes=reinterpret_cast<const uint8_t*>(bv.data());for(size_t i=0;i<bv.size()*4;++i)if(bytes[i]!=0x5a)std::exit(4);}
             const auto pav=read(pa.p,act_values/2+8),pbv=read(pb.p,act_values/2+8),sav=read(sa.p,act_values/16+8),sbv=read(sb.p,act_values/16+8);
             equal(pav,pbv);equal(sav,sbv);guards(pav,act_values/2);guards(pbv,act_values/2);guards(sav,act_values/16);guards(sbv,act_values/16);++checked;
-            const auto compact_after=read(compact.p,compact_host.size());
-            if(std::memcmp(compact_after.data(),compact_host.data(),compact_host.size()*sizeof(*compact.p)))std::exit(4);
-            if(preplanned) {
-                const auto sparse_after=read(plan.p,count);
-                size_t ordinal=0;
-                for(const auto& batch:sparse_after)if(batch.first>=0) {
-                    if(ordinal>=size_t(compact_count)||std::memcmp(&batch,&compact_host[ordinal],sizeof(batch)))std::exit(4);
-                    ++ordinal;
-                }
-                if(ordinal!=size_t(compact_count))std::exit(4);
-            }
         }
         check(cudaGraphExecDestroy(replay));
     }
-    std::printf("bf16_gate pair=%d jobs=%d captured_replays=%d rejects=%d fused=%d shared_inputs=%d stage_inputs=%d input_pitch=%d pad_logits=%d skew_weights=%d gate_intermediate_checked=%s full_activation_packed_scales_bytes=true guards=true\n",pair,count,checked,rejects,fused,shared_inputs,stage_inputs,input_pitch,pad_logits,skew_weights,fused?"untouched":"rounded_codes");std::fflush(stdout);
+    std::printf("bf16_gate pair=%d jobs=%d captured_replays=%d rejects=%d fused=%d shared_inputs=%d gate_intermediate_checked=%s full_activation_packed_scales_bytes=true guards=true\n",pair,count,checked,rejects,fused,shared_inputs,fused?"untouched":"rounded_codes");std::fflush(stdout);
     if(weight_sf) {
         const auto after=read(sf_view.p,sf_host.size());equal(after,sf_host);
         std::printf("weight_sf_oracle pair=%d jobs=%d sidecar_bytes=%zu all_view_bytes_unchanged=true construction_excluded=true\n",pair,count,sf_host.size()-8);
@@ -554,26 +519,19 @@ static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bo
         return;
     }
     if(timing){
-        if(preplanned)std::printf("preplanned_oracle routes=%d batches=%d expert_order_preserved=true construction_excluded=true\n",count,compact_count);
         std::vector<float> x(size_t(count)*k);for(size_t i=0;i<x.size();++i)x[i]=(int(i%101)-50)/37.f;copy(input.p,x);
         cudaGraphExec_t graphs[2];for(int mode=0;mode<2;++mode){cudaGraph_t graph;
-            check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));for(int set=0;set<sets;++set)chain((early||vector||fused)?true:mode,set,3,(early||vector)&&(fused||mode),!fused||mode||stage_inputs||pad_logits||skew_weights||preplanned||weight_sf||input_sf,!(stage_inputs||pad_logits||skew_weights||preplanned||weight_sf||input_sf)||mode);
+            check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));for(int set=0;set<sets;++set)chain((early||vector||fused)?true:mode,set,3,(early||vector)&&(fused||mode),!fused||mode||weight_sf||input_sf,!(weight_sf||input_sf)||mode);
             check(cudaStreamEndCapture(cudaStreamPerThread,&graph));check(cudaGraphInstantiateWithFlags(&graphs[mode],graph,0));check(cudaGraphDestroy(graph));
         }
         for(int repeat=0;repeat<7;++repeat){double us[2];for(int order=0;order<2;++order){const int mode=order^(repeat&1);us[mode]=time_graph(graphs[mode])/sets;}
-            if(hoist_token_sources)std::printf("bf16_gate_token_hoist_timing pair=%d jobs=%d tokens=%d repeat=%d baseline_us=%.3f hoist_us=%.3f scope=both_current_kmajor_views_only_token_map_hoisting_changes_producer_included_not_model\n",pair,count,token_count,repeat,us[0],us[1]);
-            else if(token_codes_kmajor)std::printf("bf16_gate_token_code_layout_timing pair=%d jobs=%d tokens=%d repeat=%d baseline_us=%.3f kmajor_us=%.3f scope=both_kmajor_weights_only_token_code_layout_changes_producer_included_not_model\n",pair,count,token_count,repeat,us[0],us[1]);
+            if(token_codes_kmajor)std::printf("bf16_gate_token_code_layout_timing pair=%d jobs=%d tokens=%d repeat=%d baseline_us=%.3f kmajor_us=%.3f scope=both_kmajor_weights_only_token_code_layout_changes_producer_included_not_model\n",pair,count,token_count,repeat,us[0],us[1]);
             else if(weight_codes_kmajor)std::printf("bf16_gate_code_layout_timing pair=%d jobs=%d tokens=%d repeat=%d baseline_us=%.3f kmajor_us=%.3f scope=both_paired_token_inputs_only_code_layout_changes_reorder_excluded_not_model\n",pair,count,token_count,repeat,us[0],us[1]);
             else if(paired_token_words)std::printf("bf16_gate_token_words_timing pair=%d jobs=%d tokens=%d repeat=%d baseline_us=%.3f paired_us=%.3f scattered=%d scope=both_shared_token_compact_logits_includes_map_and_quantization_not_model\n",pair,count,token_count,repeat,us[0],us[1],scattered_token_inputs);
             else if(token_quantization)std::printf("bf16_gate_token_quant_timing pair=%d jobs=%d tokens=%d repeat=%d baseline_us=%.3f token_us=%.3f scattered=%d scope=both_compact_logits_includes_map_and_quantization_not_model\n",pair,count,token_count,repeat,us[0],us[1],scattered_token_inputs);
             else if(compact_logits)std::printf("bf16_gate_compact_logits_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f compact_us=%.3f scope=same_kmajor_sf_quantization_and_plan_only_logit_storage_changes_not_model\n",pair,count,repeat,us[0],us[1]);
-            else if(stage_inputs&&weight_sf&&input_sf)std::printf("bf16_gate_staged_sf_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f staged_us=%.3f scope=both_sides_kmajor_sf_only_input_staging_changes_not_model\n",pair,count,repeat,us[0],us[1]);
             else if(input_sf)std::printf("bf16_gate_input_sf_timing pair=%d jobs=%d repeat=%d weight_sf=%d baseline_us=%.3f transposed_us=%.3f scope=fused_chain_includes_reordered_quantization_no_extra_storage_not_model\n",pair,count,repeat,weight_sf,us[0],us[1]);
             else if(weight_sf)std::printf("bf16_gate_weight_sf_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f transposed_us=%.3f scope=current_fused_vs_k64_major_weight_sf_view_excludes_preparation_not_model\n",pair,count,repeat,us[0],us[1]);
-            else if(preplanned)std::printf("bf16_gate_oracle_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f compact_us=%.3f scope=current_fused_vs_order_preserved_oracle_compact_chain_excludes_compaction_not_model\n",pair,count,repeat,us[0],us[1]);
-            else if(skew_weights)std::printf("bf16_gate_weights_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f skewed_us=%.3f scope=current_fused_vs_shared_weight_skew_fused_chain_synthetic_not_model\n",pair,count,repeat,us[0],us[1]);
-            else if(pad_logits)std::printf("bf16_gate_logits_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f padded_us=%.3f scope=current_fused_vs_logits_pitch33_fused_chain_synthetic_not_model\n",pair,count,repeat,us[0],us[1]);
-            else if(stage_inputs)std::printf("bf16_gate_staged_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f staged_us=%.3f scope=current_fused_vs_shared_input_fused_chain_synthetic_not_model\n",pair,count,repeat,us[0],us[1]);
             else if(fused)std::printf("bf16_gate_fused_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f fused_us=%.3f scope=parallel_plan_vector_input_quantize_gate_activation_synthetic_not_model\n",pair,count,repeat,us[0],us[1]);
             else if(vector)std::printf("bf16_gate_vector_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f vector_us=%.3f scope=parallel_plan_quantize_bf16_gate_plus_packed_activation_synthetic_not_model\n",pair,count,repeat,us[0],us[1]);
             else if(early)std::printf("bf16_gate_early_timing pair=%d jobs=%d repeat=%d baseline_us=%.3f early_us=%.3f scope=bf16_gate_quantize_mma_plus_packed_activation_synthetic_not_model\n",pair,count,repeat,us[0],us[1]);
@@ -614,14 +572,6 @@ int main(int argc,char** argv){
     const bool vector=v_option&&!std::strcmp(v_option,"1");
     const char* f_option=std::getenv("MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED");
     const bool fused=f_option&&!std::strcmp(f_option,"1");
-    const char* staged_option=std::getenv("MOLLM_TEST_NVFP4_GATE_STAGE_INPUTS");
-    const bool stage_inputs=staged_option&&!std::strcmp(staged_option,"1");
-    const char* logits_option=std::getenv("MOLLM_TEST_NVFP4_GATE_PAD_LOGITS");
-    const bool pad_logits=logits_option&&!std::strcmp(logits_option,"1");
-    const char* weights_option=std::getenv("MOLLM_TEST_NVFP4_GATE_SKEW_WEIGHTS");
-    const bool skew_weights=weights_option&&!std::strcmp(weights_option,"1");
-    const char* plan_option=std::getenv("MOLLM_TEST_NVFP4_GATE_PREPLANNED");
-    const bool preplanned=plan_option&&!std::strcmp(plan_option,"1");
     const char* sf_option=std::getenv("MOLLM_TEST_NVFP4_GATE_WEIGHT_SF_KMAJOR");
     const bool weight_sf=sf_option&&!std::strcmp(sf_option,"1");
     const char* input_sf_option=std::getenv("MOLLM_TEST_NVFP4_GATE_INPUT_SF_KMAJOR");
@@ -638,37 +588,26 @@ int main(int argc,char** argv){
     weight_codes_kmajor=code_option&&!std::strcmp(code_option,"1");
     const char* token_code_option=std::getenv("MOLLM_TEST_NVFP4_GATE_TOKEN_CODE_KMAJOR");
     token_codes_kmajor=token_code_option&&!std::strcmp(token_code_option,"1");
-    const char* hoist_option=std::getenv("MOLLM_TEST_NVFP4_GATE_TOKEN_HOIST");
-    hoist_token_sources=hoist_option&&!std::strcmp(hoist_option,"1");
-    if(hoist_token_sources&&!token_codes_kmajor)return 64;
     const char* locality_option=std::getenv("MOLLM_TEST_NVFP4_GATE_WEIGHT_LOCALITY");
     if(locality_option&&std::strcmp(locality_option,"0")&&std::strcmp(locality_option,"1")&&
         std::strcmp(locality_option,"codes")&&std::strcmp(locality_option,"scales"))return 64;
     locality_mask=locality_option?(!std::strcmp(locality_option,"1")?3:
         !std::strcmp(locality_option,"codes")?1:!std::strcmp(locality_option,"scales")?2:0):0;
     weight_locality=locality_mask!=0;
-    const char* pitch_option=std::getenv("MOLLM_TEST_NVFP4_GATE_STAGE_INPUT_PITCH");
-    const int input_pitch=pitch_option&&!std::strcmp(pitch_option,"48")?48:32;
-    if(pitch_option&&std::strcmp(pitch_option,"32")&&std::strcmp(pitch_option,"48"))return 64;
     const char* shared_option=std::getenv("MOLLM_TEST_NVFP4_GATE_SHARED_INPUTS");
     const bool shared_inputs=shared_option&&!std::strcmp(shared_option,"1");
     if(shared_inputs&&(runs.size()!=512||std::accumulate(runs.begin(),runs.end(),0)%10))return 64;
     if(fused&&(!vector||early))return 64;
-    if(stage_inputs&&!fused)return 64;
-    if(pad_logits&&(!fused||stage_inputs))return 64;
-    if(skew_weights&&(!fused||stage_inputs||pad_logits))return 64;
-    if(preplanned&&(!fused||stage_inputs||pad_logits||skew_weights))return 64;
-    if(weight_sf&&(!fused||pad_logits||skew_weights||preplanned))return 64;
-    if(input_sf&&(!fused||pad_logits||skew_weights||preplanned))return 64;
-    if(stage_inputs&&(weight_sf||input_sf)&&!(weight_sf&&input_sf&&input_pitch==32))return 64;
-    if(compact_logits&&(!fused||!weight_sf||!input_sf||stage_inputs||pad_logits||skew_weights||preplanned))return 64;
+    if(weight_sf&&!fused)return 64;
+    if(input_sf&&!fused)return 64;
+    if(compact_logits&&(!fused||!weight_sf||!input_sf))return 64;
     if(token_quantization&&(!compact_logits||(std::accumulate(runs.begin(),runs.end(),0)+9)/10>2048))return 64;
     if(scattered_token_inputs&&!token_quantization)return 64;
     if(paired_token_words&&!token_quantization)return 64;
-    if(weight_codes_kmajor&&(!paired_token_words||!fused||!weight_sf||!input_sf||!compact_logits||weight_locality||stage_inputs||pad_logits||skew_weights||preplanned))return 64;
+    if(weight_codes_kmajor&&(!paired_token_words||!fused||!weight_sf||!input_sf||!compact_logits||weight_locality))return 64;
     if(token_codes_kmajor&&!weight_codes_kmajor)return 64;
-    if(weight_locality&&(!paired_token_words||!fused||!weight_sf||!input_sf||!compact_logits||stage_inputs||pad_logits||skew_weights||preplanned))return 64;
+    if(weight_locality&&(!paired_token_words||!fused||!weight_sf||!input_sf||!compact_logits))return 64;
     if(vector&&early)return 64;
     if(weight_sf)scale_view_copy_check();
-    consumer_edges();for(bool pair:{true,false})run(runs,pair,!only,early,vector,fused,shared_inputs,stage_inputs,input_pitch,pad_logits,skew_weights,preplanned,weight_sf,input_sf);
+    consumer_edges();for(bool pair:{true,false})run(runs,pair,!only,early,vector,fused,shared_inputs,weight_sf,input_sf);
 }

@@ -120,41 +120,37 @@ cudaError_t launch_nvfp4_mma_projections(const Nvfp4Projection* jobs, int count,
     uint8_t* packed_inputs = nullptr, uint8_t* input_scales = nullptr,
     bool gate_codes_kmajor = false); // Already prepared input requires split_row==0.
 struct Nvfp4MmaBatch { int first; int size; };
-// Jobs must have adjacent equal-expert descriptors (weight and scale pointers).
-// Scratch holds count batches. GPU-only grouping; stream ordered and graph safe.
-// Diagnostic fixed gate1280/K2560 followed by activation640/quantization.
-// No gate/up output is published. Separate scratch, same ordered FP32 sums.
-// Mutable spans must be disjoint from each other and descriptor spans. Rejects
-// null/count/alignment/overflow/alias before enqueue; caller validates device
-// descriptor geometry, pointer extents and lifetimes.
-// Optional stage_inputs is standalone-only input reuse; production callers
-// retain the original false specialization.
-// Optional gate_plan is a read-only standalone oracle: caller must supply every
-// native batch exactly once, in original order, valid first/size and lifetime.
-// Sparse planning/quantization still run; compact plan construction is excluded.
-// transposed_scales requires a caller-owned, validated [40][1280][4] byte view
-// per expert; original descriptors/scales remain necessary for decode/reference.
-// kmajor_input_scales: producer directly writes
-// [40][2*count][4] into the existing scale scratch; codes/math are unchanged.
-// Standalone input staging also supports BOTH scale views with pitch32;
-// single-view staging and pitch48 with views are rejected before enqueue.
-// compact_logits is standalone/opt-in: lossless BF16-bit shared logit storage,
-// requires both scale views, rejects staging/padding/skew/oracle plans.
-// Opt-in token_input: caller MUST guarantee ALL gate/up globals equal
-// token_global and all descriptor input pointers are complete contiguous rows
-// of this caller-owned token_input[1..2048,2560]. Map is rebuilt each call;
-// pointer/schema checks do not validate device descriptor contents. Requires
-// compact logits and both SF views. token_indices has count writable ints.
-cudaError_t launch_nvfp4_mma_activation_diagnostic(const Nvfp4Projection* jobs,
+// Fused prefill path for one grouped batch plan: gate/up native-FP4 MMA,
+// SiLU-gate activation in BF16, and requantization of the activations into the
+// down projection's packed inputs and scales. All buffers must be disjoint.
+// Jobs must keep equal-expert descriptors adjacent; batches holds count entries
+// and is rebuilt on every call. Arguments are checked before anything is enqueued;
+// the caller validates descriptor geometry, pointer extents and lifetimes.
+// Each layout option requires the ones before it: compact_logits needs both
+// scale views, token_input needs compact_logits, pair_words needs token_input,
+// weight_codes_kmajor needs pair_words, token_codes_kmajor needs both.
+struct Nvfp4FusedActivationOptions {
+    bool publish_activated = false;   // Also write the FP32 activations.
+    bool transposed_scales = false;   // Gate block scales in the K-major view.
+    bool kmajor_input_scales = false; // Quantized input scales stored K-major.
+    bool compact_logits = false;      // BF16 logits kept as 16-bit codes.
+    // Quantize each prompt token once instead of once per route. The caller
+    // guarantees every gate/up global equals token_global and every descriptor
+    // input is a complete row of token_input[token_count][2560]. token_indices
+    // has count writable ints and is rebuilt on every call.
+    const float* token_input = nullptr;
+    int token_count = 0;
+    float token_global = 1.f;
+    int* token_indices = nullptr;
+    bool pair_words = false;          // Token codes loaded as 8-byte pairs.
+    bool weight_codes_kmajor = false; // Resident K-major gate codes.
+    bool token_codes_kmajor = false;  // Token codes stored K-major.
+};
+cudaError_t launch_nvfp4_mma_fused_activation(const Nvfp4Projection* jobs,
     const Nvfp4Projection* down_jobs,int count,Nvfp4MmaBatch* batches,
     uint8_t* packed_inputs,uint8_t* input_scales,float* activated,
-    uint8_t* down_packed,uint8_t* down_scales,bool publish_activated,
-    cudaStream_t stream=nullptr,bool stage_inputs=false,int input_pitch=32,bool pad_logits=false,bool skew_weights=false,
-    const Nvfp4MmaBatch* gate_plan=nullptr,int gate_batches=0,bool transposed_scales=false,
-    bool kmajor_input_scales=false,bool compact_logits=false,
-    const float* token_input=nullptr,int token_count=0,float token_global=1.f,int* token_indices=nullptr,
-    bool pair_words=false,bool weight_codes_kmajor=false,
-    bool token_codes_kmajor=false,bool hoist_token_sources=false); // Hoisting diagnostic requires the current K-major token/weight path; no production selector.
+    uint8_t* down_packed,uint8_t* down_scales,
+    const Nvfp4FusedActivationOptions& options = {},cudaStream_t stream = nullptr);
 // Diagnostic only, both choices include identical sentinel initialization.
 cudaError_t launch_nvfp4_batch_plan_diagnostic(const Nvfp4Projection* jobs,int count,
     Nvfp4MmaBatch* batches,int columns,bool parallel,cudaStream_t stream=nullptr);
