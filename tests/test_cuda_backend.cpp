@@ -4109,12 +4109,11 @@ bool test_shared_fp16_cache(CudaBackend& backend) {
 }
 
 int main(int argc, char** argv) {
-    // The backend keys prepared weights by host address for its lifetime and
-    // never forgets one. Sources of the cached pair-row fixtures are allocated
-    // before any weight is registered and live to the end, so their addresses
-    // cannot match an earlier fixture's freed source.
-    std::vector<Q4B8G32Block> cached_pair_sources[2] = {
-        std::vector<Q4B8G32Block>(4096 / 32), std::vector<Q4B8G32Block>(9216 / 32)};
+    // The backend keys prepared weights by host address. Both cached pair-row
+    // fixtures build their weight in this one buffer, so the second registers
+    // a different shape at an address the backend already knows and must get
+    // its own device copy rather than the first fixture's.
+    std::vector<Q4B8G32Block> cached_pair_source(9216 / 32);
     const bool verify_workspace_only=argc==2 && !std::strcmp(argv[1],"--verify-workspace-only");
     const bool moe_provider_only=argc==2 && !std::strcmp(argv[1],"--moe-provider-only");
     const bool shared_cache_only=argc==2 && !std::strcmp(argv[1],"--shared-cache-only");
@@ -4803,8 +4802,8 @@ int main(int argc, char** argv) {
         for (int inner = 0; inner < cached_k; ++inner)
             cached_activation[inner] =
                 static_cast<float>(inner % 37 - 18) / 41.0f;
-        auto& cached_blocks = cached_pair_sources[cached_k == 4096 ? 0 : 1];
-        if (cached_blocks.size() != static_cast<size_t>(cached_groups)) return false;
+        auto& cached_blocks = cached_pair_source;
+        if (cached_blocks.size() < static_cast<size_t>(cached_groups)) return false;
         std::vector<float> cached_weight(
             static_cast<size_t>(n) * cached_k);
         for (int group = 0; group < cached_groups; ++group) {
@@ -4841,7 +4840,7 @@ int main(int argc, char** argv) {
         backend.wrap_weight_int4(cached_q4);
         std::memset(
             cached_blocks.data(), 0,
-            cached_blocks.size() * sizeof(Q4B8G32Block));
+            cached_groups * sizeof(Q4B8G32Block));
         std::vector<float> cached_expected(n);
         std::vector<float> cached_actual(n);
         reference(

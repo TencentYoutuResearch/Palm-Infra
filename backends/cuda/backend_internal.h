@@ -140,6 +140,10 @@ struct CudaBackend::Impl {
     CPUBackend cpu;
     std::unordered_map<const void*, DeviceWeight> weights;
     std::unordered_map<const void*, const DeviceWeight*> weights_by_device;
+    // Entries whose host address was later reused by a weight of another
+    // shape. Tensors bound to them keep working; the device copies are
+    // released with every other allocation.
+    std::vector<std::unordered_map<const void*, DeviceWeight>::node_type> retired_weights;
     size_t prefill_fp16_cache_bytes = 0;
     size_t prefill_shared_cache_bytes = 0, prefill_shared_cache_hits = 0;
     std::vector<void*> device_allocations;
@@ -582,6 +586,9 @@ struct CudaBackend::Impl {
         if (prefill_token_pair_word_calls)
             std::fprintf(stderr,"CudaBackend: prefill paired token word calls=%llu\n",
                 static_cast<unsigned long long>(prefill_token_pair_word_calls));
+        if (!retired_weights.empty())
+            std::fprintf(stderr, "CudaBackend: host addresses reused by a weight of another shape=%zu\n",
+                         retired_weights.size());
         if (narrow_row_g32_weights)
             std::fprintf(stderr, "CudaBackend Q4 narrow row cache: weights=%zu bytes=%zu\n",
                 narrow_row_g32_weights, narrow_row_g32_bytes);
@@ -896,17 +903,32 @@ struct CudaBackend::Impl {
         return found == weights_by_device.end() ? nullptr : found->second;
     }
 
+    // The weight cache is keyed by host address and never forgets one. A
+    // request for another shape at a known address means the earlier owner
+    // released its memory, so that entry is set aside and the new weight is
+    // prepared from scratch. A reuse with the same shape is indistinguishable
+    // from a repeated registration and keeps the existing entry.
+    void retire_stale_weight(const void* cache_key, int n, int k) {
+        const auto found = weights.find(cache_key);
+        if (found == weights.end() || (found->second.n == n && found->second.k == k))
+            return;
+        retired_weights.push_back(weights.extract(found));
+    }
+
     // Coherent devices read host weights in place; the package mapping owns
     // the memory, so the entry is never freed by the backend.
     bool register_host_weight(Tensor& tensor, const void* source, size_t bytes,
                               cudaDataType type, int n, int k, WeightLayout layout) {
         if (!coherent_host_weights || !source || bytes == 0)
             return false;
+        retire_stale_weight(source, n, k);
         auto [found, inserted] = weights.try_emplace(source,
             DeviceWeight{const_cast<void*>(source), nullptr, type, n, k, 0, 0, layout});
         if (inserted) {
             found->second.data_bytes = bytes;
-            weights_by_device.emplace(found->second.data, &found->second);
+            // The device view is the host address itself, so a retired entry
+            // may still be indexed under it; the new one takes its place.
+            weights_by_device[found->second.data] = &found->second;
         }
         tensor.device.buffer = found->second.data;
         tensor.device.offset = 0;
@@ -919,6 +941,7 @@ struct CudaBackend::Impl {
                        WeightLayout layout = WeightLayout::Dense) {
         if (!cache_key || !source || bytes == 0)
             return false;
+        retire_stale_weight(cache_key, n, k);
         auto found = weights.find(cache_key);
         if (found == weights.end()) {
             void* device = nullptr;
