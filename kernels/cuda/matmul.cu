@@ -174,19 +174,6 @@ __global__ void q8_dense_gemv_cuda(
         output[column] = sum;
 }
 
-__global__ void swizzle_q4_g32_weight_cuda(Q4B8G32Block* weight, size_t rows) {
-    const size_t row = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
-    auto* packet = reinterpret_cast<uint4*>(weight[row / 8].q[row % 8]);
-    const uint4 original = *packet;
-    // Lane p gets canonical half p in the low word and half p+4 in
-    // the high word. No additional weight payload or scales are needed.
-    *packet = make_uint4((original.x & 0xffffu) | (original.z << 16),
-        (original.x >> 16) | (original.z & 0xffff0000u),
-        (original.y & 0xffffu) | (original.w << 16),
-        (original.y >> 16) | (original.w & 0xffff0000u));
-}
-
 // W8PC is the common decode layout: every output row has one scale and the
 // inner dimension is naturally vector aligned.  Assign four adjacent values
 // to each lane so both the int8 weights and FP32 activation are fetched with
@@ -747,21 +734,6 @@ __global__ void q4_g32_row_parallel_gemv_cuda(
         weight, output, inner, static_cast<int>(blockIdx.x));
 }
 
-__global__ void q4_g32_paired_projections_cuda(const float* activation,
-    const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
-    float* first_output, float* second_output, int inner) {
-    q4_g32_row_compute<256, false, 0>(activation,
-        blockIdx.y ? second_weight : first_weight,
-        blockIdx.y ? second_output : first_output, inner, static_cast<int>(blockIdx.x));
-}
-
-__device__ __forceinline__ float q4_shared_bf16(float value) {
-    uint32_t bits = __float_as_uint(value);
-    if ((bits & 0x7f800000u) != 0x7f800000u)
-        bits += 0x7fffu + ((bits >> 16) & 1u);
-    return __uint_as_float(bits & 0xffff0000u);
-}
-
 __device__ __forceinline__ float q4_shared_reduce_256(const float* values) {
     const int t = threadIdx.x;
     // Exactly the original stride128 -> stride64 -> stride32 tree.
@@ -770,63 +742,6 @@ __device__ __forceinline__ float q4_shared_reduce_256(const float* values) {
     float second = values[t + 32] + values[t + 160];
     second += values[t + 96] + values[t + 224];
     return mollm_cuda::detail::warp_reduce_sum(first + second);
-}
-
-__global__ void q4_g32_shared_activation_cuda(const float* __restrict__ activation,
-    const Q4B8G32Block* __restrict__ gate_weight,
-    const Q4B8G32Block* __restrict__ up_weight, float* __restrict__ output, int inner) {
-    const int row = blockIdx.x, groups = inner / 32;
-    float gate = 0.f, up = 0.f;
-    for (int pair = threadIdx.x; pair < inner / 2; pair += 256) {
-        const size_t index = static_cast<size_t>(row / 8) * groups + pair / 16;
-        const auto& g = gate_weight[index];
-        const auto& u = up_weight[index];
-        const uint8_t gp = g.q[row % 8][pair % 16], upack = u.q[row % 8][pair % 16];
-        const float2 x = reinterpret_cast<const float2*>(activation)[pair];
-        const float gd = fmaf(x.x, static_cast<float>(biased_q4_g32_nibble(gp)),
-            x.y * static_cast<float>(biased_q4_g32_nibble(gp >> 4)));
-        const float ud = fmaf(x.x, static_cast<float>(biased_q4_g32_nibble(upack)),
-            x.y * static_cast<float>(biased_q4_g32_nibble(upack >> 4)));
-        gate = fmaf(gd, g.scales[row % 8], gate);
-        up = fmaf(ud, u.scales[row % 8], up);
-    }
-    __shared__ float partial[2][256];
-    partial[0][threadIdx.x] = gate;
-    partial[1][threadIdx.x] = up;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        gate = q4_shared_bf16(q4_shared_reduce_256(partial[0]));
-        up = q4_shared_bf16(q4_shared_reduce_256(partial[1]));
-        if (threadIdx.x == 0)
-            output[row] = q4_shared_bf16((gate * (1.f / (1.f + expf(-gate)))) * up);
-    }
-}
-
-// Map the original 256 logical lanes onto 128 physical threads. Keep the
-// logical lanes' independent FMA chains, then perform the original first
-// reduction (stride128) before the unchanged remaining reduction tree.
-__global__ void q4_g32_dual_lane_gemv_cuda(const float* __restrict__ activation,
-    const Q4B8G32Block* __restrict__ weight, float* __restrict__ output, int inner) {
-    const int row = blockIdx.x;
-    const int groups = inner / 32;
-    float sums[2] = {};
-    for (int pair = threadIdx.x; pair < inner / 2; pair += 256) {
-#pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            const int logical_pair = pair + half * 128;
-            if (logical_pair < inner / 2) {
-                const auto& block = weight[static_cast<size_t>(row / 8) * groups + logical_pair / 16];
-                const uint8_t packed = block.q[row % 8][logical_pair % 16];
-                const float2 x = reinterpret_cast<const float2*>(activation)[logical_pair];
-                const float dot = fmaf(x.x, static_cast<float>(biased_q4_g32_nibble(packed)),
-                    x.y * static_cast<float>(biased_q4_g32_nibble(packed >> 4)));
-                sums[half] = fmaf(dot, block.scales[row % 8], sums[half]);
-            }
-        }
-    }
-    __shared__ float reduction[128];
-    const float total = mollm_cuda::detail::block_reduce_sum<128>(sums[0] + sums[1], reduction);
-    if (threadIdx.x == 0) output[row] = total;
 }
 
 struct Q4NarrowPacket {
@@ -869,35 +784,6 @@ __device__ __forceinline__ Q4NarrowPacket q4_narrow_packet(const float* activati
     }
 }
 
-__global__ void q4_g32_dual_lane_pipeline_cuda(const float* activation,
-    const Q4B8G32Block* weight,float* output,int inner) {
-    const int row=blockIdx.x;
-    Q4NarrowPacket pending[2];
-    float sums[2]={};
-#pragma unroll
-    for(int half=0;half<2;++half)
-        pending[half]=q4_narrow_packet<true>(activation,weight,row,inner,threadIdx.x+128*half);
-    for(int pair=threadIdx.x;pair<inner/2;pair+=256) {
-        Q4NarrowPacket incoming[2];
-#pragma unroll
-        for(int half=0;half<2;++half)
-            incoming[half]=q4_narrow_packet<true>(activation,weight,row,inner,pair+128*half+256);
-#pragma unroll
-        for(int half=0;half<2;++half) {
-            if(pair+128*half<inner/2) {
-                const auto packet=pending[half];
-                const float dot=fmaf(packet.input.x,biased_q4_g32_nibble(packet.codes),
-                    packet.input.y*biased_q4_g32_nibble(packet.codes>>4));
-                sums[half]=fmaf(dot,packet.scale,sums[half]);
-            }
-            pending[half]=incoming[half];
-        }
-    }
-    __shared__ float reduction[128];
-    const float total=mollm_cuda::detail::block_reduce_sum<128>(sums[0]+sums[1],reduction);
-    if(!threadIdx.x)output[row]=total;
-}
-
 template<int Depth, bool PipelineInputs, class Block = Q4B8G32Block, bool SingleBarrier = false>
 __device__ __forceinline__ void q4_g32_pipelined_narrow_compute(const float* activation,
     const Block* weight, float* output, int inner, int row) {
@@ -935,46 +821,6 @@ template<int Depth, bool PipelineInputs, class Block = Q4B8G32Block, bool Single
 __global__ void q4_g32_pipelined_narrow_cuda(const float* __restrict__ activation,
     const Block* __restrict__ weight, float* __restrict__ output, int inner) {
     q4_g32_pipelined_narrow_compute<Depth, PipelineInputs, Block, SingleBarrier>(activation, weight, output, inner, blockIdx.x);
-}
-
-struct CompactPacket { uint8_t codes; uint16_t scale; float2 input; };
-__device__ __forceinline__ CompactPacket compact_packet(const float* x,
-    const mollm_cuda::Q4CompactG32* weight, int row, int inner, int pair) {
-    if (pair >= inner / 2) return {};
-    const auto& block = weight[size_t(row / 8) * (inner / 32) + pair / 16];
-    return {block.q[row % 8][pair % 16], block.scales[row % 8],
-            reinterpret_cast<const float2*>(x)[pair]};
-}
-__global__ void compact_warp_table_cuda(const float* x,
-    const mollm_cuda::Q4CompactG32* weight, float* output, int inner) {
-    const int row = blockIdx.x, lane = threadIdx.x % 32;
-    unsigned table[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        unsigned m = lane + i * 32;
-        table[i] = ((((128u + m) << (m >= 96 ? 18 : 19)) + 3u) / 7u) & 0x7fffffu;
-    }
-    float sum = 0;
-    auto pending = compact_packet(x, weight, row, inner, threadIdx.x);
-    // API requires inner%512==0, so all lanes enter every shuffle together.
-    for (int pair = threadIdx.x; pair < inner / 2; pair += 256) {
-        const auto incoming = compact_packet(x, weight, row, inner, pair + 256);
-        const unsigned code = pending.scale, m = code & 127, e = (code >> 7) & 255;
-        unsigned values[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-            values[i] = __shfl_sync(0xffffffffu, table[i], m & 31);
-        const unsigned fraction = m < 32 ? values[0] : m < 64 ? values[1] : m < 96 ? values[2] : values[3];
-        const float scale = e <= 3 || e == 255 ? __fdiv_rn(__uint_as_float(code << 16), 7.f)
-            : __uint_as_float(((code & 0x8000u) << 16) | ((e - (m >= 96 ? 2 : 3)) << 23) | fraction);
-        const float dot = fmaf(pending.input.x, float(biased_q4_g32_nibble(pending.codes)),
-            pending.input.y * float(biased_q4_g32_nibble(pending.codes >> 4)));
-        sum = fmaf(dot, scale, sum);
-        pending = incoming;
-    }
-    __shared__ float reduction[256];
-    const float total = mollm_cuda::detail::block_reduce_sum<256>(sum, reduction);
-    if (!threadIdx.x) output[row] = total;
 }
 
 // M3 keeps two adjacent original logical-lane FMA chains per thread.
@@ -1078,127 +924,6 @@ __global__ void q4_g32_unequal_projections_cuda(const float* activation,
     q4_g32_pipelined_narrow_compute<1, true>(activation,
         first ? first_weight : second_weight, first ? first_output : second_output,
         inner, first ? row : row - first_columns);
-}
-
-template<int Rows>
-__global__ void q4_g32_spatial_narrow_cuda(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner) {
-    constexpr int physical = 256 / Rows;
-    constexpr int stride = physical + 32 / Rows;
-    const int local_row = threadIdx.x % Rows;
-    const int logical_lane = threadIdx.x / Rows;
-    const int row = blockIdx.x * Rows + local_row;
-    const int groups = inner / 32;
-    float sums[Rows] = {};
-    for (int base = logical_lane; base < inner / 2; base += 256) {
-#pragma unroll
-        for (int chain = 0; chain < Rows; ++chain) {
-            const int pair = base + chain * physical;
-            if (row < columns && pair < inner / 2) {
-                const auto& block = weight[static_cast<size_t>(row / 8) * groups + pair / 16];
-                const uint8_t packed = block.q[row % 8][pair % 16];
-                const float2 x = reinterpret_cast<const float2*>(activation)[pair];
-                const float dot = fmaf(x.x, static_cast<float>(biased_q4_g32_nibble(packed)),
-                    x.y * static_cast<float>(biased_q4_g32_nibble(packed >> 4)));
-                sums[chain] = fmaf(dot, block.scales[row % 8], sums[chain]);
-            }
-        }
-    }
-    // Fold logical stride128/64/32 stages without changing their tree.
-#pragma unroll
-    for (int offset = Rows / 2; offset; offset /= 2) {
-#pragma unroll
-        for (int chain = 0; chain < offset; ++chain)
-            sums[chain] += sums[chain + offset];
-    }
-    __shared__ float partial[Rows][stride];
-    partial[local_row][logical_lane] = sums[0];
-    __syncthreads();
-    const int output_row = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
-    if (output_row < Rows) {
-        float total = partial[output_row][lane];
-        if constexpr (physical == 128) {
-            total += partial[output_row][lane + 64];
-            total += partial[output_row][lane + 32] + partial[output_row][lane + 96];
-        } else if constexpr (physical == 64) {
-            total += partial[output_row][lane + 32];
-        }
-        total = mollm_cuda::detail::warp_reduce_sum(total);
-        if (!lane && blockIdx.x * Rows + output_row < columns)
-            output[blockIdx.x * Rows + output_row] = total;
-    }
-}
-
-template<int Rows>
-__global__ void q4_g32_grouped_narrow_cuda(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner) {
-    constexpr int threads = 256;
-    const int first_row = blockIdx.x * Rows;
-    const int groups = inner / 32;
-    float sums[Rows] = {};
-    for (int pair = threadIdx.x; pair < inner / 2; pair += threads) {
-        const auto& block = weight[static_cast<size_t>(first_row / 8) * groups + pair / 16];
-        const float2 x = reinterpret_cast<const float2*>(activation)[pair];
-#pragma unroll
-        for (int r = 0; r < Rows; ++r) {
-            const int lane = first_row % 8 + r;
-            const uint8_t packed = block.q[lane][pair % 16];
-            const float dot = fmaf(x.x, static_cast<float>(biased_q4_g32_nibble(packed)),
-                x.y * static_cast<float>(biased_q4_g32_nibble(packed >> 4)));
-            sums[r] = fmaf(dot, block.scales[lane], sums[r]);
-        }
-    }
-    __shared__ float partial[Rows][threads];
-#pragma unroll
-    for (int r = 0; r < Rows; ++r) partial[r][threadIdx.x] = sums[r];
-    __syncthreads();
-#pragma unroll
-    for (int offset = threads / 2; offset >= 64; offset >>= 1) {
-        if (threadIdx.x < offset) {
-#pragma unroll
-            for (int r = 0; r < Rows; ++r)
-                partial[r][threadIdx.x] += partial[r][threadIdx.x + offset];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x < 32) {
-#pragma unroll
-        for (int r = 0; r < Rows; ++r) {
-            const float value = mollm_cuda::detail::warp_reduce_sum(
-                partial[r][threadIdx.x] + partial[r][threadIdx.x + 32]);
-            if (threadIdx.x == 0 && first_row + r < columns) output[first_row + r] = value;
-        }
-    }
-}
-
-template<int Splits>
-__global__ void q4_g32_split_pair_gemv_cuda(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner) {
-    const int split = threadIdx.x / 128;
-    const int row = (threadIdx.x % 128) / 16;
-    const int pair = threadIdx.x % 16;
-    const int groups = inner / 32;
-    float sum = 0;
-    for (int group = split; group < groups; group += Splits) {
-        const auto& block = weight[static_cast<size_t>(blockIdx.x) * groups + group];
-        const uint8_t packed = block.q[row][pair];
-        const float2 x = reinterpret_cast<const float2*>(activation + group * 32)[pair];
-        const float dot = fmaf(x.x, biased_q4_g32_nibble(packed),
-            x.y * biased_q4_g32_nibble(packed >> 4));
-        sum = fmaf(dot, block.scales[row], sum);
-    }
-    for (int offset = 8; offset; offset >>= 1)
-        sum += __shfl_down_sync(0xffffffffu, sum, offset, 16);
-    __shared__ float partial[Splits][8];
-    if (pair == 0) partial[split][row] = sum;
-    __syncthreads();
-    if (threadIdx.x < 8 && blockIdx.x * 8 + threadIdx.x < columns) {
-        float total = partial[0][threadIdx.x];
-#pragma unroll
-        for (int i = 1; i < Splits; ++i) total += partial[i][threadIdx.x];
-        output[blockIdx.x * 8 + threadIdx.x] = total;
-    }
 }
 
 template <bool CacheActivation, bool Swizzled = false, int Pipeline = 0, class Block = Q4B8G32Block, bool PredecodeScale = false>
@@ -1730,33 +1455,6 @@ void launch_bias_q4_g32_weight(
         threads>>>(weight, byte_count);
 }
 
-void launch_swizzle_q4_g32_weight(Q4B8G32Block* weight, size_t block_count) {
-    constexpr int threads = 256;
-    const size_t rows = block_count * 8;
-    swizzle_q4_g32_weight_cuda<<<(rows + threads - 1) / threads, threads>>>(weight, rows);
-}
-
-void launch_q4_g32_swizzled_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner, cudaStream_t stream) {
-    if (reinterpret_cast<uintptr_t>(activation) % alignof(float4)) {
-        if (reinterpret_cast<uintptr_t>(activation) % alignof(float2) == 0)
-            q4_g32_pair_rows_gemv_cuda<false, true><<<(columns + 7) / 8, 128, 0, stream>>>(
-                activation, weight, output, columns, inner);
-        else
-            q4_g32_dense_gemv_cuda<true><<<(columns + 3) / 4, 128, 0, stream>>>(
-                activation, weight, output, columns, inner);
-        return;
-    }
-    const unsigned blocks = (columns + 31) / 32;
-    if (inner <= q4_g32_quad_activation_cache_max_inner &&
-        columns < q4_g32_quad_activation_cache_max_columns)
-        q4_g32_oct_rows_gemv_cuda<true, true><<<blocks, 128,
-            static_cast<size_t>(inner) * sizeof(float), stream>>>(activation, weight, output, columns, inner);
-    else
-        q4_g32_oct_rows_gemv_cuda<false, true><<<blocks, 128, 0, stream>>>(
-            activation, weight, output, columns, inner);
-}
-
 void launch_q4_g32_compact_gemv(const float* activation,
     const Q4CompactG32* weight, float* output, int columns, int inner, cudaStream_t stream) {
     // SM121 GDN input projection (N16480/K2560): full-scale lookup.
@@ -1794,17 +1492,6 @@ void launch_q4_g32_compact_gemv(const float* activation,
     }
     q4_g32_oct_rows_gemv_cuda<true, false, 4><<<(columns + 31) / 32, 128,
         static_cast<size_t>(inner) * sizeof(float), stream>>>(activation, weight, output, columns, inner);
-}
-
-cudaError_t launch_q4_compact_pair_probe(const float* activation,
-    const Q4CompactG32* weight,float* output,int columns,int inner,int pipeline,cudaStream_t stream) {
-    if(!activation||!weight||!output||columns<=0||columns>INT32_MAX-7||inner<=0||inner>INT32_MAX-32||inner%32||pipeline<0||pipeline>3||(pipeline==3&&inner>4096)||
-        reinterpret_cast<uintptr_t>(activation)%alignof(float2)||reinterpret_cast<uintptr_t>(weight)%alignof(Q4CompactG32))return cudaErrorInvalidValue;
-    if(pipeline==3)q4_g32_pair_rows_gemv_cuda<false,false,0,Q4CompactG32,true><<<(columns+7)/8,128,size_t(inner/32)*8*sizeof(float),stream>>>(activation,weight,output,columns,inner);
-    else if(pipeline==2)q4_g32_pair_rows_gemv_cuda<false,false,2,Q4CompactG32><<<(columns+7)/8,128,0,stream>>>(activation,weight,output,columns,inner);
-    else if(pipeline==1)q4_g32_pair_rows_gemv_cuda<false,false,1,Q4CompactG32><<<(columns+7)/8,128,0,stream>>>(activation,weight,output,columns,inner);
-    else q4_g32_pair_rows_gemv_cuda<false,false,0,Q4CompactG32><<<(columns+7)/8,128,0,stream>>>(activation,weight,output,columns,inner);
-    return cudaGetLastError();
 }
 
 cudaError_t launch_q4_compact_scale_gemv_probe(const float* activation,
@@ -1881,38 +1568,6 @@ cudaError_t launch_q4_compact_integer_gemv(const float* activation,
     return cudaGetLastError();
 }
 
-cudaError_t launch_q4_compact_warp_table_gemv(const float* activation,
-    const Q4CompactG32* weight, float* output, int columns, int inner, cudaStream_t stream) {
-    if (!activation || !weight || !output || columns <= 0 || columns > 4096 ||
-        inner <= 0 || inner > INT32_MAX - 512 || inner % 512 ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float2) ||
-        reinterpret_cast<uintptr_t>(weight) % alignof(Q4CompactG32)) return cudaErrorInvalidValue;
-    compact_warp_table_cuda<<<columns, 256, 0, stream>>>(activation, weight, output, inner);
-    return cudaGetLastError();
-}
-
-void launch_q4_g32_grouped_narrow_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner, int rows, cudaStream_t stream) {
-    switch (rows) {
-    case 2: q4_g32_grouped_narrow_cuda<2><<<(columns + 1) / 2, 256, 0, stream>>>(activation, weight, output, columns, inner); break;
-    case 4: q4_g32_grouped_narrow_cuda<4><<<(columns + 3) / 4, 256, 0, stream>>>(activation, weight, output, columns, inner); break;
-    case 8: q4_g32_grouped_narrow_cuda<8><<<(columns + 7) / 8, 256, 0, stream>>>(activation, weight, output, columns, inner); break;
-    }
-}
-
-cudaError_t launch_q8_pipeline_gemv(const float* activation, const int8_t* weight,
-    const float* scales, float* output, int columns, int inner, int mode, cudaStream_t stream) {
-    if (!activation || !weight || !scales || !output || columns <= 0 ||
-        columns > 2147483631 || inner <= 0 || inner > 2147483519 || inner % 4 || (mode != 1 && mode != 2) ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float4) ||
-        reinterpret_cast<uintptr_t>(weight) % alignof(char4)) return cudaErrorInvalidValue;
-    if (mode == 1)
-        q8_per_channel_dense_gemv_cuda<0, 8, false, 1><<<(columns + 7) / 8, 256, 0, stream>>>(activation, weight, scales, output, columns, inner);
-    else
-        q8_per_channel_dense_gemv_cuda<0, 8, false, 2><<<(columns + 7) / 8, 256, 0, stream>>>(activation, weight, scales, output, columns, inner);
-    return cudaGetLastError();
-}
-
 cudaError_t launch_q8_tuned_gemv(const float* activation, const int8_t* weight,
     const float* scales, float* output, int columns, int inner, int warps,
     bool cache_activation, cudaStream_t stream) {
@@ -1938,17 +1593,6 @@ cudaError_t launch_q8_tuned_gemv(const float* activation, const int8_t* weight,
         q8_per_channel_dense_gemv_cuda<0, 32><<<(columns + 31) / 32, 1024, 0, stream>>>(activation, weight, scales, output, columns, inner);
     else return cudaErrorInvalidValue;
     return cudaGetLastError();
-}
-
-void launch_q8_prefetch_gemv(const float* activation, const int8_t* weight,
-    const float* scales, float* output, int columns, int inner, int distance) {
-    const int blocks = (columns + 7) / 8;
-    switch (distance) {
-    case 1: q8_per_channel_dense_gemv_cuda<1><<<blocks, 256>>>(activation, weight, scales, output, columns, inner); break;
-    case 2: q8_per_channel_dense_gemv_cuda<2><<<blocks, 256>>>(activation, weight, scales, output, columns, inner); break;
-    case 4: q8_per_channel_dense_gemv_cuda<4><<<blocks, 256>>>(activation, weight, scales, output, columns, inner); break;
-    default: q8_per_channel_dense_gemv_cuda<><<<blocks, 256>>>(activation, weight, scales, output, columns, inner); break;
-    }
 }
 
 cudaError_t launch_q8_small_batch_exact(const float* activation,
@@ -2383,57 +2027,6 @@ void launch_repack_q4_row_g32(const Q4B8G32Block* source, Q4RowG32* target,
     repack_q4_row_g32_cuda<<<(count + 255) / 256, 256>>>(source, target, columns, inner / 32);
 }
 
-void launch_q4_g32_terminal_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner) {
-    q4_g32_row_parallel_gemv_cuda<256, true><<<columns, 256>>>(
-        activation, weight, output, inner);
-}
-
-cudaError_t launch_q4_g32_paired_projections(const float* activation,
-    const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
-    float* first_output, float* second_output, int columns, int inner,
-    cudaStream_t stream) {
-    if (!activation || !first_weight || !second_weight || !first_output || !second_output ||
-        columns <= 0 || columns > 4096 || inner < 2048 || inner % 32 ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float2)) return cudaErrorInvalidValue;
-    q4_g32_paired_projections_cuda<<<dim3(columns, 2), 256, 0, stream>>>(activation,
-        first_weight, second_weight, first_output, second_output, inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_q4_g32_shared_activation(const float* activation,
-    const Q4B8G32Block* gate_weight, const Q4B8G32Block* up_weight,
-    float* output, int columns, int inner, cudaStream_t stream) {
-    if (!activation || !gate_weight || !up_weight || !output || columns <= 0 ||
-        columns > 4096 || inner < 2048 || inner % 32 ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float2)) return cudaErrorInvalidValue;
-    q4_g32_shared_activation_cuda<<<columns,256,0,stream>>>(activation,
-        gate_weight,up_weight,output,inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_q4_g32_dual_lane_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner,
-    cudaStream_t stream, bool pipeline_inputs) {
-    if (!activation || !weight || !output || columns <= 0 || inner <= 0 ||
-        inner % 32 || reinterpret_cast<uintptr_t>(activation) % alignof(float2))
-        return cudaErrorInvalidValue;
-    if(pipeline_inputs)
-        q4_g32_dual_lane_pipeline_cuda<<<columns,128,0,stream>>>(activation,weight,output,inner);
-    else q4_g32_dual_lane_gemv_cuda<<<columns, 128, 0, stream>>>(activation, weight, output, inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_q4_g32_single_barrier_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner, cudaStream_t stream) {
-    if (!activation || !weight || !output || columns <= 0 || columns > 4096 ||
-        inner < 2048 || inner % 32 || reinterpret_cast<uintptr_t>(activation) % alignof(float2))
-        return cudaErrorInvalidValue;
-    q4_g32_row_parallel_gemv_cuda<256, false, 0, Q4B8G32Block, true><<<columns, 256, 0, stream>>>(
-        activation, weight, output, inner);
-    return cudaGetLastError();
-}
-
 cudaError_t launch_q4_g32_unequal_projections(const float* activation,
     const Q4B8G32Block* first_weight, const Q4B8G32Block* second_weight,
     float* first_output, float* second_output, int first_columns, int second_columns,
@@ -2515,167 +2108,6 @@ cudaError_t launch_q4_g32_pipelined_narrow_gemv(const float* activation,
     }
     return cudaGetLastError();
 }
-
-cudaError_t launch_q4_compact_pipelined_narrow_gemv(const float* activation,
-    const Q4CompactG32* weight,float* output,int columns,int inner,cudaStream_t stream) {
-    if(!activation||!weight||!output||columns<=0||columns>4096||inner<2048||
-        inner>INT32_MAX-2048||inner%32||reinterpret_cast<uintptr_t>(activation)%alignof(float2))
-        return cudaErrorInvalidValue;
-    q4_g32_pipelined_narrow_cuda<1,true,Q4CompactG32><<<columns,256,0,stream>>>(activation,weight,output,inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_q4_g32_spatial_narrow_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner, int rows_per_cta,
-    cudaStream_t stream) {
-    if (!activation || !weight || !output || columns <= 0 || columns > 4096 ||
-        inner < 2048 || inner % 32 || reinterpret_cast<uintptr_t>(activation) % alignof(float2))
-        return cudaErrorInvalidValue;
-    switch (rows_per_cta) {
-    case 2: q4_g32_spatial_narrow_cuda<2><<<(columns + 1) / 2, 256, 0, stream>>>(activation, weight, output, columns, inner); break;
-    case 4: q4_g32_spatial_narrow_cuda<4><<<(columns + 3) / 4, 256, 0, stream>>>(activation, weight, output, columns, inner); break;
-    case 8: q4_g32_spatial_narrow_cuda<8><<<(columns + 7) / 8, 256, 0, stream>>>(activation, weight, output, columns, inner); break;
-    default: return cudaErrorInvalidValue;
-    }
-    return cudaGetLastError();
-}
-
-void launch_q4_g32_pair_narrow_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner, bool cache, cudaStream_t stream) {
-    if (cache)
-        q4_g32_pair_rows_gemv_cuda<true><<<(columns + 7) / 8, 128, inner * sizeof(float), stream>>>(
-            activation, weight, output, columns, inner);
-    else
-        q4_g32_pair_rows_gemv_cuda<false><<<(columns + 7) / 8, 128, 0, stream>>>(
-            activation, weight, output, columns, inner);
-}
-
-cudaError_t launch_q4_g32_l1_prefetch_wide_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner,
-    int distance, cudaStream_t stream) {
-    if (!activation || !weight || !output || columns <= 0 || columns > INT32_MAX - 31 ||
-        inner <= 0 || inner > 2560 || inner % 32 ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float4)) return cudaErrorInvalidValue;
-    const dim3 grid((columns + 31) / 32);
-    const size_t shared = static_cast<size_t>(inner) * sizeof(float);
-    switch (distance) {
-    case 1: q4_g32_oct_rows_gemv_cuda<true, false, 1, Q4B8G32Block, 0, false, false, false, true><<<grid,128,shared,stream>>>(activation,weight,output,columns,inner); break;
-    case 2: q4_g32_oct_rows_gemv_cuda<true, false, 2, Q4B8G32Block, 0, false, false, false, true><<<grid,128,shared,stream>>>(activation,weight,output,columns,inner); break;
-    case 4: q4_g32_oct_rows_gemv_cuda<true, false, 4, Q4B8G32Block, 0, false, false, false, true><<<grid,128,shared,stream>>>(activation,weight,output,columns,inner); break;
-    case 8: q4_g32_oct_rows_gemv_cuda<true, false, 8, Q4B8G32Block, 0, false, false, false, true><<<grid,128,shared,stream>>>(activation,weight,output,columns,inner); break;
-    default: return cudaErrorInvalidValue;
-    }
-    return cudaGetLastError();
-}
-
-cudaError_t launch_q4_g32_pipelined_pair_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner,
-    bool pipeline_inputs, cudaStream_t stream) {
-    if (!activation || !weight || !output || columns <= 0 || columns > INT32_MAX - 7 ||
-        inner <= 0 || inner > 2560 || inner % 32 ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float2)) return cudaErrorInvalidValue;
-    if (pipeline_inputs)
-        q4_g32_pair_rows_gemv_cuda<false, false, 2><<<(columns + 7) / 8, 128, 0, stream>>>(activation, weight, output, columns, inner);
-    else
-        q4_g32_pair_rows_gemv_cuda<false, false, 1><<<(columns + 7) / 8, 128, 0, stream>>>(activation, weight, output, columns, inner);
-    return cudaGetLastError();
-}
-
-void launch_q4_g32_split_pair_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner, int splits) {
-    switch (splits) {
-    case 2: q4_g32_split_pair_gemv_cuda<2><<<(columns + 7) / 8, 256>>>(activation, weight, output, columns, inner); break;
-    case 4: q4_g32_split_pair_gemv_cuda<4><<<(columns + 7) / 8, 512>>>(activation, weight, output, columns, inner); break;
-    case 8: q4_g32_split_pair_gemv_cuda<8><<<(columns + 7) / 8, 1024>>>(activation, weight, output, columns, inner); break;
-    }
-}
-
-void launch_q4_g32_prefetch_narrow_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner, int distance) {
-    switch (distance) {
-    case 1: q4_g32_row_parallel_gemv_cuda<256, false, 1><<<columns, 256>>>(activation, weight, output, inner); break;
-    case 2: q4_g32_row_parallel_gemv_cuda<256, false, 2><<<columns, 256>>>(activation, weight, output, inner); break;
-    case 4: q4_g32_row_parallel_gemv_cuda<256, false, 4><<<columns, 256>>>(activation, weight, output, inner); break;
-    default: q4_g32_row_parallel_gemv_cuda<256><<<columns, 256>>>(activation, weight, output, inner); break;
-    }
-}
-
-void launch_q4_g32_uncached_wide_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner) {
-    q4_g32_oct_rows_gemv_cuda<false><<<(columns + 31) / 32, 128>>>(
-        activation, weight, output, columns, inner);
-}
-
-cudaError_t launch_q4_g32_async_wide_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner,
-    cudaStream_t stream) {
-    if (!activation || !weight || !output || columns <= 0 || columns > 2147483615 ||
-        inner <= 0 || inner > 2560 || inner % 32 ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float4) ||
-        reinterpret_cast<uintptr_t>(weight) % 16) return cudaErrorInvalidValue;
-    q4_g32_oct_rows_gemv_cuda<true, false, 0, Q4B8G32Block, 0, true><<<(columns + 31) / 32, 128,
-        static_cast<size_t>(inner) * sizeof(float), stream>>>(activation, weight, output, columns, inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_q4_g32_load_hint_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner, int hint,
-    cudaStream_t stream) {
-    if (!activation || !weight || !output || columns <= 0 || columns > 2147483615 ||
-        inner <= 0 || inner > 2560 || inner % 32 ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float4)) return cudaErrorInvalidValue;
-    const unsigned blocks = (columns + 31) / 32;
-    const size_t shared = static_cast<size_t>(inner) * sizeof(float);
-    switch (hint) {
-    case 32: q4_g32_oct_rows_gemv_cuda<true, false, 4, Q4B8G32Block, 32><<<blocks, 128, shared, stream>>>(activation, weight, output, columns, inner); break;
-    case 64: q4_g32_oct_rows_gemv_cuda<true, false, 4, Q4B8G32Block, 64><<<blocks, 128, shared, stream>>>(activation, weight, output, columns, inner); break;
-    case 128: q4_g32_oct_rows_gemv_cuda<true, false, 4, Q4B8G32Block, 128><<<blocks, 128, shared, stream>>>(activation, weight, output, columns, inner); break;
-    case 256: q4_g32_oct_rows_gemv_cuda<true, false, 4, Q4B8G32Block, 256><<<blocks, 128, shared, stream>>>(activation, weight, output, columns, inner); break;
-    default: return cudaErrorInvalidValue;
-    }
-    return cudaGetLastError();
-}
-
-void launch_q4_g32_prefetch_wide_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner, int distance,
-    cudaStream_t stream) {
-    const unsigned blocks = (columns + 31) / 32;
-    const size_t shared = inner * sizeof(float);
-    switch (distance) {
-    case 4: q4_g32_oct_rows_gemv_cuda<true, false, 4><<<blocks, 128, shared, stream>>>(activation, weight, output, columns, inner); break;
-    case 8: q4_g32_oct_rows_gemv_cuda<true, false, 8><<<blocks, 128, shared, stream>>>(activation, weight, output, columns, inner); break;
-    case 16: q4_g32_oct_rows_gemv_cuda<true, false, 16><<<blocks, 128, shared, stream>>>(activation, weight, output, columns, inner); break;
-    }
-}
-
-cudaError_t launch_q4_g32_pipelined_wide_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner,
-    cudaStream_t stream) {
-    if (!activation || !weight || !output || columns <= 0 || columns > INT32_MAX - 31 ||
-        inner <= 0 || inner > 2560 || inner % 32 ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float4)) return cudaErrorInvalidValue;
-    q4_g32_oct_rows_gemv_cuda<true, false, 4, Q4B8G32Block, 0, false, false, true>
-        <<<(columns + 31) / 32, 128, static_cast<size_t>(inner) * sizeof(float), stream>>>(
-            activation, weight, output, columns, inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_q4_g32_prefetch_scale_gemv(const float* activation,
-    const Q4B8G32Block* weight, float* output, int columns, int inner,
-    int distance, cudaStream_t stream) {
-    if (!activation || !weight || !output || columns <= 0 || columns > 2147483615 ||
-        inner <= 0 || inner > 2560 || inner % 32 ||
-        reinterpret_cast<uintptr_t>(activation) % alignof(float4)) return cudaErrorInvalidValue;
-    const unsigned blocks = (columns + 31) / 32;
-    const size_t shared = static_cast<size_t>(inner) * sizeof(float);
-    if (distance == 4)
-        q4_g32_oct_rows_gemv_cuda<true, false, 4, Q4B8G32Block, 0, false, true><<<blocks,128,shared,stream>>>(activation,weight,output,columns,inner);
-    else if (distance == 8)
-        q4_g32_oct_rows_gemv_cuda<true, false, 8, Q4B8G32Block, 0, false, true><<<blocks,128,shared,stream>>>(activation,weight,output,columns,inner);
-    else return cudaErrorInvalidValue;
-    return cudaGetLastError();
-}
-
 
 void launch_q4_g128_dense_gemv(
     const float* activation, const Q4B8G128Block* weight, float* output,

@@ -52,14 +52,6 @@ bool launch_group_rms_norm_deferred(const float* input, const float* weight,
 bool launch_group_rms_norm_cached(const float* input, const float* weight,
     float* output, int group_size, int groups, int rows, float epsilon,
     cudaStream_t stream = nullptr);
-// Diagnostic row-tiled sigmoid reduction; unsupported geometry returns false.
-bool launch_gr_reduce_sigmoid_vector4(const float* input, const float* logits,
-                                    float* output, int hidden, int streams,
-                                    int rows, cudaStream_t stream = nullptr);
-bool launch_gr_reduce_sigmoid_tiled(const float* input, const float* logits,
-                                  float* output, int hidden, int streams,
-                                  int rows, cudaStream_t stream = nullptr,
-                                  bool specialize_four = false);
 void launch_gr_reduce(const float* input, const float* gates, float* output,
                        int hidden, int streams, int rows);
 void launch_gr_reduce_sigmoid(const float* input, const float* logits,
@@ -68,10 +60,6 @@ void launch_gr_reduce_sigmoid(const float* input, const float* logits,
 void launch_gr_inject(const float* branch, const float* residual,
                        const float* gates, float* output,
                        int hidden, int streams, int rows);
-// Diagnostic geometry specialization; production dispatch is unchanged.
-bool launch_gr_inject_tiled(const float* branch, const float* residual,
-    const float* gates, float* output, int hidden, int streams, int rows,
-    cudaStream_t stream = nullptr);
 // Diagnostic only: width2560/streams4/rows<=4096; all output spans must be
 // disjoint from each other and every input. Publishes the original rounded
 // residual AND RMS outputs. No inference selector yet.

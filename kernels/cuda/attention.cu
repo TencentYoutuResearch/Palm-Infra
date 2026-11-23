@@ -12,54 +12,6 @@
 
 namespace {
 
-__global__ void sdpa_gemm_bind_heads_cuda(float** pointers, const float* query,
-    float* key, float* value, float* scores, float* output,
-    mollm_cuda::SdpaGemmPrefillParams p) {
-    const int head = blockIdx.x * blockDim.x + threadIdx.x;
-    if (head >= p.heads) return;
-    const int kv_head = head / (p.heads / p.kv_heads);
-    pointers[head] = key + static_cast<size_t>(kv_head) * p.keys * p.dimension;
-    pointers[p.heads + head] = const_cast<float*>(query + static_cast<size_t>(head) * p.query_head_stride);
-    pointers[2 * p.heads + head] = scores + static_cast<size_t>(head) * p.queries * p.keys;
-    pointers[3 * p.heads + head] = value + static_cast<size_t>(kv_head) * p.keys * p.dimension;
-    pointers[4 * p.heads + head] = output + static_cast<size_t>(head) * p.output_head_stride;
-}
-
-__global__ void sdpa_expand_fp16_cache_cuda(const __half* key, const __half* value,
-    float* key32, float* value32, size_t count, int keys, int capacity, int dimension) {
-    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= count) return;
-    const size_t head_span = static_cast<size_t>(keys) * dimension;
-    const size_t source = (index / head_span) * capacity * dimension + index % head_span;
-    key32[index] = __half2float(key[source]);
-    value32[index] = __half2float(value[source]);
-}
-
-__global__ void sdpa_gemm_softmax_cuda(float* scores, const float* mask,
-    int queries, int keys, int past, bool causal, float scale,
-    size_t mask_column_stride, size_t mask_row_stride) {
-    const int query = blockIdx.x;
-    float* row = scores + (static_cast<size_t>(blockIdx.y) * queries + query) * keys;
-    float maximum = -FLT_MAX;
-    for (int k = threadIdx.x; k < keys; k += 256) {
-        float score = row[k] * scale;
-        if (mask) score += mask[static_cast<size_t>(query) * mask_row_stride + static_cast<size_t>(k) * mask_column_stride];
-        else if (causal && k > past + query) score = -FLT_MAX;
-        row[k] = score;
-        maximum = fmaxf(maximum, score);
-    }
-    __shared__ float reduction[256];
-    maximum = mollm_cuda::detail::block_reduce_max<256>(maximum, reduction);
-    float sum = 0.f;
-    for (int k = threadIdx.x; k < keys; k += 256) {
-        const float value = expf(row[k] - maximum);
-        row[k] = value; sum += value;
-    }
-    sum = mollm_cuda::detail::block_reduce_sum<256>(sum, reduction);
-    const float inverse = sum > 0.f ? 1.f / sum : 0.f;
-    for (int k = threadIdx.x; k < keys; k += 256) row[k] *= inverse;
-}
-
 constexpr int staged_sdpa_head_dim = 128;
 constexpr int staged_sdpa_pairs = staged_sdpa_head_dim / 2;
 constexpr int staged_sdpa_threads = 256;
@@ -875,8 +827,6 @@ __global__ void validate_sdpa_prefix_cuda(const float* query,const __half* key,
     }
 }
 
-
-
 // Warp-head layout: retain each head's original256-thread reduction
 // tree while eight-lane groups of different heads share a physical warp.
 template<bool Sum>
@@ -1321,20 +1271,6 @@ __global__ void sdpa_pv_copy_cuda(const float* source,float* destination,
     destination[offset]=source[offset];
 }
 
-// Diagnostic stage isolation: keep GEMM QK/softmax, but accumulate PV in
-// ascending key order with FP32 FMAs. Never selected by production dispatch.
-__global__ void sdpa_gemm_ordered_pv_cuda(const float* probabilities,
-    const float* value,float* output,mollm_cuda::SdpaGemmPrefillParams p) {
-    const int d=threadIdx.x,q=blockIdx.x,head=blockIdx.y;
-    if(d>=p.dimension)return;
-    const int kv_head=head/(p.heads/p.kv_heads);
-    const float* row=probabilities+(size_t(head)*p.queries+q)*p.keys;
-    const float* values=value+size_t(kv_head)*p.keys*p.dimension+d;
-    float sum=0.f;
-    for(int key=0;key<p.keys;++key)sum=fmaf(row[key],values[size_t(key)*p.dimension],sum);
-    output[size_t(head)*p.output_head_stride+size_t(q)*p.output_position_stride+d]=sum;
-}
-
 }  // namespace
 
 namespace mollm_cuda {
@@ -1378,83 +1314,6 @@ void launch_sdpa_validated_pv_copy(const float* source,float* destination,
     const uint32_t* valid,const SdpaGemmPrefillParams& p,cudaStream_t stream) {
     const size_t n=size_t(p.heads)*p.queries*p.dimension;
     sdpa_pv_copy_cuda<<<unsigned((n+255)/256),256,0,stream>>>(source,destination,valid,p);
-}
-
-cublasStatus_t launch_sdpa_prefill_fp32_gemm(cublasHandle_t handle,
-    const float* query, const void* key, const void* value, float* scores,
-    float* output, const float* mask, float* key_fp32, float* value_fp32,
-    const SdpaGemmPrefillParams& p, cudaStream_t stream, float** pointer_workspace,bool ordered_pv) {
-    if (!handle || !query || !key || !value || !scores || !output || !key_fp32 || !value_fp32 ||
-        p.heads <= 0 || p.heads > 65535 || p.kv_heads <= 0 || p.heads % p.kv_heads ||
-        p.queries <= 1 || p.keys < p.queries || p.keys > INT32_MAX - 255 || p.capacity < p.keys || p.past < 0 ||
-        p.past > p.keys - p.queries || (p.dimension != 128 && p.dimension != 256) ||
-        p.query_position_stride < static_cast<size_t>(p.dimension) || p.query_position_stride > INT32_MAX ||
-        p.output_position_stride < static_cast<size_t>(p.dimension) || p.output_position_stride > INT32_MAX ||
-        p.query_head_stride < static_cast<size_t>(p.dimension) || p.output_head_stride < static_cast<size_t>(p.dimension) ||
-        static_cast<size_t>(p.queries) > SIZE_MAX / static_cast<size_t>(p.keys) / p.heads / sizeof(float) ||
-        p.query_head_stride > SIZE_MAX / p.heads / 8 || p.output_head_stride > SIZE_MAX / p.heads / 8 ||
-        p.query_position_stride > SIZE_MAX / p.queries / 8 || p.output_position_stride > SIZE_MAX / p.queries / 8 ||
-        (mask && (p.mask_column_stride > SIZE_MAX / p.keys / 8 || p.mask_row_stride > SIZE_MAX / p.queries / 8)))
-        return CUBLAS_STATUS_INVALID_VALUE;
-    if (pointer_workspace && reinterpret_cast<uintptr_t>(pointer_workspace) % alignof(float*))
-        return CUBLAS_STATUS_INVALID_VALUE;
-    cudaStream_t handle_stream;
-    auto status = cublasGetStream(handle, &handle_stream);
-    if (status != CUBLAS_STATUS_SUCCESS) return status;
-    if (handle_stream != stream) return CUBLAS_STATUS_INVALID_VALUE;
-    cublasPointerMode_t pointer_mode;
-    status = cublasGetPointerMode(handle, &pointer_mode);
-    if (status != CUBLAS_STATUS_SUCCESS) return status;
-    if (pointer_mode != CUBLAS_POINTER_MODE_HOST) return CUBLAS_STATUS_INVALID_VALUE;
-    const size_t kv_count = static_cast<size_t>(p.kv_heads) * p.keys * p.dimension;
-    if ((kv_count + 255) / 256 > INT32_MAX) return CUBLAS_STATUS_INVALID_VALUE;
-    sdpa_expand_fp16_cache_cuda<<<static_cast<unsigned>((kv_count + 255) / 256),256,0,stream>>>(
-        static_cast<const __half*>(key), static_cast<const __half*>(value), key_fp32, value_fp32,
-        kv_count, p.keys, p.capacity, p.dimension);
-    if (cudaGetLastError() != cudaSuccess) return CUBLAS_STATUS_EXECUTION_FAILED;
-    const float one = 1.f, zero = 0.f;
-    if (pointer_workspace) {
-        sdpa_gemm_bind_heads_cuda<<<(p.heads+127)/128,128,0,stream>>>(pointer_workspace,query,key_fp32,value_fp32,scores,output,p);
-        if (cudaGetLastError() != cudaSuccess) return CUBLAS_STATUS_EXECUTION_FAILED;
-        status = cublasGemmBatchedEx(handle,CUBLAS_OP_T,CUBLAS_OP_N,p.keys,p.queries,p.dimension,
-            &one,reinterpret_cast<const void* const*>(pointer_workspace),CUDA_R_32F,p.dimension,
-            reinterpret_cast<const void* const*>(pointer_workspace+p.heads),CUDA_R_32F,static_cast<int>(p.query_position_stride),
-            &zero,reinterpret_cast<void* const*>(pointer_workspace+2*p.heads),CUDA_R_32F,p.keys,p.heads,
-            CUBLAS_COMPUTE_32F_PEDANTIC,CUBLAS_GEMM_DEFAULT);
-        if (status != CUBLAS_STATUS_SUCCESS) return status;
-    } else for (int head = 0; head < p.heads; ++head) {
-        const int kv_head = head / (p.heads / p.kv_heads);
-        status = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, p.keys, p.queries, p.dimension,
-            &one, key_fp32 + static_cast<size_t>(kv_head) * p.keys * p.dimension, CUDA_R_32F, p.dimension,
-            query + static_cast<size_t>(head) * p.query_head_stride, CUDA_R_32F, static_cast<int>(p.query_position_stride),
-            &zero, scores + static_cast<size_t>(head) * p.queries * p.keys, CUDA_R_32F, p.keys,
-            CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
-        if (status != CUBLAS_STATUS_SUCCESS) return status;
-    }
-    sdpa_gemm_softmax_cuda<<<dim3(p.queries,p.heads),256,0,stream>>>(scores,mask,
-        p.queries,p.keys,p.past,p.causal,p.scale,p.mask_column_stride,p.mask_row_stride);
-    if (cudaGetLastError() != cudaSuccess) return CUBLAS_STATUS_EXECUTION_FAILED;
-    if(ordered_pv) {
-        sdpa_gemm_ordered_pv_cuda<<<dim3(p.queries,p.heads),256,0,stream>>>(scores,value_fp32,output,p);
-        return cudaGetLastError()==cudaSuccess?CUBLAS_STATUS_SUCCESS:CUBLAS_STATUS_EXECUTION_FAILED;
-    }
-    if (pointer_workspace) {
-        status = cublasGemmBatchedEx(handle,CUBLAS_OP_N,CUBLAS_OP_N,p.dimension,p.queries,p.keys,
-            &one,reinterpret_cast<const void* const*>(pointer_workspace+3*p.heads),CUDA_R_32F,p.dimension,
-            reinterpret_cast<const void* const*>(pointer_workspace+2*p.heads),CUDA_R_32F,p.keys,
-            &zero,reinterpret_cast<void* const*>(pointer_workspace+4*p.heads),CUDA_R_32F,static_cast<int>(p.output_position_stride),p.heads,
-            CUBLAS_COMPUTE_32F_PEDANTIC,CUBLAS_GEMM_DEFAULT);
-        if (status != CUBLAS_STATUS_SUCCESS) return status;
-    } else for (int head = 0; head < p.heads; ++head) {
-        const int kv_head = head / (p.heads / p.kv_heads);
-        status = cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, p.dimension, p.queries, p.keys,
-            &one, value_fp32 + static_cast<size_t>(kv_head) * p.keys * p.dimension, CUDA_R_32F, p.dimension,
-            scores + static_cast<size_t>(head) * p.queries * p.keys, CUDA_R_32F, p.keys,
-            &zero, output + static_cast<size_t>(head) * p.output_head_stride, CUDA_R_32F, static_cast<int>(p.output_position_stride),
-            CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT);
-        if (status != CUBLAS_STATUS_SUCCESS) return status;
-    }
-    return CUBLAS_STATUS_SUCCESS;
 }
 
 void launch_rope(

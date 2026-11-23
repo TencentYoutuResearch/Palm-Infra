@@ -641,141 +641,11 @@ __global__ void quantize_nvfp4_jobs_vector_cuda(const mollm_cuda::Nvfp4Projectio
 #endif
 }
 
-// Diagnostic only: cache raw per-token maxima, not expert-dependent FP4
-// bytes/scales. The original scalar quantizer and inference dispatch stay
-// unchanged. Recompute on every invocation, including captured replays.
-__global__ void nvfp4_input_block_maxima_cuda(const float* input, float* maxima,
-    int rows, int inner) {
-    const int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ordinal >= rows * (inner / 16)) return;
-    float maximum = 0.f;
-    for (int i = 0; i < 16; ++i)
-        maximum = fmaxf(maximum, fabsf(input[size_t(ordinal) * 16 + i]));
-    maxima[ordinal] = maximum;
-}
-
-__global__ void quantize_nvfp4_jobs_cached_max_cuda(const mollm_cuda::Nvfp4Projection* jobs,
-    int count, int inner, int variants, uint8_t* packed, uint8_t* scales,
-    const mollm_cuda::Nvfp4MmaBatch* batches, int minimum, const float* input,
-    int input_rows, const float* maxima) {
-#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
-    const int ordinal = blockIdx.x * blockDim.x + threadIdx.x;
-    const int groups = inner / 16, flat_job = ordinal / groups;
-    if (flat_job >= count * variants) return;
-    if (batches && batches[flat_job % count].size < minimum) return;
-    const int group = ordinal % groups;
-    const auto job = jobs[flat_job % count];
-    const uintptr_t base = reinterpret_cast<uintptr_t>(input);
-    const uintptr_t address = reinterpret_cast<uintptr_t>(job.input);
-    const unsigned row_bytes = unsigned(inner) * sizeof(float);
-    const uintptr_t delta = address - base;
-    float maximum = 0.f;
-    // The host bounds guarantee a matrix extent below 2^30 bytes. Check the
-    // full-width address range before narrowing, avoiding per-block uint64
-    // division without accepting wrapped/out-of-matrix descriptor pointers.
-    const bool in_matrix = address >= base && delta < size_t(input_rows) * row_bytes;
-    const unsigned offset = in_matrix ? unsigned(delta) : 0;
-    if (in_matrix && offset % row_bytes == 0)
-        maximum = maxima[size_t(offset / row_bytes) * groups + group];
-    else {
-        // Valid descriptors outside the advertised matrix, or shifted views,
-        // must keep the original scalar computation rather than use stale or
-        // unrelated statistics. Descriptor input validity remains caller-owned.
-        for (int i = 0; i < 16; ++i)
-            maximum = fmaxf(maximum, fabsf(job.input[group * 16 + i]));
-    }
-    const float global = flat_job >= count ? job.input_global_second : job.input_global;
-    const uint8_t code = __nv_cvt_float_to_fp8(__fdiv_rn(maximum, global * 6.f), __NV_SATFINITE, __NV_E4M3);
-    scales[size_t(flat_job) * groups + group] = code;
-    const float scale = __half2float(static_cast<__half>(__nv_cvt_fp8_to_halfraw(code, __NV_E4M3)));
-    const float inverse = scale > 0 ? __fdiv_rn(1.f, scale * global) : 0;
-    for (int i = 0; i < 8; ++i) {
-        const int offset = group * 16 + i * 2;
-        packed[size_t(flat_job) * (inner / 2) + group * 8 + i] = __nv_cvt_float2_to_fp4x2(
-            make_float2(job.input[offset] * inverse, job.input[offset + 1] * inverse), __NV_E2M1, cudaRoundNearest);
-    }
-#else
-    asm volatile("trap;");
-#endif
-}
-
 __device__ bool same_nvfp4_expert(const mollm_cuda::Nvfp4Projection& a,
     const mollm_cuda::Nvfp4Projection& b) {
     return a.weight == b.weight && a.block_scales == b.block_scales &&
         a.row_scales == b.row_scales && a.pair_layout == b.pair_layout &&
         a.mma_layout == b.mma_layout;
-}
-
-// Gate/up globals differ, but their input-block maxima are identical.
-// Preserve the scalar max order and quantize each variant independently.
-__global__ void quantize_nvfp4_jobs_dual_cuda(const mollm_cuda::Nvfp4Projection* jobs,
-    int count,int inner,int variants,uint8_t* packed,uint8_t* scales,
-    const mollm_cuda::Nvfp4MmaBatch* batches,int minimum) {
-#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
-    const int ordinal=blockIdx.x*blockDim.x+threadIdx.x;
-    const int groups=inner/16,job_index=ordinal/groups;
-    if(job_index>=count || (batches && batches[job_index].size<minimum))return;
-    const int group=ordinal%groups;
-    const auto job=jobs[job_index];
-    float maximum=0.f;
-    for(int i=0;i<16;++i)maximum=fmaxf(maximum,fabsf(job.input[group*16+i]));
-    for(int variant=0;variant<variants;++variant) {
-        const int flat_job=job_index+variant*count;
-        const float global=variant?job.input_global_second:job.input_global;
-        const uint8_t code=__nv_cvt_float_to_fp8(__fdiv_rn(maximum,global*6.f),__NV_SATFINITE,__NV_E4M3);
-        scales[size_t(flat_job)*groups+group]=code;
-        const float scale=__half2float(static_cast<__half>(__nv_cvt_fp8_to_halfraw(code,__NV_E4M3)));
-        const float inverse=scale>0?__fdiv_rn(1.f,scale*global):0.f;
-        for(int i=0;i<8;++i) {
-            const int offset=group*16+i*2;
-            packed[size_t(flat_job)*(inner/2)+group*8+i]=__nv_cvt_float2_to_fp4x2(
-                make_float2(job.input[offset]*inverse,job.input[offset+1]*inverse),__NV_E2M1,cudaRoundNearest);
-        }
-    }
-#else
-    asm volatile("trap;");
-#endif
-}
-
-template<int Lanes = 16>
-__global__ void quantize_nvfp4_jobs_subgroup_cuda(const mollm_cuda::Nvfp4Projection* jobs,
-    int count, int inner, int variants, uint8_t* packed, uint8_t* scales,
-    const mollm_cuda::Nvfp4MmaBatch* batches, int minimum) {
-#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
-    const int ordinal = (size_t(blockIdx.x)*blockDim.x + threadIdx.x)/Lanes;
-    const int groups = inner/16, flat_job = ordinal/groups;
-    if (flat_job >= count*variants) return;
-    if (batches && batches[flat_job%count].size < minimum) return;
-    const int group = ordinal%groups, lane = threadIdx.x%Lanes;
-    const auto job = jobs[flat_job%count];
-    const float value = job.input[group*16+lane*(16/Lanes)];
-    float second = 0.f;
-    float maximum = fmaxf(0.f,fabsf(value));
-    if constexpr (Lanes==8) {second=job.input[group*16+lane*2+1];maximum=fmaxf(maximum,fabsf(second));}
-    const unsigned mask = __activemask();
-#pragma unroll
-    for (int offset=Lanes/2;offset;offset/=2)
-        maximum = fmaxf(maximum,__shfl_down_sync(mask,maximum,offset,Lanes));
-    float inverse = 0.f;
-    if (lane==0) {
-        const float global = flat_job>=count ? job.input_global_second : job.input_global;
-        const uint8_t code = __nv_cvt_float_to_fp8(__fdiv_rn(maximum,global*6.f),__NV_SATFINITE,__NV_E4M3);
-        scales[size_t(flat_job)*groups+group] = code;
-        const float scale = __half2float(static_cast<__half>(__nv_cvt_fp8_to_halfraw(code,__NV_E4M3)));
-        inverse = scale>0 ? __fdiv_rn(1.f,scale*global) : 0.f;
-    }
-    inverse = __shfl_sync(mask,inverse,0,Lanes);
-    if constexpr (Lanes==8)
-        packed[size_t(flat_job)*(inner/2)+group*8+lane] = __nv_cvt_float2_to_fp4x2(
-            make_float2(value*inverse,second*inverse),__NV_E2M1,cudaRoundNearest);
-    else {
-        const float next = __shfl_down_sync(mask,value,1,16);
-        if (!(lane&1)) packed[size_t(flat_job)*(inner/2)+group*8+lane/2] = __nv_cvt_float2_to_fp4x2(
-            make_float2(value*inverse,next*inverse),__NV_E2M1,cudaRoundNearest);
-    }
-#else
-    asm volatile("trap;");
-#endif
 }
 
 // Diagnostic prefill MMA + activation/quantization dataflow fusion.
@@ -1250,7 +1120,6 @@ __global__ void moe_combine_cuda(
     return __uint_as_float(bits | ((code & 8) << 28));
 }
 
-
 __device__ float e4m3_scale(uint8_t code) {
 #if CUDART_VERSION >= 11080 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return __half2float(static_cast<__half>(__nv_cvt_fp8_to_halfraw(code, __NV_E4M3)));
@@ -1275,12 +1144,6 @@ __device__ __forceinline__ float direct_e4m3_scale(uint8_t code) {
         ? __float_as_uint(static_cast<float>(magnitude) * (1.f / 512.f))
         : (magnitude << 20) + (120u << 23);
     return __uint_as_float(bits | sign);
-}
-
-__global__ void nvfp4_scale_decode_check_cuda(uint32_t* hardware, uint32_t* direct) {
-    const unsigned code = threadIdx.x;
-    hardware[code] = __float_as_uint(e4m3_scale(static_cast<uint8_t>(code)));
-    direct[code] = __float_as_uint(direct_e4m3_scale(static_cast<uint8_t>(code)));
 }
 
 __device__ float2 e2m1_pair(uint8_t packed) {
@@ -1530,24 +1393,6 @@ __global__ void group_nvfp4_jobs_cuda(
     }
 }
 
-__global__ void nvfp4_pair_plan_cuda(const mollm_cuda::Nvfp4Projection* jobs,
-    mollm_cuda::Nvfp4MmaBatch* plan, int count) {
-    if (threadIdx.x || blockIdx.x) return;
-    int pairs = 0, singles = 0;
-    for (int i = 0; i < count;) {
-        const auto job = jobs[i];
-        const bool paired = i + 1 < count && jobs[i + 1].weight == job.weight &&
-            jobs[i + 1].block_scales == job.block_scales && jobs[i + 1].pair_layout == job.pair_layout;
-        if (paired) {
-            plan[pairs++] = {i, 2};
-            i += 2;
-        } else {
-            plan[count - 1 - singles++] = {i++, 1};
-        }
-    }
-    plan[count] = {pairs, singles};
-}
-
 struct Nvfp4SimtPacket {
     uint16_t packed;
     uint8_t scale;
@@ -1643,34 +1488,6 @@ __device__ __forceinline__ Nvfp4SimtPacket nvfp4_simt_packet(
     return result;
 }
 
-template<int Rows>
-__global__ void nvfp4_route_sum_cuda(const mollm_cuda::Nvfp4Projection* jobs,
-    int rows, int inner, int count, float* output) {
-    const int warp=threadIdx.x/32, local_row=warp%Rows;
-    const int row=blockIdx.x*Rows+local_row, route=warp/Rows, lane=threadIdx.x&31;
-    const auto job=jobs[route];
-    auto pending=row<rows?nvfp4_simt_packet<true>(job,row,inner,lane):Nvfp4SimtPacket{};
-    float sum=0.0f;
-    for(int quad=lane;quad<inner/4;quad+=32) {
-        const auto next=row<rows?nvfp4_simt_packet<true>(job,row,inner,quad+32):Nvfp4SimtPacket{};
-        const float scale=e4m3_scale(pending.scale);
-        const float2 w0=e2m1_pair(pending.packed&255),w1=e2m1_pair(pending.packed>>8);
-        const float4 a=pending.input;
-        float dot=a.x*w0.x;
-        dot=fmaf(a.y,w0.y,dot);dot=fmaf(a.z,w1.x,dot);dot=fmaf(a.w,w1.y,dot);
-        sum=fmaf(dot,scale,sum);pending=next;
-    }
-    for(int offset=16;offset;offset/=2)sum+=__shfl_down_sync(0xffffffffu,sum,offset);
-    __shared__ float values[Rows][16];
-    if(!lane)values[local_row][route]=row<rows?bf16(sum*job.row_scales[row]):0.f;
-    __syncthreads();
-    if(threadIdx.x<Rows && blockIdx.x*Rows+threadIdx.x<rows) {
-        float total=0.0f;
-        for(int i=0;i<count;++i)total+=values[threadIdx.x][i];
-        output[blockIdx.x*Rows+threadIdx.x]=total;
-    }
-}
-
 template<int Lanes, bool TailGuard = false>
 __global__ void nvfp4_exact_subwarp_cuda(const mollm_cuda::Nvfp4Projection* jobs,int rows,int inner) {
     constexpr int chains=32/Lanes;
@@ -1703,88 +1520,6 @@ __global__ void nvfp4_exact_subwarp_cuda(const mollm_cuda::Nvfp4Projection* jobs
     else sum=(sums[0]+sums[2])+(sums[1]+sums[3]);
     for(int offset=Lanes/2;offset;offset/=2)sum+=__shfl_down_sync(0xffffffffu,sum,offset,Lanes);
     if(!lane && row<rows)job.output[row]=sum*job.row_scales[row];
-}
-
-template<int RowGroup>
-__global__ void nvfp4_row_reuse_cuda(const mollm_cuda::Nvfp4Projection* jobs,
-    int rows, int inner) {
-    const int base = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * RowGroup;
-    if (base >= rows) return;
-    const int lane = threadIdx.x % 32;
-    const auto job = jobs[blockIdx.y];
-    float sums[RowGroup]{};
-    Nvfp4SimtPacket pending[RowGroup]{};
-#pragma unroll
-    for (int r=0;r<RowGroup;++r) if(base+r<rows) {
-        if(r==0) pending[r]=nvfp4_simt_packet<true>(job,base+r,inner,lane);
-        else pending[r]=nvfp4_simt_packet<false>(job,base+r,inner,lane);
-    }
-    for(int quad=lane;quad<inner/4;quad+=32) {
-        Nvfp4SimtPacket incoming[RowGroup]{};
-#pragma unroll
-        for(int r=0;r<RowGroup;++r) if(base+r<rows) {
-            if(r==0) incoming[r]=nvfp4_simt_packet<true>(job,base+r,inner,quad+32);
-            else incoming[r]=nvfp4_simt_packet<false>(job,base+r,inner,quad+32);
-        }
-        const float4 a=pending[0].input;
-#pragma unroll
-        for(int r=0;r<RowGroup;++r) if(base+r<rows) {
-            const float2 low=e2m1_pair(pending[r].packed&255);
-            const float2 high=e2m1_pair(pending[r].packed>>8);
-            float dot=a.x*low.x;
-            dot=fmaf(a.y,low.y,dot); dot=fmaf(a.z,high.x,dot); dot=fmaf(a.w,high.y,dot);
-            sums[r]=fmaf(dot,e4m3_scale(pending[r].scale),sums[r]);
-        }
-#pragma unroll
-        for(int r=0;r<RowGroup;++r) pending[r]=incoming[r];
-    }
-#pragma unroll
-    for(int r=0;r<RowGroup;++r) if(base+r<rows) {
-        for(int offset=16;offset;offset>>=1)
-            sums[r]+=__shfl_down_sync(0xffffffffu,sums[r],offset);
-        if(!lane)job.output[base+r]=sums[r]*job.row_scales[base+r];
-    }
-}
-
-// Gate and up retain independent lane accumulators and the original warp tree.
-// A shared input packet removes intermediate writes without changing precision.
-template<int LoadHint = 0>
-__global__ void nvfp4_gate_activation_cuda(const mollm_cuda::Nvfp4Projection* jobs,
-    int width, int inner, const float* route_weights, float* activated) {
-    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    if (row >= width) return;
-    const int lane = threadIdx.x % 32;
-    const auto job = jobs[blockIdx.y];
-    auto gate = nvfp4_simt_packet<true,false,LoadHint>(job, row, inner, lane);
-    auto up = nvfp4_simt_packet<false,false,LoadHint>(job, row + width, inner, lane);
-    float gate_sum = 0, up_sum = 0;
-    for (int quad = lane; quad < inner / 4; quad += 32) {
-        const auto next_gate = nvfp4_simt_packet<true,false,LoadHint>(job, row, inner, quad + 32);
-        const auto next_up = nvfp4_simt_packet<false,false,LoadHint>(job, row + width, inner, quad + 32);
-        const auto accumulate = [](const Nvfp4SimtPacket& packet, const float4& input, float sum) {
-            const float2 low = e2m1_pair(packet.packed & 255);
-            const float2 high = e2m1_pair(packet.packed >> 8);
-            float dot = input.x * low.x;
-            dot = fmaf(input.y, low.y, dot);
-            dot = fmaf(input.z, high.x, dot);
-            dot = fmaf(input.w, high.y, dot);
-            return fmaf(dot, e4m3_scale(packet.scale), sum);
-        };
-        gate_sum = accumulate(gate, gate.input, gate_sum);
-        up_sum = accumulate(up, gate.input, up_sum);
-        gate = next_gate; up = next_up;
-    }
-    for (int distance = 16; distance; distance >>= 1) {
-        gate_sum += __shfl_down_sync(0xffffffffu, gate_sum, distance);
-        up_sum += __shfl_down_sync(0xffffffffu, up_sum, distance);
-    }
-    if (!lane) {
-        const float g = bf16(gate_sum * job.row_scales[row]);
-        const float u = bf16(up_sum * job.row_scales[row + width]);
-        const float value = (g * (1.f / (1.f + expf(-g)))) * u;
-        activated[static_cast<size_t>(blockIdx.y) * width + row] =
-            bf16(value * (route_weights ? route_weights[blockIdx.y] : 1.f));
-    }
 }
 
 template<int PrefetchIterations = 0, bool NativeMmaLayout = false, bool PairedJobs = false,
@@ -2334,13 +2069,6 @@ cudaError_t launch_nvfp4_gate_scale_view(const Nvfp4Projection* source,
     return cudaGetLastError();
 }
 
-cudaError_t launch_nvfp4_scale_decode_check(uint32_t* hardware, uint32_t* direct,
-    cudaStream_t stream) {
-    if (!hardware || !direct) return cudaErrorInvalidValue;
-    nvfp4_scale_decode_check_cuda<<<1,256,0,stream>>>(hardware,direct);
-    return cudaGetLastError();
-}
-
 cudaError_t launch_fp16_expert_projections(const Nvfp4Projection* jobs,
     int count, int rows, int inner, cudaStream_t stream) {
     if (count < 0 || rows <= 0 || rows > INT32_MAX - 7 || inner <= 0 || count > 65535 ||
@@ -2406,17 +2134,6 @@ cudaError_t launch_nvfp4_mma_projections(const Nvfp4Projection* jobs, int count,
     if (parts > 1) combine_nvfp4_native_parts_cuda<<<
         (static_cast<size_t>(rows) * count + 255) / 256, 256, 0, stream>>>(
         jobs, partial, rows, count, parts, split_row);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_mma_batched8(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, int split_row, cudaStream_t stream) {
-    if (!jobs || count <= 0 || count % 8 || count / 8 > 65535 ||
-        rows <= 0 || rows > 2147483584 || rows % 16 || inner <= 0 ||
-        inner > 2560 || inner % 64 || split_row < 0 || split_row >= rows || split_row % 64)
-        return cudaErrorInvalidValue;
-    nvfp4_native_batched8_mma_cuda<<<dim3((rows + 63) / 64, count / 8), 128, 0, stream>>>(
-        jobs, rows, inner, split_row, nullptr);
     return cudaGetLastError();
 }
 
@@ -2897,74 +2614,6 @@ cudaError_t launch_nvfp4_exact_subwarp(const Nvfp4Projection* jobs,int count,int
     return cudaGetLastError();
 }
 
-cudaError_t launch_nvfp4_ranked_pairs(const Nvfp4Projection* jobs, int count,
-    const Nvfp4MmaBatch* pair_ranks, int rows, int inner, cudaStream_t stream) {
-    if(count<0||count>4096||rows<=0||rows>INT32_MAX-3||inner<=0||inner>INT32_MAX-128||inner%16||
-        (count&&(!jobs||!pair_ranks)))return cudaErrorInvalidValue;
-    if(!count)return cudaSuccess;
-    nvfp4_projections_cuda<0,false,true,0,2,1,false,false,0,false,true,true><<<
-        dim3((rows+3)/4,count),128,0,stream>>>(jobs,rows,inner,count,pair_ranks);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_inline_pairs(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, cudaStream_t stream) {
-    if (count < 0 || count > 4096 || rows <= 0 || rows > INT32_MAX-3 ||
-        inner <= 0 || inner > INT32_MAX-128 || inner % 16 || (count && !jobs)) return cudaErrorInvalidValue;
-    if (!count) return cudaSuccess;
-    nvfp4_projections_cuda<0,false,true,0,2,1,false,false,0,false,true><<<
-        dim3((rows+3)/4,count),128,0,stream>>>(jobs,rows,inner,count);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_row_reuse(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, int row_group, cudaStream_t stream) {
-    if(count<0||count>65535||rows<=0||rows>INT32_MAX-16||inner<=0||
-        inner>INT32_MAX-128||inner%16||(count&&!jobs)||(row_group!=2&&row_group!=4))
-        return cudaErrorInvalidValue;
-    if(!count)return cudaSuccess;
-    const dim3 grid((rows+4*row_group-1)/(4*row_group),count);
-    if(row_group==2)nvfp4_row_reuse_cuda<2><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else nvfp4_row_reuse_cuda<4><<<grid,128,0,stream>>>(jobs,rows,inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_gate_activation(const Nvfp4Projection* jobs, int count,
-    int width, int inner, const float* route_weights, float* activated, cudaStream_t stream, int warps, int load_hint) {
-    if (count < 0 || count > 65535 || width <= 0 || width > INT32_MAX / 2 - 4 ||
-        width % 4 || inner <= 0 || inner > INT32_MAX - 128 || inner % 16 ||
-        (count && (!jobs || !activated)) || (warps != 2 && warps != 4 && warps != 8) ||
-        (load_hint != 0 && load_hint != 3)) return cudaErrorInvalidValue;
-    if (!count) return cudaSuccess;
-    if (load_hint == 3)
-        nvfp4_gate_activation_cuda<3><<<dim3((width + warps - 1) / warps, count),warps*32,0,stream>>>(
-            jobs,width,inner,route_weights,activated);
-    else
-        nvfp4_gate_activation_cuda<0><<<dim3((width + warps - 1) / warps, count),warps*32,0,stream>>>(
-            jobs,width,inner,route_weights,activated);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_route_sum(const Nvfp4Projection* jobs,int count,int rows,
-    int inner,float* output,cudaStream_t stream,int rows_per_cta) {
-    if(!jobs||!output||count<1||count>16||rows<=0||rows>INT32_MAX-1||inner<=0||inner>INT32_MAX-128||inner%16||
-        (rows_per_cta!=1 && rows_per_cta!=2))
-        return cudaErrorInvalidValue;
-    if(rows_per_cta==2)nvfp4_route_sum_cuda<2><<<(rows+1)/2,count*64,0,stream>>>(jobs,rows,inner,count,output);
-    else nvfp4_route_sum_cuda<1><<<rows,count*32,0,stream>>>(jobs,rows,inner,count,output);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_tiled_scale_projections(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, cudaStream_t stream) {
-    if (count < 0 || count > 65535 || rows <= 0 || rows > INT32_MAX - 3 || rows % 4 ||
-        inner <= 0 || inner > INT32_MAX - 128 || inner % 16 || (count && !jobs)) return cudaErrorInvalidValue;
-    if (!count) return cudaSuccess;
-    nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,0,false,false,false,false,false,false,true>
-        <<<dim3(rows/4,count),128,0,stream>>>(jobs,rows,inner);
-    return cudaGetLastError();
-}
-
 cudaError_t launch_nvfp4_gate_code_projections(const Nvfp4Projection* jobs,
     int count, int rows, int inner, bool pipeline_inputs, cudaStream_t stream) {
     if (!jobs || count < 1 || count > 65535 || rows != 1280 || inner != 2560 ||
@@ -3095,101 +2744,6 @@ cudaError_t launch_nvfp4_pipelined_projections(const Nvfp4Projection* jobs, int 
     return cudaGetLastError();
 }
 
-cudaError_t launch_nvfp4_native_pipelined_projections(const Nvfp4Projection* jobs,
-    int count, int rows, int inner, cudaStream_t stream) {
-    if (count < 0 || count > 65535 || rows <= 0 || rows > INT32_MAX - 3 ||
-        inner <= 0 || inner > INT32_MAX - 128 || inner % 64 || (count && !jobs))
-        return cudaErrorInvalidValue;
-    if (!count) return cudaSuccess;
-    nvfp4_projections_cuda<0, true, false, 0, 2><<<dim3((rows + 3) / 4, count),128,0,stream>>>(jobs,rows,inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_interleaved_projections(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, cudaStream_t stream) {
-    if (count < 0 || count > 65535 || rows <= 0 || rows > INT32_MAX - 3 ||
-        inner <= 0 || inner > INT32_MAX - 128 || inner % 16 || (count && !jobs))
-        return cudaErrorInvalidValue;
-    if (!count) return cudaSuccess;
-    nvfp4_projections_cuda<0, false, false, 0, 2, 1, true><<<
-        dim3((rows + 3) / 4, count), 128, 0, stream>>>(jobs, rows, inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_cta_projections(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, int warps, cudaStream_t stream) {
-    if (count < 0 || count > 65535 || rows <= 0 || rows > INT32_MAX - 16 ||
-        inner <= 0 || inner > INT32_MAX - 128 || inner % 16 || (count && !jobs) ||
-        (warps != 1 && warps != 2 && warps != 4 && warps != 8 && warps != 16))
-        return cudaErrorInvalidValue;
-    if (!count) return cudaSuccess;
-    nvfp4_projections_cuda<0, false, false, 0, 2><<<
-        dim3((rows + warps - 1) / warps, count), warps * 32, 0, stream>>>(jobs, rows, inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_deep_pipelined_projections(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, int depth, cudaStream_t stream) {
-    if (count < 0 || count > 65535 || rows <= 0 || rows > INT32_MAX - 3 ||
-        inner <= 0 || inner > INT32_MAX - 512 || inner % 16 || (count && !jobs) ||
-        (depth != 2 && depth != 4)) return cudaErrorInvalidValue;
-    if (!count) return cudaSuccess;
-    const dim3 grid((rows + 3) / 4, count);
-    if (depth == 2)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 2><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else
-        nvfp4_projections_cuda<0, false, false, 0, 2, 4><<<grid,128,0,stream>>>(jobs,rows,inner);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_paired_projections(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, cudaStream_t stream, bool mma_layout) {
-    if (count < 0 || count > 65535 || rows <= 0 || rows > INT32_MAX - 3 ||
-        inner <= 0 || inner % (mma_layout ? 64 : 16) || (count && !jobs))
-        return cudaErrorInvalidValue;
-    if (!count) return cudaSuccess;
-    const dim3 grid((rows + 3) / 4, (count + 1) / 2);
-    if (mma_layout)
-        nvfp4_projections_cuda<0, true, true><<<grid, 128, 0, stream>>>(jobs, rows, inner, count);
-    else
-        nvfp4_projections_cuda<0, false, true><<<grid, 128, 0, stream>>>(jobs, rows, inner, count);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_grouped_pairs(const Nvfp4Projection* jobs, int count,
-    Nvfp4MmaBatch* plan, int rows, int inner, cudaStream_t stream, bool mma_layout) {
-    if (count < 0 || count > 4096 || rows <= 0 || rows > INT32_MAX - 3 ||
-        inner <= 0 || inner % (mma_layout ? 64 : 16) || (count && (!jobs || !plan)))
-        return cudaErrorInvalidValue;
-    if (!count) return cudaSuccess;
-    nvfp4_pair_plan_cuda<<<1, 32, 0, stream>>>(jobs, plan, count);
-    cudaError_t status = cudaGetLastError();
-    if (status != cudaSuccess) return status;
-    const dim3 pair_grid((rows + 3) / 4, (count + 1) / 2);
-    const dim3 grid((rows + 3) / 4, count);
-    if (mma_layout)
-        nvfp4_projections_cuda<0, true, true, 2><<<pair_grid, 128, 0, stream>>>(jobs, rows, inner, count, plan);
-    else
-        nvfp4_projections_cuda<0, false, true, 2><<<pair_grid, 128, 0, stream>>>(jobs, rows, inner, count, plan);
-    status = cudaGetLastError();
-    if (status != cudaSuccess) return status;
-    if (mma_layout)
-        nvfp4_projections_cuda<0, true, false, 1><<<grid, 128, 0, stream>>>(jobs, rows, inner, count, plan);
-    else
-        nvfp4_projections_cuda<0, false, false, 1><<<grid, 128, 0, stream>>>(jobs, rows, inner, count, plan);
-    return cudaGetLastError();
-}
-
-void launch_nvfp4_prefetch_projections(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, int iterations, cudaStream_t stream) {
-    const dim3 grid((rows + 3) / 4, count);
-    switch (iterations) {
-    case 1: nvfp4_projections_cuda<1><<<grid, 128, 0, stream>>>(jobs, rows, inner); break;
-    case 2: nvfp4_projections_cuda<2><<<grid, 128, 0, stream>>>(jobs, rows, inner); break;
-    case 4: nvfp4_projections_cuda<4><<<grid, 128, 0, stream>>>(jobs, rows, inner); break;
-    }
-}
-
 void launch_moe_activation(const float* gate, const float* up,
                             const float* route_weights, float* output,
                             int rows, int width, int stride, cudaStream_t stream) {
@@ -3256,44 +2810,5 @@ cudaError_t launch_moe_combine_bf16(const uint16_t* routed,const float* shared,
         reinterpret_cast<const float*>(routed),shared,shared_gate,output,count,hidden,top_k);
     return cudaGetLastError();
 }
-
-cudaError_t launch_nvfp4_quantize_probe(const Nvfp4Projection* jobs,int count,int inner,
-    int variants,uint8_t* packed,uint8_t* scales,const Nvfp4MmaBatch* batches,
-    int minimum,int mode,cudaStream_t stream) {
-    if (!jobs || !packed || !scales || count<=0 || count>65535 || inner<=0 ||
-        inner>2560 || inner%16 || (variants!=1 && variants!=2) || minimum<1 || minimum>8 || mode<0 || mode>4)
-        return cudaErrorInvalidValue;
-    const int groups = count*variants*(inner/16);
-    if(mode==4)quantize_nvfp4_jobs_vector_cuda<<<(groups+127)/128,128,0,stream>>>(
-        jobs,count,inner,variants,packed,scales,batches,minimum);
-    else if (mode==3) quantize_nvfp4_jobs_dual_cuda<<<(count*(inner/16)+127)/128,128,0,stream>>>(
-        jobs,count,inner,variants,packed,scales,batches,minimum);
-    else if (mode==2) quantize_nvfp4_jobs_subgroup_cuda<8><<<(groups+15)/16,128,0,stream>>>(
-        jobs,count,inner,variants,packed,scales,batches,minimum);
-    else if (mode==1) quantize_nvfp4_jobs_subgroup_cuda<16><<<(groups+7)/8,128,0,stream>>>(
-        jobs,count,inner,variants,packed,scales,batches,minimum);
-    else quantize_nvfp4_jobs_cuda<<<(groups+127)/128,128,0,stream>>>(
-        jobs,count,inner,variants,packed,scales,batches,minimum);
-    return cudaGetLastError();
-}
-
-cudaError_t launch_nvfp4_quantize_cached_max_probe(const Nvfp4Projection* jobs,
-    int count, int inner, int variants, uint8_t* packed, uint8_t* scales,
-    const Nvfp4MmaBatch* batches, int minimum, const float* input,
-    int input_rows, float* maxima, cudaStream_t stream) {
-    if (!jobs || !packed || !scales || !input || !maxima || count <= 0 || count > 65535 ||
-        inner <= 0 || inner > 2560 || inner % 16 || (variants != 1 && variants != 2) ||
-        minimum < 1 || minimum > 8 || input_rows <= 0 || input_rows > 65535)
-        return cudaErrorInvalidValue;
-    const int groups = inner / 16;
-    nvfp4_input_block_maxima_cuda<<<(input_rows * groups + 127) / 128, 128, 0, stream>>>(
-        input, maxima, input_rows, inner);
-    const auto status = cudaGetLastError();
-    if (status != cudaSuccess) return status;
-    quantize_nvfp4_jobs_cached_max_cuda<<<(count * variants * groups + 127) / 128, 128, 0, stream>>>(
-        jobs, count, inner, variants, packed, scales, batches, minimum, input, input_rows, maxima);
-    return cudaGetLastError();
-}
-
 
 }  // namespace mollm_cuda

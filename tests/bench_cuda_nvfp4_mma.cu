@@ -49,14 +49,6 @@ struct Arena {
     ~Arena() { munlock(data, size); munmap(data, size); }
 };
 
-__global__ void route_sum_control(const float* projected,float* output,int rows,int routes) {
-    const int r=blockIdx.x*blockDim.x+threadIdx.x;
-    if(r>=rows)return;
-    float total=0.f;
-    for(int i=0;i<routes;++i)total+=__bfloat162float(__float2bfloat16_rn(projected[size_t(i)*rows+r]));
-    output[r]=total;
-}
-
 __device__ uint32_t bf16_pair(float x, float y) {
     const __nv_bfloat162_raw raw = __floats2bfloat162_rn(x, y);
     return uint32_t(raw.x) | (uint32_t(raw.y) << 16);
@@ -647,11 +639,6 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             }
         }
         for(int set=0;set<sets;++set) {
-        cudaGraph_t graph; cudaGraphExec_t executable;
-        check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-        check(mollm_cuda::launch_nvfp4_native_pipelined_projections(native_jobs.data()+set*experts, experts, rows, inner, cudaStreamPerThread));
-        check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
-        check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
         std::vector<float> reference(size_t(rows) * experts + 8), actual(reference.size());
         for (int replay = 0; replay < 4; ++replay) {
             for (int k = 0; k < inner; ++k) original[k] = (int((k * 13 + replay * 7) % 101) - 50) / 37.f;
@@ -667,23 +654,17 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             check(cudaStreamSynchronize(cudaStreamPerThread));
             check(cudaMemcpy(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
             if (std::memcmp(reference.data(), actual.data(), actual.size() * sizeof(float))) { std::fprintf(stderr, "native baseline mismatch\n"); std::exit(1); }
-            check(cudaMemset(output, 0x7f, reference.size() * sizeof(float)));
-            check(cudaGraphLaunch(executable, cudaStreamPerThread));
-            check(cudaStreamSynchronize(cudaStreamPerThread));
-            check(cudaMemcpy(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
-            if (std::memcmp(reference.data(), actual.data(), actual.size() * sizeof(float))) { std::fprintf(stderr, "native pipeline mismatch\n"); std::exit(1); }
             const auto* guard=reinterpret_cast<const uint8_t*>(actual.data()+size_t(rows)*experts);
             if(!std::all_of(guard,guard+32,[](uint8_t b){return b==0x7f;}))std::exit(1);
         }
-        check(cudaGraphExecDestroy(executable)); check(cudaGraphDestroy(graph));
         }
         std::printf("native_pipeline_exact rows=%d K=%d pair=%d device=%d replays=%d full_bytes_guards=true\n", rows, inner, pair_layout, device_weights,4*sets);
         if (benchmark) for (int repeat = 0; repeat < 7; ++repeat) for (int order = 0; order < 4; ++order) {
             int mode = (repeat + order) % 4;
+            if (mode == 1) continue;
             auto launch = [&](int i) {
                 auto* selected = (mode < 2 ? native_jobs.data() : jobs.data()) + (i % sets) * experts;
-                if (mode == 1) check(mollm_cuda::launch_nvfp4_native_pipelined_projections(selected, experts, rows, inner, cudaStreamPerThread));
-                else if (mode == 3) check(mollm_cuda::launch_nvfp4_pipelined_projections(selected, experts, rows, inner, true, cudaStreamPerThread));
+                if (mode == 3) check(mollm_cuda::launch_nvfp4_pipelined_projections(selected, experts, rows, inner, true, cudaStreamPerThread));
                 else mollm_cuda::launch_nvfp4_projections(selected, experts, rows, inner, cudaStreamPerThread, mode == 0);
             };
             std::printf("native_pipeline_timing rows=%d K=%d pair=%d device=%d repeat=%d mode=%d us=%.3f\n", rows, inner, pair_layout, device_weights, repeat, mode, measure(launch, 128));
@@ -822,8 +803,7 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
     if (!benchmark && rows % 16 == 0) {
         auto* batch_input = device_allocate<float>(8 * inner);
         auto* batch_output = device_allocate<float>(8 * rows);
-        auto* batch_jobs = device_allocate<mollm_cuda::Nvfp4Projection>(8);
-        std::vector<float> input_values(8 * inner), scalar(8 * rows), batched(8 * rows);
+        std::vector<float> input_values(8 * inner);
         std::vector<mollm_cuda::Nvfp4Projection> descriptors(8, native_jobs[0]);
         for (int column = 0; column < 8; ++column) {
             for (int k = 0; k < inner; ++k)
@@ -837,16 +817,7 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             job.output_scale = (column - 3) * .125f;
         }
         check(cudaMemcpy(batch_input, input_values.data(), input_values.size() * sizeof(float), cudaMemcpyHostToDevice));
-        check(cudaMemcpy(batch_jobs, descriptors.data(), 8 * sizeof(descriptors[0]), cudaMemcpyHostToDevice));
         const int split = rows >= 128 && (rows / 2) % 64 == 0 ? rows / 2 : 0;
-        check(mollm_cuda::launch_nvfp4_mma_projections(batch_jobs, 8, rows, inner, split));
-        check(cudaMemcpy(scalar.data(), batch_output, scalar.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        check(mollm_cuda::launch_nvfp4_mma_batched8(batch_jobs, 8, rows, inner, split));
-        check(cudaMemcpy(batched.data(), batch_output, batched.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        if (std::memcmp(scalar.data(), batched.data(), scalar.size() * sizeof(float))) {
-            std::fprintf(stderr, "batched N8 mismatch rows=%d K=%d split=%d\n", rows, inner, split); std::exit(1);
-        }
-        std::printf("batched_N8 rows=%d K=%d split=%d distinct_inputs_globals_routes=true bit_exact=true\n", rows, inner, split);
         auto* grouped_output = device_allocate<float>(17 * rows);
         auto* grouped_jobs = device_allocate<mollm_cuda::Nvfp4Projection>(17);
         auto* batches = device_allocate<mollm_cuda::Nvfp4MmaBatch>(17);
@@ -1137,47 +1108,7 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
         check(cudaFree(grouped_output)); check(cudaFree(grouped_jobs)); check(cudaFree(batches));
         check(cudaFree(compact_batches));
         check(cudaFree(prepared_input)); check(cudaFree(prepared_scales));
-        check(cudaFree(batch_input)); check(cudaFree(batch_output)); check(cudaFree(batch_jobs));
-    }
-    if (!benchmark) {
-        std::vector<float> reference(static_cast<size_t>(experts)*rows), candidate(reference.size());
-        check(mollm_cuda::launch_nvfp4_pipelined_projections(jobs.data(),experts,rows,inner));
-        check(cudaMemcpy(reference.data(),output,reference.size()*sizeof(float),cudaMemcpyDeviceToHost));
-        for(int row_group:{2,4}) {
-            check(mollm_cuda::launch_nvfp4_row_reuse(jobs.data(),experts,rows,inner,row_group));
-            check(cudaMemcpy(candidate.data(),output,candidate.size()*sizeof(float),cudaMemcpyDeviceToHost));
-            if(std::memcmp(reference.data(),candidate.data(),candidate.size()*sizeof(float))) {
-                std::fprintf(stderr,"row reuse shape mismatch rows=%d K=%d group=%d\n",rows,inner,row_group);
-                std::exit(1);
-            }
-        }
-    }
-    if (!benchmark && rows % 8 == 0) {
-        const int width = rows / 2;
-        auto* fused_output = device_allocate<float>(static_cast<size_t>(experts) * width);
-        auto* activation_reference = device_allocate<float>(static_cast<size_t>(experts) * width);
-        auto* route_weights = device_allocate<float>(experts);
-        std::vector<float> weights(experts), reference(static_cast<size_t>(experts) * width), fused(reference.size());
-        for (int i = 0; i < experts; ++i) weights[i] = (i % 3 - 1) * .375f;
-        check(cudaMemcpy(route_weights, weights.data(), weights.size() * sizeof(float), cudaMemcpyHostToDevice));
-        for (bool weighted : {false, true}) for (int hint : {0, 3}) {
-            check(mollm_cuda::launch_nvfp4_pipelined_projections(jobs.data(), experts, rows, inner));
-            mollm_cuda::launch_moe_activation(output, output + width,
-                weighted ? route_weights : nullptr, activation_reference, experts, width, rows);
-            check(cudaGetLastError());
-            check(mollm_cuda::launch_nvfp4_gate_activation(jobs.data(), experts, width, inner,
-                weighted ? route_weights : nullptr, fused_output, nullptr, 4, hint));
-            check(cudaMemcpy(reference.data(), activation_reference, reference.size() * sizeof(float), cudaMemcpyDeviceToHost));
-            check(cudaMemcpy(fused.data(), fused_output, fused.size() * sizeof(float), cudaMemcpyDeviceToHost));
-            if (std::memcmp(reference.data(), fused.data(), reference.size() * sizeof(float))) {
-                std::fprintf(stderr, "gate activation fusion mismatch rows=%d K=%d pair=%d weighted=%d\n",
-                    rows,inner,pair_layout,weighted);
-                std::exit(1);
-            }
-        }
-        std::printf("gate_activation_fusion rows=%d K=%d pair=%d hints=0,3 weighted_and_unweighted=true bit_exact=true\n",
-            rows,inner,pair_layout);
-        check(cudaFree(fused_output)); check(cudaFree(activation_reference)); check(cudaFree(route_weights));
+        check(cudaFree(batch_input)); check(cudaFree(batch_output));
     }
     if (normalized_error > 2e-5) {
         std::fprintf(stderr, "MMA mismatch rows=%d K=%d pair=%d normalized_max_error=%.9g\n", rows, inner, pair_layout, normalized_error);
@@ -1376,7 +1307,7 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
         check(cudaFree(output)); check(cudaFree(partial));
         return;
     }
-    if (std::getenv("MOLLM_NVFP4_BF16_MMA_PROBE") || std::getenv("MOLLM_NVFP4_SIMT_SUBWARP") || std::getenv("MOLLM_NVFP4_INTEGER_SCALE") || std::getenv("MOLLM_NVFP4_CTA_PROBE") || std::getenv("MOLLM_NVFP4_INTERLEAVED")) {
+    if (std::getenv("MOLLM_NVFP4_BF16_MMA_PROBE") || std::getenv("MOLLM_NVFP4_SIMT_SUBWARP") || std::getenv("MOLLM_NVFP4_INTEGER_SCALE") || std::getenv("MOLLM_NVFP4_INTERLEAVED")) {
         std::vector<float> reference(static_cast<size_t>(experts) * rows), actual(reference.size());
         const std::vector<float> guards(8, -1234567.f);
         std::vector<float> actual_guards(8);
@@ -1386,12 +1317,11 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
         const bool split_k = std::getenv("MOLLM_NVFP4_BF16_SPLIT_K") != nullptr;
         const bool subwarp = std::getenv("MOLLM_NVFP4_SIMT_SUBWARP") != nullptr;
         const bool integer_scale = std::getenv("MOLLM_NVFP4_INTEGER_SCALE") != nullptr;
-        const bool cta_probe = std::getenv("MOLLM_NVFP4_CTA_PROBE") != nullptr;
         const bool interleaved = std::getenv("MOLLM_NVFP4_INTERLEAVED") != nullptr;
         uint8_t* interleaved_weights = nullptr;
         auto packed_jobs = jobs;
         if (interleaved) {
-            if (cta_probe || integer_scale || subwarp || split_k || cache_input || block_weights) {
+            if (integer_scale || subwarp || split_k || cache_input || block_weights) {
                 std::fprintf(stderr, "interleaved is a separate layout probe\n"); std::exit(1);
             }
             const size_t packed_stride = weight_bytes + scale_bytes;
@@ -1415,35 +1345,15 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                 packed_jobs[j].block_scales = nullptr; // Must not read original scales in this candidate.
             }
             std::printf("interleaved diagnostic extra_payload_bytes=%zu tile_bytes=36\n", payload.size());
-            if (std::getenv("MOLLM_NVFP4_INTERLEAVED_RUNTIME_PROBE")) {
-                if (mollm_cuda::launch_nvfp4_interleaved_projections(nullptr, 1, rows, inner) != cudaErrorInvalidValue ||
-                    mollm_cuda::launch_nvfp4_interleaved_projections(packed_jobs.data(), experts, 0, inner) != cudaErrorInvalidValue ||
-                    mollm_cuda::launch_nvfp4_interleaved_projections(packed_jobs.data(), experts, rows, 17) != cudaErrorInvalidValue ||
-                    mollm_cuda::launch_nvfp4_interleaved_projections(nullptr, 0, rows, inner) != cudaSuccess) {
-                    std::fprintf(stderr, "interleaved argument validation failed\n"); std::exit(1);
-                }
-            }
-        }
-        if (cta_probe) {
-            if (mollm_cuda::launch_nvfp4_cta_projections(nullptr, 1, rows, inner, 4) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_cta_projections(jobs.data(), experts, rows, inner, 3) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_cta_projections(jobs.data(), experts, rows, 17, 4) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_cta_projections(nullptr, 0, rows, inner, 4) != cudaSuccess) {
-                std::fprintf(stderr, "CTA argument validation failed\n"); std::exit(1);
-            }
-        }
-        if (cta_probe && (integer_scale || subwarp || split_k || cache_input || block_weights)) {
-            std::fprintf(stderr, "CTA is a separate canonical pipeline probe\n"); std::exit(1);
         }
         if (integer_scale && (subwarp || split_k || cache_input || block_weights)) {
             std::fprintf(stderr, "integer scale is a separate 32-lane pipeline probe\n"); std::exit(1);
         }
         const bool subwarp_pipeline = subwarp && std::getenv("MOLLM_NVFP4_SUBWARP_PIPELINE");
         if (subwarp && (split_k || cache_input || block_weights)) { std::fprintf(stderr, "subwarp is a separate probe\n"); std::exit(1); }
-        const char* probe = interleaved ? "interleaved" : cta_probe ? "cta" : integer_scale ? "integer-scale" : subwarp ? "subwarp" : "bf16";
+        const char* probe = interleaved ? "interleaved" : integer_scale ? "integer-scale" : subwarp ? "subwarp" : "bf16";
         std::printf("projection_schedule probe=%s; %s\n", probe,
             interleaved ? "36-byte four-row weight+scale tiles, 32 lanes, depth1 pipeline" :
-            cta_probe ? "canonical 32 lanes, depth1 pipeline, CTA warps1/2/4/8/16" :
             integer_scale ? "integer scale uses 32 lanes, depth1 input pipeline" : "subwarp terms1=16lanes terms2=8lanes");
         std::printf("projection_schedule subwarp_pipeline=%d\n", subwarp_pipeline);
         if (split_k && cache_input) { std::fprintf(stderr, "split-K probe excludes cached activation schedule\n"); std::exit(1); }
@@ -1456,12 +1366,8 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
         std::printf("bf16_schedule block_weights=%d\n", block_weights);
         auto launch = [&](int terms, int warps, const mollm_cuda::Nvfp4Projection* selected, cudaStream_t stream) {
             const dim3 grid((rows + warps * 16 - 1) / (warps * 16), experts, parts);
-            if (interleaved && std::getenv("MOLLM_NVFP4_INTERLEAVED_RUNTIME_PROBE"))
-                check(mollm_cuda::launch_nvfp4_interleaved_projections(
-                    packed_jobs.data() + (selected - jobs.data()), experts, rows, inner, stream));
-            else if (interleaved) nvfp4_subwarp_probe<32, true, false, true><<<dim3((rows + warps - 1) / warps, experts), warps * 32, 0, stream>>>(
+            if (interleaved) nvfp4_subwarp_probe<32, true, false, true><<<dim3((rows + warps - 1) / warps, experts), warps * 32, 0, stream>>>(
                     packed_jobs.data() + (selected - jobs.data()), rows, inner);
-            else if (cta_probe) check(mollm_cuda::launch_nvfp4_cta_projections(selected, experts, rows, inner, warps, stream));
             else if (integer_scale) nvfp4_subwarp_probe<32, true, true><<<dim3((rows + warps - 1) / warps, experts), warps * 32, 0, stream>>>(selected, rows, inner);
             else if (subwarp_pipeline && terms == 1) nvfp4_subwarp_probe<16, true><<<dim3((rows + warps * 2 - 1) / (warps * 2), experts), warps * 32, 0, stream>>>(selected, rows, inner);
             else if (subwarp_pipeline) nvfp4_subwarp_probe<8, true><<<dim3((rows + warps * 4 - 1) / (warps * 4), experts), warps * 32, 0, stream>>>(selected, rows, inner);
@@ -1486,7 +1392,7 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
         for (int split : split_k ? std::vector<int>{1, 2, 4, 8, 16} : std::vector<int>{1}) {
         if (split > inner / 16) continue;
         parts = split;
-        for (int terms : (integer_scale || cta_probe || interleaved) ? std::vector<int>{1} : std::vector<int>{1, 2}) for (int warps : cta_probe ? std::vector<int>{1, 2, 4, 8, 16} : (integer_scale || interleaved) ? std::vector<int>{4} : split_k ? std::vector<int>{1, 4} : std::vector<int>{1, 2, 4, 8}) {
+        for (int terms : (integer_scale || interleaved) ? std::vector<int>{1} : std::vector<int>{1, 2}) for (int warps : (integer_scale || interleaved) ? std::vector<int>{4} : split_k ? std::vector<int>{1, 4} : std::vector<int>{1, 2, 4, 8}) {
             double worst = 0, difference = 0, energy = 0, cpu_error = 0, cpu_max = 0;
             for (int set = 0; set < sets; ++set) {
                 const auto* selected = jobs.data() + set * experts;
@@ -1500,7 +1406,7 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                 }
                 launch(terms, warps, selected, cudaStreamPerThread);
                 check(cudaMemcpy(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                if ((integer_scale || cta_probe || interleaved) && std::memcmp(actual.data(), reference.data(), actual.size() * sizeof(float))) {
+                if ((integer_scale || interleaved) && std::memcmp(actual.data(), reference.data(), actual.size() * sizeof(float))) {
                     std::fprintf(stderr, "integer scale changed projection bits\n"); std::exit(1);
                 }
                 if ((cache_input || block_weights || subwarp_pipeline) && parts == 1) {
@@ -1539,7 +1445,7 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             std::printf("%s_check rows=%d K=%d pair=%d terms=%d warps=%d parts=%d normalized_max=%.9g relative_l2=%.9g cpu_normalized_max=%.9g\n",
                 probe, rows, inner, pair_layout, terms, warps, parts, worst,
                 std::sqrt(difference / std::max(1e-30, energy)), cpu_error / std::max(1., cpu_max));
-            const double tolerance = (subwarp || integer_scale || cta_probe || interleaved) ? .00001 : terms == 1 ? .01 : .0001;
+            const double tolerance = (subwarp || integer_scale || interleaved) ? .00001 : terms == 1 ? .01 : .0001;
             if (worst > tolerance || cpu_error / std::max(1., cpu_max) > tolerance) {
                 std::fprintf(stderr, "BF16 numerical gate failed\n"); std::exit(1);
             }
@@ -1553,7 +1459,7 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                     const auto* last = jobs.data() + ((iterations - 1) % sets) * experts;
                     check(mollm_cuda::launch_nvfp4_pipelined_projections(last, experts, rows, inner, true));
                     check(cudaMemcpy(reference.data(), output, reference.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                    if ((integer_scale || cta_probe || interleaved) && std::memcmp(actual.data(), reference.data(), actual.size() * sizeof(float))) {
+                    if ((integer_scale || interleaved) && std::memcmp(actual.data(), reference.data(), actual.size() * sizeof(float))) {
                         std::fprintf(stderr, "integer scale changed graph projection bits\n"); std::exit(1);
                     }
                     double peak = 0, error = 0;
@@ -1600,134 +1506,10 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
         check(cudaFree(output)); check(cudaFree(partial));
         return;
     }
-    const bool paired_simt = std::getenv("MOLLM_NVFP4_PAIRED_SIMT_BENCH") != nullptr;
-    if (benchmark && std::getenv("MOLLM_NVFP4_GATE_ACTIVATION_BENCH")) {
-        const int fused_load_hint = std::getenv("MOLLM_NVFP4_GATE_ACTIVATION_L2_FIRST") ? 3 : 0;
-        const char* warp_option = std::getenv("MOLLM_NVFP4_GATE_ACTIVATION_WARPS");
-        const int fused_warps = warp_option && std::strcmp(warp_option,"2")==0 ? 2 :
-            warp_option && std::strcmp(warp_option,"8")==0 ? 8 : 4;
-        const int width = rows / 2;
-        auto* fused_output = device_allocate<float>(static_cast<size_t>(experts) * width);
-        auto* separate_output = device_allocate<float>(static_cast<size_t>(experts) * width);
-        auto* route_weights = device_allocate<float>(experts);
-        std::vector<float> weights(experts), expected(static_cast<size_t>(experts) * width), actual(expected.size());
-        for (int i = 0; i < experts; ++i) weights[i] = (i % 5 - 2) * .125f;
-        check(cudaMemcpy(route_weights, weights.data(), weights.size() * sizeof(float), cudaMemcpyHostToDevice));
-        cudaStream_t stream;
-        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        auto launch = [&](bool fused, int set) {
-            const auto* selected = jobs.data() + set * experts;
-            if (fused) check(mollm_cuda::launch_nvfp4_gate_activation(selected, experts,
-                width, inner, route_weights, fused_output, stream, fused_warps, fused_load_hint));
-            else {
-                check(mollm_cuda::launch_nvfp4_pipelined_projections(selected, experts,
-                    rows, inner, true, stream));
-                mollm_cuda::launch_moe_activation(output, output + width, route_weights,
-                    separate_output, experts, width, rows, stream);
-                check(cudaGetLastError());
-            }
-        };
-        auto compare = [&](bool fused) {
-            check(cudaMemcpyAsync(actual.data(), fused ? fused_output : separate_output,
-                actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream));
-            check(cudaStreamSynchronize(stream));
-        };
-        for (int set = 0; set < sets; ++set) {
-            launch(false,set); compare(false); expected = actual;
-            launch(true,set); compare(true);
-            if (std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float))) {
-                std::fprintf(stderr,"fusion rotating-set mismatch set=%d\n",set); std::exit(1);
-            }
-        }
-        auto measure = [&](bool fused) {
-            const int iterations = std::max(sets,256), last = (iterations-1)%sets;
-            cudaGraph_t graph; cudaGraphExec_t executable;
-            check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-            for (int i=0;i<iterations;++i) launch(fused,i%sets);
-            check(cudaStreamEndCapture(stream,&graph));
-            check(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
-            for (int i=0;i<2;++i) check(cudaGraphLaunch(executable,stream));
-            cudaEvent_t start,stop;
-            check(cudaEventCreate(&start)); check(cudaEventCreate(&stop));
-            check(cudaEventRecord(start,stream));
-            for(int i=0;i<4;++i) check(cudaGraphLaunch(executable,stream));
-            check(cudaEventRecord(stop,stream)); check(cudaEventSynchronize(stop));
-            float ms; check(cudaEventElapsedTime(&ms,start,stop));
-            compare(fused); expected=actual;
-            launch(!fused,last); compare(!fused);
-            if(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float))) {
-                std::fprintf(stderr,"fusion timed graph mismatch\n");std::exit(1);
-            }
-            auto changed=original;
-            for(int replay=0;replay<2;++replay) {
-                for(float& value:changed)value=-value;
-                check(cudaMemcpyAsync(input,changed.data(),inner*sizeof(float),cudaMemcpyHostToDevice,stream));
-                check(cudaGraphLaunch(executable,stream));compare(fused);expected=actual;
-                launch(!fused,last);compare(!fused);
-                if(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float))) {
-                    std::fprintf(stderr,"fusion changed-input graph mismatch\n");std::exit(1);
-                }
-            }
-            check(cudaEventDestroy(start));check(cudaEventDestroy(stop));
-            check(cudaGraphExecDestroy(executable));check(cudaGraphDestroy(graph));
-            return ms*1000./(4*iterations);
-        };
-        for(int repeat=0;repeat<3;++repeat) {
-            double separate,fused;
-            if(repeat%2){fused=measure(true);separate=measure(false);}
-            else {separate=measure(false);fused=measure(true);}
-            std::printf("gate_activation_timing rows=%d K=%d pair=%d sets=%d warps=%d hint=%d repeat=%d separate_us=%.3f fused_us=%.3f bit_exact_graph=true\n",
-                rows,inner,pair_layout,sets,fused_warps,fused_load_hint,repeat,separate,fused);
-        }
-        check(cudaStreamDestroy(stream));
-        check(cudaFree(fused_output));check(cudaFree(separate_output));check(cudaFree(route_weights));
-        if(pinned_pool){check(cudaFreeHost(device_weights));check(cudaFreeHost(device_native_weights));}
-        else {check(cudaFree(device_weights));check(cudaFree(device_native_weights));}
-        check(cudaFree(input));check(cudaFree(qinput));check(cudaFree(qscales));
-        check(cudaFree(output));check(cudaFree(partial));
-        return;
-    }
-    if(benchmark && std::getenv("MOLLM_NVFP4_ROUTE_SUM_PROBE")) {
-        const int row_tile=std::getenv("MOLLM_NVFP4_ROUTE_SUM_TWO_ROWS")?2:1;
-        std::vector<float> reference(rows),actual(rows);
-        auto launch=[&](int i,cudaStream_t stream,bool fused) {
-            const auto* selected=jobs.data()+(i%sets)*experts;
-            if(fused)check(mollm_cuda::launch_nvfp4_route_sum(selected,experts,rows,inner,partial,stream,row_tile));
-            else {
-                check(mollm_cuda::launch_nvfp4_pipelined_projections(selected,experts,rows,inner,true,stream));
-                route_sum_control<<<(rows+255)/256,256,0,stream>>>(output,partial,rows,experts);
-                check(cudaGetLastError());
-            }
-        };
-        for(int set=0;set<sets;++set) {
-            launch(set,nullptr,false);check(cudaMemcpy(reference.data(),partial,rows*sizeof(float),cudaMemcpyDeviceToHost));
-            launch(set,nullptr,true);check(cudaMemcpy(actual.data(),partial,rows*sizeof(float),cudaMemcpyDeviceToHost));
-            if(std::memcmp(reference.data(),actual.data(),rows*sizeof(float))) {std::fprintf(stderr,"route sum mismatch\n");std::exit(1);}
-        }
-        const int iterations=std::max(sets,256);
-        auto timing=[&](bool fused) {
-            const double us=measure_graph([&](int i,cudaStream_t stream){launch(i,stream,fused);},iterations);
-            check(cudaMemcpy(actual.data(),partial,rows*sizeof(float),cudaMemcpyDeviceToHost));
-            launch(iterations-1,nullptr,false);check(cudaMemcpy(reference.data(),partial,rows*sizeof(float),cudaMemcpyDeviceToHost));
-            if(std::memcmp(reference.data(),actual.data(),rows*sizeof(float)))std::exit(1);
-            return us;
-        };
-        for(int repeat=0;repeat<3;++repeat) {
-            double fused,separate;
-            if(repeat%2){separate=timing(false);fused=timing(true);}
-            else{fused=timing(true);separate=timing(false);}
-            std::printf("route-sum rows=%d K=%d pair=%d routes=%d tile=%d repeat=%d fused_us=%.3f separate_us=%.3f bit_exact=true\n",rows,inner,pair_layout,experts,row_tile,repeat,fused,separate);
-        }
-        if(pinned_pool){check(cudaFreeHost(device_weights));check(cudaFreeHost(device_native_weights));}
-        else {check(cudaFree(device_weights));check(cudaFree(device_native_weights));}
-        check(cudaFree(input));check(cudaFree(qinput));check(cudaFree(qscales));check(cudaFree(output));check(cudaFree(partial));
-        return;
-    }
     if (benchmark && std::getenv("MOLLM_NVFP4_PIPELINE_SIMT_BENCH")) {
         const bool pair_only_probe = std::getenv("MOLLM_NVFP4_PAIR_ONLY_PROBE") != nullptr;
         const bool exact_subwarp_probe = std::getenv("MOLLM_NVFP4_EXACT_SUBWARP_PROBE") != nullptr;
         const bool scale_broadcast_probe = std::getenv("MOLLM_NVFP4_SCALE_BROADCAST_PROBE") != nullptr;
-        const bool tiled_scale_probe = std::getenv("MOLLM_NVFP4_TILED_SCALE_PROBE") != nullptr;
         const char* split_hint=std::getenv("MOLLM_NVFP4_SPLIT_CACHE_HINT");
         const bool row_scale_early = std::getenv("MOLLM_NVFP4_ROW_SCALE_EARLY_PROBE") != nullptr;
         const bool row_scale_cta = std::getenv("MOLLM_NVFP4_ROW_SCALE_CTA_PROBE") != nullptr;
@@ -1739,47 +1521,17 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
         const int l2_probe_hint = split_hint ? std::atoi(split_hint) : decoded_scale_broadcast ? 11 : row_scale_mid ? 10 : row_scale_cta ? 9 : row_scale_early ? 8 : row_scale_prefetch ? 7 : std::getenv("MOLLM_NVFP4_L2_LAST_PROBE") ? 4 : 3;
         if(split_hint && l2_probe_hint!=5 && l2_probe_hint!=6){std::fprintf(stderr,"split cache hint must be5 or6\n");std::exit(1);}
         const bool l2_first_probe = std::getenv("MOLLM_NVFP4_L2_FIRST_PROBE") != nullptr || l2_probe_hint == 4 || split_hint || row_scale_prefetch;
-        uint8_t* tiled_scales=nullptr;
-        mollm_cuda::Nvfp4Projection* tiled_jobs=nullptr;
-        if(tiled_scale_probe) {
-            std::vector<uint8_t> reordered(scale_bytes*jobs.size());
-            auto descriptors=jobs;
-            check(cudaMalloc(&tiled_scales,reordered.size()));
-            for(size_t j=0;j<jobs.size();++j) {
-                const auto* source=resident.data+j*stride+weight_bytes;
-                for(int r=0;r<rows;++r)for(int g=0;g<inner/16;++g)
-                    reordered[j*scale_bytes+(size_t(r/4)*(inner/16)+g)*4+r%4]=source[size_t(r)*(inner/16)+g];
-                descriptors[j].block_scales=tiled_scales+j*scale_bytes;
-            }
-            check(cudaMemcpy(tiled_scales,reordered.data(),reordered.size(),cudaMemcpyHostToDevice));
-            check(cudaMalloc(&tiled_jobs,descriptors.size()*sizeof(descriptors[0])));
-            check(cudaMemcpy(tiled_jobs,descriptors.data(),descriptors.size()*sizeof(descriptors[0]),cudaMemcpyHostToDevice));
-        }
-        uint32_t *hardware_codes=nullptr, *direct_codes=nullptr;
-        check(cudaMalloc(&hardware_codes,256*sizeof(uint32_t)));
-        check(cudaMalloc(&direct_codes,256*sizeof(uint32_t)));
-        check(mollm_cuda::launch_nvfp4_scale_decode_check(hardware_codes,direct_codes));
-        uint32_t hardware_bits[256],direct_bits[256];
-        check(cudaMemcpy(hardware_bits,hardware_codes,sizeof(hardware_bits),cudaMemcpyDeviceToHost));
-        check(cudaMemcpy(direct_bits,direct_codes,sizeof(direct_bits),cudaMemcpyDeviceToHost));
-        if(std::memcmp(hardware_bits,direct_bits,sizeof(hardware_bits))) {
-            std::fprintf(stderr,"E4M3 direct decode mismatch\n");std::exit(1);
-        }
-        check(cudaFree(hardware_codes));check(cudaFree(direct_codes));
-        std::printf("E4M3 all 256 codes bit_exact=true\n");
         std::vector<float> reference(static_cast<size_t>(experts) * rows), actual(reference.size());
         for (int set = 0; set < sets; ++set) {
             const auto* selected = jobs.data() + set * experts;
             mollm_cuda::launch_nvfp4_projections(selected, experts, rows, inner);
             check(cudaMemcpy(reference.data(), output, reference.size() * sizeof(float), cudaMemcpyDeviceToHost));
-            for (int mode : (l2_first_probe ? std::vector<int>{18} : tiled_scale_probe ? std::vector<int>{17} : scale_broadcast_probe ? std::vector<int>{16} : exact_subwarp_probe ? std::vector<int>{14,15} : pair_only_probe ? (pair_layout ? std::vector<int>{13} : std::vector<int>{1}) : std::vector<int>{0,1,2,3,4,5,6,7,8,9,10,11,12})) {
+            for (int mode : (l2_first_probe ? std::vector<int>{18} : scale_broadcast_probe ? std::vector<int>{16} : exact_subwarp_probe ? std::vector<int>{14,15} : pair_only_probe ? (pair_layout ? std::vector<int>{13} : std::vector<int>{1}) : std::vector<int>{0,1,2,3,4,5,6,9,10,11,12})) {
                 if (mode == 6 && inner != 640 && inner != 2560) continue;
                 const bool inputs = mode != 0;
                 if(mode==18)check(mollm_cuda::launch_nvfp4_pipelined_projections(selected,experts,rows,inner,true,nullptr,false,l2_probe_hint));
-                else if(mode==17)check(mollm_cuda::launch_nvfp4_tiled_scale_projections(tiled_jobs+set*experts,experts,rows,inner));
                 else if(mode==16)check(mollm_cuda::launch_nvfp4_pipelined_projections(selected,experts,rows,inner,true,nullptr,false,0,false,false,false,false,false,false,false,true));
                 else if(mode>=14)check(mollm_cuda::launch_nvfp4_exact_subwarp(selected,experts,rows,inner,mode==14?16:8));
-                else if(mode==7||mode==8)check(mollm_cuda::launch_nvfp4_row_reuse(selected,experts,rows,inner,mode==7?2:4));
                 else check(mollm_cuda::launch_nvfp4_pipelined_projections(selected, experts, rows, inner, inputs, nullptr, mode == 2, mode >= 3 && mode <= 4 ? mode - 2 : 0, mode == 5, mode == 6, mode==9, mode==10, mode==11, mode==12, mode==13));
                 check(cudaMemcpy(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 if (std::memcmp(reference.data(), actual.data(), actual.size() * sizeof(float))) {
@@ -1800,10 +1552,8 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                 if (mode < 0) mollm_cuda::launch_nvfp4_projections(selected, experts, rows, inner, stream);
                 else if(mode==1 && row_scale_prefetch_control)check(mollm_cuda::launch_nvfp4_pipelined_projections(selected,experts,rows,inner,true,stream,false,7));
                 else if(mode==18)check(mollm_cuda::launch_nvfp4_pipelined_projections(selected,experts,rows,inner,true,stream,false,l2_probe_hint));
-                else if(mode==17)check(mollm_cuda::launch_nvfp4_tiled_scale_projections(tiled_jobs+(i%sets)*experts,experts,rows,inner,stream));
                 else if(mode==16)check(mollm_cuda::launch_nvfp4_pipelined_projections(selected,experts,rows,inner,true,stream,false,0,false,false,false,false,false,false,false,true));
                 else if(mode>=14)check(mollm_cuda::launch_nvfp4_exact_subwarp(selected,experts,rows,inner,mode==14?16:8,stream));
-                else if(mode==7||mode==8)check(mollm_cuda::launch_nvfp4_row_reuse(selected,experts,rows,inner,mode==7?2:4,stream));
                 else check(mollm_cuda::launch_nvfp4_pipelined_projections(selected, experts, rows, inner, mode != 0, stream, mode == 2, mode >= 3 && mode <= 4 ? mode - 2 : 0, mode == 5, mode == 6, mode==9, mode==10, mode==11, mode==12, mode==13));
             }
             check(cudaStreamEndCapture(stream, &graph));
@@ -1834,14 +1584,11 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                 cudaGraph_t changed_graph;cudaGraphExec_t changed_exec;
                 check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
                 if(mode==18)check(mollm_cuda::launch_nvfp4_pipelined_projections(jobs.data()+((iterations-1)%sets)*experts,experts,rows,inner,true,stream,false,l2_probe_hint));
-                else if(mode==17)check(mollm_cuda::launch_nvfp4_tiled_scale_projections(tiled_jobs+((iterations-1)%sets)*experts,experts,rows,inner,stream));
                 else if(mode==16)check(mollm_cuda::launch_nvfp4_pipelined_projections(jobs.data()+((iterations-1)%sets)*experts,experts,rows,inner,true,stream,false,0,false,false,false,false,false,false,false,true));
                 else if(mode>=14)check(mollm_cuda::launch_nvfp4_exact_subwarp(jobs.data()+((iterations-1)%sets)*experts,experts,rows,inner,mode==14?16:8,stream));
-                else if(mode>=9)check(mollm_cuda::launch_nvfp4_pipelined_projections(
+                else check(mollm_cuda::launch_nvfp4_pipelined_projections(
                     jobs.data()+((iterations-1)%sets)*experts,experts,rows,inner,
                     true,stream,false,0,false,false,mode==9,mode==10,mode==11,mode==12,mode==13));
-                else check(mollm_cuda::launch_nvfp4_row_reuse(jobs.data()+((iterations-1)%sets)*experts,
-                    experts,rows,inner,mode==7?2:4,stream));
                 check(cudaStreamEndCapture(stream,&changed_graph));
                 check(cudaGraphInstantiate(&changed_exec,changed_graph,nullptr,nullptr,0));
                 for(int replay=0;replay<2;++replay) {
@@ -1869,13 +1616,6 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                 std::printf("l2-policy hint=%d control_hint=%d rows=%d K=%d pair=%d repeat=%d generic_us=%.3f policy_us=%.3f bit_exact=true\n",l2_probe_hint,row_scale_prefetch_control?7:0,rows,inner,pair_layout,repeat,generic,first);
                 continue;
             }
-            if(tiled_scale_probe){
-                double generic,tiled;
-                if(repeat%2){tiled=graph_time(17);generic=graph_time(1);}
-                else{generic=graph_time(1);tiled=graph_time(17);}
-                std::printf("tiled-scale rows=%d K=%d pair=%d repeat=%d generic_us=%.3f tiled_us=%.3f bit_exact=true\n",rows,inner,pair_layout,repeat,generic,tiled);
-                continue;
-            }
             if(scale_broadcast_probe){
                 double generic,broadcast;
                 if(repeat%2){broadcast=graph_time(16);generic=graph_time(1);}
@@ -1900,7 +1640,6 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             }
             const bool supports_fixed = inner == 640 || inner == 2560;
             double fixed = supports_fixed && repeat % 2 ? graph_time(6) : 0;
-            double row2=repeat%2?graph_time(7):0,row4=repeat%2?graph_time(8):0;
             double warp_packet=repeat%2?graph_time(9):0;
             double aligned_packets=repeat%2?graph_time(10):0;
             double direct_scale=repeat%2?graph_time(11):0;
@@ -1909,7 +1648,6 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             if (repeat % 2) { direct=graph_time(5); cs=graph_time(4); cg=graph_time(3); cached = graph_time(2); inputs = graph_time(1); weights = graph_time(0); control = graph_time(-1); }
             else { control = graph_time(-1); weights = graph_time(0); inputs = graph_time(1); cached = graph_time(2); cg=graph_time(3); cs=graph_time(4); direct=graph_time(5); }
             if (supports_fixed && !(repeat % 2)) fixed = graph_time(6);
-            if(!(repeat%2)){row2=graph_time(7);row4=graph_time(8);}
             if(!(repeat%2))warp_packet=graph_time(9);
             if(!(repeat%2))aligned_packets=graph_time(10);
             if(!(repeat%2))direct_scale=graph_time(11);
@@ -1922,8 +1660,6 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                 rows,inner,pair_layout,repeat,inputs,aligned_packets);
             std::printf("pipeline_warp_packet rows=%d K=%d pair=%d repeat=%d original_us=%.3f packet_us=%.3f bit_exact_graph=true\n",
                 rows,inner,pair_layout,repeat,inputs,warp_packet);
-            std::printf("pipeline_row_reuse rows=%d K=%d pair=%d repeat=%d original_us=%.3f row2_us=%.3f row4_us=%.3f bit_exact_graph=true\n",
-                rows,inner,pair_layout,repeat,inputs,row2,row4);
             if (supports_fixed) std::printf("pipeline_fixed_inner rows=%d K=%d pair=%d repeat=%d original_us=%.3f fixed_us=%.3f bit_exact=yes\n",
                 rows,inner,pair_layout,repeat,inputs,fixed);
             std::printf("pipeline_simt rows=%d K=%d pair=%d sets=%d repeat=%d baseline_us=%.3f weights_us=%.3f inputs_us=%.3f cached_us=%.3f bit_exact=yes\n",
@@ -1932,8 +1668,6 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             std::printf("pipeline_direct_fp4 rows=%d K=%d pair=%d repeat=%d original_us=%.3f direct_us=%.3f bit_exact=yes\n", rows,inner,pair_layout,repeat,inputs,direct);
         }
         check(cudaStreamDestroy(stream));
-        if(tiled_jobs)check(cudaFree(tiled_jobs));
-        if(tiled_scales)check(cudaFree(tiled_scales));
         if (pinned_pool) {
             check(cudaFreeHost(device_weights)); check(cudaFreeHost(device_native_weights));
         } else {
@@ -1949,13 +1683,11 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
     const bool guarded_output=async_probe || prepared_timing;
     if(async_probe && compact_probe){std::fprintf(stderr,"exclusive probe modes\n");std::exit(2);}
     const bool long_width_runs = width_probe && std::getenv("MOLLM_NVFP4_GROUPED_LONG_RUNS");
-    if (benchmark && (std::getenv("MOLLM_NVFP4_GROUPED_BENCH") || paired_simt || width_probe)) {
-        const bool ragged_pairs = paired_simt && std::getenv("MOLLM_NVFP4_PAIR_RAGGED_BENCH");
-        for (int tokens : replay_counts ? std::vector<int>{1} : ragged_pairs ? std::vector<int>{0} : long_width_runs ? std::vector<int>{64,128,256,512,779} : width_probe ? std::vector<int>{1,4,8,16,24,32} : std::vector<int>{1, 2, 4, 8}) {
+    if (benchmark && (std::getenv("MOLLM_NVFP4_GROUPED_BENCH") || width_probe)) {
+        for (int tokens : replay_counts ? std::vector<int>{1} : long_width_runs ? std::vector<int>{64,128,256,512,779} : width_probe ? std::vector<int>{1,4,8,16,24,32} : std::vector<int>{1, 2, 4, 8}) {
             std::vector<int> expert_for_job;
-            constexpr int ragged_sizes[] = {1,1,1,1,1,1,2,2,3,5};
             for (int expert = 0; expert < experts; ++expert)
-                for (int token = 0; token < (replay_counts ? (*replay_counts)[expert] : ragged_pairs ? ragged_sizes[expert % 10] : tokens); ++token)
+                for (int token = 0; token < (replay_counts ? (*replay_counts)[expert] : tokens); ++token)
                     expert_for_job.push_back(expert);
             const int count = static_cast<int>(expert_for_job.size());
             auto* grouped_input = device_allocate<float>(static_cast<size_t>(count) * inner);
@@ -1968,8 +1700,6 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             auto* grouped_jobs = device_allocate<mollm_cuda::Nvfp4Projection>(static_cast<size_t>(sets) * count);
             auto* batches = device_allocate<mollm_cuda::Nvfp4MmaBatch>(count + 1);
             auto* compact_plan = compact_probe ? device_allocate<mollm_cuda::Nvfp4MmaBatch>(count + 1) : nullptr;
-            const bool ranked_pairs=paired_simt && std::getenv("MOLLM_NVFP4_RANK_PAIR_BENCH");
-            auto* ranked_jobs=ranked_pairs?device_allocate<mollm_cuda::Nvfp4Projection>(2*count):nullptr;
             const bool prequantize = width_probe || std::getenv("MOLLM_NVFP4_GROUPED_PREQUANT") != nullptr;
             const int minimum = std::getenv("MOLLM_NVFP4_GROUPED_ADAPTIVE") ? (rows == 1280 ? 4 : 8) : 1;
             auto* prepared_input = prequantize ? device_allocate<uint8_t>(static_cast<size_t>(count) * inner) : nullptr;
@@ -1978,11 +1708,11 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             std::vector<mollm_cuda::Nvfp4Projection> descriptors(static_cast<size_t>(sets) * count);
             for (int job = 0; job < count; ++job)
                 for (int k = 0; k < inner; ++k)
-                    values[static_cast<size_t>(job) * inner + k] = original[k] * (1 + (job % (ragged_pairs ? 8 : tokens)) * .125f);
+                    values[static_cast<size_t>(job) * inner + k] = original[k] * (1 + (job % tokens) * .125f);
             for (int set = 0; set < sets; ++set)
                 for (int job = 0; job < count; ++job) {
                     auto& descriptor = descriptors[set * count + job];
-                    descriptor = (paired_simt || width_probe ? jobs : native_jobs)[set * experts + expert_for_job[job]];
+                    descriptor = (width_probe ? jobs : native_jobs)[set * experts + expert_for_job[job]];
                     descriptor.input = grouped_input + static_cast<size_t>(job) * inner;
                     descriptor.output = grouped_output + static_cast<size_t>(job) * rows;
                     descriptor.input_global = quantized.global * (1 + expert_for_job[job] * .025f);
@@ -1993,28 +1723,10 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             check(cudaMemcpy(grouped_jobs, descriptors.data(), descriptors.size() * sizeof(descriptors[0]), cudaMemcpyHostToDevice));
             const int split = rows == 1280 ? 640 : 0;
             auto scalar_launch = [&](int i) {
-                if (paired_simt) {
-                    mollm_cuda::launch_nvfp4_projections(grouped_jobs + (i % sets) * count, count, rows, inner);
-                    check(cudaGetLastError());
-                    return;
-                }
                 check(mollm_cuda::launch_nvfp4_mma_projections(grouped_jobs + (i % sets) * count, count, rows, inner, split,
                     nullptr,nullptr,1,width_probe));
             };
             auto grouped_launch = [&](int i) {
-                if (paired_simt) {
-                    if (ranked_pairs) {
-                        const auto* source=grouped_jobs+(i%sets)*count;
-                        mollm_cuda::launch_group_nvfp4_jobs(source,source,ranked_jobs,ranked_jobs+count,count,nullptr,batches);
-                        check(mollm_cuda::launch_nvfp4_ranked_pairs(ranked_jobs,count,batches,rows,inner));
-                    } else if (std::getenv("MOLLM_NVFP4_INLINE_PAIR_BENCH"))
-                        check(mollm_cuda::launch_nvfp4_inline_pairs(grouped_jobs+(i%sets)*count,count,rows,inner));
-                    else if (std::getenv("MOLLM_NVFP4_PAIR_PLAN_BENCH"))
-                        check(mollm_cuda::launch_nvfp4_grouped_pairs(grouped_jobs + (i % sets) * count, count, batches, rows, inner));
-                    else
-                        check(mollm_cuda::launch_nvfp4_paired_projections(grouped_jobs + (i % sets) * count, count, rows, inner));
-                    return;
-                }
                 check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs + (i % sets) * count, count, batches, rows, inner, split,
                     nullptr, prepared_input, prepared_scales, minimum,width_probe));
             };
@@ -2172,44 +1884,12 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                     }
             } else for (int repeat = 0; repeat < 3; ++repeat) {
                 double candidate,control;
-                if (paired_simt && (ranked_pairs || std::getenv("MOLLM_NVFP4_INLINE_PAIR_BENCH"))) {
-                    cudaStream_t stream;check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
-                    auto time = [&](bool paired) {
-                        cudaGraph_t graph;cudaGraphExec_t executable;
-                        const int iterations=std::max(sets,256);
-                        check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal));
-                        for(int i=0;i<iterations;++i) {
-                            const auto* selected=grouped_jobs+(i%sets)*count;
-                            if(ranked_pairs) {
-                                mollm_cuda::launch_group_nvfp4_jobs(selected,selected,ranked_jobs,ranked_jobs+count,count,stream,paired?batches:nullptr);
-                                if(paired)check(mollm_cuda::launch_nvfp4_ranked_pairs(ranked_jobs,count,batches,rows,inner,stream));
-                                else check(mollm_cuda::launch_nvfp4_pipelined_projections(ranked_jobs,count,rows,inner,true,stream));
-                            } else if(paired)check(mollm_cuda::launch_nvfp4_inline_pairs(selected,count,rows,inner,stream));
-                            else check(mollm_cuda::launch_nvfp4_pipelined_projections(selected,count,rows,inner,true,stream));
-                        }
-                        check(cudaStreamEndCapture(stream,&graph));check(cudaGraphInstantiate(&executable,graph,nullptr,nullptr,0));
-                        for(int warm=0;warm<2;++warm)check(cudaGraphLaunch(executable,stream));
-                        cudaEvent_t start,stop;check(cudaEventCreate(&start));check(cudaEventCreate(&stop));
-                        check(cudaEventRecord(start,stream));for(int replay=0;replay<4;++replay)check(cudaGraphLaunch(executable,stream));
-                        check(cudaEventRecord(stop,stream));check(cudaEventSynchronize(stop));float ms=0;check(cudaEventElapsedTime(&ms,start,stop));
-                        check(cudaMemcpy(grouped.data(),grouped_output,grouped.size()*sizeof(float),cudaMemcpyDeviceToHost));
-                        scalar_launch(iterations-1);check(cudaMemcpy(scalar.data(),grouped_output,scalar.size()*sizeof(float),cudaMemcpyDeviceToHost));
-                        if(std::memcmp(grouped.data(),scalar.data(),scalar.size()*sizeof(float))) {std::fprintf(stderr,"inline pairs graph mismatch\n");std::exit(1);}
-                        check(cudaEventDestroy(start));check(cudaEventDestroy(stop));check(cudaGraphExecDestroy(executable));check(cudaGraphDestroy(graph));
-                        return ms*1000./(4*iterations);
-                    };
-                    if(repeat%2){candidate=time(true);control=time(false);}else{control=time(false);candidate=time(true);}
-                    check(cudaStreamDestroy(stream));
-                } else {candidate=measure(grouped_launch,256);control=measure(scalar_launch,256);}
-                std::printf("%s pool=%s rows=%d K=%d tokens_per_expert=%d jobs=%d ragged=%s plan=%s repeat=%d us=%.3f control_us=%.3f bit_exact=true\n",
-                    paired_simt ? "paired_simt" : "grouped_real_shape",
-                    device_pool ? "cuda" : "host", rows, inner, tokens, count,
-                    ragged_pairs ? "true" : "false",
-                    std::getenv("MOLLM_NVFP4_PAIR_PLAN_BENCH") ? "true" : "false", repeat, candidate, control);
+                candidate=measure(grouped_launch,256);control=measure(scalar_launch,256);
+                std::printf("grouped_real_shape pool=%s rows=%d K=%d tokens_per_expert=%d jobs=%d ragged=false plan=false repeat=%d us=%.3f control_us=%.3f bit_exact=true\n",
+                    device_pool ? "cuda" : "host", rows, inner, tokens, count, repeat, candidate, control);
                 std::fflush(stdout);
             }
             check(cudaFree(grouped_input)); check(cudaFree(grouped_output)); check(cudaFree(grouped_jobs)); check(cudaFree(batches));
-            check(cudaFree(ranked_jobs));
             check(cudaFree(compact_plan));
             check(cudaFree(prepared_input)); check(cudaFree(prepared_scales));
         }
@@ -2435,11 +2115,9 @@ void run_large_pool() {
             for (int i : {0, 47, 48, 123, 2447, 5119}) {
                 simt(i);
                 check(cudaMemcpy(reference.data(), output, reference.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                for (int variant : {1, 2, 3, 4}) {
-                    if (variant <= 2) check(mollm_cuda::launch_nvfp4_pipelined_projections(
+                for (int variant : {1, 2}) {
+                    check(mollm_cuda::launch_nvfp4_pipelined_projections(
                         choose(i), selected, rows, inner, variant == 2));
-                    else check(mollm_cuda::launch_nvfp4_deep_pipelined_projections(
-                        choose(i), selected, rows, inner, variant == 3 ? 2 : 4));
                     check(cudaMemcpy(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
                     if (std::memcmp(reference.data(), actual.data(), actual.size() * sizeof(float))) {
                         std::fprintf(stderr, "large pipeline bit-exact mismatch i=%d variant=%d\n", i, variant);
@@ -2448,18 +2126,16 @@ void run_large_pool() {
                 }
             }
             for (int repeat = 0; repeat < 3; ++repeat) {
-                double times[5]{};
-                for (int variant : repeat % 2 ? std::vector<int>{4, 3, 2, 1, 0} : std::vector<int>{0, 1, 2, 3, 4}) {
+                double times[3]{};
+                for (int variant : repeat % 2 ? std::vector<int>{2, 1, 0} : std::vector<int>{0, 1, 2}) {
                     times[variant] = measure_graph([&](int i, cudaStream_t stream) {
                         if (!variant) mollm_cuda::launch_nvfp4_projections(choose(i), selected, rows, inner, stream);
-                        else if (variant <= 2) check(mollm_cuda::launch_nvfp4_pipelined_projections(
+                        else check(mollm_cuda::launch_nvfp4_pipelined_projections(
                             choose(i), selected, rows, inner, variant == 2, stream));
-                        else check(mollm_cuda::launch_nvfp4_deep_pipelined_projections(
-                            choose(i), selected, rows, inner, variant == 3 ? 2 : 4, stream));
                     }, 5120);
                 }
-                std::printf("large_pipeline=%s rows=%d K=%d repeat=%d original_us=%.3f weights_us=%.3f inputs_us=%.3f depth2_us=%.3f depth4_us=%.3f bit_exact=true varied_data=true\n",
-                    device ? "cuda" : "host", rows, inner, repeat, times[0], times[1], times[2], times[3], times[4]);
+                std::printf("large_pipeline=%s rows=%d K=%d repeat=%d original_us=%.3f weights_us=%.3f inputs_us=%.3f bit_exact=true varied_data=true\n",
+                    device ? "cuda" : "host", rows, inner, repeat, times[0], times[1], times[2]);
                 std::fflush(stdout);
             }
             continue;
@@ -2508,28 +2184,6 @@ void run_large_pool() {
                 fused_time, scalar / fused_time, packed_time);
             std::fflush(stdout);
         }
-        const char* prefetch_option = std::getenv("MOLLM_NVFP4_PROBE_PREFETCH");
-        if (prefetch_option && std::strcmp(prefetch_option, "1") == 0) {
-            simt(123);
-            std::vector<float> reference(rows * selected), actual(rows * selected);
-            check(cudaMemcpy(reference.data(), output, reference.size() * sizeof(float), cudaMemcpyDeviceToHost));
-            for (int ahead : {1, 2, 4}) {
-                auto prefetched = [&](int i) {
-                    mollm_cuda::launch_nvfp4_prefetch_projections(choose(i), selected, rows, inner, ahead);
-                };
-                prefetched(123);
-                check(cudaMemcpy(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                if (std::memcmp(reference.data(), actual.data(), actual.size() * sizeof(float))) {
-                    std::fprintf(stderr, "large-pool prefetch output mismatch\n"); std::exit(1);
-                }
-                for (int repeat = 0; repeat < 3; ++repeat) {
-                    const double candidate = measure(prefetched, 5120), control = measure(simt, 5120);
-                    std::printf("large_prefetch=%s rows=%d K=%d ahead=%d repeat=%d us=%.3f control_us=%.3f bit_exact=true\n",
-                        device ? "cuda" : "host", rows, inner, ahead, repeat, candidate, control);
-                    std::fflush(stdout);
-                }
-            }
-        }
     }
     check(cudaFree(jobs)); check(cudaFree(input)); check(cudaFree(packed_input));
     check(cudaFree(input_scales)); check(cudaFree(output)); check(cudaFree(partial));
@@ -2545,16 +2199,6 @@ int main() {
         std::getenv("MOLLM_NVFP4_N32_ASYNC_WEIGHTS_PROBE"))) {
         std::fprintf(stderr,"prepared timing requires exact1 and exclusive grouped-width mode\n");return 2;
     }
-    for (int hint : {-1, 1, 2, 4, 7}) {
-        if (mollm_cuda::launch_nvfp4_gate_activation(nullptr, 0, 4, 16,
-                nullptr, nullptr, nullptr, 4, hint) != cudaErrorInvalidValue) {
-            std::fprintf(stderr, "invalid fusion hint accepted: %d\n", hint);
-            return 1;
-        }
-    }
-    for (int hint : {0, 3})
-        check(mollm_cuda::launch_nvfp4_gate_activation(nullptr, 0, 4, 16,
-            nullptr, nullptr, nullptr, 4, hint));
     cudaDeviceProp properties{};
     check(cudaGetDeviceProperties(&properties, 0));
     if (properties.major != 12) {
@@ -2622,7 +2266,7 @@ int main() {
         }
         return 0;
     }
-    if (std::getenv("MOLLM_NVFP4_BF16_MMA_PROBE") || std::getenv("MOLLM_NVFP4_SIMT_SUBWARP") || std::getenv("MOLLM_NVFP4_INTEGER_SCALE") || std::getenv("MOLLM_NVFP4_CTA_PROBE") || std::getenv("MOLLM_NVFP4_READ_PROBE") || std::getenv("MOLLM_NVFP4_INTERLEAVED")) {
+    if (std::getenv("MOLLM_NVFP4_BF16_MMA_PROBE") || std::getenv("MOLLM_NVFP4_SIMT_SUBWARP") || std::getenv("MOLLM_NVFP4_INTEGER_SCALE") || std::getenv("MOLLM_NVFP4_READ_PROBE") || std::getenv("MOLLM_NVFP4_INTERLEAVED")) {
         for (int code = 0; code < 256; ++code) if ((code & 127) != 127)
             for (int value = 0; value < 16; ++value) {
                 const float product = fp4_value(value) * fp8_value(code);
@@ -2649,14 +2293,14 @@ int main() {
     }
     const char* large = std::getenv("MOLLM_NVFP4_PROBE_LARGE_POOL");
     if (large && std::strcmp(large, "1") == 0) { run_large_pool(); return 0; }
-    if (std::getenv("MOLLM_NVFP4_PIPELINE_SIMT_BENCH") || std::getenv("MOLLM_NVFP4_GATE_ACTIVATION_BENCH")) {
+    if (std::getenv("MOLLM_NVFP4_PIPELINE_SIMT_BENCH")) {
         for (bool pair : {false, true}) {
             run(1280, 2560, pair, true);
             run(2560, 640, pair, true);
         }
         return 0;
     }
-    if (std::getenv("MOLLM_NVFP4_GROUPED_BENCH") || std::getenv("MOLLM_NVFP4_PAIRED_SIMT_BENCH")) {
+    if (std::getenv("MOLLM_NVFP4_GROUPED_BENCH")) {
         run(1280, 2560, true, true);
         run(2560, 640, true, true);
         return 0;

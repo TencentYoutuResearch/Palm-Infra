@@ -2397,10 +2397,6 @@ bool test_nvfp4_system_memory(CudaBackend& backend) {
             }
             std::vector<float> gold0, gold1;
             if (!download(backend, output0, gold0) || !download(backend, output1, gold1)) return false;
-            // Unequal layouts/weights exercise the independent-pair fallback.
-            if (mollm_cuda::launch_nvfp4_paired_projections(jobs, 2, rows, inner) != cudaSuccess ||
-                !download(backend, output0, actual) || actual != gold0 ||
-                !download(backend, output1, actual) || actual != gold1) return false;
             // Equal immutable weights, distinct destinations; odd last job.
             Tensor output2 = device_tensor(backend, rows);
             const mollm_cuda::Nvfp4Projection same[] = {jobs[0],
@@ -2408,24 +2404,11 @@ bool test_nvfp4_system_memory(CudaBackend& backend) {
                  jobs[0].input, jobs[1].output, false},
                 {jobs[1].weight, jobs[1].block_scales, jobs[1].row_scales,
                  jobs[1].input, static_cast<float*>(output2.device.buffer), true}};
-            if (mollm_cuda::launch_nvfp4_paired_projections(same, 2, rows, inner) != cudaSuccess ||
-                !download(backend, output1, actual) || actual != gold0 ||
-                mollm_cuda::launch_nvfp4_paired_projections(same, 1, rows, inner) != cudaSuccess ||
-                !download(backend, output0, actual) || actual != gold0) return false;
-            mollm_cuda::Nvfp4MmaBatch* pair_plan = nullptr;
-            if (cudaMalloc(reinterpret_cast<void**>(&pair_plan), 4 * sizeof(*pair_plan)) != cudaSuccess) return false;
-            mollm_cuda::Nvfp4Projection* ranked_jobs = nullptr;
-            if(cudaMalloc(reinterpret_cast<void**>(&ranked_jobs),6*sizeof(*ranked_jobs))!=cudaSuccess)return false;
-            for (int mode : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}) {
+            for (int mode : {2, 3, 6, 7, 8, 9, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}) {
             if((mode==14 || mode==18) && inner%128)continue;
             cudaStream_t stream = nullptr;
             cudaGraph_t graph = nullptr;
             cudaGraphExec_t executable = nullptr;
-            auto ranked_launch = [&] {
-                mollm_cuda::launch_group_nvfp4_jobs(same,same,ranked_jobs,ranked_jobs+3,3,stream,pair_plan);
-                const auto status=cudaGetLastError();
-                return status!=cudaSuccess?status:mollm_cuda::launch_nvfp4_ranked_pairs(ranked_jobs,3,pair_plan,rows,inner,stream);
-            };
             if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess ||
                 cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess ||
                 (mode >= 21 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,mode-16)
@@ -2435,14 +2418,8 @@ bool test_nvfp4_system_memory(CudaBackend& backend) {
                  : mode >= 16 ? mollm_cuda::launch_nvfp4_exact_subwarp(same,3,rows,inner,mode==16?16:8,stream)
                  : mode == 15 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,0,false,false,false,false,false,true)
                  : mode == 14 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,0,false,false,true)
-                 : mode >= 12 ? mollm_cuda::launch_nvfp4_row_reuse(same,3,rows,inner,mode==12?2:4,stream)
-                 : mode == 11 ? ranked_launch()
-                 : mode == 10 ? mollm_cuda::launch_nvfp4_inline_pairs(same,3,rows,inner,stream)
                  : mode >= 6 ? mollm_cuda::launch_nvfp4_pipelined_projections(same, 3, rows, inner, true, stream, mode == 6, mode >= 7 && mode <= 8 ? mode - 6 : 0, mode == 9)
-                 : mode >= 4 ? mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 3, rows, inner, mode == 4 ? 2 : 4, stream)
-                 : mode >= 2 ? mollm_cuda::launch_nvfp4_pipelined_projections(same, 3, rows, inner, mode == 3, stream)
-                 : mode == 1 ? mollm_cuda::launch_nvfp4_grouped_pairs(same, 3, pair_plan, rows, inner, stream)
-                             : mollm_cuda::launch_nvfp4_paired_projections(same, 3, rows, inner, stream)) != cudaSuccess ||
+                 : mollm_cuda::launch_nvfp4_pipelined_projections(same, 3, rows, inner, mode == 3, stream)) != cudaSuccess ||
                 cudaStreamEndCapture(stream, &graph) != cudaSuccess ||
                 cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != cudaSuccess) return false;
             bool exact = true;
@@ -2466,18 +2443,6 @@ bool test_nvfp4_system_memory(CudaBackend& backend) {
             cudaStreamDestroy(stream);
             if (!exact) return false;
             }
-            cudaFree(pair_plan);
-            cudaFree(ranked_jobs);
-            if(mollm_cuda::launch_nvfp4_ranked_pairs(nullptr,0,nullptr,rows,inner)!=cudaSuccess ||
-                mollm_cuda::launch_nvfp4_ranked_pairs(same,1,nullptr,rows,inner)!=cudaErrorInvalidValue)return false;
-            if (mollm_cuda::launch_nvfp4_deep_pipelined_projections(nullptr, 0, rows, inner, 2) != cudaSuccess ||
-                mollm_cuda::launch_nvfp4_deep_pipelined_projections(nullptr, 1, rows, inner, 2) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 1, rows, inner, 3) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, -1, rows, inner, 4) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 65536, rows, inner, 4) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 1, 0, inner, 2) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_deep_pipelined_projections(same, 1, rows, inner - 1, 4) != cudaErrorInvalidValue)
-                return false;
             if (mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner, true, nullptr, false, 12) != cudaErrorInvalidValue ||
                 mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner, false, nullptr, false, 2) != cudaErrorInvalidValue ||
                 mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner, true, nullptr, true, 2) != cudaErrorInvalidValue ||
@@ -2487,11 +2452,6 @@ bool test_nvfp4_system_memory(CudaBackend& backend) {
                 mollm_cuda::launch_nvfp4_pipelined_projections(same, 65536, rows, inner) != cudaErrorInvalidValue ||
                 mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, 0, inner) != cudaErrorInvalidValue ||
                 mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner - 1) != cudaErrorInvalidValue)
-                return false;
-            if (mollm_cuda::launch_nvfp4_grouped_pairs(nullptr, 0, nullptr, rows, inner) != cudaSuccess ||
-                mollm_cuda::launch_nvfp4_grouped_pairs(nullptr, 1, nullptr, rows, inner) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_grouped_pairs(same, 4097, nullptr, rows, inner) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_grouped_pairs(same, 1, nullptr, rows, inner) != cudaErrorInvalidValue)
                 return false;
         }
     }
@@ -3396,30 +3356,7 @@ bool test_grouped_narrow_stream() {
         if (mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(nullptr, weight, output, rows, inner, 1, true, stream) != cudaErrorInvalidValue ||
             mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(input + 1, weight, output, rows, inner, 2, true, stream) != cudaErrorInvalidValue ||
             mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(input, weight, output, rows, inner, 3, false, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(input, weight, output, rows, inner - 1, 4, true, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_spatial_narrow_gemv(nullptr, weight, output, rows, inner, 2, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_spatial_narrow_gemv(input + 1, weight, output, rows, inner, 4, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_spatial_narrow_gemv(input, weight, output, rows, inner, 3, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_spatial_narrow_gemv(input, weight, output, rows, inner - 1, 8, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_dual_lane_gemv(nullptr, weight, output, rows, inner, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_dual_lane_gemv(input + 1, weight, output, rows, inner, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_dual_lane_gemv(input, weight, output, rows, inner - 1, stream) != cudaErrorInvalidValue) {
-            cleanup(); return false;
-        }
-        if (mollm_cuda::launch_q4_g32_paired_projections(input + 1, weight, weight + projection_blocks,
-                output, output + rows + 8, rows, inner, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_paired_projections(input, weight, nullptr,
-                output, output + rows + 8, rows, inner, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_paired_projections(input, weight, weight + projection_blocks,
-                output, output + rows + 8, rows, 2016, stream) != cudaErrorInvalidValue) {
-            cleanup(); return false;
-        }
-        if (mollm_cuda::launch_q4_g32_shared_activation(input + 1, weight, weight + projection_blocks,
-                output, rows, inner, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_shared_activation(input, weight, nullptr,
-                output, rows, inner, stream) != cudaErrorInvalidValue ||
-            mollm_cuda::launch_q4_g32_shared_activation(input, weight, weight + projection_blocks,
-                output, rows, 2016, stream) != cudaErrorInvalidValue) {
+            mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(input, weight, output, rows, inner - 1, 4, true, stream) != cudaErrorInvalidValue) {
             cleanup(); return false;
         }
         if (mollm_cuda::launch_q4_g32_unequal_projections(input + 1, weight, weight + projection_blocks,
@@ -3430,37 +3367,21 @@ bool test_grouped_narrow_stream() {
                 output, output + rows + 8, rows, 0, inner, stream) != cudaErrorInvalidValue) {
             cleanup(); return false;
         }
-        for (int group : {-16, -15, -14, -13, -12, -11, -10, -9, -8, -4, -3, -2, -1, 0, 2, 4, 8}) {
+        for (int group : {-16, -15, -14, -13, -12, -11, -10}) {
             std::fill(actual.begin(), actual.end(), 42.f);
             if (cudaMemcpyAsync(output, actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice, stream) != cudaSuccess ||
                 cudaStreamSynchronize(stream) != cudaSuccess ||
                 cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
                 cleanup(); return false;
             }
-            // -2 fuses shared activation; -1 pairs projections; zero uses dual lanes.
-            // Both retain byte-exact references and explicit graph streams.
             if (group == -16) {
                 mollm_cuda::launch_q4_g32_unequal_projections(input, weight, weight + projection_blocks,
                     output, output + rows + 8, rows, std::min(rows, 4), inner, stream);
-            } else if (group <= -10) {
+            } else {
                 const int ordinal = (-group - 10) % 3;
                 mollm_cuda::launch_q4_g32_pipelined_narrow_gemv(input, weight, output, rows, inner,
                     1 << ordinal, group >= -12, stream);
-            } else if (group == -9)
-                mollm_cuda::launch_q4_g32_single_barrier_gemv(input, weight, output, rows, inner, stream);
-            else if (group < -2)
-                mollm_cuda::launch_q4_g32_spatial_narrow_gemv(input, weight, output, rows, inner,
-                    group == -3 ? 2 : -group, stream);
-            else if (group == -2)
-                mollm_cuda::launch_q4_g32_shared_activation(input, weight, weight + projection_blocks,
-                    output, rows, inner, stream);
-            else if (group == -1)
-                mollm_cuda::launch_q4_g32_paired_projections(input, weight, weight + projection_blocks,
-                    output, output + rows + 8, rows, inner, stream);
-            else if (group == 0)
-                mollm_cuda::launch_q4_g32_dual_lane_gemv(input, weight, output, rows, inner, stream);
-            else
-                mollm_cuda::launch_q4_g32_grouped_narrow_gemv(input, weight, output, rows, inner, group, stream);
+            }
             cudaGraph_t graph = nullptr;
             cudaGraphExec_t executable = nullptr;
             bool ok = cudaStreamEndCapture(stream, &graph) == cudaSuccess && graph;
@@ -3474,11 +3395,6 @@ bool test_grouped_narrow_stream() {
                     ok = cudaMemcpy(reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
                     mollm_cuda::launch_q4_g32_dense_gemv(input, weight + projection_blocks, output + rows + 8, rows, inner);
                     ok = ok && cudaMemcpy(second_reference.data(), output + rows + 8, rows * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
-                    if (group == -2 && ok) {
-                        mollm_cuda::launch_moe_activation(output, output + rows + 8, nullptr,
-                            output, 1, rows, rows);
-                        ok = cudaMemcpy(reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
-                    }
                 }
                 std::fill(actual.begin(), actual.end(), 42.f);
                 // Reset on the replay stream, after reference copies complete.
@@ -3488,8 +3404,8 @@ bool test_grouped_narrow_stream() {
                     cudaStreamSynchronize(stream) == cudaSuccess;
                 ok = ok && std::memcmp(reference.data(), actual.data(), rows * sizeof(float)) == 0 &&
                     std::all_of(actual.begin() + rows, actual.begin() + rows + 8, [](float x) { return x == 42.f; });
-                if (group == -1 || group == -16) {
-                    const int second_rows = group == -16 ? std::min(rows, 4) : rows;
+                if (group == -16) {
+                    const int second_rows = std::min(rows, 4);
                     ok = ok && std::memcmp(second_reference.data(), actual.data() + rows + 8, second_rows * sizeof(float)) == 0 &&
                         std::all_of(actual.begin() + rows + 8 + second_rows, actual.end(), [](float x) { return x == 42.f; });
                 } else
@@ -3503,140 +3419,6 @@ bool test_grouped_narrow_stream() {
             }
         }
         cleanup();
-    }
-    return true;
-}
-
-bool test_q4_wide_pipeline_stream(int pair_mode = 0) {
-    std::vector<std::pair<int, int>> shapes = {{1, 32}, {19, 96}, {31, 160}, {33, 2560}, {16480, 2560}};
-    if (pair_mode == 1 || pair_mode == 2) { shapes.emplace_back(10240, 320); shapes.emplace_back(2560, 640); }
-    const auto launch = [&](const float* input, const Q4B8G32Block* weight, float* output,
-                            int rows, int inner, cudaStream_t stream) {
-        return pair_mode >= 3 ? mollm_cuda::launch_q4_g32_l1_prefetch_wide_gemv(input, weight, output, rows, inner, 1 << (pair_mode - 3), stream)
-                         : pair_mode ? mollm_cuda::launch_q4_g32_pipelined_pair_gemv(input, weight, output, rows, inner, pair_mode == 2, stream)
-                         : mollm_cuda::launch_q4_g32_pipelined_wide_gemv(input, weight, output, rows, inner, stream);
-    };
-    for (const auto shape : shapes) {
-        const int rows = shape.first, inner = shape.second;
-        std::vector<Q4B8G32Block> host(((rows + 7) / 8) * (inner / 32));
-        for (size_t i = 0; i < host.size(); ++i)
-            for (int row = 0; row < 8; ++row) {
-                host[i].scales[row] = (1 + (i + row) % 17) / 37.f;
-                for (int byte = 0; byte < 16; ++byte) host[i].q[row][byte] = (i * 19 + row * 7 + byte * 13) & 255;
-            }
-        Q4B8G32Block* weight = nullptr;
-        float* input = nullptr; float* output = nullptr;
-        cudaStream_t stream = nullptr; cudaGraph_t graph = nullptr; cudaGraphExec_t executable = nullptr;
-        const auto cleanup = [&]() {
-            if (executable) cudaGraphExecDestroy(executable);
-            if (graph) cudaGraphDestroy(graph);
-            if (stream) cudaStreamDestroy(stream);
-            cudaFree(weight); cudaFree(input); cudaFree(output);
-        };
-        if (cudaMalloc(&weight, host.size() * sizeof(host[0])) != cudaSuccess ||
-            cudaMalloc(&input, inner * sizeof(float)) != cudaSuccess ||
-            cudaMalloc(&output, (rows + 8) * sizeof(float)) != cudaSuccess ||
-            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess ||
-            // A blocking copy from pageable memory may still be in flight on
-            // the default stream when it returns, and a non-blocking stream
-            // does not wait for it: upload on the stream the kernels use.
-            cudaMemcpyAsync(weight, host.data(), host.size() * sizeof(host[0]), cudaMemcpyHostToDevice, stream) != cudaSuccess) {
-            cleanup(); return false;
-        }
-        if (pair_mode >= 3 && mollm_cuda::launch_q4_g32_l1_prefetch_wide_gemv(
-                input, weight, output, rows, inner, 3, stream) != cudaErrorInvalidValue) {
-            cleanup(); return false;
-        }
-        if (launch(nullptr, weight, output, rows, inner, stream) != cudaErrorInvalidValue ||
-            launch(input + 1, weight, output, rows, inner, stream) != cudaErrorInvalidValue ||
-            launch(input, weight, output, rows, inner - 1, stream) != cudaErrorInvalidValue ||
-            launch(input, weight, output, rows, 2592, stream) != cudaErrorInvalidValue) {
-            cleanup(); return false;
-        }
-        if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess ||
-            launch(input, weight, output, rows, inner, stream) != cudaSuccess ||
-            cudaStreamEndCapture(stream, &graph) != cudaSuccess ||
-            cudaGraphInstantiateWithFlags(&executable, graph, 0) != cudaSuccess) {
-            cleanup(); return false;
-        }
-        std::vector<float> activation(inner), reference(rows), actual(rows + 8);
-        for (int replay = 0; replay < 2; ++replay) {
-            for (int i = 0; i < inner; ++i) activation[i] = (i % 41 - 20 + replay) / (37.f + replay);
-            bool ok = cudaMemcpyAsync(input, activation.data(), inner * sizeof(float), cudaMemcpyHostToDevice, stream) == cudaSuccess;
-            if (pair_mode == 1 || pair_mode == 2) mollm_cuda::launch_q4_g32_pair_narrow_gemv(input, weight, output, rows, inner, false, stream);
-            else mollm_cuda::launch_q4_g32_prefetch_wide_gemv(input, weight, output, rows, inner, 4, stream);
-            ok = ok && cudaMemcpyAsync(reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
-                cudaStreamSynchronize(stream) == cudaSuccess;
-            std::fill(actual.begin(), actual.end(), 42.f);
-            ok = ok && cudaMemcpyAsync(output, actual.data(), actual.size() * sizeof(float), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
-                cudaGraphLaunch(executable, stream) == cudaSuccess &&
-                cudaMemcpyAsync(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
-                cudaStreamSynchronize(stream) == cudaSuccess &&
-                std::memcmp(actual.data(), reference.data(), rows * sizeof(float)) == 0 &&
-                std::all_of(actual.begin() + rows, actual.end(), [](float x) { return x == 42.f; });
-            if (!ok) {
-                std::fprintf(stderr,"Q4 wide pipeline graph check failed pair_mode=%d rows=%d inner=%d replay=%d\n",
-                    pair_mode,rows,inner,replay);
-                cleanup(); return false;
-            }
-        }
-        cleanup();
-    }
-    return true;
-}
-
-bool test_q4_async_stream() {
-    for (int rows : {1, 19, 31, 33}) for (int inner : {32, 96, 128, 160, 2560})
-    for (int variant : {0, 4, 8}) {
-        std::vector<Q4B8G32Block> host(((rows + 7) / 8) * (inner / 32));
-        for (size_t i = 0; i < host.size(); ++i) for (int r = 0; r < 8; ++r) {
-            host[i].scales[r] = (1 + (i + r) % 17) / 37.f;
-            for (int k = 0; k < 16; ++k) host[i].q[r][k] = (i * 19 + r * 7 + k * 13) & 255;
-        }
-        std::vector<float> x(inner), reference(rows), actual(rows + 8), initial(rows + 8, 42.f);
-        for (int k = 0; k < inner; ++k) x[k] = (k % 41 - 20) / 37.f;
-        Q4B8G32Block* weight = nullptr;
-        float *input = nullptr, *output = nullptr;
-        cudaStream_t stream = nullptr;
-        cudaGraph_t graph = nullptr;
-        cudaGraphExec_t executable = nullptr;
-        bool ok = cudaMalloc(reinterpret_cast<void**>(&weight), host.size() * sizeof(host[0])) == cudaSuccess &&
-            cudaMalloc(reinterpret_cast<void**>(&input), inner * sizeof(float)) == cudaSuccess &&
-            cudaMalloc(reinterpret_cast<void**>(&output), initial.size() * sizeof(float)) == cudaSuccess &&
-            cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess;
-        if (ok) ok = cudaMemcpy(weight, host.data(), host.size() * sizeof(host[0]), cudaMemcpyHostToDevice) == cudaSuccess &&
-            cudaMemcpy(input, x.data(), inner * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
-        if (ok) {
-            mollm_cuda::launch_q4_g32_prefetch_wide_gemv(input, weight, output, rows, inner, 4);
-            ok = cudaMemcpy(reference.data(), output, rows * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess &&
-                cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
-            if (ok) {
-                const auto launch = variant == 0
-                    ? mollm_cuda::launch_q4_g32_async_wide_gemv(input, weight, output, rows, inner, stream)
-                    : mollm_cuda::launch_q4_g32_prefetch_scale_gemv(input, weight, output, rows, inner, variant, stream);
-                const auto end = cudaStreamEndCapture(stream, &graph);
-                ok = launch == cudaSuccess && end == cudaSuccess;
-            }
-            if (ok) ok = cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) == cudaSuccess;
-            for (int replay = 0; ok && replay < 2; ++replay) {
-                ok = cudaMemcpyAsync(output, initial.data(), initial.size() * sizeof(float), cudaMemcpyHostToDevice, stream) == cudaSuccess &&
-                    cudaGraphLaunch(executable, stream) == cudaSuccess &&
-                    cudaMemcpyAsync(actual.data(), output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
-                    cudaStreamSynchronize(stream) == cudaSuccess;
-                ok = ok && std::memcmp(actual.data(), reference.data(), rows * sizeof(float)) == 0 &&
-                    std::all_of(actual.begin() + rows, actual.end(), [](float y) { return y == 42.f; });
-            }
-        }
-        if (executable) cudaGraphExecDestroy(executable);
-        if (graph) cudaGraphDestroy(graph);
-        if (stream) cudaStreamDestroy(stream);
-        if (output) cudaFree(output);
-        if (input) cudaFree(input);
-        if (weight) cudaFree(weight);
-        if (!ok) {
-            std::fprintf(stderr, "Q4 async/scale-prefetch graph mismatch rows=%d inner=%d variant=%d\n", rows, inner, variant);
-            return false;
-        }
     }
     return true;
 }
@@ -4337,6 +4119,12 @@ bool test_shared_fp16_cache(CudaBackend& backend) {
 }
 
 int main(int argc, char** argv) {
+    // The backend keys prepared weights by host address for its lifetime and
+    // never forgets one. Sources of the cached pair-row fixtures are allocated
+    // before any weight is registered and live to the end, so their addresses
+    // cannot match an earlier fixture's freed source.
+    std::vector<Q4B8G32Block> cached_pair_sources[2] = {
+        std::vector<Q4B8G32Block>(4096 / 32), std::vector<Q4B8G32Block>(9216 / 32)};
     const bool verify_workspace_only=argc==2 && !std::strcmp(argv[1],"--verify-workspace-only");
     const bool moe_provider_only=argc==2 && !std::strcmp(argv[1],"--moe-provider-only");
     const bool shared_cache_only=argc==2 && !std::strcmp(argv[1],"--shared-cache-only");
@@ -5025,7 +4813,8 @@ int main(int argc, char** argv) {
         for (int inner = 0; inner < cached_k; ++inner)
             cached_activation[inner] =
                 static_cast<float>(inner % 37 - 18) / 41.0f;
-        std::vector<Q4B8G32Block> cached_blocks(cached_groups);
+        auto& cached_blocks = cached_pair_sources[cached_k == 4096 ? 0 : 1];
+        if (cached_blocks.size() != static_cast<size_t>(cached_groups)) return false;
         std::vector<float> cached_weight(
             static_cast<size_t>(n) * cached_k);
         for (int group = 0; group < cached_groups; ++group) {
@@ -5100,14 +4889,8 @@ int main(int argc, char** argv) {
         auto* weights = static_cast<const Q4B8G32Block*>(dw.device.buffer);
         auto* input = static_cast<const float*>(dx.device.buffer);
         auto* output = static_cast<float*>(dy.device.buffer);
-        mollm_cuda::launch_q4_g32_prefetch_narrow_gemv(input, weights, output, narrow_n, narrow_k, 0);
-        if (!download(backend, dy, original)) return 1;
-        for (int distance : {1, 2, 4}) {
-            mollm_cuda::launch_q4_g32_prefetch_narrow_gemv(input, weights, output, narrow_n, narrow_k, distance);
-            if (!download(backend, dy, candidate) || std::memcmp(original.data(), candidate.data(), narrow_n * sizeof(float))) return 1;
-        }
         mollm_cuda::launch_q4_g32_dense_gemv(input, weights, output, narrow_n, narrow_k);
-        if (!download(backend, dy, candidate) || std::memcmp(original.data(), candidate.data(), narrow_n * sizeof(float))) return 1;
+        if (!download(backend, dy, original)) return 1;
         Tensor dr = device_tensor(backend, packed.size() * sizeof(Q4B8G32Block) / sizeof(float));
         auto* row_weights = static_cast<mollm_cuda::Q4RowG32*>(dr.device.buffer);
         mollm_cuda::launch_repack_q4_row_g32(weights, row_weights, narrow_n, narrow_k);
@@ -5131,14 +4914,6 @@ int main(int argc, char** argv) {
             std::memcmp(original.data(), candidate.data(), narrow_n * sizeof(float))) {
             std::fprintf(stderr, "narrow decode fixture mismatch n=%d k=%d\n", narrow_n, narrow_k);
             return 1;
-        }
-        for (bool cache : {false, true}) {
-            mollm_cuda::launch_q4_g32_pair_narrow_gemv(input, weights, output, narrow_n, narrow_k, cache);
-            if (!download(backend, dy, candidate) || !close_enough(candidate, original, 1e-3f)) return 1;
-        }
-        for (int splits : {2, 4, 8}) {
-            mollm_cuda::launch_q4_g32_split_pair_gemv(input, weights, output, narrow_n, narrow_k, splits);
-            if (!download(backend, dy, candidate) || !close_enough(candidate, original, 1e-3f)) return 1;
         }
     }
 
@@ -5430,10 +5205,6 @@ int main(int argc, char** argv) {
     if (!test_grouped_narrow_stream()) return 1;
     phase.name = "FP16 conversion and NVFP4 sort streams";
     if (!test_fp16_to_fp32_reference() || !test_nvfp4_sort_stream()) return 1;
-    phase.name = "Q4 pipeline and async streams";
-    if (!test_q4_wide_pipeline_stream() || !test_q4_wide_pipeline_stream(1) ||
-        !test_q4_wide_pipeline_stream(2) || !test_q4_async_stream()) return 1;
-    for (int mode = 3; mode <= 6; ++mode) if (!test_q4_wide_pipeline_stream(mode)) return 1;
     std::printf("CUDA device-resident ops, fallback views, FP16, W8, W4G32 "
                 "and W4G128 matmul tests passed\n");
     phase.passed = true;

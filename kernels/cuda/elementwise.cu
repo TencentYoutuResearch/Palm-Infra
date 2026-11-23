@@ -93,44 +93,6 @@ __global__ void gr_reduce_cuda(
     output[index] = round_bf16(sum * (1.0f / streams));
 }
 
-__global__ void gr_reduce_sigmoid_vector4_cuda(
-    const float4* input, const float4* logits, float4* output, int vectors) {
-    const size_t dim = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (dim >= size_t(vectors)) return;
-    const size_t row = blockIdx.y;
-    const size_t base = row * size_t(vectors) * 4 + dim;
-    float4 sum{0.f,0.f,0.f,0.f};
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {
-        const size_t source = base + size_t(s) * vectors;
-        const float4 x = input[source], g = logits[source];
-        sum.x += (1.f / (1.f + expf(-g.x))) * x.x;
-        sum.y += (1.f / (1.f + expf(-g.y))) * x.y;
-        sum.z += (1.f / (1.f + expf(-g.z))) * x.z;
-        sum.w += (1.f / (1.f + expf(-g.w))) * x.w;
-    }
-    output[row * vectors + dim] = float4{round_bf16(sum.x * .25f),
-        round_bf16(sum.y * .25f),round_bf16(sum.z * .25f),round_bf16(sum.w * .25f)};
-}
-
-template<int StaticStreams = 0>
-__global__ void gr_reduce_sigmoid_tiled_cuda(
-    const float* input, const float* logits, float* output,
-    int hidden, int streams) {
-    const size_t dim = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (dim >= size_t(hidden)) return;
-    const size_t row = blockIdx.y;
-    const size_t base = row * size_t(hidden) * streams + dim;
-    float sum = 0.0f;
-#pragma unroll
-    for (int s = 0; s < (StaticStreams ? StaticStreams : streams); ++s) {
-        const size_t source = base + size_t(s) * hidden;
-        const float gate = 1.0f / (1.0f + expf(-logits[source]));
-        sum += gate * input[source];
-    }
-    output[row * hidden + dim] = round_bf16(sum * (1.0f / streams));
-}
-
 __global__ void gr_inject_cuda(
     const float* branch, const float* residual, const float* gates,
     float* output, int hidden, int streams, size_t count) {
@@ -140,18 +102,6 @@ __global__ void gr_inject_cuda(
     const int stream = (index / hidden) % streams;
     output[index] = round_bf16(residual[index] +
         gates[row * streams + stream] * branch[row * hidden + index % hidden]);
-}
-
-__global__ void gr_inject_tiled_cuda(
-    const float* branch, const float* residual, const float* gates,
-    float* output, int hidden, int streams) {
-    const size_t dim = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (dim >= static_cast<size_t>(hidden)) return;
-    const size_t row = blockIdx.z;
-    const size_t stream = blockIdx.y;
-    const size_t index = (row * streams + stream) * hidden + dim;
-    output[index] = round_bf16(residual[index] +
-        gates[row * streams + stream] * branch[row * hidden + dim]);
 }
 
 template<bool DeferredNormalized=false,bool CompactCarry=false,bool CompactResidual=false>
@@ -838,35 +788,6 @@ bool launch_group_rms_norm_cached(const float* input, const float* weight,
     return true;
 }
 
-bool launch_gr_reduce_sigmoid_vector4(const float* input, const float* logits,
-                                    float* output, int hidden, int streams,
-                                    int rows, cudaStream_t stream) {
-    if (!input || !logits || !output || hidden <= 0 || hidden % 4 || streams != 4 ||
-        rows <= 0 || rows > 65535 ||
-        (reinterpret_cast<uintptr_t>(input) & 15) ||
-        (reinterpret_cast<uintptr_t>(logits) & 15) ||
-        (reinterpret_cast<uintptr_t>(output) & 15)) return false;
-    if (size_t(hidden) > SIZE_MAX / sizeof(float) / 4 / size_t(rows)) return false;
-    const dim3 grid(unsigned((size_t(hidden) / 4 + 255) / 256),unsigned(rows));
-    gr_reduce_sigmoid_vector4_cuda<<<grid,256,0,stream>>>(
-        reinterpret_cast<const float4*>(input),reinterpret_cast<const float4*>(logits),
-        reinterpret_cast<float4*>(output),hidden / 4);
-    return cudaGetLastError() == cudaSuccess;
-}
-
-bool launch_gr_reduce_sigmoid_tiled(const float* input, const float* logits,
-                                  float* output, int hidden, int streams,
-                                  int rows, cudaStream_t stream, bool specialize_four) {
-    if (!input || !logits || !output || hidden <= 0 || streams <= 0 ||
-        rows <= 0 || rows > 65535) return false;
-    if (size_t(hidden) > SIZE_MAX / sizeof(float) / size_t(streams) / size_t(rows)) return false;
-    const dim3 grid(unsigned((size_t(hidden) + 255) / 256), unsigned(rows));
-    if (specialize_four && streams == 4)
-        gr_reduce_sigmoid_tiled_cuda<4><<<grid,256,0,stream>>>(input,logits,output,hidden,streams);
-    else gr_reduce_sigmoid_tiled_cuda<0><<<grid,256,0,stream>>>(input,logits,output,hidden,streams);
-    return cudaGetLastError() == cudaSuccess;
-}
-
 void launch_gr_reduce(const float* input, const float* gates, float* output,
                        int hidden, int streams, int rows) {
     const size_t count = static_cast<size_t>(hidden) * rows;
@@ -1079,19 +1000,6 @@ bool launch_gr_rms_deferred_materialize(const float* carry,const float* weight,
     if(compact_carry)gr_rms_deferred_materialize_cuda<true><<<(count+255)/256,256,0,stream>>>(carry,weight,inverses,output,count);
     else gr_rms_deferred_materialize_cuda<false><<<(count+255)/256,256,0,stream>>>(carry,weight,inverses,output,count);
     return cudaGetLastError()==cudaSuccess;
-}
-
-bool launch_gr_inject_tiled(const float* branch, const float* residual,
-    const float* gates, float* output, int hidden, int streams, int rows,
-    cudaStream_t stream) {
-    if (!branch || !residual || !gates || !output || hidden <= 0 ||
-        streams <= 0 || streams > 65535 || rows <= 0 || rows > 65535) return false;
-    if (static_cast<size_t>(hidden) * streams * rows > SIZE_MAX / sizeof(float)) return false;
-    const dim3 grid((static_cast<unsigned>(hidden) + 255) / 256,
-        static_cast<unsigned>(streams), static_cast<unsigned>(rows));
-    gr_inject_tiled_cuda<<<grid, 256, 0, stream>>>(
-        branch, residual, gates, output, hidden, streams);
-    return true;
 }
 
 void launch_add_rms_norm(

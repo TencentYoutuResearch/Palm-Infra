@@ -20,13 +20,6 @@ struct SdpaGemmPrefillParams {
     size_t mask_column_stride, mask_row_stride;
     size_t output_position_stride, output_head_stride;
 };
-// ordered_pv is diagnostic stage isolation: GEMM QK/softmax, ordered FP32
-// PV FMAs. It is not a runtime selector and does not promise bit equivalence.
-cublasStatus_t launch_sdpa_prefill_fp32_gemm(cublasHandle_t handle,
-    const float* query, const void* key, const void* value, float* scores,
-    float* output, const float* mask, float* key_fp32, float* value_fp32,
-    const SdpaGemmPrefillParams& params, cudaStream_t stream = nullptr,
-    float** pointer_workspace = nullptr, bool ordered_pv = false);
 // Default-off runtime entry: validates the explicit0/-1e38 causal mask and Q/K bounds
 // on device before skipping future QK. Caller owns a four-byte flag.
 // skip_zero_pv also requires finite V; zero/subnormal PV results retain

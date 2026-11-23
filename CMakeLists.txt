@@ -630,11 +630,6 @@ if(MOLLM_CUDA)
         target_compile_options(bench_cuda_gdn_chunkwise PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
         set_target_properties(bench_cuda_gdn_chunkwise PROPERTIES CUDA_STANDARD 17)
-        add_executable(bench_cuda_nvfp4_quantize tests/bench_cuda_nvfp4_quantize.cu)
-        target_link_libraries(bench_cuda_nvfp4_quantize PRIVATE mollm_lib)
-        target_compile_options(bench_cuda_nvfp4_quantize PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
-        set_target_properties(bench_cuda_nvfp4_quantize PROPERTIES CUDA_STANDARD 17)
         target_link_libraries(bench_cuda_gdn_recurrence PRIVATE mollm_lib)
         target_compile_options(bench_cuda_gdn_recurrence PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
@@ -660,11 +655,6 @@ if(MOLLM_CUDA)
             target_compile_options(bench_cuda_nvfp4_mma PRIVATE
                 $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
             set_target_properties(bench_cuda_nvfp4_mma PROPERTIES CUDA_STANDARD 17)
-            add_executable(bench_cuda_nvfp4_bf16_tile tests/bench_cuda_nvfp4_bf16_tile.cu)
-            target_link_libraries(bench_cuda_nvfp4_bf16_tile PRIVATE mollm_lib)
-            target_compile_options(bench_cuda_nvfp4_bf16_tile PRIVATE
-                $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
-            set_target_properties(bench_cuda_nvfp4_bf16_tile PROPERTIES CUDA_STANDARD 17)
         endif()
     endif()
 endif()
@@ -1052,11 +1042,6 @@ if(MOLLM_BUILD_TESTS)
                 ENVIRONMENT "MOLLM_GROUP_RMS_HALF_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         endif()
-        if(TARGET bench_cuda_sdpa_prefill)
-            add_test(NAME test_cuda_sdpa_gemm_ordered_pv COMMAND bench_cuda_sdpa_prefill --gemm-ordered-pv-check)
-            set_tests_properties(test_cuda_sdpa_gemm_ordered_pv PROPERTIES
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        endif()
         if(TARGET bench_cuda_sdpa_validated_prefix)
             add_test(NAME test_cuda_sdpa_mid_pv_guards
                 COMMAND bench_cuda_sdpa_validated_prefix --native-pv-gemm-mid-sanitize)
@@ -1114,16 +1099,6 @@ if(MOLLM_BUILD_TESTS)
             add_test(NAME test_cuda_sdpa_validated_prefix_guards COMMAND bench_cuda_sdpa_validated_prefix)
             set_tests_properties(test_cuda_sdpa_validated_prefix_guards PROPERTIES
                 ENVIRONMENT "MOLLM_SDPA_VALIDATED_PREFIX_CHECK_ONLY=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        endif()
-        if(TARGET bench_cuda_nvfp4_quantize)
-            add_test(NAME test_cuda_nvfp4_quantize_guards COMMAND bench_cuda_nvfp4_quantize)
-            add_test(NAME test_cuda_nvfp4_shared_max_cache_guards COMMAND bench_cuda_nvfp4_quantize)
-            set_tests_properties(test_cuda_nvfp4_shared_max_cache_guards PROPERTIES
-                ENVIRONMENT "MOLLM_NVFP4_SHARED_MAX_PROBE=1;MOLLM_NVFP4_QUANTIZE_CHECK_ONLY=1"
-                SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            set_tests_properties(test_cuda_nvfp4_quantize_guards PROPERTIES
-                ENVIRONMENT "MOLLM_NVFP4_QUANTIZE_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         endif()
         if(TARGET bench_cuda_gdn_recurrence)
@@ -1184,9 +1159,6 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         endif()
         set_tests_properties(test_cuda_sigmoid_gr_reduce PROPERTIES
-            SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-        add_test(NAME test_cuda_gr_inject_tiled COMMAND bench_cuda_gr_reduce --inject-check)
-        set_tests_properties(test_cuda_gr_inject_tiled PROPERTIES
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         add_mollm_test(test_cuda_backend tests/test_cuda_backend.cpp)
         if(MOLLM_CUDA_DECODE_SEGMENTS)
