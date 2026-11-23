@@ -257,7 +257,7 @@ private:
                                                                  mode == Mode::pipelined, stream_),
                   "gate code launch");
         } else if (mode == Mode::pipelined) {
-            check(mollm_cuda::launch_nvfp4_pipelined_projections(jobs, routes_, rows, inner, true, stream_),
+            check(mollm_cuda::launch_nvfp4_pipelined_projections(jobs, routes_, rows, inner, stream_),
                   "pipelined launch");
         } else {
             mollm_cuda::launch_nvfp4_projections(jobs, routes_, rows, inner, stream_);

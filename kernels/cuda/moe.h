@@ -97,12 +97,10 @@ void launch_nvfp4_projections(const Nvfp4Projection* jobs, int count,
                               int rows, int inner, cudaStream_t stream = nullptr,
                               bool mma_layout = false);
 // Preserves FP32 accumulation/reduction order. No allocation or synchronization.
+// One-step packet pipeline. prefetch_row_scale adds an L2 prefetch of the
+// row scale on entry.
 cudaError_t launch_nvfp4_pipelined_projections(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, bool pipeline_inputs = true, cudaStream_t stream = nullptr,
-    bool cache_input = false, int load_hint = 0, bool direct_fp4 = false,
-    bool fixed_inner = false, bool warp_packet = false,
-    bool aligned_packets = false, bool direct_scale = false, bool route_major = false,
-    bool pair_only = false, bool broadcast_scale = false); // Broadcast requires K%128==0. Pair-only caller guarantees canonical pair layout; aligned caller guarantees 2-byte weights / 16-byte inputs.
+    int rows, int inner, cudaStream_t stream = nullptr, bool prefetch_row_scale = false);
 // Reuse the routed descriptor ABI for FP16 expert-major matrices. Only
 // weight/input/output fields are read; route weights are applied by activation.
 cudaError_t launch_fp16_expert_projections(const Nvfp4Projection* jobs,

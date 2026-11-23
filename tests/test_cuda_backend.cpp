@@ -2404,22 +2404,15 @@ bool test_nvfp4_system_memory(CudaBackend& backend) {
                  jobs[0].input, jobs[1].output, false},
                 {jobs[1].weight, jobs[1].block_scales, jobs[1].row_scales,
                  jobs[1].input, static_cast<float*>(output2.device.buffer), true}};
-            for (int mode : {2, 3, 6, 7, 8, 9, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27}) {
-            if((mode==14 || mode==18) && inner%128)continue;
+            for (int mode : {3, 16, 17, 23}) {
             cudaStream_t stream = nullptr;
             cudaGraph_t graph = nullptr;
             cudaGraphExec_t executable = nullptr;
             if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess ||
                 cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess ||
-                (mode >= 21 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,mode-16)
-                 : mode == 20 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,4)
-                 : mode == 19 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,3)
-                 : mode == 18 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,0,false,false,false,false,false,false,false,true)
+                (mode == 23 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,stream,true)
                  : mode >= 16 ? mollm_cuda::launch_nvfp4_exact_subwarp(same,3,rows,inner,mode==16?16:8,stream)
-                 : mode == 15 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,0,false,false,false,false,false,true)
-                 : mode == 14 ? mollm_cuda::launch_nvfp4_pipelined_projections(same,3,rows,inner,true,stream,false,0,false,false,true)
-                 : mode >= 6 ? mollm_cuda::launch_nvfp4_pipelined_projections(same, 3, rows, inner, true, stream, mode == 6, mode >= 7 && mode <= 8 ? mode - 6 : 0, mode == 9)
-                 : mollm_cuda::launch_nvfp4_pipelined_projections(same, 3, rows, inner, mode == 3, stream)) != cudaSuccess ||
+                 : mollm_cuda::launch_nvfp4_pipelined_projections(same, 3, rows, inner, stream)) != cudaSuccess ||
                 cudaStreamEndCapture(stream, &graph) != cudaSuccess ||
                 cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != cudaSuccess) return false;
             bool exact = true;
@@ -2443,10 +2436,7 @@ bool test_nvfp4_system_memory(CudaBackend& backend) {
             cudaStreamDestroy(stream);
             if (!exact) return false;
             }
-            if (mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner, true, nullptr, false, 12) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner, false, nullptr, false, 2) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_pipelined_projections(same, 1, rows, inner, true, nullptr, true, 2) != cudaErrorInvalidValue ||
-                mollm_cuda::launch_nvfp4_pipelined_projections(nullptr, 0, rows, inner) != cudaSuccess ||
+            if (mollm_cuda::launch_nvfp4_pipelined_projections(nullptr, 0, rows, inner) != cudaSuccess ||
                 mollm_cuda::launch_nvfp4_pipelined_projections(nullptr, 1, rows, inner) != cudaErrorInvalidValue ||
                 mollm_cuda::launch_nvfp4_pipelined_projections(same, -1, rows, inner) != cudaErrorInvalidValue ||
                 mollm_cuda::launch_nvfp4_pipelined_projections(same, 65536, rows, inner) != cudaErrorInvalidValue ||

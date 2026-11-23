@@ -891,7 +891,7 @@ bool CudaBackend::try_nvfp4_moe(
                         break;
                     case Gate::Pipelined:
                         if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_pipelined_projections(
-                                gate_jobs, routes, 2 * inter, hidden, true, execution_stream), "NVFP4 pipelined gate/up")) return fail();
+                                gate_jobs, routes, 2 * inter, hidden, execution_stream), "NVFP4 pipelined gate/up")) return fail();
                         break;
                     case Gate::Generic:
                         mollm_cuda::launch_nvfp4_projections(gate_jobs, routes, 2 * inter, hidden, execution_stream,
@@ -933,8 +933,8 @@ bool CudaBackend::try_nvfp4_moe(
                             nullptr, 1, canonical_mma), "NVFP4 down MMA")) return fail();
                 } else {
                     const bool prefetch_down_row_scale=impl_->options.nvfp4_down_row_scale_prefetch;
-                    const int load_hint = prefetch_down_row_scale && rows == 1 &&
-                        hidden == 2560 && inter == 640 ? 7 : 0;
+                    const bool prefetch_row_scale = prefetch_down_row_scale && rows == 1 &&
+                        hidden == 2560 && inter == 640;
                     mollm_cuda::Nvfp4DownRequest request;
                     request.rows = rows;
                     request.top_k = top_k;
@@ -944,7 +944,7 @@ bool CudaBackend::try_nvfp4_moe(
                     request.pipeline = small_pipeline;
                     request.resident_mma_layout = down_source->resident_nvfp4_mma_layout;
                     request.pair_layout = found->second.down_pair_layout;
-                    request.row_scale_prefetch = load_hint != 0;
+                    request.row_scale_prefetch = prefetch_row_scale;
                     const auto kernel = mollm_cuda::select_nvfp4_down(impl_->policy, request);
                     impl_->trace_expert_kernel("down", mollm_cuda::kernel_name(kernel), rows, routes, hidden, inter);
                     using Down = mollm_cuda::Nvfp4DownKernel;
@@ -955,8 +955,8 @@ bool CudaBackend::try_nvfp4_moe(
                         break;
                     case Down::Pipelined:
                         if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_pipelined_projections(
-                                down_jobs, routes, hidden, inter, true, execution_stream,
-                                false, load_hint), "NVFP4 pipelined down")) return fail();
+                                down_jobs, routes, hidden, inter, execution_stream,
+                                prefetch_row_scale), "NVFP4 pipelined down")) return fail();
                         break;
                     case Down::SmallBatchSubwarp:
                         if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_exact_subwarp(

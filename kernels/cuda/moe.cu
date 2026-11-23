@@ -1135,17 +1135,6 @@ __device__ float e4m3_scale(uint8_t code) {
 #endif
 }
 
-__device__ __forceinline__ float direct_e4m3_scale(uint8_t code) {
-    const unsigned magnitude = code & 127u;
-    const unsigned sign = static_cast<unsigned>(code & 128u) << 24;
-    // Preserve the hardware NaN encoding, including its sign convention.
-    if (magnitude == 127u) return e4m3_scale(code);
-    const unsigned bits = magnitude < 8u
-        ? __float_as_uint(static_cast<float>(magnitude) * (1.f / 512.f))
-        : (magnitude << 20) + (120u << 23);
-    return __uint_as_float(bits | sign);
-}
-
 __device__ float2 e2m1_pair(uint8_t packed) {
 #if CUDART_VERSION >= 12080 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     return __half22float2(static_cast<__half2>(
@@ -1153,13 +1142,6 @@ __device__ float2 e2m1_pair(uint8_t packed) {
 #else
     return make_float2(e2m1_value(packed & 15), e2m1_value(packed >> 4));
 #endif
-}
-
-__device__ float direct_e2m1_value(unsigned code) {
-    const unsigned magnitude = code & 7u;
-    const unsigned bits = magnitude < 2 ? magnitude * 0x3f000000u
-        : ((magnitude / 2 + 126u) << 23) | ((magnitude & 1u) << 22);
-    return __uint_as_float(bits | ((code & 8u) << 28));
 }
 
 template<int Slots = 32, bool RegisterScores = false, bool CachedBest = false, bool PrefetchDescriptors = false, bool DownBf16 = false, bool GateBf16 = false>
@@ -1401,90 +1383,34 @@ struct Nvfp4SimtPacket {
 
 enum class Nvfp4PacketBounds { Checked, Gate2560Proven };
 
-template<bool Inputs, bool Interleaved = false, int LoadHint = 0, bool WarpPacket = false,
-         bool AlignedPackets = false, bool PairOnly = false, bool BroadcastScale = false,
-         bool TiledScale = false, bool NativeMmaLayout = false, bool KmajorCodes = false,
+// One lane's FP4 code pair, block scale and four activations for a row.
+template<bool AlignedPackets = false, bool KmajorCodes = false,
          Nvfp4PacketBounds Bounds = Nvfp4PacketBounds::Checked>
 __device__ __forceinline__ Nvfp4SimtPacket nvfp4_simt_packet(
     const mollm_cuda::Nvfp4Projection& job, int row, int inner, int quad) {
-    static_assert(Bounds == Nvfp4PacketBounds::Checked || (Inputs && KmajorCodes),
+    static_assert(Bounds == Nvfp4PacketBounds::Checked || KmajorCodes,
                   "unchecked packets require the proven gate loop");
     if constexpr (Bounds == Nvfp4PacketBounds::Checked) {
         if (quad >= inner / 4) return {};
     }
     const int groups = inner / 16, group = quad / 4;
-    static_assert(!NativeMmaLayout || (!Interleaved && !LoadHint && !WarpPacket && !AlignedPackets && !PairOnly && !BroadcastScale && !TiledScale));
     const int col = quad * 4;
-    static_assert(!KmajorCodes || (!NativeMmaLayout && !Interleaved));
-    const size_t native_tile = static_cast<size_t>(row / 16) * (inner / 64) + col / 64;
-    const size_t native_offset = (native_tile * 128 +
-        ((col % 64 / 32) * 2 + row % 16 / 8) * 32 +
-        (row % 8) * 4 + col % 32 / 8) * 4 + (col % 8) / 2;
-    const size_t tile = (static_cast<size_t>(row / 4) * groups + group) * 36;
     const size_t offset = KmajorCodes
         ? size_t(col / 64) * 1280 * 32 + (job.pair_layout
             ? size_t(row / 4) * 128 + (col % 64 / 16) * 32 + (row % 4) * 8 + (col % 16) / 2
             : size_t(row) * 32 + (col % 64) / 2)
-        : NativeMmaLayout ? native_offset : Interleaved ? tile + (row % 4) * 8 + (quad % 4) * 2 : (PairOnly || job.pair_layout)
+        : job.pair_layout
         ? (static_cast<size_t>(row / 4) * groups + group) * 32 + (row % 4) * 8 + (quad % 4) * 2
         : static_cast<size_t>(row) * (inner / 2) + quad * 2;
     const auto* codes = job.weight + offset;
     Nvfp4SimtPacket result{};
     const auto* packed = reinterpret_cast<const uint16_t*>(codes);
-    if constexpr (!WarpPacket) result.packed = (AlignedPackets || reinterpret_cast<uintptr_t>(codes) % 2 == 0)
-        ? (LoadHint == 1 || LoadHint == 6 ? __ldcg(packed) : LoadHint == 2 ? __ldcs(packed) : *packed)
-        : uint16_t(codes[0]) | (uint16_t(codes[1]) << 8);
-    if constexpr (LoadHint == 3 || LoadHint == 4) {
-        if (!(reinterpret_cast<uintptr_t>(codes) & 1)) {
-            unsigned short code;
-            unsigned long long policy;
-            if constexpr (LoadHint == 4) asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-            else asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
-            asm volatile("ld.global.L1::no_allocate.L2::cache_hint.u16 %0, [%1], %2;" : "=h"(code) : "l"(codes), "l"(policy));
-            result.packed=code;
-        }
-    }
-    const auto* scale = NativeMmaLayout ? job.block_scales + native_tile * 64 + (row % 8) * 8 + (row % 16 / 8) * 4 + group % 4
-        : Interleaved ? job.weight + tile + 32 + row % 4
-        : job.block_scales + (TiledScale ? (static_cast<size_t>(row / 4) * groups + group) * 4 + row % 4
-                                       : nvfp4_block_scale_offset(job,row,groups,group));
-    if constexpr (!WarpPacket) {
-        if constexpr (BroadcastScale) {
-            unsigned code = (quad & 3) == 0 ? *scale : 0;
-            result.scale = __shfl_sync(0xffffffffu, code, (threadIdx.x & 31) & ~3);
-        } else result.scale = LoadHint == 1 || LoadHint == 5 ? __ldcg(scale) : LoadHint == 2 ? __ldcs(scale) : *scale;
-    }
-    if constexpr (LoadHint == 3 || LoadHint == 4) {
-        unsigned code;
-        unsigned long long policy;
-        if constexpr (LoadHint == 4) asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-        else asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
-        asm volatile("ld.global.L1::no_allocate.L2::cache_hint.u8 %0, [%1], %2;" : "=r"(code) : "l"(scale), "l"(policy));
-        result.scale=code;
-    }
-    if constexpr (WarpPacket) {
-        // Four neighbouring lanes consume one 8-byte FP4 group. Every lane
-        // enters these shuffles; supported K values have no partial warp tail.
-        const int slot=quad&3;
-        const uint8_t* group_codes=codes-slot*2;
-        uint64_t whole=0;
-        unsigned scale_code=0;
-        if(!slot) {
-            if(!(reinterpret_cast<uintptr_t>(group_codes)&7)) whole=*reinterpret_cast<const uint64_t*>(group_codes);
-            else for(int byte=0;byte<8;++byte)whole|=static_cast<uint64_t>(group_codes[byte])<<(byte*8);
-            scale_code=*scale;
-        }
-        const int owner=(threadIdx.x&31)&~3;
-        const uint32_t low=__shfl_sync(0xffffffffu,static_cast<uint32_t>(whole),owner);
-        const uint32_t high=__shfl_sync(0xffffffffu,static_cast<uint32_t>(whole>>32),owner);
-        result.packed=(slot<2?low:high)>>((slot&1)*16);
-        result.scale=__shfl_sync(0xffffffffu,scale_code,owner);
-    }
-    if constexpr (Inputs) {
-        const float* x = job.input + quad * 4;
-        result.input = (AlignedPackets || reinterpret_cast<uintptr_t>(x) % alignof(float4) == 0)
-            ? *reinterpret_cast<const float4*>(x) : make_float4(x[0], x[1], x[2], x[3]);
-    }
+    result.packed = (AlignedPackets || reinterpret_cast<uintptr_t>(codes) % 2 == 0)
+        ? *packed : uint16_t(codes[0]) | (uint16_t(codes[1]) << 8);
+    result.scale = job.block_scales[nvfp4_block_scale_offset(job,row,groups,group)];
+    const float* x = job.input + quad * 4;
+    result.input = (AlignedPackets || reinterpret_cast<uintptr_t>(x) % alignof(float4) == 0)
+        ? *reinterpret_cast<const float4*>(x) : make_float4(x[0], x[1], x[2], x[3]);
     return result;
 }
 
@@ -1498,12 +1424,12 @@ __global__ void nvfp4_exact_subwarp_cuda(const mollm_cuda::Nvfp4Projection* jobs
     Nvfp4SimtPacket pending[chains]{};
 #pragma unroll
     for(int chain=0;chain<chains;++chain)
-        if(row<rows)pending[chain]=nvfp4_simt_packet<true>(job,row,inner,lane+chain*Lanes);
+        if(row<rows)pending[chain]=nvfp4_simt_packet<>(job,row,inner,lane+chain*Lanes);
     for(int first=lane;first<inner/4;first+=32) {
         Nvfp4SimtPacket next[chains]{};
 #pragma unroll
         for(int chain=0;chain<chains;++chain)
-            if(row<rows)next[chain]=nvfp4_simt_packet<true>(job,row,inner,first+chain*Lanes+32);
+            if(row<rows)next[chain]=nvfp4_simt_packet<>(job,row,inner,first+chain*Lanes+32);
 #pragma unroll
         for(int chain=0;chain<chains;++chain) {
             if constexpr(TailGuard) { if(first+chain*Lanes>=inner/4)continue; }
@@ -1522,104 +1448,62 @@ __global__ void nvfp4_exact_subwarp_cuda(const mollm_cuda::Nvfp4Projection* jobs
     if(!lane && row<rows)job.output[row]=sum*job.row_scales[row];
 }
 
-template<int PrefetchIterations = 0, bool NativeMmaLayout = false, bool PairedJobs = false,
-         int PlannedSize = 0, int Pipeline = 0, int PipelineDepth = 1, bool Interleaved = false,
-         bool CacheInput = false, int LoadHint = 0, bool DirectFp4 = false, bool InlinePairs = false,
-         bool RankPairs = false, int FixedInner = 0, bool WarpPacket = false,
-         bool AlignedPackets = false, bool DirectScale = false, bool RouteMajor = false,
-         bool PairOnly = false, bool BroadcastScale = false, bool TiledScale = false,
-         bool KmajorCodes = false, bool ProvenDescriptor = false>
+// The forms of the one-row-per-warp SIMT projection that launchers select.
+struct Nvfp4SimtCanonical { // Canonical or pair layout, loads inside the dot loop.
+    static constexpr bool native_mma_layout = false; // Weights in native MMA fragment order.
+    static constexpr bool pipelined = false;         // Load each packet one iteration ahead.
+    static constexpr bool prefetch_row_scale = false; // L2 prefetch of the row scale on entry.
+    static constexpr bool aligned_packets = false;   // Caller guarantees aligned codes and inputs.
+    static constexpr bool kmajor_codes = false;      // Resident K-major gate codes.
+    static constexpr bool proven_descriptor = false; // Descriptor layout validated by the backend.
+};
+struct Nvfp4SimtNativeLayout : Nvfp4SimtCanonical { static constexpr bool native_mma_layout = true; };
+struct Nvfp4SimtPipelined : Nvfp4SimtCanonical { static constexpr bool pipelined = true; };
+struct Nvfp4SimtPipelinedRowScalePrefetch : Nvfp4SimtPipelined {
+    static constexpr bool prefetch_row_scale = true;
+};
+struct Nvfp4SimtKmajor : Nvfp4SimtCanonical { static constexpr bool kmajor_codes = true; };
+struct Nvfp4SimtKmajorPipelined : Nvfp4SimtKmajor { static constexpr bool pipelined = true; };
+struct Nvfp4SimtKmajorProven : Nvfp4SimtKmajorPipelined {
+    static constexpr bool aligned_packets = true;
+    static constexpr bool proven_descriptor = true;
+};
+
+template<class Variant>
 __global__ void nvfp4_projections_cuda(
-    const mollm_cuda::Nvfp4Projection* jobs, int rows, int dynamic_inner, int count = 0,
-    const mollm_cuda::Nvfp4MmaBatch* plan = nullptr) {
-    const int inner = FixedInner ? FixedInner : dynamic_inner;
-    static_assert(!KmajorCodes || (!NativeMmaLayout && !Interleaved && !PairedJobs && !PrefetchIterations));
-    if constexpr (PlannedSize != 0) {
-        const int valid = PlannedSize == 2 ? plan[count].first : plan[count].size;
-        if (blockIdx.y >= valid) return;
-    }
+    const mollm_cuda::Nvfp4Projection* jobs, int rows, int inner) {
+    constexpr bool NativeMmaLayout = Variant::native_mma_layout;
+    constexpr bool Pipelined = Variant::pipelined;
+    constexpr bool AlignedPackets = Variant::aligned_packets;
+    constexpr bool KmajorCodes = Variant::kmajor_codes;
+    static_assert(!NativeMmaLayout || (!Pipelined && !KmajorCodes && !Variant::prefetch_row_scale));
+    static_assert(!AlignedPackets || Pipelined);
+    static_assert(!Variant::proven_descriptor || (Pipelined && AlignedPackets && KmajorCodes));
     const int warps = blockDim.x / 32;
-    static_assert(!Interleaved || (Pipeline == 2 && !NativeMmaLayout && !PairedJobs && !PlannedSize));
     constexpr int lanes = 32;
-    const int row = (RouteMajor ? blockIdx.y : blockIdx.x) * warps + threadIdx.x / 32;
-    if constexpr (!CacheInput) { if (row >= rows) return; }
+    const int row = blockIdx.x * warps + threadIdx.x / 32;
+    if (row >= rows) return;
     const int lane = threadIdx.x % lanes;
-    int first = RouteMajor ? blockIdx.x : PlannedSize == 2 ? plan[blockIdx.y].first :
-        PlannedSize == 1 ? plan[count - 1 - blockIdx.y].first :
-        blockIdx.y * (PairedJobs ? 2 : 1);
-    const auto same_group = [](const auto& a, const auto& b) {
-        return same_nvfp4_expert(a,b) && a.pair_layout == b.pair_layout;
-    };
-    if constexpr (InlinePairs) {
-        static_assert(PairedJobs && !PlannedSize && !NativeMmaLayout && !CacheInput);
-        first = blockIdx.y;
-        if constexpr (RankPairs) {
-            if (plan[first].first < 0) return;
-        } else {
-            int begin = first;
-            while (begin > 0 && same_group(jobs[begin-1],jobs[first])) --begin;
-            if ((first-begin) & 1) return;
-        }
-    }
-    auto job = jobs[first];
-    static_assert(!ProvenDescriptor || (Pipeline == 2 && AlignedPackets && KmajorCodes &&
-        !NativeMmaLayout && !PairedJobs && !PlannedSize && !Interleaved));
-    if constexpr (ProvenDescriptor) {
+    auto job = jobs[blockIdx.y];
+    if constexpr (Variant::proven_descriptor) {
         // The resident backend validates every weight descriptor at table
         // construction and each routed input before this specialization.
         job.pair_layout = true;
         job.gate_scales_kmajor = true;
     }
-    float early_row_scale = 0.f;
-    if constexpr (LoadHint == 8) {
-        if (lane == 0 && row < rows)
-            asm volatile("ld.global.f32 %0, [%1];" : "=f"(early_row_scale) : "l"(job.row_scales + row));
-    }
-    if constexpr (LoadHint == 7) {
-        if (lane == 0 && row < rows)
+    if constexpr (Variant::prefetch_row_scale) {
+        if (lane == 0)
             asm volatile("prefetch.global.L2 [%0];" :: "l"(job.row_scales + row));
     }
-    if constexpr (LoadHint == 9) {
-        // Four adjacent scales fit an aligned16-byte segment. Otherwise
-        // retain per-warp prefetch so the final scale is not overlooked.
-        if (lane == 0 && row < rows &&
-            (threadIdx.x == 0 || reinterpret_cast<uintptr_t>(job.row_scales) % 16 != 0))
-            asm volatile("prefetch.global.L2 [%0];" :: "l"(job.row_scales + row));
-    }
-    if constexpr (CacheInput) {
-        static_assert(Pipeline == 2 && !NativeMmaLayout && !PairedJobs && !PlannedSize);
-        extern __shared__ float cached_input[];
-        for (int i = threadIdx.x; i < inner; i += blockDim.x)
-            cached_input[i] = job.input[i];
-        __syncthreads();
-        job.input = cached_input;
-        if (row >= rows) return;
-    }
-    const bool second_valid = PairedJobs && first + 1 < count &&
-        (!InlinePairs || same_group(jobs[first],jobs[first+1])) &&
-        (!RankPairs || plan[first].size==2);
-    const auto second = second_valid ? jobs[first + 1] : job;
-    const bool shared = second.weight == job.weight &&
-        second.block_scales == job.block_scales && second.pair_layout == job.pair_layout;
     const int groups = inner / 16;
     float sum = 0.0f;
-    float second_sum = 0.0f;
-    Nvfp4SimtPacket pending[PipelineDepth]{};
-    if constexpr (Pipeline) {
-        static_assert((!PairedJobs || InlinePairs) && !PlannedSize);
-        static_assert(!NativeMmaLayout || (!PairedJobs && !Interleaved && !CacheInput && !LoadHint && !DirectFp4 && !FixedInner && !WarpPacket && !AlignedPackets && !DirectScale && !RouteMajor && !PairOnly && !BroadcastScale && !TiledScale));
-        static_assert(PipelineDepth == 1 || PipelineDepth == 2 || PipelineDepth == 4);
-#pragma unroll
-        for (int i = 0; i < PipelineDepth; ++i)
-            pending[i] = nvfp4_simt_packet<Pipeline == 2, Interleaved, LoadHint, WarpPacket, AlignedPackets, PairOnly, BroadcastScale, TiledScale, NativeMmaLayout, KmajorCodes>(job, row, inner, lane + lanes * i);
-    }
+    Nvfp4SimtPacket pending{};
+    if constexpr (Pipelined)
+        pending = nvfp4_simt_packet<AlignedPackets, KmajorCodes>(job, row, inner, lane);
     for (int quad = lane; quad < inner / 4; quad += lanes) {
-        if constexpr (LoadHint == 10) {
-            if (lane == 0 && quad == (inner / 4 / lanes / 2) * lanes)
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(job.row_scales + row));
-        }
         Nvfp4SimtPacket incoming{};
-        if constexpr (Pipeline) incoming = nvfp4_simt_packet<Pipeline == 2, Interleaved, LoadHint, WarpPacket, AlignedPackets, PairOnly, BroadcastScale, TiledScale, NativeMmaLayout, KmajorCodes>(job, row, inner, quad + lanes * PipelineDepth);
+        if constexpr (Pipelined)
+            incoming = nvfp4_simt_packet<AlignedPackets, KmajorCodes>(job, row, inner, quad + lanes);
         const int group = quad / 4;
         const int col = quad * 4;
         const size_t native_tile = static_cast<size_t>(row / 16) * (inner / 64) + col / 64;
@@ -1635,33 +1519,18 @@ __global__ void nvfp4_projections_cuda(
               (row % 4) * 8 + (quad % 4) * 2
             : static_cast<size_t>(row) * (inner / 2) + quad * 2;
         const uint8_t* codes = job.weight + offset;
-        if constexpr (PrefetchIterations > 0) {
-            if (!NativeMmaLayout && quad + lanes * PrefetchIterations < inner / 4) {
-                const auto* next_codes = codes +
-                    (job.pair_layout ? 256 : 64) * PrefetchIterations;
-                const auto* next_scale = job.block_scales +
-                    static_cast<size_t>(row) * groups + group + 8 * PrefetchIterations;
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_codes));
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(next_scale));
-            }
-        }
-        const uint16_t packed = Pipeline ? pending[0].packed : reinterpret_cast<uintptr_t>(codes) % 2 == 0
+        const uint16_t packed = Pipelined ? pending.packed : reinterpret_cast<uintptr_t>(codes) % 2 == 0
             ? *reinterpret_cast<const uint16_t*>(codes)
             : static_cast<uint16_t>(codes[0]) | (static_cast<uint16_t>(codes[1]) << 8);
         const size_t scale_offset = NativeMmaLayout
             ? native_tile * 64 + (row % 8) * 8 + (row % 16 / 8) * 4 + group % 4
             : nvfp4_block_scale_offset(job,row,groups,group);
-        const uint8_t scale_code = Pipeline ? pending[0].scale : job.block_scales[scale_offset];
-        float scale;
-        if constexpr (LoadHint == 11) {
-            const unsigned scale_mask = __activemask();
-            const float leader_scale = (lane % 4 == 0) ? e4m3_scale(scale_code) : 0.f;
-            scale = __shfl_sync(scale_mask, leader_scale, lane & ~3);
-        } else scale = DirectScale ? direct_e4m3_scale(scale_code) : e4m3_scale(scale_code);
-        const float2 w0 = DirectFp4 ? make_float2(direct_e2m1_value(packed),direct_e2m1_value(packed >> 4)) : e2m1_pair(packed & 255);
-        const float2 w1 = DirectFp4 ? make_float2(direct_e2m1_value(packed >> 8),direct_e2m1_value(packed >> 12)) : e2m1_pair(packed >> 8);
+        const uint8_t scale_code = Pipelined ? pending.scale : job.block_scales[scale_offset];
+        const float scale = e4m3_scale(scale_code);
+        const float2 w0 = e2m1_pair(packed & 255);
+        const float2 w1 = e2m1_pair(packed >> 8);
         const float* x = job.input + quad * 4;
-        const float4 a = Pipeline == 2 ? pending[0].input : reinterpret_cast<uintptr_t>(x) % alignof(float4) == 0
+        const float4 a = Pipelined ? pending.input : reinterpret_cast<uintptr_t>(x) % alignof(float4) == 0
             ? *reinterpret_cast<const float4*>(x)
             : make_float4(x[0], x[1], x[2], x[3]);
         float dot = a.x * w0.x;
@@ -1669,49 +1538,12 @@ __global__ void nvfp4_projections_cuda(
         dot = fmaf(a.z, w1.x, dot);
         dot = fmaf(a.w, w1.y, dot);
         sum = fmaf(dot, scale, sum);
-        if constexpr (Pipeline) {
-#pragma unroll
-            for (int i = 0; i + 1 < PipelineDepth; ++i) pending[i] = pending[i + 1];
-            pending[PipelineDepth - 1] = incoming;
-        }
-        if constexpr (PairedJobs) {
-            if (second_valid) {
-                const size_t second_offset = NativeMmaLayout ? native_offset : second.pair_layout
-                    ? (static_cast<size_t>(row / 4) * groups + group) * 32 +
-                      (row % 4) * 8 + (quad % 4) * 2
-                    : static_cast<size_t>(row) * (inner / 2) + quad * 2;
-                const uint8_t* second_codes = second.weight + second_offset;
-                const uint16_t second_packed = shared ? packed :
-                    reinterpret_cast<uintptr_t>(second_codes) % 2 == 0
-                    ? *reinterpret_cast<const uint16_t*>(second_codes)
-                    : static_cast<uint16_t>(second_codes[0]) |
-                      (static_cast<uint16_t>(second_codes[1]) << 8);
-                const float second_scale = shared ? scale : e4m3_scale(second.block_scales[scale_offset]);
-                const float2 v0 = shared ? w0 : e2m1_pair(second_packed & 255);
-                const float2 v1 = shared ? w1 : e2m1_pair(second_packed >> 8);
-                const float* y = second.input + quad * 4;
-                const float4 b = reinterpret_cast<uintptr_t>(y) % alignof(float4) == 0
-                    ? *reinterpret_cast<const float4*>(y)
-                    : make_float4(y[0], y[1], y[2], y[3]);
-                float second_dot = b.x * v0.x;
-                second_dot = fmaf(b.y, v0.y, second_dot);
-                second_dot = fmaf(b.z, v1.x, second_dot);
-                second_dot = fmaf(b.w, v1.y, second_dot);
-                second_sum = fmaf(second_dot, second_scale, second_sum);
-            }
-        }
+        if constexpr (Pipelined) pending = incoming;
     }
     const unsigned mask = __activemask();
     for (int offset = lanes / 2; offset; offset /= 2)
         sum += __shfl_down_sync(mask, sum, offset, lanes);
-    if (lane == 0) job.output[row] = sum * (LoadHint == 8 ? early_row_scale : job.row_scales[row]);
-    if constexpr (PairedJobs) {
-        if (second_valid) {
-            for (int offset = lanes / 2; offset; offset /= 2)
-                second_sum += __shfl_down_sync(mask, second_sum, offset, lanes);
-            if (lane == 0) second.output[row] = second_sum * second.row_scales[row];
-        }
-    }
+    if (lane == 0) job.output[row] = sum * job.row_scales[row];
 }
 
 // Two virtual 32-lane FMA chains per physical 16-lane row. The merge is the
@@ -1725,8 +1557,7 @@ __device__ __forceinline__ void nvfp4_gate_code_subgroup_compute(
     const mollm_cuda::Nvfp4Projection& job, int row, int lane) {
     constexpr int inner = 2560, quads = inner / 4;
     const auto packet = [&](int quad) {
-        return nvfp4_simt_packet<true, false, 0, false, Aligned, false, false, false, false, true,
-            Nvfp4PacketBounds::Gate2560Proven>(job, row, inner, quad);
+        return nvfp4_simt_packet<Aligned, true, Nvfp4PacketBounds::Gate2560Proven>(job, row, inner, quad);
     };
     const auto accumulate = [](const Nvfp4SimtPacket& p, float sum) {
         const float2 low = e2m1_pair(p.packed & 255);
@@ -1795,8 +1626,7 @@ __device__ __forceinline__ void nvfp4_gate_pair_compute(
     if constexpr (ScaleMajor) job.gate_scales_kmajor = true;
     const auto packet = [&](int q) {
         Nvfp4GatePairPacket p;
-        p.first = nvfp4_simt_packet<true, false, 0, false, Aligned, false, false, false, false, true,
-            Nvfp4PacketBounds::Gate2560Proven>(job, row, 2560, q);
+        p.first = nvfp4_simt_packet<Aligned, true, Nvfp4PacketBounds::Gate2560Proven>(job, row, 2560, q);
         const float* x = other.input + 4 * q;
         p.second = (Aligned || (reinterpret_cast<uintptr_t>(x) & 15) == 0)
             ? *reinterpret_cast<const float4*>(x)
@@ -1888,8 +1718,7 @@ __device__ __forceinline__ void nvfp4_gate_eight_compute(
     int row, int lane) {
     const auto packet = [&](int q) {
         Nvfp4GatePairPacket p{};
-        p.first = nvfp4_simt_packet<true, false, 0, false, Aligned, false, false, false, false, true,
-            Nvfp4PacketBounds::Gate2560Proven>(job, row, 2560, q);
+        p.first = nvfp4_simt_packet<Aligned, true, Nvfp4PacketBounds::Gate2560Proven>(job, row, 2560, q);
         if constexpr (Pair) {
             const float* x = other.input + 4 * q;
             p.second = (Aligned || (reinterpret_cast<uintptr_t>(x) & 15) == 0)
@@ -2598,9 +2427,9 @@ void launch_nvfp4_projections(const Nvfp4Projection* jobs, int count,
                               int rows, int inner, cudaStream_t stream, bool mma_layout) {
     const dim3 grid((rows + 3) / 4, count);
     if (mma_layout)
-        nvfp4_projections_cuda<0, true><<<grid, 128, 0, stream>>>(jobs, rows, inner);
+        nvfp4_projections_cuda<Nvfp4SimtNativeLayout><<<grid, 128, 0, stream>>>(jobs, rows, inner);
     else
-        nvfp4_projections_cuda<><<<grid, 128, 0, stream>>>(jobs, rows, inner);
+        nvfp4_projections_cuda<Nvfp4SimtCanonical><<<grid, 128, 0, stream>>>(jobs, rows, inner);
 }
 
 cudaError_t launch_nvfp4_exact_subwarp(const Nvfp4Projection* jobs,int count,int rows,int inner,int lanes,cudaStream_t stream) {
@@ -2621,11 +2450,9 @@ cudaError_t launch_nvfp4_gate_code_projections(const Nvfp4Projection* jobs,
         return cudaErrorInvalidValue;
     const dim3 grid(320, count);
     if (pipeline_inputs)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,0,false,false,false,false,false,false,false,true>
-            <<<grid,128,0,stream>>>(jobs,rows,inner);
+        nvfp4_projections_cuda<Nvfp4SimtKmajorPipelined><<<grid,128,0,stream>>>(jobs,rows,inner);
     else
-        nvfp4_projections_cuda<0,false,false,0,0,1,false,false,0,false,false,false,0,false,false,false,false,false,false,false,true>
-            <<<grid,128,0,stream>>>(jobs,rows,inner);
+        nvfp4_projections_cuda<Nvfp4SimtKmajor><<<grid,128,0,stream>>>(jobs,rows,inner);
     return cudaGetLastError();
 }
 
@@ -2635,9 +2462,7 @@ cudaError_t launch_nvfp4_gate_code_m1_proven_projections(const Nvfp4Projection* 
         reinterpret_cast<uintptr_t>(jobs) % alignof(Nvfp4Projection))
         return cudaErrorInvalidValue;
     // Retain runtime bounds and the original pending-packet schedule.
-    nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 0, false, false, false, 0,
-        false, true, false, false, false, false, false, true, true>
-        <<<dim3(320, count), 128, 0, stream>>>(jobs, rows, inner);
+    nvfp4_projections_cuda<Nvfp4SimtKmajorProven><<<dim3(320, count), 128, 0, stream>>>(jobs, rows, inner);
     return cudaGetLastError();
 }
 
@@ -2672,75 +2497,15 @@ cudaError_t launch_nvfp4_gate_paired8_projections(const Nvfp4Projection* jobs,
 }
 
 cudaError_t launch_nvfp4_pipelined_projections(const Nvfp4Projection* jobs, int count,
-    int rows, int inner, bool pipeline_inputs, cudaStream_t stream, bool cache_input, int load_hint,
-    bool direct_fp4, bool fixed_inner, bool warp_packet, bool aligned_packets, bool direct_scale, bool route_major, bool pair_only, bool broadcast_scale) {
+    int rows, int inner, cudaStream_t stream, bool prefetch_row_scale) {
     if (count < 0 || count > 65535 || rows <= 0 || rows > INT32_MAX - 3 ||
         inner <= 0 || inner > INT32_MAX - 128 || inner % 16 || (count && !jobs)) return cudaErrorInvalidValue;
-    if (cache_input && (!pipeline_inputs || inner > 4096)) return cudaErrorInvalidValue;
-    if (load_hint < 0 || load_hint > 11 || (load_hint && (!pipeline_inputs || cache_input))) return cudaErrorInvalidValue;
-    if (direct_fp4 && (!pipeline_inputs || cache_input || load_hint)) return cudaErrorInvalidValue;
-    if (fixed_inner && (!pipeline_inputs || cache_input || load_hint || direct_fp4 ||
-        (inner != 640 && inner != 2560))) return cudaErrorInvalidValue;
-    if(warp_packet&&(!pipeline_inputs||cache_input||load_hint||direct_fp4||fixed_inner||inner%128))
-        return cudaErrorInvalidValue;
-    if(aligned_packets&&(!pipeline_inputs||cache_input||load_hint||direct_fp4||fixed_inner||warp_packet))
-        return cudaErrorInvalidValue;
-    if(direct_scale&&(!pipeline_inputs||cache_input||load_hint||direct_fp4||fixed_inner||warp_packet||aligned_packets))
-        return cudaErrorInvalidValue;
-    if(route_major&&(!pipeline_inputs||cache_input||load_hint||direct_fp4||fixed_inner||warp_packet||aligned_packets||direct_scale||rows>65535*4))
-        return cudaErrorInvalidValue;
-    if(pair_only&&(!pipeline_inputs||cache_input||load_hint||direct_fp4||fixed_inner||warp_packet||aligned_packets||direct_scale||route_major))
-        return cudaErrorInvalidValue;
-    if(broadcast_scale && (!pipeline_inputs || cache_input || load_hint || direct_fp4 || fixed_inner ||
-        warp_packet || aligned_packets || direct_scale || route_major || pair_only || inner%128)) return cudaErrorInvalidValue;
     if (!count) return cudaSuccess;
     const dim3 grid((rows + 3) / 4, count);
-    if(broadcast_scale)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,0,false,false,false,false,false,true><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if(pair_only)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,0,false,false,false,false,true><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if(route_major)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,0,false,false,false,true><<<dim3(count,(rows+3)/4),128,0,stream>>>(jobs,rows,inner);
-    else if(direct_scale)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,0,false,false,true><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if(aligned_packets)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,0,false,true><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if(warp_packet)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,0,true><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (fixed_inner && inner == 640)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,640><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (fixed_inner)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,false,false,false,2560><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (direct_fp4)
-        nvfp4_projections_cuda<0,false,false,0,2,1,false,false,0,true><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 11)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 11><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 10)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 10><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 9)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 9><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 8)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 8><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 7)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 7><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 6)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 6><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 5)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 5><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 4)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 4><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 3)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 3><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 1)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 1><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (load_hint == 2)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, false, 2><<<grid,128,0,stream>>>(jobs,rows,inner);
-    else if (cache_input)
-        nvfp4_projections_cuda<0, false, false, 0, 2, 1, false, true><<<grid,128,inner*sizeof(float),stream>>>(jobs,rows,inner);
-    else if (pipeline_inputs)
-        nvfp4_projections_cuda<0, false, false, 0, 2><<<grid,128,0,stream>>>(jobs,rows,inner);
+    if (prefetch_row_scale)
+        nvfp4_projections_cuda<Nvfp4SimtPipelinedRowScalePrefetch><<<grid,128,0,stream>>>(jobs,rows,inner);
     else
-        nvfp4_projections_cuda<0, false, false, 0, 1><<<grid,128,0,stream>>>(jobs,rows,inner);
+        nvfp4_projections_cuda<Nvfp4SimtPipelined><<<grid,128,0,stream>>>(jobs,rows,inner);
     return cudaGetLastError();
 }
 
