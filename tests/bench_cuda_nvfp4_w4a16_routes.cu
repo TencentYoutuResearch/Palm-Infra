@@ -86,8 +86,17 @@ int main(int argc,char** argv){
         options.kmajor_input_scales=true;
         if(gate)ck(mollm_cuda::launch_nvfp4_mma_fused_activation(jobs,down_jobs,count,native_plan,packed,scales,activated,down_packed,down_scales,options,
             cudaStreamPerThread));
-        else ck(mollm_cuda::launch_nvfp4_mma_grouped(jobs,count,native_plan,rows,inner,0,cudaStreamPerThread,
-            packed,scales,1,true,false,nullptr,0,8,false,prepared,false,true,false,true,false));};
+        else ck(mollm_cuda::launch_nvfp4_mma_grouped(jobs, count, native_plan, rows, inner,
+            [&] {
+                mollm_cuda::Nvfp4GroupedOptions o;
+                o.packed_inputs = packed;
+                o.input_scales = scales;
+                o.canonical_weights = true;
+                o.inputs_prepared = prepared;
+                o.output_bf16 = true;
+                o.parallel_plan = true;
+                return o;
+            }(), cudaStreamPerThread));};
     cudaGraph_t g;cudaGraphExec_t ex;ck(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));candidate();ck(cudaStreamEndCapture(cudaStreamPerThread,&g));ck(cudaGraphInstantiateWithFlags(&ex,g,0));
     std::vector<float> hx(size_t(count)*inner),ref(size_t(count)*rows);std::vector<__nv_bfloat16> result(size_t(count)*rows+16);
     size_t comparisons=0;double worst=0;

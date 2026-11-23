@@ -2012,10 +2012,17 @@ cudaError_t launch_nvfp4_mma_fused_activation(const Nvfp4Projection* jobs,
 }
 
 cudaError_t launch_nvfp4_mma_grouped(const Nvfp4Projection* jobs, int count,
-    Nvfp4MmaBatch* batches, int rows, int inner, int split_row, cudaStream_t stream,
-    uint8_t* packed_inputs, uint8_t* input_scales, int minimum, bool canonical_weights,
-    bool prepare_singles, Nvfp4MmaBatch* compact_batches, int compact_grid_y, int max_batch_size,
-    bool specialized_prepared, bool inputs_prepared, bool async_weights,bool output_bf16,bool early_inputs,bool parallel_plan,bool vector_quantize,bool gate_codes_kmajor) {
+    Nvfp4MmaBatch* batches, int rows, int inner, const Nvfp4GroupedOptions& options, cudaStream_t stream) {
+    const int split_row = options.split_row, minimum = options.min_batch_size;
+    uint8_t* const packed_inputs = options.packed_inputs;
+    uint8_t* const input_scales = options.input_scales;
+    const bool canonical_weights = options.canonical_weights, prepare_singles = options.prepare_singles;
+    Nvfp4MmaBatch* const compact_batches = options.compact_batches;
+    const int compact_grid_y = options.compact_grid_y, max_batch_size = options.max_batch_size;
+    const bool specialized_prepared = options.specialized_prepared, inputs_prepared = options.inputs_prepared;
+    const bool async_weights = options.async_weights, output_bf16 = options.output_bf16;
+    const bool early_inputs = options.early_inputs, parallel_plan = options.parallel_plan;
+    const bool vector_quantize = options.vector_quantize, gate_codes_kmajor = options.gate_codes_kmajor;
     if (gate_codes_kmajor && (!canonical_weights || rows != 1280 || inner != 2560))
         return cudaErrorInvalidValue;
     if(vector_quantize&&(!output_bf16||!async_weights||rows!=1280||inner!=2560||

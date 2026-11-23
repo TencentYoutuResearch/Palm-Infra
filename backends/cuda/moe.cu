@@ -843,13 +843,27 @@ bool CudaBackend::try_nvfp4_moe(
                 } else if (native_mma) {
                     if (use_batched) {
                         auto* scratch = static_cast<uint8_t*>(impl_->moe_mma_group_scratch);
+                        mollm_cuda::Nvfp4GroupedOptions grouped;
+                        grouped.split_row = inter;
+                        grouped.packed_inputs = scratch + batch_bytes;
+                        grouped.input_scales = scratch + batch_bytes + packed_bytes;
+                        grouped.min_batch_size = batch_gate_min;
+                        grouped.canonical_weights = canonical_mma;
+                        grouped.prepare_singles = prepare_singles;
+                        grouped.compact_batches = compact_gate_dispatch
+                            ? reinterpret_cast<mollm_cuda::Nvfp4MmaBatch*>(scratch + compact_offset) : nullptr;
+                        grouped.compact_grid_y = gate_compact_grid_y;
+                        grouped.max_batch_size = gate_batch_routes;
+                        grouped.specialized_prepared = specialized_prepared;
+                        grouped.async_weights = async_gate;
+                        grouped.output_bf16 = gate_output_bf16;
+                        grouped.early_inputs = gate_early_inputs;
+                        grouped.parallel_plan = parallel_plan;
+                        grouped.vector_quantize = gate_vector_quantize;
+                        grouped.gate_codes_kmajor = gate_codes_kmajor;
                         if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_mma_grouped(
                             gate_jobs, routes, reinterpret_cast<mollm_cuda::Nvfp4MmaBatch*>(scratch),
-                            2 * inter, hidden, inter, execution_stream, scratch + batch_bytes,
-                            scratch + batch_bytes + packed_bytes, batch_gate_min, canonical_mma, prepare_singles,
-                            compact_gate_dispatch ? reinterpret_cast<mollm_cuda::Nvfp4MmaBatch*>(scratch + compact_offset) : nullptr,
-                            gate_compact_grid_y, gate_batch_routes, specialized_prepared,false,async_gate,
-                            gate_output_bf16,gate_early_inputs,parallel_plan,gate_vector_quantize,gate_codes_kmajor), "NVFP4 batched gate/up MMA")) return fail();
+                            2 * inter, hidden, grouped, execution_stream), "NVFP4 batched gate/up MMA")) return fail();
                         if(gate_output_bf16)++impl_->moe_bf16_gate_output_prefill_calls;
                         if(parallel_plan)++impl_->moe_parallel_batch_plan_prefill_calls;
                         if(gate_early_inputs)++impl_->moe_gate_early_inputs_prefill_calls;
@@ -926,15 +940,23 @@ bool CudaBackend::try_nvfp4_moe(
                 if (native_mma) {
                     if (use_batched) {
                         auto* scratch = static_cast<uint8_t*>(impl_->moe_mma_group_scratch);
+                        mollm_cuda::Nvfp4GroupedOptions grouped;
+                        grouped.packed_inputs = scratch+(mma_activation_fused?fused_down_offset:batch_bytes);
+                        grouped.input_scales = scratch+(mma_activation_fused?fused_down_offset+routes*size_t(inter)/2:batch_bytes+packed_bytes);
+                        grouped.min_batch_size = batch_down_min;
+                        grouped.canonical_weights = canonical_mma;
+                        grouped.prepare_singles = prepare_singles;
+                        grouped.compact_batches = compact_down_dispatch
+                            ? reinterpret_cast<mollm_cuda::Nvfp4MmaBatch*>(scratch + compact_offset) : nullptr;
+                        grouped.compact_grid_y = compact_grid_y;
+                        grouped.max_batch_size = mma_batch_routes;
+                        grouped.specialized_prepared = specialized_prepared;
+                        grouped.inputs_prepared = fused_prepare;
+                        grouped.output_bf16 = down_output_bf16;
+                        grouped.parallel_plan = parallel_plan;
                         if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_mma_grouped(
                             down_jobs, routes, reinterpret_cast<mollm_cuda::Nvfp4MmaBatch*>(scratch),
-                            hidden, inter, 0, execution_stream,
-                            scratch+(mma_activation_fused?fused_down_offset:batch_bytes),
-                            scratch+(mma_activation_fused?fused_down_offset+routes*size_t(inter)/2:batch_bytes+packed_bytes),
-                            batch_down_min, canonical_mma, prepare_singles,
-                            compact_down_dispatch ? reinterpret_cast<mollm_cuda::Nvfp4MmaBatch*>(scratch + compact_offset) : nullptr,
-                            compact_grid_y, mma_batch_routes, specialized_prepared,fused_prepare,
-                            false,down_output_bf16,false,parallel_plan), "NVFP4 batched down MMA")) return fail();
+                            hidden, inter, grouped, execution_stream), "NVFP4 batched down MMA")) return fail();
                         if (down_output_bf16) ++impl_->moe_bf16_down_output_prefill_calls;
                         if(parallel_plan)++impl_->moe_parallel_batch_plan_prefill_calls;
                         if (compact_down_dispatch) ++impl_->moe_down_compact_prefill_calls;

@@ -23,9 +23,28 @@ struct Args {
     bool code_kmajor=false,bf16=false,early=false,parallel=false,vector=false,singles=false;
 };
 cudaError_t launch(const Args& a,bool async) {
-    return mollm_cuda::launch_nvfp4_mma_grouped(a.jobs,a.count,a.batches,a.rows,a.inner,
-        a.split,cudaStreamPerThread,a.packed,a.scales,a.minimum,a.canonical,a.singles,
-        a.compact,a.hint,a.width,a.specialized,a.prepared,async,a.bf16,a.early,a.parallel,a.vector,a.code_kmajor);
+    return mollm_cuda::launch_nvfp4_mma_grouped(a.jobs, a.count, a.batches, a.rows, a.inner,
+        [&] {
+            mollm_cuda::Nvfp4GroupedOptions o;
+            o.split_row = a.split;
+            o.packed_inputs = a.packed;
+            o.input_scales = a.scales;
+            o.min_batch_size = a.minimum;
+            o.canonical_weights = a.canonical;
+            o.prepare_singles = a.singles;
+            o.compact_batches = a.compact;
+            o.compact_grid_y = a.hint;
+            o.max_batch_size = a.width;
+            o.specialized_prepared = a.specialized;
+            o.inputs_prepared = a.prepared;
+            o.async_weights = async;
+            o.output_bf16 = a.bf16;
+            o.early_inputs = a.early;
+            o.parallel_plan = a.parallel;
+            o.vector_quantize = a.vector;
+            o.gate_codes_kmajor = a.code_kmajor;
+            return o;
+        }(), cudaStreamPerThread);
 }
 }
 

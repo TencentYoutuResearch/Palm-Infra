@@ -35,8 +35,15 @@ static void run(const std::vector<int>& counts,bool timing){
         variant==0?nullptr:jobs.p,variant==1?0:variant==2?65536:count,
         variant==3?nullptr:parallel.p,variant==4?7:variant==5?64:32,true,cudaStreamPerThread);
         if(status!=cudaErrorInvalidValue)std::exit(4);++rejected;}
-    for(int variant=0;variant<2;++variant){const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p,count,parallel.p,
-        2560,640,0,cudaStreamPerThread,nullptr,nullptr,1,true,false,variant==0?parallel.p:nullptr,0,8,variant==1,false,false,false,false,true);
+    for(int variant=0;variant<2;++variant){const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p, count, parallel.p, 2560, 640,
+        [&] {
+            mollm_cuda::Nvfp4GroupedOptions o;
+            o.canonical_weights = true;
+            o.compact_batches = variant==0?parallel.p:nullptr;
+            o.specialized_prepared = variant==1;
+            o.parallel_plan = true;
+            return o;
+        }(), cudaStreamPerThread);
         if(status!=cudaErrorInvalidValue)std::exit(4);++rejected;}
     std::vector<unsigned char> untouched(size_t(count+8)*sizeof(*parallel.p));
     check(cudaMemcpy(untouched.data(),parallel.p,untouched.size(),cudaMemcpyDeviceToHost));for(auto x:untouched)if(x!=0x5a)std::exit(4);

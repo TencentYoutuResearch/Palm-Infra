@@ -842,8 +842,13 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             check(cudaMemcpy(scalar_grouped.data(), grouped_output, scalar_grouped.size() * sizeof(float), cudaMemcpyDeviceToHost));
             for (bool compact : {false, true}) {
             check(cudaMemset(grouped_output, 0, 17 * rows * sizeof(float)));
-            check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, count, batches, rows, inner, split,
-                nullptr, nullptr, nullptr, 1, false, false, compact ? compact_batches : nullptr));
+            check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, count, batches, rows, inner,
+                [&] {
+                    mollm_cuda::Nvfp4GroupedOptions o;
+                    o.split_row = split;
+                    o.compact_batches = compact ? compact_batches : nullptr;
+                    return o;
+                }()));
             check(cudaMemcpy(actual_grouped.data(), grouped_output, actual_grouped.size() * sizeof(float), cudaMemcpyDeviceToHost));
             if (std::memcmp(scalar_grouped.data(), actual_grouped.data(), scalar_grouped.size() * sizeof(float))) {
                 std::fprintf(stderr, "grouped N8 mismatch count=%d rows=%d K=%d\n", count, rows, inner); std::exit(1);
@@ -853,17 +858,34 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             check(cudaMemset(grouped_output, 0, 17 * rows * sizeof(float)));
             check(cudaMemset(prepared_input, 0xff, 2 * 17 * inner / 2));
             check(cudaMemset(prepared_scales, 0xff, 2 * 17 * inner / 16));
-            check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, count, batches, rows, inner, split,
-                nullptr, prepared_input, prepared_scales, minimum, false, reuse, compact ? compact_batches : nullptr));
+            check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, count, batches, rows, inner,
+                [&] {
+                    mollm_cuda::Nvfp4GroupedOptions o;
+                    o.split_row = split;
+                    o.packed_inputs = prepared_input;
+                    o.input_scales = prepared_scales;
+                    o.min_batch_size = minimum;
+                    o.prepare_singles = reuse;
+                    o.compact_batches = compact ? compact_batches : nullptr;
+                    return o;
+                }()));
             check(cudaMemcpy(actual_grouped.data(), grouped_output, actual_grouped.size() * sizeof(float), cudaMemcpyDeviceToHost));
             if (std::memcmp(scalar_grouped.data(), actual_grouped.data(), scalar_grouped.size() * sizeof(float))) {
                 std::fprintf(stderr, "prequantized grouped mismatch count=%d rows=%d K=%d\n", count, rows, inner); std::exit(1);
             }
             if (!split) {
                 check(cudaMemset(grouped_output,0,17*rows*sizeof(float)));
-                check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs,count,batches,rows,inner,0,
-                    nullptr,prepared_input,prepared_scales,minimum,false,reuse,
-                    compact?compact_batches:nullptr,0,8,false,true));
+                check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, count, batches, rows, inner,
+                    [&] {
+                        mollm_cuda::Nvfp4GroupedOptions o;
+                        o.packed_inputs = prepared_input;
+                        o.input_scales = prepared_scales;
+                        o.min_batch_size = minimum;
+                        o.prepare_singles = reuse;
+                        o.compact_batches = compact?compact_batches:nullptr;
+                        o.inputs_prepared = true;
+                        return o;
+                    }()));
                 check(cudaMemcpy(actual_grouped.data(),grouped_output,actual_grouped.size()*sizeof(float),cudaMemcpyDeviceToHost));
                 if (std::memcmp(scalar_grouped.data(),actual_grouped.data(),actual_grouped.size()*sizeof(float))) {
                     std::fprintf(stderr,"preprepared generic N8 mismatch\n");std::exit(1);
@@ -890,10 +912,18 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             for (int minimum : {1, 2, 3, 4, 5, 6, 7, 8}) {
                 if (reuse && !prepared) continue;
                 check(cudaMemset(grouped_output, 0, 17 * rows * sizeof(float)));
-                check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, count,
-                    batches, rows, inner, split, nullptr,
-                    prepared ? prepared_input : nullptr,
-                    prepared ? prepared_scales : nullptr, minimum, true, reuse, compact ? compact_batches : nullptr));
+                check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, count, batches, rows, inner,
+                    [&] {
+                        mollm_cuda::Nvfp4GroupedOptions o;
+                        o.split_row = split;
+                        o.packed_inputs = prepared ? prepared_input : nullptr;
+                        o.input_scales = prepared ? prepared_scales : nullptr;
+                        o.min_batch_size = minimum;
+                        o.canonical_weights = true;
+                        o.prepare_singles = reuse;
+                        o.compact_batches = compact ? compact_batches : nullptr;
+                        return o;
+                    }()));
                 check(cudaMemcpy(actual_grouped.data(), grouped_output,
                     actual_grouped.size() * sizeof(float), cudaMemcpyDeviceToHost));
                 if (std::memcmp(scalar_grouped.data(), actual_grouped.data(),
@@ -915,10 +945,18 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
         for (int minimum : {1, 2, 3, 4, 5, 6, 7, 8}) {
             if (reuse && !prepared) continue;
             check(cudaMemset(grouped_output, 0, 17 * rows * sizeof(float)));
-            check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, 17,
-                batches, rows, inner, split, nullptr,
-                prepared ? prepared_input : nullptr,
-                prepared ? prepared_scales : nullptr, minimum, true, reuse, compact ? compact_batches : nullptr));
+            check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, 17, batches, rows, inner,
+                [&] {
+                    mollm_cuda::Nvfp4GroupedOptions o;
+                    o.split_row = split;
+                    o.packed_inputs = prepared ? prepared_input : nullptr;
+                    o.input_scales = prepared ? prepared_scales : nullptr;
+                    o.min_batch_size = minimum;
+                    o.canonical_weights = true;
+                    o.prepare_singles = reuse;
+                    o.compact_batches = compact ? compact_batches : nullptr;
+                    return o;
+                }()));
             check(cudaMemcpy(actual_grouped.data(), grouped_output,
                 actual_grouped.size() * sizeof(float), cudaMemcpyDeviceToHost));
             if (std::memcmp(scalar_grouped.data(), actual_grouped.data(),
@@ -935,10 +973,18 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
             cudaGraph_t graph;
             cudaGraphExec_t executable;
             check(cudaStreamBeginCapture(grouped_stream, cudaStreamCaptureModeThreadLocal));
-            check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, 17,
-                batches, rows, inner, split, grouped_stream,
-                prepared ? prepared_input : nullptr,
-                prepared ? prepared_scales : nullptr, minimum, true, reuse, compact ? compact_batches : nullptr));
+            check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs, 17, batches, rows, inner,
+                [&] {
+                    mollm_cuda::Nvfp4GroupedOptions o;
+                    o.split_row = split;
+                    o.packed_inputs = prepared ? prepared_input : nullptr;
+                    o.input_scales = prepared ? prepared_scales : nullptr;
+                    o.min_batch_size = minimum;
+                    o.canonical_weights = true;
+                    o.prepare_singles = reuse;
+                    o.compact_batches = compact ? compact_batches : nullptr;
+                    return o;
+                }(), grouped_stream));
             check(cudaStreamEndCapture(grouped_stream, &graph));
             check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
             for (int replay = 0; replay < 2; ++replay) {
@@ -1007,20 +1053,60 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                 };
                 set_descriptors(1);
                 check(cudaMemcpy(wide_jobs, wide_descriptors.data(), total * sizeof(wide_descriptors[0]), cudaMemcpyHostToDevice));
-                if (mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner, split,
-                        nullptr, nullptr, nullptr, 1, canonical, false, nullptr, 0, 16) != cudaErrorInvalidValue ||
-                    mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner, split,
-                        nullptr, nullptr, nullptr, 1, canonical, false, nullptr, 0, 32) != cudaErrorInvalidValue ||
-                    mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner, split,
-                        nullptr, wide_packed, wide_scales, 1, canonical, false, nullptr, 0, 64) != cudaErrorInvalidValue ||
-                    mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner, split,
-                        nullptr, nullptr, nullptr, 1, canonical, false, nullptr, 0, 8, true) != cudaErrorInvalidValue) {
+                if (mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner,
+                    [&] {
+                        mollm_cuda::Nvfp4GroupedOptions o;
+                        o.split_row = split;
+                        o.canonical_weights = canonical;
+                        o.max_batch_size = 16;
+                        return o;
+                    }()) != cudaErrorInvalidValue ||
+                    mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner,
+                        [&] {
+                            mollm_cuda::Nvfp4GroupedOptions o;
+                            o.split_row = split;
+                            o.canonical_weights = canonical;
+                            o.max_batch_size = 32;
+                            return o;
+                        }()) != cudaErrorInvalidValue ||
+                    mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner,
+                        [&] {
+                            mollm_cuda::Nvfp4GroupedOptions o;
+                            o.split_row = split;
+                            o.packed_inputs = wide_packed;
+                            o.input_scales = wide_scales;
+                            o.canonical_weights = canonical;
+                            o.max_batch_size = 64;
+                            return o;
+                        }()) != cudaErrorInvalidValue ||
+                    mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner,
+                        [&] {
+                            mollm_cuda::Nvfp4GroupedOptions o;
+                            o.split_row = split;
+                            o.canonical_weights = canonical;
+                            o.specialized_prepared = true;
+                            return o;
+                        }()) != cudaErrorInvalidValue) {
                     std::fprintf(stderr, "N16/N32 preparation/width guard failed\n"); std::exit(1);
                 }
-                if (mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs,total,wide_plan,rows,inner,split,
-                        nullptr,nullptr,nullptr,1,canonical,false,nullptr,0,8,false,true)!=cudaErrorInvalidValue ||
-                    (split && mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs,total,wide_plan,rows,inner,split,
-                        nullptr,wide_packed,wide_scales,1,canonical,false,nullptr,0,8,false,true)!=cudaErrorInvalidValue)) {
+                if (mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner,
+                    [&] {
+                        mollm_cuda::Nvfp4GroupedOptions o;
+                        o.split_row = split;
+                        o.canonical_weights = canonical;
+                        o.inputs_prepared = true;
+                        return o;
+                    }())!=cudaErrorInvalidValue ||
+                    (split && mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner,
+                        [&] {
+                            mollm_cuda::Nvfp4GroupedOptions o;
+                            o.split_row = split;
+                            o.packed_inputs = wide_packed;
+                            o.input_scales = wide_scales;
+                            o.canonical_weights = canonical;
+                            o.inputs_prepared = true;
+                            return o;
+                        }())!=cudaErrorInvalidValue)) {
                     std::fprintf(stderr,"already-prepared input guard failed\n");std::exit(1);
                 }
                 for (int pattern : {1, 2, 3}) {
@@ -1037,9 +1123,20 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                             check(cudaMemset(wide_output, 0, got.size() * sizeof(float)));
                             check(cudaMemset(wide_packed, 0xff, 2 * total * inner / 2));
                             check(cudaMemset(wide_scales, 0xff, 2 * total * inner / 16));
-                            check(mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, count, wide_plan, rows, inner, split,
-                                nullptr, wide_packed, wide_scales, minimum, canonical, reuse,
-                                compact ? wide_compact : nullptr, 0, width, true));
+                            check(mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, count, wide_plan, rows, inner,
+                                [&] {
+                                    mollm_cuda::Nvfp4GroupedOptions o;
+                                    o.split_row = split;
+                                    o.packed_inputs = wide_packed;
+                                    o.input_scales = wide_scales;
+                                    o.min_batch_size = minimum;
+                                    o.canonical_weights = canonical;
+                                    o.prepare_singles = reuse;
+                                    o.compact_batches = compact ? wide_compact : nullptr;
+                                    o.max_batch_size = width;
+                                    o.specialized_prepared = true;
+                                    return o;
+                                }()));
                             check(cudaMemcpy(got.data(), wide_output, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
                             if (std::memcmp(expected.data(), got.data(), got.size() * sizeof(float))) {
                                 std::fprintf(stderr, "prepared MMA mismatch width=%d rows=%d K=%d canonical=%d pattern=%d count=%d minimum=%d compact=%d reuse=%d\n",
@@ -1056,9 +1153,20 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                                     for (auto& job : descriptors) job.input=nullptr;
                                     check(cudaMemcpy(wide_jobs,descriptors.data(),total*sizeof(descriptors[0]),cudaMemcpyHostToDevice));
                                 }
-                                check(mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs,count,wide_plan,rows,inner,0,
-                                    nullptr,wide_packed,wide_scales,minimum,canonical,reuse,
-                                    compact?wide_compact:nullptr,0,width,true,true));
+                                check(mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, count, wide_plan, rows, inner,
+                                    [&] {
+                                        mollm_cuda::Nvfp4GroupedOptions o;
+                                        o.packed_inputs = wide_packed;
+                                        o.input_scales = wide_scales;
+                                        o.min_batch_size = minimum;
+                                        o.canonical_weights = canonical;
+                                        o.prepare_singles = reuse;
+                                        o.compact_batches = compact?wide_compact:nullptr;
+                                        o.max_batch_size = width;
+                                        o.specialized_prepared = true;
+                                        o.inputs_prepared = true;
+                                        return o;
+                                    }()));
                                 if (poison)
                                     check(cudaMemcpy(wide_jobs,wide_descriptors.data(),total*sizeof(wide_descriptors[0]),cudaMemcpyHostToDevice));
                                 check(cudaMemcpy(got.data(),wide_output,got.size()*sizeof(float),cudaMemcpyDeviceToHost));
@@ -1075,9 +1183,20 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                     cudaGraph_t wide_graph;
                     cudaGraphExec_t wide_exec;
                     check(cudaStreamBeginCapture(wide_stream, cudaStreamCaptureModeThreadLocal));
-                    check(mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner, split,
-                        wide_stream, wide_packed, wide_scales, minimum, canonical, reuse,
-                        compact ? wide_compact : nullptr, 0, width, true));
+                    check(mollm_cuda::launch_nvfp4_mma_grouped(wide_jobs, total, wide_plan, rows, inner,
+                        [&] {
+                            mollm_cuda::Nvfp4GroupedOptions o;
+                            o.split_row = split;
+                            o.packed_inputs = wide_packed;
+                            o.input_scales = wide_scales;
+                            o.min_batch_size = minimum;
+                            o.canonical_weights = canonical;
+                            o.prepare_singles = reuse;
+                            o.compact_batches = compact ? wide_compact : nullptr;
+                            o.max_batch_size = width;
+                            o.specialized_prepared = true;
+                            return o;
+                        }(), wide_stream));
                     check(cudaStreamEndCapture(wide_stream, &wide_graph));
                     check(cudaGraphInstantiate(&wide_exec, wide_graph, nullptr, nullptr, 0));
                     for (int replay = 0; replay < 4; ++replay) {
@@ -1669,8 +1788,16 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                     nullptr,nullptr,1,width_probe));
             };
             auto grouped_launch = [&](int i) {
-                check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs + (i % sets) * count, count, batches, rows, inner, split,
-                    nullptr, prepared_input, prepared_scales, minimum,width_probe));
+                check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs + (i % sets) * count, count, batches, rows, inner,
+                    [&] {
+                        mollm_cuda::Nvfp4GroupedOptions o;
+                        o.split_row = split;
+                        o.packed_inputs = prepared_input;
+                        o.input_scales = prepared_scales;
+                        o.min_batch_size = minimum;
+                        o.canonical_weights = width_probe;
+                        return o;
+                    }()));
             };
             for (int set = 0; set < sets; ++set) {
                 scalar_launch(set);
@@ -1686,9 +1813,20 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                     // Match the runtime hint; overflow handling remains the kernel's responsibility.
                     const int hint = compact ? std::min(count, (count + width - 1) / width +
                         (experts * (width - 1) + width - 1) / width) : 0;
-                    check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs + (i % sets) * count,count,batches,
-                        rows,inner,split,nullptr,prepared_input,prepared_scales,1,true,false,
-                        compact ? compact_plan : nullptr,hint,width,false,prepared,async));
+                    check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs + (i % sets) * count, count, batches, rows, inner,
+                        [&] {
+                            mollm_cuda::Nvfp4GroupedOptions o;
+                            o.split_row = split;
+                            o.packed_inputs = prepared_input;
+                            o.input_scales = prepared_scales;
+                            o.canonical_weights = true;
+                            o.compact_batches = compact ? compact_plan : nullptr;
+                            o.compact_grid_y = hint;
+                            o.max_batch_size = width;
+                            o.inputs_prepared = prepared;
+                            o.async_weights = async;
+                            return o;
+                        }()));
                 };
                 const std::vector<int> widths = async_probe ? std::vector<int>{32} :
                     compact_probe ? std::vector<int>{rows == 1280 ? 32 : 8} : std::vector<int>{8,16,32};
@@ -1732,9 +1870,16 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                     for(int set=0;set<sets;++set)for(int width:widths) {
                         cudaGraph_t graph=nullptr;cudaGraphExec_t replay=nullptr;
                         check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
-                        check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs+set*count,count,batches,
-                            rows,inner,0,cudaStreamPerThread,prepared_input,prepared_scales,1,true,false,
-                            nullptr,0,width,false,true));
+                        check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs+set*count, count, batches, rows, inner,
+                            [&] {
+                                mollm_cuda::Nvfp4GroupedOptions o;
+                                o.packed_inputs = prepared_input;
+                                o.input_scales = prepared_scales;
+                                o.canonical_weights = true;
+                                o.max_batch_size = width;
+                                o.inputs_prepared = true;
+                                return o;
+                            }(), cudaStreamPerThread));
                         check(cudaStreamEndCapture(cudaStreamPerThread,&graph));
                         check(cudaGraphInstantiateWithFlags(&replay,graph,0));
                         for(int variant=0;variant<3;++variant) {
@@ -1766,9 +1911,18 @@ void run(int rows, int inner, bool pair_layout, bool benchmark, float fixed_glob
                     // Actual backend-style captured plan/quantization/kernel
                     // chain, changed inputs, every minimum and rotating set.
                     const auto validate_launch=[&](int set,int minimum,bool async,cudaStream_t stream) {
-                        check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs+set*count,count,batches,
-                            rows,inner,split,stream,prepared_input,prepared_scales,minimum,true,false,
-                            nullptr,0,32,false,false,async));
+                        check(mollm_cuda::launch_nvfp4_mma_grouped(grouped_jobs+set*count, count, batches, rows, inner,
+                            [&] {
+                                mollm_cuda::Nvfp4GroupedOptions o;
+                                o.split_row = split;
+                                o.packed_inputs = prepared_input;
+                                o.input_scales = prepared_scales;
+                                o.min_batch_size = minimum;
+                                o.canonical_weights = true;
+                                o.max_batch_size = 32;
+                                o.async_weights = async;
+                                return o;
+                            }(), stream));
                     };
                     int checked_replays=0;
                     for(int set=0;set<sets;++set)for(int min=1;min<=8;++min) {

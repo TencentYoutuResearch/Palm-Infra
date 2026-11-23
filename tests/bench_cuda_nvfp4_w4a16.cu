@@ -314,7 +314,14 @@ int main(int argc,char** argv){
                 else if(mode==1)project<true><<<grid,128,0,cudaStreamPerThread>>>(fjobs,groups,bx,rows,inner);
                 else project<false><<<grid,128,0,cudaStreamPerThread>>>(jobs,groups,bx,rows,inner);
                 ck(cudaGetLastError());};
-            auto native=[&](){ck(mollm_cuda::launch_nvfp4_mma_grouped(jobs,count,plan,rows,inner,0,cudaStreamPerThread,packed,scales,1,true));};
+            auto native=[&](){ck(mollm_cuda::launch_nvfp4_mma_grouped(jobs, count, plan, rows, inner,
+                [&] {
+                    mollm_cuda::Nvfp4GroupedOptions o;
+                    o.packed_inputs = packed;
+                    o.input_scales = scales;
+                    o.canonical_weights = true;
+                    return o;
+                }(), cudaStreamPerThread));};
             std::vector<float> hx(size_t(count)*inner),hy(size_t(count)*rows+8);
             std::vector<__nv_bfloat16> hb(hx.size());
             cudaGraph_t check_graph;cudaGraphExec_t check_exec;

@@ -234,30 +234,85 @@ static void run(const std::vector<int>& runs,bool pair,bool timing,bool early,bo
             copy(locality_jobs.p,sf_descriptors);
         }
     }
-    auto producer=[&](bool compressed,int set,bool ahead){return mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+(set+(compressed?sets:0))*count,count,plan.p,h,k,inner,cudaStreamPerThread,packed.p,scales.p,1,true,false,nullptr,0,32,false,false,true,compressed,vector?compressed&&pair:ahead,vector,vector&&compressed&&ahead);};
+    auto producer=[&](bool compressed,int set,bool ahead){return mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+(set+(compressed?sets:0))*count, count, plan.p, h, k,
+        [&] {
+            mollm_cuda::Nvfp4GroupedOptions o;
+            o.split_row = inner;
+            o.packed_inputs = packed.p;
+            o.input_scales = scales.p;
+            o.canonical_weights = true;
+            o.max_batch_size = 32;
+            o.async_weights = true;
+            o.output_bf16 = compressed;
+            o.early_inputs = vector?compressed&&pair:ahead;
+            o.parallel_plan = vector;
+            o.vector_quantize = vector&&compressed&&ahead;
+            return o;
+        }(), cudaStreamPerThread);};
     check(cudaMemset(bf.p,0x5a,(values+8)*2));check(cudaMemset(plan.p,0x5a,(count+1)*sizeof(*plan.p)));
     int rejects=0;for(int id=0;id<12;++id){
-        const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+sets*count,count,plan.p,
-            id==0?2560:id==11?1296:h,id==1?640:k,id==2?0:inner,cudaStreamPerThread,packed.p,scales.p,
-            id==3?2:1,id!=4,id==5,id==6?plan.p:nullptr,0,id==7?8:32,id==8,id==9,id!=10,true);
+        const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+sets*count, count, plan.p, id==0?2560:id==11?1296:h, id==1?640:k,
+            [&] {
+                mollm_cuda::Nvfp4GroupedOptions o;
+                o.split_row = id==2?0:inner;
+                o.packed_inputs = packed.p;
+                o.input_scales = scales.p;
+                o.min_batch_size = id==3?2:1;
+                o.canonical_weights = id!=4;
+                o.prepare_singles = id==5;
+                o.compact_batches = id==6?plan.p:nullptr;
+                o.max_batch_size = id==7?8:32;
+                o.specialized_prepared = id==8;
+                o.inputs_prepared = id==9;
+                o.async_weights = id!=10;
+                o.output_bf16 = true;
+                return o;
+            }(), cudaStreamPerThread);
         if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
     }
     if(early){
         for(int id=0;id<12;++id){
-            const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+sets*count,count,plan.p,
-                id==0?2560:h,id==1?640:k,id==2?0:inner,cudaStreamPerThread,packed.p,scales.p,
-                id==3?2:1,id!=4,id==5,id==6?plan.p:nullptr,0,id==7?8:32,id==8,id==9,id!=10,id!=11,true);
+            const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+sets*count, count, plan.p, id==0?2560:h, id==1?640:k,
+                [&] {
+                    mollm_cuda::Nvfp4GroupedOptions o;
+                    o.split_row = id==2?0:inner;
+                    o.packed_inputs = packed.p;
+                    o.input_scales = scales.p;
+                    o.min_batch_size = id==3?2:1;
+                    o.canonical_weights = id!=4;
+                    o.prepare_singles = id==5;
+                    o.compact_batches = id==6?plan.p:nullptr;
+                    o.max_batch_size = id==7?8:32;
+                    o.specialized_prepared = id==8;
+                    o.inputs_prepared = id==9;
+                    o.async_weights = id!=10;
+                    o.output_bf16 = id!=11;
+                    o.early_inputs = true;
+                    return o;
+                }(), cudaStreamPerThread);
             if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
         }
     }
     if(vector){
         for(int id=0;id<18;++id){
-            const auto status=mollm_cuda::launch_nvfp4_mma_grouped(
-                id==12?nullptr:jobs.p+sets*count,id==16?0:count,id==13?nullptr:plan.p,
-                id==0?2560:id==17?1296:h,id==1?640:k,id==2?0:inner,cudaStreamPerThread,
-                id==14?nullptr:packed.p,id==15?nullptr:scales.p,id==3?2:1,
-                id!=4,id==5,id==6?plan.p:nullptr,0,id==7?8:32,
-                id==8,id==9,id!=10,id!=11,false,false,true);
+            const auto status=mollm_cuda::launch_nvfp4_mma_grouped(id==12?nullptr:jobs.p+sets*count, id==16?0:count, id==13?nullptr:plan.p, id==0?2560:id==17?1296:h, id==1?640:k,
+                [&] {
+                    mollm_cuda::Nvfp4GroupedOptions o;
+                    o.split_row = id==2?0:inner;
+                    o.packed_inputs = id==14?nullptr:packed.p;
+                    o.input_scales = id==15?nullptr:scales.p;
+                    o.min_batch_size = id==3?2:1;
+                    o.canonical_weights = id!=4;
+                    o.prepare_singles = id==5;
+                    o.compact_batches = id==6?plan.p:nullptr;
+                    o.max_batch_size = id==7?8:32;
+                    o.specialized_prepared = id==8;
+                    o.inputs_prepared = id==9;
+                    o.async_weights = id!=10;
+                    o.output_bf16 = id!=11;
+                    o.vector_quantize = true;
+                    return o;
+                }(), cudaStreamPerThread);
             if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
         }
     }

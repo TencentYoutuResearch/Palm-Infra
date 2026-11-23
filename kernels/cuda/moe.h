@@ -154,18 +154,31 @@ cudaError_t launch_nvfp4_mma_fused_activation(const Nvfp4Projection* jobs,
 // Diagnostic only, both choices include identical sentinel initialization.
 cudaError_t launch_nvfp4_batch_plan_diagnostic(const Nvfp4Projection* jobs,int count,
     Nvfp4MmaBatch* batches,int columns,bool parallel,cudaStream_t stream=nullptr);
+// Native-FP4 MMA for a prefill batch: groups jobs that share an expert into
+// batches of up to max_batch_size columns, quantizes their inputs and runs one
+// MMA per batch. batches holds count entries and is rebuilt on every call.
+struct Nvfp4GroupedOptions {
+    int split_row = 0;                 // Rows of the gate half when gate and up are stacked; 0 for one matrix.
+    uint8_t* packed_inputs = nullptr;  // Scratch for quantized inputs, or the inputs when inputs_prepared.
+    uint8_t* input_scales = nullptr;   // Scratch for their block scales.
+    int min_batch_size = 1;            // Smaller groups take the per-job path.
+    bool canonical_weights = false;    // Weights in the package layout rather than native fragment order.
+    bool prepare_singles = false;
+    Nvfp4MmaBatch* compact_batches = nullptr; // Scratch for a dense batch list; needs compact_grid_y.
+    int compact_grid_y = 0;
+    int max_batch_size = 8;
+    bool specialized_prepared = false;
+    bool inputs_prepared = false;      // packed_inputs and input_scales already hold this batch's inputs.
+    bool async_weights = false;        // Stage weights with asynchronous copies.
+    bool output_bf16 = false;          // Outputs are tightly packed BF16 rows.
+    bool early_inputs = false;
+    bool parallel_plan = false;        // Build the batch plan in parallel; excludes the compact list.
+    bool vector_quantize = false;      // Gate 1280x2560 only, with output_bf16 and async_weights.
+    bool gate_codes_kmajor = false;    // Resident K-major gate codes; canonical 1280x2560 only.
+};
 cudaError_t launch_nvfp4_mma_grouped(const Nvfp4Projection* jobs, int count,
-    Nvfp4MmaBatch* batches, int rows, int inner, int split_row = 0,
-    cudaStream_t stream = nullptr, uint8_t* packed_inputs = nullptr,
-    uint8_t* input_scales = nullptr, int min_batch_size = 1,
-    bool canonical_weights = false, bool prepare_singles = false,
-    Nvfp4MmaBatch* compact_batches = nullptr, int compact_grid_y = 0,
-    int max_batch_size = 8, bool specialized_prepared = false,
-    bool inputs_prepared = false, bool async_weights = false,
-    bool output_bf16 = false, bool early_inputs = false,
-    bool parallel_plan = false,
-    bool vector_quantize = false,
-    bool gate_codes_kmajor = false);
+    Nvfp4MmaBatch* batches, int rows, int inner,
+    const Nvfp4GroupedOptions& options = {}, cudaStream_t stream = nullptr);
 // Ungrouped routing, up to 1024 experts / 32 selected experts. The immutable
 // tables contain gate then down descriptors in expert-ID order; only input /
 // output fields of the selected descriptors are filled for this invocation.

@@ -116,11 +116,35 @@ static void run(const std::vector<int>& runs,bool pair,bool timing){
         }
     }
     copy(jobs.p,descriptors);
-    auto producer=[&](bool compressed,bool prepared,int set,cudaStream_t stream){return mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+(set+(compressed?sets:0))*count,count,plan.p,h,inner,0,stream,packed.p,scales.p,1,true,false,nullptr,0,8,false,prepared,false,compressed);};
+    auto producer=[&](bool compressed,bool prepared,int set,cudaStream_t stream){return mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+(set+(compressed?sets:0))*count, count, plan.p, h, inner,
+        [&] {
+            mollm_cuda::Nvfp4GroupedOptions o;
+            o.packed_inputs = packed.p;
+            o.input_scales = scales.p;
+            o.canonical_weights = true;
+            o.inputs_prepared = prepared;
+            o.output_bf16 = compressed;
+            return o;
+        }(), stream);};
     check(cudaMemset(fp.p,0x5a,(values+8)*4));check(cudaMemset(bf.p,0x5a,(values+8)*2));check(cudaMemset(plan.p,0x5a,(count+1)*sizeof(*plan.p)));
     int rejects=0;for(int id=0;id<10;++id){
         const int nr=id==0?1280:h,nk=id==1?2560:inner,split=id==2?64:0,min=id==3?2:1,width=id==4?16:8;
-        const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+sets*count,count,plan.p,nr,nk,split,cudaStreamPerThread,packed.p,scales.p,min,id!=5,id==6,id==7?plan.p:nullptr,0,width,id==8,false,id==9,true);
+        const auto status=mollm_cuda::launch_nvfp4_mma_grouped(jobs.p+sets*count, count, plan.p, nr, nk,
+            [&] {
+                mollm_cuda::Nvfp4GroupedOptions o;
+                o.split_row = split;
+                o.packed_inputs = packed.p;
+                o.input_scales = scales.p;
+                o.min_batch_size = min;
+                o.canonical_weights = id!=5;
+                o.prepare_singles = id==6;
+                o.compact_batches = id==7?plan.p:nullptr;
+                o.max_batch_size = width;
+                o.specialized_prepared = id==8;
+                o.async_weights = id==9;
+                o.output_bf16 = true;
+                return o;
+            }(), cudaStreamPerThread);
         if(status!=cudaErrorInvalidValue)std::exit(4);++rejects;
     }
     const auto sentinel=read(bf.p,values+8);for(auto v:sentinel)if(v!=0x5a5a)std::exit(4);
