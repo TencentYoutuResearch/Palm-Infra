@@ -106,7 +106,6 @@ MoeSsdCache::MoeSsdCache() = default;
 
 MoeSsdCache::~MoeSsdCache() {
     stop_io_workers();
-    if (fd_ >= 0) close(fd_);
 }
 
 bool MoeSsdCache::clear_resident() {
@@ -160,6 +159,17 @@ void MoeSsdCache::stop_io_workers() {
 bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
                        int io_workers, bool enable_cross_layer_worker,
                        bool lock_expert_pages) {
+    if (capacity_bytes == 0 || io_workers < 1) {
+        std::fprintf(stderr, "MoE SSD: cache capacity and I/O worker count must be non-zero\n");
+        return false;
+    }
+    return open(mollm::FileRangeTransport::open(package_path), capacity_bytes, io_workers,
+                enable_cross_layer_worker, lock_expert_pages);
+}
+
+bool MoeSsdCache::open(std::shared_ptr<mollm::RangeTransport> transport, size_t capacity_bytes,
+                       int io_workers, bool enable_cross_layer_worker,
+                       bool lock_expert_pages) {
     // Like initial registration, reopening requires the caller to stop new
     // requests. Do not invalidate any already-issued expert leases.
     {
@@ -171,35 +181,11 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         std::fprintf(stderr, "MoE SSD: cache capacity and I/O worker count must be non-zero\n");
         return false;
     }
-    int fd = ::open(package_path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        std::fprintf(stderr, "MoE SSD: failed to open %s: %s\n",
-                     package_path.c_str(), std::strerror(errno));
-        return false;
-    }
-    struct stat file_stat {};
-    if (fstat(fd, &file_stat) != 0 || file_stat.st_size < 0) {
-        std::fprintf(stderr, "MoE SSD: failed to stat %s: %s\n",
-                     package_path.c_str(), std::strerror(errno));
-        close(fd);
-        return false;
-    }
-#if defined(__APPLE__)
-    // Request uncached expert reads on this dedicated fd; keep the dense
-    // mmap descriptor's policy unchanged. F_NOCACHE does not guarantee that
-    // every logical read reaches the device: existing UBC pages and alignment
-    // can still affect the path. Cache byte counters remain logical traffic.
-    if (fcntl(fd, F_NOCACHE, 1) != 0) {
-        std::fprintf(stderr, "MoE SSD: warning: could not disable macOS file cache: %s\n",
-                     std::strerror(errno));
-    }
-#endif
+    if (!transport) return false;
     stop_io_workers();
-    if (fd_ >= 0) close(fd_);
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        fd_ = fd;
-        file_size_ = static_cast<uint64_t>(file_stat.st_size);
+        transport_ = std::move(transport);
         io_workers_count_ = io_workers;
         next_trace_id_ = 1;
         capacity_bytes_ = capacity_bytes;
@@ -259,7 +245,7 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
             [](float value) { return !std::isfinite(value) || value <= 0; }))) {
         std::fprintf(stderr, "MoE SSD: invalid NVFP4 activation calibration\n"); return false;
     }
-    if (fd_ < 0 || spec.weight_ref.empty() || spec.layer < 0 ||
+    if (!transport_ || spec.weight_ref.empty() || spec.layer < 0 ||
         spec.num_experts <= 0 || spec.rows <= 0 || spec.cols <= 0 ||
         spec.data_bytes == 0) {
         std::fprintf(stderr, "MoE SSD: invalid expert storage metadata for %s\n",
@@ -270,10 +256,10 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
     if (!source_bytes(spec, bytes) || !components_fit_expert_stride(spec) ||
         !component_range_fits(spec.data_offset, spec.data_bytes,
                               spec.expert_stride, spec.num_experts,
-                              file_size_) ||
+                              transport_size()) ||
         !component_range_fits(spec.scales_offset, spec.scales_bytes,
                               spec.expert_stride, spec.num_experts,
-                              file_size_)) {
+                              transport_size())) {
         std::fprintf(stderr,
                      "MoE SSD: expert storage range is invalid for %s\n",
                      spec.weight_ref.c_str());
@@ -495,7 +481,7 @@ bool MoeSsdCache::set_read_alignment(size_t alignment) {
     if (!entries_.empty() || !io_jobs_.empty() || !low_priority_io_jobs_.empty() ||
         buffer_pool_) return false;
 #if defined(__APPLE__)
-    if (fd_ < 0 || !global_capacity_pool_ || sources_.empty()) return false;
+    if (!transport_ || !global_capacity_pool_ || sources_.empty()) return false;
     const size_t page = static_cast<size_t>(getpagesize());
     if (alignment > page || (alignment && (alignment & (alignment - 1))))
         return false;
@@ -529,7 +515,7 @@ bool MoeSsdCache::set_buffer_reuse_capacity(size_t bytes) {
         return true;
     }
 #if defined(__APPLE__)
-    if (fd_ < 0 || !global_capacity_pool_ || sources_.empty()) return false;
+    if (!transport_ || !global_capacity_pool_ || sources_.empty()) return false;
     const size_t page = static_cast<size_t>(getpagesize());
     if (bytes % page != 0) return false;
     // Page-multiple payloads have exact capacity charges, including any

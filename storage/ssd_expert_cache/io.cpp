@@ -16,63 +16,13 @@
 #include <utility>
 #include <vector>
 
-#include <sys/uio.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <pthread/qos.h>
 #endif
 
-namespace {
-
-bool preadv_exact(int fd, uint64_t offset, std::vector<iovec> vectors) {
-    size_t index = 0;
-    while (index < vectors.size()) {
-        const ssize_t bytes = preadv(
-            fd, vectors.data() + static_cast<ptrdiff_t>(index),
-            static_cast<int>(vectors.size() - index),
-            static_cast<off_t>(offset));
-        if (bytes < 0 && errno == EINTR)
-            continue;
-        if (bytes <= 0) {
-            std::fprintf(stderr,
-                         "MoE SSD: preadv failed at offset %llu: %s\n",
-                         static_cast<unsigned long long>(offset),
-                         bytes == 0 ? "unexpected EOF" : std::strerror(errno));
-            return false;
-        }
-        offset += static_cast<uint64_t>(bytes);
-        size_t consumed = static_cast<size_t>(bytes);
-        while (index < vectors.size() && consumed >= vectors[index].iov_len) {
-            consumed -= vectors[index].iov_len;
-            ++index;
-        }
-        if (index < vectors.size() && consumed != 0) {
-            vectors[index].iov_base =
-                static_cast<uint8_t*>(vectors[index].iov_base) + consumed;
-            vectors[index].iov_len -= consumed;
-        }
-    }
-    return true;
-}
-
-}  // namespace
-
 bool MoeSsdCache::read_exact(uint64_t offset, void* dst, size_t bytes) const {
-    uint8_t* out = static_cast<uint8_t*>(dst);
-    size_t done = 0;
-    while (done < bytes) {
-        ssize_t n = pread(fd_, out + done, bytes - done,
-                          static_cast<off_t>(offset + done));
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            std::fprintf(stderr, "MoE SSD: pread failed at offset %llu: %s\n",
-                         (unsigned long long)(offset + done),
-                         n == 0 ? "unexpected EOF" : std::strerror(errno));
-            return false;
-        }
-        done += static_cast<size_t>(n);
-    }
-    return true;
+    return transport_ && transport_->read(offset, dst, bytes);
 }
 
 const MoeSsdCache::ByteBuffer& MoeSsdCache::component_buffer(const Entry& entry,
@@ -287,11 +237,9 @@ bool MoeSsdCache::read_job(const IoJob& job) {
                     !read_exact(scales_offset, scales.data(), scales.size()))
                     return false;
             } else {
-                std::vector<iovec> vectors = {
-                    {data.data(), data.size()},
-                    {scales.data(), scales.size()},
-                };
-                if (!preadv_exact(fd_, data_offset, std::move(vectors)))
+                if (!transport_->read_segments(data_offset, {
+                        {data.data(), data.size()},
+                        {scales.data(), scales.size()}}))
                     return false;
             }
             lock_buffer(data);
@@ -310,13 +258,13 @@ bool MoeSsdCache::read_job(const IoJob& job) {
         if (read_alignment_) {
             const size_t head = offset % read_alignment_;
             const uint64_t start = offset - head;
-            if (start > file_size_ || dst.size() > dst.active_bytes - head)
+            if (start > transport_size() || dst.size() > dst.active_bytes - head)
                 return false;
             const size_t needed = head + dst.size();
             const size_t rounded = (needed + read_alignment_ - 1) /
                                    read_alignment_ * read_alignment_;
             const size_t count = static_cast<size_t>(
-                std::min<uint64_t>(rounded, file_size_ - start));
+                std::min<uint64_t>(rounded, transport_size() - start));
             if (count < needed || count > dst.active_bytes) return false;
             dst.payload_offset = head;
             if (!read_exact(start, dst.storage, count)) return false;
@@ -330,14 +278,14 @@ bool MoeSsdCache::read_job(const IoJob& job) {
     // These entries are adjacent in the package. Scatter one contiguous file
     // read directly into their final cache buffers instead of allocating a
     // temporary merged buffer and copying several megabytes a second time.
-    std::vector<iovec> vectors;
-    vectors.reserve(job.entries.size());
+    std::vector<mollm::ReadSegment> segments;
+    segments.reserve(job.entries.size());
     for (Entry* entry : job.entries) {
         ByteBuffer& dst = component_buffer(*entry, job.component);
         if (dst.size() != bytes_per_entry) return false;
-        vectors.push_back({dst.data(), dst.size()});
+        segments.push_back({dst.data(), dst.size()});
     }
-    if (!preadv_exact(fd_, offset, std::move(vectors)))
+    if (!transport_->read_segments(offset, segments))
         return false;
     for (Entry* entry : job.entries)
         lock_buffer(component_buffer(*entry, job.component));

@@ -2,6 +2,7 @@
 
 #include "core/tensor.h"
 #include "runtime/expert_provider.h"
+#include "storage/range_transport.h"
 
 #include <cstddef>
 #include <condition_variable>
@@ -206,7 +207,13 @@ public:
     MoeSsdCache(const MoeSsdCache&) = delete;
     MoeSsdCache& operator=(const MoeSsdCache&) = delete;
 
+    // Serve expert payloads from the package file at this path.
     bool open(const std::string& package_path, size_t capacity_bytes,
+              int io_workers = 8, bool enable_cross_layer_worker = false,
+              bool lock_expert_pages = false);
+    // Serve them from any transport that exposes the package's byte range;
+    // the offsets in each MoeSsdTensorSpec address that range.
+    bool open(std::shared_ptr<mollm::RangeTransport> transport, size_t capacity_bytes,
               int io_workers = 8, bool enable_cross_layer_worker = false,
               bool lock_expert_pages = false);
     bool add_source(const MoeSsdTensorSpec& spec);
@@ -407,8 +414,8 @@ private:
                        const uint8_t* data,
                        const uint8_t* scales) const;
 
-    int fd_ = -1;
-    uint64_t file_size_ = 0;
+    std::shared_ptr<mollm::RangeTransport> transport_;
+    uint64_t transport_size() const { return transport_ ? transport_->size() : 0; }
     int io_workers_count_ = 0;
     uint64_t next_trace_id_ = 1;
     // Declared before entries so their buffers return before pool destruction.

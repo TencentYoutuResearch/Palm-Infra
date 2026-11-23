@@ -73,6 +73,7 @@ set(SOURCES
     runtime/trace.cpp
     # storage
     storage/mapped_file.cpp
+    storage/range_transport.cpp
     storage/byte_ranges.cpp
     storage/ssd_expert_cache/provider.cpp
     storage/ssd_expert_cache/cache.cpp
@@ -177,6 +178,7 @@ set(PUBLIC_CPU_BACKEND_HEADERS
 
 set(PUBLIC_STORAGE_HEADERS
     storage/mapped_file.h
+    storage/range_transport.h
     storage/byte_ranges.h
 )
 
@@ -756,6 +758,7 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_moe           tests/test_moe.cpp)
     add_mollm_test(test_moe_ssd       tests/test_moe_ssd.cpp)
     add_mollm_test(test_expert_provider tests/test_expert_provider.cpp)
+    add_mollm_test(test_range_transport tests/test_range_transport.cpp)
     add_mollm_test(test_hyper_connection tests/test_hyper_connection.cpp)
     add_mollm_test(test_gated_residual tests/test_gated_residual.cpp)
     add_mollm_test(test_ple            tests/test_ple.cpp)
