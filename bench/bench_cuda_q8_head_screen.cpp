@@ -6,7 +6,7 @@
 #include "kernels/cuda/matmul.h"
 #include "kernels/cuda/q8_head_screen.h"
 
-#include "cuda_test_support.h"
+#include "tests/cuda_test_support.h"
 
 #include <cmath>
 #include <cstdint>

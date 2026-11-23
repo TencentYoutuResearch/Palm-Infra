@@ -529,28 +529,28 @@ if(MOLLM_CUDA)
         CUDA_SEPARABLE_COMPILATION OFF)
     message(STATUS "CUDA correctness backend enabled")
     if(MOLLM_BUILD_TESTS)
-        add_executable(bench_cuda_dense_lt_gemm tests/bench_cuda_dense_lt_gemm.cu)
-        add_executable(bench_cuda_nvfp4_batch_plan tests/bench_cuda_nvfp4_batch_plan.cu)
+        add_executable(bench_cuda_dense_lt_gemm bench/bench_cuda_dense_lt_gemm.cu)
+        add_executable(bench_cuda_nvfp4_batch_plan bench/bench_cuda_nvfp4_batch_plan.cu)
         target_link_libraries(bench_cuda_nvfp4_batch_plan PRIVATE mollm_lib)
         set_target_properties(bench_cuda_nvfp4_batch_plan PROPERTIES CUDA_STANDARD 17)
         target_link_libraries(bench_cuda_dense_lt_gemm PRIVATE mollm_lib CUDA::cublasLt)
         set_target_properties(bench_cuda_dense_lt_gemm PROPERTIES CUDA_STANDARD 17)
-        add_executable(bench_cuda_projections tests/bench_cuda_projections.cpp)
+        add_executable(bench_cuda_projections bench/bench_cuda_projections.cpp)
         target_link_libraries(bench_cuda_projections PRIVATE mollm_lib)
-        add_executable(bench_cuda_q8_head_screen tests/bench_cuda_q8_head_screen.cpp)
+        add_executable(bench_cuda_q8_head_screen bench/bench_cuda_q8_head_screen.cpp)
         target_link_libraries(bench_cuda_q8_head_screen PRIVATE mollm_lib)
         add_executable(test_cuda_q4_scale_lookup tests/test_cuda_q4_scale_lookup.cpp)
         target_link_libraries(test_cuda_q4_scale_lookup PRIVATE mollm_lib)
         add_executable(test_cuda_q8_head_screen_batch tests/test_cuda_q8_head_screen_batch.cpp)
         target_link_libraries(test_cuda_q8_head_screen_batch PRIVATE mollm_lib)
-        add_executable(bench_cuda_q8_traffic tests/bench_cuda_q8_traffic.cu)
+        add_executable(bench_cuda_q8_traffic bench/bench_cuda_q8_traffic.cu)
         target_link_libraries(bench_cuda_q8_traffic PRIVATE mollm_lib)
         set_target_properties(bench_cuda_q8_traffic PROPERTIES CUDA_STANDARD 17)
-        add_executable(bench_cuda_q4_mma tests/bench_cuda_q4_mma.cu)
-        add_executable(bench_cuda_sdpa_prefill tests/bench_cuda_sdpa_prefill.cu)
-        add_executable(bench_cuda_sdpa_validated_prefix tests/bench_cuda_sdpa_validated_prefix.cu)
-        add_executable(bench_cuda_group_rms_half tests/bench_cuda_group_rms_half.cu)
-        add_executable(bench_cuda_gr_deferred_rms tests/bench_cuda_gr_deferred_rms.cu)
+        add_executable(bench_cuda_q4_mma bench/bench_cuda_q4_mma.cu)
+        add_executable(bench_cuda_sdpa_prefill bench/bench_cuda_sdpa_prefill.cu)
+        add_executable(bench_cuda_sdpa_validated_prefix bench/bench_cuda_sdpa_validated_prefix.cu)
+        add_executable(bench_cuda_group_rms_half bench/bench_cuda_group_rms_half.cu)
+        add_executable(bench_cuda_gr_deferred_rms bench/bench_cuda_gr_deferred_rms.cu)
         target_link_libraries(bench_cuda_gr_deferred_rms PRIVATE mollm_lib)
         target_compile_options(bench_cuda_gr_deferred_rms PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
@@ -575,13 +575,13 @@ if(MOLLM_CUDA)
         target_compile_options(test_cuda_nvfp4_gate_code_decode PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
         set_target_properties(test_cuda_nvfp4_gate_code_decode PROPERTIES CUDA_STANDARD 17)
-        add_executable(bench_cuda_nvfp4_bf16_output tests/bench_cuda_nvfp4_bf16_output.cu)
-        add_executable(bench_cuda_nvfp4_w4a16 tests/bench_cuda_nvfp4_w4a16.cu)
+        add_executable(bench_cuda_nvfp4_bf16_output bench/bench_cuda_nvfp4_bf16_output.cu)
+        add_executable(bench_cuda_nvfp4_w4a16 bench/bench_cuda_nvfp4_w4a16.cu)
         target_link_libraries(bench_cuda_nvfp4_w4a16 PRIVATE mollm_lib)
         target_compile_options(bench_cuda_nvfp4_w4a16 PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
         set_target_properties(bench_cuda_nvfp4_w4a16 PROPERTIES CUDA_STANDARD 17)
-        add_executable(bench_cuda_nvfp4_w4a16_routes tests/bench_cuda_nvfp4_w4a16_routes.cu)
+        add_executable(bench_cuda_nvfp4_w4a16_routes bench/bench_cuda_nvfp4_w4a16_routes.cu)
         target_link_libraries(bench_cuda_nvfp4_w4a16_routes PRIVATE mollm_lib)
         target_compile_options(bench_cuda_nvfp4_w4a16_routes PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
@@ -590,9 +590,9 @@ if(MOLLM_CUDA)
         target_compile_options(bench_cuda_nvfp4_bf16_output PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
         set_target_properties(bench_cuda_nvfp4_bf16_output PROPERTIES CUDA_STANDARD 17)
-        add_executable(bench_cuda_hc_fused_up_reduce tests/bench_cuda_hc_fused_up_reduce.cu)
-        add_executable(bench_cuda_hc_compact_carry tests/bench_cuda_hc_compact_carry.cu)
-        add_executable(bench_cuda_moe_hc_inject tests/bench_cuda_moe_hc_inject.cu)
+        add_executable(bench_cuda_hc_fused_up_reduce bench/bench_cuda_hc_fused_up_reduce.cu)
+        add_executable(bench_cuda_hc_compact_carry bench/bench_cuda_hc_compact_carry.cu)
+        add_executable(bench_cuda_moe_hc_inject bench/bench_cuda_moe_hc_inject.cu)
         target_link_libraries(bench_cuda_moe_hc_inject PRIVATE mollm_lib)
         target_compile_options(bench_cuda_moe_hc_inject PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
@@ -605,8 +605,8 @@ if(MOLLM_CUDA)
         target_compile_options(bench_cuda_hc_fused_up_reduce PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
         set_target_properties(bench_cuda_hc_fused_up_reduce PROPERTIES CUDA_STANDARD 17)
-        add_executable(bench_cuda_nvfp4_bf16_gate tests/bench_cuda_nvfp4_bf16_gate.cu)
-        add_executable(bench_cuda_moe_route_windows tests/bench_cuda_moe_route_windows.cu)
+        add_executable(bench_cuda_nvfp4_bf16_gate bench/bench_cuda_nvfp4_bf16_gate.cu)
+        add_executable(bench_cuda_moe_route_windows bench/bench_cuda_moe_route_windows.cu)
         target_link_libraries(bench_cuda_moe_route_windows PRIVATE mollm_lib)
         target_compile_options(bench_cuda_moe_route_windows PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
@@ -623,9 +623,9 @@ if(MOLLM_CUDA)
         target_compile_options(bench_cuda_sdpa_validated_prefix PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
         set_target_properties(bench_cuda_sdpa_validated_prefix PROPERTIES CUDA_STANDARD 17)
-        add_executable(bench_cuda_gr_reduce tests/bench_cuda_gr_reduce.cu)
-        add_executable(bench_cuda_gdn_recurrence tests/bench_cuda_gdn_recurrence.cu)
-        add_executable(bench_cuda_gdn_chunkwise tests/bench_cuda_gdn_chunkwise.cu)
+        add_executable(bench_cuda_gr_reduce bench/bench_cuda_gr_reduce.cu)
+        add_executable(bench_cuda_gdn_recurrence bench/bench_cuda_gdn_recurrence.cu)
+        add_executable(bench_cuda_gdn_chunkwise bench/bench_cuda_gdn_chunkwise.cu)
         target_link_libraries(bench_cuda_gdn_chunkwise PRIVATE mollm_lib)
         target_compile_options(bench_cuda_gdn_chunkwise PRIVATE
             $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
@@ -645,12 +645,12 @@ if(MOLLM_CUDA)
         target_link_libraries(bench_cuda_q4_mma PRIVATE mollm_lib)
         set_target_properties(bench_cuda_q4_mma PROPERTIES CUDA_STANDARD 17)
         if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
-            add_executable(bench_cuda_nvfp4_activation tests/bench_cuda_nvfp4_activation.cu)
+            add_executable(bench_cuda_nvfp4_activation bench/bench_cuda_nvfp4_activation.cu)
             target_link_libraries(bench_cuda_nvfp4_activation PRIVATE mollm_lib)
             target_compile_options(bench_cuda_nvfp4_activation PRIVATE
                 $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
             set_target_properties(bench_cuda_nvfp4_activation PROPERTIES CUDA_STANDARD 17)
-            add_executable(bench_cuda_nvfp4_mma tests/bench_cuda_nvfp4_mma.cu)
+            add_executable(bench_cuda_nvfp4_mma bench/bench_cuda_nvfp4_mma.cu)
             target_link_libraries(bench_cuda_nvfp4_mma PRIVATE mollm_lib)
             target_compile_options(bench_cuda_nvfp4_mma PRIVATE
                 $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
@@ -706,6 +706,16 @@ add_custom_target(mollm_quantize_weight DEPENDS mollm-quantize)
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
+# A check that runs a benchmark binary (bench/) in its verification mode.
+# Registered like add_test and additionally labelled "bench-check", so
+# `ctest -L bench-check` and `ctest -LE bench-check` separate these from the
+# dedicated tests.
+function(add_bench_check)
+    add_test(${ARGN})
+    cmake_parse_arguments(BENCH_CHECK "" "NAME" "" ${ARGN})
+    set_property(GLOBAL APPEND PROPERTY MOLLM_BENCH_CHECK_TESTS ${BENCH_CHECK_NAME})
+endfunction()
+
 
 if(MOLLM_BUILD_TESTS)
     enable_testing()
@@ -755,9 +765,9 @@ if(MOLLM_BUILD_TESTS)
     add_executable(dump_hy4_logits tests/dump_hy4_logits.cpp)
     target_link_libraries(dump_hy4_logits PRIVATE mollm_lib)
     add_mollm_test(test_trace         tests/test_trace.cpp)
-    add_mollm_test(bench_matmul       tests/bench_matmul.cpp)
-    add_mollm_test(bench_sdpa         tests/bench_sdpa.cpp)
-    add_mollm_test(bench_recurrent    tests/bench_recurrent.cpp)
+    add_mollm_test(bench_matmul       bench/bench_matmul.cpp)
+    add_mollm_test(bench_sdpa         bench/bench_sdpa.cpp)
+    add_mollm_test(bench_recurrent    bench/bench_recurrent.cpp)
     add_mollm_test(test_norm          tests/test_norm.cpp)
     add_mollm_test(test_rope          tests/test_rope.cpp)
     add_mollm_test(test_attention     tests/test_attention.cpp)
@@ -819,7 +829,7 @@ if(MOLLM_BUILD_TESTS)
     add_test(NAME test_ppl_decode_schedule COMMAND test_ppl_decode_schedule)
     if(MOLLM_CUDA)
         add_executable(test_cuda_qsa_selected_attention tests/test_cuda_qsa_selected_attention.cu)
-        add_executable(bench_cuda_qsa_attention tests/bench_cuda_qsa_attention.cu)
+        add_executable(bench_cuda_qsa_attention bench/bench_cuda_qsa_attention.cu)
         target_link_libraries(bench_cuda_qsa_attention PRIVATE mollm_lib)
         set_target_properties(bench_cuda_qsa_attention PROPERTIES CUDA_STANDARD 17)
         add_executable(test_cuda_qsa_indexer tests/test_cuda_qsa_indexer.cu)
@@ -853,13 +863,13 @@ if(MOLLM_BUILD_TESTS)
         set_tests_properties(test_cuda_qsa_selected_attention PROPERTIES
             SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 180)
         if(NOT TARGET bench_cuda_gr_reduce)
-            add_executable(bench_cuda_gr_reduce tests/bench_cuda_gr_reduce.cu)
+            add_executable(bench_cuda_gr_reduce bench/bench_cuda_gr_reduce.cu)
             target_link_libraries(bench_cuda_gr_reduce PRIVATE mollm_lib)
             target_compile_options(bench_cuda_gr_reduce PRIVATE
                 $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)
             set_target_properties(bench_cuda_gr_reduce PROPERTIES CUDA_STANDARD 17)
         endif()
-        add_test(NAME test_cuda_sigmoid_gr_reduce COMMAND bench_cuda_gr_reduce --check-only)
+        add_bench_check(NAME test_cuda_sigmoid_gr_reduce COMMAND bench_cuda_gr_reduce --check-only)
         if(TARGET bench_cuda_group_rms_half)
             add_test(NAME test_cuda_nvfp4_async_weights COMMAND test_cuda_nvfp4_async_weights)
             set_tests_properties(test_cuda_nvfp4_async_weights PROPERTIES
@@ -882,24 +892,24 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_nvfp4_gate_code_decode PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_nvfp4_bf16_output COMMAND bench_cuda_nvfp4_bf16_output --check-only)
-            add_test(NAME test_cuda_hc_fused_up_reduce COMMAND bench_cuda_hc_fused_up_reduce --check-only)
-            add_test(NAME test_cuda_moe_hc_inject_probe COMMAND bench_cuda_moe_hc_inject --boundaries)
+            add_bench_check(NAME test_cuda_nvfp4_bf16_output COMMAND bench_cuda_nvfp4_bf16_output --check-only)
+            add_bench_check(NAME test_cuda_hc_fused_up_reduce COMMAND bench_cuda_hc_fused_up_reduce --check-only)
+            add_bench_check(NAME test_cuda_moe_hc_inject_probe COMMAND bench_cuda_moe_hc_inject --boundaries)
             set_tests_properties(test_cuda_moe_hc_inject_probe PROPERTIES
                 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS cuda)
-            add_test(NAME test_cuda_moe_hc_inject_no_branch COMMAND bench_cuda_moe_hc_inject --boundaries)
+            add_bench_check(NAME test_cuda_moe_hc_inject_no_branch COMMAND bench_cuda_moe_hc_inject --boundaries)
             set_tests_properties(test_cuda_moe_hc_inject_no_branch PROPERTIES
                 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS cuda
                 ENVIRONMENT "MOLLM_TEST_MOE_HC_PUBLISH_BRANCH=0")
-            add_test(NAME test_cuda_hc_fused_up_reduce_pitch328 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
-            add_test(NAME test_cuda_hc_fused_up_reduce_pitch336 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
-            add_test(NAME test_cuda_hc_fused_up_reduce_columns32 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
-            add_test(NAME test_cuda_hc_fused_up_reduce_columns32_pitch336 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
-            add_test(NAME test_cuda_hc_fused_up_reduce_compact_columns32_pitch336 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
+            add_bench_check(NAME test_cuda_hc_fused_up_reduce_pitch328 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
+            add_bench_check(NAME test_cuda_hc_fused_up_reduce_pitch336 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
+            add_bench_check(NAME test_cuda_hc_fused_up_reduce_columns32 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
+            add_bench_check(NAME test_cuda_hc_fused_up_reduce_columns32_pitch336 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
+            add_bench_check(NAME test_cuda_hc_fused_up_reduce_compact_columns32_pitch336 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
             set_tests_properties(test_cuda_hc_fused_up_reduce_compact_columns32_pitch336 PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_CUDA_HC_UP_INPUT_PITCH=336;MOLLM_TEST_CUDA_HC_UP_TILE_COLUMNS=32;MOLLM_TEST_CUDA_HC_UP_COMPACT_CARRY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_hc_fused_up_reduce_columns32_pitch328 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
+            add_bench_check(NAME test_cuda_hc_fused_up_reduce_columns32_pitch328 COMMAND bench_cuda_hc_fused_up_reduce --check-only)
             set_tests_properties(test_cuda_hc_fused_up_reduce_columns32_pitch328 PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_CUDA_HC_UP_TILE_COLUMNS=32;MOLLM_TEST_CUDA_HC_UP_INPUT_PITCH=328"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
@@ -917,17 +927,17 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_hc_fused_up_reduce PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_nvfp4_bf16_gate COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_fused COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_weight_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_input_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_both_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_compact_logits COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_token_quantization COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_token_quantization_scatter COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_token_pair_words COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_activation_token_pair_words_scatter COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_mma_weight_locality_control COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_bf16_gate COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_activation_fused COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_activation_weight_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_activation_input_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_activation_both_sf COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_activation_compact_logits COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_activation_token_quantization COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_activation_token_quantization_scatter COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_activation_token_pair_words COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_activation_token_pair_words_scatter COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_mma_weight_locality_control COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
             set_tests_properties(test_cuda_nvfp4_mma_weight_locality_control PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_INPUT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_WEIGHT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_COMPACT_LOGITS=1;MOLLM_TEST_NVFP4_GATE_TOKEN_QUANTIZE=1;MOLLM_TEST_NVFP4_GATE_TOKEN_SCATTER=1;MOLLM_TEST_NVFP4_GATE_TOKEN_PAIR_WORDS=1;MOLLM_TEST_NVFP4_GATE_WEIGHT_LOCALITY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
@@ -946,8 +956,8 @@ if(MOLLM_BUILD_TESTS)
             set_tests_properties(test_cuda_nvfp4_mma_activation_token_quantization_scatter PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_INPUT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_WEIGHT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_COMPACT_LOGITS=1;MOLLM_TEST_NVFP4_GATE_TOKEN_QUANTIZE=1;MOLLM_TEST_NVFP4_GATE_TOKEN_SCATTER=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_nvfp4_gate_code_kmajor COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_gate_token_code_kmajor COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_gate_code_kmajor COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_gate_token_code_kmajor COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
             set_tests_properties(test_cuda_nvfp4_gate_code_kmajor PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_INPUT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_WEIGHT_SF_KMAJOR=1;MOLLM_TEST_NVFP4_GATE_COMPACT_LOGITS=1;MOLLM_TEST_NVFP4_GATE_TOKEN_QUANTIZE=1;MOLLM_TEST_NVFP4_GATE_TOKEN_SCATTER=1;MOLLM_TEST_NVFP4_GATE_TOKEN_PAIR_WORDS=1;MOLLM_TEST_NVFP4_GATE_CODE_KMAJOR=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
@@ -970,32 +980,32 @@ if(MOLLM_BUILD_TESTS)
             set_tests_properties(test_cuda_nvfp4_mma_activation_weight_sf PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1;MOLLM_TEST_NVFP4_GATE_WEIGHT_SF_KMAJOR=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_moe_route_windows COMMAND bench_cuda_moe_route_windows --check-only)
+            add_bench_check(NAME test_cuda_moe_route_windows COMMAND bench_cuda_moe_route_windows --check-only)
             set_tests_properties(test_cuda_moe_route_windows PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_nvfp4_mma_activation_fused PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1;MOLLM_TEST_NVFP4_MMA_ACTIVATION_FUSED=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_dense_lt_policy COMMAND bench_cuda_dense_lt_gemm --policy-only)
-            add_test(NAME test_cuda_dense_full_lt COMMAND bench_cuda_dense_lt_gemm --logical-policy-only)
+            add_bench_check(NAME test_cuda_dense_lt_policy COMMAND bench_cuda_dense_lt_gemm --policy-only)
+            add_bench_check(NAME test_cuda_dense_full_lt COMMAND bench_cuda_dense_lt_gemm --logical-policy-only)
             set_tests_properties(test_cuda_dense_full_lt PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_dense_window_partition COMMAND bench_cuda_dense_lt_gemm --window-merge-check)
-            add_test(NAME test_cuda_hc_gate_row_tile COMMAND bench_cuda_dense_lt_gemm --hc-gate-tile-check)
+            add_bench_check(NAME test_cuda_dense_window_partition COMMAND bench_cuda_dense_lt_gemm --window-merge-check)
+            add_bench_check(NAME test_cuda_hc_gate_row_tile COMMAND bench_cuda_dense_lt_gemm --hc-gate-tile-check)
             set_tests_properties(test_cuda_hc_gate_row_tile PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_dense_window_balance COMMAND bench_cuda_dense_lt_gemm --window-balance-check)
+            add_bench_check(NAME test_cuda_dense_window_balance COMMAND bench_cuda_dense_lt_gemm --window-balance-check)
             set_tests_properties(test_cuda_dense_window_partition test_cuda_dense_window_balance PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_nvfp4_parallel_batch_plan COMMAND bench_cuda_nvfp4_batch_plan --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_parallel_batch_plan COMMAND bench_cuda_nvfp4_batch_plan --check-only)
             set_tests_properties(test_cuda_nvfp4_parallel_batch_plan PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_dense_lt_policy PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_nvfp4_bf16_gate PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_nvfp4_bf16_gate_early_inputs COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
-            add_test(NAME test_cuda_nvfp4_bf16_gate_vector_quantize COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_bf16_gate_early_inputs COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
+            add_bench_check(NAME test_cuda_nvfp4_bf16_gate_vector_quantize COMMAND bench_cuda_nvfp4_bf16_gate --check-only)
             set_tests_properties(test_cuda_nvfp4_bf16_gate_vector_quantize PROPERTIES
                 ENVIRONMENT "MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
@@ -1004,10 +1014,10 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_nvfp4_bf16_output PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_group_rms_half COMMAND bench_cuda_group_rms_half)
-            add_test(NAME test_cuda_group_rms_half_cached COMMAND bench_cuda_group_rms_half --cached-input)
-            add_test(NAME test_cuda_gr_inject_rms_half COMMAND bench_cuda_group_rms_half --inject-rms)
-            add_test(NAME test_cuda_gr_deferred_rms COMMAND bench_cuda_gr_deferred_rms --check-only)
+            add_bench_check(NAME test_cuda_group_rms_half COMMAND bench_cuda_group_rms_half)
+            add_bench_check(NAME test_cuda_group_rms_half_cached COMMAND bench_cuda_group_rms_half --cached-input)
+            add_bench_check(NAME test_cuda_gr_inject_rms_half COMMAND bench_cuda_group_rms_half --inject-rms)
+            add_bench_check(NAME test_cuda_gr_deferred_rms COMMAND bench_cuda_gr_deferred_rms --check-only)
             set_tests_properties(test_cuda_gr_deferred_rms PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_group_rms_half test_cuda_group_rms_half_cached test_cuda_gr_inject_rms_half PROPERTIES
@@ -1015,15 +1025,15 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         endif()
         if(TARGET bench_cuda_sdpa_validated_prefix)
-            add_test(NAME test_cuda_sdpa_mid_pv_guards
+            add_bench_check(NAME test_cuda_sdpa_mid_pv_guards
                 COMMAND bench_cuda_sdpa_validated_prefix --native-pv-gemm-mid-sanitize)
             set_tests_properties(test_cuda_sdpa_mid_pv_guards PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_sdpa_native_pv_gemm COMMAND bench_cuda_sdpa_validated_prefix --native-pv-gemm-sanitize)
+            add_bench_check(NAME test_cuda_sdpa_native_pv_gemm COMMAND bench_cuda_sdpa_validated_prefix --native-pv-gemm-sanitize)
             add_test(NAME test_cuda_sdpa_native_pv_capacity32k
                 COMMAND ${CMAKE_COMMAND} -E env MOLLM_SDPA_VALIDATED_PREFIX_CHECK_ONLY=1
                     $<TARGET_FILE:bench_cuda_sdpa_validated_prefix> --native-pv-capacity32k)
-            add_test(NAME test_cuda_sdpa_native_pv_capacity32k_sanitize
+            add_bench_check(NAME test_cuda_sdpa_native_pv_capacity32k_sanitize
                 COMMAND bench_cuda_sdpa_validated_prefix --native-pv-capacity32k-sanitize)
             set_tests_properties(test_cuda_sdpa_native_pv_capacity32k test_cuda_sdpa_native_pv_capacity32k_sanitize
                 PROPERTIES SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE TIMEOUT 240)
@@ -1036,56 +1046,56 @@ if(MOLLM_BUILD_TESTS)
             endforeach()
             set_tests_properties(test_cuda_sdpa_native_pv_gemm PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_sdpa_full_batch COMMAND bench_cuda_sdpa_validated_prefix --full-batch)
-            add_test(NAME test_cuda_sdpa_full_batch_group2 COMMAND bench_cuda_sdpa_validated_prefix --full-batch-group2)
-            add_test(NAME test_cuda_sdpa_full_batch_group4 COMMAND bench_cuda_sdpa_validated_prefix --full-batch-group4)
-            add_test(NAME test_cuda_sdpa_full_batch_heads4 COMMAND bench_cuda_sdpa_validated_prefix --full-batch-heads4)
+            add_bench_check(NAME test_cuda_sdpa_full_batch COMMAND bench_cuda_sdpa_validated_prefix --full-batch)
+            add_bench_check(NAME test_cuda_sdpa_full_batch_group2 COMMAND bench_cuda_sdpa_validated_prefix --full-batch-group2)
+            add_bench_check(NAME test_cuda_sdpa_full_batch_group4 COMMAND bench_cuda_sdpa_validated_prefix --full-batch-group4)
+            add_bench_check(NAME test_cuda_sdpa_full_batch_heads4 COMMAND bench_cuda_sdpa_validated_prefix --full-batch-heads4)
             set_tests_properties(test_cuda_sdpa_full_batch test_cuda_sdpa_full_batch_group2 test_cuda_sdpa_full_batch_group4 test_cuda_sdpa_full_batch_heads4 PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_sdpa_prefix_query_pair COMMAND bench_cuda_sdpa_validated_prefix --pair-queries)
-            add_test(NAME test_cuda_sdpa_prefix_query_group4 COMMAND bench_cuda_sdpa_validated_prefix --pair-queries4)
-            add_test(NAME test_cuda_sdpa_prefix_query_group4_long_shared COMMAND bench_cuda_sdpa_validated_prefix --pair-queries4-long-shared-small)
-            add_test(NAME test_cuda_sdpa_prefix_head_group4 COMMAND bench_cuda_sdpa_validated_prefix --group-heads4-small)
+            add_bench_check(NAME test_cuda_sdpa_prefix_query_pair COMMAND bench_cuda_sdpa_validated_prefix --pair-queries)
+            add_bench_check(NAME test_cuda_sdpa_prefix_query_group4 COMMAND bench_cuda_sdpa_validated_prefix --pair-queries4)
+            add_bench_check(NAME test_cuda_sdpa_prefix_query_group4_long_shared COMMAND bench_cuda_sdpa_validated_prefix --pair-queries4-long-shared-small)
+            add_bench_check(NAME test_cuda_sdpa_prefix_head_group4 COMMAND bench_cuda_sdpa_validated_prefix --group-heads4-small)
             set_tests_properties(test_cuda_sdpa_prefix_head_group4 PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_sdpa_prefix_query_group4_long_shared PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_sdpa_prefix_query_pair test_cuda_sdpa_prefix_query_group4 PROPERTIES
                 ENVIRONMENT "MOLLM_SDPA_VALIDATED_PREFIX_CHECK_ONLY=1" SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_sdpa_pv_dimension_pair_guards COMMAND bench_cuda_sdpa_validated_prefix --pair-pv)
+            add_bench_check(NAME test_cuda_sdpa_pv_dimension_pair_guards COMMAND bench_cuda_sdpa_validated_prefix --pair-pv)
             set_tests_properties(test_cuda_sdpa_pv_dimension_pair_guards PROPERTIES
                 ENVIRONMENT "MOLLM_SDPA_VALIDATED_PREFIX_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_sdpa_pv_unroll_guards COMMAND bench_cuda_sdpa_validated_prefix --pv-unroll)
+            add_bench_check(NAME test_cuda_sdpa_pv_unroll_guards COMMAND bench_cuda_sdpa_validated_prefix --pv-unroll)
             set_tests_properties(test_cuda_sdpa_pv_unroll_guards PROPERTIES
                 ENVIRONMENT "MOLLM_SDPA_VALIDATED_PREFIX_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_sdpa_validated_prefix_long_shared_zero_pv_guards COMMAND bench_cuda_sdpa_validated_prefix --long-shared-zero-pv)
+            add_bench_check(NAME test_cuda_sdpa_validated_prefix_long_shared_zero_pv_guards COMMAND bench_cuda_sdpa_validated_prefix --long-shared-zero-pv)
             set_tests_properties(test_cuda_sdpa_validated_prefix_long_shared_zero_pv_guards PROPERTIES
                 ENVIRONMENT "MOLLM_SDPA_VALIDATED_PREFIX_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_sdpa_validated_zero_pv_guards COMMAND bench_cuda_sdpa_validated_prefix --skip-zero-pv)
+            add_bench_check(NAME test_cuda_sdpa_validated_zero_pv_guards COMMAND bench_cuda_sdpa_validated_prefix --skip-zero-pv)
             set_tests_properties(test_cuda_sdpa_validated_zero_pv_guards PROPERTIES
                 ENVIRONMENT "MOLLM_SDPA_VALIDATED_PREFIX_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_sdpa_validated_prefix_guards COMMAND bench_cuda_sdpa_validated_prefix)
+            add_bench_check(NAME test_cuda_sdpa_validated_prefix_guards COMMAND bench_cuda_sdpa_validated_prefix)
             set_tests_properties(test_cuda_sdpa_validated_prefix_guards PROPERTIES
                 ENVIRONMENT "MOLLM_SDPA_VALIDATED_PREFIX_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         endif()
         if(TARGET bench_cuda_gdn_recurrence)
-            add_test(NAME test_cuda_gdn_chunkwise_prototype COMMAND bench_cuda_gdn_chunkwise --check-only)
-            add_test(NAME test_cuda_gdn_chunkwise_column_solve COMMAND bench_cuda_gdn_chunkwise --check-only --column-solve --small-only)
-            add_test(NAME test_cuda_gdn_chunkwise_coalesced_values COMMAND bench_cuda_gdn_chunkwise --check-only --coalesced-values --small-only)
-            add_test(NAME test_cuda_gdn_chunkwise_dual_projection COMMAND bench_cuda_gdn_chunkwise --check-only --dual-projection --small-only)
-            add_test(NAME test_cuda_gdn_chunkwise_shared_grams COMMAND bench_cuda_gdn_chunkwise --check-only --shared-grams --small-only)
-            add_test(NAME test_cuda_gdn_chunkwise_shared_grams_combo COMMAND bench_cuda_gdn_chunkwise --check-only --shared-grams --dual-projection --coalesced-values --small-only)
-            add_test(NAME test_cuda_gdn_chunkwise_staged_coefficients COMMAND bench_cuda_gdn_chunkwise --check-only --staged-coefficients --small-only)
-            add_test(NAME test_cuda_gdn_chunkwise_logical_shapes
+            add_bench_check(NAME test_cuda_gdn_chunkwise_prototype COMMAND bench_cuda_gdn_chunkwise --check-only)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_column_solve COMMAND bench_cuda_gdn_chunkwise --check-only --column-solve --small-only)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_coalesced_values COMMAND bench_cuda_gdn_chunkwise --check-only --coalesced-values --small-only)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_dual_projection COMMAND bench_cuda_gdn_chunkwise --check-only --dual-projection --small-only)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_shared_grams COMMAND bench_cuda_gdn_chunkwise --check-only --shared-grams --small-only)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_shared_grams_combo COMMAND bench_cuda_gdn_chunkwise --check-only --shared-grams --dual-projection --coalesced-values --small-only)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_staged_coefficients COMMAND bench_cuda_gdn_chunkwise --check-only --staged-coefficients --small-only)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_logical_shapes
                 COMMAND bench_cuda_gdn_chunkwise --check-only --staged-coefficients --logical-shapes)
             set_tests_properties(test_cuda_gdn_chunkwise_logical_shapes PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_gdn_chunkwise_tensor_coeff_combo COMMAND bench_cuda_gdn_chunkwise --check-only --tensor-coeff-combo --small-only)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_tensor_coeff_combo COMMAND bench_cuda_gdn_chunkwise --check-only --tensor-coeff-combo --small-only)
             set_tests_properties(test_cuda_gdn_chunkwise_tensor_coeff_combo PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_gdn_chunkwise_staged_coefficients PROPERTIES
@@ -1100,32 +1110,32 @@ if(MOLLM_BUILD_TESTS)
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
             set_tests_properties(test_cuda_gdn_chunkwise_prototype PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_gdn_chunkwise_tf32_tile16 COMMAND bench_cuda_gdn_chunkwise --check-only --tensor-core)
-            add_test(NAME test_cuda_gdn_chunkwise_tf32_tile32 COMMAND bench_cuda_gdn_chunkwise --check-only --value-tile32)
-            add_test(NAME test_cuda_gdn_chunkwise_tf32_prepare COMMAND bench_cuda_gdn_chunkwise --check-only --tensor-prepare)
-            add_test(NAME test_cuda_gdn_chunkwise_tf32_padded COMMAND bench_cuda_gdn_chunkwise --check-only --padded)
-            add_test(NAME test_cuda_gdn_chunkwise_shared_update COMMAND bench_cuda_gdn_chunkwise --check-only --shared-update)
-            add_test(NAME test_cuda_gdn_chunkwise_shared_eight COMMAND bench_cuda_gdn_chunkwise --check-only --shared-update --eight-warps)
-            add_test(NAME test_cuda_gdn_chunkwise_half_products COMMAND bench_cuda_gdn_chunkwise --check-only --half-products)
-            add_test(NAME test_cuda_gdn_chunkwise_half_eight COMMAND bench_cuda_gdn_chunkwise --check-only --half-products --eight-warps)
-            add_test(NAME test_cuda_gdn_chunkwise_tensor_coeff COMMAND bench_cuda_gdn_chunkwise --check-only --tensor-coeff)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_tf32_tile16 COMMAND bench_cuda_gdn_chunkwise --check-only --tensor-core)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_tf32_tile32 COMMAND bench_cuda_gdn_chunkwise --check-only --value-tile32)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_tf32_prepare COMMAND bench_cuda_gdn_chunkwise --check-only --tensor-prepare)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_tf32_padded COMMAND bench_cuda_gdn_chunkwise --check-only --padded)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_shared_update COMMAND bench_cuda_gdn_chunkwise --check-only --shared-update)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_shared_eight COMMAND bench_cuda_gdn_chunkwise --check-only --shared-update --eight-warps)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_half_products COMMAND bench_cuda_gdn_chunkwise --check-only --half-products)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_half_eight COMMAND bench_cuda_gdn_chunkwise --check-only --half-products --eight-warps)
+            add_bench_check(NAME test_cuda_gdn_chunkwise_tensor_coeff COMMAND bench_cuda_gdn_chunkwise --check-only --tensor-coeff)
             set_tests_properties(test_cuda_gdn_chunkwise_tf32_tile16 test_cuda_gdn_chunkwise_tf32_tile32
                 test_cuda_gdn_chunkwise_tf32_prepare test_cuda_gdn_chunkwise_tf32_padded
                 test_cuda_gdn_chunkwise_shared_update test_cuda_gdn_chunkwise_shared_eight
                 test_cuda_gdn_chunkwise_half_products test_cuda_gdn_chunkwise_half_eight
                 test_cuda_gdn_chunkwise_tensor_coeff PROPERTIES
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_gdn_quad_values_guards COMMAND bench_cuda_gdn_recurrence --quad-values)
+            add_bench_check(NAME test_cuda_gdn_quad_values_guards COMMAND bench_cuda_gdn_recurrence --quad-values)
             set_tests_properties(test_cuda_gdn_quad_values_guards PROPERTIES
                 ENVIRONMENT "MOLLM_GDN_RECURRENCE_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
-            add_test(NAME test_cuda_gdn_paired_values_guards COMMAND bench_cuda_gdn_recurrence --paired-values)
+            add_bench_check(NAME test_cuda_gdn_paired_values_guards COMMAND bench_cuda_gdn_recurrence --paired-values)
             set_tests_properties(test_cuda_gdn_paired_values_guards PROPERTIES
                 ENVIRONMENT "MOLLM_GDN_RECURRENCE_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
         endif()
         if(TARGET bench_cuda_nvfp4_activation)
-            add_test(NAME test_cuda_nvfp4_activation_prepare COMMAND bench_cuda_nvfp4_activation)
+            add_bench_check(NAME test_cuda_nvfp4_activation_prepare COMMAND bench_cuda_nvfp4_activation)
             set_tests_properties(test_cuda_nvfp4_activation_prepare PROPERTIES
                 ENVIRONMENT "MOLLM_NVFP4_ACTIVATION_CHECK_ONLY=1"
                 SKIP_RETURN_CODE 77 LABELS "cuda" RUN_SERIAL TRUE)
@@ -1713,24 +1723,24 @@ if(MOLLM_BUILD_TESTS)
         # Developer-only microbenchmark for the decode-time Metal SSD-MoE
         # selected-expert kernel. It is intentionally not registered with
         # CTest because it allocates full 122B expert working sets.
-        add_executable(bench_metal_moe tests/bench_metal_moe.mm)
+        add_executable(bench_metal_moe bench/bench_metal_moe.mm)
         target_link_libraries(bench_metal_moe PRIVATE mollm_lib)
         set_source_files_properties(
-            tests/bench_metal_moe.mm
+            bench/bench_metal_moe.mm
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
         add_executable(
-            bench_metal_w4_gemv tests/bench_metal_w4_gemv.mm)
+            bench_metal_w4_gemv bench/bench_metal_w4_gemv.mm)
         target_link_libraries(bench_metal_w4_gemv PRIVATE mollm_lib)
         set_source_files_properties(
-            tests/bench_metal_w4_gemv.mm
+            bench/bench_metal_w4_gemv.mm
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 
         add_executable(
-            bench_metal_w4_gemm tests/bench_metal_w4_gemm.mm)
+            bench_metal_w4_gemm bench/bench_metal_w4_gemm.mm)
         target_link_libraries(bench_metal_w4_gemm PRIVATE mollm_lib)
         set_source_files_properties(
-            tests/bench_metal_w4_gemm.mm
+            bench/bench_metal_w4_gemm.mm
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     endif()
 endif()
@@ -1775,3 +1785,9 @@ install(FILES
         ${CMAKE_CURRENT_BINARY_DIR}/mollmConfig.cmake
         ${CMAKE_CURRENT_BINARY_DIR}/mollmConfigVersion.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/mollm)
+
+# Labels are appended last because set_tests_properties replaces them.
+get_property(MOLLM_BENCH_CHECK_TESTS GLOBAL PROPERTY MOLLM_BENCH_CHECK_TESTS)
+foreach(bench_check IN LISTS MOLLM_BENCH_CHECK_TESTS)
+    set_property(TEST ${bench_check} APPEND PROPERTY LABELS bench-check)
+endforeach()
