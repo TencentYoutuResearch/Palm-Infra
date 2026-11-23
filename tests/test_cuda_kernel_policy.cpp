@@ -147,6 +147,103 @@ int main() {
         expect(q4_g128_batch_rows(sm121, tokens) == (tokens <= 4 ? 1 : 4), "SM121 G128 rows");
     }
 
+    // NVFP4 expert gate below the native-MMA threshold.
+    {
+        Nvfp4GateRequest decode_gate;
+        decode_gate.rows = 1;
+        decode_gate.routes = 10;
+        decode_gate.top_k = 10;
+        decode_gate.hidden = 2560;
+        decode_gate.inter = 640;
+        decode_gate.verification_rows = 8;
+        decode_gate.codes_kmajor = true;
+        decode_gate.scales_kmajor = true;
+        decode_gate.pipeline = true;
+        decode_gate.pair_layout = true;
+        decode_gate.m1_layout_proven = true;
+        decode_gate.activation_aligned = true;
+        expect(select_nvfp4_gate(sm121, decode_gate) == Nvfp4GateKernel::M1Proven, "SM121 proven M1 gate");
+        expect(select_nvfp4_gate(sm89, decode_gate) == Nvfp4GateKernel::Code, "generic M1 gate");
+        Nvfp4GateRequest unaligned = decode_gate;
+        unaligned.activation_aligned = false;
+        expect(select_nvfp4_gate(sm121, unaligned) == Nvfp4GateKernel::Code, "unaligned M1 gate");
+        Nvfp4GateRequest unproven = decode_gate;
+        unproven.m1_layout_proven = false;
+        expect(select_nvfp4_gate(sm121, unproven) == Nvfp4GateKernel::Code, "unproven M1 gate");
+
+        // Verification batches run without the pipelined kernels.
+        Nvfp4GateRequest verify = decode_gate;
+        verify.pipeline = false;
+        for (int rows = 2; rows <= 8; ++rows) {
+            verify.rows = rows;
+            verify.routes = rows * 10;
+            Nvfp4GateRequest request = verify;
+            expect(select_nvfp4_gate(sm121, request) == Nvfp4GateKernel::Paired8, "SM121 paired-eight gate");
+            expect(nvfp4_gate_pair_candidate(sm121, request), "SM121 pair candidate");
+            expect(select_nvfp4_gate(sm89, request) == Nvfp4GateKernel::Code, "generic batch gate");
+            expect(!nvfp4_gate_pair_candidate(sm89, request), "generic pair candidate");
+            request.pair_layout = false;
+            expect(select_nvfp4_gate(sm121, request) ==
+                   (rows <= 5 ? Nvfp4GateKernel::Paired : Nvfp4GateKernel::Subgroup),
+                   "SM121 gate without the pair layout");
+            expect(nvfp4_gate_pair_candidate(sm121, request), "pair candidate without the pair layout");
+            request.hidden = 2048;
+            expect(select_nvfp4_gate(sm121, request) == Nvfp4GateKernel::Subgroup, "SM121 subgroup gate");
+            request.top_k = 8;
+            expect(select_nvfp4_gate(sm121, request) == Nvfp4GateKernel::Code, "gate with another top-k");
+            request = verify;
+            request.pipeline = true;
+            expect(select_nvfp4_gate(sm121, request) == Nvfp4GateKernel::Code, "pipelined batch gate");
+        }
+        verify.rows = 6;
+        verify.verification_rows = 5;
+        expect(select_nvfp4_gate(sm121, verify) == Nvfp4GateKernel::Code, "gate beyond the verification limit");
+
+        Nvfp4GateRequest canonical = decode_gate;
+        canonical.codes_kmajor = false;
+        canonical.scales_kmajor = false;
+        expect(select_nvfp4_gate(sm121, canonical) == Nvfp4GateKernel::Pipelined, "canonical pipelined gate");
+        canonical.resident_mma_layout = true;
+        expect(select_nvfp4_gate(sm121, canonical) == Nvfp4GateKernel::Generic, "MMA-layout gate");
+        canonical.resident_mma_layout = false;
+        canonical.pipeline = false;
+        expect(select_nvfp4_gate(sm121, canonical) == Nvfp4GateKernel::Generic, "canonical gate without pipeline");
+    }
+
+    // NVFP4 expert down projection below the native-MMA threshold.
+    {
+        Nvfp4DownRequest down;
+        down.rows = 1;
+        down.top_k = 10;
+        down.hidden = 2560;
+        down.inter = 640;
+        down.verification_rows = 8;
+        down.pipeline = true;
+        down.pair_layout = true;
+        expect(select_nvfp4_down(sm121, down) == Nvfp4DownKernel::M1Subwarp, "SM121 M1 down");
+        expect(select_nvfp4_down(sm89, down) == Nvfp4DownKernel::Pipelined, "generic M1 down");
+        Nvfp4DownRequest request = down;
+        request.row_scale_prefetch = true;
+        expect(select_nvfp4_down(sm121, request) == Nvfp4DownKernel::Pipelined, "M1 down with prefetch");
+        request = down;
+        request.pair_layout = false;
+        expect(select_nvfp4_down(sm121, request) == Nvfp4DownKernel::Pipelined, "M1 down without the pair layout");
+        request = down;
+        request.rows = 3;
+        expect(select_nvfp4_down(sm121, request) == Nvfp4DownKernel::Pipelined, "pipelined batch down");
+        request.pipeline = false;
+        expect(select_nvfp4_down(sm121, request) == Nvfp4DownKernel::SmallBatchSubwarp, "SM121 batch down");
+        expect(select_nvfp4_down(sm89, request) == Nvfp4DownKernel::Generic, "generic batch down");
+        request.rows = 9;
+        expect(select_nvfp4_down(sm121, request) == Nvfp4DownKernel::Generic, "down beyond the verification limit");
+        request.rows = 3;
+        request.resident_mma_layout = true;
+        expect(select_nvfp4_down(sm121, request) == Nvfp4DownKernel::Generic, "MMA-layout down");
+        request = down;
+        request.resident_mma_layout = true;
+        expect(select_nvfp4_down(sm121, request) == Nvfp4DownKernel::Generic, "MMA-layout M1 down");
+    }
+
     if (failures) return 1;
     std::printf("CUDA kernel selection tables match\n");
     return 0;

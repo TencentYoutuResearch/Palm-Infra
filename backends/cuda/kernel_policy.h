@@ -167,6 +167,95 @@ inline int q4_g128_batch_rows(const DevicePolicy& policy, int tokens) {
     return tokens <= 3 ? 2 : 4;
 }
 
+// NVFP4 expert projections below the native-MMA row threshold (decode and
+// verification batches). Prefill batches at or above it take the MMA paths,
+// which moe.cu selects from the prefill batch plan.
+enum class Nvfp4GateKernel {
+    M1Proven,  // Resident K-major codes, one token, proven layout.
+    Paired8,   // K-major codes and scales, pair layout, 2..limit rows.
+    Paired,    // K-major codes, 2..5 rows.
+    Subgroup,  // K-major codes, tiny batch.
+    Code,      // K-major codes, generic; pipelined when the request says so.
+    Pipelined, // Canonical codes, pipelined.
+    Generic,
+};
+
+struct Nvfp4GateRequest {
+    int rows = 0;
+    int routes = 0;
+    int top_k = 0;
+    int hidden = 0;
+    int inter = 0;
+    int verification_rows = 0; // Largest verification batch the backend admits.
+    bool codes_kmajor = false;
+    bool scales_kmajor = false;
+    bool pipeline = false; // The pipelined kernels are enabled for this row count.
+    bool resident_mma_layout = false;
+    bool pair_layout = false;
+    bool m1_layout_proven = false;
+    bool activation_aligned = false; // 16-byte aligned input.
+};
+
+// A verification batch on K-major gate codes that the paired kernels were
+// built for; also what the pair-dispatch counter counts.
+inline bool nvfp4_gate_pair_candidate(const DevicePolicy& policy, const Nvfp4GateRequest& request) {
+    return policy.prefer_nvfp4_mtp_gate_pairs && request.codes_kmajor &&
+        request.rows >= 2 && request.rows <= request.verification_rows &&
+        request.top_k == 10 && request.hidden == 2560 && request.inter == 640 && !request.pipeline;
+}
+
+inline Nvfp4GateKernel select_nvfp4_gate(const DevicePolicy& policy, const Nvfp4GateRequest& request) {
+    if (!request.codes_kmajor)
+        return request.pipeline && !request.resident_mma_layout ? Nvfp4GateKernel::Pipelined
+                                                                : Nvfp4GateKernel::Generic;
+    if (policy.prefer_nvfp4_gate_m1_proven && request.rows == 1 && request.routes == 10 &&
+        request.pipeline && request.hidden == 2560 && request.inter == 640 &&
+        request.m1_layout_proven && request.activation_aligned)
+        return Nvfp4GateKernel::M1Proven;
+    const bool paired = nvfp4_gate_pair_candidate(policy, request);
+    if (paired && policy.prefer_nvfp4_mtp_gate_eight && request.scales_kmajor && request.pair_layout)
+        return Nvfp4GateKernel::Paired8;
+    if (paired && request.rows <= 5) return Nvfp4GateKernel::Paired;
+    if (policy.prefer_nvfp4_gate_subgroup && request.rows >= 2 &&
+        request.rows <= request.verification_rows && request.top_k == 10 && !request.pipeline)
+        return Nvfp4GateKernel::Subgroup;
+    return Nvfp4GateKernel::Code;
+}
+
+enum class Nvfp4DownKernel {
+    M1Subwarp,         // Eight-lane exact, one token.
+    Pipelined,
+    SmallBatchSubwarp, // Eight-lane exact, 2..limit rows.
+    Generic,
+};
+
+struct Nvfp4DownRequest {
+    int rows = 0;
+    int top_k = 0;
+    int hidden = 0;
+    int inter = 0;
+    int verification_rows = 0;
+    bool pipeline = false;
+    bool resident_mma_layout = false;
+    bool pair_layout = false;
+    bool row_scale_prefetch = false; // The pipelined kernel was asked to prefetch row scales.
+};
+
+inline Nvfp4DownKernel select_nvfp4_down(const DevicePolicy& policy, const Nvfp4DownRequest& request) {
+    const bool pair_shape = request.top_k == 10 && request.hidden == 2560 && request.inter == 640 &&
+        request.pair_layout;
+    if (request.pipeline && !request.resident_mma_layout) {
+        if (policy.prefer_nvfp4_m1_down_subwarp && request.rows == 1 && pair_shape &&
+            !request.row_scale_prefetch)
+            return Nvfp4DownKernel::M1Subwarp;
+        return Nvfp4DownKernel::Pipelined;
+    }
+    if (policy.prefer_nvfp4_mtp_down_subwarp && request.rows >= 2 &&
+        request.rows <= request.verification_rows && pair_shape && !request.resident_mma_layout)
+        return Nvfp4DownKernel::SmallBatchSubwarp;
+    return Nvfp4DownKernel::Generic;
+}
+
 inline const char* weight_name(MatmulWeight weight) {
     switch (weight) {
     case MatmulWeight::Other: return "dense";
@@ -211,6 +300,29 @@ inline const char* kernel_name(DecodeKernel kernel) {
     case DecodeKernel::Q4RowMajor: return "q4_row_g32_gemv";
     case DecodeKernel::Q4G32: return "q4_g32_dense_gemv";
     case DecodeKernel::Q4G128: return "q4_g128_dense_gemv";
+    }
+    return "unknown";
+}
+
+inline const char* kernel_name(Nvfp4GateKernel kernel) {
+    switch (kernel) {
+    case Nvfp4GateKernel::M1Proven: return "nvfp4_gate_code_m1_proven";
+    case Nvfp4GateKernel::Paired8: return "nvfp4_gate_paired8";
+    case Nvfp4GateKernel::Paired: return "nvfp4_gate_paired";
+    case Nvfp4GateKernel::Subgroup: return "nvfp4_gate_code_subgroup";
+    case Nvfp4GateKernel::Code: return "nvfp4_gate_code";
+    case Nvfp4GateKernel::Pipelined: return "nvfp4_pipelined";
+    case Nvfp4GateKernel::Generic: return "nvfp4_generic";
+    }
+    return "unknown";
+}
+
+inline const char* kernel_name(Nvfp4DownKernel kernel) {
+    switch (kernel) {
+    case Nvfp4DownKernel::M1Subwarp: return "nvfp4_exact_subwarp_m1";
+    case Nvfp4DownKernel::Pipelined: return "nvfp4_pipelined";
+    case Nvfp4DownKernel::SmallBatchSubwarp: return "nvfp4_exact_subwarp_small_batch";
+    case Nvfp4DownKernel::Generic: return "nvfp4_generic";
     }
     return "unknown";
 }

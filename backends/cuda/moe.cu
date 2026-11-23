@@ -857,6 +857,9 @@ bool CudaBackend::try_nvfp4_moe(
                         }
                     }
                 }
+                // Decode and verification batches may use the pipelined SIMT kernels.
+                const bool small_pipeline = (simt_pipeline && rows == 1) ||
+                    (batch_pipeline && rows >= 2 && rows <= 8);
                 if(mma_activation_fused){
                     auto* scratch=static_cast<uint8_t*>(impl_->moe_mma_group_scratch);
                     if(!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_mma_activation_diagnostic(
@@ -894,38 +897,57 @@ bool CudaBackend::try_nvfp4_moe(
                             gate_jobs, routes, 2 * inter, hidden, inter, execution_stream,
                             static_cast<float*>(impl_->moe_mma_partial), native_gate_parts, canonical_mma,
                             nullptr,nullptr,gate_codes_kmajor), "NVFP4 gate/up MMA")) return fail();
-                } else if (gate_codes_kmajor) {
-                    const bool pipeline=(simt_pipeline&&rows==1)||
-                        (batch_pipeline&&rows>=2&&rows<=8);
-                    const bool paired=impl_->policy.prefer_nvfp4_mtp_gate_pairs &&
-                        rows>=2 && rows<=verification_workspace_max_rows() && top_k==10 && hidden==2560 && inter==640 && !pipeline;
-                    const bool subgroup=impl_->policy.prefer_nvfp4_gate_subgroup &&
-                        rows>=2 && rows<=verification_workspace_max_rows() && top_k==10 && !pipeline;
-                    const bool paired_eight=paired&&impl_->policy.prefer_nvfp4_mtp_gate_eight&&
-                        gate_scales_kmajor&&found->second.gate_pair_layout;
-                    const bool proven_m1=impl_->policy.prefer_nvfp4_gate_m1_proven&&
-                        rows==1&&routes==10&&pipeline&&hidden==2560&&inter==640&&
-                        found->second.gate_m1_layout_proven&&!(reinterpret_cast<uintptr_t>(x)&15);
-                    const auto status=proven_m1
-                        ? mollm_cuda::launch_nvfp4_gate_code_m1_proven_projections(
-                            gate_jobs,routes,2*inter,hidden,execution_stream)
-                        : paired_eight
-                        ? mollm_cuda::launch_nvfp4_gate_paired8_projections(
-                            gate_jobs,routes,2*inter,hidden,execution_stream)
-                        : paired && rows<=5 ? mollm_cuda::launch_nvfp4_gate_paired_projections(
-                            gate_jobs,routes,2*inter,hidden,execution_stream)
-                        : subgroup ? mollm_cuda::launch_nvfp4_gate_code_subgroup_projections(
-                            gate_jobs,routes,2*inter,hidden,execution_stream)
-                        : mollm_cuda::launch_nvfp4_gate_code_projections(
-                            gate_jobs,routes,2*inter,hidden,pipeline,execution_stream);
-                    if(!mollm_cuda::report_cuda(status,"NVFP4 gate code SIMT"))return fail();
-                    if(paired)++impl_->moe_mtp_gate_pair_dispatches;
-                } else if (((simt_pipeline && rows == 1) ||
-                    (batch_pipeline && rows >= 2 && rows <= 8)) && !gate_source->resident_nvfp4_mma_layout) {
-                    if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_pipelined_projections(
-                            gate_jobs, routes, 2 * inter, hidden, true, execution_stream), "NVFP4 pipelined gate/up")) return fail();
-                } else mollm_cuda::launch_nvfp4_projections(gate_jobs, routes, 2 * inter, hidden, execution_stream,
-                    gate_source->resident_nvfp4_mma_layout);
+                } else {
+                    mollm_cuda::Nvfp4GateRequest request;
+                    request.rows = rows;
+                    request.routes = static_cast<int>(routes);
+                    request.top_k = top_k;
+                    request.hidden = hidden;
+                    request.inter = inter;
+                    request.verification_rows = verification_workspace_max_rows();
+                    request.codes_kmajor = gate_codes_kmajor;
+                    request.scales_kmajor = gate_scales_kmajor;
+                    request.pipeline = small_pipeline;
+                    request.resident_mma_layout = gate_source->resident_nvfp4_mma_layout;
+                    request.pair_layout = found->second.gate_pair_layout;
+                    request.m1_layout_proven = found->second.gate_m1_layout_proven;
+                    request.activation_aligned = !(reinterpret_cast<uintptr_t>(x) & 15);
+                    const auto kernel = mollm_cuda::select_nvfp4_gate(impl_->policy, request);
+                    impl_->trace_expert_kernel("gate", mollm_cuda::kernel_name(kernel), rows, routes, hidden, inter);
+                    using Gate = mollm_cuda::Nvfp4GateKernel;
+                    switch (kernel) {
+                    case Gate::M1Proven:
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_gate_code_m1_proven_projections(
+                                gate_jobs, routes, 2 * inter, hidden, execution_stream), "NVFP4 gate code SIMT")) return fail();
+                        break;
+                    case Gate::Paired8:
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_gate_paired8_projections(
+                                gate_jobs, routes, 2 * inter, hidden, execution_stream), "NVFP4 gate code SIMT")) return fail();
+                        break;
+                    case Gate::Paired:
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_gate_paired_projections(
+                                gate_jobs, routes, 2 * inter, hidden, execution_stream), "NVFP4 gate code SIMT")) return fail();
+                        break;
+                    case Gate::Subgroup:
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_gate_code_subgroup_projections(
+                                gate_jobs, routes, 2 * inter, hidden, execution_stream), "NVFP4 gate code SIMT")) return fail();
+                        break;
+                    case Gate::Code:
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_gate_code_projections(
+                                gate_jobs, routes, 2 * inter, hidden, small_pipeline, execution_stream), "NVFP4 gate code SIMT")) return fail();
+                        break;
+                    case Gate::Pipelined:
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_pipelined_projections(
+                                gate_jobs, routes, 2 * inter, hidden, true, execution_stream), "NVFP4 pipelined gate/up")) return fail();
+                        break;
+                    case Gate::Generic:
+                        mollm_cuda::launch_nvfp4_projections(gate_jobs, routes, 2 * inter, hidden, execution_stream,
+                            gate_source->resident_nvfp4_mma_layout);
+                        break;
+                    }
+                    if (mollm_cuda::nvfp4_gate_pair_candidate(impl_->policy, request))
+                        ++impl_->moe_mtp_gate_pair_dispatches;
+                }
                 const bool fused_prepare=activation_prepare_fusion && native_mma && use_batched && rows>=16;
                 const bool packed_only=fused_prepare && activation_prepare_fusion==2 &&
                     (batch_down_min==1 || prepare_singles);
@@ -956,35 +978,48 @@ bool CudaBackend::try_nvfp4_moe(
                     } else if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_mma_projections(
                             down_jobs, routes, hidden, inter, 0, execution_stream,
                             nullptr, 1, canonical_mma), "NVFP4 down MMA")) return fail();
-                } else if (((simt_pipeline && rows == 1) ||
-                    (batch_pipeline && rows >= 2 && rows <= 8)) && !down_source->resident_nvfp4_mma_layout) {
+                } else {
                     static const bool prefetch_down_row_scale = [] {
                         const char* value = std::getenv("MOLLM_CUDA_NVFP4_DOWN_ROW_SCALE_PREFETCH");
                         return value && std::strcmp(value, "1") == 0;
                     }();
                     const int load_hint = prefetch_down_row_scale && rows == 1 &&
                         hidden == 2560 && inter == 640 ? 7 : 0;
-                    const bool exact_m1_down = impl_->policy.prefer_nvfp4_m1_down_subwarp &&
-                        rows == 1 && top_k == 10 && hidden == 2560 && inter == 640 &&
-                        found->second.down_pair_layout && load_hint == 0;
-                    const auto down_status = exact_m1_down
-                        ? mollm_cuda::launch_nvfp4_exact_subwarp(
-                            down_jobs, routes, hidden, inter, 8, execution_stream)
-                        : mollm_cuda::launch_nvfp4_pipelined_projections(
-                            down_jobs, routes, hidden, inter, true, execution_stream,
-                            false, load_hint);
-                    if (!mollm_cuda::report_cuda(down_status,
-                            exact_m1_down ? "NVFP4 exact M1 down" : "NVFP4 pipelined down")) return fail();
-                } else if (impl_->policy.prefer_nvfp4_mtp_down_subwarp && rows >= 2 && rows <= verification_workspace_max_rows() &&
-                           top_k == 10 && hidden == 2560 && inter == 640 &&
-                           found->second.down_pair_layout &&
-                           !down_source->resident_nvfp4_mma_layout) {
-                    if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_exact_subwarp(
-                            down_jobs, routes, hidden, inter, 8, execution_stream),
-                            "NVFP4 small-batch exact down")) return fail();
-                    ++impl_->moe_mtp_down_subwarp_dispatches;
-                } else mollm_cuda::launch_nvfp4_projections(down_jobs, routes, hidden, inter, execution_stream,
-                    down_source->resident_nvfp4_mma_layout);
+                    mollm_cuda::Nvfp4DownRequest request;
+                    request.rows = rows;
+                    request.top_k = top_k;
+                    request.hidden = hidden;
+                    request.inter = inter;
+                    request.verification_rows = verification_workspace_max_rows();
+                    request.pipeline = small_pipeline;
+                    request.resident_mma_layout = down_source->resident_nvfp4_mma_layout;
+                    request.pair_layout = found->second.down_pair_layout;
+                    request.row_scale_prefetch = load_hint != 0;
+                    const auto kernel = mollm_cuda::select_nvfp4_down(impl_->policy, request);
+                    impl_->trace_expert_kernel("down", mollm_cuda::kernel_name(kernel), rows, routes, hidden, inter);
+                    using Down = mollm_cuda::Nvfp4DownKernel;
+                    switch (kernel) {
+                    case Down::M1Subwarp:
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_exact_subwarp(
+                                down_jobs, routes, hidden, inter, 8, execution_stream), "NVFP4 exact M1 down")) return fail();
+                        break;
+                    case Down::Pipelined:
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_pipelined_projections(
+                                down_jobs, routes, hidden, inter, true, execution_stream,
+                                false, load_hint), "NVFP4 pipelined down")) return fail();
+                        break;
+                    case Down::SmallBatchSubwarp:
+                        if (!mollm_cuda::report_cuda(mollm_cuda::launch_nvfp4_exact_subwarp(
+                                down_jobs, routes, hidden, inter, 8, execution_stream),
+                                "NVFP4 small-batch exact down")) return fail();
+                        ++impl_->moe_mtp_down_subwarp_dispatches;
+                        break;
+                    case Down::Generic:
+                        mollm_cuda::launch_nvfp4_projections(down_jobs, routes, hidden, inter, execution_stream,
+                            down_source->resident_nvfp4_mma_layout);
+                        break;
+                    }
+                }
                 if (parallel_shared) {
                     if (!mollm_cuda::report_cuda(cudaStreamWaitEvent(execution_stream,
                             impl_->moe_shared_done, 0), "shared expert join")) return fail();

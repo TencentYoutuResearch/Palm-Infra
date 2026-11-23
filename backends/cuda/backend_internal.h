@@ -1087,6 +1087,18 @@ struct CudaBackend::Impl {
                      kernel, layout, m, n, k);
     }
 
+    // MOE expert projections: stage is "gate" or "down".
+    void trace_expert_kernel(const char* stage, const char* kernel, int rows, size_t routes,
+                             int hidden, int inter) {
+        static const bool enabled = std::getenv("MOLLM_CUDA_TRACE_KERNELS") != nullptr;
+        if (!enabled) return;
+        const std::string key = std::string(stage) + ' ' + kernel + ' ' + std::to_string(rows) + ' ' +
+            std::to_string(routes) + ' ' + std::to_string(hidden) + ' ' + std::to_string(inter);
+        if (!traced_kernels.insert(key).second) return;
+        std::fprintf(stderr, "mollm cuda kernel: expert_%s %s rows=%d routes=%zu hidden=%d inter=%d\n",
+                     stage, kernel, rows, routes, hidden, inter);
+    }
+
     // One token through the quantized projection select_decode names.
     bool launch_decode_gemv(const DeviceWeight& prepared, mollm_cuda::MatmulWeight kind,
                             const float* a, float* c, int n, int k, int lda, int ldc,
