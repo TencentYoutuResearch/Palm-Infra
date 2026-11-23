@@ -1091,7 +1091,7 @@ __device__ float2 e2m1_pair(uint8_t packed) {
 #endif
 }
 
-template<int Slots = 32, bool RegisterScores = false, bool CachedBest = false, bool PrefetchDescriptors = false, bool DownBf16 = false, bool GateBf16 = false>
+template<int Slots, bool RegisterScores, bool CachedBest, bool DownBf16, bool GateBf16>
 __global__ void moe_resident_routes_cuda(
     const float* logits, int experts, int top_k, int score_func,
     bool normalize, float scale, const mollm_cuda::Nvfp4Projection* tables,
@@ -1168,13 +1168,6 @@ __global__ void moe_resident_routes_cuda(
                 cached_id = 0x7fffffff;
                 local_max(cached_best, cached_id);
             }
-        }
-    }
-    if constexpr (PrefetchDescriptors) {
-        __syncwarp();
-        if (lane < top_k) {
-            asm volatile("prefetch.global.L2 [%0];" :: "l"(tables + ids[lane]));
-            asm volatile("prefetch.global.L2 [%0];" :: "l"(tables + experts + ids[lane]));
         }
     }
     if (lane == 0) {
@@ -2298,23 +2291,23 @@ void launch_moe_resident_routes(const float* logits, int rows, int experts,
     constexpr bool bf16_down=decltype(packed)::value;
     constexpr bool bf16_gate=decltype(gate_packed)::value;
     if (cached_best_override == 2 && experts <= 512)
-        moe_resident_routes_cuda<16, false, false, false, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
+        moe_resident_routes_cuda<16, false, false, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
             normalize, scale, tables, input, gate_up, activated, down, hidden, inter,
             gate_jobs, down_jobs, weights);
     else if (cached_best_override == 1)
-        moe_resident_routes_cuda<32, false, true, false, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
+        moe_resident_routes_cuda<32, false, true, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
             normalize, scale, tables, input, gate_up, activated, down, hidden, inter,
             gate_jobs, down_jobs, weights);
     else if (cached_best_override < 0 && register_scores && experts <= 512)
-        moe_resident_routes_cuda<16, true, false, false, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
+        moe_resident_routes_cuda<16, true, false, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
             normalize, scale, tables, input, gate_up, activated, down, hidden, inter,
             gate_jobs, down_jobs, weights);
     else if (cached_best_override < 0 && register_scores)
-        moe_resident_routes_cuda<32, true, false, false, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
+        moe_resident_routes_cuda<32, true, false, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
             normalize, scale, tables, input, gate_up, activated, down, hidden, inter,
             gate_jobs, down_jobs, weights);
     else
-        moe_resident_routes_cuda<32, false, false, false, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
+        moe_resident_routes_cuda<32, false, false, bf16_down, bf16_gate><<<rows, 32, 0, stream>>>(logits, experts, top_k, score_func,
         normalize, scale, tables, input, gate_up, activated, down, hidden, inter,
         gate_jobs, down_jobs, weights);
     };

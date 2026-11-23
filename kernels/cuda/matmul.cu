@@ -654,22 +654,17 @@ __global__ void q4_g32_small_batch_wide_cuda(const float* activation,
     }
 }
 
-template <int Threads, bool TerminalReduction = false, int PrefetchDistance = 0,
-          class Block = Q4B8G32Block, bool SingleBarrier = false>
-__device__ __forceinline__ void q4_g32_row_compute(
+// One output row per 256-thread block: each thread owns a strided set of
+// activation pairs and the block reduces in shared memory.
+template <class Block>
+__global__ void q4_g32_row_parallel_gemv_cuda(
     const float* __restrict__ activation, const Block* __restrict__ weight,
-    float* __restrict__ output, int inner, int row) {
+    float* __restrict__ output, int inner) {
+    constexpr int threads = 256;
+    const int row = static_cast<int>(blockIdx.x);
     const int groups = inner / 32;
     float sum = 0.0f;
-    for (int pair = threadIdx.x; pair < inner / 2; pair += Threads) {
-        if constexpr (PrefetchDistance > 0) {
-            if (pair + Threads * PrefetchDistance < inner / 2) {
-                const auto& next = weight[static_cast<size_t>(row / 8) * groups +
-                    (pair + Threads * PrefetchDistance) / 16];
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(&next.q[row % 8][pair % 16]));
-                asm volatile("prefetch.global.L2 [%0];" :: "l"(&next.scales[row % 8]));
-            }
-        }
+    for (int pair = threadIdx.x; pair < inner / 2; pair += threads) {
         const auto& block = weight[static_cast<size_t>(row / 8) * groups + pair / 16];
         const uint8_t packed = block.q[row % 8][pair % 16];
         const float2 x = reinterpret_cast<const float2*>(activation)[pair];
@@ -691,47 +686,9 @@ __device__ __forceinline__ void q4_g32_row_compute(
         } else scale = block.scales[row % 8];
         sum = fmaf(dot, scale, sum);
     }
-    __shared__ float reduction[Threads];
-    if constexpr (SingleBarrier) {
-        static_assert(Threads == 256);
-        reduction[threadIdx.x] = sum;
-        __syncthreads();
-        if (threadIdx.x < 32) {
-            const float* r = reduction + threadIdx.x;
-            const float first = (r[0] + r[128]) + (r[64] + r[192]);
-            const float second = (r[32] + r[160]) + (r[96] + r[224]);
-            const float total = mollm_cuda::detail::warp_reduce_sum(first + second);
-            if (threadIdx.x == 0) output[row] = total;
-        }
-        return;
-    }
-    if constexpr (TerminalReduction) {
-        reduction[threadIdx.x] = sum;
-        __syncthreads();
-#pragma unroll
-        for (int offset = Threads / 2; offset >= 64; offset >>= 1) {
-            if (threadIdx.x < offset)
-                reduction[threadIdx.x] += reduction[threadIdx.x + offset];
-            __syncthreads();
-        }
-        if (threadIdx.x < 32) {
-            float total = reduction[threadIdx.x] + reduction[threadIdx.x + 32];
-            total = mollm_cuda::detail::warp_reduce_sum(total);
-            if (threadIdx.x == 0) output[row] = total;
-        }
-        return;
-    }
-    const float total = mollm_cuda::detail::block_reduce_sum<Threads>(sum, reduction);
+    __shared__ float reduction[threads];
+    const float total = mollm_cuda::detail::block_reduce_sum<threads>(sum, reduction);
     if (threadIdx.x == 0) output[row] = total;
-}
-
-template <int Threads, bool TerminalReduction = false, int PrefetchDistance = 0,
-          class Block = Q4B8G32Block, bool SingleBarrier = false>
-__global__ void q4_g32_row_parallel_gemv_cuda(
-    const float* __restrict__ activation, const Block* __restrict__ weight,
-    float* __restrict__ output, int inner) {
-    q4_g32_row_compute<Threads, TerminalReduction, PrefetchDistance, Block, SingleBarrier>(activation,
-        weight, output, inner, static_cast<int>(blockIdx.x));
 }
 
 __device__ __forceinline__ float q4_shared_reduce_256(const float* values) {
@@ -1486,7 +1443,7 @@ void launch_q4_g32_compact_gemv(const float* activation,
     }
     if (columns <= 4096 && inner >= 2048 &&
         reinterpret_cast<uintptr_t>(activation) % alignof(float2) == 0) {
-        q4_g32_row_parallel_gemv_cuda<256><<<columns, 256, 0, stream>>>(
+        q4_g32_row_parallel_gemv_cuda<Q4CompactG32><<<columns, 256, 0, stream>>>(
             activation, weight, output, inner);
         return;
     }
@@ -1701,7 +1658,7 @@ void launch_q4_g32_dense_gemv(
             if (pipeline_shape) {
                 q4_g32_pipelined_narrow_cuda<1,true><<<columns,256,0,stream>>>(activation,weight,output,inner);
             } else {
-                q4_g32_row_parallel_gemv_cuda<256><<<columns, 256, 0, stream>>>(
+                q4_g32_row_parallel_gemv_cuda<Q4B8G32Block><<<columns, 256, 0, stream>>>(
                     activation, weight, output, inner);
             }
             return;
