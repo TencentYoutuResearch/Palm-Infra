@@ -256,6 +256,69 @@ inline Nvfp4DownKernel select_nvfp4_down(const DevicePolicy& policy, const Nvfp4
     return Nvfp4DownKernel::Generic;
 }
 
+// Vocabulary and hidden size the screened and compact heads were fitted on;
+// every other shape keeps the exact Q8 GEMV.
+constexpr int qualified_head_rows = 248320;
+constexpr int qualified_head_inner = 2560;
+
+// One hidden state through the language-model head.
+enum class ScalarHeadKernel {
+    DraftFittedQ4Screen, // Fitted compact Q4 with energy screening (draft confidence).
+    DraftCompactQ4,      // Compact Q4 draft head.
+    ScreenQ4,            // Exact Q8 argmax behind a Q4 screen.
+    ScreenQ6,            // Exact Q8 argmax behind a Q6 screen.
+    Matmul,              // The matmul dispatcher's decode projection.
+};
+
+struct ScalarHeadRequest {
+    int rows = 0;
+    int inner = 0;
+    bool draft_compact_eligible = false; // A draft request on a Q8 head the compact pack accepts.
+    bool probability_output = false; // The draft asked for a confidence.
+    bool screen_eligible = false; // A Q8 head, activation and shape the screens accept.
+    bool weight_shape_matches = false; // The prepared weight has exactly rows x inner.
+};
+
+inline ScalarHeadKernel select_scalar_head(const DevicePolicy& policy, const ScalarHeadRequest& request) {
+    const bool qualified_rows = request.rows == qualified_head_rows;
+    if (request.draft_compact_eligible)
+        return request.probability_output && qualified_rows && request.inner == qualified_head_inner &&
+            policy.prefer_screened_heads ? ScalarHeadKernel::DraftFittedQ4Screen
+                                         : ScalarHeadKernel::DraftCompactQ4;
+    if (request.screen_eligible)
+        return policy.prefer_screened_heads && qualified_rows && request.weight_shape_matches
+            ? ScalarHeadKernel::ScreenQ4 : ScalarHeadKernel::ScreenQ6;
+    return ScalarHeadKernel::Matmul;
+}
+
+// Screened Q8 argmax for a verification batch: zero when the batch takes
+// the unscreened path, otherwise the widest batch to size the scratch for.
+// `candidate` covers the facts the backend checks (layout, shape, alignment,
+// no draft request, 3..limit tokens).
+inline int q8_head_batch_screen_capacity(const DevicePolicy& policy, int tokens, bool candidate) {
+    if (!candidate) return 0;
+    if (policy.prefer_screened_heads) return tokens > 5 ? tokens : 5;
+    return tokens == 3 ? 3 : 0;
+}
+
+// A verification batch through the language-model head.
+enum class BatchHeadKernel { ScreenBatch3, ScreenBatch, Q4G128Exact, Q8Exact };
+
+inline BatchHeadKernel select_batch_head(const DevicePolicy& policy, int tokens, bool screen_candidate,
+                                         bool q4_g128) {
+    if (q8_head_batch_screen_capacity(policy, tokens, screen_candidate) > 0)
+        return tokens == 3 ? BatchHeadKernel::ScreenBatch3 : BatchHeadKernel::ScreenBatch;
+    return q4_g128 ? BatchHeadKernel::Q4G128Exact : BatchHeadKernel::Q8Exact;
+}
+
+// The paired HC projections of one decode token.
+enum class HcPairKernel { CachedCopy, Adjacent, Unequal };
+
+inline HcPairKernel select_hc_pair(const DevicePolicy& policy, bool second_of_pair, bool input_aligned) {
+    if (second_of_pair) return HcPairKernel::CachedCopy;
+    return policy.prefer_q4_hc_adjacent && input_aligned ? HcPairKernel::Adjacent : HcPairKernel::Unequal;
+}
+
 inline const char* weight_name(MatmulWeight weight) {
     switch (weight) {
     case MatmulWeight::Other: return "dense";
@@ -323,6 +386,36 @@ inline const char* kernel_name(Nvfp4DownKernel kernel) {
     case Nvfp4DownKernel::Pipelined: return "nvfp4_pipelined";
     case Nvfp4DownKernel::SmallBatchSubwarp: return "nvfp4_exact_subwarp_small_batch";
     case Nvfp4DownKernel::Generic: return "nvfp4_generic";
+    }
+    return "unknown";
+}
+
+inline const char* kernel_name(ScalarHeadKernel kernel) {
+    switch (kernel) {
+    case ScalarHeadKernel::DraftFittedQ4Screen: return "draft_fitted_q4_screen";
+    case ScalarHeadKernel::DraftCompactQ4: return "draft_compact_q4";
+    case ScalarHeadKernel::ScreenQ4: return "q8_head_screen_q4";
+    case ScalarHeadKernel::ScreenQ6: return "q8_head_screen_q6";
+    case ScalarHeadKernel::Matmul: return "matmul";
+    }
+    return "unknown";
+}
+
+inline const char* kernel_name(BatchHeadKernel kernel) {
+    switch (kernel) {
+    case BatchHeadKernel::ScreenBatch3: return "q8_head_screen_batch3";
+    case BatchHeadKernel::ScreenBatch: return "q8_head_screen_batch";
+    case BatchHeadKernel::Q4G128Exact: return "q4_g128_small_batch_exact";
+    case BatchHeadKernel::Q8Exact: return "q8_small_batch_exact";
+    }
+    return "unknown";
+}
+
+inline const char* kernel_name(HcPairKernel kernel) {
+    switch (kernel) {
+    case HcPairKernel::CachedCopy: return "hc_cached_copy";
+    case HcPairKernel::Adjacent: return "q4_g32_hc_adjacent";
+    case HcPairKernel::Unequal: return "q4_g32_unequal";
     }
     return "unknown";
 }

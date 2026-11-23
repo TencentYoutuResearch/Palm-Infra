@@ -588,11 +588,12 @@ void CudaBackend::dispatch(const GraphNode& node,
     if (hc_tag) {
         cudaError_t result;
         const int rows = hc_pair->computed_rows;
-        if (hc_tag == 2) {
+        const auto hc_kernel = mollm_cuda::select_hc_pair(impl_->policy, hc_tag == 2,
+            reinterpret_cast<uintptr_t>(hc_pair->computed_input) % alignof(float4) == 0);
+        if (hc_kernel == mollm_cuda::HcPairKernel::CachedCopy) {
             result = cudaMemcpyAsync(device_pointer<float>(*output), hc_pair->cache,
                 size_t(rows) * 4 * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        } else if (impl_->policy.prefer_q4_hc_adjacent &&
-                   reinterpret_cast<uintptr_t>(hc_pair->computed_input) % alignof(float4) == 0) {
+        } else if (hc_kernel == mollm_cuda::HcPairKernel::Adjacent) {
             result = mollm_cuda::launch_q4_g32_hc_adjacent_projections(
                 hc_pair->computed_input, static_cast<const Q4B8G32Block*>(hc_first_weight->data),
                 static_cast<const Q4B8G32Block*>(hc_second_weight->data),

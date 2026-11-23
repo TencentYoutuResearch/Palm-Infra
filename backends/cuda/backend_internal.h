@@ -1076,27 +1076,33 @@ struct CudaBackend::Impl {
 
     // Prints each distinct kernel selection once when MOLLM_CUDA_TRACE_KERNELS
     // is set, so a run shows which kernels its shapes actually reach.
-    void trace_kernel(const char* kernel, mollm_cuda::MatmulWeight weight, int m, int n, int k) {
+    // MOLLM_CUDA_TRACE_KERNELS prints each distinct selection once.
+    static bool tracing_kernels() {
         static const bool enabled = std::getenv("MOLLM_CUDA_TRACE_KERNELS") != nullptr;
-        if (!enabled) return;
-        const char* layout = mollm_cuda::weight_name(weight);
-        const std::string key = std::string(kernel) + ' ' + layout + ' ' + std::to_string(m) + ' ' +
-            std::to_string(n) + ' ' + std::to_string(k);
-        if (!traced_kernels.insert(key).second) return;
-        std::fprintf(stderr, "mollm cuda kernel: matmul %s weight=%s m=%d n=%d k=%d\n",
-                     kernel, layout, m, n, k);
+        return enabled;
     }
-
+    void trace_selection(const std::string& selection) {
+        if (traced_kernels.insert(selection).second)
+            std::fprintf(stderr, "mollm cuda kernel: %s\n", selection.c_str());
+    }
+    void trace_kernel(const char* kernel, mollm_cuda::MatmulWeight weight, int m, int n, int k) {
+        if (!tracing_kernels()) return;
+        trace_selection(std::string("matmul ") + kernel + " weight=" + mollm_cuda::weight_name(weight) +
+            " m=" + std::to_string(m) + " n=" + std::to_string(n) + " k=" + std::to_string(k));
+    }
     // MOE expert projections: stage is "gate" or "down".
     void trace_expert_kernel(const char* stage, const char* kernel, int rows, size_t routes,
                              int hidden, int inter) {
-        static const bool enabled = std::getenv("MOLLM_CUDA_TRACE_KERNELS") != nullptr;
-        if (!enabled) return;
-        const std::string key = std::string(stage) + ' ' + kernel + ' ' + std::to_string(rows) + ' ' +
-            std::to_string(routes) + ' ' + std::to_string(hidden) + ' ' + std::to_string(inter);
-        if (!traced_kernels.insert(key).second) return;
-        std::fprintf(stderr, "mollm cuda kernel: expert_%s %s rows=%d routes=%zu hidden=%d inter=%d\n",
-                     stage, kernel, rows, routes, hidden, inter);
+        if (!tracing_kernels()) return;
+        trace_selection(std::string("expert_") + stage + ' ' + kernel + " rows=" + std::to_string(rows) +
+            " routes=" + std::to_string(routes) + " hidden=" + std::to_string(hidden) +
+            " inter=" + std::to_string(inter));
+    }
+    // Language-model head: tokens hidden states against rows x inner.
+    void trace_head_kernel(const char* kernel, int tokens, int rows, int inner) {
+        if (!tracing_kernels()) return;
+        trace_selection(std::string("head ") + kernel + " m=" + std::to_string(tokens) +
+            " n=" + std::to_string(rows) + " k=" + std::to_string(inner));
     }
 
     // One token through the quantized projection select_decode names.

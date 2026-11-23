@@ -244,6 +244,59 @@ int main() {
         expect(select_nvfp4_down(sm121, request) == Nvfp4DownKernel::Generic, "MMA-layout M1 down");
     }
 
+    // Language-model head, one hidden state.
+    {
+        ScalarHeadRequest draft;
+        draft.rows = qualified_head_rows;
+        draft.inner = qualified_head_inner;
+        draft.draft_compact_eligible = true;
+        draft.probability_output = true;
+        draft.screen_eligible = true;
+        draft.weight_shape_matches = true;
+        expect(select_scalar_head(sm121, draft) == ScalarHeadKernel::DraftFittedQ4Screen, "SM121 fitted draft head");
+        expect(select_scalar_head(sm89, draft) == ScalarHeadKernel::DraftCompactQ4, "generic draft head");
+        ScalarHeadRequest request = draft;
+        request.probability_output = false;
+        expect(select_scalar_head(sm121, request) == ScalarHeadKernel::DraftCompactQ4, "draft head without confidence");
+        request = draft;
+        request.rows = 151936;
+        expect(select_scalar_head(sm121, request) == ScalarHeadKernel::DraftCompactQ4, "draft head of another vocabulary");
+        request = draft;
+        request.draft_compact_eligible = false;
+        expect(select_scalar_head(sm121, request) == ScalarHeadKernel::ScreenQ4, "SM121 Q4 screen");
+        expect(select_scalar_head(sm89, request) == ScalarHeadKernel::ScreenQ6, "generic Q6 screen");
+        request.weight_shape_matches = false;
+        expect(select_scalar_head(sm121, request) == ScalarHeadKernel::ScreenQ6, "Q6 screen for a weight slice");
+        request.weight_shape_matches = true;
+        request.rows = 151936;
+        expect(select_scalar_head(sm121, request) == ScalarHeadKernel::ScreenQ6, "Q6 screen for another vocabulary");
+        request.screen_eligible = false;
+        expect(select_scalar_head(sm121, request) == ScalarHeadKernel::Matmul, "unscreened head");
+    }
+
+    // Language-model head, verification batch.
+    for (int tokens = 2; tokens <= 8; ++tokens) {
+        expect(select_batch_head(sm121, tokens, true, false) ==
+               (tokens == 3 ? BatchHeadKernel::ScreenBatch3 : BatchHeadKernel::ScreenBatch),
+               "SM121 screened batch head");
+        expect(q8_head_batch_screen_capacity(sm121, tokens, true) == (tokens > 5 ? tokens : 5),
+               "SM121 batch screen capacity");
+        expect(select_batch_head(sm89, tokens, true, false) ==
+               (tokens == 3 ? BatchHeadKernel::ScreenBatch3 : BatchHeadKernel::Q8Exact),
+               "generic batch head");
+        expect(q8_head_batch_screen_capacity(sm89, tokens, true) == (tokens == 3 ? 3 : 0),
+               "generic batch screen capacity");
+        expect(select_batch_head(sm121, tokens, false, false) == BatchHeadKernel::Q8Exact, "exact Q8 batch head");
+        expect(select_batch_head(sm121, tokens, false, true) == BatchHeadKernel::Q4G128Exact, "G128 batch head");
+    }
+
+    // Paired HC projections.
+    expect(select_hc_pair(sm121, true, true) == HcPairKernel::CachedCopy &&
+           select_hc_pair(sm89, true, false) == HcPairKernel::CachedCopy, "HC cached copy");
+    expect(select_hc_pair(sm121, false, true) == HcPairKernel::Adjacent, "SM121 adjacent HC");
+    expect(select_hc_pair(sm121, false, false) == HcPairKernel::Unequal, "unaligned HC");
+    expect(select_hc_pair(sm89, false, true) == HcPairKernel::Unequal, "generic HC");
+
     if (failures) return 1;
     std::printf("CUDA kernel selection tables match\n");
     return 0;
