@@ -299,6 +299,7 @@ struct CudaBackend::Impl {
     size_t moe_gate_compact_prefill_calls = 0;
     size_t moe_down_compact_prefill_calls = 0;
     size_t moe_mtp_gate_pair_dispatches = 0; // Host dispatches, including graph capture.
+    size_t moe_demand_gpu_calls = 0; // Demand-cached MoE calls that ran on the GPU.
     size_t moe_mtp_down_subwarp_dispatches = 0; // Host dispatches, including graph capture.
     size_t sigmoid_gr_reduce_fused_calls = 0;
     size_t gr_inject_rms_fused_calls = 0;
@@ -694,6 +695,8 @@ struct CudaBackend::Impl {
             std::fprintf(stderr, "CudaBackend: compact gate NVFP4 prefill calls=%zu\n", moe_gate_compact_prefill_calls);
         if (moe_down_compact_prefill_calls)
             std::fprintf(stderr, "CudaBackend: compact down NVFP4 prefill calls=%zu\n", moe_down_compact_prefill_calls);
+        if (moe_demand_gpu_calls)
+            std::fprintf(stderr, "CudaBackend: demand-cached MoE calls on GPU=%zu\n", moe_demand_gpu_calls);
         if (moe_mtp_gate_pair_dispatches)
             std::fprintf(stderr, "CudaBackend: NVFP4 small-batch gate pair host dispatches=%zu\n", moe_mtp_gate_pair_dispatches);
         if (moe_mtp_down_subwarp_dispatches)

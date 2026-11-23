@@ -29,6 +29,9 @@ struct RuntimeOptions {
     bool disable_nvfp4_grouping = false;         // MOLLM_CUDA_DISABLE_NVFP4_GROUPING
     bool disable_resident_routes = false;        // MOLLM_CUDA_DISABLE_RESIDENT_ROUTES
     bool disable_moe_graphs = false;             // MOLLM_CUDA_DISABLE_MOE_GRAPHS
+    // Leave a demand-cached MoE call with a missing expert to the CPU kernel
+    // instead of requesting its experts and waiting for them on the GPU path.
+    bool disable_moe_demand_wait = false;        // MOLLM_CUDA_DISABLE_MOE_DEMAND_WAIT
 
     // Opt-ins (exactly "1").
     bool dense_prefill_fp32_reference = false; // MOLLM_CUDA_DENSE_PREFILL_FP32_REFERENCE
@@ -104,6 +107,7 @@ inline RuntimeOptions read_runtime_options() {
     options.disable_nvfp4_grouping = set("MOLLM_CUDA_DISABLE_NVFP4_GROUPING");
     options.disable_resident_routes = set("MOLLM_CUDA_DISABLE_RESIDENT_ROUTES");
     options.disable_moe_graphs = set("MOLLM_CUDA_DISABLE_MOE_GRAPHS");
+    options.disable_moe_demand_wait = set("MOLLM_CUDA_DISABLE_MOE_DEMAND_WAIT");
 
     options.dense_prefill_fp32_reference = one("MOLLM_CUDA_DENSE_PREFILL_FP32_REFERENCE");
     options.q4_small_batch = one("MOLLM_CUDA_Q4_SMALL_BATCH");

@@ -1074,6 +1074,13 @@ bool CudaBackend::try_nvfp4_moe(
     std::vector<float> weights;
     if (!mollm::detail::select_moe_routes(host_logits.data(), rows, nullptr,
                                          routing, indices, weights)) return fail();
+    ExpertProvider* const provider = gate_source->provider;
+    const bool wait_for_experts = !impl_->options.disable_moe_demand_wait;
+    // As in the CPU kernel: a decode token tells the cache which experts to
+    // keep for the next one, in router rank order.
+    if (wait_for_experts && rows == 1)
+        provider->retain_for_next_forward(gate_source, down_source,
+            std::vector<int>(indices.begin(), indices.begin() + top_k), true);
     // Accumulate experts in the same ascending-ID order as the CPU provider.
     for (int row = 0; row < rows; ++row) {
         for (int i = 1; i < top_k; ++i) {
@@ -1083,18 +1090,35 @@ bool CudaBackend::try_nvfp4_moe(
             }
         }
     }
-    std::vector<ExpertLease> leases(routes);
-    std::vector<mollm_cuda::Nvfp4Projection> gate_jobs(routes), down_jobs(routes);
-    for (size_t i = 0; i < routes; ++i) {
-        // Never initiate I/O from the CUDA path. A cache miss or unsupported
-        // provider is handled by the existing CPU bridge without partial output.
-        if (!gate_source->provider->borrow(gate_source, down_source, indices[i], leases[i], false))
+    std::vector<int> wanted(indices.begin(), indices.begin() + routes);
+    std::sort(wanted.begin(), wanted.end());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    if (wait_for_experts) {
+        // Queue every miss at once so the reads overlap, then wait for each
+        // expert below. The cache must be able to hold all of this call's
+        // experts together, because each stays pinned until the projections
+        // have run; when it cannot, the CPU kernel streams them in a window.
+        if (!provider->request_many(gate_source, down_source, wanted) ||
+            provider->resident_count(gate_source, down_source, wanted) < wanted.size())
+            return false;
+    }
+    // One lease per distinct expert. Without waiting, a miss or an
+    // unsupported provider leaves the whole operator to the CPU bridge.
+    std::vector<ExpertLease> leases(wanted.size());
+    for (size_t i = 0; i < wanted.size(); ++i) {
+        if (!provider->borrow(gate_source, down_source, wanted[i], leases[i], wait_for_experts))
             return false;
         if (!valid(leases[i].gate_up, 2 * inter, hidden) ||
             !valid(leases[i].down, hidden, inter)) return false;
-        gate_jobs[i] = projection(leases[i].gate_up, x + (i / top_k) * hidden,
+    }
+    if (wait_for_experts) ++impl_->moe_demand_gpu_calls;
+    std::vector<mollm_cuda::Nvfp4Projection> gate_jobs(routes), down_jobs(routes);
+    for (size_t i = 0; i < routes; ++i) {
+        const ExpertLease& lease = leases[static_cast<size_t>(
+            std::lower_bound(wanted.begin(), wanted.end(), indices[i]) - wanted.begin())];
+        gate_jobs[i] = projection(lease.gate_up, x + (i / top_k) * hidden,
                                   gate_up + i * 2 * inter);
-        down_jobs[i] = projection(leases[i].down, activated + i * inter, down + i * hidden);
+        down_jobs[i] = projection(lease.down, activated + i * inter, down + i * hidden);
     }
     mollm_cuda::launch_nvfp4_projections(gate_jobs.data(), routes, 2 * inter, hidden);
     mollm_cuda::launch_moe_activation(gate_up, gate_up + inter, weights.data(),

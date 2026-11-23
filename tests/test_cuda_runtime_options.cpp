@@ -20,7 +20,8 @@ const char* const names[] = {
     "MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION", "MOLLM_CUDA_DISABLE_DECODE_SEGMENTS",
     "MOLLM_CUDA_DISABLE_GEOMETRIC_GROWTH", "MOLLM_CUDA_DISABLE_NVFP4_MOE",
     "MOLLM_CUDA_DISABLE_NVFP4_GROUPING", "MOLLM_CUDA_DISABLE_RESIDENT_ROUTES",
-    "MOLLM_CUDA_DISABLE_MOE_GRAPHS", "MOLLM_CUDA_DENSE_PREFILL_FP32_REFERENCE",
+    "MOLLM_CUDA_DISABLE_MOE_GRAPHS", "MOLLM_CUDA_DISABLE_MOE_DEMAND_WAIT",
+    "MOLLM_CUDA_DENSE_PREFILL_FP32_REFERENCE",
     "MOLLM_CUDA_Q4_SMALL_BATCH", "MOLLM_CUDA_NVFP4_BATCH_PIPELINE",
     "MOLLM_CUDA_NVFP4_MMA_PREPARE_SINGLES", "MOLLM_CUDA_NVFP4_DOWN_ROW_SCALE_PREFETCH",
     "MOLLM_CUDA_QSA_GQA_REUSE", "MOLLM_CUDA_QSA_DECODE_SPLIT", "MOLLM_CUDA_STRIDED_RESHAPE_VIEWS",
@@ -55,7 +56,9 @@ int main() {
     clear();
     const RuntimeOptions defaults = read_runtime_options();
     expect(!defaults.disable_qualified_verification && !defaults.disable_decode_segments &&
-           !defaults.disable_nvfp4_moe && !defaults.disable_moe_graphs, "opt-outs default off");
+           !defaults.disable_nvfp4_moe && !defaults.disable_moe_graphs &&
+           !defaults.disable_moe_demand_wait, "opt-outs default off");
+    expect(with("MOLLM_CUDA_DISABLE_MOE_DEMAND_WAIT", "1").disable_moe_demand_wait, "demand wait opt-out");
     expect(!defaults.q4_small_batch && !defaults.nvfp4_batch_pipeline &&
            !defaults.dense_prefill_fp32_reference, "opt-ins default off");
     expect(defaults.qsa_gqa_reuse && defaults.qsa_decode_split, "QSA reuse defaults on");

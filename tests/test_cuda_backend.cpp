@@ -1657,13 +1657,14 @@ bool test_nvfp4_moe_provider() {
         cpu.dispatch(node, {&host_x, &router, &gate, &down, &sg, &su, &sd, &scale}, &host_y, nullptr);
         Tensor x = device_tensor(backend, 32, rows), y = device_tensor(backend, 32, rows);
         if (!upload(backend, x, input)) return false;
+        // Both experts are routed by every row; each is borrowed once per call.
         const int before = provider.borrows;
         backend.dispatch(node, {&x, &router, &gate, &down, &sg, &su, &sd, &scale}, &y, nullptr);
         if (cpu.dispatch_failed() || backend.dispatch_failed() || provider.pins != 0 ||
-            provider.borrows - before != rows * 2 || !download(backend, y, actual) ||
+            provider.borrows - before != 2 || !download(backend, y, actual) ||
             !close_enough(actual, expected, 1e-6f)) return false;
-        // A partial nonblocking acquisition must release its pins before
-        // entering the CPU bridge; reference execution may then wait for I/O.
+        // An expert that is not ready without waiting is waited for, and no
+        // pin outlives the call whichever path produced the output.
         provider.miss_nonblocking = true;
         backend.set_operator_fallback_policy(OperatorFallbackPolicy::ALLOW_REFERENCE);
         backend.dispatch(node, {&x, &router, &gate, &down, &sg, &su, &sd, &scale}, &y, nullptr);
