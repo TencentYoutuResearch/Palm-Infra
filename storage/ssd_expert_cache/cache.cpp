@@ -903,7 +903,7 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
                                &entry->down_data, &entry->down_scales}) {
         const size_t alignment = transport_->direct_alignment();
         if (buffer->direct_alignment != alignment) {
-            buffer->resize(0);  // A recycled buffer keeps the layout it was allocated with.
+            buffer->release();  // A recycled buffer keeps the layout it was allocated with.
             buffer->direct_alignment = alignment;
         }
     }
@@ -931,10 +931,30 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
             !entry->down_data.resize_in_arena(down->spec.data_bytes, resident_arena_) ||
             !entry->down_scales.resize_in_arena(down->spec.scales_bytes, resident_arena_)) return nullptr;
     } else {
-        entry->gate_up_data.resize(static_cast<size_t>(gate_up->spec.data_bytes));
-        entry->gate_up_scales.resize(static_cast<size_t>(gate_up->spec.scales_bytes));
-        entry->down_data.resize(static_cast<size_t>(down->spec.data_bytes));
-        entry->down_scales.resize(static_cast<size_t>(down->spec.scales_bytes));
+        const auto scales_follow_data = [&](const MoeSsdTensorSpec& spec) {
+            return spec.precision == Precision::NVFP4 && spec.data_bytes && spec.scales_bytes &&
+                spec.scales_file_offset(expert) == spec.data_file_offset(expert) + spec.data_bytes;
+        };
+        // The same condition under which the I/O queue reads a tensor's data
+        // and scales as one job.
+        const bool one_read_per_tensor = scales_follow_data(gate_up->spec) && scales_follow_data(down->spec);
+        const auto size_tensor = [&](ByteBuffer& data, ByteBuffer& scales, const MoeSsdTensorSpec& spec) {
+            const size_t data_bytes = static_cast<size_t>(spec.data_bytes);
+            const size_t scales_bytes = static_cast<size_t>(spec.scales_bytes);
+#if !defined(__APPLE__)
+            // Direct reads fill whole blocks, so such a tensor is read once
+            // into one allocation and its scales are a view of the tail.
+            if (data.direct_alignment && one_read_per_tensor) {
+                data.resize(data_bytes, scales_bytes);
+                scales.resize_as_view(scales_bytes);
+                return;
+            }
+#endif
+            data.resize(data_bytes);
+            scales.resize(scales_bytes);
+        };
+        size_tensor(entry->gate_up_data, entry->gate_up_scales, gate_up->spec);
+        size_tensor(entry->down_data, entry->down_scales, down->spec);
     }
     resident_bytes_ += entry->capacity_bytes();
     layer_resident += entry->capacity_bytes();

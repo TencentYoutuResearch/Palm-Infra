@@ -129,14 +129,16 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
 bool MoeSsdCache::read_buffer(ByteBuffer& dst, uint64_t offset) {
     if (dst.empty()) return true;
 #if !defined(__APPLE__)
+    if (dst.is_view) return dst.data() != nullptr;  // Filled with the buffer it points into.
     if (dst.direct()) {
         const size_t alignment = dst.direct_alignment;
         const size_t head = static_cast<size_t>(offset % alignment);
-        const size_t count = (head + dst.size() + alignment - 1) / alignment * alignment;
+        const size_t count = (head + dst.size() + dst.trailing + alignment - 1) / alignment * alignment;
         if (count > dst.allocated) return false;
         dst.payload_offset = head;
         return transport_ && transport_->read(offset - head, dst.storage.get(), count);
     }
+    if (dst.trailing) return read_exact(offset, dst.storage.get(), dst.size() + dst.trailing);
 #endif
     return read_exact(offset, dst.data(), dst.size());
 }
@@ -247,12 +249,18 @@ bool MoeSsdCache::read_job(const IoJob& job) {
             const uint64_t scales_offset =
                 component_offset(entry, scales_component);
 #if defined(__APPLE__)
-            const bool separate = false;
+            const bool shared = false;
 #else
-            // Each direct buffer is filled by its own aligned read.
-            const bool separate = data.direct() || scales.direct();
+            // One aligned read fills the data and the scales that follow it.
+            const bool shared = scales.is_view && data.trailing == scales.size();
+            if (shared) {
+                if (scales_offset != data_offset + data.size() || !read_buffer(data, data_offset))
+                    return false;
+                scales.point(data.data() + data.size());
+            }
 #endif
-            if (separate || scales.empty() || scales_offset != data_offset + data.size()) {
+            if (shared) {
+            } else if (scales.empty() || scales_offset != data_offset + data.size()) {
                 if (!read_buffer(data, data_offset) || !read_buffer(scales, scales_offset))
                     return false;
             } else {

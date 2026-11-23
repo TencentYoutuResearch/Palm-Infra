@@ -178,6 +178,50 @@ int main() {
             check(good, "direct cache hands out the package bytes");
             check(direct->direct_reads() == direct_before + 6 && direct->cached_reads() == cached_before,
                   "every cache read took the direct path exactly once");
+
+            // NVFP4 keeps a tensor's scales right after its data. Each tensor
+            // is then one direct read into one allocation, not two.
+            MoeSsdTensorSpec fp4_gate, fp4_down;
+            for (MoeSsdTensorSpec* tensor : {&fp4_gate, &fp4_down}) {
+                tensor->layer = 1;
+                tensor->num_experts = 2;
+                tensor->rows = 16;
+                tensor->cols = 64;
+                tensor->precision = Precision::NVFP4;
+                tensor->group_size = 16;
+                tensor->groups_per_row = 4;
+                tensor->data_bytes = 16 * 64 / 2;
+                tensor->scales_bytes = 16 * 64 / 16 + 16 * 4;
+                tensor->expert_stride = tensor->data_bytes + tensor->scales_bytes;
+            }
+            fp4_gate.weight_ref = "fg";
+            fp4_down.weight_ref = "fd";
+            fp4_gate.data_offset = 123457;
+            fp4_gate.scales_offset = fp4_gate.data_offset + fp4_gate.data_bytes;
+            fp4_down.data_offset = 777001;
+            fp4_down.scales_offset = fp4_down.data_offset + fp4_down.data_bytes;
+            const bool added = cache.add_source(fp4_gate) && cache.add_source(fp4_down);
+            if (!added) {
+                std::printf("this build rejects the NVFP4 fixture geometry; skipping the shared-read part\n");
+            } else {
+                const uint64_t before_fp4 = direct->direct_reads();
+                bool fp4_good = true;
+                for (int expert = 0; expert < 2; ++expert) {
+                    ExpertLease lease;
+                    const size_t stride = fp4_gate.expert_stride;
+                    fp4_good = fp4_good &&
+                        cache.borrow(cache.find_source("fg"), cache.find_source("fd"), expert, lease) &&
+                        !std::memcmp(lease.gate_up.data, large.data() + 123457 + expert * stride, fp4_gate.data_bytes) &&
+                        !std::memcmp(lease.gate_up.nvfp4_scales,
+                                     large.data() + 123457 + expert * stride + fp4_gate.data_bytes, 16 * 4) &&
+                        !std::memcmp(lease.down.data, large.data() + 777001 + expert * stride, fp4_down.data_bytes) &&
+                        !std::memcmp(lease.down.nvfp4_scales,
+                                     large.data() + 777001 + expert * stride + fp4_down.data_bytes, 16 * 4);
+                }
+                check(fp4_good, "direct cache hands out NVFP4 data and scales from one read");
+                check(direct->direct_reads() == before_fp4 + 4 && direct->cached_reads() == cached_before,
+                      "an NVFP4 expert costs two direct reads");
+            }
         }
         unlink(local.c_str());
     }

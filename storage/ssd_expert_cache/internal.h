@@ -291,68 +291,96 @@ struct MoeSsdCache::ByteBuffer {
     uint8_t* slice = nullptr;
     size_t length = 0;
     // Nonzero when the transport reads aligned ranges straight from the
-    // device. The storage is then aligned and one unit larger than the
-    // payload, so the whole blocks that cover the payload fit; the payload
-    // starts payload_offset bytes in, wherever its first block puts it.
+    // device. The storage is then aligned and holds the whole blocks that
+    // cover the payload, which starts payload_offset bytes in, wherever its
+    // first block puts it.
     size_t direct_alignment = 0;
     size_t allocated = 0;
     size_t payload_offset = 0;
+    // Bytes that follow the payload in the package and are read with it in
+    // one request: a tensor's scales after its data. They belong to a sibling
+    // buffer, which is then a view into this storage and owns nothing.
+    size_t trailing = 0;
+    uint8_t* view = nullptr;
+    bool is_view = false;
     bool locked = false;
 
     ~ByteBuffer() {
         unlock();
     }
 
-    void resize(size_t bytes) {
-        if (bytes == length) return;
+    void release() {
         unlock();
+        storage.reset();
         arena.reset();
-        slice = nullptr;
-        payload_offset = 0;
-        allocated = bytes;
-        if (bytes == 0) {
-            storage.reset();
-        } else if (direct_alignment) {
-            if (bytes > std::numeric_limits<size_t>::max() - 2 * direct_alignment) throw std::bad_alloc();
-            allocated = (bytes + 2 * direct_alignment - 1) / direct_alignment * direct_alignment;
+        slice = view = nullptr;
+        is_view = false;
+        length = allocated = payload_offset = trailing = 0;
+    }
+    void resize(size_t bytes) { resize(bytes, 0); }
+    // Own storage for bytes of payload followed by trailing_bytes of a sibling's.
+    void resize(size_t bytes, size_t trailing_bytes) {
+        if (bytes == length && trailing_bytes == trailing && !is_view && !arena) return;
+        release();
+        if (bytes == 0) return;
+        if (direct_alignment) {
+            if (trailing_bytes > std::numeric_limits<size_t>::max() - bytes ||
+                bytes + trailing_bytes > std::numeric_limits<size_t>::max() - 2 * direct_alignment)
+                throw std::bad_alloc();
+            // The first block may start up to one unit before the payload.
+            allocated = (bytes + trailing_bytes + 2 * direct_alignment - 1) /
+                direct_alignment * direct_alignment;
             void* aligned = nullptr;
             if (posix_memalign(&aligned, direct_alignment, allocated) != 0) throw std::bad_alloc();
             storage.reset(static_cast<uint8_t*>(aligned));
         } else {
-            storage.reset(static_cast<uint8_t*>(std::malloc(bytes)));
+            if (trailing_bytes > std::numeric_limits<size_t>::max() - bytes) throw std::bad_alloc();
+            allocated = bytes + trailing_bytes;
+            storage.reset(static_cast<uint8_t*>(std::malloc(allocated)));
             if (!storage) throw std::bad_alloc();
         }
         length = bytes;
+        trailing = trailing_bytes;
     }
+    // Describe bytes that a sibling's storage holds; point() binds the view
+    // once the sibling has been read.
+    void resize_as_view(size_t bytes) {
+        release();
+        length = bytes;
+        is_view = bytes != 0;
+    }
+    void point(uint8_t* data) { view = data; }
     bool resize_in_arena(size_t bytes, const std::shared_ptr<ResidentArena>& owner) {
-        unlock();
-        storage.reset();
+        release();
         arena = owner;
         slice = owner->allocate(bytes);
         length = bytes;
-        allocated = payload_offset = 0;
         locked = owner->locked;
         return bytes == 0 || slice != nullptr;
     }
     // True when a read can go straight from the device into this buffer.
     bool direct() const { return direct_alignment && !arena && storage; }
     bool lock() {
-        if (locked || length == 0) return true;
+        if (locked || length == 0 || is_view) return true;
         locked = arena ? arena->locked : mlock(storage.get(), allocated) == 0;
         return locked;
     }
     void unlock() {
         if (locked) {
-            if (!arena) munlock(storage.get(), allocated);
+            if (!arena && !is_view) munlock(storage.get(), allocated);
             locked = false;
         }
     }
     bool empty() const { return length == 0; }
     size_t size() const { return length; }
     size_t capacity_bytes() const { return length; }
-    bool is_locked() const { return locked; }
-    uint8_t* data() { return arena ? slice : storage ? storage.get() + payload_offset : nullptr; }
-    const uint8_t* data() const { return arena ? slice : storage ? storage.get() + payload_offset : nullptr; }
+    bool is_locked() const { return locked || is_view; }
+    uint8_t* data() {
+        return arena ? slice : is_view ? view : storage ? storage.get() + payload_offset : nullptr;
+    }
+    const uint8_t* data() const {
+        return arena ? slice : is_view ? view : storage ? storage.get() + payload_offset : nullptr;
+    }
 };
 #endif
 
