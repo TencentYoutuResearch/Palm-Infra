@@ -124,6 +124,23 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
     }
 }
 
+// Fill one cache buffer with the payload at offset. A direct-capable buffer
+// receives the whole blocks that cover the payload, with no intermediate copy.
+bool MoeSsdCache::read_buffer(ByteBuffer& dst, uint64_t offset) {
+    if (dst.empty()) return true;
+#if !defined(__APPLE__)
+    if (dst.direct()) {
+        const size_t alignment = dst.direct_alignment;
+        const size_t head = static_cast<size_t>(offset % alignment);
+        const size_t count = (head + dst.size() + alignment - 1) / alignment * alignment;
+        if (count > dst.allocated) return false;
+        dst.payload_offset = head;
+        return transport_ && transport_->read(offset - head, dst.storage.get(), count);
+    }
+#endif
+    return read_exact(offset, dst.data(), dst.size());
+}
+
 bool MoeSsdCache::read_job(const IoJob& job) {
     if (job.entries.empty()) return false;
 #if defined(MOLLM_CUDA)
@@ -229,12 +246,14 @@ bool MoeSsdCache::read_job(const IoJob& job) {
                 component_offset(entry, data_component);
             const uint64_t scales_offset =
                 component_offset(entry, scales_component);
-            if (scales.empty() || scales_offset != data_offset + data.size()) {
-                if (!data.empty() &&
-                    !read_exact(data_offset, data.data(), data.size()))
-                    return false;
-                if (!scales.empty() &&
-                    !read_exact(scales_offset, scales.data(), scales.size()))
+#if defined(__APPLE__)
+            const bool separate = false;
+#else
+            // Each direct buffer is filled by its own aligned read.
+            const bool separate = data.direct() || scales.direct();
+#endif
+            if (separate || scales.empty() || scales_offset != data_offset + data.size()) {
+                if (!read_buffer(data, data_offset) || !read_buffer(scales, scales_offset))
                     return false;
             } else {
                 if (!transport_->read_segments(data_offset, {
@@ -270,10 +289,21 @@ bool MoeSsdCache::read_job(const IoJob& job) {
             if (!read_exact(start, dst.storage, count)) return false;
         } else
 #endif
-        if (!read_exact(offset, dst.data(), dst.size())) return false;
+        if (!read_buffer(dst, offset)) return false;
         lock_buffer(dst);
         return true;
     }
+#if !defined(__APPLE__)
+    if (component_buffer(*job.entries.front(), job.component).direct()) {
+        for (size_t i = 0; i < job.entries.size(); ++i) {
+            ByteBuffer& dst = component_buffer(*job.entries[i], job.component);
+            if (dst.size() != bytes_per_entry || !read_buffer(dst, offset + i * bytes_per_entry))
+                return false;
+            lock_buffer(dst);
+        }
+        return true;
+    }
+#endif
 
     // These entries are adjacent in the package. Scatter one contiguous file
     // read directly into their final cache buffers instead of allocating a

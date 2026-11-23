@@ -4,6 +4,7 @@
 #include "runtime/cuda_host_memory_budget.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <new>
@@ -284,10 +285,18 @@ struct MoeSsdCache::ByteBuffer {
 };
 #else
 struct MoeSsdCache::ByteBuffer {
-    std::unique_ptr<uint8_t[]> storage;
+    struct Free { void operator()(uint8_t* p) const { std::free(p); } };
+    std::unique_ptr<uint8_t, Free> storage;
     std::shared_ptr<ResidentArena> arena;
     uint8_t* slice = nullptr;
     size_t length = 0;
+    // Nonzero when the transport reads aligned ranges straight from the
+    // device. The storage is then aligned and one unit larger than the
+    // payload, so the whole blocks that cover the payload fit; the payload
+    // starts payload_offset bytes in, wherever its first block puts it.
+    size_t direct_alignment = 0;
+    size_t allocated = 0;
+    size_t payload_offset = 0;
     bool locked = false;
 
     ~ByteBuffer() {
@@ -299,7 +308,20 @@ struct MoeSsdCache::ByteBuffer {
         unlock();
         arena.reset();
         slice = nullptr;
-        storage.reset(bytes == 0 ? nullptr : new uint8_t[bytes]);
+        payload_offset = 0;
+        allocated = bytes;
+        if (bytes == 0) {
+            storage.reset();
+        } else if (direct_alignment) {
+            if (bytes > std::numeric_limits<size_t>::max() - 2 * direct_alignment) throw std::bad_alloc();
+            allocated = (bytes + 2 * direct_alignment - 1) / direct_alignment * direct_alignment;
+            void* aligned = nullptr;
+            if (posix_memalign(&aligned, direct_alignment, allocated) != 0) throw std::bad_alloc();
+            storage.reset(static_cast<uint8_t*>(aligned));
+        } else {
+            storage.reset(static_cast<uint8_t*>(std::malloc(bytes)));
+            if (!storage) throw std::bad_alloc();
+        }
         length = bytes;
     }
     bool resize_in_arena(size_t bytes, const std::shared_ptr<ResidentArena>& owner) {
@@ -308,17 +330,20 @@ struct MoeSsdCache::ByteBuffer {
         arena = owner;
         slice = owner->allocate(bytes);
         length = bytes;
+        allocated = payload_offset = 0;
         locked = owner->locked;
         return bytes == 0 || slice != nullptr;
     }
+    // True when a read can go straight from the device into this buffer.
+    bool direct() const { return direct_alignment && !arena && storage; }
     bool lock() {
         if (locked || length == 0) return true;
-        locked = arena ? arena->locked : mlock(storage.get(), length) == 0;
+        locked = arena ? arena->locked : mlock(storage.get(), allocated) == 0;
         return locked;
     }
     void unlock() {
         if (locked) {
-            if (!arena) munlock(storage.get(), length);
+            if (!arena) munlock(storage.get(), allocated);
             locked = false;
         }
     }
@@ -326,8 +351,8 @@ struct MoeSsdCache::ByteBuffer {
     size_t size() const { return length; }
     size_t capacity_bytes() const { return length; }
     bool is_locked() const { return locked; }
-    uint8_t* data() { return arena ? slice : storage.get(); }
-    const uint8_t* data() const { return arena ? slice : storage.get(); }
+    uint8_t* data() { return arena ? slice : storage ? storage.get() + payload_offset : nullptr; }
+    const uint8_t* data() const { return arena ? slice : storage ? storage.get() + payload_offset : nullptr; }
 };
 #endif
 

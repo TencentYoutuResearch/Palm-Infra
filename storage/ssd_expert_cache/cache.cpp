@@ -163,7 +163,13 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         std::fprintf(stderr, "MoE SSD: cache capacity and I/O worker count must be non-zero\n");
         return false;
     }
-    return open(mollm::FileRangeTransport::open(package_path), capacity_bytes, io_workers,
+    // MOLLM_SSD_DIRECT_IO=1 reads demand-cached experts from the device and
+    // not the page cache, which is what a package larger than free memory
+    // sees. Resident arenas keep using ordinary reads.
+    const char* direct = std::getenv("MOLLM_SSD_DIRECT_IO");
+    const auto mode = direct && std::strcmp(direct, "1") == 0 ? mollm::FileReadMode::Direct
+                                                              : mollm::FileReadMode::Default;
+    return open(mollm::FileRangeTransport::open(package_path, mode), capacity_bytes, io_workers,
                 enable_cross_layer_worker, lock_expert_pages);
 }
 
@@ -892,6 +898,15 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     for (ByteBuffer* buffer : {&entry->gate_up_data, &entry->gate_up_scales,
                                &entry->down_data, &entry->down_scales})
         buffer->read_alignment = read_alignment_;
+#else
+    for (ByteBuffer* buffer : {&entry->gate_up_data, &entry->gate_up_scales,
+                               &entry->down_data, &entry->down_scales}) {
+        const size_t alignment = transport_->direct_alignment();
+        if (buffer->direct_alignment != alignment) {
+            buffer->resize(0);  // A recycled buffer keeps the layout it was allocated with.
+            buffer->direct_alignment = alignment;
+        }
+    }
 #endif
     entry->gate_up = gate_up;
     entry->down = down;

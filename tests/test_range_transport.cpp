@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -113,6 +114,73 @@ int main() {
         check(!file->read_segments(object.size() - 1, {{&byte, 1}, {&byte, 1}}), "file segments past the end fail");
     }
     check(mollm::FileRangeTransport::open(path + ".missing") == nullptr, "missing file is rejected");
+    if (file) check(file->direct_alignment() == 0, "default file transport has no direct path");
+
+    // Direct reads need a filesystem that supports them, so use the working
+    // directory and not /tmp, which is often tmpfs. The object's size is not
+    // a multiple of the block size, which exercises the short last block.
+    {
+        const std::string local = "mollm_test_range_transport_direct_" + std::to_string(getpid()) + ".bin";
+        const std::vector<uint8_t> large = pattern((size_t{3} << 20) + 1234);
+        {
+            std::ofstream out(local, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(large.data()), static_cast<std::streamsize>(large.size()));
+        }
+        auto direct = mollm::FileRangeTransport::open(local, mollm::FileReadMode::Direct);
+        if (!direct || !direct->direct_alignment()) {
+            std::printf("direct reads are not available here; skipping that part\n");
+        } else {
+            const size_t unit = direct->direct_alignment();
+            check(!std::strcmp(direct->kind(), "file-direct"), "direct transport kind");
+            // Unaligned callers still get correct bytes, through the page cache.
+            check_reads(*direct, large, "direct transport serves unaligned reads");
+            check(direct->direct_reads() == 0 && direct->cached_reads() > 0, "unaligned reads use the page cache");
+            // Aligned offset, length and destination go to the device.
+            void* raw = nullptr;
+            check(posix_memalign(&raw, unit, 64 * unit) == 0, "aligned buffer");
+            auto* aligned = static_cast<uint8_t*>(raw);
+            check(direct->read(8 * unit, aligned, 16 * unit) && direct->direct_reads() == 1 &&
+                  !std::memcmp(aligned, large.data() + 8 * unit, 16 * unit), "aligned read takes the direct path");
+            // An aligned read may run past the end by less than one unit.
+            const size_t last = large.size() / unit * unit;
+            std::memset(aligned, 0xee, 2 * unit);
+            check(direct->read(last, aligned, unit) && direct->direct_reads() == 2 &&
+                  !std::memcmp(aligned, large.data() + last, large.size() - last),
+                  "aligned read of the short last block");
+            check(direct->read(last - unit, aligned, 2 * unit) &&
+                  !std::memcmp(aligned, large.data() + last - unit, large.size() - last + unit),
+                  "aligned read ending past the end");
+            const uint64_t before = direct->direct_reads();
+            check(direct->read(8 * unit, aligned + 1, unit) && direct->read(8 * unit + 1, aligned, unit) &&
+                  direct->read(8 * unit, aligned, unit - 1) && direct->direct_reads() == before,
+                  "any misalignment falls back to the page cache");
+            std::free(raw);
+
+            // An expert cache on a direct transport reads every payload from
+            // the device into its final buffer, at offsets inside blocks.
+            MoeSsdTensorSpec gate = spec("g", 5000);
+            MoeSsdTensorSpec down = spec("d", 5000 + 3 * 70000);
+            gate.cols = down.cols = 35000;
+            gate.data_bytes = down.data_bytes = 35000 * sizeof(uint16_t);
+            MoeSsdCache cache;
+            check(cache.open(direct, 16 * 70000, 2, false, false) && cache.add_source(gate) &&
+                  cache.add_source(down), "open a cache on a direct transport");
+            const uint64_t cached_before = direct->cached_reads();
+            const uint64_t direct_before = direct->direct_reads();
+            bool good = true;
+            for (int round = 0; round < 2; ++round)
+                for (int expert = 0; expert < 3; ++expert) {
+                    ExpertLease lease;
+                    good = good && cache.borrow(cache.find_source("g"), cache.find_source("d"), expert, lease) &&
+                        !std::memcmp(lease.gate_up.data, large.data() + 5000 + expert * 70000, 70000) &&
+                        !std::memcmp(lease.down.data, large.data() + 5000 + (3 + expert) * 70000, 70000);
+                }
+            check(good, "direct cache hands out the package bytes");
+            check(direct->direct_reads() == direct_before + 6 && direct->cached_reads() == cached_before,
+                  "every cache read took the direct path exactly once");
+        }
+        unlink(local.c_str());
+    }
 
     mollm::MemoryRangeTransport memory(object.data(), object.size());
     check(!std::strcmp(memory.kind(), "memory"), "memory transport kind");

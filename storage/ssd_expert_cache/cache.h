@@ -407,6 +407,7 @@ private:
                                     bool low_priority = false);
     bool read_job(const IoJob& job);
     bool read_exact(uint64_t offset, void* dst, size_t bytes) const;
+    bool read_buffer(ByteBuffer& dst, uint64_t offset);
     void io_worker_main(int worker_index);
     void cross_layer_worker_main();
     void stop_io_workers();
