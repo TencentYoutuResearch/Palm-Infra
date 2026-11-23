@@ -1,6 +1,5 @@
 // Synthetic compound-operator diagnostic; no model/backend selector.
 #include "kernels/cuda/elementwise.h"
-#include "runtime/cuda_host_memory_budget.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -43,8 +42,6 @@ int main(int argc,char** argv){
     const bool checks_only=argc==2&&!std::strcmp(argv[1],"--check-only");
     if(argc>1&&!checks_only)return 64;
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;
-    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);
-    if(!mollm_memory::cuda_host_allocation_allowed(512*1024*1024,"bounded deferred RMS diagnostic"))return 4;
     constexpr int width=2560,streams=4,max_rows=1024,guard=8;
     constexpr size_t capacity=size_t(width)*streams*max_rows;
     Buffer<float> residual(capacity),branch(capacity/streams),gates(max_rows*streams),weight(width*streams),logits(capacity);

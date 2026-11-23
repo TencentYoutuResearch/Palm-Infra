@@ -1,6 +1,5 @@
 // Independent sparse metadata planner comparison; no model/expert payload.
 #include "kernels/cuda/moe.h"
-#include "runtime/cuda_host_memory_budget.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdio>
@@ -82,7 +81,6 @@ int main(int argc,char** argv){
             if(p==begin||p-begin>5||(*p&&*p!=','))return 64;long n=std::strtol(begin,nullptr,10);if(n<0||n>65535)return 64;counts.push_back(n);if(!*p)break;++p;if(!*p)return 64;}
         if(counts.size()!=512||std::accumulate(counts.begin(),counts.end(),0)!=std::atoi(argv[2])*10)return 64;}
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;
-    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);if(!mollm_memory::cuda_host_allocation_allowed(size_t(1)<<30,"bounded planner diagnostic"))return 1;
     if(only){for(int count:{1,31,32,33,127,128,129,1024,65535})if(!small||count!=65535)run({count},false);run(counts,false);}
     else run(counts,true);
 }

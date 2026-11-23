@@ -2,7 +2,6 @@
 #include "kernels/cuda/elementwise.h"
 #include "kernels/cuda/matmul.h"
 #include "kernels/cuda/reduction.cuh"
-#include "runtime/cuda_host_memory_budget.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -118,8 +117,6 @@ int main(int argc,char** argv){
     const bool small=mode_argc==2&&(!std::strcmp(argv[1],"--checks-only")||!std::strcmp(argv[1],"--hc-up-checks-only"));
     if(mode_argc>1&&!small&&!hc_up)return 64;
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;
-    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);
-    if(!mollm_memory::cuda_host_allocation_allowed(2ull*1024*1024*1024,"compact carry bounded diagnostic"))return 4;
     {
         constexpr size_t codes=65536;
         Buffer<uint16_t> raw(codes+8);Buffer<float> restored(codes+8);

@@ -1,5 +1,4 @@
 // Bounded FP16/F32-output dense GEMM algorithm diagnostic, not model throughput.
-#include "runtime/cuda_host_memory_budget.h"
 #include "backends/cuda/dense_lt_gemm.h"
 #include "kernels/cuda/matmul.h"
 #include <cuda_fp16.h>
@@ -281,7 +280,6 @@ int main(int argc,char** argv){
     const bool gate_tile=argc==2&&!std::strcmp(argv[1],"--hc-gate-tile-check");
     const bool policy_only=argc==2&&!std::strcmp(argv[1],"--policy-only");if(argc>1&&!only&&!policy_only&&!remaining&&!attention_tiles&&!attention_finalists&&!shared_logical&&!shared_tiles&&!shared_finalist&&!logical_sweep&&!tile_sweep&&!tile_finalists&&!logical_policy&&!windows&&!windows_check&&!balanced&&!balanced_check&&!gate_tile)return 64;
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;cudaDeviceProp prop{};check(cudaGetDeviceProperties(&prop,0));if(prop.major!=12||prop.minor>1)return 77;
-    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);if(!mollm_memory::cuda_host_allocation_allowed(size_t(3)<<30,"bounded dense Lt diagnostic"))return 1;
     std::printf("dense_lt_device name=%s l2_bytes=%d weight_sets=%d clocks_uncontrolled=true\n",prop.name,prop.l2CacheSize,policy_only?1:4);
     cublasHandle_t classic;cublasLtHandle_t lt;blas(cublasCreate(&classic));blas(cublasSetStream(classic,cudaStreamPerThread));blas(cublasLtCreate(&lt));
     if(gate_tile)for(int n:{4,320})for(int rows:{1,1024,1025,1743,2048,2049})for(int padding:{0,8})hc_gate_tile_check(classic,rows,padding,n);

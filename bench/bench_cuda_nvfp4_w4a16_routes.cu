@@ -22,15 +22,12 @@ int main(int argc,char** argv){
             if(!*p)break;++p;if(!*p)return 2;}
         if(counts.size()!=512||std::accumulate(counts.begin(),counts.end(),0)!=17430)return 2;
     }
-    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","4",1);
+    setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","4",1);
     cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,0));if(prop.major!=12||prop.minor!=1)return 77;
     int rows=gate?1280:(small?64:2560),inner=gate?2560:(small?64:640),experts=counts.size(),count=std::accumulate(counts.begin(),counts.end(),0);
     const int input_tokens=gate&&!small?1743:count;
     std::printf("diagnostic gate=%d routes=%d source_tokens=%d; gate candidate excludes activation/down quantization\n",gate,count,input_tokens);
     size_t codes=size_t(rows)*inner/2,sfs=size_t(rows)*inner/16,stride=codes+sfs+rows*4;
-    size_t budget=2*experts*stride+size_t(count)*(inner*7+rows*8+3*sizeof(mollm_cuda::Nvfp4Projection)+3*sizeof(mollm_cuda::Nvfp4MmaBatch))+(size_t(2)<<20);
-    if(gate)budget+=experts*sfs+size_t(count)*(inner/2+inner/16+640*4+320+40+sizeof(mollm_cuda::Nvfp4Projection))+64;
-    if(!mollm_memory::cuda_host_allocation_allowed(budget,"bounded ragged W4A16 down diagnostic"))return 2;
     auto* w=alloc<uint8_t>(experts*stride);auto* fw=alloc<uint8_t>(experts*stride);
     auto* x=alloc<float>(size_t(count)*inner);auto* bx=alloc<__nv_bfloat16>(size_t(count)*inner);
     auto* y0=alloc<__nv_bfloat16>(size_t(count)*rows+16);auto* y1=alloc<__nv_bfloat16>(size_t(count)*rows+16);

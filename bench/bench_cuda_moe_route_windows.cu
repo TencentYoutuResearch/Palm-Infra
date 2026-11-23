@@ -1,6 +1,5 @@
 // Same-process frozen-route window comparison, not model scheduling or TPS.
 #include "kernels/cuda/moe.h"
-#include "runtime/cuda_host_memory_budget.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdio>
@@ -137,7 +136,5 @@ int main(int argc,char** argv){
     if(a.size()!=b.size()||na<=0||nb<=0||na%10||nb%10||na+nb>40960)return 64;
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;
     cudaDeviceProp prop{};check(cudaGetDeviceProperties(&prop,0));if(prop.major!=12||prop.minor>1)return 77;
-    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);
-    if(!mollm_memory::cuda_host_allocation_allowed(size_t(5)<<30,"bounded route-window diagnostic"))return 1;
     for(bool pair:{true,false})run(a,b,pair,!only);
 }

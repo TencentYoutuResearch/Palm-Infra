@@ -1,7 +1,6 @@
 // Standalone structural diagnostic: HC up projection + deferred RMS reduction.
 // Numerical validation remains mandatory for every optional tile/layout.
 #include "kernels/cuda/elementwise.h"
-#include "runtime/cuda_host_memory_budget.h"
 #include "core/quant_layouts.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -221,8 +220,6 @@ int main(int argc,char** argv){
         std::printf("real_package_weight_record=%llu canonical_signed_Q4_to_FP16=true synthetic_other_inputs=true\n",offset);
     }
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;
-    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);
-    if(!mollm_memory::cuda_host_allocation_allowed(size_t(1)<<30,"HC fused up/reduce probe"))return 1;
     size_t mismatches=0;
     for(int rows:{17,719,1024,1025,1743,2048})mismatches+=run(rows,real_weight.empty()?nullptr:&real_weight,sanitize_only,check_only,input_pitch,tile_columns);
     return mismatches?2:0;

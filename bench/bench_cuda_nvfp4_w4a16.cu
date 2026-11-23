@@ -1,7 +1,6 @@
 // Independent W4A16 diagnostic. No backend integration or model default change.
 // Weights remain packed; decoded BF16 operands exist only in registers.
 #include "kernels/cuda/moe.h"
-#include "runtime/cuda_host_memory_budget.h"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -211,14 +210,11 @@ int main(int argc,char** argv){
     bool gate=argc==2&&!std::strcmp(argv[1],"--gate");
     if(argc>1&&!small&&!gate){std::fprintf(stderr,"usage: %s [--checks-only | --gate]\n",argv[0]);return 2;}
     cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,0));if(prop.major!=12||prop.minor!=1)return 77;
-    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);
     setenv("MOLLM_CUDA_NVFP4_MMA_BATCH_WARPS","4",1);
     int rows=small?64:(gate?1280:2560),inner=small?64:(gate?2560:640),experts=small?3:32,maxn=64;
     std::printf("diagnostic projection rows=%d inner=%d experts=%d; native comparator=N8 FP32, candidates preplanned; NOT production fused gate/up or BF16 down\n",rows,inner,experts);
     size_t codes=size_t(rows)*inner/2,sfs=size_t(rows)*inner/16,stride=codes+sfs+rows*sizeof(float);
     int capacity=experts*maxn;
-    size_t budget=4*experts*stride+size_t(capacity)*(inner*7+rows*4+4*sizeof(mollm_cuda::Nvfp4Projection)+sizeof(mollm_cuda::Nvfp4MmaBatch))+4096;
-    if(!mollm_memory::cuda_host_allocation_allowed(budget,"bounded register W4A16 diagnostic"))return 2;
     auto* code_check=alloc<uint32_t>(512);std::vector<uint32_t> decoded(512);
     check_codes<<<1,256,0,cudaStreamPerThread>>>(code_check);ck(cudaGetLastError());
     ck(cudaStreamSynchronize(cudaStreamPerThread));ck(cudaMemcpy(decoded.data(),code_check,2048,cudaMemcpyDeviceToHost));

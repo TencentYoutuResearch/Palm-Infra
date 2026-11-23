@@ -1,6 +1,5 @@
 // Bounded gate producer + activation/quantization consumer, not model TPS.
 #include "kernels/cuda/moe.h"
-#include "runtime/cuda_host_memory_budget.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdio>
@@ -619,8 +618,6 @@ int main(int argc,char** argv){
         if(runs.size()!=512||std::accumulate(runs.begin(),runs.end(),0)!=std::atoi(argv[2])*10)return 64;
     }
     int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;cudaDeviceProp prop{};check(cudaGetDeviceProperties(&prop,0));if(prop.major!=12||prop.minor>1)return 77;
-    setenv("MOLLM_CUDA_HOST_HEADROOM_MB","102400",1);
-    if(!mollm_memory::cuda_host_allocation_allowed(size_t(5)<<30,"bounded BF16 gate diagnostic"))return 1;
     const char* option=std::getenv("MOLLM_TEST_NVFP4_EARLY_INPUTS");
     const bool early=option&&!std::strcmp(option,"1");
     const char* v_option=std::getenv("MOLLM_TEST_NVFP4_GATE_VECTOR_QUANTIZE");
