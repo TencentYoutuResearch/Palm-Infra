@@ -33,10 +33,9 @@ int CudaBackend::hc_up_reduce_max_rows() const {
 }
 
 bool CudaBackend::supports_hc_up_reduce_fusion() const {
-    const char* reference=std::getenv("MOLLM_CUDA_DENSE_PREFILL_FP32_REFERENCE");
     return impl_->qualified_fusions&&impl_->hc_deferred_enabled&&
         supports_sigmoid_gr_reduce_fusion()&&
-        !(reference&&!std::strcmp(reference,"1"));
+        !impl_->options.dense_prefill_fp32_reference;
 }
 
 bool CudaBackend::dispatch_hc_up_reduce(const GraphNode& up,const GraphNode& reduce,
@@ -952,12 +951,8 @@ void CudaBackend::dispatch(const GraphNode& node,
                 p.key_position_stride=key_dim;p.key_head_stride=size_t(key_capacity)*key_dim;
                 p.value_position_stride=value_dim;p.value_head_stride=size_t(key_capacity)*value_dim;
                 p.index_position_stride=indices->stride[1]/4;p.mask_column_stride=mask->stride[0]/4;p.mask_row_stride=mask->stride[1]/4;
-                static const bool grouped=[] {
-                    const char* value=std::getenv("MOLLM_CUDA_QSA_GQA_REUSE");return !value||!std::strcmp(value,"1");
-                }();
-                static const bool split=[] {
-                    const char* value=std::getenv("MOLLM_CUDA_QSA_DECODE_SPLIT");return !value||!std::strcmp(value,"1");
-                }();
+                const bool grouped=impl_->options.qsa_gqa_reuse;
+                const bool split=impl_->options.qsa_decode_split;
                 const int group=num_heads/num_kv_heads;
                 p.reuse_gqa=grouped&&query_length>=32&&key_dim==256&&value_dim==256&&group>=2&&group<=16;
                 const bool exact_short_queries=query_length>1&&query_length<=8;
@@ -1134,29 +1129,20 @@ void CudaBackend::dispatch(const GraphNode& node,
                 record_native();
                 return;
             }
-            static const int validated_prefix_requested=[] {
-                const char* value=std::getenv("MOLLM_CUDA_SDPA_PREFILL_VALIDATED_PREFIX");
-                return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
-            }();
+            const int validated_prefix_requested=static_cast<int>(impl_->options.sdpa_prefill_validated_prefix);
             const bool validated_prefix=validated_prefix_requested<0?
                 logical_prefill_batch_active_:validated_prefix_requested!=0;
             if (validated_prefix && cached && fp16_cache && key_dim==256 &&
                 value_dim==256 && mask_data && query_length>1 &&
                 query.stride[0]==sizeof(float) && output->stride[0]==sizeof(float)) {
                 constexpr int prefix_shared_limit=1024;
-                static const int prefix_skip_zero_pv_requested=[] {
-                    const char* value=std::getenv("MOLLM_CUDA_SDPA_PREFILL_SKIP_ZERO_PV");
-                    return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
-                }();
+                const int prefix_skip_zero_pv_requested=static_cast<int>(impl_->options.sdpa_prefill_skip_zero_pv);
                 const bool prefix_skip_zero_pv=prefix_skip_zero_pv_requested<0?
                     logical_prefill_batch_active_:prefix_skip_zero_pv_requested!=0;
                 // PV pair supersedes loop unrolling; retain the unroll branch
                 // only for callers that explicitly disable pair.
                 constexpr bool prefix_unroll_pv=false;
-                static const int prefix_pair_pv_requested=[] {
-                    const char* value=std::getenv("MOLLM_CUDA_SDPA_PREFILL_PV_PAIR");
-                    return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
-                }();
+                const int prefix_pair_pv_requested=static_cast<int>(impl_->options.sdpa_prefill_pv_pair);
                 const bool prefix_pair_pv=prefix_pair_pv_requested<0?
                     logical_prefill_batch_active_:prefix_pair_pv_requested!=0;
                 // Qualified dense-prefill policy: four query heads share one
@@ -1271,7 +1257,7 @@ void CudaBackend::dispatch(const GraphNode& node,
                         if (use_pv_pair) ++impl_->attention_prefix_pv_pair_enqueues;
                         // Diagnostic synchronization only; never use trace runs
                         // for throughput. Capture skips host readback entirely.
-                        static const bool trace=std::getenv("MOLLM_CUDA_SDPA_PREFIX_TRACE_VALIDATION")!=nullptr;
+                        const bool trace = impl_->options.sdpa_prefix_trace_validation;
                         if (trace && capture==cudaStreamCaptureStatusNone) {
                             uint32_t valid=0;
                             if (!mollm_cuda::report_cuda(cudaMemcpy(&valid,impl_->attention_prefix_valid,

@@ -238,7 +238,7 @@ bool CudaBackend::dispatch_moe_pair(const GraphNode& node,
 
 bool CudaBackend::try_nvfp4_moe(
     const GraphNode& node, const std::vector<const Tensor*>& inputs, Tensor* output) {
-    static const bool disabled = std::getenv("MOLLM_CUDA_DISABLE_NVFP4_MOE") != nullptr;
+    const bool disabled = impl_->options.disable_nvfp4_moe;
     if (disabled || !impl_->coherent_host_weights || inputs.size() != 8 || !output ||
         !std::all_of(inputs.begin(), inputs.end(), [](const Tensor* t) { return t != nullptr; }))
         return false;
@@ -276,10 +276,7 @@ bool CudaBackend::try_nvfp4_moe(
     const int mma_min_rows = qualified_geometry ? qualified_verify_max_rows + 1 : 2;
     bool native_mma = inputs[0]->shape[1] >= mma_min_rows;
     constexpr bool simt_pipeline=true;
-    static const bool batch_pipeline = [] {
-        const char* value=std::getenv("MOLLM_CUDA_NVFP4_BATCH_PIPELINE");
-        return value && std::strcmp(value,"1")==0;
-    }();
+    const bool batch_pipeline=impl_->options.nvfp4_batch_pipeline;
     const bool gate_codes_kmajor = gate_source->resident_nvfp4_gate_codes_kmajor;
     const bool gate_scales_kmajor=gate_source->resident_nvfp4_gate_scales_kmajor;
     if((gate_scales_kmajor&&!gate_codes_kmajor)||down_source->resident_nvfp4_gate_scales_kmajor)
@@ -288,13 +285,7 @@ bool CudaBackend::try_nvfp4_moe(
         gate_source->resident_nvfp4_mma_layout || down_source->resident_nvfp4_mma_layout ||
         down_source->resident_nvfp4_gate_codes_kmajor || hidden != 2560 || inter != 640))
         return false;
-    static const int native_gate_parts = [] {
-        const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_GATE_PARTS");
-        if (value && std::strcmp(value, "2") == 0) return 2;
-        if (value && std::strcmp(value, "4") == 0) return 4;
-        if (value && std::strcmp(value, "8") == 0) return 8;
-        return 1;
-    }();
+    const int native_gate_parts=impl_->options.nvfp4_mma_gate_parts;
     if (native_mma &&
         (!impl_->policy.supports_native_nvfp4_mma ||
          gate_source->resident_nvfp4_mma_layout != down_source->resident_nvfp4_mma_layout ||
@@ -319,10 +310,7 @@ bool CudaBackend::try_nvfp4_moe(
     const int rows = static_cast<int>(inputs[0]->shape[1]);
     const size_t routes = static_cast<size_t>(rows) * top_k;
     if (routes > 65535) return false; // CUDA grid.y limit; retain the generic bridge.
-    static const int reuse_prefill_input=[] {
-        const char* value=std::getenv("MOLLM_CUDA_MOE_PREFILL_INPUT_HALF_REUSE");
-        return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
-    }();
+    const int reuse_prefill_input=static_cast<int>(impl_->options.moe_prefill_input_half_reuse);
     bool half_reuse=(reuse_prefill_input<0?logical_prefill_batch_active_:reuse_prefill_input!=0)&&rows>=16&&rows<=2048&&hidden<=2560&&
         hidden%32==0&&!impl_->capture_audit;
     for(int index:{1,4,5,7}) {
@@ -421,7 +409,7 @@ bool CudaBackend::try_nvfp4_moe(
         if (!shared_branch()) return fail();
         return combine(synchronous);
     };
-    static const bool host_routing = std::getenv("MOLLM_CUDA_DISABLE_RESIDENT_ROUTES") != nullptr;
+    const bool host_routing = impl_->options.disable_resident_routes;
     const int score_func = graph_params::get_i32(p, 5, 0);
     if (!host_routing && experts <= 1024 && top_k <= 32 &&
         score_func >= 0 && score_func <= 2 && graph_params::get_i32(p, 8, 1) <= 1) {
@@ -488,7 +476,7 @@ bool CudaBackend::try_nvfp4_moe(
         if (found != impl_->resident_experts.end() && found->second.down_source == down_source &&
             found->second.hidden == hidden && found->second.inter == inter &&
             found->second.leases.size() == static_cast<size_t>(experts)) {
-            static const bool no_grouping = std::getenv("MOLLM_CUDA_DISABLE_NVFP4_GROUPING") != nullptr;
+            const bool no_grouping = impl_->options.disable_nvfp4_grouping;
             // Qualified grouped batched prefill; per-shape guards below.
             constexpr bool batch_prefill=true;
             // Canonical and native fragment loads may have different crossover
@@ -496,18 +484,10 @@ bool CudaBackend::try_nvfp4_moe(
             // Qualified grouped-MMA policy: no scalar singleton fallback.
             constexpr int batch_gate_min=1;
             constexpr int batch_down_min=1;
-            static const bool prepare_singles = [] {
-                const char* value = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREPARE_SINGLES");
-                return value && std::strcmp(value, "1") == 0;
-            }();
+            const bool prepare_singles=impl_->options.nvfp4_mma_prepare_singles;
             // Admit grouped batching from 32 rows so short prompts benefit.
             constexpr bool batch_small_prefill=true;
-            static const int sort_override = [] {
-                const char* option = std::getenv("MOLLM_CUDA_NVFP4_PREFILL_SORT");
-                if (!option) option = std::getenv("MOLLM_CUDA_NVFP4_MMA_PREFILL_SORT");
-                if (!option) return -1;
-                return std::strcmp(option, "1") == 0 ? 1 : 0;
-            }();
+            const int sort_override=static_cast<int>(impl_->options.nvfp4_prefill_sort);
             const bool sort_prefill = sort_override >= 0 ? sort_override != 0 :
                 impl_->supports_extended_nvfp4_prefill_sort;
             const bool batch_candidate = native_mma && batch_prefill &&
@@ -579,22 +559,10 @@ bool CudaBackend::try_nvfp4_moe(
             constexpr bool mma_activation_requested=true;
             const mollm_cuda::Nvfp4PrefillBatchPolicy batch_policy{
                 logical_prefill_batch_active_,moe_window_merge_active_};
-            static const int input_scale_kmajor_override=[] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_INPUT_SCALE_KMAJOR");
-                return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
-            }();
-            static const int compact_logits_override=[] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_COMPACT_LOGITS");
-                return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
-            }();
-            static const int token_quantization_override=[] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_TOKEN_QUANTIZE");
-                return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
-            }();
-            static const int token_pair_words_override=[] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_TOKEN_PAIR_WORDS");
-                return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
-            }();
+            const int input_scale_kmajor_override=static_cast<int>(impl_->options.nvfp4_prefill_input_scale_kmajor);
+            const int compact_logits_override=static_cast<int>(impl_->options.nvfp4_prefill_compact_logits);
+            const int token_quantization_override=static_cast<int>(impl_->options.nvfp4_prefill_token_quantize);
+            const int token_pair_words_override=static_cast<int>(impl_->options.nvfp4_prefill_token_pair_words);
             const auto requested=[&](int option) {
                 return option<0?logical_prefill_batch_active_:option!=0;
             };
@@ -613,13 +581,7 @@ bool CudaBackend::try_nvfp4_moe(
                 found->second.gate_pair_layout))mma_activation_fused=false;
             // Explicit total budget; native descriptors remain immutable for
             // decode and every unfused fallback. Never allocate during capture.
-            static const size_t scale_cache_limit=[] {
-                const char* value=std::getenv("MOLLM_CUDA_PREFILL_GATE_SCALE_CACHE_MB");
-                if(!value||!*value||*value<'0'||*value>'9')return size_t{0};
-                char* end=nullptr;
-                const auto mb=std::strtoull(value,&end,10);
-                return end&&!*end&&mb<=8192?size_t(mb)*1024*1024:size_t{0};
-            }();
+            const size_t scale_cache_limit=impl_->options.prefill_gate_scale_cache_bytes;
             auto& resident=found->second;
             const size_t scale_view_bytes=size_t(experts)*204800;
             const size_t scale_table_bytes=size_t(experts)*2*sizeof(mollm_cuda::Nvfp4Projection);
@@ -680,10 +642,7 @@ bool CudaBackend::try_nvfp4_moe(
                 compact_logits=false;
                 token_quantization=false;
             }
-            static const int token_codes_kmajor_requested=[] {
-                const char* value=std::getenv("MOLLM_CUDA_NVFP4_PREFILL_TOKEN_CODES_KMAJOR");
-                return value?int(mollm_cuda::logical_prefill_option(value,false)):-1;
-            }();
+            const int token_codes_kmajor_requested=static_cast<int>(impl_->options.nvfp4_prefill_token_codes_kmajor);
             const bool token_codes_kmajor=(token_codes_kmajor_requested<0?logical_prefill_batch_active_:token_codes_kmajor_requested!=0)&&gate_codes_kmajor&&
                 mma_activation_fused&&token_pair_words;
             const auto* gate_scale_tables=use_scale_view&&!gate_scales_kmajor?
@@ -741,14 +700,8 @@ bool CudaBackend::try_nvfp4_moe(
                     graph_params::get_f32(p, 0, 1.0f), gate_scale_tables, x,
                     gate_up, activated, down, hidden, inter, gate_jobs, down_jobs,
                     device_route_weights, execution_stream, -1, down_output_bf16,gate_output_bf16);
-                static const bool trace_first_routes = [] {
-                    const char* value = std::getenv("MOLLM_CUDA_NVFP4_TRACE_FIRST_ROUTES");
-                    return value && std::strcmp(value, "1") == 0;
-                }();
-                static const bool trace_batch_occupancy = [] {
-                    const char* value = std::getenv("MOLLM_CUDA_NVFP4_TRACE_BATCH_OCCUPANCY");
-                    return value && std::strcmp(value, "1") == 0;
-                }();
+                const bool trace_first_routes=impl_->options.nvfp4_trace_first_routes;
+                const bool trace_batch_occupancy=impl_->options.nvfp4_trace_batch_occupancy;
                 if ((trace_first_routes || trace_batch_occupancy) && rows > 1) {
                     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
                     if (!mollm_cuda::report_cuda(cudaStreamIsCapturing(execution_stream, &capture), "first-route capture check")) return fail();
@@ -827,7 +780,7 @@ bool CudaBackend::try_nvfp4_moe(
                     down_jobs += 2 * routes;
                     // Diagnostic only: deliberately synchronizes; never use
                     // these runs as throughput evidence or during capture.
-                    static const bool trace_pairs = std::getenv("MOLLM_CUDA_NVFP4_TRACE_PAIRS") != nullptr;
+                    const bool trace_pairs = impl_->options.nvfp4_trace_pairs;
                     if (trace_pairs) {
                         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
                         if (!mollm_cuda::report_cuda(cudaStreamIsCapturing(execution_stream, &capture), "NVFP4 route trace capture check")) return fail();
@@ -979,10 +932,7 @@ bool CudaBackend::try_nvfp4_moe(
                             down_jobs, routes, hidden, inter, 0, execution_stream,
                             nullptr, 1, canonical_mma), "NVFP4 down MMA")) return fail();
                 } else {
-                    static const bool prefetch_down_row_scale = [] {
-                        const char* value = std::getenv("MOLLM_CUDA_NVFP4_DOWN_ROW_SCALE_PREFETCH");
-                        return value && std::strcmp(value, "1") == 0;
-                    }();
+                    const bool prefetch_down_row_scale=impl_->options.nvfp4_down_row_scale_prefetch;
                     const int load_hint = prefetch_down_row_scale && rows == 1 &&
                         hidden == 2560 && inter == 640 ? 7 : 0;
                     mollm_cuda::Nvfp4DownRequest request;
@@ -1031,7 +981,7 @@ bool CudaBackend::try_nvfp4_moe(
             // launching an already instantiated graph into capture is rejected
             // by CUDA. Resident leases still keep every descriptor alive.
             if (impl_->segment_mode == Impl::SegmentMode::CAPTURE) return enqueue();
-            static const bool no_graphs = std::getenv("MOLLM_CUDA_DISABLE_MOE_GRAPHS") != nullptr;
+            const bool no_graphs = impl_->options.disable_moe_graphs;
             std::array<const void*, 5> graph_weights{};
             bool capture_safe = !no_graphs && rows == 1;
             int weight_index = 0;

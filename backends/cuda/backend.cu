@@ -377,20 +377,14 @@ CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) 
         impl_->hc_compact_enabled = false;
         impl_->strided_reshape_views = false;
     }
-    if (const char* flag = std::getenv("MOLLM_CUDA_STRIDED_RESHAPE_VIEWS"))
-        impl_->strided_reshape_views = !std::strcmp(flag, "1");
-    if (const char* option = std::getenv("MOLLM_CUDA_OUTPUT_POOL_MB")) {
-        errno = 0;
-        char* end = nullptr;
-        const unsigned long long mb = std::strtoull(option, &end, 10);
-        const bool digits = *option && std::all_of(option, option + std::strlen(option),
-            [](char c) { return c >= '0' && c <= '9'; });
-        if (!digits || errno || !end || *end || mb > std::numeric_limits<size_t>::max() / (1024 * 1024)) {
-            std::fprintf(stderr, "CudaBackend: invalid MOLLM_CUDA_OUTPUT_POOL_MB\n");
-            return;
-        }
-        impl_->output_pool_limit_bytes = static_cast<size_t>(mb) * 1024 * 1024;
+    const mollm_cuda::RuntimeOptions& options = impl_->options;
+    impl_->strided_reshape_views = mollm_cuda::resolve(options.strided_reshape_views,
+        impl_->strided_reshape_views);
+    if (options.output_pool_invalid) {
+        std::fprintf(stderr, "CudaBackend: invalid MOLLM_CUDA_OUTPUT_POOL_MB\n");
+        return;
     }
+    impl_->output_pool_limit_bytes = options.output_pool_limit_bytes;
     int count = 0;
     if (!mollm_cuda::report_cuda(
             cudaGetDeviceCount(&count), "cudaGetDeviceCount") ||
@@ -426,7 +420,7 @@ CudaBackend::CudaBackend(FusionPolicy policy) : impl_(std::make_unique<Impl>()) 
         impl_->policy = mollm_cuda::make_device_policy(properties.major, properties.minor);
         // Reference runs can opt out of decode-equivalent verification to
         // compare against the generic batch paths.
-        if (std::getenv("MOLLM_CUDA_DISABLE_QUALIFIED_VERIFICATION"))
+        if (options.disable_qualified_verification)
             impl_->policy.qualified_verification = false;
         if (impl_->policy.prefer_q4_hc_adjacent &&
             mollm_cuda::configure_q4_g32_hc_adjacent_cache() != cudaSuccess) {
@@ -449,7 +443,7 @@ CudaBackend::~CudaBackend() {
     // by output_pool; only dormant leases can be inspected in this mode.
     if (!clear_verification_workspaces(nullptr, nullptr))
         std::fprintf(stderr, "CudaBackend: verification cache cleanup failed; releasing at shutdown\n");
-    if (std::getenv("MOLLM_CUDA_STRIDED_RESHAPE_VIEWS"))
+    if (impl_->options.strided_reshape_views != mollm_cuda::Override::Unset)
         std::fprintf(stderr, "CUDA strided reshape views: enabled=%d calls=%zu\n",
                      impl_->strided_reshape_views, impl_->strided_reshape_calls);
     if(impl_->state_prefix_peak_payload_bytes)std::fprintf(stderr,
@@ -919,7 +913,7 @@ void CudaBackend::wrap_weight_int4(Tensor& tensor,
                 }
             }
             if (exact) {
-                if (std::getenv("MOLLM_CUDA_Q4_PALETTE_AUDIT")) {
+                if (impl_->options.q4_palette_audit) {
                     std::array<bool,65536> seen{};
                     size_t unique=0;
                     for(const auto& block:encoded) for(uint16_t code:block.scales)

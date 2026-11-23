@@ -8,6 +8,7 @@
 #include "backends/cuda/backend.h"
 #include "backends/cuda/device_runtime.h"
 #include "backends/cuda/kernel_policy.h"
+#include "backends/cuda/runtime_options.h"
 #include "backends/cuda/fp16_expert_palette_cache.h"
 #include "backends/cuda/dense_lt_gemm.h"
 #include "runtime/cuda_host_memory_budget.h"
@@ -31,6 +32,8 @@
 #include <vector>
 
 struct CudaBackend::Impl {
+    // Declared first: member initializers below read it.
+    const mollm_cuda::RuntimeOptions options = mollm_cuda::read_runtime_options();
     enum class WeightLayout : uint8_t {
         Dense = 0,
         Q8RowMajor,
@@ -359,10 +362,7 @@ struct CudaBackend::Impl {
     std::unordered_map<const Graph*, HcProjectionPlan> hc_projection_plans;
     std::unordered_map<const GraphNode*, HcProjectionPair*> hc_projection_nodes;
     std::unordered_map<const GraphNode*, HcProjectionPair*> hc_prefill_rms_nodes;
-    bool hc_prefill_reuse_enabled = [] {
-        const char* diagnostic=std::getenv("MOLLM_CUDA_DENSE_PREFILL_FP32_REFERENCE");
-        return !(diagnostic && std::strcmp(diagnostic,"1")==0);
-    }();
+    bool hc_prefill_reuse_enabled = !options.dense_prefill_fp32_reference;
     bool hc_prefill_rms_half_enabled = true;
     void* hc_prefill_half = nullptr;
     size_t hc_prefill_half_bytes = 0;
@@ -475,10 +475,10 @@ struct CudaBackend::Impl {
     }
     uint64_t hc_execution_epoch = 0, hc_projection_enqueues = 0, hc_projection_copies = 0;
     uint64_t moe_graph_builds = 0, moe_graph_hits = 0;
-    bool capture_audit = std::getenv("MOLLM_CUDA_CAPTURE_AUDIT") != nullptr;
+    bool capture_audit = options.capture_audit;
     uint64_t attention_prefix_query_group_enqueues = 0;
     uint64_t attention_prefix_head_group_enqueues = 0;
-    bool exact_scratch_growth = std::getenv("MOLLM_CUDA_DISABLE_GEOMETRIC_GROWTH") != nullptr;
+    bool exact_scratch_growth = options.disable_geometric_growth;
     struct CaptureSignature {
         std::vector<uint64_t> storage;
         std::vector<int32_t> i32;
@@ -538,7 +538,7 @@ struct CudaBackend::Impl {
     const GraphNode* segment_decode_node = nullptr;
     bool segment_enabled =
 #ifdef MOLLM_CUDA_DECODE_SEGMENTS
-        std::getenv("MOLLM_CUDA_DISABLE_DECODE_SEGMENTS") == nullptr;
+        !options.disable_decode_segments;
 #else
         false;
 #endif
@@ -825,7 +825,7 @@ struct CudaBackend::Impl {
             cudaFree(recurrent_scratch);
         if (moe_scratch)
             cudaFree(moe_scratch);
-        if (std::getenv("MOLLM_CUDA_PROFILE")) {
+        if (options.profile) {
             std::fprintf(stderr, "\nCudaBackend MoE graphs: builds=%llu hits=%llu\n",
                 static_cast<unsigned long long>(moe_graph_builds),
                 static_cast<unsigned long long>(moe_graph_hits));
@@ -946,11 +946,7 @@ struct CudaBackend::Impl {
                 }
             }
             mollm_cuda::Q4RowG32* row_g32 = nullptr;
-            static const int row_major = [] {
-                const char* option = std::getenv("MOLLM_CUDA_Q4_ROW_MAJOR");
-                if (option && std::strcmp(option, "2") == 0) return 2;
-                return option && std::strcmp(option, "1") == 0 ? 1 : 0;
-            }();
+            const int row_major = options.q4_row_major;
             if (row_major && layout == WeightLayout::Q4Bg32Biased &&
                 ((n == 2560 && k == 6144) || (n == 320 && k == 10240) ||
                  (row_major == 2 && n == 640 && k == 2560))) {
@@ -992,13 +988,7 @@ struct CudaBackend::Impl {
             found->second.narrow_row_g32 = narrow_row_g32;
             weights_by_device.emplace(device, &found->second);
         }
-        static const size_t prefill_cache_limit = [] {
-            const char* value = std::getenv("MOLLM_CUDA_PREFILL_FP16_CACHE_MB");
-            if (!value || !*value) return size_t{0};
-            char* end = nullptr;
-            const unsigned long long mb = std::strtoull(value, &end, 10);
-            return end && !*end && mb <= 32768 ? static_cast<size_t>(mb) * 1024 * 1024 : size_t{0};
-        }();
+        const size_t prefill_cache_limit = options.prefill_fp16_cache_bytes;
         auto& cached = found->second;
         // Qualified dense-prefill cache shapes within the configured budget.
         constexpr bool cache_narrow=true;
@@ -1077,10 +1067,7 @@ struct CudaBackend::Impl {
     // Prints each distinct kernel selection once when MOLLM_CUDA_TRACE_KERNELS
     // is set, so a run shows which kernels its shapes actually reach.
     // MOLLM_CUDA_TRACE_KERNELS prints each distinct selection once.
-    static bool tracing_kernels() {
-        static const bool enabled = std::getenv("MOLLM_CUDA_TRACE_KERNELS") != nullptr;
-        return enabled;
-    }
+    bool tracing_kernels() const { return options.trace_kernels; }
     void trace_selection(const std::string& selection) {
         if (traced_kernels.insert(selection).second)
             std::fprintf(stderr, "mollm cuda kernel: %s\n", selection.c_str());
@@ -1189,10 +1176,7 @@ struct CudaBackend::Impl {
         const bool valid_quantized = kind != MatmulWeight::Other;
         // Non-default streams are used only by resident Q4 MoE graph capture.
         if (stream && !(valid_q4_g32 && m == 1 && activation_kind == Activation::NONE)) return false;
-        static const bool small_batch = [] {
-            const char* value = std::getenv("MOLLM_CUDA_Q4_SMALL_BATCH");
-            return value && std::strcmp(value, "1") == 0;
-        }();
+        const bool small_batch = options.q4_small_batch;
         mollm_cuda::MatmulRequest request;
         request.weight = kind;
         request.tokens = m;
@@ -1331,10 +1315,7 @@ struct CudaBackend::Impl {
 
             const void* gemm_activation = device_a;
             cudaDataType activation_type = CUDA_R_32F;
-            static const bool fp32_reference = [] {
-                const char* value = std::getenv("MOLLM_CUDA_DENSE_PREFILL_FP32_REFERENCE");
-                return value && std::strcmp(value, "1") == 0;
-            }();
+            const bool fp32_reference = options.dense_prefill_fp32_reference;
             const bool use_fp32_reference = fp32_reference && m > 1 &&
                 linear_weight_type == CUDA_R_16F;
             if (use_fp32_reference) {
